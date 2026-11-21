@@ -1,11 +1,11 @@
 //! Deterministic synthetic UDP transmit loss over real Quinn QUIC/TLS.
 //! This is a recovery/telemetry smoke test, NOT a throughput or BBR fairness benchmark.
 //! No OS-wide network settings, privileged netem, external servers, or unsafe TLS verifiers.
+use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, TokioRuntime, UdpPoller,
 };
-use quinn::udp::{RecvMeta, Transmit};
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::{
     io::{self, IoSliceMut},
@@ -107,8 +107,8 @@ struct Sample {
 
 /// Build a real TLS 1.3 QUIC connection with ordinary certificate verification.
 fn endpoints(drop_every: u64) -> (Endpoint, Endpoint, SocketAddr, Arc<DeterministicLoss>) {
-    let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-        .expect("test certificate");
+    let identity =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("test certificate");
     let cert = identity.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(identity.key_pair.serialize_der());
 
@@ -136,7 +136,8 @@ fn endpoints(drop_every: u64) -> (Endpoint, Endpoint, SocketAddr, Arc<Determinis
         Some(server_config),
         loss.clone(),
         runtime,
-    ).expect("server endpoint");
+    )
+    .expect("server endpoint");
     let address = server.local_addr().expect("bound UDP endpoint");
 
     let mut roots = rustls::RootCertStore::empty();
@@ -153,8 +154,8 @@ fn endpoints(drop_every: u64) -> (Endpoint, Endpoint, SocketAddr, Arc<Determinis
         QuicClientConfig::try_from(client_tls).expect("QUIC client TLS"),
     ));
     configure_client_bbr(&mut client_config);
-    let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap())
-        .expect("bind client endpoint");
+    let mut client =
+        Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("bind client endpoint");
     client.set_default_client_config(client_config);
     (server, client, address, loss)
 }
@@ -167,8 +168,11 @@ async fn run_scenario(drop_every: u64) -> Sample {
             let incoming = server.accept().await.expect("incoming QUIC");
             let connection = incoming.await.expect("verified QUIC TLS");
             assert!(
-                connection.congestion_state().into_any()
-                    .downcast::<quinn::congestion::Bbr>().is_ok(),
+                connection
+                    .congestion_state()
+                    .into_any()
+                    .downcast::<quinn::congestion::Bbr>()
+                    .is_ok(),
                 "server must use BBR"
             );
             // Arm only after handshake; isolate data transport recovery from
@@ -178,7 +182,10 @@ async fn run_scenario(drop_every: u64) -> Sample {
             let mut outgoing = connection.open_uni().await.expect("open data stream");
             let payload = vec![0x5a; CHUNK_SIZE];
             for _ in 0..(PAYLOAD_LEN / CHUNK_SIZE) {
-                outgoing.write_all(&payload).await.expect("write all through loss");
+                outgoing
+                    .write_all(&payload)
+                    .await
+                    .expect("write all through loss");
             }
             outgoing.finish().expect("send FIN");
             let mut acknowledgement = connection.accept_uni().await.expect("client ack stream");
@@ -189,7 +196,9 @@ async fn run_scenario(drop_every: u64) -> Sample {
             let elapsed = started.elapsed();
             let stats = connection.stats().path;
             // Keep endpoint active until client confirms the scenario is complete.
-            client_done_rx.await.expect("client received complete stream");
+            client_done_rx
+                .await
+                .expect("client received complete stream");
             Sample {
                 drop_every,
                 attempted_datagrams: loss.attempts.load(Ordering::Relaxed),
@@ -202,17 +211,29 @@ async fn run_scenario(drop_every: u64) -> Sample {
             }
         });
 
-        let connection = client.connect(address, "localhost").unwrap()
-            .await.expect("verify certificate + SNI");
+        let connection = client
+            .connect(address, "localhost")
+            .unwrap()
+            .await
+            .expect("verify certificate + SNI");
         assert!(
-            connection.congestion_state().into_any()
-                .downcast::<quinn::congestion::Bbr>().is_ok(),
+            connection
+                .congestion_state()
+                .into_any()
+                .downcast::<quinn::congestion::Bbr>()
+                .is_ok(),
             "client must also use BBR"
         );
         let mut incoming = connection.accept_uni().await.expect("server data");
-        let content = incoming.read_to_end(PAYLOAD_LEN + 1).await.expect("reassembled stream");
+        let content = incoming
+            .read_to_end(PAYLOAD_LEN + 1)
+            .await
+            .expect("reassembled stream");
         assert_eq!(content.len(), PAYLOAD_LEN);
-        assert!(content.iter().all(|&byte| byte == 0x5a), "payload must be byte-exact");
+        assert!(
+            content.iter().all(|&byte| byte == 0x5a),
+            "payload must be byte-exact"
+        );
         let mut ack = connection.open_uni().await.expect("ack stream");
         ack.write_all(b"received").await.expect("send ack");
         ack.finish().expect("ack FIN");
@@ -221,7 +242,8 @@ async fn run_scenario(drop_every: u64) -> Sample {
         client.close(0u32.into(), b"complete");
         sample
     })
-    .await.expect("QUIC loss scenario exceeded 40 seconds")
+    .await
+    .expect("QUIC loss scenario exceeded 40 seconds")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -231,8 +253,14 @@ async fn active_bbr_recovers_byte_exactly_from_synthetic_udp_loss() {
     let clean = run_scenario(0).await;
     let lossy = run_scenario(20).await; // drop every twentieth data-phase datagram
 
-    assert_eq!(clean.dropped_datagrams, 0, "clean socket must not drop anything");
-    assert!(lossy.dropped_datagrams >= 1, "test must actually inject losses");
+    assert_eq!(
+        clean.dropped_datagrams, 0,
+        "clean socket must not drop anything"
+    );
+    assert!(
+        lossy.dropped_datagrams >= 1,
+        "test must actually inject losses"
+    );
     assert!(lossy.attempted_datagrams >= lossy.dropped_datagrams);
     assert!(lossy.sent_packets > 0);
     // QUIC's loss detection can report retransmissions independently of
