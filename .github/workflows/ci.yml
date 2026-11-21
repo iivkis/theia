@@ -52,7 +52,7 @@ jobs:
         with:
           workspaces: "spikes/m0_1 -> target"
           key: "m0-1"
-      - name: Test actual HTTP/2 duplex and API probes
+      - name: Test actual HTTP/2 and HTTP/3 TLS transports
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
@@ -73,9 +73,7 @@ jobs:
         with:
           workspaces: "spikes/m0_1 -> target"
           key: "m0-1-windows"
-      - name: Refresh isolated spike lockfile for added test-only dependencies
-        run: cargo generate-lockfile --manifest-path spikes/m0_1/Cargo.toml
-      - name: Native Windows API spike tests
+      - name: Native Windows TLS/H2 and QUIC/H3 tests
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
 
   rust-tests:
