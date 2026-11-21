@@ -25,7 +25,22 @@ const (
 	maxFrameSize    = 16_384
 )
 
+func validateLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid test TCP address: %w", err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("test-only uTLS H2 probe refuses non-loopback destinations")
+	}
+	return nil
+}
+
 func tlsProbe(addr, mode string) error {
+	if err := validateLoopback(addr); err != nil {
+		return err
+	}
 	pem := os.Getenv("THEIA_TEST_ROOT_PEM")
 	if pem == "" {
 		return errors.New("THEIA_TEST_ROOT_PEM missing")

@@ -37,7 +37,10 @@ async fn inspect_real_wire_client_hello(socket: &TcpStream) -> ClientHelloSummar
     tokio::time::timeout(Duration::from_secs(12), async {
         let mut raw = [0u8; 16 * 1024];
         loop {
-            let n = socket.peek(&mut raw).await.expect("peek Go uTLS first flight");
+            let n = socket
+                .peek(&mut raw)
+                .await
+                .expect("peek Go uTLS first flight");
             if n >= 5 {
                 assert_eq!(raw[0], 22, "TLS handshake record");
                 let length = usize::from(u16::from_be_bytes([raw[3], raw[4]]));
@@ -60,7 +63,9 @@ async fn exercise_go_utls(mode: &'static str) {
         let binary = std::env::var_os("THEIA_UTLS_H2_PROBE")
             .expect("CI must build test-only Go uTLS h2_probe binary");
         let (acceptor, trusted_pem) = tls_server();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let address = listener.local_addr().expect("listen address");
         let (reader_done_tx, reader_done_rx) = oneshot::channel::<()>();
 
