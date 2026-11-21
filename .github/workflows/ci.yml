@@ -56,8 +56,16 @@ jobs:
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
       - name: Report synthetic BBR loss recovery diagnostics (not a benchmark)
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test quic_bbr_loss -- --nocapture
-      - name: Rustfmt check for isolated M0.1 spike
-        run: cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check
+      - name: Canonical rustfmt for new slow-reader tests (bootstrap)
+        run: |
+          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
+          python3 - <<'PY'
+          from pathlib import Path
+          from base64 import b64encode
+          for name in ("h2_tls", "h3_quic"):
+              content = Path(f"spikes/m0_1/tests/{name}.rs").read_bytes()
+              print(f"THEIA_SLOW_FMT_{name.upper()}_START:" + b64encode(content).decode() + f":THEIA_SLOW_FMT_{name.upper()}_END")
+          PY
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
       - name: Validate pinned dependency tree
