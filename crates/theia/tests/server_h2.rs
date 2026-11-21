@@ -265,7 +265,10 @@ async fn h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial() {
             Frame::Data(b"protected echo".to_vec())
         );
         assert_eq!(next_frame(&mut rx, &mut decoder, &mut queue).await, Frame::Fin);
-        assert!(rx.data().await.is_none());
+        while let Some(chunk) = rx.data().await {
+            assert!(chunk.unwrap().is_empty(), "no DATA after terminal SmartTheia frame");
+        }
+        decoder.finish().unwrap();
         echo_task.await.unwrap();
         driver.abort();
         server.abort();
@@ -301,7 +304,10 @@ async fn h2_tls_default_policy_rejects_private_ip_without_tcp_dial() {
             next_frame(&mut rx, &mut decoder, &mut queue).await,
             Frame::OpenError(ErrorCode::PolicyDenied)
         );
-        assert!(rx.data().await.is_none());
+        while let Some(chunk) = rx.data().await {
+            assert!(chunk.unwrap().is_empty(), "no DATA after terminal SmartTheia frame");
+        }
+        decoder.finish().unwrap();
         assert!(timeout(Duration::from_millis(250), echo.accept()).await.is_err());
         driver.abort();
         server.abort();
