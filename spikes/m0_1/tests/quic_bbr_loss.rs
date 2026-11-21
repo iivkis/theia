@@ -3,8 +3,9 @@
 //! No OS-wide network settings, privileged netem, external servers, or unsafe TLS verifiers.
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
-    AsyncUdpSocket, Endpoint, EndpointConfig, RecvMeta, Runtime, TokioRuntime, Transmit, UdpPoller,
+    AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, TokioRuntime, UdpPoller,
 };
+use quinn::udp::{RecvMeta, Transmit};
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::{
     io::{self, IoSliceMut},
