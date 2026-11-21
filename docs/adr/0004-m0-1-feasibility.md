@@ -23,24 +23,24 @@
 | Контракт | Доказательство M0.1 | Вывод |
 | --- | --- | --- |
 | H2 response до request EOF | `http2_response_before_request_eof`: настоящий in-memory h2 handshake, POST с открытым body, HTTP response приходит до body EOF, затем сервер получает оставшиеся bytes | **PASS** в Linux CI (без TLS); TLS-backed H2 E2E ещё **OPEN** |
-| QUIC BBR factory | Rust код создаёт `TransportConfig` с `Arc<BbrConfig>`; API применимости к `ClientConfig`/ `ServerConfig` проверен компилятором | **API PASS**, но BBR *не проверен в реальном QUIC соединении*; algorithm telemetry/loss bench **OPEN** |
-| H3 split | Компиляция generic API для `h3::client::RequestStream::split` и `h3::server::RequestStream::split`, тип bridge `h3_quinn::Connection` | **API PASS**, но H3 QUIC TLS и реальный full-duplex **OPEN** |
+| QUIC BBR active state | Реальный QUIC loopback TLS H3 тест использует `BbrConfig` на обоих endpoints, проверяет `Connection::congestion_state().into_any().downcast::<Bbr>()` **и у клиента, и у сервера** | **ACTIVE CONTROLLER PASS** на Linux; loss/jitter benchmarks **OPEN** |
+| H3 real QUIC/TLS and streaming | Настоящие UDP sockets, TLS cert generated for localhost (trusted test root, no custom verifier), ALPN `h3`, send request phase-1, receive response before request EOF, then phase-2 both ways; wrong hostname rejection | **PASS** в Linux и Windows CI; HTTP3 half-close/cancellation stress **OPEN** |
 | Windows x64 | Независимый native Windows CI spike тестирует API и h2 | **PASS** в Windows-native CI (без Windows System Proxy); WinINet/TUI не затрагиваются |
 | uTLS-like TLS fingerprint | Рассмотрены upstream rustls/Quinn ограничения и сторонние fork/BoringSSL варианты; нет проверенного одинакового профиля H3/H2 | **BLOCKER P0**; не считать feature реализованной и не включать профили кроме `default` |
 
-CI свидетельства: https://github.com/iivkis/theia/actions/runs/44938796454 (первый Linux: 3/3 tests; `cargo check --all-targets` success) и https://github.com/iivkis/theia/actions/runs/44939068608 (Linux **и Windows native** spike успешны при закреплённом `Cargo.lock`). Эти тесты доказывают только явные свойства API/HTTP2, но не релизные критерии QUIC/TLS.
+Сетевое доказательство (5/5 tests) и зафиксированный Cargo.lock: https://github.com/iivkis/theia/actions/runs/44940250307. Ранее CI свидетельства: https://github.com/iivkis/theia/actions/runs/44938796454 (первый Linux: 3/3 tests; `cargo check --all-targets` success) и https://github.com/iivkis/theia/actions/runs/44939068608 (Linux **и Windows native** spike успешны при закреплённом `Cargo.lock`). Эти тесты доказывают только явные свойства API/HTTP2, но не релизные критерии QUIC/TLS.
 
 ## Технические выводы
 
 ### BBR
 
-В `quinn 0.11.12` присутствуют `congestion::BbrConfig` и `TransportConfig::congestion_controller_factory`. По документации BBR помечен **experimental**. Протокол требует включить BBR **на отправителе клиента и сервера**; SPIKE пока только компилирует factory functions. Для M3.3 нужно инстанцировать оба QUIC endpoints с этим TransportConfig, получить фактическую диагностику выбранного контроллера или инструментировать контроллер, измерить loss/jitter/RTT.
+В `quinn 0.11.12` присутствуют `congestion::BbrConfig` и `TransportConfig::congestion_controller_factory`. BBR помечен **experimental**. В реальном HTTP/3 QUIC/TLS тесте оба отправителя используют `BbrConfig`; проверено через `Connection::congestion_state().into_any().downcast::<Bbr>()` на клиенте и сервере. Это **доказывает активный класс контроллера, но не качество его работы**: loss/jitter/RTT benchmarks, pacing, fairness и resilience остаются отдельным блокером F-11.
 
 Источники: https://docs.rs/quinn/0.11.12/quinn/congestion/struct.BbrConfig.html · https://docs.rs/quinn/0.11.12/quinn/struct.TransportConfig.html · https://docs.rs/quinn/0.11.12/quinn/congestion/index.html.
 
 ### HTTP/3 и HTTP/2
 
-`h3 0.0.8` включает `RequestStream::split` для независимых задач отправки и получения; `h3-quinn 0.0.10` зависит от Quinn `^0.11.7`. `h2 0.4.19` даёт `ResponseFuture` и `SendStream`; реальный in-memory test прошёл с ответом до завершения запроса. **Но** это не доказывает HTTP/3 success или H2 full-duplex на реальном TLS socket. Дальнейшие E2E обязаны проверить request-body-without-EOF, response body, half-close, cancellation, bounded send capacity.
+`h3 0.0.8` включает `RequestStream::split` для независимых задач отправки и получения; `h3-quinn 0.0.10` работает с Quinn 0.11.x. В отдельном интеграционном тесте HTTP/3 по UDP/QUIC/TLS 1.3 **реально** получил ответ до EOF запроса и продолжил двустороннюю передачу; ALPN `h3`, hostname verification и активный BBR проверены. `h2 0.4.19` дал in-memory response-before-EOF, но TLS-backed H2 остаётся открыть. Дальнейшие E2E обязаны проверить request-body-without-EOF, response body, half-close, cancellation, bounded send capacity.
 
 `h2::SendStream::send_data` **может буферизовать без верхнего предела**, если отправлять без `reserve_capacity/poll_capacity`: production adapter должен использовать явный bounded backpressure, а не копировать маленький тестовый пример.
 
@@ -62,7 +62,8 @@ Quinn поддерживает pluggable crypto abstraction, но докумен
 
 ## Следующие обязательные эксперименты (open)
 
-- [ ] Реальный H3 over QUIC localhost client/server, TLS trust verification + ALPN h3, full-duplex before request EOF.
+- [x] Реальный H3 over QUIC localhost client/server, TLS trust verification + ALPN h3, full-duplex before request EOF и negative wrong hostname на Linux **и Windows native CI**.
+- [ ] H3 full-duplex half-close/cancel/backpressure under load — отдельный тест.
 - [ ] TLS-backed H2 over TCP TLS 1.3, ALPN h2, full-duplex with body backpressure.
 - [ ] BBR selected on both actual endpoints + loss/jitter comparison, logs do not expose credentials.
 - [ ] Один проверяемый кросс-платформенный uTLS-like profile для H2 **и** H3; packet captures с поддерживаемыми/несовпадающими полями.
