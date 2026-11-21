@@ -56,16 +56,10 @@ jobs:
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
       - name: Report synthetic BBR loss recovery diagnostics (not a benchmark)
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test quic_bbr_loss -- --nocapture
-      - name: Temporary canonical rustfmt bootstrap for fingerprint probe
-        run: |
-          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
-          python3 - <<'PY'
-          from base64 import b64encode
-          from pathlib import Path
-          for name, path in (("LIB", "src/lib.rs"), ("HELLO", "src/client_hello.rs"), ("TEST", "tests/client_hello_baseline.rs")):
-              content = Path("spikes/m0_1", path).read_bytes()
-              print(f"THEIA_HELLO_FMT_{name}_START:" + b64encode(content).decode("ascii") + f":THEIA_HELLO_FMT_{name}_END")
-          PY
+      - name: Fingerprint baseline diagnostics (default rustls, NOT browser profile)
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test client_hello_baseline -- --nocapture
+      - name: Rustfmt check for isolated M0.1 spike
+        run: cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
       - name: Validate pinned dependency tree

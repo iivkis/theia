@@ -269,7 +269,10 @@ mod tests {
         let mut incorrect_type = hello;
         incorrect_type[0] = 2;
         assert!(parse_handshake(&incorrect_type).is_err());
-        assert_eq!(parse_tls_records(&[22, 3, 1, 0, 10, 1]), Err(ParseError::Truncated));
+        assert_eq!(
+            parse_tls_records(&[22, 3, 1, 0, 10, 1]),
+            Err(ParseError::Truncated)
+        );
     }
 
     #[test]
@@ -282,9 +285,13 @@ mod tests {
         hello[2] = (body_len >> 8) as u8;
         hello[3] = body_len as u8;
         let extensions_offset = 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1;
-        let ext_len = u16::from_be_bytes([hello[extensions_offset], hello[extensions_offset+1]]);
-        hello[extensions_offset..extensions_offset+2].copy_from_slice(&(ext_len+7).to_be_bytes());
-        assert_eq!(parse_handshake(&hello), Err(ParseError::Invalid("duplicate TLS extension")));
+        let ext_len = u16::from_be_bytes([hello[extensions_offset], hello[extensions_offset + 1]]);
+        hello[extensions_offset..extensions_offset + 2]
+            .copy_from_slice(&(ext_len + 7).to_be_bytes());
+        assert_eq!(
+            parse_handshake(&hello),
+            Err(ParseError::Invalid("duplicate TLS extension"))
+        );
     }
 
     #[test]

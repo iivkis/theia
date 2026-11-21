@@ -24,11 +24,15 @@ fn client_config(alpn: &[u8]) -> Arc<rustls::ClientConfig> {
 
 fn default_tls_h2_clienthello() -> ClientHelloSummary {
     let mut conn = rustls::ClientConnection::new(
-        client_config(b"h2"), ServerName::try_from("localhost".to_string()).unwrap()
-    ).expect("TLS engine");
+        client_config(b"h2"),
+        ServerName::try_from("localhost".to_string()).unwrap(),
+    )
+    .expect("TLS engine");
     let mut bytes = Vec::new();
     while conn.wants_write() {
-        let written = conn.write_tls(&mut bytes).expect("emit ClientHello TLS records");
+        let written = conn
+            .write_tls(&mut bytes)
+            .expect("emit ClientHello TLS records");
         assert!(written > 0, "TLS handshake writer must progress");
     }
     parse_tls_records(&bytes).expect("parse generated TLS ClientHello")
@@ -43,10 +47,14 @@ fn default_quic_h3_clienthello() -> ClientHelloSummary {
         rustls::quic::Version::V1,
         ServerName::try_from("localhost".to_string()).unwrap(),
         Vec::new(),
-    ).expect("QUIC-compatible TLS engine");
+    )
+    .expect("QUIC-compatible TLS engine");
     let mut plaintext_handshake = Vec::new();
     conn.write_hs(&mut plaintext_handshake);
-    assert!(!plaintext_handshake.is_empty(), "TLS client handshake CRYPTO payload");
+    assert!(
+        !plaintext_handshake.is_empty(),
+        "TLS client handshake CRYPTO payload"
+    );
     parse_handshake(&plaintext_handshake).expect("parse plaintext QUIC ClientHello")
 }
 
@@ -56,7 +64,10 @@ fn default_rustls_h2_clienthello_has_tls13_sni_and_alpn() {
     assert_eq!(hello.legacy_version, 0x0303);
     assert_eq!(hello.alpn, vec![b"h2".to_vec()]);
     assert!(hello.sni_present);
-    assert!(hello.supported_versions.contains(&0x0304), "TLS1.3 advertised");
+    assert!(
+        hello.supported_versions.contains(&0x0304),
+        "TLS1.3 advertised"
+    );
     assert!(!hello.cipher_suites.is_empty());
     assert!(!hello.extensions_in_wire_order.is_empty());
     assert!(!hello.quic_transport_parameters_present);
@@ -70,8 +81,14 @@ fn default_rustls_quic_h3_clienthello_has_transport_params_and_alpn() {
     assert_eq!(hello.legacy_version, 0x0303);
     assert_eq!(hello.alpn, vec![b"h3".to_vec()]);
     assert!(hello.sni_present);
-    assert!(hello.supported_versions.contains(&0x0304), "QUIC must use TLS1.3");
-    assert!(hello.quic_transport_parameters_present, "QUIC TLS extension 57 must exist");
+    assert!(
+        hello.supported_versions.contains(&0x0304),
+        "QUIC must use TLS1.3"
+    );
+    assert!(
+        hello.quic_transport_parameters_present,
+        "QUIC TLS extension 57 must exist"
+    );
     assert!(!hello.cipher_suites.is_empty());
     eprintln!("default rustls QUIC/H3 ClientHello (no host/random/secret): {hello:?}");
 }
@@ -83,8 +100,16 @@ fn default_h2_and_h3_clienthello_are_distinct_and_not_browser_claims() {
     assert_ne!(h2.alpn, h3.alpn);
     assert!(!h2.quic_transport_parameters_present);
     assert!(h3.quic_transport_parameters_present);
-    let h2_grease = h2.extensions_in_wire_order.iter().filter(|&&e| is_grease(e)).count();
-    let h3_grease = h3.extensions_in_wire_order.iter().filter(|&&e| is_grease(e)).count();
+    let h2_grease = h2
+        .extensions_in_wire_order
+        .iter()
+        .filter(|&&e| is_grease(e))
+        .count();
+    let h3_grease = h3
+        .extensions_in_wire_order
+        .iter()
+        .filter(|&&e| is_grease(e))
+        .count();
     // Diagnostic only, no assertion against any browser build or GREASE policy:
     eprintln!("default rustls GREASE extension counts: h2={h2_grease} h3={h3_grease}");
 }
