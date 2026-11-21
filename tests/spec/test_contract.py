@@ -140,6 +140,10 @@ class SpecContractTests(unittest.TestCase):
         self.assertTrue((spike / "Cargo.lock").is_file())
         parser = (spike / "src" / "client_hello.rs").read_text(encoding="utf-8")
         probe = (spike / "tests" / "client_hello_baseline.rs").read_text(encoding="utf-8")
+        for required in ("has_grease_extension", "has_alps", "supported_groups", "read_groups",
+                         "17_513", "17_613"):
+            self.assertIn(required, parser)
+        self.assertIn("default_rustls_h2_cannot_pass_named_browser_gate", probe)
         for required in ("parse_tls_records", "parse_handshake", "MAX_HELLO",
                          "extensions_in_wire_order", "quic_transport_parameters_present",
                          "ParseError::Truncated", "is_grease"):

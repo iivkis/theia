@@ -11,6 +11,7 @@ pub struct ClientHelloSummary {
     pub extensions_in_wire_order: Vec<u16>,
     pub alpn: Vec<Vec<u8>>,
     pub supported_versions: Vec<u16>,
+    pub supported_groups: Vec<u16>,
     pub sni_present: bool,
     pub quic_transport_parameters_present: bool,
 }
@@ -20,6 +21,23 @@ pub enum ParseError {
     Truncated,
     Invalid(&'static str),
     TooLarge,
+}
+
+impl ClientHelloSummary {
+    /// GREASE extension IDs are informative, not a complete browser fingerprint.
+    pub fn has_grease_extension(&self) -> bool {
+        self.extensions_in_wire_order
+            .iter()
+            .any(|&id| is_grease(id))
+    }
+
+    /// BoringSSL supports an old and a new application_settings (ALPS)
+    /// codepoint. Do not mistake lack of one for lack of ALPS altogether.
+    pub fn has_alps(&self) -> bool {
+        self.extensions_in_wire_order
+            .iter()
+            .any(|&id| id == 17_513 || id == 17_613)
+    }
 }
 
 struct Reader<'a> {
@@ -79,6 +97,19 @@ fn read_versions(data: &[u8]) -> Result<Vec<u16>, ParseError> {
         versions.push(r.u16()?);
     }
     Ok(versions)
+}
+
+fn read_groups(data: &[u8]) -> Result<Vec<u16>, ParseError> {
+    let mut r = Reader::new(data);
+    let n = usize::from(r.u16()?);
+    if n == 0 || n % 2 != 0 || n != r.remaining() {
+        return Err(ParseError::Invalid("supported_groups length"));
+    }
+    let mut groups = Vec::new();
+    while r.remaining() != 0 {
+        groups.push(r.u16()?);
+    }
+    Ok(groups)
 }
 
 fn validate_sni(data: &[u8]) -> Result<bool, ParseError> {
@@ -144,6 +175,7 @@ pub fn parse_handshake(raw: &[u8]) -> Result<ClientHelloSummary, ParseError> {
     let mut extension_types = Vec::new();
     let mut alpn = Vec::new();
     let mut supported_versions = Vec::new();
+    let mut supported_groups = Vec::new();
     let mut sni_present = false;
     let mut quic_transport_parameters_present = false;
     while exts.remaining() != 0 {
@@ -157,6 +189,7 @@ pub fn parse_handshake(raw: &[u8]) -> Result<ClientHelloSummary, ParseError> {
         match typ {
             0 => sni_present = validate_sni(value)?,
             16 => alpn = read_alpn(value)?,
+            10 => supported_groups = read_groups(value)?,
             43 => supported_versions = read_versions(value)?,
             57 => quic_transport_parameters_present = true,
             _ => {}
@@ -168,6 +201,7 @@ pub fn parse_handshake(raw: &[u8]) -> Result<ClientHelloSummary, ParseError> {
         extensions_in_wire_order: extension_types,
         alpn,
         supported_versions,
+        supported_groups,
         sni_present,
         quic_transport_parameters_present,
     })
@@ -301,6 +335,50 @@ mod tests {
         assert!(is_grease(0xfafa));
         assert!(!is_grease(0x1301));
         assert!(!is_grease(0x0a0b));
+    }
+
+    // Append a synthetic extension and update both TLS length prefixes.
+    fn append_extension(hello: &mut Vec<u8>, id: u16, value: &[u8]) {
+        let extensions_offset = 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1;
+        let old_len = u16::from_be_bytes([hello[extensions_offset], hello[extensions_offset + 1]]);
+        hello.extend(id.to_be_bytes());
+        hello.extend((value.len() as u16).to_be_bytes());
+        hello.extend(value);
+        hello[extensions_offset..extensions_offset + 2]
+            .copy_from_slice(&(old_len + 4 + value.len() as u16).to_be_bytes());
+        let body_len = hello.len() - 4;
+        hello[1] = (body_len >> 16) as u8;
+        hello[2] = (body_len >> 8) as u8;
+        hello[3] = body_len as u8;
+    }
+
+    #[test]
+    fn supported_groups_are_observed_and_invalid_vectors_fail_closed() {
+        let mut valid = minimal_hello();
+        append_extension(&mut valid, 10, &[0, 4, 0, 29, 0, 23]);
+        assert_eq!(
+            parse_handshake(&valid).unwrap().supported_groups,
+            vec![29, 23]
+        );
+        let mut invalid = minimal_hello();
+        append_extension(&mut invalid, 10, &[0, 3, 0, 29, 23]);
+        assert_eq!(
+            parse_handshake(&invalid),
+            Err(ParseError::Invalid("supported_groups length"))
+        );
+    }
+
+    #[test]
+    fn alps_old_and_new_codepoints_are_detected() {
+        assert!(!parse_handshake(&minimal_hello()).unwrap().has_alps());
+        for codepoint in [17_513, 17_613] {
+            let mut h = minimal_hello();
+            append_extension(&mut h, codepoint, &[0, 0]);
+            assert!(
+                parse_handshake(&h).unwrap().has_alps(),
+                "ALPS codepoint {codepoint}"
+            );
+        }
     }
 
     #[test]
