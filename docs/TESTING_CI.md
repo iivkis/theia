@@ -7,7 +7,7 @@
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)
 
 - SmartTheia encode/decode golden byte vectors; arbitrary chunk splitting/aggregation; frame length 0/65536/65537; invalid flags/type/state; отсутствие паники и out-of-bounds.
-- Typed TOML: missing/unknown fields, duplicate IDs/hashes, bind collisions, malformed DNS/IPv6/port, unsupported schema_version, UTF-8 errors, missing secret refs, empty user list, диапазоны таймаутов, **missing/empty/unknown/duplicate allowed_user_ids**, запрет `system_proxy=on`, отказ неизвестного `tls_profile`.
+- Typed TOML: missing/unknown fields, duplicate IDs/hashes, bind collisions **including wildcard overlap and IPv6 dual-stack**, malformed DNS/IPv6/port, unsupported schema_version, UTF-8 errors, missing secret refs, empty user list, диапазоны таймаутов, **missing/empty/unknown/duplicate allowed_user_ids**, запрет `system_proxy=on`, отказ неизвестного `tls_profile`.
 - Transport selector: строгая таблица классификации `UdpUnavailable` versus `TlsVerificationFailed`/`Unauthorized`/`IncompatibleProtocol`/`PolicyDenied`, negative-cache TTL, cancellation, no re-dial after downstream error.
 - Policy: IPv4/IPv6 public/private, loopback, link-local, multicast, DNS rebinding after resolution, case folding/IDNA validation.
 - TUI update model: keyboard, focus, dirty state, save and apply distinct, privacy masking, compact terminal, back navigation.
