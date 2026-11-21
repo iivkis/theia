@@ -54,6 +54,8 @@
 - CI сначала проверяет спецификацию и тесты, затем lint/build; кэш cargo/target через `Swatinem/rust-cache`; Windows проверяется нативно.
 - Никакой микрооптимизации без замеров и регрессий в тестах. Производительность в `docs/TESTING_CI.md` — измеряется на одинаковых условиях.
 
+- **M1.1 CLI shell:** корневой workspace `crates/theia` с зафиксированным `Cargo.lock`; отдельный `spikes/m0_1` не входит в production workspace. Работают только `--help` и `--version`. Распознаваемые `tui`, `server/client run`, `config validate` обязаны завершаться nonzero без сети, TUI и модификации OS proxy, пока реализация соответствующих M1.2/M2/M4 этапов отсутствует. Проверять unit + CLI integration tests на Linux/Windows; не называть синтаксический parser реализацией proxy.
+
 ## Definition of Done (для каждого среза)
 
 - [ ] Есть автоматизированный позитивный и негативный тест; пограничные значения покрыты.
