@@ -1,0 +1,147 @@
+"""Specification-only contract checks. NOT Rust implementation tests."""
+from __future__ import annotations
+
+from pathlib import Path
+import re
+import tomllib
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def read(name: str) -> str:
+    return (ROOT / name).read_text(encoding="utf-8")
+
+
+def toml(name: str) -> dict:
+    with (ROOT / name).open("rb") as stream:
+        return tomllib.load(stream)
+
+
+def explicit_grants_are_valid(server: dict) -> bool:
+    """Sanity check of documented template references, not a production validator."""
+    users = server.get("users", [])
+    inbounds = server.get("inbounds", [])
+    ids = [u["id"] for u in users]
+    if not users or not inbounds or len(set(ids)) != len(ids):
+        return False
+    if len({u["token_sha256"] for u in users}) != len(users):
+        return False
+    for inbound in inbounds:
+        grants = inbound.get("allowed_user_ids")
+        if not isinstance(grants, list) or not grants:
+            return False
+        if len(grants) != len(set(grants)) or any(i not in ids for i in grants):
+            return False
+    return True
+
+
+class SpecContractTests(unittest.TestCase):
+    def test_required_files(self):
+        required = [
+            "README.md", "AGENTS.md",
+            "docs/IMPLEMENTATION_SPEC.md", "docs/ARCHITECTURE.md",
+            "docs/SMARTTHEIA_PROTOCOL.md", "docs/CONFIGURATION.md",
+            "docs/TUI_UX.md", "docs/IMPLEMENTATION_PLAN.md",
+            "docs/TESTING_CI.md", "docs/SPEC_REVIEW.md",
+            "docs/adr/0001-standard-h3-h2-embedding.md",
+            "docs/adr/0002-inbound-authorization-and-tcp-ack.md",
+            "docs/adr/0003-mvp-bbr-and-fingerprint.md",
+            "examples/server.toml", "examples/client.toml",
+            ".github/workflows/ci.yml", "scripts/check-spec.sh"
+        ]
+        for path in required:
+            with self.subTest(path=path):
+                self.assertTrue((ROOT / path).is_file(), path)
+
+    def test_local_markdown_links(self):
+        docs = [ROOT / "README.md", ROOT / "AGENTS.md"]
+        docs += list((ROOT / "docs").rglob("*.md"))
+        for file in docs:
+            text = file.read_text(encoding="utf-8")
+            with self.subTest(file=file):
+                self.assertGreater(len(text), 200)
+            for link in re.findall(r"\]\(([^)]+)\)", text):
+                path = link.split("#", 1)[0].strip()
+                if not path or path.startswith(("https://", "http://", "mailto:")):
+                    continue
+                if path.startswith("<") or " " in path:
+                    continue
+                with self.subTest(file=file, link=path):
+                    self.assertTrue((file.parent / path).exists(), f"{file}: {path}")
+
+    def test_toml_schema_versions(self):
+        for kind in ("server", "client"):
+            conf = toml(f"examples/{kind}.toml")
+            self.assertEqual(conf["schema_version"], 1)
+            self.assertIn(kind, conf)
+
+    def test_server_template_denies_private_by_default(self):
+        server = toml("examples/server.toml")["server"]
+        self.assertIs(server["policy"]["allow_private_ips"], False)
+        self.assertTrue(server["inbounds"])
+        self.assertTrue(server["users"])
+        self.assertIn("REPLACE_WITH", server["users"][0]["token_sha256"])
+
+    def test_inbounds_require_explicit_user_grants(self):
+        server = toml("examples/server.toml")["server"]
+        self.assertTrue(explicit_grants_are_valid(server))
+        import copy
+        for changed in (
+            lambda s: s["inbounds"][0].pop("allowed_user_ids"),
+            lambda s: s["inbounds"][0].update(allowed_user_ids=[]),
+            lambda s: s["inbounds"][0].update(allowed_user_ids=["missing"]),
+            lambda s: s["inbounds"][0].update(allowed_user_ids=["device-a", "device-a"]),
+        ):
+            modified = copy.deepcopy(server)
+            changed(modified)
+            self.assertFalse(explicit_grants_are_valid(modified))
+
+    def test_client_uses_safe_transport_proxy_and_secrets(self):
+        client = toml("examples/client.toml")["client"]
+        profiles = client["profiles"]
+        self.assertIn(client["active_profile"], {p["id"] for p in profiles})
+        for profile in profiles:
+            self.assertIn(profile["transport"], ("auto", "h3", "h2"))
+            self.assertTrue(profile["auth_token"].startswith(("env:", "file:")))
+            self.assertEqual(profile["tls_profile"], "default")
+        proxy = client["proxy"]
+        self.assertEqual(proxy["system_proxy"], "off")
+        for name in ("http_listen", "socks5_listen"):
+            self.assertRegex(proxy[name], r"^(127\.0\.0\.1|\[::1\]):[0-9]+$")
+
+    def test_product_mvp_gates(self):
+        text = read("docs/IMPLEMENTATION_SPEC.md")
+        for feature in ("F-06", "F-11", "F-13", "F-16", "F-17"):
+            with self.subTest(feature=feature):
+                self.assertRegex(text, rf"(?m)^\| {feature} \| P0 \|")
+        self.assertIn("BBR", text)
+        self.assertIn("browser-like", text)
+
+    def test_smarttheia_protocol_and_ack_contract(self):
+        text = read("docs/SMARTTHEIA_PROTOCOL.md")
+        for token in ("0x01", "0x02", "0x03", "0x04", "0x05", "0x10", "0x11", "0x12",
+                      "65 536", "OPEN_OK", "full-duplex", "h3", "h2"):
+            self.assertIn(token, text)
+        self.assertNotIn("client_nonce", text)
+        self.assertIn("ровно 6 байт", text)
+
+    def test_windows_manual_proxy_is_not_auto_enabled(self):
+        config = read("docs/CONFIGURATION.md")
+        self.assertIn("только `off` и `manual`", config)
+        self.assertNotIn("`on` — явный opt-in", config)
+        self.assertNotIn('system_proxy = "on"', read("examples/client.toml"))
+        self.assertIn("CAS", read("docs/TUI_UX.md") + config)  # compare-and-swap restoration documented
+
+    def test_ci_tests_first_and_cached(self):
+        workflow = read(".github/workflows/ci.yml")
+        self.assertIn("Swatinem/rust-cache@v2", workflow)
+        self.assertIn("scripts/check-spec.sh", workflow)
+        self.assertIn("cargo test --workspace --all-targets --locked", workflow)
+        self.assertLess(workflow.index("cargo test --workspace --all-targets --locked"),
+                        workflow.index("cargo clippy"))
+        self.assertIn("Cargo.lock", workflow)
+
+
+if __name__ == "__main__":
+    unittest.main()

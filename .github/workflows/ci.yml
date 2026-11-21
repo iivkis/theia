@@ -2,6 +2,7 @@ name: CI (tests first)
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -16,6 +17,7 @@ jobs:
   specification:
     name: specification
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     outputs:
       rust_ready: ${{ steps.detect.outputs.rust_ready }}
     steps:
@@ -32,7 +34,7 @@ jobs:
             echo "::error::Cargo.toml exists but Cargo.lock is missing"
             exit 1
           else
-            echo "::notice::Specification-only stage: Rust tests are skipped until the workspace is created"
+            echo "::notice::Specification-only stage: Rust tests skipped until Cargo workspace exists"
             echo "rust_ready=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -41,6 +43,7 @@ jobs:
     needs: specification
     if: needs.specification.outputs.rust_ready == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -55,7 +58,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Release compilation
+      - name: Release compilation only after main merge
+        if: github.event_name != 'pull_request'
         run: cargo build --workspace --release --locked
 
   windows-smoke:
@@ -63,6 +67,7 @@ jobs:
     needs: [specification, rust-tests]
     if: needs.specification.outputs.rust_ready == 'true'
     runs-on: windows-latest
+    timeout-minutes: 35
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -71,5 +76,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Native Windows tests
         run: cargo test --workspace --all-targets --locked
-      - name: Native Windows release compilation
+      - name: Native Windows release compilation only after main merge
+        if: github.event_name != 'pull_request'
         run: cargo build --workspace --release --locked

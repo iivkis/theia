@@ -99,6 +99,15 @@ UDP_ASSOCIATE/UDP relay позже, через отдельное докумен
 - Active probing: rate limiting, auth, корректные HTTP status и отсутствие выдачи диагностического баннера неавторизованным клиентам. Это уменьшает тривиальный fingerprint, но не исключает классификацию.
 - В документации запрещены абсолютные заявления вроде «невозможно обнаружить через DPI».
 
+### Golden vectors v1 (hex, без пробелов между chunk boundaries)
+
+- HELLO (v1, capabilities=0, payload=6): `01 00 00 00 00 06 00 01 00 00 00 00`.
+- HELLO_ACK (v1, accepted_capabilities=0): `02 00 00 00 00 06 00 01 00 00 00 00`.
+- FIN (empty payload): `11 00 00 00 00 00`.
+- OPEN_ERROR (POLICY_DENIED=3): `05 00 00 00 00 02 00 03`.
+
+Тесты должны проверять **точные байты** и декодирование этих векторов, а не только поиск строки в документации. Если изменить wire, нужно явно версионировать протокол, а не молча переписать golden tests.
+
 ## 8. Контрактные тесты
 
 Golden byte vectors для всех type/payload (включая HELLO payload **ровно 6 байт**), endian, границ 0/65536/65537, UTF-8+IDNA, неизвестных type/flags, фрагментации HTTP body, двойного FIN, EOF, 0-RTT denial; fuzz decode no-panic. Проверять HTTP/2+HTTP/3 **full-duplex** без ожидания EOF запроса; HTTP 200 до `OPEN_OK`, но local HTTP CONNECT 200 / SOCKS5 success **строго после** OPEN_OK; cross-inbound token rejection и server-side DNS without local resolver calls. E2E: TCP echo through H3, H2 при отключённом UDP, отсутствие fallback при bad cert/token, DNS policy, slow readers, half-close, cancellation.
