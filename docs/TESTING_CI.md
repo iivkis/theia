@@ -1,6 +1,6 @@
 # Testing strategy и CI
 
-**Правило:** тестирование предшествует сборке релизных артефактов. CI не должен маскировать отсутствие сетевой Rust-реализации. С M1.1 корневой workspace и `Cargo.lock` существуют: Linux `rust-tests` и Windows `windows-smoke` должны запускаться. CLI `--help`/`--version` работают; команды `tui`, `server run`, `client run`, `config validate` обязательно возвращают ошибку `not implemented` (exit 3), пока нет реализаций. До M1.1 Rust jobs были skipped.
+**Правило:** тестирование предшествует сборке релизных артефактов. CI не должен маскировать отсутствие сетевой Rust-реализации. С M1.1 корневой workspace и `Cargo.lock` существуют: Linux `rust-tests` и Windows `windows-smoke` должны запускаться. CLI `--help`/`--version` работают; с M1.2 `config validate` выполняет структурную TOML v1 validation (exit 0/2) без чтения секретов. Команды `tui`, `server run`, `client run` обязательно возвращают `not implemented` (exit 3). До M1.1 Rust jobs были skipped.
 
 ## 1. Test pyramid
 

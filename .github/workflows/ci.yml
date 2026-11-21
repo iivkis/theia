@@ -157,6 +157,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Generate M1.2 Cargo.lock for review (temporary bootstrap)
+        shell: bash
+        run: |
+          cargo generate-lockfile
+          echo BEGIN_THEIA_M12_LOCKFILE
+          cat Cargo.lock
+          echo END_THEIA_M12_LOCKFILE
       - name: Tests first
         run: cargo test --workspace --all-targets --locked
       - name: Formatting

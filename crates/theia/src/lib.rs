@@ -2,7 +2,10 @@
 //! are intentionally unavailable until their respective implementation stages.
 //! Parsing must never trigger networking, file I/O, or OS proxy modifications.
 
+pub mod config;
+
 use std::fmt;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -20,13 +23,14 @@ pub enum Command {
     ConfigValidate { config: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
     InvalidArguments,
     InvalidRole,
     InvalidConfigPath,
     NonUtf8Argument,
     NotImplemented(&'static str),
+    Config(config::ConfigError),
 }
 
 impl CliError {
@@ -48,6 +52,7 @@ impl fmt::Display for CliError {
             Self::InvalidRole => write!(f, "invalid role; expected 'server' or 'client'"),
             Self::InvalidConfigPath => write!(f, "missing or invalid --config path"),
             Self::NonUtf8Argument => write!(f, "arguments must be UTF-8"),
+            Self::Config(error) => write!(f, "configuration invalid: {error}"),
             Self::NotImplemented(feature) => write!(
                 f,
                 "{feature} is not implemented; no network or system proxy was started"
@@ -102,17 +107,17 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
     }
 }
 
-const HELP: &str = "Theia 0.1.0 (M1.1 CLI shell; no proxy runtime)\n\
+const HELP: &str = "Theia 0.1.0 (M1.2 typed config; no proxy runtime)\n\
 Usage:\n\
   theia --help | --version\n\
   theia tui [--role server|client]\n\
   theia server run --config <path>\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
-\nOnly --help and --version are operational. Runtime, TUI and TOML validation\n\
-return a nonzero exit code until implemented. System proxy is never modified.";
+\n--help, --version and config validate are operational. Server/client runtimes and TUI\n\
+remain unavailable. Validation never starts a network listener or system proxy.";
 
-/// This dispatcher only handles introspection; all runtime operations fail closed.
+/// Introspection and structural TOML validation work; network/TUI commands fail closed.
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
     match command {
         Command::Help(None) => Ok(HELP),
@@ -126,14 +131,17 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia client run --config <path>\nClient runtime is not implemented.")
         }
         Command::Help(Some("config")) => {
-            Ok("Usage: theia config validate --config <path>\nTOML validation is not implemented.")
+            Ok("Usage: theia config validate --config <path>\nValidate TOML v1 without reading secret values.")
         }
         Command::Help(Some(_)) => Err(CliError::InvalidArguments),
         Command::Version => Ok(concat!("theia ", env!("CARGO_PKG_VERSION"))),
         Command::Tui { .. } => Err(CliError::NotImplemented("TUI")),
         Command::ServerRun { .. } => Err(CliError::NotImplemented("server runtime")),
         Command::ClientRun { .. } => Err(CliError::NotImplemented("client runtime")),
-        Command::ConfigValidate { .. } => Err(CliError::NotImplemented("TOML validation")),
+        Command::ConfigValidate { config } => {
+            config::read_file(Path::new(&config)).map_err(CliError::Config)?;
+            Ok("configuration structurally valid (secret/file existence not checked)")
+        }
     }
 }
 
@@ -241,9 +249,6 @@ mod tests {
                 config: "server.toml".into(),
             },
             Command::ClientRun {
-                config: "client.toml".into(),
-            },
-            Command::ConfigValidate {
                 config: "client.toml".into(),
             },
         ] {
