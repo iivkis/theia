@@ -244,3 +244,98 @@ async fn h3_quic_eight_concurrent_bidirectional_streams() {
         client_endpoint.close(0u32.into(), b"done");
     }).await.expect("eight concurrent QUIC/H3 streams timed out");
 }
+
+
+/// A cancelled HTTP/3 request must reset its QUIC stream, not kill the
+/// authenticated QUIC connection or another HTTP/3 stream on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h3_quic_cancel_stream_preserves_sibling_request() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (server_endpoint, client_endpoint, addr) = endpoints();
+        let (first_consumed_tx, first_consumed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancel_observed_tx, cancel_observed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (client_done_tx, client_done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.expect("QUIC");
+            let connection = incoming.await.expect("TLS verified");
+            assert_h3_and_bbr(&connection);
+            let mut h3 = h3::server::Connection::new(h3_quinn::Connection::new(connection))
+                .await.expect("H3 server session");
+
+            let first = h3.accept().await.expect("accept first").expect("first request");
+            let cancel_handler = tokio::spawn(async move {
+                let (request, mut stream) = first.resolve_request().await.expect("headers");
+                assert_eq!(request.uri().path(), "/v1/session/cancel");
+                let mut data = stream.recv_data().await.expect("first chunk").expect("DATA");
+                assert_eq!(data.copy_to_bytes(data.remaining()),
+                           Bytes::from_static(b"before-cancel"));
+                first_consumed_tx.send(()).expect("client waiting");
+                // HTTP/3 request cancellation is QUIC RESET_STREAM on request
+                // sending half; this is not a graceful request FIN.
+                let next = stream.recv_data().await;
+                assert!(next.is_err(), "expected H3 stream reset, got {next:?}");
+                cancel_observed_tx.send(()).expect("client awaiting cancellation");
+            });
+
+            let second = h3.accept().await.expect("accept sibling").expect("second request");
+            let sibling_handler = tokio::spawn(async move {
+                let (request, mut stream) = second.resolve_request().await.expect("sibling headers");
+                assert_eq!(request.uri().path(), "/v1/session/after-cancel");
+                let mut data = stream.recv_data().await.expect("sibling DATA").expect("body");
+                assert_eq!(data.copy_to_bytes(data.remaining()),
+                           Bytes::from_static(b"still-alive"));
+                assert!(stream.recv_data().await.expect("sibling EOF").is_none());
+                stream.send_response(
+                    http::Response::builder().status(204).body(()).unwrap(),
+                ).await.expect("reply to sibling");
+                stream.finish().await.expect("sibling response FIN");
+            });
+
+            client_done_rx.await.expect("client read sibling reply");
+            cancel_handler.await.expect("cancel handler");
+            sibling_handler.await.expect("sibling handler");
+        });
+
+        let connection = client_endpoint.connect(addr, "localhost")
+            .expect("QUIC connect").await.expect("TLS certificate validation");
+        assert_h3_and_bbr(&connection);
+        let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+            .await.expect("H3 client");
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost/v1/session/cancel")
+            .body(()).unwrap();
+        let mut cancelled = sender.send_request(request).await.expect("first stream");
+        cancelled.send_data(Bytes::from_static(b"before-cancel"))
+            .await.expect("first DATA");
+        first_consumed_rx.await.expect("server received DATA");
+        cancelled.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        cancelled.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+        drop(cancelled);
+        cancel_observed_rx.await.expect("server observed H3 reset");
+
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost/v1/session/after-cancel")
+            .body(()).unwrap();
+        let mut sibling = sender.send_request(request).await.expect("independent stream");
+        sibling.send_data(Bytes::from_static(b"still-alive"))
+            .await.expect("sibling DATA");
+        sibling.finish().await.expect("sibling request FIN");
+        assert_eq!(
+            sibling.recv_response().await.expect("sibling response").status(),
+            http::StatusCode::NO_CONTENT,
+        );
+        assert!(sibling.recv_data().await.expect("sibling response EOF").is_none());
+
+        client_done_tx.send(()).expect("server still alive");
+        server.await.expect("server task");
+        driver_task.abort();
+        client_endpoint.close(0u32.into(), b"done");
+    }).await.expect("H3 cancelled stream isolation timed out");
+}
