@@ -1,6 +1,6 @@
 use theia::protocol::{
-    decode, encode, Address, Decoder, Direction, ErrorCode, Frame, ProtocolError,
-    Role, Session, HEADER_LEN, MAX_PAYLOAD, VERSION,
+    decode, encode, Address, Decoder, Direction, ErrorCode, Frame, ProtocolError, Role, Session,
+    HEADER_LEN, MAX_PAYLOAD, VERSION,
 };
 
 fn hello() -> Frame {
@@ -31,13 +31,15 @@ fn establish() -> (Session, Session) {
         (Direction::Receive, Frame::OpenOk),
     ] {
         client.apply(direction, &frame).unwrap();
-        server.apply(
-            match direction {
-                Direction::Send => Direction::Receive,
-                Direction::Receive => Direction::Send,
-            },
-            &frame,
-        ).unwrap();
+        server
+            .apply(
+                match direction {
+                    Direction::Send => Direction::Receive,
+                    Direction::Receive => Direction::Send,
+                },
+                &frame,
+            )
+            .unwrap();
     }
     (client, server)
 }
@@ -92,7 +94,8 @@ fn all_frame_variants_round_trip_and_big_endian_address_length() {
     let wire = encode(&Frame::OpenTcp {
         address: Address::V4([1, 2, 3, 4]),
         port: 443,
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(&wire[HEADER_LEN..], &[1, 0, 4, 1, 2, 3, 4, 1, 187]);
 }
 
@@ -117,7 +120,14 @@ fn size_boundaries_are_enforced_before_buffering() {
 
 #[test]
 fn stream_decoder_accepts_every_split_and_multiple_coalesced_frames() {
-    let frames = [hello(), ack(), open(), Frame::OpenOk, Frame::Data(vec![8; 1024]), Frame::Fin];
+    let frames = [
+        hello(),
+        ack(),
+        open(),
+        Frame::OpenOk,
+        Frame::Data(vec![8; 1024]),
+        Frame::Fin,
+    ];
     let mut wire = Vec::new();
     for frame in &frames {
         wire.extend(encode(frame).unwrap());
@@ -132,10 +142,12 @@ fn stream_decoder_accepts_every_split_and_multiple_coalesced_frames() {
     let mut one_byte_at_a_time = Decoder::new();
     let mut frames_seen = Vec::new();
     for chunk in wire.chunks(1) {
-        one_byte_at_a_time.feed_each(chunk, |f| {
-            frames_seen.push(f);
-            Ok(())
-        }).unwrap();
+        one_byte_at_a_time
+            .feed_each(chunk, |f| {
+                frames_seen.push(f);
+                Ok(())
+            })
+            .unwrap();
         assert!(one_byte_at_a_time.pending_len() <= MAX_PAYLOAD + HEADER_LEN);
     }
     one_byte_at_a_time.finish().unwrap();
@@ -145,24 +157,52 @@ fn stream_decoder_accepts_every_split_and_multiple_coalesced_frames() {
 #[test]
 fn malformed_payloads_flags_version_and_types_are_rejected() {
     let bad: [(Vec<u8>, ProtocolError); 13] = [
-        (vec![0x01, 1, 0, 0, 0, 6, 0, 1, 0, 0, 0, 0], ProtocolError::InvalidFlags),
+        (
+            vec![0x01, 1, 0, 0, 0, 6, 0, 1, 0, 0, 0, 0],
+            ProtocolError::InvalidFlags,
+        ),
         (vec![0xff, 0, 0, 0, 0, 0], ProtocolError::UnknownType),
-        (vec![0x01, 0, 0, 0, 0, 6, 0, 2, 0, 0, 0, 0], ProtocolError::UnsupportedVersion),
-        (vec![0x02, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 1], ProtocolError::UnsupportedCapabilities),
-        (vec![0x01, 0, 0, 0, 0, 5, 0, 1, 0, 0, 0], ProtocolError::InvalidLength),
+        (
+            vec![0x01, 0, 0, 0, 0, 6, 0, 2, 0, 0, 0, 0],
+            ProtocolError::UnsupportedVersion,
+        ),
+        (
+            vec![0x02, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 1],
+            ProtocolError::UnsupportedCapabilities,
+        ),
+        (
+            vec![0x01, 0, 0, 0, 0, 5, 0, 1, 0, 0, 0],
+            ProtocolError::InvalidLength,
+        ),
         (vec![0x04, 0, 0, 0, 0, 1, 0], ProtocolError::InvalidLength),
         (vec![0x05, 0, 0, 0, 0, 2, 0, 0], ProtocolError::InvalidCode),
         (vec![0x11, 0, 0, 0, 0, 1, 0], ProtocolError::InvalidLength),
-        (vec![0x03, 0, 0, 0, 0, 5, 1, 0, 0, 0, 80], ProtocolError::InvalidAddress),
-        (vec![0x03, 0, 0, 0, 0, 6, 3, 0, 1, 0xff, 0, 80], ProtocolError::InvalidAddress),
-        (vec![0x03, 0, 0, 0, 0, 6, 3, 0, 1, b'a', 0, 0], ProtocolError::InvalidAddress),
+        (
+            vec![0x03, 0, 0, 0, 0, 5, 1, 0, 0, 0, 80],
+            ProtocolError::InvalidAddress,
+        ),
+        (
+            vec![0x03, 0, 0, 0, 0, 6, 3, 0, 1, 0xff, 0, 80],
+            ProtocolError::InvalidAddress,
+        ),
+        (
+            vec![0x03, 0, 0, 0, 0, 6, 3, 0, 1, b'a', 0, 0],
+            ProtocolError::InvalidAddress,
+        ),
         (vec![0x10, 0, 0, 0, 0, 2, 0], ProtocolError::Truncated),
         (vec![0x11, 0, 0, 0, 0, 0, 0], ProtocolError::TrailingBytes),
     ];
     for (wire, expected) in bad {
         assert_eq!(decode(&wire), Err(expected), "{wire:?}");
     }
-    for name in ["", "bad..example", "-bad.com", "bad-.com", "example/path", "💀.com"] {
+    for name in [
+        "",
+        "bad..example",
+        "-bad.com",
+        "bad-.com",
+        "example/path",
+        "💀.com",
+    ] {
         assert_eq!(
             encode(&Frame::OpenTcp {
                 address: Address::Dns(name.into()),
@@ -227,8 +267,12 @@ fn full_duplex_half_close_then_both_fin_and_drain() {
         client.apply(Direction::Send, &Frame::Fin),
         Err(ProtocolError::InvalidTransition)
     );
-    client.apply(Direction::Receive, &Frame::Data(vec![4])).unwrap();
-    server.apply(Direction::Send, &Frame::Data(vec![4])).unwrap();
+    client
+        .apply(Direction::Receive, &Frame::Data(vec![4]))
+        .unwrap();
+    server
+        .apply(Direction::Send, &Frame::Data(vec![4]))
+        .unwrap();
     server.apply(Direction::Send, &Frame::Fin).unwrap();
     client.apply(Direction::Receive, &Frame::Fin).unwrap();
     assert!(client.is_closed());
@@ -247,7 +291,12 @@ fn open_error_and_abort_are_terminal_and_never_open_tunnel() {
     client.apply(Direction::Send, &hello()).unwrap();
     client.apply(Direction::Receive, &ack()).unwrap();
     client.apply(Direction::Send, &open()).unwrap();
-    client.apply(Direction::Receive, &Frame::OpenError(ErrorCode::PolicyDenied)).unwrap();
+    client
+        .apply(
+            Direction::Receive,
+            &Frame::OpenError(ErrorCode::PolicyDenied),
+        )
+        .unwrap();
     assert!(!client.tunnel_open());
     assert!(client.is_closed());
     assert!(client.finish().is_ok());
@@ -256,8 +305,12 @@ fn open_error_and_abort_are_terminal_and_never_open_tunnel() {
         Err(ProtocolError::InvalidTransition)
     );
     let (mut client, mut server) = establish();
-    client.apply(Direction::Send, &Frame::Abort(ErrorCode::General)).unwrap();
-    server.apply(Direction::Receive, &Frame::Abort(ErrorCode::General)).unwrap();
+    client
+        .apply(Direction::Send, &Frame::Abort(ErrorCode::General))
+        .unwrap();
+    server
+        .apply(Direction::Receive, &Frame::Abort(ErrorCode::General))
+        .unwrap();
     assert!(client.is_closed() && server.is_closed());
     assert_eq!(
         client.apply(Direction::Send, &Frame::Abort(ErrorCode::General)),

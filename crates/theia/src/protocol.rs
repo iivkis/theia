@@ -64,9 +64,18 @@ pub enum Address {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    Hello { version: u16, capabilities: u32 },
-    HelloAck { version: u16, accepted_capabilities: u32 },
-    OpenTcp { address: Address, port: u16 },
+    Hello {
+        version: u16,
+        capabilities: u32,
+    },
+    HelloAck {
+        version: u16,
+        accepted_capabilities: u32,
+    },
+    OpenTcp {
+        address: Address,
+        port: u16,
+    },
     OpenOk,
     OpenError(ErrorCode),
     Data(Vec<u8>),
@@ -84,7 +93,9 @@ fn valid_dns(host: &str) -> bool {
                 && label.len() <= 63
                 && label.as_bytes()[0].is_ascii_alphanumeric()
                 && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
 }
 
@@ -259,8 +270,8 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
                     Address::V4(ip)
                 }
                 0x03 => {
-                    let host = std::str::from_utf8(raw)
-                        .map_err(|_| ProtocolError::InvalidAddress)?;
+                    let host =
+                        std::str::from_utf8(raw).map_err(|_| ProtocolError::InvalidAddress)?;
                     Address::Dns(host.to_owned())
                 }
                 0x04 if raw.len() == 16 => {
@@ -415,11 +426,7 @@ impl Session {
         self.phase == Phase::Closed
     }
 
-    pub fn apply(
-        &mut self,
-        direction: Direction,
-        frame: &Frame,
-    ) -> Result<(), ProtocolError> {
+    pub fn apply(&mut self, direction: Direction, frame: &Frame) -> Result<(), ProtocolError> {
         validate(frame)?;
         if self.is_closed() {
             return Err(ProtocolError::InvalidTransition);
