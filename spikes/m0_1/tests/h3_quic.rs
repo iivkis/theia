@@ -14,7 +14,8 @@ fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
     let cert = key.cert.der().clone();
     let private = PrivatePkcs8KeyDer::from(key.key_pair.serialize_der());
 
-    let mut server_tls = rustls::ServerConfig::builder()
+    let mut server_tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions().expect("TLS1.3 provider")
         .with_no_client_auth()
         .with_single_cert(vec![cert.clone()], private.into())
         .expect("valid test certificate");
@@ -30,7 +31,8 @@ fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert).expect("trust generated test certificate");
-    let mut client_tls = rustls::ClientConfig::builder()
+    let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions().expect("TLS1.3 provider")
         .with_root_certificates(roots)
         .with_no_client_auth();
     client_tls.alpn_protocols = vec![ALPN.into()];
