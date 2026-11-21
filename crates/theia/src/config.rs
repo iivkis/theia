@@ -172,11 +172,17 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
     )?;
     let config = if has_server {
         Config::Server(toml::from_str(source).map_err(|_| {
-            ConfigError::new("document", "invalid server schema, unknown field or field type")
+            ConfigError::new(
+                "document",
+                "invalid server schema, unknown field or field type",
+            )
         })?)
     } else {
         Config::Client(toml::from_str(source).map_err(|_| {
-            ConfigError::new("document", "invalid client schema, unknown field or field type")
+            ConfigError::new(
+                "document",
+                "invalid client schema, unknown field or field type",
+            )
         })?)
     };
     config.validate()?;
@@ -190,7 +196,11 @@ pub fn read_file(path: &Path) -> Result<Config, ConfigError> {
     file.take((MAX_BYTES + 1) as u64)
         .read_to_end(&mut buf)
         .map_err(|_| ConfigError::new("config", "cannot read configuration file"))?;
-    ensure(buf.len() <= MAX_BYTES, "document", "configuration exceeds 1 MiB")?;
+    ensure(
+        buf.len() <= MAX_BYTES,
+        "document",
+        "configuration exceeds 1 MiB",
+    )?;
     let text = std::str::from_utf8(&buf)
         .map_err(|_| ConfigError::new("document", "configuration is not UTF-8"))?;
     parse(text)
@@ -219,7 +229,8 @@ impl Config {
 fn valid_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 fn valid_dns(name: &str) -> bool {
     !name.is_empty()
@@ -230,7 +241,9 @@ fn valid_dns(name: &str) -> bool {
                 && label.len() <= 63
                 && label.as_bytes()[0].is_ascii_alphanumeric()
                 && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                && label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
         })
 }
 fn valid_file_ref(raw: &str) -> bool {
@@ -238,8 +251,10 @@ fn valid_file_ref(raw: &str) -> bool {
         return false;
     };
     let path = Path::new(path);
-    path.is_absolute()
-        && !path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+    (path.is_absolute() || path.to_string_lossy().starts_with('/'))
+        && !path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
         && !raw.contains(['\n', '\r', '\0'])
 }
 fn valid_secret_ref(raw: &str) -> bool {
@@ -281,27 +296,49 @@ fn validate_shared(schema: u32, m: &Management, ui: &Ui) -> Check {
     ensure(schema == 1, "schema_version", "only version 1 is supported")?;
     ensure(m.ipc == "auto", "management.ipc", "only auto is supported")?;
     ensure(
-        matches!(m.log_level.as_str(), "error" | "warn" | "info" | "debug" | "trace"),
+        matches!(
+            m.log_level.as_str(),
+            "error" | "warn" | "info" | "debug" | "trace"
+        ),
         "management.log_level",
         "unknown log level",
     )?;
-    ensure(matches!(ui.language.as_str(), "ru" | "en"), "ui.language", "unknown language")
+    ensure(
+        matches!(ui.language.as_str(), "ru" | "en"),
+        "ui.language",
+        "unknown language",
+    )
 }
 
 impl ServerDocument {
     fn validate(&self) -> Check {
         validate_shared(self.schema_version, &self.management, &self.ui)?;
-        ensure(!self.server.users.is_empty(), "server.users", "at least one user is required")?;
-        ensure(!self.server.inbounds.is_empty(), "server.inbounds", "at least one inbound is required")?;
+        ensure(
+            !self.server.users.is_empty(),
+            "server.users",
+            "at least one user is required",
+        )?;
+        ensure(
+            !self.server.inbounds.is_empty(),
+            "server.inbounds",
+            "at least one inbound is required",
+        )?;
         let mut user_ids = HashSet::new();
         let mut token_digests = HashSet::new();
         for (i, user) in self.server.users.iter().enumerate() {
             let field = format!("server.users[{i}]");
             ensure(valid_id(&user.id), format!("{field}.id"), "invalid user ID")?;
-            ensure(user_ids.insert(user.id.as_str()), format!("{field}.id"), "duplicate user ID")?;
+            ensure(
+                user_ids.insert(user.id.as_str()),
+                format!("{field}.id"),
+                "duplicate user ID",
+            )?;
             ensure(
                 user.token_sha256.len() == 64
-                    && user.token_sha256.bytes().all(|x| x.is_ascii_digit() || (b'a'..=b'f').contains(&x)),
+                    && user
+                        .token_sha256
+                        .bytes()
+                        .all(|x| x.is_ascii_digit() || (b'a'..=b'f').contains(&x)),
                 format!("{field}.token_sha256"),
                 "expected 64 lowercase hex digits",
             )?;
@@ -316,33 +353,85 @@ impl ServerDocument {
         let mut tcp_listeners = Vec::new();
         for (i, inbound) in self.server.inbounds.iter().enumerate() {
             let field = format!("server.inbounds[{i}]");
-            ensure(valid_id(&inbound.id), format!("{field}.id"), "invalid inbound ID")?;
-            ensure(inbound_ids.insert(inbound.id.as_str()), format!("{field}.id"), "duplicate inbound ID")?;
-            ensure(!inbound.allowed_user_ids.is_empty(), format!("{field}.allowed_user_ids"), "explicit grant list must not be empty")?;
+            ensure(
+                valid_id(&inbound.id),
+                format!("{field}.id"),
+                "invalid inbound ID",
+            )?;
+            ensure(
+                inbound_ids.insert(inbound.id.as_str()),
+                format!("{field}.id"),
+                "duplicate inbound ID",
+            )?;
+            ensure(
+                !inbound.allowed_user_ids.is_empty(),
+                format!("{field}.allowed_user_ids"),
+                "explicit grant list must not be empty",
+            )?;
             let mut grants = HashSet::new();
             for user_id in &inbound.allowed_user_ids {
-                ensure(user_ids.contains(user_id.as_str()), format!("{field}.allowed_user_ids"), "unknown user grant")?;
-                ensure(grants.insert(user_id), format!("{field}.allowed_user_ids"), "duplicate user grant")?;
+                ensure(
+                    user_ids.contains(user_id.as_str()),
+                    format!("{field}.allowed_user_ids"),
+                    "unknown user grant",
+                )?;
+                ensure(
+                    grants.insert(user_id),
+                    format!("{field}.allowed_user_ids"),
+                    "duplicate user grant",
+                )?;
             }
-            ensure(valid_dns(&inbound.server_name), format!("{field}.server_name"), "invalid DNS name")?;
-            ensure(valid_file_ref(&inbound.tls_cert), format!("{field}.tls_cert"), "expected absolute file: reference")?;
-            ensure(valid_file_ref(&inbound.tls_key), format!("{field}.tls_key"), "expected absolute file: reference")?;
+            ensure(
+                valid_dns(&inbound.server_name),
+                format!("{field}.server_name"),
+                "invalid DNS name",
+            )?;
+            ensure(
+                valid_file_ref(&inbound.tls_cert),
+                format!("{field}.tls_cert"),
+                "expected absolute file: reference",
+            )?;
+            ensure(
+                valid_file_ref(&inbound.tls_key),
+                format!("{field}.tls_key"),
+                "expected absolute file: reference",
+            )?;
             let udp = listen(&inbound.quic_listen, &format!("{field}.quic_listen"))?;
             let tcp = listen(&inbound.h2_listen, &format!("{field}.h2_listen"))?;
-            ensure(!udp_listeners.iter().any(|x| overlaps(*x, udp)), format!("{field}.quic_listen"), "UDP listener overlaps another inbound")?;
-            ensure(!tcp_listeners.iter().any(|x| overlaps(*x, tcp)), format!("{field}.h2_listen"), "TCP listener overlaps another inbound")?;
+            ensure(
+                !udp_listeners.iter().any(|x| overlaps(*x, udp)),
+                format!("{field}.quic_listen"),
+                "UDP listener overlaps another inbound",
+            )?;
+            ensure(
+                !tcp_listeners.iter().any(|x| overlaps(*x, tcp)),
+                format!("{field}.h2_listen"),
+                "TCP listener overlaps another inbound",
+            )?;
             udp_listeners.push(udp);
             tcp_listeners.push(tcp);
         }
         let p = &self.server.policy;
-        ensure(p.max_connections_per_user > 0, "server.policy.max_connections_per_user", "must be positive")?;
-        ensure(p.max_connections_total > 0, "server.policy.max_connections_total", "must be positive")?;
+        ensure(
+            p.max_connections_per_user > 0,
+            "server.policy.max_connections_per_user",
+            "must be positive",
+        )?;
+        ensure(
+            p.max_connections_total > 0,
+            "server.policy.max_connections_total",
+            "must be positive",
+        )?;
         ensure(
             p.max_connections_per_user <= p.max_connections_total,
             "server.policy.max_connections_per_user",
             "must not exceed total connection cap",
         )?;
-        ensure(p.connect_timeout_ms > 0, "server.policy.connect_timeout_ms", "must be positive")
+        ensure(
+            p.connect_timeout_ms > 0,
+            "server.policy.connect_timeout_ms",
+            "must be positive",
+        )
     }
 }
 fn valid_remote(raw: &str) -> bool {
@@ -357,20 +446,60 @@ fn valid_remote(raw: &str) -> bool {
 impl ClientDocument {
     fn validate(&self) -> Check {
         validate_shared(self.schema_version, &self.management, &self.ui)?;
-        ensure(!self.client.profiles.is_empty(), "client.profiles", "at least one profile is required")?;
+        ensure(
+            !self.client.profiles.is_empty(),
+            "client.profiles",
+            "at least one profile is required",
+        )?;
         let mut ids = HashSet::new();
         for (i, profile) in self.client.profiles.iter().enumerate() {
             let field = format!("client.profiles[{i}]");
-            ensure(valid_id(&profile.id), format!("{field}.id"), "invalid profile ID")?;
-            ensure(ids.insert(profile.id.as_str()), format!("{field}.id"), "duplicate profile ID")?;
-            ensure(valid_remote(&profile.server), format!("{field}.server"), "invalid host:port or [IPv6]:port")?;
-            ensure(valid_dns(&profile.server_name), format!("{field}.server_name"), "invalid TLS server name")?;
-            ensure(valid_secret_ref(&profile.auth_token), format!("{field}.auth_token"), "expected env:NAME or absolute file: reference")?;
-            ensure(profile.tls_profile == "default", format!("{field}.tls_profile"), "unsupported TLS profile (fail closed)")?;
-            ensure((500..=15_000).contains(&profile.quic_connect_timeout_ms), format!("{field}.quic_connect_timeout_ms"), "must be within 500..=15000")?;
-            ensure(profile.quic_negative_cache_ttl_s <= 86_400, format!("{field}.quic_negative_cache_ttl_s"), "must be within 0..=86400")?;
+            ensure(
+                valid_id(&profile.id),
+                format!("{field}.id"),
+                "invalid profile ID",
+            )?;
+            ensure(
+                ids.insert(profile.id.as_str()),
+                format!("{field}.id"),
+                "duplicate profile ID",
+            )?;
+            ensure(
+                valid_remote(&profile.server),
+                format!("{field}.server"),
+                "invalid host:port or [IPv6]:port",
+            )?;
+            ensure(
+                valid_dns(&profile.server_name),
+                format!("{field}.server_name"),
+                "invalid TLS server name",
+            )?;
+            ensure(
+                valid_secret_ref(&profile.auth_token),
+                format!("{field}.auth_token"),
+                "expected env:NAME or absolute file: reference",
+            )?;
+            ensure(
+                profile.tls_profile == "default",
+                format!("{field}.tls_profile"),
+                "unsupported TLS profile (fail closed)",
+            )?;
+            ensure(
+                (500..=15_000).contains(&profile.quic_connect_timeout_ms),
+                format!("{field}.quic_connect_timeout_ms"),
+                "must be within 500..=15000",
+            )?;
+            ensure(
+                profile.quic_negative_cache_ttl_s <= 86_400,
+                format!("{field}.quic_negative_cache_ttl_s"),
+                "must be within 0..=86400",
+            )?;
         }
-        ensure(ids.contains(self.client.active_profile.as_str()), "client.active_profile", "unknown profile")?;
+        ensure(
+            ids.contains(self.client.active_profile.as_str()),
+            "client.active_profile",
+            "unknown profile",
+        )?;
         let proxy = &self.client.proxy;
         let http = listen(&proxy.http_listen, "client.proxy.http_listen")?;
         let socks = listen(&proxy.socks5_listen, "client.proxy.socks5_listen")?;
@@ -379,12 +508,19 @@ impl ClientDocument {
             (socks, "client.proxy.socks5_listen"),
         ] {
             ensure(
-                matches!(address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST)),
+                matches!(
+                    address.ip(),
+                    IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST)
+                ),
                 field,
                 "listener must bind to 127.0.0.1 or [::1]",
             )?;
         }
-        ensure(http != socks, "client.proxy", "HTTP and SOCKS5 listener addresses must differ")
+        ensure(
+            http != socks,
+            "client.proxy",
+            "HTTP and SOCKS5 listener addresses must differ",
+        )
     }
 }
 
@@ -393,9 +529,18 @@ impl ClientDocument {
 /// Callers must supply a trusted destination directory (no untrusted symlinks).
 pub fn atomic_write(path: &Path, config: &Config) -> Result<(), ConfigError> {
     let data = config.to_toml()?;
-    ensure(data.len() <= MAX_BYTES, "document", "configuration exceeds 1 MiB")?;
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = path.file_name().ok_or_else(|| ConfigError::new("config", "destination file name is missing"))?;
+    ensure(
+        data.len() <= MAX_BYTES,
+        "document",
+        "configuration exceeds 1 MiB",
+    )?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| ConfigError::new("config", "destination file name is missing"))?;
     let mut pending = None;
     for _ in 0..16 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -416,10 +561,16 @@ pub fn atomic_write(path: &Path, config: &Config) -> Result<(), ConfigError> {
                 break;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(ConfigError::new("config", "cannot create temporary config file")),
+            Err(_) => {
+                return Err(ConfigError::new(
+                    "config",
+                    "cannot create temporary config file",
+                ))
+            }
         }
     }
-    let (temp, mut file) = pending.ok_or_else(|| ConfigError::new("config", "cannot allocate temporary file"))?;
+    let (temp, mut file) =
+        pending.ok_or_else(|| ConfigError::new("config", "cannot allocate temporary file"))?;
     let result = (|| {
         file.write_all(data.as_bytes())
             .map_err(|_| ConfigError::new("config", "cannot write temporary file"))?;
@@ -431,7 +582,9 @@ pub fn atomic_write(path: &Path, config: &Config) -> Result<(), ConfigError> {
         #[cfg(unix)]
         {
             if let Ok(directory) = fs::File::open(parent) {
-                directory.sync_all().map_err(|_| ConfigError::new("config", "cannot sync directory"))?;
+                directory
+                    .sync_all()
+                    .map_err(|_| ConfigError::new("config", "cannot sync directory"))?;
             }
         }
         Ok(())
@@ -452,7 +605,8 @@ mod tests {
     use super::*;
 
     fn server() -> String {
-        include_str!("../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))
+        include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))
     }
     fn client() -> String {
         include_str!("../../../examples/client.toml").to_owned()
@@ -469,39 +623,99 @@ mod tests {
     fn server_denies_invalid_ids_digests_and_grants() {
         let original = server();
         for (from, to, expected) in [
-            ("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = []", "allowed_user_ids"),
-            ("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"missing\"]", "allowed_user_ids"),
-            ("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"device-a\", \"device-a\"]", "allowed_user_ids"),
+            (
+                "allowed_user_ids = [\"device-a\"]",
+                "allowed_user_ids = []",
+                "allowed_user_ids",
+            ),
+            (
+                "allowed_user_ids = [\"device-a\"]",
+                "allowed_user_ids = [\"missing\"]",
+                "allowed_user_ids",
+            ),
+            (
+                "allowed_user_ids = [\"device-a\"]",
+                "allowed_user_ids = [\"device-a\", \"device-a\"]",
+                "allowed_user_ids",
+            ),
             ("id = \"public\"", "id = \"bad id\"", "id"),
-            ("token_sha256 = \"", "token_sha256 = \"UPPER", "token_sha256"),
-            ("max_connections_total = 1024", "max_connections_total = 0", "max_connections_total"),
+            (
+                "token_sha256 = \"",
+                "token_sha256 = \"UPPER",
+                "token_sha256",
+            ),
+            (
+                "max_connections_total = 1024",
+                "max_connections_total = 0",
+                "max_connections_total",
+            ),
         ] {
             let changed = original.replacen(from, to, 1);
-            assert!(parse(&changed).unwrap_err().field.contains(expected), "{expected}");
+            assert!(
+                parse(&changed).unwrap_err().field.contains(expected),
+                "{expected}"
+            );
         }
     }
     #[test]
     fn rejects_unsafe_client_settings() {
         let original = client();
         for (from, to, expected) in [
-            ("system_proxy = \"off\"", "system_proxy = \"on\"", "document"),
-            ("http_listen = \"127.0.0.1:7890\"", "http_listen = \"0.0.0.0:7890\"", "http_listen"),
-            ("socks5_listen = \"127.0.0.1:7891\"", "socks5_listen = \"127.0.0.1:7890\"", "client.proxy"),
-            ("tls_profile = \"default\"", "tls_profile = \"chrome133\"", "tls_profile"),
-            ("auth_token = \"env:THEIA_AUTH_TOKEN\"", "auth_token = \"literal-secret\"", "auth_token"),
-            ("quic_connect_timeout_ms = 1600", "quic_connect_timeout_ms = 499", "quic_connect_timeout_ms"),
-            ("active_profile = \"home\"", "active_profile = \"missing\"", "active_profile"),
+            (
+                "system_proxy = \"off\"",
+                "system_proxy = \"on\"",
+                "document",
+            ),
+            (
+                "http_listen = \"127.0.0.1:7890\"",
+                "http_listen = \"0.0.0.0:7890\"",
+                "http_listen",
+            ),
+            (
+                "socks5_listen = \"127.0.0.1:7891\"",
+                "socks5_listen = \"127.0.0.1:7890\"",
+                "client.proxy",
+            ),
+            (
+                "tls_profile = \"default\"",
+                "tls_profile = \"chrome133\"",
+                "tls_profile",
+            ),
+            (
+                "auth_token = \"env:THEIA_AUTH_TOKEN\"",
+                "auth_token = \"literal-secret\"",
+                "auth_token",
+            ),
+            (
+                "quic_connect_timeout_ms = 1600",
+                "quic_connect_timeout_ms = 499",
+                "quic_connect_timeout_ms",
+            ),
+            (
+                "active_profile = \"home\"",
+                "active_profile = \"missing\"",
+                "active_profile",
+            ),
         ] {
             let changed = original.replacen(from, to, 1);
-            assert!(parse(&changed).unwrap_err().field.contains(expected), "{expected}");
+            assert!(
+                parse(&changed).unwrap_err().field.contains(expected),
+                "{expected}"
+            );
         }
     }
     #[test]
     fn unknown_keys_versions_and_malformed_input_fail() {
         for src in [
             client().replace("schema_version = 1", "schema_version = 2"),
-            client().replace("system_proxy = \"off\"", "system_proxy = \"off\"\nunsafe = true"),
-            client().replace("schema_version = 1", "schema_version = 1\nschema_version = 1"),
+            client().replace(
+                "system_proxy = \"off\"",
+                "system_proxy = \"off\"\nunsafe = true",
+            ),
+            client().replace(
+                "schema_version = 1",
+                "schema_version = 1\nschema_version = 1",
+            ),
             client().replace("schema_version = 1", "schema_version = \"secret\""),
         ] {
             assert!(parse(&src).is_err());
@@ -521,10 +735,19 @@ server_name = "edge.example.org"
 tls_cert = "file:/etc/theia/tls/fullchain.pem"
 tls_key = "file:/etc/theia/tls/privkey.pem"
 "#;
-        let source = original.replace("[[server.users]]", &format!("{secondary}\n[[server.users]]"));
+        let source = original.replace(
+            "[[server.users]]",
+            &format!("{secondary}\n[[server.users]]"),
+        );
         assert!(parse(&source).unwrap_err().field.contains("quic_listen"));
-        let without_udp_conflict = source.replace("quic_listen = \"127.0.0.1:443\"", "quic_listen = \"127.0.0.1:444\"");
-        assert!(parse(&without_udp_conflict).unwrap_err().field.contains("h2_listen"));
+        let without_udp_conflict = source.replace(
+            "quic_listen = \"127.0.0.1:443\"",
+            "quic_listen = \"127.0.0.1:444\"",
+        );
+        assert!(parse(&without_udp_conflict)
+            .unwrap_err()
+            .field
+            .contains("h2_listen"));
     }
     #[test]
     fn atomic_store_roundtrip_and_invalid_update_preserves_old_file() {
@@ -546,7 +769,10 @@ tls_key = "file:/etc/theia/tls/privkey.pem"
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         fs::remove_file(path).unwrap();
     }

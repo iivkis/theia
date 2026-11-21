@@ -44,9 +44,17 @@ fn validates_client_toml_and_rejects_unknown_fields() {
     std::fs::write(&path, valid).unwrap();
     let path_str = path.to_str().unwrap();
     let output = invoke(&["config", "validate", "--config", path_str]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("structurally valid"));
-    std::fs::write(&path, valid.replace("system_proxy = \"off\"", "system_proxy = \"on\"")).unwrap();
+    std::fs::write(
+        &path,
+        valid.replace("system_proxy = \"off\"", "system_proxy = \"on\""),
+    )
+    .unwrap();
     let output = invoke(&["config", "validate", "--config", path_str]);
     assert_eq!(output.status.code(), Some(2));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("THEIA_AUTH_TOKEN"));
