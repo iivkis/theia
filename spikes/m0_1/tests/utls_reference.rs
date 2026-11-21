@@ -15,8 +15,10 @@ fn rustls_default_h2() -> theia_m0_1_feasibility::client_hello::ClientHelloSumma
     .with_no_client_auth();
     tls.alpn_protocols = vec![b"h2".to_vec()];
     let mut client = rustls::ClientConnection::new(
-        Arc::new(tls), ServerName::try_from("localhost".to_owned()).unwrap(),
-    ).expect("TLS client");
+        Arc::new(tls),
+        ServerName::try_from("localhost".to_owned()).unwrap(),
+    )
+    .expect("TLS client");
     let mut serialized = Vec::new();
     while client.wants_write() {
         assert!(client.write_tls(&mut serialized).unwrap() > 0);
@@ -39,12 +41,17 @@ fn go_utls_chrome133_is_a_reference_but_not_rustls_or_quic() {
     assert!(go.sni_present, "Go uTLS reference must send SNI");
     assert_eq!(go.alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     assert!(go.supported_versions.contains(&0x0304));
-    assert!(go.has_grease_extension(), "uTLS Chrome133 template uses GREASE");
+    assert!(
+        go.has_grease_extension(),
+        "uTLS Chrome133 template uses GREASE"
+    );
     assert!(go.has_alps(), "uTLS Chrome133 template uses ALPS 17613");
     assert!(go.cipher_suites.iter().any(|&v| is_grease(v)));
     assert!(go.supported_groups.iter().any(|&v| is_grease(v)));
-    assert!(!go.quic_transport_parameters_present,
-            "TCP uTLS hello is not a QUIC Initial reference");
+    assert!(
+        !go.quic_transport_parameters_present,
+        "TCP uTLS hello is not a QUIC Initial reference"
+    );
 
     // Show exact class of mismatches without exposing SNI/random/key material.
     assert_eq!(rust.alpn, vec![b"h2".to_vec()]);

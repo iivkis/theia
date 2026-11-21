@@ -67,29 +67,28 @@ jobs:
         run: |
           set -euo pipefail
           pushd spikes/m0_1/utls_reference
-          go mod tidy
+          go mod verify
           go test ./...
-          python3 - <<'PY'
-          import base64
-          from pathlib import Path
-          for filename in ("go.mod", "go.sum"):
-              value = base64.b64encode(Path(filename).read_bytes()).decode("ascii")
-              print(f"THEIA_GOLOCK_{filename.replace('.', '_').upper()}_START:{value}:THEIA_GOLOCK_{filename.replace('.', '_').upper()}_END")
-          PY
           go run . "$RUNNER_TEMP/theia-utls-h2-hello.bin"
           popd
           THEIA_UTLS_HELLO_PATH="$RUNNER_TEMP/theia-utls-h2-hello.bin" cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_reference -- --ignored --nocapture
           rm -f "$RUNNER_TEMP/theia-utls-h2-hello.bin"
-      - name: Bootstrap rustfmt of uTLS comparison test
+      - name: Rustfmt check for isolated M0.1 spike
+        run: cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check
+      - name: Bootstrap canonical gofmt files for review
         shell: bash
         run: |
-          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
+          pushd spikes/m0_1/utls_reference
+          gofmt -w main.go main_test.go
           python3 - <<'PY'
           from pathlib import Path
           from base64 import b64encode
-          b64 = b64encode(Path("spikes/m0_1/tests/utls_reference.rs").read_bytes()).decode("ascii")
-          print("THEIA_RUST_UTLS_FMT_START:" + b64 + ":THEIA_RUST_UTLS_FMT_END")
+          for name in ("main.go", "main_test.go"):
+              b64 = b64encode(Path(name).read_bytes()).decode("ascii")
+              token = name.replace(".", "_").upper()
+              print(f"THEIA_GOFMT_{token}_START:{b64}:THEIA_GOFMT_{token}_END")
           PY
+          popd
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
       - name: Validate pinned dependency tree
