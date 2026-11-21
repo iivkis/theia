@@ -258,3 +258,129 @@ async fn tls13_h2_rejects_untrusted_ca() {
 async fn tls13_h2_rejects_alpn_mismatch() {
     handshake_must_fail(true, H2_ALPN, b"http/1.1", "localhost").await;
 }
+
+
+/// More than the default HTTP/2 stream window in both directions, with explicit
+/// backpressure and half-close. Not a throughput benchmark or allocator profiler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls13_h2_megabyte_flow_control_and_half_close() {
+    const BLOCK: usize = 4096;
+    const GATE_BYTES: usize = 15 * BLOCK; // 61,440 < default 65,535 stream window
+    const REQUEST_BYTES: usize = 1024 * 1024;
+    const RESPONSE_BYTES: usize = 256 * 1024;
+
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let (acceptor, connector) = tls_configs(true, H2_ALPN, H2_ALPN);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TCP");
+        let addr = listener.local_addr().unwrap();
+        let (held_tx, held_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (server_done_tx, server_done_rx) = oneshot::channel::<()>();
+        let (client_done_tx, client_done_rx) = oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("TCP accept");
+            let tls = acceptor.accept(socket).await.expect("TLS server");
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(H2_ALPN));
+            let mut connection = h2::server::handshake(tls).await.expect("h2 server");
+            let (request, mut responder) =
+                connection.accept().await.expect("accept HTTP2").expect("POST stream");
+
+            let handler = tokio::spawn(async move {
+                let mut request_body = request.into_body();
+                let mut received = 0;
+                // Intentionally withhold stream WINDOW_UPDATE while reading 60 KiB.
+                while received < GATE_BYTES {
+                    let data = request_body.data().await.expect("DATA").expect("chunk");
+                    assert!(data.iter().all(|&b| b == 0xa5));
+                    received += data.len();
+                }
+                assert_eq!(received, GATE_BYTES, "test depends on 4 KiB DATA frames");
+                held_tx.send(()).expect("client waiting for held window");
+                release_rx.await.expect("client observed sender capacity exhausted");
+                request_body.flow_control().release_capacity(received).unwrap();
+
+                while let Some(data) = request_body.data().await {
+                    let data = data.expect("valid DATA");
+                    assert!(data.iter().all(|&b| b == 0xa5));
+                    received += data.len();
+                    request_body.flow_control().release_capacity(data.len()).unwrap();
+                }
+                assert_eq!(received, REQUEST_BYTES, "all request bytes delivered");
+                // POST request body is closed; response stream remains writable.
+                let mut response_body = responder.send_response(
+                    http::Response::builder().status(200).body(()).unwrap(), false,
+                ).expect("response after request FIN");
+                let data = Bytes::from(vec![0x7c; BLOCK]);
+                for i in 0..(RESPONSE_BYTES / BLOCK) {
+                    bounded_send(
+                        &mut response_body,
+                        data.clone(),
+                        i == RESPONSE_BYTES / BLOCK - 1,
+                    ).await;
+                }
+                server_done_tx.send(()).expect("client still waiting");
+            });
+
+            // Keep driving h2 transport while handler awaits request/response body.
+            tokio::select! {
+                _ = async { while connection.accept().await.is_some() {} } => {},
+                _ = client_done_rx => {},
+            }
+            handler.await.expect("stream handler");
+        });
+
+        let tcp = TcpStream::connect(addr).await.expect("TCP connect");
+        let tls = connector.connect(
+            ServerName::try_from("localhost".to_owned()).unwrap(),
+            tcp,
+        ).await.expect("verified TLS client");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(H2_ALPN));
+        let (mut sender, driver) = h2::client::handshake(tls).await.expect("h2 client");
+        let driver_task = tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost/v1/session")
+            .body(()).unwrap();
+        let (response_future, mut outgoing) =
+            sender.send_request(request, false).expect("send POST");
+        let block = Bytes::from(vec![0xa5; BLOCK]);
+
+        // Fill most of the advertised 64 KiB stream window without remote
+        // release_capacity. The 16th complete 4 KiB block cannot yet be sent.
+        for _ in 0..(GATE_BYTES / BLOCK) {
+            bounded_send(&mut outgoing, block.clone(), false).await;
+        }
+        held_rx.await.expect("server withheld window");
+        assert!(
+            outgoing.capacity() < BLOCK,
+            "a full 4 KiB sender chunk must not fit before WINDOW_UPDATE"
+        );
+        release_tx.send(()).expect("server waiting for window release");
+        for i in (GATE_BYTES / BLOCK)..(REQUEST_BYTES / BLOCK) {
+            bounded_send(
+                &mut outgoing,
+                block.clone(),
+                i == REQUEST_BYTES / BLOCK - 1,
+            ).await;
+        }
+
+        let response = response_future.await.expect("response after request FIN");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let mut body = response.into_body();
+        let mut received = 0;
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("response DATA");
+            assert!(chunk.iter().all(|&b| b == 0x7c));
+            received += chunk.len();
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+        }
+        assert_eq!(received, RESPONSE_BYTES, "response survives request half-close");
+        server_done_rx.await.expect("server finished response");
+        client_done_tx.send(()).expect("server still polling");
+        server_task.await.expect("server task");
+        driver_task.abort();
+    }).await.expect("h2 megabyte/backpressure/half-close timed out");
+}

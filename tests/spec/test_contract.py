@@ -140,6 +140,13 @@ class SpecContractTests(unittest.TestCase):
         self.assertTrue((spike / "Cargo.lock").is_file())
         h2_tls = (spike / "tests" / "h2_tls.rs")
         self.assertTrue(h2_tls.is_file())
+        loss_test = spike / "tests" / "quic_bbr_loss.rs"
+        self.assertTrue(loss_test.is_file())
+        loss_code = loss_test.read_text(encoding="utf-8")
+        for required in ("DeterministicLoss", "active_bbr_recovers_byte_exactly_from_synthetic_udp_loss",
+                         "connection.stats().path", "congestion_state", "dropped_datagrams", "lost_packets", "PAYLOAD_LEN"):
+            self.assertIn(required, loss_code)
+        self.assertIn("tls13_h2_megabyte_flow_control_and_half_close", h2_tls.read_text(encoding="utf-8"))
         for required in ("tls13_h2_full_duplex_response_before_request_eof",
                          "tls13_h2_rejects_wrong_hostname",
                          "tls13_h2_rejects_untrusted_ca",
