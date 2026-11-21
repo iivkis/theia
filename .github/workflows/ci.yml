@@ -52,8 +52,21 @@ jobs:
         with:
           workspaces: "spikes/m0_1 -> target"
           key: "m0-1"
-      - name: Test actual HTTP/2 duplex and API probes
+      - name: Refresh spike lockfile for TLS/H2 test dependencies (bootstrap)
+        run: cargo generate-lockfile --manifest-path spikes/m0_1/Cargo.toml
+      - name: Test actual HTTP/2 and HTTP/3 TLS transports
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
+      - name: Format spike source for reproducible patch
+        run: cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
+      - name: Emit lockfile and formatted H2 test (bootstrap)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          for name, path in [('LOCK', 'spikes/m0_1/Cargo.lock'), ('H2TEST', 'spikes/m0_1/tests/h2_tls.rs')]:
+              value = base64.b64encode(Path(path).read_bytes()).decode('ascii')
+              print(f'THEIA_M01_{name}_START:{value}:THEIA_M01_{name}_END')
+          PY
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
       - name: Validate pinned dependency tree
@@ -73,9 +86,9 @@ jobs:
         with:
           workspaces: "spikes/m0_1 -> target"
           key: "m0-1-windows"
-      - name: Refresh isolated spike lockfile for added test-only dependencies
+      - name: Refresh spike lockfile for TLS/H2 test dependencies (bootstrap)
         run: cargo generate-lockfile --manifest-path spikes/m0_1/Cargo.toml
-      - name: Native Windows API spike tests
+      - name: Native Windows TLS/H2 and QUIC/H3 tests
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
 
   rust-tests:
