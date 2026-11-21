@@ -1,6 +1,6 @@
 # SmartTheia v1: wire и transport контракт
 
-**Версия:** 1 (проектный контракт, без действующей реализации). **Область:** прикладной протокол проксирования поверх аутентифицированных TLS/QUIC HTTP-streams. Не собственный аналог TLS или QUIC.
+**Версия:** 1 (реализованы чистый frame codec и stream FSM в `crates/theia/src/protocol.rs`; HTTP/TLS транспорт, auth, policy и dial ещё не реализованы). **Область:** прикладной протокол проксирования поверх аутентифицированных TLS/QUIC HTTP-streams. Не собственный аналог TLS или QUIC.
 
 ## 1. Transport embedding
 
@@ -24,7 +24,7 @@
 ```
 
 - `flags` обязано быть `0` в v1, иначе `PROTOCOL_ERROR`; reserved future extension.
-- `payload_len` максимально **65 536** bytes, до выделения памяти парсер проверяет размер; decode incremental across arbitrary chunks.
+- `payload_len` максимально **65 536** bytes, до выделения памяти парсер проверяет размер; decode incremental across arbitrary chunks. Rust `Decoder::feed_each` удерживает не более одного неполного кадра (65 542 байта) и передаёт завершённые кадры callback без очереди. Упрощённый `feed()` возвращает коллекцию всех кадров из переданного чанка, поэтому вызывающий обязан ограничить размер входного чанка.
 - Многобайтовые числа — big-endian, строки — UTF-8, размерность payload задаётся ниже.
 - Никакой компрессии или произвольного TLV в v1.
 - Неизвестный type/version → закрыть конкретный stream с `UNSUPPORTED_VERSION` или `PROTOCOL_ERROR`; никогда не panic.
@@ -41,7 +41,7 @@
 | `0x11` FIN | в обе стороны после OPEN_OK | empty, означает half-close отправки |
 | `0x12` ABORT | в обе стороны | `code: u16`, поток завершается |
 
-Адресные типы как в SOCKS5: `0x01` IPv4 (4 байта), `0x03` ASCII IDNA DNS имя (1..253 байт; без схемы/пути), `0x04` IPv6 (16 байт). `addr_len` обязательно равен длине адреса, `port` в диапазоне 1..65535. Пустой DATA допустим, но рекомендуется не отправлять. `capabilities` v1 первоначально = 0; неизвестные биты игнорировать или корректно отклонять при явной обязательности в будущей версии; **UDP не объявлять до реализации**.
+Адресные типы как в SOCKS5: `0x01` IPv4 (4 байта), `0x03` ASCII IDNA DNS имя (1..253 байт; без схемы/пути), `0x04` IPv6 (16 байт). `addr_len` обязательно равен длине адреса, `port` в диапазоне 1..65535. Пустой DATA допустим, но рекомендуется не отправлять. `capabilities` и `accepted_capabilities` v1 строго равны 0; текущий Rust codec **отклоняет любые ненулевые биты** с `UnsupportedCapabilities`, чтобы не объявить несуществующую UDP/transport capability. Будущие версии потребуют явно задокументированного расширения без silent downgrade.
 
 ## 3. State machine
 
@@ -56,7 +56,7 @@ server:  validate HTTP/auth → HELLO → HELLO_ACK → OPEN_TCP
 
 - Перемещение в DATA до OPEN_OK, повторный HELLO/OPEN, DATA после FIN, недопустимые payload lengths вызывают `PROTOCOL_ERROR`.
 - FIN — half-close направления; после обоих FIN и drain завершать HTTP-stream. ABORT — немедленный stop, все задачи отменены.
-- EOF до согласования → `TRUNCATED`, EOF после корректного закрытия → нормальное завершение. Остаток неполного frame в EOF всегда ошибка.
+- EOF до согласования → `TRUNCATED`, EOF после корректного закрытия → нормальное завершение. Остаток неполного frame в EOF всегда ошибка. M1.3 `Decoder::finish()` проверяет отсутствие частичного кадра, `Session::finish()` требует OPEN_ERROR/ABORT либо FIN в обоих направлениях. Обвязка transport обязана вызвать **оба** метода, прежде чем считать соединение штатно завершённым.
 - Ошибки destination dial/ACL отражать `OPEN_ERROR` без раскрытия внутреннего адреса/stack trace; timeout ограничен.
 - Не вводить `stream_id` и сложную очередность при v1: один HTTP-stream равен одному upstream TCP-соединению.
 - **Proxy success gate:** локальный HTTP CONNECT получает `200 Connection Established`, SOCKS5 получает `REP=0x00` **только** после `OPEN_OK`. `OPEN_ERROR` конвертируется в HTTP 403/502/504 или подходящий SOCKS5 REP; локальное соединение не обозначается как работающее до успешного dial. Отказы TLS/auth/HELLO/OPEN не должны подтверждать локальному приложению соединение.
@@ -110,6 +110,6 @@ UDP_ASSOCIATE/UDP relay позже, через отдельное докумен
 
 ## 8. Контрактные тесты
 
-Golden byte vectors для всех type/payload (включая HELLO payload **ровно 6 байт**), endian, границ 0/65536/65537, UTF-8+IDNA, неизвестных type/flags, фрагментации HTTP body, двойного FIN, EOF, 0-RTT denial; fuzz decode no-panic. Проверять HTTP/2+HTTP/3 **full-duplex** без ожидания EOF запроса; HTTP 200 до `OPEN_OK`, но local HTTP CONNECT 200 / SOCKS5 success **строго после** OPEN_OK; cross-inbound token rejection и server-side DNS without local resolver calls. E2E: TCP echo through H3, H2 при отключённом UDP, отсутствие fallback при bad cert/token, DNS policy, slow readers, half-close, cancellation.
+M1.3: тесты `crates/theia/tests/protocol.rs` выполняются в Linux/Windows CI, включая одиночный байт и все границы разрезания, контроль отказов до OPEN_OK, half-close и детерминированный случайный bounded parser workload. Это **не** полноценный coverage-guided fuzzing: отдельные fuzz targets остаются к M5. Golden byte vectors для всех type/payload (включая HELLO payload **ровно 6 байт**), endian, границ 0/65536/65537, UTF-8+IDNA, неизвестных type/flags, фрагментации HTTP body, двойного FIN, EOF, 0-RTT denial; fuzz decode no-panic. Проверять HTTP/2+HTTP/3 **full-duplex** без ожидания EOF запроса; HTTP 200 до `OPEN_OK`, но local HTTP CONNECT 200 / SOCKS5 success **строго после** OPEN_OK; cross-inbound token rejection и server-side DNS without local resolver calls. E2E: TCP echo through H3, H2 при отключённом UDP, отсутствие fallback при bad cert/token, DNS policy, slow readers, half-close, cancellation.
 
 Нормативные транспортные стандарты: RFC 9000/9001 (QUIC), RFC 9114 (HTTP/3), RFC 9113 (HTTP/2), RFC 8446 (TLS 1.3).

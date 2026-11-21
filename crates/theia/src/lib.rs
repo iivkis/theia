@@ -3,6 +3,7 @@
 //! Parsing must never trigger networking, file I/O, or OS proxy modifications.
 
 pub mod config;
+pub mod protocol;
 
 use std::fmt;
 use std::path::Path;

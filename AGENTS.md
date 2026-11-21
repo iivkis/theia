@@ -58,6 +58,8 @@
 
 - **M1.2 typed TOML:** `config.rs` содержит строгую serde-модель, безопасные проверки grants/binds/secret refs, upper bound 1 МиБ и атомарную запись. `config validate` структурная проверка без чтения secret content; не считать отсутствие проверки base64url токена из env/file полной runtime validation. Запуск client/server остаётся fail-closed.
 
+- **M1.3 SmartTheia v1 pure codec:** frame layout + header 6 bytes, max 65 536 payload, strict flags/version, 8 типов, limited incremental buffer и state transitions tested. `Session::tunnel_open()` true только после правильного OPEN_OK, DATA после FIN запрещено; ABORT/OPEN_ERROR terminal. Настоящие HTTP/2/3 transports, TLS auth/ACL, local CONNECT/SOCKS5 и runtime persistence **не** реализованы. Не заявлять E2E или production readiness.
+
 ## Definition of Done (для каждого среза)
 
 - [ ] Есть автоматизированный позитивный и негативный тест; пограничные значения покрыты.
