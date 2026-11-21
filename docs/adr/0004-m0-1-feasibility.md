@@ -34,7 +34,7 @@
 | **H2/H3 multiplexing** | `tls13_h2_eight_concurrent_full_duplex_streams` и `h3_quic_eight_concurrent_bidirectional_streams`: восемь stream HEADERS получены прежде любого ответа, затем у каждого HTTP response и DATA до request EOF, ещё один DATA в обоих направлениях | **PASS** Linux+Windows на одном TLS/H2 и одном QUIC/H3 соединении; 8 не означает сотни потоков |
 | **H2/H3 cancellation isolation** | `tls13_h2_cancel_stream_preserves_connection`: RST_STREAM CANCEL и следующий 204 по тому же TLS. `h3_quic_cancel_stream_preserves_sibling_request`: QUIC RESET_STREAM/STOP_SENDING `H3_REQUEST_CANCELLED`, следующий 204 по тому же QUIC | **PASS** Linux+Windows; race/cancellation under load **OPEN** |
 | Windows x64 | Независимый native Windows CI spike проверяет реальный H2 over TCP/TLS, H3 over UDP/QUIC/TLS и API | **PASS** в Windows-native CI; WinINet/TUI не затрагиваются |
-| uTLS-like TLS fingerprint | Рассмотрены upstream rustls/Quinn ограничения и сторонние fork/BoringSSL варианты; нет проверенного одинакового профиля H3/H2 | **BLOCKER P0**; не считать feature реализованной и не включать профили кроме `default` |
+| uTLS-like TLS fingerprint | **Исполняемый rustls ClientHello baseline** для TCP/H2 и QUIC/H3 TLS CRYPTO: cipher IDs, extension IDs/order, ALPN, groups, TLS versions; H2 не содержит GREASE и ALPS old/new. Отдельные bounded-parser regressions. См. ADR-0005 | **OBSERVABILITY PASS**, но реальный Quinn Initial pcap и сравнение с Chrome отсутствуют. **P0 BLOCKER**: browser-like профиль не реализован; конфиг только `default` |
 
 Новые сценарии CI (**17 Rust tests**) включают H2/H3 slow-reader backpressure: https://github.com/iivkis/theia/actions/runs/44944894920. Предыдущий CI (**15 Rust tests**) включает H2/H3 concurrency и cancellation isolation: https://github.com/iivkis/theia/actions/runs/44943882915. Предыдущий CI (11 Rust tests) включает loss-recovery и large H2 flow control: https://github.com/iivkis/theia/actions/runs/44942565497. Сетевые доказательства с закреплённым Cargo.lock: H2/TLS + H3/TLS + API (**9/9 Rust tests**, Linux/Windows) https://github.com/iivkis/theia/actions/runs/44941068710; ранее H3/BBR (**5/5 Rust tests**) https://github.com/iivkis/theia/actions/runs/44940250307. Ранее CI свидетельства: https://github.com/iivkis/theia/actions/runs/44938796454 (первый Linux: 3/3 tests; `cargo check --all-targets` success) и https://github.com/iivkis/theia/actions/runs/44939068608 (Linux **и Windows native** spike успешны при закреплённом `Cargo.lock`). Эти тесты доказывают только явные свойства API/HTTP2, но не релизные критерии QUIC/TLS.
 
@@ -58,7 +58,7 @@
 
 Quinn поддерживает pluggable crypto abstraction, но документированная встроенная реализация TLS для QUIC основана на `rustls`. У обычного rustls **нельзя автоматически предполагать** управление всем ClientHello (extension order/GREASE/ALPS) для uTLS-совместимого профиля. `BoringSSL`-based библиотеки и RustLS forks могут быть кандидатами, но их API совместимость с **Quinn QUIC** и `h3` не доказана наличием работающего H2 TLS-клиента. Не смешивать H2-TLS fingerprints с H3-QUIC fingerprints.
 
-Следующий отдельный `M0.1 TLS` эксперимент: подобрать один кросс-платформенный backend, поднять localhost TLS client/server с нормальной проверкой trust chain и SNI, снять pcap ClientHello H2 и H3, сравнить с контрольным браузером, проверить невозможность silent downgrade. Только тогда именованный `tls_profile` можно назвать реализованным.
+Отдельный исполняемый **ClientHello first-flight observation** уже создан для TCP/H2 и QUIC/H3 TLS CRYPTO (см. **ADR-0005**). Он фиксирует absence GREASE и ALPS old/new у pinned default rustls, **но не заменяет** pcap на проводе, QUIC Initial decryption и контрольный browser capture. Следующий M0.1 experiment обязан проверить named TLS backend с реальными H2/H3 pcap и strict PKI, а не только API совместимость. Только тогда именованный `tls_profile` можно назвать реализованным.
 
 Источники: https://docs.rs/quinn/0.11.12/quinn/crypto/index.html · https://github.com/rustls/rustls/issues/1932 · https://github.com/3andne/craftls · https://docs.rs/primp-rustls/latest/rustls/client/struct.BrowserEmulator.html.
 
@@ -81,7 +81,8 @@ Quinn поддерживает pluggable crypto abstraction, но докумен
 - [ ] H2 сотни concurrent slow readers, массовые cancellation races и memory-cap measurements перед переносом адаптера в production.
 - [x] BBR controller выбран на обоих real QUIC endpoints; синтетическое отбрасывание каждой 20-й исходящей UDP-датаграммы на сервере после TLS handshake, восстановление 768 КиБ байт-в-байт, статистика RTT/loss/congestion (Linux+Windows).
 - [ ] BBR controlled RTT/jitter/loss vs CUBIC baselines + throughput/pacing/fairness; статистика из CI **не считается** performance benchmark; не записывать учётные данные в логи.
-- [ ] Один проверяемый кросс-платформенный uTLS-like profile для H2 **и** H3; packet captures с поддерживаемыми/несовпадающими полями.
+- [x] Структурное наблюдение TCP/H2 и QUIC/H3 TLS CRYPTO first flights и negative control default rustls без GREASE/ALPS; ADR-0005.
+- [ ] Один проверяемый кросс-платформенный uTLS-like profile для H2 **и** H3; **реальные** browser reference и Quinn wire packet captures с поддерживаемыми/несовпадающими полями.
 - [x] Windows native spike CI пройден (API/H2).
 - [ ] Windows system proxy VM smoke (M4.3) — не относится к scope spike.
 - [ ] Security audit и лицензии всех production dependency candidates.

@@ -151,6 +151,21 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("tls13_h2_megabyte_flow_control_and_half_close", h2_source)
         self.assertIn("tls13_h2_slow_response_reader_stalls_and_recovers", h2_source)
         self.assertIn("h3_quic_slow_response_reader_stalls_and_recovers", h3_source)
+        tls_fingerprint = (spike / "tests" / "tls_fingerprint.rs")
+        self.assertTrue(tls_fingerprint.is_file())
+        fp_source = tls_fingerprint.read_text(encoding="utf-8")
+        for required in ("h2_rustls_client_hello_first_flight_observed",
+                         "h3_rustls_quic_crypto_client_hello_first_flight_observed",
+                         "parser_rejects_truncated_and_corrupt_first_flights",
+                         "rustls_default_h2_is_not_a_verified_browser_profile",
+                         "EXT_APPLICATION_SETTINGS_OLD", "EXT_APPLICATION_SETTINGS",
+                         "parse_client_hello", "browser_profile_verified=false"):
+            self.assertIn(required, fp_source)
+        fp_adr = read("docs/adr/0005-tls-fingerprint-feasibility.md")
+        self.assertIn("NOT IMPLEMENTED", fp_adr)
+        self.assertIn("QUIC UDP Initial", fp_adr)
+        self.assertIn("GREASE", fp_adr)
+        self.assertIn("ALPS", fp_adr)
         self.assertIn("transport.send_window(48 * 1024)", h3_source)
         self.assertIn("transport.stream_receive_window(quinn::VarInt::from_u32(32 * 1024))", h3_source)
         for test_name in ("tls13_h2_eight_concurrent_full_duplex_streams",

@@ -58,15 +58,8 @@ jobs:
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test quic_bbr_loss -- --nocapture
       - name: Collect TLS first-flight evidence (no secrets)
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test tls_fingerprint -- --nocapture
-      - name: Bootstrap rustfmt for TLS observation test
-        run: |
-          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
-          python3 - <<'PY'
-          from pathlib import Path
-          from base64 import b64encode
-          source = Path("spikes/m0_1/tests/tls_fingerprint.rs").read_bytes()
-          print("THEIA_HELLO_FMT_START:" + b64encode(source).decode() + ":THEIA_HELLO_FMT_END")
-          PY
+      - name: Rustfmt check for isolated M0.1 spike
+        run: cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
       - name: Validate pinned dependency tree
