@@ -74,16 +74,33 @@ jobs:
           popd
           THEIA_UTLS_HELLO_PATH="$RUNNER_TEMP/theia-utls-h2-hello.bin" cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_reference -- --ignored --nocapture
           rm -f "$RUNNER_TEMP/theia-utls-h2-hello.bin"
-      - name: Rustfmt check for isolated M0.1 spike
-        run: cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check
-      - name: Check Go uTLS helper formatting
+      - name: Real Go uTLS H2 request and strict certificate verification against Rust server
         shell: bash
         run: |
-          unformatted="$(gofmt -l spikes/m0_1/utls_reference/main.go spikes/m0_1/utls_reference/main_test.go)"
-          if [[ -n "$unformatted" ]]; then
-            echo "::error::gofmt drift: $unformatted"
-            exit 1
-          fi
+          set -euo pipefail
+          pushd spikes/m0_1/utls_reference
+          go build -o "$RUNNER_TEMP/theia-utls-h2-probe" ./cmd/h2_probe
+          popd
+          THEIA_UTLS_H2_PROBE="$RUNNER_TEMP/theia-utls-h2-probe" cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_h2_loopback -- --ignored --nocapture
+      - name: Bootstrap Rust formatting of real Go uTLS E2E test
+        run: |
+          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
+          python3 - <<'PY'
+          from pathlib import Path
+          from base64 import b64encode
+          content = Path("spikes/m0_1/tests/utls_h2_loopback.rs").read_bytes()
+          print("THEIA_UTLS_LIVE_RUST_START:" + b64encode(content).decode() + ":THEIA_UTLS_LIVE_RUST_END")
+          PY
+      - name: Bootstrap Go formatting of network probe
+        shell: bash
+        run: |
+          gofmt -w spikes/m0_1/utls_reference/cmd/h2_probe/main.go
+          python3 - <<'PY'
+          from pathlib import Path
+          from base64 import b64encode
+          content = Path("spikes/m0_1/utls_reference/cmd/h2_probe/main.go").read_bytes()
+          print("THEIA_UTLS_LIVE_GO_START:" + b64encode(content).decode() + ":THEIA_UTLS_LIVE_GO_END")
+          PY
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
       - name: Validate pinned dependency tree
@@ -123,6 +140,17 @@ jobs:
           cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_reference -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Rust comparison to Go uTLS failed' }
           Remove-Item $hello -Force
+      - name: Real Windows Go uTLS H2 handshake and PKI negative tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location spikes/m0_1/utls_reference
+          $env:THEIA_UTLS_H2_PROBE = Join-Path $env:RUNNER_TEMP "theia-utls-h2-probe.exe"
+          go build -o $env:THEIA_UTLS_H2_PROBE ./cmd/h2_probe
+          if ($LASTEXITCODE -ne 0) { throw 'build Go H2 probe failed' }
+          Pop-Location
+          cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_h2_loopback -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Go uTLS and Rust H2 E2E failed' }
 
   rust-tests:
     name: rust-tests (Linux)
