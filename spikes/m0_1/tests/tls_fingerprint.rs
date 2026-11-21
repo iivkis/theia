@@ -15,7 +15,8 @@ const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
-const EXT_APPLICATION_SETTINGS: u16 = 0x4469; // ALPS, 17513
+const EXT_APPLICATION_SETTINGS_OLD: u16 = 0x4469; // 17513, BoringSSL legacy ALPS
+const EXT_APPLICATION_SETTINGS: u16 = 0x44cd; // 17613, BoringSSL current ALPS
 
 #[derive(Debug, PartialEq, Eq)]
 struct ClientHelloFeatures {
@@ -30,13 +31,15 @@ struct ClientHelloFeatures {
 impl ClientHelloFeatures {
     fn has_grease_extension(&self) -> bool {
         // RFC 8701 GREASE: 0x0a0a, 0x1a1a, ..., 0xfafa.
-        self.extension_ids_in_order.iter().any(|&id| {
-            (id & 0x0f0f) == 0x0a0a && (id >> 8) == (id & 0xff)
-        })
+        self.extension_ids_in_order
+            .iter()
+            .any(|&id| (id & 0x0f0f) == 0x0a0a && (id >> 8) == (id & 0xff))
     }
 
     fn has_alps(&self) -> bool {
-        self.extension_ids_in_order.contains(&EXT_APPLICATION_SETTINGS)
+        self.extension_ids_in_order
+            .contains(&EXT_APPLICATION_SETTINGS)
+            || self.extension_ids_in_order.contains(&EXT_APPLICATION_SETTINGS_OLD)
     }
 }
 
@@ -85,7 +88,8 @@ fn decode_u16s(bytes: &[u8]) -> Result<Vec<u16>, &'static str> {
     if bytes.len() % 2 != 0 {
         return Err("odd length for u16 vector");
     }
-    Ok(bytes.chunks_exact(2)
+    Ok(bytes
+        .chunks_exact(2)
         .map(|x| u16::from_be_bytes([x[0], x[1]]))
         .collect())
 }
@@ -192,9 +196,11 @@ fn parse_tls_records(records: &[u8]) -> Result<ClientHelloFeatures, &'static str
 
 fn config(alpn: &[u8]) -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-        .expect("test certificate");
-    roots.add(cert.cert.der().clone()).expect("valid trust anchor");
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("test certificate");
+    roots
+        .add(cert.cert.der().clone())
+        .expect("valid trust anchor");
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -210,9 +216,12 @@ fn tcp_client_hello() -> (ClientHelloFeatures, Vec<u8>) {
     let mut client = rustls::ClientConnection::new(
         config(b"h2"),
         ServerName::try_from("localhost".to_owned()).expect("SNI"),
-    ).expect("TLS client config");
+    )
+    .expect("TLS client config");
     let mut first_flight = Vec::new();
-    let len = client.write_tls(&mut first_flight).expect("serialize TCP TLS records");
+    let len = client
+        .write_tls(&mut first_flight)
+        .expect("serialize TCP TLS records");
     assert_eq!(len, first_flight.len());
     let observed = parse_tls_records(&first_flight).expect("valid TCP ClientHello");
     (observed, first_flight)
@@ -228,7 +237,8 @@ fn quic_client_hello() -> (ClientHelloFeatures, Vec<u8>) {
         rustls::quic::Version::V1,
         ServerName::try_from("localhost".to_owned()).expect("SNI"),
         transport_params,
-    ).expect("QUIC TLS config");
+    )
+    .expect("QUIC TLS config");
     let mut crypto_data = Vec::new();
     client.write_hs(&mut crypto_data);
     let observed = parse_client_hello(&crypto_data).expect("valid QUIC CRYPTO ClientHello");
@@ -239,12 +249,20 @@ fn quic_client_hello() -> (ClientHelloFeatures, Vec<u8>) {
 fn h2_rustls_client_hello_first_flight_observed() {
     let (features, _) = tcp_client_hello();
     assert_eq!(features.legacy_version, 0x0303);
-    assert!(features.cipher_suites.contains(&0x1301), "TLS_AES_128_GCM_SHA256");
+    assert!(
+        features.cipher_suites.contains(&0x1301),
+        "TLS_AES_128_GCM_SHA256"
+    );
     assert!(features.extension_ids_in_order.contains(&EXT_SNI));
     assert!(features.extension_ids_in_order.contains(&EXT_ALPN));
-    assert!(features.supported_versions.contains(&0x0304), "TLS 1.3 offered");
+    assert!(
+        features.supported_versions.contains(&0x0304),
+        "TLS 1.3 offered"
+    );
     assert_eq!(features.alpn, vec!["h2"]);
-    assert!(!features.extension_ids_in_order.contains(&EXT_QUIC_TRANSPORT_PARAMETERS));
+    assert!(!features
+        .extension_ids_in_order
+        .contains(&EXT_QUIC_TRANSPORT_PARAMETERS));
     // Observational, not a test of any claimed browser profile.
     eprintln!(
         "M0.1/TCP TLS1.3 rustls first flight (no secret material): {features:?}; GREASE={} ALPS={}; browser_profile_verified=false",
@@ -259,7 +277,9 @@ fn h3_rustls_quic_crypto_client_hello_first_flight_observed() {
     assert!(features.extension_ids_in_order.contains(&EXT_SNI));
     assert!(features.supported_versions.contains(&0x0304));
     assert_eq!(features.alpn, vec!["h3"]);
-    assert!(features.extension_ids_in_order.contains(&EXT_QUIC_TRANSPORT_PARAMETERS));
+    assert!(features
+        .extension_ids_in_order
+        .contains(&EXT_QUIC_TRANSPORT_PARAMETERS));
     eprintln!(
         "M0.1/QUIC TLS1.3 rustls CRYPTO first flight (not decrypted UDP Initial): {features:?}; GREASE={} ALPS={}; browser_profile_verified=false",
         features.has_grease_extension(), features.has_alps()
@@ -270,16 +290,45 @@ fn h3_rustls_quic_crypto_client_hello_first_flight_observed() {
 fn parser_rejects_truncated_and_corrupt_first_flights() {
     let (_, tls_records) = tcp_client_hello();
     for i in 0..tls_records.len() {
-        assert!(parse_tls_records(&tls_records[..i]).is_err(), "truncated TLS record at {i}");
+        assert!(
+            parse_tls_records(&tls_records[..i]).is_err(),
+            "truncated TLS record at {i}"
+        );
     }
     let (_, crypto) = quic_client_hello();
     for i in 0..crypto.len() {
-        assert!(parse_client_hello(&crypto[..i]).is_err(), "truncated QUIC CRYPTO at {i}");
+        assert!(
+            parse_client_hello(&crypto[..i]).is_err(),
+            "truncated QUIC CRYPTO at {i}"
+        );
     }
     let mut invalid = crypto.clone();
     invalid[0] = 2;
-    assert!(parse_client_hello(&invalid).is_err(), "ServerHello must not be misread");
+    assert!(
+        parse_client_hello(&invalid).is_err(),
+        "ServerHello must not be misread"
+    );
     let mut invalid = crypto;
     invalid.push(0);
-    assert!(parse_client_hello(&invalid).is_err(), "trailing bytes must not be ignored");
+    assert!(
+        parse_client_hello(&invalid).is_err(),
+        "trailing bytes must not be ignored"
+    );
+}
+
+
+/// A pinned negative-control. rustls 0.23.46 emits valid and secure TLS but
+/// lacks two BoringSSL/Chromium H2 characteristics in the observed first
+/// flight. GREASE and ALPS alone are never sufficient to prove browser parity.
+#[test]
+fn rustls_default_h2_is_not_a_verified_browser_profile() {
+    let (features, _) = tcp_client_hello();
+    assert!(
+        !features.has_grease_extension(),
+        "rustls baseline changed: re-capture and reassess browser profile gate"
+    );
+    assert!(
+        !features.has_alps(),
+        "rustls baseline changed: re-capture and reassess browser profile gate"
+    );
 }
