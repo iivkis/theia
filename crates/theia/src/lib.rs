@@ -116,10 +116,18 @@ return a nonzero exit code until implemented. System proxy is never modified.";
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
     match command {
         Command::Help(None) => Ok(HELP),
-        Command::Help(Some("tui")) => Ok("Usage: theia tui [--role server|client]\nTUI is not implemented."),
-        Command::Help(Some("server")) => Ok("Usage: theia server run --config <path>\nServer runtime is not implemented."),
-        Command::Help(Some("client")) => Ok("Usage: theia client run --config <path>\nClient runtime is not implemented."),
-        Command::Help(Some("config")) => Ok("Usage: theia config validate --config <path>\nTOML validation is not implemented."),
+        Command::Help(Some("tui")) => {
+            Ok("Usage: theia tui [--role server|client]\nTUI is not implemented.")
+        }
+        Command::Help(Some("server")) => {
+            Ok("Usage: theia server run --config <path>\nServer runtime is not implemented.")
+        }
+        Command::Help(Some("client")) => {
+            Ok("Usage: theia client run --config <path>\nClient runtime is not implemented.")
+        }
+        Command::Help(Some("config")) => {
+            Ok("Usage: theia config validate --config <path>\nTOML validation is not implemented.")
+        }
         Command::Help(Some(_)) => Err(CliError::InvalidArguments),
         Command::Version => Ok(concat!("theia ", env!("CARGO_PKG_VERSION"))),
         Command::Tui { .. } => Err(CliError::NotImplemented("TUI")),
@@ -134,7 +142,12 @@ mod tests {
     use super::*;
 
     fn command(words: &[&str]) -> Result<Command, CliError> {
-        parse(&words.iter().map(|word| (*word).to_owned()).collect::<Vec<_>>())
+        parse(
+            &words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[test]
@@ -143,7 +156,9 @@ mod tests {
         assert_eq!(command(&["-h"]), Ok(Command::Help(None)));
         assert_eq!(command(&["--version"]), Ok(Command::Version));
         assert!(execute(Command::Version).unwrap().starts_with("theia "));
-        assert!(execute(Command::Help(None)).unwrap().contains("no proxy runtime"));
+        assert!(execute(Command::Help(None))
+            .unwrap()
+            .contains("no proxy runtime"));
     }
 
     #[test]
@@ -152,13 +167,20 @@ mod tests {
         assert_eq!(command(&["tui"]), Ok(Command::Tui { role: None }));
         assert_eq!(
             command(&["tui", "--role", "server"]),
-            Ok(Command::Tui { role: Some(Role::Server) })
+            Ok(Command::Tui {
+                role: Some(Role::Server)
+            })
         );
         assert_eq!(
             command(&["tui", "--role", "client"]),
-            Ok(Command::Tui { role: Some(Role::Client) })
+            Ok(Command::Tui {
+                role: Some(Role::Client)
+            })
         );
-        assert_eq!(command(&["tui", "--role", "admin"]), Err(CliError::InvalidRole));
+        assert_eq!(
+            command(&["tui", "--role", "admin"]),
+            Err(CliError::InvalidRole)
+        );
         assert_eq!(
             command(&["tui", "--role", "server", "--role", "client"]),
             Err(CliError::InvalidArguments)
@@ -169,15 +191,21 @@ mod tests {
     fn recognizes_both_headless_roles_and_config_validation() {
         assert_eq!(
             command(&["server", "run", "--config", "server.toml"]),
-            Ok(Command::ServerRun { config: "server.toml".into() })
+            Ok(Command::ServerRun {
+                config: "server.toml".into()
+            })
         );
         assert_eq!(
             command(&["client", "run", "--config", "client.toml"]),
-            Ok(Command::ClientRun { config: "client.toml".into() })
+            Ok(Command::ClientRun {
+                config: "client.toml".into()
+            })
         );
         assert_eq!(
             command(&["config", "validate", "--config", "a.toml"]),
-            Ok(Command::ConfigValidate { config: "a.toml".into() })
+            Ok(Command::ConfigValidate {
+                config: "a.toml".into()
+            })
         );
     }
 
@@ -206,10 +234,18 @@ mod tests {
     fn unavailable_features_never_report_success() {
         for command in [
             Command::Tui { role: None },
-            Command::Tui { role: Some(Role::Server) },
-            Command::ServerRun { config: "server.toml".into() },
-            Command::ClientRun { config: "client.toml".into() },
-            Command::ConfigValidate { config: "client.toml".into() },
+            Command::Tui {
+                role: Some(Role::Server),
+            },
+            Command::ServerRun {
+                config: "server.toml".into(),
+            },
+            Command::ClientRun {
+                config: "client.toml".into(),
+            },
+            Command::ConfigValidate {
+                config: "client.toml".into(),
+            },
         ] {
             let error = execute(command).expect_err("stub must fail closed");
             assert_eq!(error.exit_code(), 3);
