@@ -25,6 +25,23 @@
 | H2 SETTINGS/pseudo-header ordering и H3 SETTINGS/priority сопоставлены с эталоном | OPEN |
 | Один реально настроенный и измеренный browser-like профиль с нормальной проверкой TLS trust на Quinn H3 и TCP H2 | **P0 BLOCKER** |
 
+## Измерения CI: стандартный rustls 0.23.46
+
+Linux CI: https://github.com/iivkis/theia/actions/runs/44946132698 (тест `client_hello_baseline`, вывод `--nocapture`). Значения **не относятся к браузеру** и могут меняться при обновлении crypto provider или rustls:
+
+| Поле | H2/TCP TLS | H3/rustls QUIC plaintext |
+| --- | --- | --- |
+| legacy_version | 0x0303 (771) | 0x0303 (771) |
+| supported_versions | 0x0304 (TLS 1.3) | 0x0304 (TLS 1.3) |
+| ALPN | `h2` | `h3` |
+| cipher suite IDs (wire order, десятичные) | 4866, 4865, 4867, 49196, 49195, 52393, 49200, 49199, 52392 | 4866, 4865, 4867 |
+| extension IDs (wire order, десятичные) | 23, 43, 51, 45, 16, 13, 5, 11, 10, 0 | 10, 16, 5, 45, 0, 43, 23, 51, 57, 11, 13 |
+| QUIC TP extension 57 | нет | есть |
+| GREASE extension IDs | 0 | 0 |
+| SNI | присутствует; само значение не выводится | присутствует; значение не выводится |
+
+Эта диагностика **не** рассчитывает JA3/JA4 и не сравнивает реальный wire traffic с Chrome. Engine-only H3 использует пустые test transport params, поэтому packet-level QUIC fingerprint может отличаться. Отсутствие GREASE в одном default rustls baseline не позволяет сделать вывод о поведении любого браузера.
+
 ## Контракт диагностики
 
 ```sh
