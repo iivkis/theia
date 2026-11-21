@@ -664,3 +664,107 @@ async fn tls13_h2_cancel_stream_preserves_connection() {
     .await
     .expect("TLS/h2 cancellation test timed out");
 }
+
+
+/// The *response* reader withholds HTTP/2 flow-control credit, forcing the
+/// server's bounded SendStream to stop. After releasing capacity, a 512 KiB
+/// body completes without reconnecting. No unbounded application queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls13_h2_slow_response_reader_stalls_and_recovers() {
+    const BLOCK: usize = 4096;
+    const HELD: usize = 15 * BLOCK; // 61,440, less than 65,535 default stream window
+    const TOTAL: usize = 512 * 1024;
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (acceptor, connector) = tls_configs(true, H2_ALPN, H2_ALPN);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TCP");
+        let addr = listener.local_addr().unwrap();
+        let (window_held_tx, window_held_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (client_done_tx, client_done_rx) = oneshot::channel::<()>();
+        let (server_done_tx, server_done_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("TCP accept");
+            let tls = acceptor.accept(socket).await.expect("TLS handshake");
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(H2_ALPN));
+            let mut connection = h2::server::handshake(tls).await.expect("h2 server");
+            let (request, mut responder) = connection.accept()
+                .await.expect("connection").expect("request");
+            assert_eq!(request.uri().path(), "/v1/session/slow-reader");
+            let handler = tokio::spawn(async move {
+                let mut body = request.into_body();
+                assert!(body.data().await.is_none(), "request is half-closed");
+
+                let mut outgoing = responder.send_response(
+                    http::Response::builder().status(200).body(()).unwrap(), false,
+                ).expect("response HEADERS");
+                let block = Bytes::from(vec![0xc3; BLOCK]);
+                for _ in 0..(HELD / BLOCK) {
+                    bounded_send(&mut outgoing, block.clone(), false).await;
+                }
+                // Response stream credit must remain unavailable until the
+                // client explicitly calls release_capacity on received DATA.
+                assert!(outgoing.capacity() < BLOCK,
+                    "slow reader has not released enough credit for another block");
+                window_held_tx.send(()).expect("client observing stalled window");
+                release_rx.await.expect("client releases stream window");
+
+                for index in (HELD / BLOCK)..(TOTAL / BLOCK) {
+                    bounded_send(
+                        &mut outgoing,
+                        block.clone(),
+                        index == TOTAL / BLOCK - 1,
+                    ).await;
+                }
+                server_done_tx.send(()).expect("client still waiting");
+            });
+            tokio::select! {
+                _ = async { while connection.accept().await.is_some() {} } => {},
+                _ = client_done_rx => {},
+            }
+            handler.await.expect("response sender task");
+        });
+
+        let tcp = TcpStream::connect(addr).await.expect("TCP connect");
+        let tls = connector.connect(
+            ServerName::try_from("localhost".to_owned()).unwrap(), tcp,
+        ).await.expect("verified TLS");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(H2_ALPN));
+        let (mut sender, driver) = h2::client::handshake(tls).await.expect("h2 client");
+        let driver_task = tokio::spawn(async move { let _ = driver.await; });
+
+        let request = http::Request::builder().method(http::Method::POST)
+            .uri("https://localhost/v1/session/slow-reader")
+            .body(()).unwrap();
+        let (response, _finished_request) = sender.send_request(request, true)
+            .expect("send request with EOS");
+        let response = response.await.expect("response HEADERS");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let mut incoming = response.into_body();
+        let mut held = 0;
+        while held < HELD {
+            let chunk = incoming.data().await.expect("DATA").expect("frame");
+            assert!(chunk.iter().all(|&x| x == 0xc3), "byte-exact payload");
+            held += chunk.len();
+            // Intentionally do not release credit yet.
+        }
+        assert_eq!(held, HELD, "expected exactly fifteen 4 KiB DATA frames");
+        window_held_rx.await.expect("sender reached credit limit");
+        incoming.flow_control().release_capacity(held).expect("release window");
+        release_tx.send(()).expect("server ready to continue");
+
+        let mut received = held;
+        while let Some(chunk) = incoming.data().await {
+            let chunk = chunk.expect("response DATA");
+            assert!(chunk.iter().all(|&x| x == 0xc3), "recovered payload");
+            received += chunk.len();
+            incoming.flow_control().release_capacity(chunk.len()).expect("bounded receiver");
+        }
+        assert_eq!(received, TOTAL, "complete response after slow reader resumed");
+        server_done_rx.await.expect("server completed response");
+        client_done_tx.send(()).expect("server alive");
+        server.await.expect("server handler");
+        driver_task.abort();
+    }).await.expect("H2/TLS slow-reader backpressure test timed out");
+}
