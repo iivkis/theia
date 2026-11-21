@@ -12,6 +12,13 @@ use theia_m0_1_feasibility::{configure_client_bbr, configure_server_bbr};
 const ALPN: &[u8] = b"h3";
 
 fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
+    endpoints_with_slow_reader_limits(false)
+}
+
+/// When enabled, the QUIC receiver advertises a small per-stream window and
+/// the sender has a small global write buffer, so stalled readers can exert
+/// testable backpressure. Ordinary tests use their original defaults.
+fn endpoints_with_slow_reader_limits(slow_reader: bool) -> (Endpoint, Endpoint, SocketAddr) {
     let key =
         rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate test cert");
     let cert = key.cert.der().clone();
@@ -30,7 +37,15 @@ fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(server_tls).expect("QUIC TLS server config"),
     ));
-    configure_server_bbr(&mut server_config);
+    if slow_reader {
+        let mut transport = theia_m0_1_feasibility::bbr_transport();
+        // Maximum aggregate bytes accepted by application writers on the
+        // server connection, not a measured peak-RSS limit.
+        transport.send_window(48 * 1024);
+        server_config.transport_config(Arc::new(transport));
+    } else {
+        configure_server_bbr(&mut server_config);
+    }
     let server =
         Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).expect("bind UDP server");
     let address = server.local_addr().expect("bound address");
@@ -48,7 +63,15 @@ fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(client_tls).expect("QUIC TLS client config"),
     ));
-    configure_client_bbr(&mut client_config);
+    if slow_reader {
+        let mut transport = theia_m0_1_feasibility::bbr_transport();
+        transport.stream_receive_window(quinn::VarInt::from_u32(32 * 1024));
+        // Reserve credit for H3 control/QPACK streams and other traffic.
+        transport.receive_window(quinn::VarInt::from_u32(256 * 1024));
+        client_config.transport_config(Arc::new(transport));
+    } else {
+        configure_client_bbr(&mut client_config);
+    }
     let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("bind UDP client");
     client.set_default_client_config(client_config);
     (server, client, address)
@@ -510,4 +533,116 @@ async fn h3_quic_cancel_stream_preserves_sibling_request() {
     })
     .await
     .expect("H3 cancelled stream isolation timed out");
+}
+
+/// With QUIC send_window=48 KiB and peer stream_receive_window=32 KiB,
+/// a server writing 1 MiB of H3 response DATA must stall while the client
+/// ignores the body, then finish once that same reader begins draining it.
+/// A success here proves transport backpressure and recovery, not peak RSS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h3_quic_slow_response_reader_stalls_and_recovers() {
+    const BLOCK: usize = 4096;
+    const TOTAL: usize = 1024 * 1024;
+
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let (server_endpoint, client_endpoint, addr) = endpoints_with_slow_reader_limits(true);
+        let (first_chunk_tx, first_chunk_rx) = tokio::sync::oneshot::channel::<()>();
+        let (send_finished_tx, mut send_finished_rx) = tokio::sync::oneshot::channel::<()>();
+        let (client_done_tx, client_done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.expect("incoming QUIC");
+            let connection = incoming.await.expect("QUIC TLS handshake");
+            assert_h3_and_bbr(&connection);
+            let mut h3: h3::server::Connection<_, Bytes> =
+                h3::server::Connection::new(h3_quinn::Connection::new(connection))
+                    .await
+                    .expect("H3 server");
+            let resolver = h3.accept().await.expect("H3 accept").expect("request");
+            let (request, mut stream) = resolver.resolve_request().await.expect("request headers");
+            assert_eq!(request.uri().path(), "/v1/session/slow-reader");
+            assert!(stream.recv_data().await.expect("request EOF").is_none());
+            stream
+                .send_response(http::Response::builder().status(200).body(()).unwrap())
+                .await
+                .expect("early response");
+
+            let chunk = Bytes::from(vec![0x6d; BLOCK]);
+            stream
+                .send_data(chunk.clone())
+                .await
+                .expect("first H3 DATA");
+            first_chunk_tx
+                .send(())
+                .expect("client awaiting first chunk");
+            for _ in 1..(TOTAL / BLOCK) {
+                stream
+                    .send_data(chunk.clone())
+                    .await
+                    .expect("write under backpressure");
+            }
+            stream.finish().await.expect("H3 response EOF");
+            send_finished_tx.send(()).expect("client awaits sender");
+            client_done_rx.await.expect("reader completed response");
+        });
+
+        let connection = client_endpoint
+            .connect(addr, "localhost")
+            .expect("connect")
+            .await
+            .expect("verified certificate");
+        assert_h3_and_bbr(&connection);
+        let (mut driver, mut sender) =
+            h3::client::new(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .expect("H3 client");
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost/v1/session/slow-reader")
+            .body(())
+            .unwrap();
+        let mut stream = sender.send_request(request).await.expect("H3 request");
+        stream.finish().await.expect("request body EOS");
+        assert_eq!(
+            stream
+                .recv_response()
+                .await
+                .expect("HTTP response")
+                .status(),
+            http::StatusCode::OK
+        );
+        first_chunk_rx.await.expect("server began writing response");
+
+        // The client has not read *any* response DATA. The producer must not
+        // be able to buffer a full mebibyte behind a 48 KiB send_window.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send_finished_rx)
+                .await
+                .is_err(),
+            "H3 sender unexpectedly buffered entire 1 MiB"
+        );
+
+        let mut received = 0usize;
+        while let Some(mut buf) = stream.recv_data().await.expect("response DATA") {
+            let len = buf.remaining();
+            let bytes = buf.copy_to_bytes(len);
+            assert!(bytes.iter().all(|&b| b == 0x6d), "byte-exact H3 body");
+            received += len;
+            assert!(received <= TOTAL, "response exceeded test payload budget");
+        }
+        assert_eq!(
+            received, TOTAL,
+            "full H3 body delivered after stalled reader"
+        );
+        send_finished_rx.await.expect("server finished sending");
+        client_done_tx.send(()).expect("server still alive");
+        server.await.expect("server task");
+        driver_task.abort();
+        client_endpoint.close(0u32.into(), b"done");
+    })
+    .await
+    .expect("H3/QUIC slow-reader backpressure timed out");
 }
