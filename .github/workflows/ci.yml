@@ -52,20 +52,29 @@ jobs:
         with:
           workspaces: "spikes/m0_1 -> target"
           key: "m0-1"
-      - name: Resolve isolated spike dependencies
-        run: cargo generate-lockfile --manifest-path spikes/m0_1/Cargo.toml
       - name: Test actual HTTP/2 duplex and API probes
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
-      - name: Export lockfile for committing after verified run
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import base64
-          data = Path("spikes/m0_1/Cargo.lock").read_bytes()
-          print("THEIA_M01_LOCK_START:" + base64.b64encode(data).decode("ascii") + ":THEIA_M01_LOCK_END")
-          PY
+      - name: Validate pinned dependency tree
+        run: cargo metadata --manifest-path spikes/m0_1/Cargo.toml --locked --format-version 1 --no-deps > /dev/null
+
+  m0-1-windows-spike:
+    name: m0-1-api-spike (Windows)
+    needs: specification
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "spikes/m0_1 -> target"
+          key: "m0-1-windows"
+      - name: Native Windows API spike tests
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
 
   rust-tests:
     name: rust-tests (Linux)

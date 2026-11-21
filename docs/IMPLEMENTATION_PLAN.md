@@ -7,7 +7,7 @@
 | Этап | Вертикальный срез | Тест/критерий завершения |
 | --- | --- | --- |
 | M0 | Документация, AGENTS, TOML examples, docs-only CI | структура спецификации проверяется CI; работающая функциональность **не заявлена** |
-| M0.1 | **Feasibility spike** H2/H3 full-duplex + BBR + fingerprint backend (без заявления о готовой функции) | ADR: выбранные crate/API, HTTP request/response одновременно открыты, BBR доступен с обеих сторон, TLS profile управляем или зафиксирован блокер |
+| M0.1 | **Feasibility spike** H2/H3 full-duplex + BBR + fingerprint backend (без заявления о готовой функции) | **Частично проверено**: изолированный Rust crate + CI H2 in-memory duplex, Quinn BBR API, H3 split API; остаются TLS-backed H2, реальный H3+BBR и fingerprint backend. См. ADR-0004 |
 | M1.1 | Cargo workspace, единый `theia` CLI, `--help`/`--version`, роли | unit/CLI integration tests; Windows/Linux compile; `Cargo.lock` |
 | M1.2 | Typed TOML v1 + validator + atomic store | round-trip, unknown keys, duplicate ID, missing refs, atomic rollback, file perms |
 | M1.3 | SmartTheia pure frame codec + FSM | golden vectors, max frame guard, chunk fragmentation, malformed/unknown frames, fuzz |

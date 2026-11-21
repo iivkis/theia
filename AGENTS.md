@@ -49,6 +49,7 @@
 ## Зависимости, CI, оптимизация
 
 - Фиксировать версии в `Cargo.lock`; сначала выбрать минимальное количество зрелых crates. Проверять их API по текущей документации.
+- `spikes/m0_1` — **изолированный исследовательский crate**, а не production workspace. Его зелёные тесты подтверждают только API/HTTP2 duplex, но **не закрывают P0 BBR-on-wire, H3 TLS E2E и uTLS-like profile**. Перед переносом кода в один бинарник свериться с `docs/adr/0004-m0-1-feasibility.md`.
 - Базовые команды: `cargo test --workspace --all-targets --locked`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 - CI сначала проверяет спецификацию и тесты, затем lint/build; кэш cargo/target через `Swatinem/rust-cache`; Windows проверяется нативно.
 - Никакой микрооптимизации без замеров и регрессий в тестах. Производительность в `docs/TESTING_CI.md` — измеряется на одинаковых условиях.
