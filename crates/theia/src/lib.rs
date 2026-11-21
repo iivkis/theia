@@ -170,7 +170,7 @@ mod tests {
         assert!(execute(Command::Version).unwrap().starts_with("theia "));
         assert!(execute(Command::Help(None))
             .unwrap()
-            .contains("no proxy runtime"));
+            .contains("H2 server inbound"));
     }
 
     #[test]

@@ -342,6 +342,25 @@ async fn tls_wrong_hostname_and_untrusted_ca_fail_closed() {
             ServerName::try_from("wrong.example".to_owned()).unwrap(),
             socket,
         ).await.is_err());
+
+        // A distinct, valid CA must not authenticate this listener.
+        let unrelated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(unrelated.cert.der().clone()).unwrap();
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let untrusted = TlsConnector::from(Arc::new(tls));
+        let socket = TcpStream::connect(address).await.unwrap();
+        assert!(untrusted.connect(
+            ServerName::try_from("localhost".to_owned()).unwrap(),
+            socket,
+        ).await.is_err());
         server.abort();
     }).await.unwrap();
 }

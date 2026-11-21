@@ -157,13 +157,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Bootstrap M2.1 dependency lockfile (replace with pinned file)
-        shell: bash
-        run: |
-          cargo generate-lockfile
-          echo BEGIN_M21_LOCK
-          cat Cargo.lock
-          echo END_M21_LOCK
       - name: Tests first
         run: cargo test --workspace --all-targets --locked
       - name: Formatting

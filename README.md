@@ -41,7 +41,7 @@ applications → local HTTP/SOCKS → SmartTheia over HTTP/3 (QUIC + BBR)
 | [examples/server.toml](examples/server.toml) | серверный шаблон |
 | [examples/client.toml](examples/client.toml) | клиентский шаблон |
 
-## CLI (M1.1: поддерживается синтаксис, не runtime)
+## CLI (M2.1: сервер H2/TLS работает, клиент и TUI отсутствуют)
 
 ```sh
 theia tui                              # стартовый экран: две панели

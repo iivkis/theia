@@ -12,7 +12,7 @@ fn invoke(args: &[&str]) -> Output {
 fn help_and_version_exit_successfully() {
     let help = invoke(&["--help"]);
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("no proxy runtime"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("H2 server inbound"));
     assert!(help.stderr.is_empty());
 
     let version = invoke(&["--version"]);
