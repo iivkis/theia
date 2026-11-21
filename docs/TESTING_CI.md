@@ -7,7 +7,7 @@
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)
 
 - SmartTheia encode/decode golden byte vectors; arbitrary chunk splitting/aggregation; frame length 0/65536/65537; invalid flags/type/state; отсутствие паники и out-of-bounds.
-- Typed TOML: missing/unknown fields, duplicate IDs, bind collisions, malformed DNS/IPv6/port, unsupported schema_version, UTF-8 errors, missing secret refs, empty user list, диапазоны таймаутов.
+- Typed TOML: missing/unknown fields, duplicate IDs/hashes, bind collisions, malformed DNS/IPv6/port, unsupported schema_version, UTF-8 errors, missing secret refs, empty user list, диапазоны таймаутов, **missing/empty/unknown/duplicate allowed_user_ids**, запрет `system_proxy=on`, отказ неизвестного `tls_profile`.
 - Transport selector: строгая таблица классификации `UdpUnavailable` versus `TlsVerificationFailed`/`Unauthorized`/`IncompatibleProtocol`/`PolicyDenied`, negative-cache TTL, cancellation, no re-dial after downstream error.
 - Policy: IPv4/IPv6 public/private, loopback, link-local, multicast, DNS rebinding after resolution, case folding/IDNA validation.
 - TUI update model: keyboard, focus, dirty state, save and apply distinct, privacy masking, compact terminal, back navigation.
@@ -15,10 +15,10 @@
 
 ### B. Integration tests (локальный реальный IO)
 
-- TLS-backed H2 echo tunnel, multiple concurrent streams, half-close, abrupt EOF, timeout, bounded backpressure, broken clients and error mapping.
-- H3 echo tunnel via UDP loopback, certificate validation, resumption/0-RTT disabled, BBR selection with pinned quinn (или явный pending).
+- TLS-backed H2 echo tunnel, multiple concurrent streams, **full-duplex HTTP POST without request EOF**, half-close, abrupt EOF, timeout, bounded backpressure, broken clients and error mapping. Loopback echo тестировать только с explicit test-only `allow_private_ips=true`; отдельный negative test обязан подтвердить default=false.
+- H3 echo tunnel via UDP loopback, full-duplex request/response, certificate validation, resumption/0-RTT disabled, **BBR на обоих отправителях как P0 release gate** (никаких `pending` при объявлении MVP).
 - Fallback H3→H2 с симуляцией/блокировкой UDP; ни одного H2 retry при wrong cert/auth/protocol mismatch.
-- HTTP CONNECT + SOCKS5 local proxy с DNS, IPv4/IPv6, отказом auth и неразрешённым адресом.
+- HTTP CONNECT + SOCKS5 local proxy с server-side DNS, IPv4/IPv6, отказом auth и неразрешённым адресом. HTTP 200/SOCKS5 success должны приходить **строго после OPEN_OK**; неверный токен другого inbound не получает доступ; имена не резолвятся локальным клиентом.
 - IPC auth/ACL (Unix socket/Windows pipe), atomic config reload, сохранение старого runtime при failed apply.
 - Windows per-user proxy smoke: Windows runner tests for API adapters + manual VM test of end-user settings and recovery.
 - No external production endpoints in CI; TLS сертификаты для теста генерируются в памяти/fixtures, без реальных секретов.
@@ -34,7 +34,7 @@
 
 - Измерять throughput по H2/H3 и RTT p50/p95 при одинаковых payload/host, CPU, peak RSS, количество аллокаций, потери при 1%/5%, число H3→H2 fallback.
 - CI не должен запускать шумные full benchmarks при каждом PR. Baselines записывать в отчёт на стабильном окружении перед релизом.
-- Для заявлений о fingerprint resistance: packet captures H3/H2 TLS/QUIC handshake, HTTP/2 SETTINGS, SNI/ALPN, распределение пакетов; контрольное браузерное соединение с той же конфигурацией тестового окружения. Публиковать различия, а не только успешный тест.
+- **P0 gate F-13:** packet captures H3/H2 TLS/QUIC handshake, HTTP/2 SETTINGS, SNI/ALPN, распределение пакетов при минимум одном реально настраиваемом browser-like профиле; контрольное браузерное соединение в том же окружении. Публиковать поддерживаемые параметры и различия, а не только «успешный» тест.
 - Проверка BBR: идентификация конкретной реализации congestion controller и сравнительные loss/jitter benchmarks, а не только строковый параметр в TOML.
 
 ## 2. CI pipeline

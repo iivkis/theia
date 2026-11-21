@@ -7,18 +7,20 @@
 | Этап | Вертикальный срез | Тест/критерий завершения |
 | --- | --- | --- |
 | M0 | Документация, AGENTS, TOML examples, docs-only CI | структура спецификации проверяется CI; работающая функциональность **не заявлена** |
+| M0.1 | **Feasibility spike** H2/H3 full-duplex + BBR + fingerprint backend (без заявления о готовой функции) | ADR: выбранные crate/API, HTTP request/response одновременно открыты, BBR доступен с обеих сторон, TLS profile управляем или зафиксирован блокер |
 | M1.1 | Cargo workspace, единый `theia` CLI, `--help`/`--version`, роли | unit/CLI integration tests; Windows/Linux compile; `Cargo.lock` |
 | M1.2 | Typed TOML v1 + validator + atomic store | round-trip, unknown keys, duplicate ID, missing refs, atomic rollback, file perms |
 | M1.3 | SmartTheia pure frame codec + FSM | golden vectors, max frame guard, chunk fragmentation, malformed/unknown frames, fuzz |
-| M2.1 | TLS/H2 server inbound + bearer auth + TCP dial + ACL | real loopback TLS echo; bad cert/token, DNS rebinding, private IP rejection |
-| M2.2 | Local HTTP CONNECT/SOCKS5 + client H2 | browser/curl CONNECT and SOCKS5 E2E on Linux+Windows; half-close, cancellation |
+| M2.1 | TLS/H2 server inbound + bearer auth + TCP dial + ACL | real loopback TLS echo с **test-only** allow-private; bad cert/token, cross-inbound rejection, DNS rebinding, private IP rejection default |
+| M2.2 | Local HTTP CONNECT/SOCKS5 + client H2 | browser/curl E2E Windows/Linux; local 200/SOCKS success **only after** OPEN_OK; remote DNS, half-close, cancellation |
 | M3.1 | H3/QUIC transport with same app frames | H3↔server loopback E2E, HTTP/3 state and security invariants |
 | M3.2 | QUIC-first selector + safe H2 fallback | UDP blocked → H2; wrong cert/token → no fallback; TTL; network change |
-| M3.3 | BBR verified on chosen quinn version | actual congestion selection, packet loss benchmarks, no unverifiable flag |
+| M3.3 | P0: BBR verified on chosen quinn version | client+server send controllers verified, packet loss benchmarks, no silent CUBIC substitute |
+| M3.4 | P0: uTLS-like fingerprint profile | как минимум один измеренный named browser-like TLS/H2/H3 профиль Windows/Linux, PCAP/отчёт расхождений; если backend не позволяет, M5 заблокирован |
 | M4.1 | ratatui landing + server/client panels | focus/resize/dirty/save/validation UI tests, two independent modes |
 | M4.2 | Local management IPC + reload | ACL, status, transactional apply, rollback, no open admin TCP port |
 | M4.3 | Windows system proxy integration | WinINet user settings backup/apply/CAS restore, manual Windows smoke tests |
-| M5 | Hardening/release | Linux and Windows full E2E matrix, security checklist, release notes, binary artifacts |
+| M5 | Hardening/release (все P0 обязаны пройти) | Linux/Windows E2E, BBR + named fingerprint evidence, Windows proxy recovery, security checklist, release notes |
 | P1+ | UDP relay, fingerprint profiles, UX extras | protocol extension and reproducible fingerprint comparison, separate PRs |
 
 **Нельзя переходить на следующий этап, скрыв невыполненные требования в silent fallback.** Зависимость «Windows proxy» подразумевает наличие работающего loopback HTTP proxy.
@@ -47,7 +49,7 @@
 ## Технические решения, которые агент фиксирует ADR
 
 - Конкретная версия quinn и API BBR, совместимость h3.
-- TLS backend для optional browser-like fingerprint profile и его реальный footprint.
+- TLS backend для **обязательного P0** browser-like fingerprint profile и его реальный footprint; при технической невозможности открыть блокирующий ADR, не помечать задачу готовой.
 - Семантика half-close на HTTP streaming adapter (тест на обоих транспортах).
 - Политика DNS resolve и фильтрация адресов, включая IPv6.
 - Выбор OS proxy APIs и crash recovery format.
