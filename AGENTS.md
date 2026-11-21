@@ -49,7 +49,7 @@
 ## Зависимости, CI, оптимизация
 
 - Фиксировать версии в `Cargo.lock`; сначала выбрать минимальное количество зрелых crates. Проверять их API по текущей документации.
-- `spikes/m0_1` — **изолированный исследовательский crate**, а не production workspace. Реальные Linux/Windows loopback тесты подтверждают HTTP/2 over TCP/TLS 1.3, HTTP/3 over QUIC/TLS, strict hostname/ALPN и активный BBR class на обоих peers. Это **не** готовый proxy и **не** подтверждение P0 BBR-loss/jitter/throughput или uTLS-like profile. Перед переносом кода в один бинарник свериться с `docs/adr/0004-m0-1-feasibility.md`.
+- `spikes/m0_1` — **изолированный исследовательский crate**, а не production workspace. Реальные Linux/Windows loopback тесты подтверждают HTTP/2 over TCP/TLS 1.3, HTTP/3 over QUIC/TLS, strict hostname/ALPN и активный BBR class на обоих peers. Контролируемый синтетический UDP drop test показывает recovery 768 КиБ, H2 credit-window тест показывает recovery/half-close 1 МиБ. Это **не** готовый proxy и **не** сравнительный P0 BBR RTT/jitter/throughput benchmark или uTLS-like profile. Перед переносом кода в один бинарник свериться с `docs/adr/0004-m0-1-feasibility.md`.
 - Базовые команды: `cargo test --workspace --all-targets --locked`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 - CI сначала проверяет спецификацию и тесты, затем lint/build; кэш cargo/target через `Swatinem/rust-cache`; Windows проверяется нативно.
 - Никакой микрооптимизации без замеров и регрессий в тестах. Производительность в `docs/TESTING_CI.md` — измеряется на одинаковых условиях.
