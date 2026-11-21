@@ -52,10 +52,19 @@ jobs:
         with:
           workspaces: "spikes/m0_1 -> target"
           key: "m0-1"
+      - name: Refresh isolated spike lockfile for added test-only dependencies
+        run: cargo generate-lockfile --manifest-path spikes/m0_1/Cargo.toml
       - name: Test actual HTTP/2 duplex and API probes
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
+      - name: Emit updated lockfile for version pinning
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          print("THEIA_M01_LOCK_START:" + base64.b64encode(Path("spikes/m0_1/Cargo.lock").read_bytes()).decode() + ":THEIA_M01_LOCK_END")
+          PY
       - name: Validate pinned dependency tree
         run: cargo metadata --manifest-path spikes/m0_1/Cargo.toml --locked --format-version 1 --no-deps > /dev/null
 
