@@ -21,6 +21,8 @@
 | Безопасный bounded parser, malformed records и duplicate extensions | PASS |
 | H3 ClientHello внутри настоящего зашифрованного QUIC Initial packet | OPEN |
 | **Go uTLS v1.8.2 HelloChrome_133 H2/TLS эталон** вместо захватов браузера | PASS: generated first flight, сравнение с rustls, Linux/Windows CI |
+| **Реальное TCP/TLS 1.3 + H2 Go uTLS → Rust h2 loopback** | PASS Linux/Windows: на TCP обнаружены GREASE/ALPS, x509 trust chain, SNI, ALPN h2, GET/204, wrong-name/untrusted-CA fail closed |
+| **Browser-like TLS/H2 в едином Rust бинарнике** | **OPEN**: Go uTLS network helper запускается только из CI и не встроен в Rust Theia |
 | QUIC/H3-совместимый эталон (Go uTLS TCP H2 для этого недостаточно) | OPEN |
 | Изменение полного набора browser TLS extensions, ordering, GREASE, ALPS, сигнатур на обеих OS | OPEN |
 | H2 SETTINGS/pseudo-header ordering и H3 SETTINGS/priority сопоставлены с эталоном | OPEN |
@@ -102,3 +104,29 @@ rm -f /tmp/theia-utls-h2.bin
 ```
 
 **Граница:** этот Go-инструмент пока служит **только эталоном**, не TLS-бэкендом Rust Theia. Поставка остаётся одним Rust binary; Go не является runtime-зависимостью. Go uTLS TCP/H2 ClientHello не содержит mandatory QUIC transport parameters, не подключён к crypto trait Quinn и не создаёт H3 SETTINGS. Для F-13 нужны реальное изменение TLS fingerprint на H2/H3, отдельный совместимый QUIC эталон, сравнение действительного сетевого выхода Theia и CI на обеих ОС. Ни одна из этих частей пока не объявлена готовой.
+
+## Измерение настоящего Go uTLS TCP/H2 соединения (M0.1 PR #13)
+
+`spikes/m0_1/utls_reference/cmd/h2_probe/main.go` теперь использует pinned `HelloChrome_133` не только для генерации эталонного буфера, а для **настоящего** TLS 1.3 соединения с Rust сервером на `127.0.0.1`. Rust тест `spikes/m0_1/tests/utls_h2_loopback.rs` извлекает первый TLS ClientHello через `TcpStream::peek` **до TLS accept**, затем проверяет настоящую сессию Rust `h2 0.4.19`.
+
+На обеих ОС проверяются три сценария:
+- **Успех**: Go uTLS посылает TCP ClientHello с `h2,http/1.1`, GREASE, ALPS и SNI. Go проверяет x509 цепочку/hostname через `RootCAs` и **не** использует `InsecureSkipVerify`. Negotiated TLS 1.3 и ALPN `h2`; Go отправляет минимальный HTTP/2 preface, SETTINGS, GET HEADERS, Rust возвращает HTTP 204.
+- **Wrong-hostname**: Go требует `wronghost`, certificate SAN содержит только `localhost`. Клиент должен получить `x509.HostnameError`, не послать H2.
+- **Untrusted-CA**: пустой root pool, Go должен получить `x509.UnknownAuthorityError`, не послать H2.
+
+Проверка снимает структурные признаки ClientHello с реального локального TCP-сокета. **Нет** журналирования SNI, key share, TLS random, полного сертификата или сырых TLS-байт. Отдельный Go test запрещает тестовому CLI подключения вне loopback; Go test-only binary **не** распространяется и не запускается в production. Запрос GET реализован минимальными стандартными H2 фреймами, а **не** браузерным профилем H2 SETTINGS/priority.
+
+**Критическая граница:** это реальный Go uTLS *клиент*, подключённый к Rust H2 *серверу*. В Windows/Linux CI Go бинарник собирается специально для теста, он **не** является TLS бэкендом Rust Theia. Требование одного Rust binary сохраняется. Настоящее имитирующее `ClientHello` поведение Rust H2 клиента и отдельный QUIC/H3 профиль **OPEN/P0**. Единичный GET не доказывает full-duplex SmartTheia adapter, а факт присутствия GREASE/ALPS не обеспечивает точного соответствия Chrome.
+
+Исходные доказательства: https://github.com/iivkis/theia/actions/runs/44952081857 (Linux/Windows, 3/3 network E2E tests); финальный PR CI: https://github.com/iivkis/theia/pull/13.
+
+```sh
+# CI builds the helper after Go dependencies are verified:
+cd spikes/m0_1/utls_reference
+go test ./...
+go build -o /tmp/theia-utls-h2-probe ./cmd/h2_probe
+cd ../../..
+THEIA_UTLS_H2_PROBE=/tmp/theia-utls-h2-probe cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_h2_loopback -- --ignored --nocapture
+```
+
+Для M3.4 по-прежнему нужен кроссплатформенный H2 TLS backend *внутри одного Rust бинарника* и отдельная проверка QUIC/H3. Использовать Go uTLS для эталона и CI допустимо, автоматически объявлять его production backend нельзя.
