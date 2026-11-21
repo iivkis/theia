@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     io::BufReader,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     sync::Arc,
     time::Duration,
@@ -190,7 +190,7 @@ fn decode_digest(raw: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0; 32];
-    for (index, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         fn nibble(b: u8) -> Option<u8> {
             match b {
                 b'0'..=b'9' => Some(b - b'0'),
