@@ -145,3 +145,102 @@ async fn h3_quic_rejects_wrong_server_hostname() {
         server_task.await.expect("handshake task");
     }).await.expect("rejection test timed out");
 }
+
+
+/// Eight independent HTTP/3 bidirectional streams share one authenticated
+/// QUIC/TLS connection. All headers arrive before the server responds on any
+/// stream, proving multiplexing rather than sequential connection reuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h3_quic_eight_concurrent_bidirectional_streams() {
+    const STREAMS: usize = 8;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (server_endpoint, client_endpoint, addr) = endpoints();
+        let (client_done_tx, client_done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.expect("QUIC connection");
+            let connection = incoming.await.expect("verified TLS/QUIC");
+            assert_h3_and_bbr(&connection);
+            let mut h3 = h3::server::Connection::new(h3_quinn::Connection::new(connection))
+                .await.expect("H3 session");
+
+            let mut resolvers = Vec::new();
+            for _ in 0..STREAMS {
+                let resolver = h3.accept().await.expect("H3 stream").expect("request");
+                resolvers.push(resolver);
+            }
+            let handlers: Vec<_> = resolvers.into_iter().map(|resolver| {
+                tokio::spawn(async move {
+                    let (request, mut stream) = resolver.resolve_request().await.expect("POST headers");
+                    let i = request.uri().path().strip_prefix("/v1/session/")
+                        .expect("request route").parse::<u8>().expect("stream id");
+                    assert_eq!(request.method(), http::Method::POST);
+                    let mut initial = stream.recv_data().await
+                        .expect("initial DATA").expect("nonempty body");
+                    assert_eq!(initial.copy_to_bytes(initial.remaining()), Bytes::from(vec![i]));
+
+                    // Respond while request stream is still open.
+                    stream.send_response(
+                        http::Response::builder().status(200).body(()).unwrap(),
+                    ).await.expect("early H3 response");
+                    stream.send_data(Bytes::from(vec![i])).await.expect("first reply");
+
+                    let mut second = stream.recv_data().await
+                        .expect("later request DATA").expect("phase-2");
+                    assert_eq!(second.copy_to_bytes(second.remaining()),
+                               Bytes::from(vec![i.wrapping_add(1)]));
+                    assert!(stream.recv_data().await.expect("request EOF").is_none());
+                    stream.send_data(Bytes::from(vec![i.wrapping_add(1)]))
+                        .await.expect("second reply");
+                    stream.finish().await.expect("response FIN");
+                })
+            }).collect();
+
+            client_done_rx.await.expect("client read all replies");
+            for handler in handlers {
+                handler.await.expect("independent H3 stream handler");
+            }
+        });
+
+        let connection = client_endpoint.connect(addr, "localhost")
+            .expect("QUIC connect").await.expect("verified certificate");
+        assert_h3_and_bbr(&connection);
+        let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+            .await.expect("H3 client");
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let mut active = Vec::new();
+        for i in 0..STREAMS {
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("https://localhost/v1/session/{i}"))
+                .body(()).unwrap();
+            let mut stream = sender.send_request(request).await.expect("open H3 stream");
+            stream.send_data(Bytes::from(vec![i as u8]))
+                .await.expect("send phase-1 without EOF");
+            active.push((i as u8, stream));
+        }
+
+        for (i, mut stream) in active {
+            let response = stream.recv_response().await
+                .expect("early H3 response before request EOF");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let mut first = stream.recv_data().await.expect("first reply").expect("DATA");
+            assert_eq!(first.copy_to_bytes(first.remaining()), Bytes::from(vec![i]));
+
+            stream.send_data(Bytes::from(vec![i.wrapping_add(1)]))
+                .await.expect("phase-2 while reading response");
+            stream.finish().await.expect("request FIN");
+            let mut second = stream.recv_data().await.expect("second reply").expect("DATA");
+            assert_eq!(second.copy_to_bytes(second.remaining()), Bytes::from(vec![i.wrapping_add(1)]));
+            assert!(stream.recv_data().await.expect("response EOF").is_none());
+        }
+
+        client_done_tx.send(()).expect("server alive");
+        server.await.expect("server task");
+        driver_task.abort();
+        client_endpoint.close(0u32.into(), b"done");
+    }).await.expect("eight concurrent QUIC/H3 streams timed out");
+}
