@@ -25,10 +25,10 @@
 | H2 response до request EOF | `http2_response_before_request_eof`: настоящий in-memory h2 handshake, POST с открытым body, HTTP response приходит до body EOF, затем сервер получает оставшиеся bytes | **PASS** в Linux CI (без TLS); TLS-backed H2 E2E ещё **OPEN** |
 | QUIC BBR factory | Rust код создаёт `TransportConfig` с `Arc<BbrConfig>`; API применимости к `ClientConfig`/ `ServerConfig` проверен компилятором | **API PASS**, но BBR *не проверен в реальном QUIC соединении*; algorithm telemetry/loss bench **OPEN** |
 | H3 split | Компиляция generic API для `h3::client::RequestStream::split` и `h3::server::RequestStream::split`, тип bridge `h3_quinn::Connection` | **API PASS**, но H3 QUIC TLS и реальный full-duplex **OPEN** |
-| Windows x64 | Независимый native Windows CI spike тестирует API и h2 | **На проверке в PR**; WinINet/TUI не затрагиваются |
+| Windows x64 | Независимый native Windows CI spike тестирует API и h2 | **PASS** в Windows-native CI (без Windows System Proxy); WinINet/TUI не затрагиваются |
 | uTLS-like TLS fingerprint | Рассмотрены upstream rustls/Quinn ограничения и сторонние fork/BoringSSL варианты; нет проверенного одинакового профиля H3/H2 | **BLOCKER P0**; не считать feature реализованной и не включать профили кроме `default` |
 
-CI свидетельство первого успешного Linux spike: https://github.com/iivkis/theia/actions/runs/44938796454 (3/3 tests; `cargo check --all-targets` success). CI может поменять последующие SHA: проверять job после merge.
+CI свидетельства: https://github.com/iivkis/theia/actions/runs/44938796454 (первый Linux: 3/3 tests; `cargo check --all-targets` success) и https://github.com/iivkis/theia/actions/runs/44939068608 (Linux **и Windows native** spike успешны при закреплённом `Cargo.lock`). Эти тесты доказывают только явные свойства API/HTTP2, но не релизные критерии QUIC/TLS.
 
 ## Технические выводы
 
@@ -66,7 +66,8 @@ Quinn поддерживает pluggable crypto abstraction, но докумен
 - [ ] TLS-backed H2 over TCP TLS 1.3, ALPN h2, full-duplex with body backpressure.
 - [ ] BBR selected on both actual endpoints + loss/jitter comparison, logs do not expose credentials.
 - [ ] Один проверяемый кросс-платформенный uTLS-like profile для H2 **и** H3; packet captures с поддерживаемыми/несовпадающими полями.
-- [ ] Windows native spike CI + затем отдельный Windows system proxy VM smoke (M4.3).
+- [x] Windows native spike CI пройден (API/H2).
+- [ ] Windows system proxy VM smoke (M4.3) — не относится к scope spike.
 - [ ] Security audit и лицензии всех production dependency candidates.
 
 Только после выполнения этих пунктов агент имеет право пометить `M0.1` как **complete**. До этого — **partial**; принцип «не изображать готовность» обязателен.

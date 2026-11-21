@@ -143,7 +143,12 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("congestion::BbrConfig", source)
         self.assertIn("h3_client_has_split", source)
         self.assertNotIn("mod theia", source)
-        self.assertFalse((ROOT / "Cargo.toml").is_file(), "M0.1 alone must not pretend theia workspace exists")
+        # M1.1 will add a root workspace; do not make this spike test a future CI blocker.
+        root_manifest = ROOT / "Cargo.toml"
+        if root_manifest.is_file():
+            workspace = tomllib.loads(root_manifest.read_text(encoding="utf-8")).get("workspace", {})
+            self.assertNotIn("spikes/m0_1", workspace.get("members", []),
+                             "Research-only spike must not be part of the production workspace")
 
     def test_ci_tests_first_and_cached(self):
         workflow = read(".github/workflows/ci.yml")
