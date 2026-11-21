@@ -24,11 +24,11 @@
 | --- | --- | --- |
 | H2 response до request EOF | `http2_response_before_request_eof`: настоящий in-memory h2 handshake, POST с открытым body, HTTP response приходит до body EOF, затем сервер получает оставшиеся bytes | **PASS** в Linux CI (без TLS); TLS-backed H2 E2E ещё **OPEN** |
 | QUIC BBR active state | Реальный QUIC loopback TLS H3 тест использует `BbrConfig` на обоих endpoints, проверяет `Connection::congestion_state().into_any().downcast::<Bbr>()` **и у клиента, и у сервера** | **ACTIVE CONTROLLER PASS** на Linux; loss/jitter benchmarks **OPEN** |
-| H3 real QUIC/TLS and streaming | Настоящие UDP sockets, TLS cert generated for localhost (trusted test root, no custom verifier), ALPN `h3`, send request phase-1, receive response before request EOF, then phase-2 both ways; wrong hostname rejection | **PASS** в Linux CI, Windows-native rerun отдельно в PR; HTTP3 half-close/cancellation stress **OPEN** |
+| H3 real QUIC/TLS and streaming | Настоящие UDP sockets, TLS cert generated for localhost (trusted test root, no custom verifier), ALPN `h3`, send request phase-1, receive response before request EOF, then phase-2 both ways; wrong hostname rejection | **PASS** в Linux и Windows CI; HTTP3 half-close/cancellation stress **OPEN** |
 | Windows x64 | Независимый native Windows CI spike тестирует API и h2 | **PASS** в Windows-native CI (без Windows System Proxy); WinINet/TUI не затрагиваются |
 | uTLS-like TLS fingerprint | Рассмотрены upstream rustls/Quinn ограничения и сторонние fork/BoringSSL варианты; нет проверенного одинакового профиля H3/H2 | **BLOCKER P0**; не считать feature реализованной и не включать профили кроме `default` |
 
-CI свидетельства: https://github.com/iivkis/theia/actions/runs/44938796454 (первый Linux: 3/3 tests; `cargo check --all-targets` success) и https://github.com/iivkis/theia/actions/runs/44939068608 (Linux **и Windows native** spike успешны при закреплённом `Cargo.lock`). Эти тесты доказывают только явные свойства API/HTTP2, но не релизные критерии QUIC/TLS.
+Сетевое доказательство (5/5 tests) и зафиксированный Cargo.lock: https://github.com/iivkis/theia/actions/runs/44940250307. Ранее CI свидетельства: https://github.com/iivkis/theia/actions/runs/44938796454 (первый Linux: 3/3 tests; `cargo check --all-targets` success) и https://github.com/iivkis/theia/actions/runs/44939068608 (Linux **и Windows native** spike успешны при закреплённом `Cargo.lock`). Эти тесты доказывают только явные свойства API/HTTP2, но не релизные критерии QUIC/TLS.
 
 ## Технические выводы
 
@@ -62,7 +62,7 @@ Quinn поддерживает pluggable crypto abstraction, но докумен
 
 ## Следующие обязательные эксперименты (open)
 
-- [x] Реальный H3 over QUIC localhost client/server, TLS trust verification + ALPN h3, full-duplex before request EOF (Linux), negative wrong hostname; Windows-native acceptance на проверке в PR.
+- [x] Реальный H3 over QUIC localhost client/server, TLS trust verification + ALPN h3, full-duplex before request EOF и negative wrong hostname на Linux **и Windows native CI**.
 - [ ] H3 full-duplex half-close/cancel/backpressure under load — отдельный тест.
 - [ ] TLS-backed H2 over TCP TLS 1.3, ALPN h2, full-duplex with body backpressure.
 - [ ] BBR selected on both actual endpoints + loss/jitter comparison, logs do not expose credentials.
