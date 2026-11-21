@@ -26,7 +26,9 @@ pub enum ParseError {
 impl ClientHelloSummary {
     /// GREASE extension IDs are informative, not a complete browser fingerprint.
     pub fn has_grease_extension(&self) -> bool {
-        self.extensions_in_wire_order.iter().any(|&id| is_grease(id))
+        self.extensions_in_wire_order
+            .iter()
+            .any(|&id| is_grease(id))
     }
 
     /// BoringSSL supports an old and a new application_settings (ALPS)
@@ -338,10 +340,7 @@ mod tests {
     // Append a synthetic extension and update both TLS length prefixes.
     fn append_extension(hello: &mut Vec<u8>, id: u16, value: &[u8]) {
         let extensions_offset = 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1;
-        let old_len = u16::from_be_bytes([
-            hello[extensions_offset],
-            hello[extensions_offset + 1],
-        ]);
+        let old_len = u16::from_be_bytes([hello[extensions_offset], hello[extensions_offset + 1]]);
         hello.extend(id.to_be_bytes());
         hello.extend((value.len() as u16).to_be_bytes());
         hello.extend(value);

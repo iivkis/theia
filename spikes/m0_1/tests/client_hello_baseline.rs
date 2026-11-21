@@ -114,7 +114,6 @@ fn default_h2_and_h3_clienthello_are_distinct_and_not_browser_claims() {
     eprintln!("default rustls GREASE extension counts: h2={h2_grease} h3={h3_grease}");
 }
 
-
 /// A version-pinned negative control: the default rustls 0.23.46 TLS/H2
 /// first flight lacks GREASE and both old/new ALPS codepoints. This is
 /// evidence against *claiming* a Chrome profile, not proof of matching or
@@ -122,10 +121,14 @@ fn default_h2_and_h3_clienthello_are_distinct_and_not_browser_claims() {
 #[test]
 fn default_rustls_h2_cannot_pass_named_browser_gate() {
     let hello = default_tls_h2_clienthello();
-    assert!(!hello.has_grease_extension(),
-        "rustls first flight changed: update fingerprint evidence and comparison");
-    assert!(!hello.has_alps(),
-        "rustls ALPS support changed: update fingerprint evidence and comparison");
+    assert!(
+        !hello.has_grease_extension(),
+        "rustls first flight changed: update fingerprint evidence and comparison"
+    );
+    assert!(
+        !hello.has_alps(),
+        "rustls ALPS support changed: update fingerprint evidence and comparison"
+    );
     assert_eq!(hello.supported_groups, vec![29, 23, 24]);
     eprintln!("named browser profile gate: BLOCKED, GREASE=false ALPS(old/new)=false; no real Chrome capture");
 }

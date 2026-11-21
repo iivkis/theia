@@ -58,16 +58,8 @@ jobs:
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test quic_bbr_loss -- --nocapture
       - name: Fingerprint baseline diagnostics (default rustls, NOT browser profile)
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test client_hello_baseline -- --nocapture
-      - name: Bootstrap formatting for new fingerprint guards
-        run: |
-          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
-          python3 - <<'PY'
-          from pathlib import Path
-          from base64 import b64encode
-          for name, path in (("PARSER", "spikes/m0_1/src/client_hello.rs"), ("BASELINE", "spikes/m0_1/tests/client_hello_baseline.rs")):
-              data = b64encode(Path(path).read_bytes()).decode("ascii")
-              print(f"THEIA_FPGUARD_{name}_START:{data}:THEIA_FPGUARD_{name}_END")
-          PY
+      - name: Rustfmt check for isolated M0.1 spike
+        run: cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
       - name: Validate pinned dependency tree
