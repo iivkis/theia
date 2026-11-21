@@ -34,7 +34,7 @@
 
 - Измерять throughput по H2/H3 и RTT p50/p95 при одинаковых payload/host, CPU, peak RSS, количество аллокаций, потери при 1%/5%, число H3→H2 fallback.
 - CI не должен запускать шумные full benchmarks при каждом PR. Baselines записывать в отчёт на стабильном окружении перед релизом.
-- **P0 gate F-13:** packet captures H3/H2 TLS/QUIC handshake, HTTP/2 SETTINGS, SNI/ALPN, распределение пакетов при минимум одном реально настраиваемом browser-like профиле; контрольное браузерное соединение в том же окружении. Публиковать поддерживаемые параметры и различия, а не только «успешный» тест.
+- **P0 gate F-13:** M0.1 baseline `spikes/m0_1/tests/client_hello_baseline.rs` измеряет default rustls ClientHello для TLS/H2 (TLS record) и QUIC/H3 (plaintext CRYPTO before encryption), выводит IDs/ALPN и не пишет SNI/random/session ID. Это НЕ browser pcap, не named profile. Release gate по-прежнему требует packet captures H3/H2 TLS/QUIC handshake, HTTP/2 SETTINGS, SNI/ALPN, распределение пакетов при минимум одном реально настраиваемом browser-like профиле; контрольное браузерное соединение в том же окружении. Публиковать поддерживаемые параметры и различия, а не только «успешный» тест.
 - Проверка BBR: идентификация конкретной реализации congestion controller и сравнительные loss/jitter benchmarks, а не только строковый параметр в TOML.
 
 ## 2. CI pipeline

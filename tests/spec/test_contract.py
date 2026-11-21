@@ -138,6 +138,17 @@ class SpecContractTests(unittest.TestCase):
         spike = ROOT / "spikes" / "m0_1"
         self.assertTrue((spike / "Cargo.toml").is_file())
         self.assertTrue((spike / "Cargo.lock").is_file())
+        parser = (spike / "src" / "client_hello.rs").read_text(encoding="utf-8")
+        probe = (spike / "tests" / "client_hello_baseline.rs").read_text(encoding="utf-8")
+        for required in ("parse_tls_records", "parse_handshake", "MAX_HELLO",
+                         "extensions_in_wire_order", "quic_transport_parameters_present",
+                         "ParseError::Truncated", "is_grease"):
+            self.assertIn(required, parser)
+        for required in ("rustls::ClientConnection::new", "rustls::quic::ClientConnection::new",
+                         "default_rustls_h2_clienthello", "default_rustls_quic_h3_clienthello",
+                         "write_tls", "write_hs"):
+            self.assertIn(required, probe)
+        self.assertIn("P0 BLOCKER", read("docs/adr/0005-tls-fingerprint-baseline.md"))
         h2_tls = (spike / "tests" / "h2_tls.rs")
         self.assertTrue(h2_tls.is_file())
         loss_test = spike / "tests" / "quic_bbr_loss.rs"
