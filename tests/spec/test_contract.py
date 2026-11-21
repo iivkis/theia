@@ -153,6 +153,19 @@ class SpecContractTests(unittest.TestCase):
                          "write_tls", "write_hs"):
             self.assertIn(required, probe)
         self.assertIn("P0 BLOCKER", read("docs/adr/0005-tls-fingerprint-baseline.md"))
+        go_ref = spike / "utls_reference"
+        self.assertTrue((go_ref / "go.mod").is_file())
+        self.assertTrue((go_ref / "go.sum").is_file())
+        mod = (go_ref / "go.mod").read_text(encoding="utf-8")
+        self.assertIn("github.com/refraction-networking/utls v1.8.2", mod)
+        source = (go_ref / "main.go").read_text(encoding="utf-8")
+        self.assertIn("utls.HelloChrome_133", source)
+        self.assertIn("BuildHandshakeState", source)
+        self.assertIn("os.O_EXCL", source)
+        fixture_test = (spike / "tests" / "utls_reference.rs").read_text(encoding="utf-8")
+        self.assertIn("go_utls_chrome133_is_a_reference_but_not_rustls_or_quic", fixture_test)
+        self.assertIn("THEIA_UTLS_HELLO_PATH", fixture_test)
+        self.assertIn("refraction-networking/utls v1.8.2", read("docs/adr/0005-tls-fingerprint-baseline.md"))
         h2_tls = (spike / "tests" / "h2_tls.rs")
         self.assertTrue(h2_tls.is_file())
         loss_test = spike / "tests" / "quic_bbr_loss.rs"
