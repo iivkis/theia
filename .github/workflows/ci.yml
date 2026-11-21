@@ -38,6 +38,35 @@ jobs:
             echo "rust_ready=false" >> "$GITHUB_OUTPUT"
           fi
 
+  m0-1-api-spike:
+    name: m0-1-api-spike (Linux)
+    needs: specification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "spikes/m0_1 -> target"
+          key: "m0-1"
+      - name: Resolve isolated spike dependencies
+        run: cargo generate-lockfile --manifest-path spikes/m0_1/Cargo.toml
+      - name: Test actual HTTP/2 duplex and API probes
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
+      - name: Check all targets
+        run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
+      - name: Export lockfile for committing after verified run
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          data = Path("spikes/m0_1/Cargo.lock").read_bytes()
+          print("THEIA_M01_LOCK_START:" + base64.b64encode(data).decode("ascii") + ":THEIA_M01_LOCK_END")
+          PY
+
   rust-tests:
     name: rust-tests (Linux)
     needs: specification
