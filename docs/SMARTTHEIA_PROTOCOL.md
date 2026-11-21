@@ -9,7 +9,7 @@
 | primary | QUIC (TLS 1.3), HTTP/3 | `h3` | bidirectional streaming `POST` |
 | fallback | TCP (TLS 1.3), HTTP/2 | `h2` | bidirectional streaming `POST` |
 
-Одинаковый inbound может слушать UDP и TCP **одного номера порта**. TLS cert/hostname проверяется на обоих путях. Клиент посылает `POST /v1/session`; `content-type: application/octet-stream`, `Authorization: Bearer <token>` в защищённых HTTP-заголовках. Сервер отвечает HTTP 200 только после принятия запроса; двунаправленные body несут SmartTheia frames. HTTP-библиотеки должны поддерживать потоковую передачу request и response bodies (не буферизовать запрос целиком).
+Одинаковый inbound может слушать UDP и TCP **одного номера порта**. TLS cert/hostname проверяется на обоих путях. Клиент посылает `POST /v1/session`; `content-type: application/octet-stream`, `Authorization: Bearer <token>` в защищённых HTTP-заголовках. Сервер отвечает HTTP 200 **после проверки HTTP headers, TLS identity и Bearer-права на inbound, но ДО получения всего request body**; двунаправленные body несут SmartTheia frames. Нужен настоящий **full-duplex**: клиент продолжает писать request body и одновременно читает response body, сервер — наоборот. Нельзя ждать EOF request body перед response headers или перед `HELLO_ACK`; иначе неизбежен deadlock. До `OPEN_OK` HTTP 200 означает лишь принятие HTTP-запроса, а не успех целевого TCP dial.
 
 Никаких самодельных открытых UDP handshakes, отдельного нестандартного ALPN или ошибок, отключающих TLS checks. TLS ClientHello и QUIC Initial могут быть видны DPI, HTTP path/Authorization защищены TLS. Определить приложение по статистике или активному probing всё равно возможно.
 
@@ -32,7 +32,7 @@
 
 | Type | Значение | Payload |
 | --- | --- | --- |
-| `0x01` HELLO | клиент → сервер, первым | `version: u16 (=1), capabilities: u32, client_nonce: [u8;16]` |
+| `0x01` HELLO | клиент → сервер, первым | `version: u16 (=1), capabilities: u32` |
 | `0x02` HELLO_ACK | сервер → клиент, первым ответом | `version: u16 (=1), accepted_capabilities: u32` |
 | `0x03` OPEN_TCP | клиент → сервер, после ACK | `addr_type: u8, addr_len: u16, addr: bytes, port: u16` |
 | `0x04` OPEN_OK | сервер → клиент, после OPEN | empty |
@@ -59,6 +59,9 @@ server:  validate HTTP/auth → HELLO → HELLO_ACK → OPEN_TCP
 - EOF до согласования → `TRUNCATED`, EOF после корректного закрытия → нормальное завершение. Остаток неполного frame в EOF всегда ошибка.
 - Ошибки destination dial/ACL отражать `OPEN_ERROR` без раскрытия внутреннего адреса/stack trace; timeout ограничен.
 - Не вводить `stream_id` и сложную очередность при v1: один HTTP-stream равен одному upstream TCP-соединению.
+- **Proxy success gate:** локальный HTTP CONNECT получает `200 Connection Established`, SOCKS5 получает `REP=0x00` **только** после `OPEN_OK`. `OPEN_ERROR` конвертируется в HTTP 403/502/504 или подходящий SOCKS5 REP; локальное соединение не обозначается как работающее до успешного dial. Отказы TLS/auth/HELLO/OPEN не должны подтверждать локальному приложению соединение.
+- HTTP/2 и HTTP/3 request/response body могут оставаться открытыми одновременно; `FIN` в SmartTheia означает half-close передаваемого направления, а не автоматическое закрытие обоих HTTP-направлений. После `FIN` нельзя передать `DATA` в том же направлении. Код адаптера обязан доказать управление flow control и отменой.
+- Состояния UI: `local_proxy_listening` (локальные listeners готовы), `transport_authenticated` (HTTP Bearer + HELLO_ACK), `tunnel_open` (получен OPEN_OK). Одно состояние не подменяет другое.
 
 ### Codes v1
 
@@ -67,11 +70,12 @@ server:  validate HTTP/auth → HELLO → HELLO_ACK → OPEN_TCP
 ## 4. Аутентификация и антизлоупотребления
 
 - TLS hostname и certificate chain валидируются **до** отправки токена.
-- Каждый request проходит Bearer authentication: клиентский токен = 32 байта криптографически случайных данных (представление hex/base64url, формат выбрать и закрепить тестом); сервер хранит SHA-256 digest, использует constant-time comparison. Не принимать короткие пароли вместо токенов.
+- Каждый request проходит Bearer authentication: клиентский токен = **32 случайных байта**, передаваемых в виде **canonical base64url без padding**; сервер хэширует SHA-256 от **декодированных 32 байт**, а не от строки, и сравнивает digest constant-time. Не принимать короткие пароли или digest вместо токенов. Token hash должен быть уникален в глобальном каталоге пользователей.
+- После проверки токена сервер идентифицирует `server.users[].id` и допускает request **только при включении ID в `server.inbounds[].allowed_user_ids` выбранного listener**. Отключённые пользователи и неназначенные токены не получают никаких привилегий, даже если их хеш присутствует в другом inbound. Не выбирать inbound по HTTP `Host`/`:authority`.
 - Ошибка auth HTTP 401/403 до создания remote dial; отсутствие Authorization нельзя пропускать. Rate limit по IP и user id; не писать auth headers в лог.
 - TLS session resumption допустим, QUIC/HTTP 0-RTT отключён в v1 во избежание 0-RTT replay.
 - Ограничения: request header/body budgets, caps для конкурентных streams, таймаут handshake, ограничение исходящих соединений и DNS lookup.
-- Не доверять DNS имени: после resolution проверять каждый IP на deny policy, сохранять выбранный разрешённый IP для dial.
+- При доменном `OPEN_TCP` клиент отправляет ASCII IDNA hostname, а не выполняет локальный DNS lookup. Сервер резолвит имя, проверяет **каждый** полученный IP на deny policy; выбирает только разрешённый IP и использует **именно этот закреплённый IP** для dial (повторный непроверенный resolve запрещён). При IP literal сервер также проверяет policy. Тесты TCP echo на `127.0.0.1` используют исключительно явную **тестовую** конфигурацию `allow_private_ips=true`; production default — false.
 
 ## 5. QUIC-first и безопасный fallback
 
@@ -88,14 +92,24 @@ UDP_ASSOCIATE/UDP relay позже, через отдельное докумен
 ## 7. DPI/fingerprint требования
 
 - Цель: снизить **тривиальную сигнатурную отличимость**, сохраняя стандарты HTTP/3 и HTTP/2. Не гарантируется обход любого DPI или активного анализа.
-- Проверить TLS fingerprint profile как самостоятельный P1-компонент: ClientHello cipher/extension ordering, SNI, ALPN, HTTP/2 SETTINGS, H3 fingerprint и согласованность с профилем. Только смена User-Agent **не** равна uTLS.
+- **P0, блокирует релиз:** минимум один именованный browser-like профиль, отличный от `default`, с реальной настройкой подтверждённых параметров TLS/HTTP fingerprint в выбранном стеке. Проверять ClientHello cipher/extension ordering, SNI, ALPN, HTTP/2 SETTINGS и HTTP/3/QUIC fingerprint, согласованность с выбранным контрольным клиентом; результаты и неизбежные расхождения публиковать. Только смена User-Agent **не** равна uTLS. Нельзя заявлять поддерживаемый профиль, если underlying TLS backend не позволяет реализовать заявленные изменения.
+- Профиль применяется при H3 и H2 там, где соответствующие параметры существуют; ALPN `h3`/`h2` и корректное RFC-поведение обязательны, не «подгонять» протокол к неподдерживаемому браузерному следу. P0 требует измеряемой конфигурации fingerprint, **не** идентичности браузеру.
 - Не использовать ложное заявление о стандартном HTTP/3, если реально посылается raw QUIC с частным ALPN.
 - Passive capture tests: сравнивать pcap TLS/QUIC/HTTP metadata, длины, тайминги, частоту ретраев с выбранным контрольным клиентом; вести результаты и ограничения по версиям.
 - Active probing: rate limiting, auth, корректные HTTP status и отсутствие выдачи диагностического баннера неавторизованным клиентам. Это уменьшает тривиальный fingerprint, но не исключает классификацию.
 - В документации запрещены абсолютные заявления вроде «невозможно обнаружить через DPI».
 
+### Golden vectors v1 (hex, без пробелов между chunk boundaries)
+
+- HELLO (v1, capabilities=0, payload=6): `01 00 00 00 00 06 00 01 00 00 00 00`.
+- HELLO_ACK (v1, accepted_capabilities=0): `02 00 00 00 00 06 00 01 00 00 00 00`.
+- FIN (empty payload): `11 00 00 00 00 00`.
+- OPEN_ERROR (POLICY_DENIED=3): `05 00 00 00 00 02 00 03`.
+
+Тесты должны проверять **точные байты** и декодирование этих векторов, а не только поиск строки в документации. Если изменить wire, нужно явно версионировать протокол, а не молча переписать golden tests.
+
 ## 8. Контрактные тесты
 
-Golden byte vectors для всех type/payload, endian, границ 0/65536/65537, UTF-8+IDNA, неизвестных type/flags, фрагментации HTTP body, двойного FIN, EOF, 0-RTT denial; fuzz decode no-panic. E2E: TCP echo through H3, H2 при отключённом UDP, отсутствие fallback при bad cert/token, DNS policy, slow readers, half-close, cancellation.
+Golden byte vectors для всех type/payload (включая HELLO payload **ровно 6 байт**), endian, границ 0/65536/65537, UTF-8+IDNA, неизвестных type/flags, фрагментации HTTP body, двойного FIN, EOF, 0-RTT denial; fuzz decode no-panic. Проверять HTTP/2+HTTP/3 **full-duplex** без ожидания EOF запроса; HTTP 200 до `OPEN_OK`, но local HTTP CONNECT 200 / SOCKS5 success **строго после** OPEN_OK; cross-inbound token rejection и server-side DNS without local resolver calls. E2E: TCP echo through H3, H2 при отключённом UDP, отсутствие fallback при bad cert/token, DNS policy, slow readers, half-close, cancellation.
 
 Нормативные транспортные стандарты: RFC 9000/9001 (QUIC), RFC 9114 (HTTP/3), RFC 9113 (HTTP/2), RFC 8446 (TLS 1.3).

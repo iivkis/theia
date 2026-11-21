@@ -6,6 +6,8 @@ enabled = true
 
 [[server.inbounds]]
 id = "public"
+# Access to each inbound must be granted explicitly to global user IDs.
+allowed_user_ids = ["device-a"]
 # UDP and TCP can use the same numeric port.
 quic_listen = "0.0.0.0:443"
 h2_listen = "0.0.0.0:443"

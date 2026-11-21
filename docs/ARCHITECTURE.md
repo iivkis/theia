@@ -58,9 +58,9 @@ fuzz/                  # необязательный отдельный workspa
 
 ## 3. Контракт между transport и протоколом
 
-Порт `SmartStream` предоставляет асинхронные `read/write/flush/shutdown` с backpressure и отменой. Адаптеры H3 и H2 реализуют его с HTTP-запросом `POST` и потоковыми request/response bodies. Поверх каждого HTTP-stream — один логический TCP dial, так что **дополнительный multiplexing в v1 не нужен**: его уже делает HTTP/2 или HTTP/3. Контрольный HELLO/OPEN и DATA остаются одинаковыми при обеих схемах.
+Порт `SmartStream` предоставляет асинхронные `read/write/flush/shutdown` с backpressure и отменой. Адаптеры H3 и H2 реализуют его с HTTP-запросом `POST` и потоковыми request/response bodies. Поверх каждого HTTP-stream — один логический TCP dial, так что **дополнительный multiplexing в v1 не нужен**: его уже делает HTTP/2 или HTTP/3. Контрольный HELLO/OPEN и DATA остаются одинаковыми при обеих схемах. **H2/H3 full-duplex обязателен**: сервер может отправить HTTP 200 и `HELLO_ACK` при открытом request body, клиент продолжает писать DATA при чтении response DATA. До `OPEN_OK` локальный HTTP CONNECT/SOCKS5 не отвечает успехом. Запретить адаптер, буферизующий request body целиком.
 
-Приёмный HTTP-сервер сначала валидирует путь, метод, TLS, Authorization, затем даёт stream процессору; неизвестные endpoint — обычный отказ HTTP. Исключить логирование Authorization.
+Приёмный HTTP-сервер сначала валидирует путь, метод, TLS, Authorization, **назначение пользователя конкретному inbound по listener**, затем даёт stream процессору; неизвестные endpoint — обычный отказ HTTP. Глобальная запись пользователя не даёт доступ к другим inbound. Host/`:authority` не переопределяет авторизуемый inbound. Исключить логирование Authorization.
 
 ## 4. Выбор транспорта и отказоустойчивость
 
@@ -78,7 +78,7 @@ ACTIVE_H3/H2 → stream ends → CLOSED
 - Не делать fallback из-за ошибки удалённого TCP-dial на сервере; это ошибка destination, а не QUIC.
 - TLS hostname validation одинаково строгая в обеих ветках. Никакого insecure toggle в публичном релизе.
 - При обрыве живого потока не «продолжать» его на новом транспорте: это не поддерживаемая миграция.
-- QUIC congestion controller: настроить BBR, если выбранная версия quinn предоставляет проверенную реализацию. Если нет, блокировать обещание F-11, а не подменять код молчаливым CUBIC.
+- QUIC congestion controller: BBR — **P0 release gate**. Выбранный QUIC backend должен реально поддерживать BBR и на client send, и на server send. Проверить установленную реализацию и тесты под loss/jitter, не подменять молча CUBIC. До реализации/замеров продукт не заявляется готовым.
 - Backpressure: bounded channels; ограничение одновременно открытых HTTP-streams и remote dials; timeouts с отменой.
 
 ## 5. Хранилище и конфигурация
@@ -91,11 +91,13 @@ ACTIVE_H3/H2 → stream ends → CLOSED
 
 ## 6. Безопасность и эксплуатация
 
-- Удалённый inbound должен защищаться TLS 1.3 и токеном пользователя, серверной policy с проверкой destination IP **после DNS resolution** (SSRF/rebinding), квотами и rate limit.
+- Удалённый inbound должен защищаться TLS 1.3, **inbound-scoped** пользовательским токеном и policy с проверкой destination IP **после DNS resolution** (SSRF/rebinding), квотами и rate limit. При доменном CONNECT/SOCKS5 клиент не вызывает локальный resolver; передаёт имя серверу, который dial закреплённого IP после ACL. Для E2E на loopback нужен отдельный тестовый allow-private fixture.
 - Токен клиента — secure file/env; сервер хранит только SHA-256 high-entropy token. Сравнение в constant time, максимум 256-bit random input, без слабых пользовательских паролей.
 - Защита от исчерпания RAM/CPU: жёсткие ограничения фреймов, concurrent connection caps, timeout и предсказуемая обработка EOF/half-close.
 - Логи: уровни и агрегированные метрики без целевых URL, payload, токенов по умолчанию; opt-in debug с предупреждением о метаданных.
 - Протокольная и transport реализация должны быть тестируемы через fake streams и локальные localhost TLS endpoints без внешних сетевых зависимостей.
+- Клиентский `local_proxy_listening` не равен `transport_authenticated` и не равен `tunnel_open`; отображать статусы отдельно. `theia client run` сам не включает системный proxy: Windows изменение возможно только после подтверждённого TUI-действия в режиме `manual` и с безопасным snapshot/restore.
+- Browser-like TLS/HTTP fingerprint профиль P0 требует отдельного benchmark/capture gate; до выбора TLS backend проверить реализуемость профилей вместе с h3/h2 и quinn. Нельзя тайно менять security settings ради «похожести».
 
 ## 7. Обоснование выбора технологий
 
