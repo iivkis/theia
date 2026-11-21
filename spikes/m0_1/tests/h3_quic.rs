@@ -64,6 +64,7 @@ async fn h3_quic_tls_full_duplex_and_active_bbr_on_both_sides() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let (server_endpoint, client_endpoint, server_addr) = endpoints();
 
+        let (client_done_tx, client_done_rx) = tokio::sync::oneshot::channel::<()>();
         let server_task = tokio::spawn(async move {
             let incoming = server_endpoint.accept().await.expect("incoming QUIC");
             let conn = incoming.await.expect("TLS handshake");
@@ -87,8 +88,8 @@ async fn h3_quic_tls_full_duplex_and_active_bbr_on_both_sides() {
             assert_eq!(second.copy_to_bytes(second.remaining()), Bytes::from_static(b"phase-2"));
             stream.send_data(Bytes::from_static(b"reply-2")).await.expect("second response");
             stream.finish().await.expect("finish response");
-            // Keep both endpoints alive until client has consumed response.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Keep endpoint and the H3 connection alive until the client confirms EOF.
+            client_done_rx.await.expect("client consumed response");
         });
 
         let conn = client_endpoint.connect(server_addr, "localhost")
@@ -120,6 +121,7 @@ async fn h3_quic_tls_full_duplex_and_active_bbr_on_both_sides() {
             Bytes::from_static(b"reply-2"),
         );
         assert!(stream.recv_data().await.expect("response EOF").is_none());
+        client_done_tx.send(()).expect("server waiter alive");
 
         server_task.await.expect("server task");
         driver_task.abort();
