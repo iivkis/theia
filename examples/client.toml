@@ -10,6 +10,7 @@ server = "edge.example.org:443"
 server_name = "edge.example.org"
 # THEIA_AUTH_TOKEN must contain base64url(no-padding) of 32 random bytes.
 auth_token = "env:THEIA_AUTH_TOKEN"
+tls_profile = "default"
 transport = "auto"
 quic_connect_timeout_ms = 1600
 quic_negative_cache_ttl_s = 900
@@ -17,7 +18,7 @@ quic_negative_cache_ttl_s = 900
 [client.proxy]
 http_listen = "127.0.0.1:7890"
 socks5_listen = "127.0.0.1:7891"
-# off / manual / on; never enable OS-wide proxy accidentally.
+# Only off/manual are allowed. Manual needs a separate user-confirmed TUI action.
 system_proxy = "off"
 
 [management]

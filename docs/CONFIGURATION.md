@@ -21,6 +21,7 @@ enabled = true
 
 [[server.inbounds]]
 id = "public"
+allowed_user_ids = ["device-a"]
 quic_listen = "0.0.0.0:443"
 h2_listen = "0.0.0.0:443"
 server_name = "edge.example.org"
@@ -49,7 +50,9 @@ language = "ru"
 **Rules:**
 - `inbounds[].id` уникален; ID не пустой, regexp `[a-zA-Z0-9_-]{1,64}`. Дубли bind IP+port+transport запрещены. UDP и TCP на одинаковом порту разрешены.
 - TLS `server_name` обязательное валидное DNS-имя; сертификат должен ему соответствовать. File refs разрешаются с запретом выхода за разрешённую директорию секрета при необходимости.
-- Каждый user ID уникален; `token_sha256` — строго 64 lower-case hex symbols (placeholder не принимается). Уровень защиты зависит от случайности исходного токена: обязателен CSPRNG и 32 bytes.
+- Каждый user ID и `token_sha256` уникальны; `token_sha256` — строго 64 lower-case hex symbols (placeholder не принимается). Токен должен состоять из 32 bytes, созданных CSPRNG.
+- `inbounds[].allowed_user_ids` **обязателен** и непуст: все ID должны существовать в `server.users[]`, без повторов. Глобальный каталог пользователей **не предоставляет прав доступа автоматически**. Подключение разрешено только при валидном токене, активном пользователе и явном включении ID пользователя в `allowed_user_ids` конкретного inbound. Выбор inbound производится по listener socket, а не по недоверенному HTTP `Host`/`:authority`.
+- `Authorization: Bearer` содержит canonical base64url без padding от **сырых 32 байт** токена. Сервер вычисляет SHA-256 от декодированных исходных байт (не текста base64url), сравнивает digest constant-time и только затем проверяет назначение inbound. Digest никогда не принимается вместо bearer token.
 - `allow_private_ips=false` исключает loopback, RFC1918, link-local, unspecified, multicast и прочие недоступные назначения; перепроверять после DNS resolve.
 - Limiting values >0; server должен выполнять caps с bounded resources, ошибки параметров с номером строки/полем.
 - `management.ipc="auto"`: Linux Unix socket с ограниченными permissions, Windows Named Pipe с ACL. `log_level`: error/warn/info/debug/trace, trace с предупреждением о метаданных.
@@ -67,6 +70,7 @@ id = "home"
 server = "edge.example.org:443"
 server_name = "edge.example.org"
 auth_token = "env:THEIA_AUTH_TOKEN"
+tls_profile = "default"
 transport = "auto"
 quic_connect_timeout_ms = 1600
 quic_negative_cache_ttl_s = 900
@@ -87,11 +91,14 @@ language = "ru"
 **Rules:**
 - `active_profile` указывает на существующий уникальный `profiles[].id`.
 - `server` — hostname:port или [IPv6]:port. `server_name` — hostname для TLS/SNI, без insecure override.
-- `auth_token` — `env:NAME` или `file:path` и должен декодироваться в случайные 32 bytes. Рекомендованный формат — base64url **без padding**; зафиксировать test vector и не принимать двусмысленные формы.
+- `auth_token` — `env:NAME` или `file:path`, содержимое должно быть canonical base64url **без padding**, декодироваться строго в **32 байта**; зафиксировать test vector и отклонять двусмысленные формы.
+- `tls_profile`: `default` (не имитирует браузер) или конкретный **реализованный и проверенный** именованный browser-like профиль (F-13, P0). Неизвестное имя = ошибка; запрещён тихий fallback на default. Для профиля необходимы воспроизводимые TLS/HTTP2/HTTP3 сравнения и документированные расхождения.
 - `transport`: `auto`, `h3`, `h2`. В `h3` не разрешён fallback; `h2` не инициирует UDP. В `auto` fallback только при network-level QUIC failure.
 - `quic_connect_timeout_ms`: рекомендуемый 1600, допустимо 500..15000. `quic_negative_cache_ttl_s`: по умолчанию 900, допускается 0 (без кеша) .. 86400.
 - Proxy listeners строго loopback по умолчанию; возможность внешнего bind НЕ включать до явной аутентификации локального proxy и отдельной политики безопасности.
-- `system_proxy`: `off` по умолчанию; `manual` — TUI/CLI действие с подтверждением; `on` — явный opt-in для автоприменения при `client run`. Значение отличается от TUN и не гарантирует перехват всех приложений. На Linux этот режим должен выдавать `UnsupportedPlatform` до реализации OS adapter.
+- `system_proxy` допускает **только `off` и `manual`**. `off` (default) вообще не трогает OS proxy. `manual` позволяет включить прокси **только отдельным подтверждённым действием в TUI**: запуск `theia client run` или `theia tui` не должен сам менять пользовательские настройки. `on` запрещён в v1. Это не TUN и не перехват всех приложений; на Linux включение выдаёт `UnsupportedPlatform` до реализации адаптера.
+- `http_listen`/`socks5_listen` принимают только `127.0.0.1` или `[::1]` с уникальной парой `(IP,port)`; wildcard bind запрещён. P0 local proxy не аутентифицирует соседние локальные процессы: loopback **не означает изоляцию от иных локальных приложений**.
+- При доменном HTTP CONNECT/SOCKS5 запросе клиент передаёт DNS hostname как SmartTheia `OPEN_TCP` с `addr_type=0x03`, не резолвит цель локально. Сервер делает DNS resolve, фильтрует **каждый** полученный IP через ACL и dial только закреплённого разрешённого IP. При IP literal DNS не нужен. Системные приложения вне прокси и bypass могут резолвить имена локально: обещать отсутствие любых DNS-утечек нельзя.
 
 ## 4. Валидация и запись
 
@@ -108,9 +115,10 @@ language = "ru"
 
 Алгоритм:
 1. Прочитать исходные per-user settings; создать защищённый на диске snapshot (для аварийного восстановления).
-2. Проверить, что HTTP listener поднят; **только затем** по явному opt-in применить system proxy.
+2. Проверить, что HTTP listener поднят и `system_proxy="manual"`; **только затем** по отдельному подтверждению в TUI применить system proxy. Headless start никогда не включает proxy автоматически.
 3. Запомнить applied values; при отключении сравнить текущие настройки с нашим applied snapshot. Восстановить исходные **только если настройки по-прежнему наши**. При изменении другим приложением не перетирать, показать конфликт.
 4. После crash/restart предложить восстановить snapshot, если текущий proxy всё ещё указывает на Theia. Не молча перезаписывать настройки.
-5. Тестировать idempotency, отказ прав, существующие PAC/AutoDetect, пользователя с другим proxy, внезапное завершение; TCP listener shutdown должен сопровождаться процедурой безопасного восстановления.
+5. Тестировать idempotency, отказ прав, существующие PAC/AutoDetect, пользователя с другим proxy, внезапное завершение; TCP listener shutdown должен сопровождаться процедурой безопасного восстановления. Закрытие одного окна TUI при действующем headless runtime не является отключением proxy; остановка runtime вызывает безопасную попытку восстановления.
+6. Snapshot хранится с per-user ACL и версией схемы и включает все исходные поля (PAC/AutoDetect/bypass). Неуспех сохранения snapshot блокирует активацию. После изменения сигнализировать WinINet о смене настроек; не путать per-user WinINet и WinHTTP.
 
 Microsoft references: https://learn.microsoft.com/en-us/windows/win32/wininet/enabling-internet-functionality , https://learn.microsoft.com/en-us/windows/win32/winhttp/setting-wininet-proxy-configurations-in-winhttp
