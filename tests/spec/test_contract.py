@@ -149,6 +149,10 @@ class SpecContractTests(unittest.TestCase):
         h2_source = h2_tls.read_text(encoding="utf-8")
         h3_source = (spike / "tests" / "h3_quic.rs").read_text(encoding="utf-8")
         self.assertIn("tls13_h2_megabyte_flow_control_and_half_close", h2_source)
+        self.assertIn("tls13_h2_slow_response_reader_stalls_and_recovers", h2_source)
+        self.assertIn("h3_quic_slow_response_reader_stalls_and_recovers", h3_source)
+        self.assertIn("transport.send_window(48 * 1024)", h3_source)
+        self.assertIn("transport.stream_receive_window(quinn::VarInt::from_u32(32 * 1024))", h3_source)
         for test_name in ("tls13_h2_eight_concurrent_full_duplex_streams",
                           "tls13_h2_cancel_stream_preserves_connection"):
             self.assertIn(test_name, h2_source)

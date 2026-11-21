@@ -535,7 +535,6 @@ async fn h3_quic_cancel_stream_preserves_sibling_request() {
     .expect("H3 cancelled stream isolation timed out");
 }
 
-
 /// With QUIC send_window=48 KiB and peer stream_receive_window=32 KiB,
 /// a server writing 1 MiB of H3 response DATA must stall while the client
 /// ignores the body, then finish once that same reader begins draining it.
@@ -546,11 +545,9 @@ async fn h3_quic_slow_response_reader_stalls_and_recovers() {
     const TOTAL: usize = 1024 * 1024;
 
     tokio::time::timeout(Duration::from_secs(25), async {
-        let (server_endpoint, client_endpoint, addr) =
-            endpoints_with_slow_reader_limits(true);
+        let (server_endpoint, client_endpoint, addr) = endpoints_with_slow_reader_limits(true);
         let (first_chunk_tx, first_chunk_rx) = tokio::sync::oneshot::channel::<()>();
-        let (send_finished_tx, mut send_finished_rx) =
-            tokio::sync::oneshot::channel::<()>();
+        let (send_finished_tx, mut send_finished_rx) = tokio::sync::oneshot::channel::<()>();
         let (client_done_tx, client_done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server = tokio::spawn(async move {
@@ -559,50 +556,74 @@ async fn h3_quic_slow_response_reader_stalls_and_recovers() {
             assert_h3_and_bbr(&connection);
             let mut h3: h3::server::Connection<_, Bytes> =
                 h3::server::Connection::new(h3_quinn::Connection::new(connection))
-                    .await.expect("H3 server");
+                    .await
+                    .expect("H3 server");
             let resolver = h3.accept().await.expect("H3 accept").expect("request");
-            let (request, mut stream) = resolver.resolve_request().await
-                .expect("request headers");
+            let (request, mut stream) = resolver.resolve_request().await.expect("request headers");
             assert_eq!(request.uri().path(), "/v1/session/slow-reader");
             assert!(stream.recv_data().await.expect("request EOF").is_none());
-            stream.send_response(http::Response::builder().status(200)
-                .body(()).unwrap()).await.expect("early response");
+            stream
+                .send_response(http::Response::builder().status(200).body(()).unwrap())
+                .await
+                .expect("early response");
 
             let chunk = Bytes::from(vec![0x6d; BLOCK]);
-            stream.send_data(chunk.clone()).await.expect("first H3 DATA");
-            first_chunk_tx.send(()).expect("client awaiting first chunk");
+            stream
+                .send_data(chunk.clone())
+                .await
+                .expect("first H3 DATA");
+            first_chunk_tx
+                .send(())
+                .expect("client awaiting first chunk");
             for _ in 1..(TOTAL / BLOCK) {
-                stream.send_data(chunk.clone()).await.expect("write under backpressure");
+                stream
+                    .send_data(chunk.clone())
+                    .await
+                    .expect("write under backpressure");
             }
             stream.finish().await.expect("H3 response EOF");
             send_finished_tx.send(()).expect("client awaits sender");
             client_done_rx.await.expect("reader completed response");
         });
 
-        let connection = client_endpoint.connect(addr, "localhost")
-            .expect("connect").await.expect("verified certificate");
+        let connection = client_endpoint
+            .connect(addr, "localhost")
+            .expect("connect")
+            .await
+            .expect("verified certificate");
         assert_h3_and_bbr(&connection);
-        let (mut driver, mut sender) = h3::client::new(
-            h3_quinn::Connection::new(connection.clone())
-        ).await.expect("H3 client");
+        let (mut driver, mut sender) =
+            h3::client::new(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .expect("H3 client");
         let driver_task = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
         let request = http::Request::builder()
             .method(http::Method::POST)
             .uri("https://localhost/v1/session/slow-reader")
-            .body(()).unwrap();
+            .body(())
+            .unwrap();
         let mut stream = sender.send_request(request).await.expect("H3 request");
         stream.finish().await.expect("request body EOS");
-        assert_eq!(stream.recv_response().await.expect("HTTP response").status(),
-                   http::StatusCode::OK);
+        assert_eq!(
+            stream
+                .recv_response()
+                .await
+                .expect("HTTP response")
+                .status(),
+            http::StatusCode::OK
+        );
         first_chunk_rx.await.expect("server began writing response");
 
         // The client has not read *any* response DATA. The producer must not
         // be able to buffer a full mebibyte behind a 48 KiB send_window.
-        assert!(tokio::time::timeout(
-            Duration::from_millis(100), &mut send_finished_rx
-        ).await.is_err(), "H3 sender unexpectedly buffered entire 1 MiB");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send_finished_rx)
+                .await
+                .is_err(),
+            "H3 sender unexpectedly buffered entire 1 MiB"
+        );
 
         let mut received = 0usize;
         while let Some(mut buf) = stream.recv_data().await.expect("response DATA") {
@@ -612,11 +633,16 @@ async fn h3_quic_slow_response_reader_stalls_and_recovers() {
             received += len;
             assert!(received <= TOTAL, "response exceeded test payload budget");
         }
-        assert_eq!(received, TOTAL, "full H3 body delivered after stalled reader");
+        assert_eq!(
+            received, TOTAL,
+            "full H3 body delivered after stalled reader"
+        );
         send_finished_rx.await.expect("server finished sending");
         client_done_tx.send(()).expect("server still alive");
         server.await.expect("server task");
         driver_task.abort();
         client_endpoint.close(0u32.into(), b"done");
-    }).await.expect("H3/QUIC slow-reader backpressure timed out");
+    })
+    .await
+    .expect("H3/QUIC slow-reader backpressure timed out");
 }
