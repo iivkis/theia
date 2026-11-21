@@ -274,7 +274,7 @@ async fn h3_quic_cancel_stream_preserves_sibling_request() {
                 // HTTP/3 request cancellation is QUIC RESET_STREAM on request
                 // sending half; this is not a graceful request FIN.
                 let next = stream.recv_data().await;
-                assert!(next.is_err(), "expected H3 stream reset, got {next:?}");
+                assert!(next.is_err(), "expected H3 stream reset after cancellation");
                 cancel_observed_tx.send(()).expect("client awaiting cancellation");
             });
 
