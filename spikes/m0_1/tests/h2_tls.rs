@@ -384,3 +384,182 @@ async fn tls13_h2_megabyte_flow_control_and_half_close() {
         driver_task.abort();
     }).await.expect("h2 megabyte/backpressure/half-close timed out");
 }
+
+
+/// Several HTTP/2 streams must remain open simultaneously on one verified TLS
+/// connection. All request headers are accepted before *any* server response,
+/// and all responses arrive before their corresponding request EOF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls13_h2_eight_concurrent_full_duplex_streams() {
+    const STREAMS: usize = 8;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (acceptor, connector) = tls_configs(true, H2_ALPN, H2_ALPN);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TCP");
+        let address = listener.local_addr().unwrap();
+        let (client_done_tx, client_done_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept TCP");
+            let tls = acceptor.accept(socket).await.expect("TLS 1.3");
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(H2_ALPN));
+            let mut connection = h2::server::handshake(tls).await.expect("h2 server");
+
+            // Force eight live streams: no server handler responds until all
+            // eight HEADERS have arrived, rather than testing sequential requests.
+            let mut accepted = Vec::new();
+            for _ in 0..STREAMS {
+                let next = connection.accept().await.expect("h2 connection").expect("request");
+                accepted.push(next);
+            }
+            let handlers: Vec<_> = accepted.into_iter().map(|(request, mut responder)| {
+                tokio::spawn(async move {
+                    let index = request.uri().path().strip_prefix("/v1/session/")
+                        .expect("expected path").parse::<u8>().expect("stream number");
+                    let mut request_body = request.into_body();
+                    let first = request_body.data().await.expect("initial DATA").expect("no reset");
+                    assert_eq!(first, Bytes::from(vec![index]));
+                    request_body.flow_control().release_capacity(first.len()).unwrap();
+
+                    // The request body is still open at this point.
+                    let mut response = responder.send_response(
+                        http::Response::builder().status(200).body(()).unwrap(), false,
+                    ).expect("early response HEADERS");
+                    bounded_send(&mut response, Bytes::from(vec![index]), false).await;
+
+                    let second = request_body.data().await.expect("second DATA").expect("no reset");
+                    assert_eq!(second, Bytes::from(vec![index.wrapping_add(1)]));
+                    request_body.flow_control().release_capacity(second.len()).unwrap();
+                    assert!(request_body.data().await.is_none(), "request half-close");
+                    bounded_send(&mut response, Bytes::from(vec![index.wrapping_add(1)]), true).await;
+                })
+            }).collect();
+
+            tokio::select! {
+                _ = async { while connection.accept().await.is_some() {} } => {},
+                _ = client_done_rx => {},
+            }
+            for handler in handlers {
+                handler.await.expect("independent stream handler");
+            }
+        });
+
+        let socket = TcpStream::connect(address).await.expect("TCP connect");
+        let tls = connector.connect(
+            ServerName::try_from("localhost".to_owned()).unwrap(),
+            socket,
+        ).await.expect("verified TLS");
+        let (mut sender, driver) = h2::client::handshake(tls).await.expect("h2 client");
+        let client_driver = tokio::spawn(async move { let _ = driver.await; });
+        let mut streams = Vec::new();
+        for i in 0..STREAMS {
+            let req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("https://localhost/v1/session/{i}"))
+                .body(()).unwrap();
+            let (response, mut send) = sender.send_request(req, false).expect("new stream");
+            bounded_send(&mut send, Bytes::from(vec![i as u8]), false).await;
+            streams.push((i as u8, response, send));
+        }
+
+        for (i, response, mut request_body) in streams {
+            let response = response.await.expect("early response on independent stream");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let mut body = response.into_body();
+            let first = body.data().await.expect("reply-1").expect("valid frame");
+            assert_eq!(first, Bytes::from(vec![i]));
+            body.flow_control().release_capacity(first.len()).unwrap();
+
+            bounded_send(&mut request_body, Bytes::from(vec![i.wrapping_add(1)]), true).await;
+            let second = body.data().await.expect("reply-2").expect("valid frame");
+            assert_eq!(second, Bytes::from(vec![i.wrapping_add(1)]));
+            body.flow_control().release_capacity(second.len()).unwrap();
+            assert!(body.data().await.is_none(), "response EOS");
+        }
+
+        client_done_tx.send(()).expect("server still alive");
+        server.await.expect("server task");
+        client_driver.abort();
+    }).await.expect("eight concurrent TLS/h2 streams timed out");
+}
+
+/// Cancel one in-flight HTTP/2 stream with RST_STREAM CANCEL; a sibling stream
+/// must still be usable on the same TLS session. No sleeps or external servers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls13_h2_cancel_stream_preserves_connection() {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        let (acceptor, connector) = tls_configs(true, H2_ALPN, H2_ALPN);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TCP");
+        let address = listener.local_addr().unwrap();
+        let (first_consumed_tx, first_consumed_rx) = oneshot::channel::<()>();
+        let (reset_observed_tx, reset_observed_rx) = oneshot::channel::<()>();
+        let (client_done_tx, client_done_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("TCP");
+            let tls = acceptor.accept(socket).await.expect("TLS");
+            let mut connection = h2::server::handshake(tls).await.expect("h2 server");
+            let (cancelled, _responder) =
+                connection.accept().await.expect("client").expect("first request");
+            let cancel_handler = tokio::spawn(async move {
+                let mut body = cancelled.into_body();
+                let first = body.data().await.expect("body").expect("first DATA");
+                assert_eq!(first, Bytes::from_static(b"before-cancel"));
+                body.flow_control().release_capacity(first.len()).unwrap();
+                first_consumed_tx.send(()).expect("client ready");
+                match body.data().await {
+                    Some(Err(error)) => assert!(error.is_reset(), "expected RST_STREAM: {error:?}"),
+                    other => panic!("expected stream reset after cancel, got {other:?}"),
+                }
+                reset_observed_tx.send(()).expect("client waiting for reset");
+            });
+
+            let (second, mut respond) =
+                connection.accept().await.expect("connection alive").expect("second request");
+            assert_eq!(second.uri().path(), "/v1/session/after-cancel");
+            let second_handler = tokio::spawn(async move {
+                let mut body = second.into_body();
+                let data = body.data().await.expect("DATA").expect("chunk");
+                assert_eq!(data, Bytes::from_static(b"still-alive"));
+                body.flow_control().release_capacity(data.len()).unwrap();
+                assert!(body.data().await.is_none(), "second request EOF");
+                respond.send_response(http::Response::builder().status(204).body(()).unwrap(), true)
+                    .expect("successful independent stream");
+            });
+            tokio::select! {
+                _ = async { while connection.accept().await.is_some() {} } => {},
+                _ = client_done_rx => {},
+            }
+            cancel_handler.await.expect("RST_STREAM handler");
+            second_handler.await.expect("sibling request handler");
+        });
+
+        let tcp = TcpStream::connect(address).await.expect("TCP connect");
+        let tls = connector.connect(
+            ServerName::try_from("localhost".to_owned()).unwrap(),
+            tcp,
+        ).await.expect("TLS verified");
+        let (mut sender, driver) = h2::client::handshake(tls).await.expect("h2 client");
+        let client_driver = tokio::spawn(async move { let _ = driver.await; });
+
+        let (old_response, mut cancelled) = sender.send_request(
+            http::Request::builder().method(http::Method::POST)
+                .uri("https://localhost/v1/session/cancel").body(()).unwrap(), false,
+        ).expect("first stream");
+        bounded_send(&mut cancelled, Bytes::from_static(b"before-cancel"), false).await;
+        first_consumed_rx.await.expect("server consumed initial data");
+        cancelled.send_reset(h2::Reason::CANCEL);
+        drop(old_response);
+        reset_observed_rx.await.expect("server saw request cancellation");
+
+        let (response, mut sibling) = sender.send_request(
+            http::Request::builder().method(http::Method::POST)
+                .uri("https://localhost/v1/session/after-cancel").body(()).unwrap(), false,
+        ).expect("second stream");
+        bounded_send(&mut sibling, Bytes::from_static(b"still-alive"), true).await;
+        assert_eq!(response.await.expect("sibling response").status(), http::StatusCode::NO_CONTENT);
+
+        client_done_tx.send(()).expect("server alive");
+        server.await.expect("server task");
+        client_driver.abort();
+    }).await.expect("TLS/h2 cancellation test timed out");
+}
