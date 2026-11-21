@@ -24,7 +24,6 @@ fn help_and_version_exit_successfully() {
 fn accepted_runtime_commands_fail_closed() {
     for args in [
         vec!["tui", "--role", "client"],
-        vec!["server", "run", "--config", "missing.toml"],
         vec!["client", "run", "--config", "missing.toml"],
     ] {
         let result = invoke(&args);
@@ -59,6 +58,14 @@ fn validates_client_toml_and_rejects_unknown_fields() {
     assert_eq!(output.status.code(), Some(2));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("THEIA_AUTH_TOKEN"));
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn server_run_missing_config_fails_before_binding() {
+    let result = invoke(&["server", "run", "--config", "not-present-m21.toml"]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("server failed"));
 }
 
 #[test]

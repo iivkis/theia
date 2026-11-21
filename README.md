@@ -2,11 +2,13 @@
 
 **Specification-first · Rust · one binary · TOML · ratatui · SmartTheia**
 
+**M2.1:** `theia server run --config server.toml` принимает только TLS 1.3 + ALPN `h2` на `server.inbounds[].h2_listen`; сертификат и ключ должны существовать (`file:` absolute path), Unix private key должен быть недоступен группе/прочим. Для реальной работы замените шаблонный digest токена на SHA-256 декодированных 32 случайных байт. Сервер не запускает QUIC/HTTP3. По умолчанию частные/локальные назначения запрещены; тесты используют явный `allow_private_ips=true` на loopback. Нативный H2 клиент пока только тестовый.
+
 **M1.3:** добавлена чистая реализация SmartTheia v1 frame codec + incremental decoder + per-stream FSM в `crates/theia/src/protocol.rs` с golden/negative тестами. Она **не** открывает HTTP/TLS сессии, не проверяет токены и не запускает прокси. TUI и `server/client run` по-прежнему возвращают ошибку вместо фиктивного запуска.
 
 Theia — проект компактной клиент-серверной прокси-платформы. Один исполняемый файл работает в режиме **сервера** (inbound, пользователи, политика подключения) или **клиента** (подключение к inbound, локальный прокси, системный прокси Windows). При запуске TUI показывает два раздела: **«Для сервера»** и **«Для клиента»**.
 
-> **Статус: M1.2 configuration foundation.** Единый Rust бинарник умеет `--help`, `--version` и структурно проверяет TOML v1 с типизированной схемой и безопасными отказами. Конфигурации сохраняются атомарно через library API. **Сеть, TUI, аутентификация и системный прокси ещё не реализованы.** Команды запуска возвращают ненулевой код; это не рабочий прокси.
+> **Статус: M2.1 H2 server inbound (частичный вертикальный срез).** Единый бинарник запускает реальный TLS 1.3/HTTP/2 серверный inbound с bearer auth, explicit inbound grants, IP ACL и TCP dial после SmartTheia OPEN_TCP. H3, клиентский CONNECT/SOCKS5, TUI, системный прокси и P0 fingerprint/BBR измерения **не реализованы**. Это не работающий end-to-end пользовательский прокси.
 
 ## Архитектура одним взглядом
 
@@ -51,7 +53,7 @@ theia config validate --config client.toml
 theia --version
 ```
 
-`theia config validate --config FILE` выполняет структурную проверку TOML v1 и возвращает 0 при успехе, 2 при ошибке. **Проверка не раскрывает секреты и не читает содержимое `env:`/`file:` refs**; сертификаты, bearer и их доступность будут проверены отдельным диагностическим этапом. `tui` и `server/client run` всё ещё завершаются с кодом 3 (`not implemented`) без доступа к сети или системному прокси. `--help`/`--version` возвращают код 0. Отдельный Rust workspace расположен в `crates/theia/`; `spikes/m0_1/` исключён из production workspace. Проверка: `cargo test --workspace --all-targets --locked`.
+`theia config validate --config FILE` выполняет структурную проверку TOML v1 и возвращает 0 при успехе, 2 при ошибке. **Проверка не раскрывает секреты и не читает содержимое `env:`/`file:` refs**; сертификаты, bearer и их доступность будут проверены отдельным диагностическим этапом. `tui` и `client run` всё ещё завершаются с кодом 3 (`not implemented`). `server run` запускает только H2/TLS inbound и требует действующую серверную конфигурацию и PEM файлы; при ошибке выходит с кодом 2. `--help`/`--version` возвращают код 0. Отдельный Rust workspace расположен в `crates/theia/`; `spikes/m0_1/` исключён из production workspace. Проверка: `cargo test --workspace --all-targets --locked`.
 
 ## Приоритеты
 

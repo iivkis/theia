@@ -60,6 +60,8 @@
 
 - **M1.3 SmartTheia v1 pure codec:** frame layout + header 6 bytes, max 65 536 payload, strict flags/version, 8 типов, limited incremental buffer и state transitions tested. `Session::tunnel_open()` true только после правильного OPEN_OK, DATA после FIN запрещено; ABORT/OPEN_ERROR terminal. Настоящие HTTP/2/3 transports, TLS auth/ACL, local CONNECT/SOCKS5 и runtime persistence **не** реализованы. Не заявлять E2E или production readiness.
 
+- **M2.1 H2 server inbound:** unit/loopback TLS1.3/H2 tests с проверенным hostname/ALPN, canonical base64url bearer SHA-256 constant-time digest, inbound grants, denied private IP by default, server-side DNS + pinned IP dial, OPEN_OK после TCP connect, refusal codes и bounded sessions. Это первая серверная реализация; **не** H3/QUIC и не клиентский CONNECT/SOCKS5. Не считать M2.1 полностью закрытым до mass-cancel/rate-limit/PKI cert-name binding тестов. Нельзя логировать токены или адреса целей.
+
 ## Definition of Done (для каждого среза)
 
 - [ ] Есть автоматизированный позитивный и негативный тест; пограничные значения покрыты.

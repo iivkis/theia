@@ -1,6 +1,6 @@
 # Testing strategy и CI
 
-**Правило:** тестирование предшествует сборке релизных артефактов. CI не должен маскировать отсутствие сетевой Rust-реализации. С M1.1 корневой workspace и `Cargo.lock` существуют: Linux `rust-tests` и Windows `windows-smoke` должны запускаться. CLI `--help`/`--version` работают; с M1.2 `config validate` выполняет структурную TOML v1 validation (exit 0/2) без чтения секретов. Команды `tui`, `server run`, `client run` обязательно возвращают `not implemented` (exit 3). До M1.1 Rust jobs были skipped.
+**Правило:** тестирование предшествует сборке релизных артефактов. CI не должен маскировать отсутствие сетевой Rust-реализации. С M1.1 корневой workspace и `Cargo.lock` существуют: Linux `rust-tests` и Windows `windows-smoke` должны запускаться. CLI `--help`/`--version` работают; с M1.2 `config validate` выполняет структурную TOML v1 validation (exit 0/2) без чтения секретов. Команды `tui` и `client run` возвращают `not implemented` (exit 3); с M2.1 `server run` — реальный TLS1.3/H2 сервер с bearer/inbound ACL + TCP dial и ненулевым exit на invalid config/PEM. До M1.1 Rust jobs были skipped.
 
 ## 1. Test pyramid
 
@@ -15,7 +15,7 @@
 
 ### B. Integration tests (локальный реальный IO)
 
-- TLS-backed H2 echo tunnel, multiple concurrent streams, **full-duplex HTTP POST without request EOF**, half-close, abrupt EOF, timeout, bounded backpressure, broken clients and error mapping. Loopback echo тестировать только с explicit test-only `allow_private_ips=true`; отдельный negative test обязан подтвердить default=false.
+- TLS-backed H2 echo tunnel, multiple concurrent streams, **full-duplex HTTP POST without request EOF**, half-close, abrupt EOF, timeout, bounded backpressure, broken clients and error mapping. С M2.1 `crates/theia/tests/server_h2.rs` проверяет реальное TLS1.3/H2 OPEN_OK→echo + half-close, missing bearer HTTP401, private ACL OPEN_ERROR без dial, strict wrong-hostname TLS и pure auth/IP ranges. **Дополнительные** many-stream/race/cancellation/slow-reader/peak RSS и DNS rebinding fixtures ещё не закрыты. Loopback echo тестировать только с explicit test-only `allow_private_ips=true`; отдельный negative test обязан подтвердить default=false.
 - H3 echo tunnel via UDP loopback, full-duplex request/response, certificate validation, resumption/0-RTT disabled, **BBR на обоих отправителях как P0 release gate** (никаких `pending` при объявлении MVP).
 - Fallback H3→H2 с симуляцией/блокировкой UDP; ни одного H2 retry при wrong cert/auth/protocol mismatch.
 - HTTP CONNECT + SOCKS5 local proxy с server-side DNS, IPv4/IPv6, отказом auth и неразрешённым адресом. HTTP 200/SOCKS5 success должны приходить **строго после OPEN_OK**; неверный токен другого inbound не получает доступ; имена не резолвятся локальным клиентом.

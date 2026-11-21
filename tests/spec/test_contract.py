@@ -264,6 +264,23 @@ class SpecContractTests(unittest.TestCase):
                      "deterministic_random_chunks_never_panic_and_bound_partial_memory"):
             self.assertIn(test, tests)
 
+    def test_m21_h2_ingress_is_real_and_has_fail_closed_tests(self):
+        implementation = read("crates/theia/src/server.rs")
+        tests = read("crates/theia/tests/server_h2.rs")
+        binary = read("crates/theia/src/main.rs")
+        for term in ("pub async fn serve(", "pub async fn run_file(",
+                     "fn allowed_destination(", "URL_SAFE_NO_PAD", "Sha256::digest",
+                     "ct_eq(", "lookup_host(", "TcpStream::connect(candidate)",
+                     "Frame::OpenOk", "TlsAcceptor", "max_concurrent_streams"):
+            self.assertIn(term, implementation)
+        for term in ("h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial",
+                     "h2_tls_default_policy_rejects_private_ip_without_tcp_dial",
+                     "h2_tls_rejects_missing_bearer_before_smarttheia",
+                     "canonical_token_and_inbound_user_grants_are_enforced",
+                     "tls_wrong_hostname_and_untrusted_ca_fail_closed"):
+            self.assertIn(term, tests)
+        self.assertIn("server::run_file(", binary)
+
     def test_ci_tests_first_and_cached(self):
         workflow = read(".github/workflows/ci.yml")
         self.assertIn("Swatinem/rust-cache@v2", workflow)
