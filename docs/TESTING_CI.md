@@ -45,12 +45,14 @@
 2. `rust-tests` после specification: Rust toolchain + cache, `cargo test --workspace --all-targets --locked` **первым**, только после успеха `cargo fmt`, `cargo clippy -D warnings` и `cargo build --release`.
 3. `windows-smoke` после Linux tests: Windows-native `cargo test` и `cargo build --release` с отдельным кэшем. Системные proxy settings на GitHub-hosted runner без явного sandbox-плана не менять.
 4. Кэш: `Swatinem/rust-cache@v2` для registry/git/target, `Cargo.lock` как источник cache key; concurrency отменяет устаревшие runs на одной ветке. Запуск на push и PR.
-5. Rust jobs **skipped**, пока нет workspace; как только добавлен `Cargo.toml`, отсутствие `Cargo.lock` становится ошибкой CI, а не silent skip.
+5. Rust jobs **skipped**, пока нет production workspace; как только добавлен корневой `Cargo.toml`, отсутствие корневого `Cargo.lock` становится ошибкой CI, а не silent skip.
+6. **M0.1 в отдельном `spikes/m0_1`**: `cargo test --manifest-path spikes/m0_1/Cargo.toml --locked` на Ubuntu и Windows, кэш по отдельной директории, без включения spike в поставляемый бинарник. `Cargo.lock` находится в каталоге spike и зафиксирован в git. Успех API tests не закрывает release gates (TLS/QUIC E2E, BBR telemetry, packet-capture fingerprint).
 
 ## 3. Локальная проверка
 
 ```sh
 bash scripts/check-spec.sh
+cargo test --manifest-path spikes/m0_1/Cargo.toml --locked  # only isolated M0.1 spike
 
 # После M1.1 / появления Cargo.toml и Cargo.lock:
 cargo test --workspace --all-targets --locked

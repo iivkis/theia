@@ -133,6 +133,23 @@ class SpecContractTests(unittest.TestCase):
         self.assertNotIn('system_proxy = "on"', read("examples/client.toml"))
         self.assertIn("CAS", read("docs/TUI_UX.md") + config)  # compare-and-swap restoration documented
 
+    def test_m01_api_spike_isolated_and_locked(self):
+        from pathlib import Path
+        spike = ROOT / "spikes" / "m0_1"
+        self.assertTrue((spike / "Cargo.toml").is_file())
+        self.assertTrue((spike / "Cargo.lock").is_file())
+        source = (spike / "src" / "lib.rs").read_text(encoding="utf-8")
+        self.assertIn("http2_response_before_request_eof", source)
+        self.assertIn("congestion::BbrConfig", source)
+        self.assertIn("h3_client_has_split", source)
+        self.assertNotIn("mod theia", source)
+        # M1.1 will add a root workspace; do not make this spike test a future CI blocker.
+        root_manifest = ROOT / "Cargo.toml"
+        if root_manifest.is_file():
+            workspace = tomllib.loads(root_manifest.read_text(encoding="utf-8")).get("workspace", {})
+            self.assertNotIn("spikes/m0_1", workspace.get("members", []),
+                             "Research-only spike must not be part of the production workspace")
+
     def test_ci_tests_first_and_cached(self):
         workflow = read(".github/workflows/ci.yml")
         self.assertIn("Swatinem/rust-cache@v2", workflow)
