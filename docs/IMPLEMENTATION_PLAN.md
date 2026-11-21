@@ -7,7 +7,7 @@
 | Этап | Вертикальный срез | Тест/критерий завершения |
 | --- | --- | --- |
 | M0 | Документация, AGENTS, TOML examples, docs-only CI | структура спецификации проверяется CI; работающая функциональность **не заявлена** |
-| M0.1 | **Feasibility spike** H2/H3 full-duplex + BBR + fingerprint backend (без заявления о готовой функции) | **Частично проверено**: реальные H2/TLS и H3/QUIC/TLS, H2 1 МиБ WINDOW_UPDATE/half-close, byte-exact QUIC BBR recovery при каждом 20-м dropped datagram, Linux+Windows. **Открыты**: сравнительные BBR loss/jitter/RTT/throughput benchmarks, measured browser-like TLS/H2/H3 fingerprint, cancellation/slow readers/multi-stream; ADR-0004 |
+| M0.1 | **Feasibility spike** H2/H3 full-duplex + BBR + fingerprint backend (без заявления о готовой функции) | **Частично проверено**: реальные H2/TLS, H3/QUIC/TLS, H2 WINDOW_UPDATE/half-close (1 МиБ), BBR byte-exact recovery при synthetic loss, по 8 concurrent streams H2/H3 и отмена одного stream с успешным соседним запросом; Linux+Windows. **Открыты**: BBR controlled RTT/jitter/throughput benchmark, measured browser-like TLS/H2/H3 fingerprint, массовая отмена/slow readers/peak RSS; ADR-0004 |
 | M1.1 | Cargo workspace, единый `theia` CLI, `--help`/`--version`, роли | unit/CLI integration tests; Windows/Linux compile; `Cargo.lock` |
 | M1.2 | Typed TOML v1 + validator + atomic store | round-trip, unknown keys, duplicate ID, missing refs, atomic rollback, file perms |
 | M1.3 | SmartTheia pure frame codec + FSM | golden vectors, max frame guard, chunk fragmentation, malformed/unknown frames, fuzz |

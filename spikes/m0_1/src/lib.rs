@@ -83,38 +83,54 @@ mod tests {
                     tokio::spawn(async move {
                         // Respond BEFORE consuming request body or seeing EOS.
                         respond
-                            .send_response(http::Response::builder().status(200).body(()).unwrap(), true)
+                            .send_response(
+                                http::Response::builder().status(200).body(()).unwrap(),
+                                true,
+                            )
                             .unwrap();
 
                         let mut incoming = request.into_body();
                         let part1 = incoming.data().await.unwrap().unwrap();
                         assert_eq!(part1, Bytes::from_static(b"phase-1"));
-                        incoming.flow_control().release_capacity(part1.len()).unwrap();
+                        incoming
+                            .flow_control()
+                            .release_capacity(part1.len())
+                            .unwrap();
                         let part2 = incoming.data().await.unwrap().unwrap();
                         assert_eq!(part2, Bytes::from_static(b"phase-2"));
-                        incoming.flow_control().release_capacity(part2.len()).unwrap();
+                        incoming
+                            .flow_control()
+                            .release_capacity(part2.len())
+                            .unwrap();
                         assert!(incoming.data().await.is_none());
-                        if let Some(tx) = done { tx.send(()).unwrap(); }
+                        if let Some(tx) = done {
+                            tx.send(()).unwrap();
+                        }
                     });
                 }
             });
 
             let (mut sender, connection) = h2::client::handshake(client_io).await.unwrap();
-            let client_driver = tokio::spawn(async move { connection.await.unwrap(); });
+            let client_driver = tokio::spawn(async move {
+                connection.await.unwrap();
+            });
             let request = http::Request::builder()
                 .method("POST")
                 .version(http::Version::HTTP_2)
                 .uri("https://localhost/v1/session")
                 .body(())
                 .unwrap();
-            let (response_future, mut request_body) =
-                sender.send_request(request, false).unwrap();
-            request_body.send_data(Bytes::from_static(b"phase-1"), false).unwrap();
+            let (response_future, mut request_body) = sender.send_request(request, false).unwrap();
+            request_body
+                .send_data(Bytes::from_static(b"phase-1"), false)
+                .unwrap();
 
             // If the server waited for body EOF, awaiting this response would deadlock.
             let response = response_future.await.unwrap();
             assert_eq!(response.status(), http::StatusCode::OK);
-            request_body.send_data(Bytes::from_static(b"phase-2"), true).unwrap();
+            request_body
+                .send_data(Bytes::from_static(b"phase-2"), true)
+                .unwrap();
             done_rx.await.unwrap();
             server.abort();
             client_driver.abort();

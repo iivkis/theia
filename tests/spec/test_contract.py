@@ -146,7 +146,15 @@ class SpecContractTests(unittest.TestCase):
         for required in ("DeterministicLoss", "active_bbr_recovers_byte_exactly_from_synthetic_udp_loss",
                          "connection.stats().path", "congestion_state", "dropped_datagrams", "lost_packets", "PAYLOAD_LEN"):
             self.assertIn(required, loss_code)
-        self.assertIn("tls13_h2_megabyte_flow_control_and_half_close", h2_tls.read_text(encoding="utf-8"))
+        h2_source = h2_tls.read_text(encoding="utf-8")
+        h3_source = (spike / "tests" / "h3_quic.rs").read_text(encoding="utf-8")
+        self.assertIn("tls13_h2_megabyte_flow_control_and_half_close", h2_source)
+        for test_name in ("tls13_h2_eight_concurrent_full_duplex_streams",
+                          "tls13_h2_cancel_stream_preserves_connection"):
+            self.assertIn(test_name, h2_source)
+        for test_name in ("h3_quic_eight_concurrent_bidirectional_streams",
+                          "h3_quic_cancel_stream_preserves_sibling_request"):
+            self.assertIn(test_name, h3_source)
         for required in ("tls13_h2_full_duplex_response_before_request_eof",
                          "tls13_h2_rejects_wrong_hostname",
                          "tls13_h2_rejects_untrusted_ca",
