@@ -62,10 +62,11 @@ jobs:
         with:
           go-version: '1.24.x'
           cache: false
-      - name: Generate Go uTLS Chrome133 reference and compare with rustls (bootstrap)
+      - name: Generate Go uTLS Chrome133 reference and compare with rustls
         shell: bash
         run: |
           set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/theia-utls-h2-hello.bin"' EXIT
           pushd spikes/m0_1/utls_reference
           go mod verify
           go test ./...
@@ -75,20 +76,14 @@ jobs:
           rm -f "$RUNNER_TEMP/theia-utls-h2-hello.bin"
       - name: Rustfmt check for isolated M0.1 spike
         run: cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check
-      - name: Bootstrap canonical gofmt files for review
+      - name: Check Go uTLS helper formatting
         shell: bash
         run: |
-          pushd spikes/m0_1/utls_reference
-          gofmt -w main.go main_test.go
-          python3 - <<'PY'
-          from pathlib import Path
-          from base64 import b64encode
-          for name in ("main.go", "main_test.go"):
-              b64 = b64encode(Path(name).read_bytes()).decode("ascii")
-              token = name.replace(".", "_").upper()
-              print(f"THEIA_GOFMT_{token}_START:{b64}:THEIA_GOFMT_{token}_END")
-          PY
-          popd
+          unformatted="$(gofmt -l spikes/m0_1/utls_reference/main.go spikes/m0_1/utls_reference/main_test.go)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::gofmt drift: $unformatted"
+            exit 1
+          fi
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
       - name: Validate pinned dependency tree

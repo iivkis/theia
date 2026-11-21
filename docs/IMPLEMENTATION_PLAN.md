@@ -7,7 +7,7 @@
 | Этап | Вертикальный срез | Тест/критерий завершения |
 | --- | --- | --- |
 | M0 | Документация, AGENTS, TOML examples, docs-only CI | структура спецификации проверяется CI; работающая функциональность **не заявлена** |
-| M0.1 | **Feasibility spike** H2/H3 full-duplex + BBR + fingerprint backend (без заявления о готовой функции) | **Частично проверено**: реальные H2/TLS, H3/QUIC/TLS, H2 WINDOW_UPDATE/half-close (1 МиБ), BBR byte-exact recovery при synthetic loss, по 8 concurrent streams H2/H3 и отмена одного stream с успешным соседним запросом; Linux+Windows. **Также проверено**: slow-reader responses H2 (512 КиБ) и H3 (1 МиБ), остановка/возобновление по flow control. **Также измерен**: default rustls ClientHello H2/TLS и QUIC/H3 на TLS engine level (не browser profile). **Открыты**: BBR controlled RTT/jitter/throughput benchmark, browser reference capture + configurable browser-like H2/H3 fingerprint backend, массовая отмена/сотни slow readers/peak RSS; ADR-0004/0005 |
+| M0.1 | **Feasibility spike** H2/H3 full-duplex + BBR + fingerprint backend (без заявления о готовой функции) | **Частично проверено**: реальные H2/TLS, H3/QUIC/TLS, H2 WINDOW_UPDATE/half-close (1 МиБ), BBR byte-exact recovery при synthetic loss, по 8 concurrent streams H2/H3 и отмена одного stream с успешным соседним запросом; Linux+Windows. **Также проверено**: slow-reader responses H2 (512 КиБ) и H3 (1 МиБ), остановка/возобновление по flow control. **Также измерен**: default rustls ClientHello H2/TLS и QUIC/H3 на TLS engine level (не browser profile). **Открыты**: BBR controlled RTT/jitter/throughput benchmark, pinned Go uTLS H2 reference (генератор/сравнение) + **реальный** configurable browser-like H2/H3 TLS backend и отдельный QUIC/H3 эталон, массовая отмена/сотни slow readers/peak RSS; ADR-0004/0005 |
 | M1.1 | Cargo workspace, единый `theia` CLI, `--help`/`--version`, роли | unit/CLI integration tests; Windows/Linux compile; `Cargo.lock` |
 | M1.2 | Typed TOML v1 + validator + atomic store | round-trip, unknown keys, duplicate ID, missing refs, atomic rollback, file perms |
 | M1.3 | SmartTheia pure frame codec + FSM | golden vectors, max frame guard, chunk fragmentation, malformed/unknown frames, fuzz |
@@ -16,7 +16,7 @@
 | M3.1 | H3/QUIC transport with same app frames | H3↔server loopback E2E, HTTP/3 state and security invariants |
 | M3.2 | QUIC-first selector + safe H2 fallback | UDP blocked → H2; wrong cert/token → no fallback; TTL; network change |
 | M3.3 | P0: BBR verified on chosen quinn version | client+server send controllers verified, packet loss benchmarks, no silent CUBIC substitute |
-| M3.4 | P0: uTLS-like fingerprint profile | как минимум один измеренный named browser-like TLS/H2/H3 профиль Windows/Linux, PCAP/отчёт расхождений; если backend не позволяет, M5 заблокирован |
+| M3.4 | P0: uTLS-like fingerprint profile | Go uTLS v1.8.2 HelloChrome_133 служит воспроизводимым эталоном H2/TLS без захватов браузера; отдельный QUIC/H3 эталон, реально настроенный named TLS/HTTP profile Windows/Linux и проверка фактического выхода Theia + отчёт расхождений обязательны. Если backend не позволяет, M5 заблокирован |
 | M4.1 | ratatui landing + server/client panels | focus/resize/dirty/save/validation UI tests, two independent modes |
 | M4.2 | Local management IPC + reload | ACL, status, transactional apply, rollback, no open admin TCP port |
 | M4.3 | Windows system proxy integration | WinINet user settings backup/apply/CAS restore, manual Windows smoke tests |
