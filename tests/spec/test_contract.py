@@ -165,6 +165,21 @@ class SpecContractTests(unittest.TestCase):
         fixture_test = (spike / "tests" / "utls_reference.rs").read_text(encoding="utf-8")
         self.assertIn("go_utls_chrome133_is_a_reference_but_not_rustls_or_quic", fixture_test)
         self.assertIn("THEIA_UTLS_HELLO_PATH", fixture_test)
+        live_probe = (spike / "utls_reference" / "cmd" / "h2_probe" / "main.go").read_text(encoding="utf-8")
+        for required in ("utls.HelloChrome_133", "Handshake()", "VerifiedChains",
+                         "utls.VersionTLS13", "sendMinimalH2Request", "receiveH2NoContent",
+                         "validateLoopback", "modeWrongName", "modeUntrustedCA"):
+            self.assertIn(required, live_probe)
+        live_tests = (spike / "tests" / "utls_h2_loopback.rs").read_text(encoding="utf-8")
+        for required in ("inspect_real_wire_client_hello", "TcpListener::bind",
+                         "utls_chrome133_real_tcp_tls13_h2_request_with_verified_identity",
+                         "utls_chrome133_real_tcp_rejects_wrong_hostname_before_h2",
+                         "utls_chrome133_real_tcp_rejects_untrusted_ca_before_h2"):
+            self.assertIn(required, live_tests)
+        workflow = read(".github/workflows/ci.yml")
+        self.assertIn("go build -o", workflow)
+        self.assertIn("--test utls_h2_loopback -- --ignored", workflow)
+        self.assertIn("go test ./...", workflow)
         self.assertIn("refraction-networking/utls v1.8.2", read("docs/adr/0005-tls-fingerprint-baseline.md"))
         h2_tls = (spike / "tests" / "h2_tls.rs")
         self.assertTrue(h2_tls.is_file())
