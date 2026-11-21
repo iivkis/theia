@@ -1,0 +1,75 @@
+name: CI (tests first)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  specification:
+    name: specification
+    runs-on: ubuntu-latest
+    outputs:
+      rust_ready: ${{ steps.detect.outputs.rust_ready }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test documentation and TOML contracts
+        run: bash scripts/check-spec.sh
+      - name: Detect Rust workspace
+        id: detect
+        shell: bash
+        run: |
+          if [[ -f Cargo.toml && -f Cargo.lock ]]; then
+            echo "rust_ready=true" >> "$GITHUB_OUTPUT"
+          elif [[ -f Cargo.toml ]]; then
+            echo "::error::Cargo.toml exists but Cargo.lock is missing"
+            exit 1
+          else
+            echo "::notice::Specification-only stage: Rust tests are skipped until the workspace is created"
+            echo "rust_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  rust-tests:
+    name: rust-tests (Linux)
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests first
+        run: cargo test --workspace --all-targets --locked
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Release compilation
+        run: cargo build --workspace --release --locked
+
+  windows-smoke:
+    name: windows-smoke
+    needs: [specification, rust-tests]
+    if: needs.specification.outputs.rust_ready == 'true'
+    runs-on: windows-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Native Windows tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Native Windows release compilation
+        run: cargo build --workspace --release --locked
