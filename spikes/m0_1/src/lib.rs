@@ -1,3 +1,4 @@
+pub mod client_hello;
 //! M0.1 API feasibility spike: NOT a proxy, TLS implementation, or benchmark.
 //! The tests prove only explicitly named properties, never DPI resistance.
 use std::sync::Arc;
