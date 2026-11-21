@@ -260,7 +260,7 @@ async fn h3_quic_cancel_stream_preserves_sibling_request() {
             let incoming = server_endpoint.accept().await.expect("QUIC");
             let connection = incoming.await.expect("TLS verified");
             assert_h3_and_bbr(&connection);
-            let mut h3 = h3::server::Connection::new(h3_quinn::Connection::new(connection))
+            let mut h3: h3::server::Connection<_, Bytes> = h3::server::Connection::new(h3_quinn::Connection::new(connection))
                 .await.expect("H3 server session");
 
             let first = h3.accept().await.expect("accept first").expect("first request");
