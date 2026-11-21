@@ -85,11 +85,7 @@ fn tls_pair() -> (TlsAcceptor, TlsConnector) {
     )
 }
 
-async fn send(
-    stream: &mut h2::SendStream<Bytes>,
-    frame: &Frame,
-    end: bool,
-) {
+async fn send(stream: &mut h2::SendStream<Bytes>, frame: &Frame, end: bool) {
     let bytes = Bytes::from(theia::protocol::encode(frame).unwrap());
     stream.reserve_capacity(bytes.len());
     while stream.capacity() < bytes.len() {
@@ -111,7 +107,11 @@ async fn next_frame(
         if let Some(frame) = queued.pop_front() {
             return frame;
         }
-        let chunk = body.data().await.expect("response frame").expect("body bytes");
+        let chunk = body
+            .data()
+            .await
+            .expect("response frame")
+            .expect("body bytes");
         let size = chunk.len();
         queued.extend(decoder.feed(&chunk).expect("valid SmartTheia"));
         body.flow_control().release_capacity(size).unwrap();
@@ -121,17 +121,19 @@ async fn next_frame(
 async fn client(
     address: std::net::SocketAddr,
     connector: TlsConnector,
-) -> (
-    h2::client::SendRequest<Bytes>,
-    tokio::task::JoinHandle<()>,
-) {
+) -> (h2::client::SendRequest<Bytes>, tokio::task::JoinHandle<()>) {
     let socket = TcpStream::connect(address).await.unwrap();
     let tls = connector
-        .connect(ServerName::try_from("localhost".to_owned()).unwrap(), socket)
+        .connect(
+            ServerName::try_from("localhost".to_owned()).unwrap(),
+            socket,
+        )
         .await
         .expect("validated TLS chain + hostname");
     assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
-    let (sender, connection) = h2::client::handshake(tls).await.expect("h2 client handshake");
+    let (sender, connection) = h2::client::handshake(tls)
+        .await
+        .expect("h2 client handshake");
     let driver = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -153,7 +155,10 @@ fn canonical_token_and_inbound_user_grants_are_enforced() {
     let context = context(false);
     let valid = bearer();
     assert!(context.authorize(Some(&valid)).is_ok());
-    assert!(matches!(context.authorize(None), Err(AuthFailure::Unauthorized)));
+    assert!(matches!(
+        context.authorize(None),
+        Err(AuthFailure::Unauthorized)
+    ));
     assert!(matches!(
         context.authorize(Some("Bearer secret")),
         Err(AuthFailure::Unauthorized)
@@ -163,7 +168,10 @@ fn canonical_token_and_inbound_user_grants_are_enforced() {
         Err(AuthFailure::Unauthorized)
     ));
     assert!(matches!(
-        context.authorize(Some(&format!("Bearer {}", URL_SAFE_NO_PAD.encode([0x43; 32])))),
+        context.authorize(Some(&format!(
+            "Bearer {}",
+            URL_SAFE_NO_PAD.encode([0x43; 32])
+        ))),
         Err(AuthFailure::Unauthorized)
     ));
 
@@ -183,7 +191,10 @@ fn canonical_token_and_inbound_user_grants_are_enforced() {
     limited.max_connections_per_user = 1;
     let context = ServerContext::new(&inbound(), &users(), &limited);
     let first = context.authorize(Some(&valid)).unwrap();
-    assert!(matches!(context.authorize(Some(&valid)), Err(AuthFailure::Busy)));
+    assert!(matches!(
+        context.authorize(Some(&valid)),
+        Err(AuthFailure::Busy)
+    ));
     drop(first);
     assert!(context.authorize(Some(&valid)).is_ok());
 }
@@ -238,7 +249,15 @@ async fn h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial() {
         let (mut sender, driver) = client(address, connector).await;
         let (response_future, mut tx) = sender.send_request(request(&bearer()), false).unwrap();
 
-        send(&mut tx, &Frame::Hello { version: VERSION, capabilities: 0 }, false).await;
+        send(
+            &mut tx,
+            &Frame::Hello {
+                version: VERSION,
+                capabilities: 0,
+            },
+            false,
+        )
+        .await;
         let response = response_future.await.unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
         let mut rx = response.into_body();
@@ -246,7 +265,10 @@ async fn h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial() {
         let mut queue = VecDeque::new();
         assert_eq!(
             next_frame(&mut rx, &mut decoder, &mut queue).await,
-            Frame::HelloAck { version: VERSION, accepted_capabilities: 0 }
+            Frame::HelloAck {
+                version: VERSION,
+                accepted_capabilities: 0
+            }
         );
         // HELLO_ACK is intentionally received before request EOF.
         send(
@@ -256,23 +278,35 @@ async fn h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial() {
                 port: target.port(),
             },
             false,
-        ).await;
-        assert_eq!(next_frame(&mut rx, &mut decoder, &mut queue).await, Frame::OpenOk);
+        )
+        .await;
+        assert_eq!(
+            next_frame(&mut rx, &mut decoder, &mut queue).await,
+            Frame::OpenOk
+        );
         send(&mut tx, &Frame::Data(b"protected echo".to_vec()), false).await;
         send(&mut tx, &Frame::Fin, true).await;
         assert_eq!(
             next_frame(&mut rx, &mut decoder, &mut queue).await,
             Frame::Data(b"protected echo".to_vec())
         );
-        assert_eq!(next_frame(&mut rx, &mut decoder, &mut queue).await, Frame::Fin);
+        assert_eq!(
+            next_frame(&mut rx, &mut decoder, &mut queue).await,
+            Frame::Fin
+        );
         while let Some(chunk) = rx.data().await {
-            assert!(chunk.unwrap().is_empty(), "no DATA after terminal SmartTheia frame");
+            assert!(
+                chunk.unwrap().is_empty(),
+                "no DATA after terminal SmartTheia frame"
+            );
         }
         decoder.finish().unwrap();
         echo_task.await.unwrap();
         driver.abort();
         server.abort();
-    }).await.expect("TLS/H2 authenticated echo timed out");
+    })
+    .await
+    .expect("TLS/H2 authenticated echo timed out");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -286,7 +320,15 @@ async fn h2_tls_default_policy_rejects_private_ip_without_tcp_dial() {
         let server = tokio::spawn(serve(listener, acceptor, Arc::new(context(false))));
         let (mut sender, driver) = client(address, connector).await;
         let (response_future, mut tx) = sender.send_request(request(&bearer()), false).unwrap();
-        send(&mut tx, &Frame::Hello { version: VERSION, capabilities: 0 }, false).await;
+        send(
+            &mut tx,
+            &Frame::Hello {
+                version: VERSION,
+                capabilities: 0,
+            },
+            false,
+        )
+        .await;
         let response = response_future.await.unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
         let mut rx = response.into_body();
@@ -296,22 +338,34 @@ async fn h2_tls_default_policy_rejects_private_ip_without_tcp_dial() {
             next_frame(&mut rx, &mut decoder, &mut queue).await,
             Frame::HelloAck { .. }
         ));
-        send(&mut tx, &Frame::OpenTcp {
-            address: Address::V4([127, 0, 0, 1]),
-            port: target.port(),
-        }, true).await;
+        send(
+            &mut tx,
+            &Frame::OpenTcp {
+                address: Address::V4([127, 0, 0, 1]),
+                port: target.port(),
+            },
+            true,
+        )
+        .await;
         assert_eq!(
             next_frame(&mut rx, &mut decoder, &mut queue).await,
             Frame::OpenError(ErrorCode::PolicyDenied)
         );
         while let Some(chunk) = rx.data().await {
-            assert!(chunk.unwrap().is_empty(), "no DATA after terminal SmartTheia frame");
+            assert!(
+                chunk.unwrap().is_empty(),
+                "no DATA after terminal SmartTheia frame"
+            );
         }
         decoder.finish().unwrap();
-        assert!(timeout(Duration::from_millis(250), echo.accept()).await.is_err());
+        assert!(timeout(Duration::from_millis(250), echo.accept())
+            .await
+            .is_err());
         driver.abort();
         server.abort();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -333,7 +387,9 @@ async fn h2_tls_rejects_missing_bearer_before_smarttheia() {
         assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
         driver.abort();
         server.abort();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -344,10 +400,13 @@ async fn tls_wrong_hostname_and_untrusted_ca_fail_closed() {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(serve(listener, acceptor, Arc::new(context(true))));
         let socket = TcpStream::connect(address).await.unwrap();
-        assert!(connector.connect(
-            ServerName::try_from("wrong.example".to_owned()).unwrap(),
-            socket,
-        ).await.is_err());
+        assert!(connector
+            .connect(
+                ServerName::try_from("wrong.example".to_owned()).unwrap(),
+                socket,
+            )
+            .await
+            .is_err());
 
         // A distinct, valid CA must not authenticate this listener.
         let unrelated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -363,10 +422,15 @@ async fn tls_wrong_hostname_and_untrusted_ca_fail_closed() {
         tls.alpn_protocols = vec![b"h2".to_vec()];
         let untrusted = TlsConnector::from(Arc::new(tls));
         let socket = TcpStream::connect(address).await.unwrap();
-        assert!(untrusted.connect(
-            ServerName::try_from("localhost".to_owned()).unwrap(),
-            socket,
-        ).await.is_err());
+        assert!(untrusted
+            .connect(
+                ServerName::try_from("localhost".to_owned()).unwrap(),
+                socket,
+            )
+            .await
+            .is_err());
         server.abort();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

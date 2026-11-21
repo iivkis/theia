@@ -137,7 +137,9 @@ impl ServerContext {
     /// reflect token bytes, hashes or even the candidate string in errors.
     pub fn authorize(&self, authorization: Option<&str>) -> Result<SessionPermit, AuthFailure> {
         let header = authorization.ok_or(AuthFailure::Unauthorized)?;
-        let bearer = header.strip_prefix("Bearer ").ok_or(AuthFailure::Unauthorized)?;
+        let bearer = header
+            .strip_prefix("Bearer ")
+            .ok_or(AuthFailure::Unauthorized)?;
         if bearer.len() != 43 || bearer.contains('=') {
             return Err(AuthFailure::Unauthorized);
         }
@@ -168,7 +170,10 @@ impl ServerContext {
             .clone()
             .try_acquire_owned()
             .map_err(|_| AuthFailure::Busy)?;
-        let user_limit = self.user_streams.get(&user.id).ok_or(AuthFailure::Forbidden)?;
+        let user_limit = self
+            .user_streams
+            .get(&user.id)
+            .ok_or(AuthFailure::Forbidden)?;
         let per_user = user_limit
             .clone()
             .try_acquire_owned()
@@ -222,8 +227,7 @@ pub fn allowed_destination(ip: IpAddr, allow_private_ips: bool) -> bool {
 
 fn allowed_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, d] = ip.octets();
-    !(
-        a == 0
+    !(a == 0
         || a == 10
         || a == 127
         || a >= 224
@@ -234,8 +238,7 @@ fn allowed_v4(ip: Ipv4Addr) -> bool {
         || (a == 198 && ((b == 18 || b == 19) || (b == 51 && c == 100)))
         || (a == 203 && b == 0 && c == 113)
         || (a == 192 && b == 0 && c == 2)
-        || (a == 255 && b == 255 && c == 255 && d == 255)
-    )
+        || (a == 255 && b == 255 && c == 255 && d == 255))
 }
 
 async fn connect_target(
@@ -335,13 +338,22 @@ async fn handle_request(
     if request.method() != Method::POST
         || request.uri().path() != "/v1/session"
         || request.uri().query().is_some()
-        || request.headers().get(header::CONTENT_TYPE).map(|value| value.as_bytes())
+        || request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|value| value.as_bytes())
             != Some(b"application/octet-stream".as_slice())
     {
         reject(&mut respond, StatusCode::NOT_FOUND).await?;
         return Ok(());
     }
-    if request.headers().get_all(header::AUTHORIZATION).iter().count() != 1 {
+    if request
+        .headers()
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .count()
+        != 1
+    {
         reject(&mut respond, StatusCode::UNAUTHORIZED).await?;
         return Ok(());
     }
@@ -371,11 +383,7 @@ async fn handle_request(
     )
     .await;
     if !matches!(result, Ok(Ok(()))) {
-        let _ = send_frame(
-            &mut outgoing,
-            &Frame::Abort(ErrorCode::ProtocolError),
-        )
-        .await;
+        let _ = send_frame(&mut outgoing, &Frame::Abort(ErrorCode::ProtocolError)).await;
     }
     let _ = outgoing.send_data(Bytes::new(), true);
     drop(permit);
@@ -414,10 +422,7 @@ struct IncomingFrames {
 }
 
 impl IncomingFrames {
-    async fn next(
-        &mut self,
-        incoming: &mut h2::RecvStream,
-    ) -> Result<Option<Frame>, ServerError> {
+    async fn next(&mut self, incoming: &mut h2::RecvStream) -> Result<Option<Frame>, ServerError> {
         loop {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
@@ -431,9 +436,15 @@ impl IncomingFrames {
             };
             let block = block.map_err(|_| ServerError::Http2)?;
             let size = block.len();
-            let frames = self.decoder.feed(&block).map_err(|_| ServerError::Protocol)?;
+            let frames = self
+                .decoder
+                .feed(&block)
+                .map_err(|_| ServerError::Protocol)?;
             self.ready.extend(frames);
-            incoming.flow_control().release_capacity(size).map_err(|_| ServerError::Http2)?;
+            incoming
+                .flow_control()
+                .release_capacity(size)
+                .map_err(|_| ServerError::Http2)?;
         }
     }
 }
@@ -447,7 +458,9 @@ async fn handle_frames(
     let mut state = Session::new(Role::Server);
     let opened = timeout(HANDSHAKE_TIMEOUT, async {
         let hello = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
-        state.apply(Direction::Receive, &hello).map_err(|_| ServerError::Protocol)?;
+        state
+            .apply(Direction::Receive, &hello)
+            .map_err(|_| ServerError::Protocol)?;
         send_frame(
             outgoing,
             &Frame::HelloAck {
@@ -456,16 +469,19 @@ async fn handle_frames(
             },
         )
         .await?;
-        state.apply(
-            Direction::Send,
-            &Frame::HelloAck {
-                version: protocol::VERSION,
-                accepted_capabilities: 0,
-            },
-        )
-        .map_err(|_| ServerError::Protocol)?;
+        state
+            .apply(
+                Direction::Send,
+                &Frame::HelloAck {
+                    version: protocol::VERSION,
+                    accepted_capabilities: 0,
+                },
+            )
+            .map_err(|_| ServerError::Protocol)?;
         let open = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
-        state.apply(Direction::Receive, &open).map_err(|_| ServerError::Protocol)?;
+        state
+            .apply(Direction::Receive, &open)
+            .map_err(|_| ServerError::Protocol)?;
         let Frame::OpenTcp { address, port } = open else {
             return Err(ServerError::Protocol);
         };
@@ -478,12 +494,16 @@ async fn handle_frames(
         Ok(tcp) => tcp,
         Err(code) => {
             let failure = Frame::OpenError(code);
-            state.apply(Direction::Send, &failure).map_err(|_| ServerError::Protocol)?;
+            state
+                .apply(Direction::Send, &failure)
+                .map_err(|_| ServerError::Protocol)?;
             send_frame(outgoing, &failure).await?;
             return Ok(());
         }
     };
-    state.apply(Direction::Send, &Frame::OpenOk).map_err(|_| ServerError::Protocol)?;
+    state
+        .apply(Direction::Send, &Frame::OpenOk)
+        .map_err(|_| ServerError::Protocol)?;
     send_frame(outgoing, &Frame::OpenOk).await?;
 
     let mut buffer = [0_u8; 4096];
