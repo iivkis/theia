@@ -1,0 +1,34 @@
+# TEMPLATE ONLY: replace placeholders. Not production-ready.
+schema_version = 1
+
+[server]
+enabled = true
+
+[[server.inbounds]]
+id = "public"
+# UDP and TCP can use the same numeric port.
+quic_listen = "0.0.0.0:443"
+h2_listen = "0.0.0.0:443"
+server_name = "edge.example.org"
+tls_cert = "file:/etc/theia/tls/fullchain.pem"
+tls_key = "file:/etc/theia/tls/privkey.pem"
+
+[[server.users]]
+id = "device-a"
+# SHA-256 of a CSPRNG-generated 32-byte bearer token, lower-case hex.
+# Deliberately INVALID placeholder; replace before validate/run.
+token_sha256 = "REPLACE_WITH_64_LOWERCASE_HEX"
+disabled = false
+
+[server.policy]
+allow_private_ips = false
+max_connections_per_user = 64
+max_connections_total = 1024
+connect_timeout_ms = 10000
+
+[management]
+ipc = "auto"
+log_level = "info"
+
+[ui]
+language = "ru"

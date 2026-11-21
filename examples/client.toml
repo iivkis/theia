@@ -1,0 +1,28 @@
+# TEMPLATE ONLY: replace edge.example.org and provision token via env/secure file.
+schema_version = 1
+
+[client]
+active_profile = "home"
+
+[[client.profiles]]
+id = "home"
+server = "edge.example.org:443"
+server_name = "edge.example.org"
+# THEIA_AUTH_TOKEN must contain base64url(no-padding) of 32 random bytes.
+auth_token = "env:THEIA_AUTH_TOKEN"
+transport = "auto"
+quic_connect_timeout_ms = 1600
+quic_negative_cache_ttl_s = 900
+
+[client.proxy]
+http_listen = "127.0.0.1:7890"
+socks5_listen = "127.0.0.1:7891"
+# off / manual / on; never enable OS-wide proxy accidentally.
+system_proxy = "off"
+
+[management]
+ipc = "auto"
+log_level = "info"
+
+[ui]
+language = "ru"
