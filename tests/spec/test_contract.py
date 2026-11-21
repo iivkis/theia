@@ -138,6 +138,14 @@ class SpecContractTests(unittest.TestCase):
         spike = ROOT / "spikes" / "m0_1"
         self.assertTrue((spike / "Cargo.toml").is_file())
         self.assertTrue((spike / "Cargo.lock").is_file())
+        h2_tls = (spike / "tests" / "h2_tls.rs")
+        self.assertTrue(h2_tls.is_file())
+        for required in ("tls13_h2_full_duplex_response_before_request_eof",
+                         "tls13_h2_rejects_wrong_hostname",
+                         "tls13_h2_rejects_untrusted_ca",
+                         "tls13_h2_rejects_alpn_mismatch",
+                         "reserve_capacity", "release_capacity"):
+            self.assertIn(required, h2_tls.read_text(encoding="utf-8"))
         source = (spike / "src" / "lib.rs").read_text(encoding="utf-8")
         self.assertIn("http2_response_before_request_eof", source)
         self.assertIn("congestion::BbrConfig", source)

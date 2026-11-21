@@ -46,7 +46,7 @@
 3. `windows-smoke` после Linux tests: Windows-native `cargo test` и `cargo build --release` с отдельным кэшем. Системные proxy settings на GitHub-hosted runner без явного sandbox-плана не менять.
 4. Кэш: `Swatinem/rust-cache@v2` для registry/git/target, `Cargo.lock` как источник cache key; concurrency отменяет устаревшие runs на одной ветке. Запуск на push и PR.
 5. Rust jobs **skipped**, пока нет production workspace; как только добавлен корневой `Cargo.toml`, отсутствие корневого `Cargo.lock` становится ошибкой CI, а не silent skip.
-6. **M0.1 в отдельном `spikes/m0_1`**: `cargo test --manifest-path spikes/m0_1/Cargo.toml --locked` на Ubuntu и Windows, кэш по отдельной директории, без включения spike в поставляемый бинарник. `Cargo.lock` находится в каталоге spike и зафиксирован в git. Успех API tests не закрывает release gates (TLS/QUIC E2E, BBR telemetry, packet-capture fingerprint).
+6. **M0.1 в отдельном `spikes/m0_1`**: `cargo test --manifest-path spikes/m0_1/Cargo.toml --locked` на Ubuntu и Windows, кэш по отдельной директории, без включения spike в поставляемый бинарник. `Cargo.lock` находится в каталоге spike и зафиксирован в git. Успех M0.1 transport tests подтверждает **H2/TLS и H3/QUIC/TLS E2E** (real loopback, TLS name+ALPN verification, body before request EOF), но не закрывает release gates: **BBR loss/jitter/pacing benchmarks, backpressure under load, SmartTheia auth/ACL tunnel, packet-capture fingerprint**. Отрицательные TLS tests: wrong name, untrusted CA, ALPN mismatch.
 
 ## 3. Локальная проверка
 
