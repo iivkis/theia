@@ -141,7 +141,7 @@ fn mask_v6(address: Ipv6Addr, bits: u8) -> Ipv6Addr {
 /// purpose, private, carrier NAT, documentation, multicast, and reserved IPs.
 /// This is a defense-in-depth filter, NOT a comprehensive IANA registry check
 /// or authorization to reach a remote host.
-fn plausible_public_address(address: IpAddr) -> bool {
+pub(crate) fn plausible_public_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(ip) => {
             let [a, b, c, _] = ip.octets();

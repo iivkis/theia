@@ -120,6 +120,26 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("BBR", text)
         self.assertIn("browser-like", text)
 
+    def test_m35b2a_explicit_tls_probe_contract(self):
+        code = read("crates/theia/src/camouflage_probe.rs")
+        tests = read("crates/theia/tests/camouflage_probe.rs")
+        adr = read("docs/adr/0023-m3-5b2a-explicit-tls-probe.md")
+        self.assertIn("pub mod camouflage_probe;", read("crates/theia/src/lib.rs"))
+        for token in ("pub fn route_selected_local_ip", "pub async fn probe_tls_h2",
+                      "ProbeApproval", "IsolatedLoopbackFixture", "PublicHttpsIp",
+                      "TlsConnector", "RootCertStore", "Semaphore::const_new(4)",
+                      "MAX_HANDSHAKE_DEADLINE", "Observation::Unknown"):
+            with self.subTest(token=token):
+                self.assertIn(token, code)
+        for token in ("wrong_ca", "wrong_sni", "timeout", "NoTrustAnchors",
+                      "NotApproved", "fingerprint", "TLS1.3"):
+            with self.subTest(token=token):
+                self.assertIn(token.lower(), (tests + adr).lower())
+        self.assertIn("M3.5b2a", read("docs/STEALTH_REALITY.md"))
+        self.assertIn("M3.5b2a", read("docs/IMPLEMENTATION_PLAN.md"))
+        self.assertIn("M3.5b2a", read("README.md"))
+        self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
+
     def test_m35b1_code_contract_does_not_claim_active_scan_or_reality(self):
         code = read("crates/theia/src/camouflage_discovery.rs")
         tests = read("crates/theia/tests/camouflage_discovery.rs")
