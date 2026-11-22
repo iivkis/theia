@@ -4,7 +4,7 @@
 
 Theia — проект компактной клиент-серверной прокси-платформы. Один исполняемый файл работает в режиме **сервера** (inbound, пользователи, политика подключения) или **клиента** (подключение к inbound, локальный прокси, системный прокси Windows). При запуске TUI показывает два раздела: **«Для сервера»** и **«Для клиента»**.
 
-> **Статус: SPECIFICATION ONLY.** Репозиторий пока не содержит работающего ядра и не должен рекламироваться как готовая альтернатива Xray/sing-box. Каждый инкремент реализации обязан проходить тесты.
+> **Статус: M1.1 CLI shell.** Корневой Rust workspace и единый бинарник `theia` теперь предоставляют работающие `--help`/`--version`, безопасный разбор команд и тесты Linux/Windows. Сеть, TUI, авторизация и TOML validation ещё **не реализованы**. Все команды запуска и проверки конфигурации возвращают ненулевой код; это не рабочий прокси.
 
 ## Архитектура одним взглядом
 
@@ -37,7 +37,7 @@ applications → local HTTP/SOCKS → SmartTheia over HTTP/3 (QUIC + BBR)
 | [examples/server.toml](examples/server.toml) | серверный шаблон |
 | [examples/client.toml](examples/client.toml) | клиентский шаблон |
 
-## Целевая CLI (ещё не реализована)
+## CLI (M1.1: поддерживается синтаксис, не runtime)
 
 ```sh
 theia tui                              # стартовый экран: две панели
@@ -48,6 +48,8 @@ theia client run --config client.toml  # headless клиент
 theia config validate --config client.toml
 theia --version
 ```
+
+Все примеры запуска `tui`, `server run`, `client run`, `config validate` выше показывают **только распознаваемый синтаксис**. В M1.1 они завершаются с кодом 3 (`not implemented`) и не запускают сеть или системный прокси. Неизвестные/некорректные параметры дают код 2. `theia --help` и `theia --version` дают код 0. Отдельный Rust workspace расположен в `crates/theia/`; `spikes/m0_1/` исключён из production workspace. Проверка: `cargo test --workspace --all-targets --locked`.
 
 ## Приоритеты
 

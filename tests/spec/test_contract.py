@@ -220,6 +220,22 @@ class SpecContractTests(unittest.TestCase):
             self.assertNotIn("spikes/m0_1", workspace.get("members", []),
                              "Research-only spike must not be part of the production workspace")
 
+    def test_m11_cli_workspace_is_real_but_runtime_is_not(self):
+        root = toml("Cargo.toml")
+        workspace = root["workspace"]
+        self.assertEqual(workspace["members"], ["crates/theia"])
+        self.assertIn("spikes/m0_1", workspace["exclude"])
+        self.assertTrue((ROOT / "Cargo.lock").is_file())
+        package = toml("crates/theia/Cargo.toml")["package"]
+        self.assertEqual(package["name"], "theia")
+        source = read("crates/theia/src/lib.rs")
+        for marker in ("ServerRun", "ClientRun", "ConfigValidate", "NotImplemented",
+                       "pub fn parse(", "pub fn execute(", "CliError::InvalidArguments"):
+            self.assertIn(marker, source)
+        integration = read("crates/theia/tests/cli.rs")
+        self.assertIn("accepted_runtime_commands_fail_closed", integration)
+        self.assertIn("rejected_arguments_cannot_start_a_runtime", integration)
+
     def test_ci_tests_first_and_cached(self):
         workflow = read(".github/workflows/ci.yml")
         self.assertIn("Swatinem/rust-cache@v2", workflow)
