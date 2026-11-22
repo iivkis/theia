@@ -316,12 +316,7 @@ mod tests {
         // Its contents are NEVER decoded, copied into Observation or logged.
         let mut valid = CLIENT_PREFACE.to_vec();
         valid.extend(frame(4, 0, 0, &[0, 6, 0, 0, 0x20, 0]));
-        valid.extend(frame(
-            1,
-            4,
-            1,
-            &[0x83, 0x87, 0x81, 0x84, 0, 0x81, 0xff, 0],
-        ));
+        valid.extend(frame(1, 4, 1, &[0x83, 0x87, 0x81, 0x84, 0, 0x81, 0xff, 0]));
         let obs = inspect(&valid).unwrap();
         assert_eq!(obs.pseudo_headers.len(), 4);
         assert_eq!(obs.ordinary_fields, 1);
