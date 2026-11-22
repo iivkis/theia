@@ -6,6 +6,7 @@ pub mod client;
 pub mod config;
 pub mod local_proxy;
 pub mod protocol;
+pub mod quic_transport;
 pub mod server;
 
 use std::fmt;
