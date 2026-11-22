@@ -117,3 +117,7 @@ M1.3: тесты `crates/theia/tests/protocol.rs` выполняются в Linu
 ## Out-of-band F-14 connection invitations
 
 The versioned theia://v1 invitation is **not** a SmartTheia frame, HTTP endpoint, auth handshake, or remote administration API. It is an out-of-band human-controlled profile transfer; no changes to SmartTheia v1 wire frames, HTTP request semantics, bearer verification or network fallback rules. An embedded 256-bit token is confidential and can only be issued from fresh in-memory random bytes with a verified inbound grant and matching stored digest. See docs/INVITATIONS.md. Unknown invitation versions must fail closed, independently of supported SmartTheia wire version.
+
+## F-18/F-19: будущие security mode и TLS-in-TLS (не реализовано)
+
+Текущий SmartTheia frame v1 и H2/H3 transport contract **не меняются**. REALITY-подобная проверка идентичности сервера и camouflaged handshake является задачей внешнего security/transport adapter, не новым SmartTheia type или собственным TLS cipher. Anti-TLS-in-TLS flow shaping не дешифрует inner TLS и обязан сохранять byte-exact TCP и OPEN_OK/FIN/backpressure. H2 и H3 требуют отдельных wire feasibility/CI и явного согласования security mode без silent downgrade. Расширения version/capabilities, TOML и invite v2 требуют ADR, миграции, негативных TLS/auth/replay/probing тестов. До реализации такого режима в бинарнике нет; см. docs/STEALTH_REALITY.md и ADR-0020.

@@ -43,6 +43,8 @@ class SpecContractTests(unittest.TestCase):
             "docs/IMPLEMENTATION_SPEC.md", "docs/ARCHITECTURE.md",
             "docs/SMARTTHEIA_PROTOCOL.md", "docs/CONFIGURATION.md",
             "docs/TUI_UX.md", "docs/IMPLEMENTATION_PLAN.md",
+            "docs/STEALTH_REALITY.md",
+            "docs/adr/0020-reality-like-and-tls-in-tls.md",
             "docs/TESTING_CI.md", "docs/SPEC_REVIEW.md",
             "docs/adr/0001-standard-h3-h2-embedding.md",
             "docs/adr/0002-inbound-authorization-and-tcp-ack.md",
@@ -117,6 +119,36 @@ class SpecContractTests(unittest.TestCase):
                 self.assertRegex(text, rf"(?m)^\| {feature} \| P0 \|")
         self.assertIn("BBR", text)
         self.assertIn("browser-like", text)
+
+    def test_future_reality_like_and_tls_in_tls_are_p0_but_not_claimed_live(self):
+        spec = read("docs/IMPLEMENTATION_SPEC.md")
+        plan = read("docs/IMPLEMENTATION_PLAN.md")
+        model = read("docs/STEALTH_REALITY.md")
+        adr = read("docs/adr/0020-reality-like-and-tls-in-tls.md")
+        for feature in ("F-18", "F-19"):
+            with self.subTest(feature=feature):
+                self.assertIn(f"| {feature} | P0 |", spec)
+                self.assertIn(feature, model)
+                self.assertIn(feature, plan)
+                self.assertIn(feature, adr)
+        for text in (
+            "REALITY", "TLS-in-TLS", "не реализовано", "Проверить и подобрать",
+            "Применить", "score", "confidence", "SSRF", "FPR", "OPEN_OK",
+            "Linux/Windows", "H2", "H3", "theia://v1",
+        ):
+            with self.subTest(token=text):
+                self.assertIn(text.lower(), model.lower())
+        self.assertIn("M3.5a", plan)
+        self.assertIn("M3.5d", plan)
+        self.assertIn("M4.5", plan)
+        self.assertIn("off/optional/required", model)
+        self.assertIn("не реализовано", read("README.md"))
+        client = toml("examples/client.toml")["client"]
+        self.assertTrue(all(p["tls_profile"] == "default" for p in client["profiles"]))
+        self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
+        self.assertIn("REALITY", read("docs/TUI_UX.md"))
+        self.assertIn("TLS-in-TLS", read("docs/TESTING_CI.md"))
+        self.assertIn("schema_version=1", read("docs/CONFIGURATION.md"))
 
     def test_smarttheia_protocol_and_ack_contract(self):
         text = read("docs/SMARTTHEIA_PROTOCOL.md")
