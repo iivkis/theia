@@ -62,7 +62,11 @@ pub fn build_preview(
         Some(report) => {
             let address = report.ip();
             snapshot.egress = Some(address);
-            if snapshot.interfaces.iter().any(|iface| iface.address == address) {
+            if snapshot
+                .interfaces
+                .iter()
+                .any(|iface| iface.address == address)
+            {
                 EgressAssessment::MatchesAssignedAddress
             } else {
                 EgressAssessment::DiffersFromAssignedAddress

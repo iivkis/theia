@@ -1,9 +1,11 @@
 //! M3.5b2b2: zero-I/O network candidate preview, explicit planning scopes.
-use std::net::IpAddr;
 #[cfg(not(target_os = "linux"))]
 use std::io::ErrorKind;
+use std::net::IpAddr;
 use theia::{
-    camouflage_discovery::{CandidateHost, CandidateSource, NetworkPrefix, Warning, POPULAR_HTTPS_DOMAINS},
+    camouflage_discovery::{
+        CandidateHost, CandidateSource, NetworkPrefix, Warning, POPULAR_HTTPS_DOMAINS,
+    },
     camouflage_interfaces::{InterfaceSource, NativeInterfaces, ObservedInterface},
     camouflage_workflow::{build_preview, collect_preview, EgressAssessment, PreviewScope},
 };
@@ -27,7 +29,10 @@ fn passive_preview_includes_observations_but_never_expands_neighbour_addresses()
     assert_eq!(preview.egress_assessment, EgressAssessment::Unknown);
     assert!(preview.egress_observed_at.is_none());
     assert_eq!(preview.assigned_public_addresses, 1);
-    assert_eq!(preview.plan.candidates.len(), POPULAR_HTTPS_DOMAINS.len() + 1);
+    assert_eq!(
+        preview.plan.candidates.len(),
+        POPULAR_HTTPS_DOMAINS.len() + 1
+    );
     assert!(preview.plan.candidates.iter().any(|entry| {
         entry.host == CandidateHost::Ip("93.184.216.10".parse::<IpAddr>().unwrap())
             && entry.source == CandidateSource::ServerAddress
@@ -42,20 +47,35 @@ fn explicit_small_cidr_expands_only_inside_verified_assigned_prefix() {
     let n = native("93.184.216.10", 29, true);
     let approved = ["93.184.216.8/29".parse::<NetworkPrefix>().unwrap()];
     let preview = build_preview(&n, None, PreviewScope::OperatorApprovedCidrs(&approved));
-    assert_eq!(preview.plan.candidates.len(), POPULAR_HTTPS_DOMAINS.len() + 6);
+    assert_eq!(
+        preview.plan.candidates.len(),
+        POPULAR_HTTPS_DOMAINS.len() + 6
+    );
     assert!(preview.plan.candidates.iter().any(|entry| {
         entry.host == CandidateHost::Ip("93.184.216.11".parse().unwrap())
             && entry.source == CandidateSource::AuthorizedSubnet
     }));
-    assert!(!preview.plan.candidates.iter().any(|entry| {
-        entry.host == CandidateHost::Ip("93.184.216.15".parse().unwrap())
-    }));
+    assert!(!preview
+        .plan
+        .candidates
+        .iter()
+        .any(|entry| { entry.host == CandidateHost::Ip("93.184.216.15".parse().unwrap()) }));
 
     // Even explicit planning consent cannot override a /32 host assignment.
     let single = native("93.184.216.10", 32, true);
-    let blocked = build_preview(&single, None, PreviewScope::OperatorApprovedCidrs(&approved));
-    assert!(blocked.plan.warnings.contains(&Warning::RangeExceedsAssignedPrefix));
-    assert_eq!(blocked.plan.candidates.len(), POPULAR_HTTPS_DOMAINS.len() + 1);
+    let blocked = build_preview(
+        &single,
+        None,
+        PreviewScope::OperatorApprovedCidrs(&approved),
+    );
+    assert!(blocked
+        .plan
+        .warnings
+        .contains(&Warning::RangeExceedsAssignedPrefix));
+    assert_eq!(
+        blocked.plan.candidates.len(),
+        POPULAR_HTTPS_DOMAINS.len() + 1
+    );
 }
 
 #[test]
@@ -68,11 +88,15 @@ fn malformed_or_down_interface_cannot_supply_public_prefix_authorization() {
             PreviewScope::OperatorApprovedCidrs(&approved),
         );
         assert_eq!(
-            preview.plan.candidates.len(), POPULAR_HTTPS_DOMAINS.len(),
+            preview.plan.candidates.len(),
+            POPULAR_HTTPS_DOMAINS.len(),
             "invalid interface prefix {prefix} or up={up} must not grant neighbors"
         );
         assert_eq!(preview.assigned_public_addresses, 0);
-        assert!(preview.plan.warnings.contains(&Warning::NoPublicServerAddress));
+        assert!(preview
+            .plan
+            .warnings
+            .contains(&Warning::NoPublicServerAddress));
         assert!(preview.plan.warnings.contains(&Warning::RangeNotOnServer));
     }
 }
@@ -99,14 +123,20 @@ fn actual_native_linux_preview_never_queries_external_egress_or_expands_neighbor
     assert_eq!(result.egress_assessment, EgressAssessment::Unknown);
     assert!(result.egress_observed_at.is_none());
     assert!(result.plan.candidates.len() >= POPULAR_HTTPS_DOMAINS.len());
-    assert!(!result.plan.candidates.iter().any(|entry| entry.source == CandidateSource::AuthorizedSubnet));
+    assert!(!result
+        .plan
+        .candidates
+        .iter()
+        .any(|entry| entry.source == CandidateSource::AuthorizedSubnet));
 }
 
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn native_preview_is_explicitly_unsupported_without_windows_native_collector() {
     assert_eq!(
-        collect_preview(None, PreviewScope::PassiveOnly).unwrap_err().kind(),
+        collect_preview(None, PreviewScope::PassiveOnly)
+            .unwrap_err()
+            .kind(),
         ErrorKind::Unsupported
     );
 }

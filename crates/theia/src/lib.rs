@@ -5,8 +5,8 @@
 pub mod camouflage_discovery;
 pub mod camouflage_egress;
 pub mod camouflage_interfaces;
-pub mod camouflage_workflow;
 pub mod camouflage_probe;
+pub mod camouflage_workflow;
 pub mod client;
 pub mod config;
 #[cfg(feature = "experimental-btls-h2")]

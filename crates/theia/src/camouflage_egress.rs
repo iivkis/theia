@@ -49,9 +49,7 @@ impl EgressApproval {
         match self {
             Self::Denied => false,
             Self::PublicHttpsIp(ip) => {
-                socket.ip() == ip
-                    && socket.port() == 443
-                    && plausible_public_address(ip)
+                socket.ip() == ip && socket.port() == 443 && plausible_public_address(ip)
             }
             Self::IsolatedLoopbackFixture(fixture) => {
                 socket == fixture && socket.ip().is_loopback()
@@ -182,10 +180,15 @@ fn body_length(header: &[u8]) -> Result<usize, EgressError> {
             return Err(EgressError::InvalidResponse);
         }
         if name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            if content_length.is_some()
+                || value.is_empty()
+                || !value.bytes().all(|b| b.is_ascii_digit())
+            {
                 return Err(EgressError::InvalidResponse);
             }
-            let length = value.parse::<usize>().map_err(|_| EgressError::InvalidResponse)?;
+            let length = value
+                .parse::<usize>()
+                .map_err(|_| EgressError::InvalidResponse)?;
             if length > MAX_RESPONSE_BODY {
                 return Err(EgressError::InvalidResponse);
             }
