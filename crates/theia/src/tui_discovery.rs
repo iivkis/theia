@@ -150,7 +150,9 @@ impl DiscoveryPanel {
                 "отличается от назначенных адресов (возможен NAT/маршрутизация)"
             }
         };
-        let local = self.native_error.unwrap_or("Linux: локальные адреса/маски ОС прочитаны.");
+        let local = self
+            .native_error
+            .unwrap_or("Linux: локальные адреса/маски ОС прочитаны.");
         let mut body = format!(
             "Пассивный просмотр сетевых адресов и кандидатов\n\n{local}\nПубличных адресов интерфейсов: {}\nКандидатов в офлайн-плане: {} (популярных доменов: {})\nИсходящий IP: {assessment}\n\nCIDR НЕ сканируются. DNS/TLS-проверки доменов НЕ выполняются.\nНаблюдение ipify не доказывает владение IP, CIDR или NAT.\n",
             preview.assigned_public_addresses,
