@@ -48,10 +48,7 @@ async fn capture_production_h2_hello() -> ClientHelloSummary {
             assert_eq!(header[0], 22, "expected TLS handshake record");
             let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
             assert!((1..=18_432).contains(&length), "bounded TLS record");
-            assert!(
-                wire.len() + 5 + length <= 65_536,
-                "bounded TLS ClientHello"
-            );
+            assert!(wire.len() + 5 + length <= 65_536, "bounded TLS ClientHello");
             wire.extend_from_slice(&header);
             let offset = wire.len();
             wire.resize(offset + length, 0);
