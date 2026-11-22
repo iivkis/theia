@@ -186,6 +186,18 @@ impl Editor {
         }
     }
 
+    /// Validated server SNI for the currently selected inbound only.
+    /// No token, private key, client credential or implicit DNS resolution.
+    pub fn selected_server_name(&self) -> Option<&str> {
+        let Config::Server(doc) = &self.draft else {
+            return None;
+        };
+        doc.server
+            .inbounds
+            .get(self.selected_record)
+            .map(|inbound| inbound.server_name.as_str())
+    }
+
     pub fn selected_record_is_active(&self) -> bool {
         match &self.draft {
             Config::Client(doc) => doc.client.active_profile == self.selected_record_id(),
