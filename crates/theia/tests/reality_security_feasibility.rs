@@ -18,9 +18,14 @@ use std::{sync::Arc, time::Duration};
 use theia::{
     config::{self, Config},
     invite::Invitation,
-    quic_transport::{accept as accept_quic, client_endpoint, connect as connect_quic, server_endpoint},
+    quic_transport::{
+        accept as accept_quic, client_endpoint, connect as connect_quic, server_endpoint,
+    },
 };
-use tokio::{net::{TcpListener, TcpStream}, time::timeout};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    time::timeout,
+};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroize;
 
@@ -66,11 +71,7 @@ fn v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile() {
     let anchor = "tls_profile = \"default\"\n";
     assert!(baseline.contains(anchor));
     for unsupported in ["smart-reality-v1", "reality", "chrome133", "insecure"] {
-        let changed = baseline.replacen(
-            anchor,
-            &format!("tls_profile = \"{unsupported}\"\n"),
-            1,
-        );
+        let changed = baseline.replacen(anchor, &format!("tls_profile = \"{unsupported}\"\n"), 1);
         assert!(
             config::parse(&changed).is_err(),
             "unimplemented named TLS/security mode must fail closed"
@@ -82,9 +83,7 @@ fn v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile() {
         "flow_shaping = \"required\"\n",
         "disable_certificate_verification = true\n",
     ] {
-        assert!(
-            config::parse(&baseline.replacen(anchor, &format!("{anchor}{extra}"), 1)).is_err()
-        );
+        assert!(config::parse(&baseline.replacen(anchor, &format!("{anchor}{extra}"), 1)).is_err());
     }
 }
 
@@ -101,13 +100,19 @@ fn v1_invite_rejects_new_mode_and_identity_injection_without_a_version_bump() {
         .unwrap();
     let text = std::str::from_utf8(&wire).unwrap();
     for candidate in [
-        text.replace("tls_profile = \"default\"", "tls_profile = \"smart-reality-v1\""),
+        text.replace(
+            "tls_profile = \"default\"",
+            "tls_profile = \"smart-reality-v1\"",
+        ),
         text.replace("version = 1", "version = 2"),
         format!("{text}server_public_key = \"test-only-key\"\n"),
         format!("{text}flow_shaping = \"required\"\n"),
         format!("{text}insecure_skip_verify = true\n"),
     ] {
-        let link = format!("theia://v1/{}", URL_SAFE_NO_PAD.encode(candidate.as_bytes()));
+        let link = format!(
+            "theia://v1/{}",
+            URL_SAFE_NO_PAD.encode(candidate.as_bytes())
+        );
         assert!(
             Invitation::decode(&link).is_err(),
             "v1 must reject new trust and anti-DPI fields"
@@ -154,7 +159,10 @@ async fn verified_h2_tls_exporter_is_identical_on_peers_and_context_separated() 
             let stream = acceptor.accept(socket).await.unwrap();
             let connection = stream.get_ref().1;
             assert_eq!(connection.alpn_protocol(), Some(&b"h2"[..]));
-            assert_eq!(connection.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
+            assert_eq!(
+                connection.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_3)
+            );
             let same = connection
                 .export_keying_material([0u8; 32], EXPORTER_LABEL, Some(CONTEXT))
                 .unwrap();
@@ -170,7 +178,10 @@ async fn verified_h2_tls_exporter_is_identical_on_peers_and_context_separated() 
             .unwrap();
         let connection = tls.get_ref().1;
         assert_eq!(connection.alpn_protocol(), Some(&b"h2"[..]));
-        assert_eq!(connection.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
+        assert_eq!(
+            connection.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
         let mut same = connection
             .export_keying_material([0u8; 32], EXPORTER_LABEL, Some(CONTEXT))
             .unwrap();
@@ -178,9 +189,18 @@ async fn verified_h2_tls_exporter_is_identical_on_peers_and_context_separated() 
             .export_keying_material([0u8; 32], EXPORTER_LABEL, Some(b"other context"))
             .unwrap();
         let (mut server_same, mut server_distinct) = server.await.unwrap();
-        assert_eq!(same, server_same, "exporter binds to the authenticated TLS session");
-        assert_eq!(distinct, server_distinct, "both sides use identical context");
-        assert_ne!(same, distinct, "context must domain-separate different uses");
+        assert_eq!(
+            same, server_same,
+            "exporter binds to the authenticated TLS session"
+        );
+        assert_eq!(
+            distinct, server_distinct,
+            "both sides use identical context"
+        );
+        assert_ne!(
+            same, distinct,
+            "context must domain-separate different uses"
+        );
         same.zeroize();
         distinct.zeroize();
         server_same.zeroize();
