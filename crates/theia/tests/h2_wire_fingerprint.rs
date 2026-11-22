@@ -212,7 +212,7 @@ async fn measure(backend: Backend) -> Observation {
         let observation = server.await.expect("capture server complete");
         // No raw wire bytes, header values, SNI or secrets are printed.
         eprintln!(
-            "M3.4f H2 first-flight backend={} SETTINGS={:?} preceding_frame_types={:?} optional_settings_ack={} pseudo_names={:?} ordinary_fields={} END_STREAM={}",
+            "M3.4i production H2 first-flight backend={} SETTINGS={:?} preceding_frame_types={:?} connection_WINDOW_UPDATE_increments={:?} optional_settings_ack={} pseudo_names={:?} ordinary_fields={} END_STREAM={}",
             match backend {
                 Backend::Rustls => "rustls",
                 #[cfg(feature = "experimental-btls-h2")]
@@ -220,6 +220,7 @@ async fn measure(backend: Backend) -> Observation {
             },
             observation.settings,
             observation.frames_before_headers,
+            observation.connection_window_updates,
             observation.settings_ack_before_headers,
             observation.pseudo_headers,
             observation.ordinary_fields,
@@ -250,6 +251,7 @@ async fn real_default_h2_settings_and_pseudo_headers_are_measured() {
         [":method", ":scheme", ":authority", ":path"]
     );
     assert!(observed.frames_before_headers.is_empty());
+    assert!(observed.connection_window_updates.is_empty());
     assert_eq!(observed.ordinary_fields, 2); // content type and bearer names
 }
 
@@ -263,6 +265,11 @@ async fn real_experimental_btls_and_rustls_share_h2_engine_not_chrome_profile() 
     assert_eq!(btls.settings, [(2, 0), (6, 8192)]);
     assert_eq!(btls.pseudo_headers, rustls.pseudo_headers);
     assert_eq!(btls.frames_before_headers, rustls.frames_before_headers);
+    assert_eq!(
+        btls.connection_window_updates,
+        rustls.connection_window_updates
+    );
+    assert!(btls.connection_window_updates.is_empty());
     assert_eq!(btls.ordinary_fields, rustls.ordinary_fields);
     // The Go uTLS repository's minimal H2 probe is a standards-compliant
     // NEGATIVE CONTROL, not a Chrome133 HTTP/2 reference capture.

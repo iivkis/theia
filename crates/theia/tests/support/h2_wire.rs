@@ -12,6 +12,10 @@ const MAX_HEADERS: usize = 32_768;
 pub struct Observation {
     pub settings: Vec<(u16, u32)>,
     pub frames_before_headers: Vec<u8>,
+    /// Increment values of valid connection-level WINDOW_UPDATE frames before
+    /// the first request, without retaining any header or application bytes.
+    /// Timing varies: absence here does not mean a different TLS/H2 profile.
+    pub connection_window_updates: Vec<u32>,
     /// Timing-dependent acknowledgement of the server's SETTINGS; not a
     /// client fingerprint parameter, so excluded from frame-order matching.
     pub settings_ack_before_headers: bool,
@@ -149,6 +153,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Observation, &'static str> {
     let mut cursor = CLIENT_PREFACE.len();
     let mut settings = None;
     let mut prior = Vec::new();
+    let mut connection_window_updates = Vec::new();
     let mut headers = Vec::new();
     let mut in_headers = false;
     let mut settings_ack_before_headers = false;
@@ -203,6 +208,21 @@ pub fn inspect(bytes: &[u8]) -> Result<Observation, &'static str> {
             settings_ack_before_headers = true;
             continue;
         }
+        if kind == 8 && !in_headers {
+            if flags != 0 || stream != 0 || length != 4 {
+                return Err("malformed first-flight connection WINDOW_UPDATE");
+            }
+            let increment = u32::from_be_bytes(payload.try_into().unwrap());
+            if increment == 0 || increment & 0x8000_0000 != 0 {
+                return Err("zero or reserved-bit WINDOW_UPDATE credit");
+            }
+            if connection_window_updates.len() >= 4 {
+                return Err("too many connection WINDOW_UPDATE frames before HEADERS");
+            }
+            connection_window_updates.push(increment);
+            prior.push(kind);
+            continue;
+        }
         if kind == 1 && !in_headers {
             if stream != 1 {
                 return Err("first request must use stream 1");
@@ -246,6 +266,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Observation, &'static str> {
             return Ok(Observation {
                 settings: settings.unwrap(),
                 frames_before_headers: prior,
+                connection_window_updates,
                 settings_ack_before_headers,
                 pseudo_headers,
                 ordinary_fields,
@@ -308,6 +329,35 @@ mod tests {
         malformed[CLIENT_PREFACE.len() + 9 + 6 + 1] = 0;
         malformed[CLIENT_PREFACE.len() + 9 + 6 + 2] = 1;
         assert!(inspect(&malformed).is_err());
+    }
+
+    #[test]
+    fn observes_valid_connection_window_update_increment_before_headers() {
+        let mut raw = CLIENT_PREFACE.to_vec();
+        raw.extend(frame(4, 0, 0, &[0, 2, 0, 0, 0, 0]));
+        raw.extend(frame(8, 0, 0, &15_663_105u32.to_be_bytes()));
+        raw.extend(frame(1, 4, 1, &[0x83, 0x87, 0x81, 0x84]));
+        let observed = inspect(&raw).unwrap();
+        assert_eq!(observed.connection_window_updates, [15_663_105]);
+        assert_eq!(observed.frames_before_headers, [8]);
+        assert_eq!(observed.pseudo_headers.len(), 4);
+    }
+
+    #[test]
+    fn refuses_invalid_first_flight_window_update_without_guessing_credit() {
+        for (flags, stream, body) in [
+            (0, 0, 0u32.to_be_bytes().to_vec()),
+            (0, 0, 0x8000_0001u32.to_be_bytes().to_vec()),
+            (1, 0, 1u32.to_be_bytes().to_vec()),
+            (0, 1, 1u32.to_be_bytes().to_vec()),
+            (0, 0, vec![0, 1, 2]),
+        ] {
+            let mut raw = CLIENT_PREFACE.to_vec();
+            raw.extend(frame(4, 0, 0, &[]));
+            raw.extend(frame(8, flags, stream, &body));
+            raw.extend(frame(1, 4, 1, &[0x83, 0x87, 0x81, 0x84]));
+            assert!(inspect(&raw).is_err(), "bad WINDOW_UPDATE must fail");
+        }
     }
 
     #[test]
