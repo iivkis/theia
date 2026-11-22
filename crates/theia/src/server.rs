@@ -313,7 +313,7 @@ async fn connect_target(
         let permitted = permitted_candidates(candidates, policy.allow_private_ips)?;
         // Pin each ACL-checked SocketAddr. Share the remaining deadline
         // between candidates so an unresponsive IPv6 route cannot starve IPv4.
-        dial_candidates(&permitted, deadline, |candidate| TcpStream::connect(candidate)).await
+        dial_candidates(&permitted, deadline, TcpStream::connect).await
     })
     .await
     .map_err(|_| ErrorCode::DialTimeout)?
