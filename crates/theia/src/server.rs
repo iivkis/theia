@@ -601,7 +601,7 @@ async fn handle_frames(
             return Err(ServerError::Http2);
         }
     };
-    let mut tcp = match dial {
+    let tcp = match dial {
         Ok(tcp) => tcp,
         Err(code) => {
             let failure = Frame::OpenError(code);
@@ -617,73 +617,103 @@ async fn handle_frames(
         .map_err(|_| ServerError::Protocol)?;
     send_frame(outgoing, &Frame::OpenOk).await?;
 
-    let mut buffer = [0_u8; 4096];
-    let mut inbound_eof = false;
-    let mut remote_eof = false;
-    let mut received_fin = false;
-    loop {
-        if state.is_closed() {
-            // Both FINs were exchanged. Reject queued or trailing frames and
-            // partial input rather than silently accepting a truncated body.
-            if !inbound_eof {
-                let tail = timeout(CLOSE_TIMEOUT, decoder.next(incoming))
+    relay_tcp(tcp, incoming, outgoing, decoder, state).await
+}
+
+/// Drive the two TCP directions independently. In particular, lack of H2
+/// response credit must never block writes to the target TCP connection.
+/// Each directional FSM starts at OPEN_OK; only its own DATA/FIN transitions
+/// are applied. Both tasks must finish successfully for graceful completion.
+async fn relay_tcp(
+    tcp: TcpStream,
+    incoming: &mut h2::RecvStream,
+    outgoing: &mut h2::SendStream<Bytes>,
+    mut decoder: IncomingFrames,
+    mut state: Session,
+) -> Result<(), ServerError> {
+    let (mut read, mut write) = tcp.into_split();
+    let mut rx_state = state.clone();
+    let mut tx_state = state.clone();
+    let (download_done, mut download_finished) = tokio::sync::oneshot::channel();
+    let upload = async {
+        loop {
+            let frame = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
+            rx_state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            match frame {
+                Frame::Data(data) => {
+                    timeout(FRAME_IDLE_TIMEOUT, write.write_all(&data))
+                        .await
+                        .map_err(|_| ServerError::TimedOut)?
+                        .map_err(|_| ServerError::Io)?;
+                }
+                Frame::Fin => {
+                    timeout(FRAME_IDLE_TIMEOUT, write.shutdown())
+                        .await
+                        .map_err(|_| ServerError::TimedOut)?
+                        .map_err(|_| ServerError::Io)?;
+                    break;
+                }
+                Frame::Abort(_) => return Err(ServerError::Http2),
+                _ => return Err(ServerError::Protocol),
+            }
+        }
+        // FIN half-closes TCP upload, not the HTTP request itself. Keep
+        // watching for reset, trailing frames or request EOF while downloading.
+        let tail = tokio::select! {
+            result = decoder.next(incoming) => result?,
+            _ = &mut download_finished => {
+                timeout(CLOSE_TIMEOUT, decoder.next(incoming))
                     .await
-                    .map_err(|_| ServerError::TimedOut)??;
-                if tail.is_some() {
-                    return Err(ServerError::Protocol);
-                }
+                    .map_err(|_| ServerError::TimedOut)??
             }
-            state.finish().map_err(|_| ServerError::Protocol)?;
-            return Ok(());
+        };
+        if tail.is_some() {
+            return Err(ServerError::Protocol);
         }
-        tokio::select! {
-            _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
-                return Err(ServerError::Http2);
-            }
-            message = decoder.next(incoming), if !inbound_eof => {
-                match message? {
-                    Some(Frame::Data(data)) => {
-                        state.apply(Direction::Receive, &Frame::Data(data.clone()))
-                            .map_err(|_| ServerError::Protocol)?;
-                        timeout(FRAME_IDLE_TIMEOUT, tcp.write_all(&data))
-                            .await.map_err(|_| ServerError::TimedOut)?
-                            .map_err(|_| ServerError::Io)?;
-                    }
-                    Some(Frame::Fin) => {
-                        state.apply(Direction::Receive, &Frame::Fin)
-                            .map_err(|_| ServerError::Protocol)?;
-                        received_fin = true;
-                        tcp.shutdown().await.map_err(|_| ServerError::Io)?;
-                    }
-                    Some(Frame::Abort(code)) => {
-                        state.apply(Direction::Receive, &Frame::Abort(code))
-                            .map_err(|_| ServerError::Protocol)?;
-                        return Ok(());
-                    }
-                    Some(_) => return Err(ServerError::Protocol),
-                    None => {
-                        if !received_fin {
-                            return Err(ServerError::Protocol);
-                        }
-                        inbound_eof = true;
-                    }
+        Ok::<(), ServerError>(())
+    };
+    let download = async {
+        let mut buffer = [0u8; 4096];
+        loop {
+            let size = tokio::select! {
+                result = timeout(FRAME_IDLE_TIMEOUT, read.read(&mut buffer)) => {
+                    result.map_err(|_| ServerError::TimedOut)?
+                        .map_err(|_| ServerError::Io)?
                 }
-            }
-            count = timeout(FRAME_IDLE_TIMEOUT, tcp.read(&mut buffer)), if !remote_eof => {
-                let size = count.map_err(|_| ServerError::TimedOut)?.map_err(|_| ServerError::Io)?;
-                if size == 0 {
-                    state.apply(Direction::Send, &Frame::Fin)
-                        .map_err(|_| ServerError::Protocol)?;
-                    send_frame(outgoing, &Frame::Fin).await?;
-                    remote_eof = true;
-                } else {
-                    let frame = Frame::Data(buffer[..size].to_vec());
-                    state.apply(Direction::Send, &frame).map_err(|_| ServerError::Protocol)?;
-                    send_frame(outgoing, &frame).await?;
+                _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
+                    return Err(ServerError::Http2);
                 }
+            };
+            let frame = if size == 0 {
+                Frame::Fin
+            } else {
+                Frame::Data(buffer[..size].to_vec())
+            };
+            tx_state
+                .apply(Direction::Send, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &frame))
+                .await
+                .map_err(|_| ServerError::TimedOut)??;
+            if size == 0 {
+                let _ = download_done.send(());
+                return Ok::<(), ServerError>(());
             }
         }
-    }
+    };
+
+    // An error can cancel send_frame halfway through an H2 window. Reset
+    // the stream instead of appending an ABORT to a partially written frame.
+    tokio::try_join!(upload, download).map_err(|_| ServerError::Http2)?;
+    state
+        .apply(Direction::Receive, &Frame::Fin)
+        .map_err(|_| ServerError::Protocol)?;
+    state
+        .apply(Direction::Send, &Frame::Fin)
+        .map_err(|_| ServerError::Protocol)?;
+    state.finish().map_err(|_| ServerError::Protocol)
 }
 
 fn pem_data(reference: &str, private_key: bool) -> Result<Vec<u8>, ServerError> {

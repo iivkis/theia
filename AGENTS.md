@@ -79,3 +79,5 @@
 
 
 M2.1 hardening: preflight certificate SAN matches configured DNS name (not full PKI chain/time validation), bounded shared IP request budget (120/min; 4096 peers; fixed windows; all requests), 8 KiB H2 header limit, H2/TLS handshake deadlines, single DNS/dial deadline with at most 64 results, task ownership via JoinSet, and bounded abort/drain. Remaining stress and full PKI checks are not claimed complete.
+
+M2.1 relay regression: independently driven TCP read/write halves, bounded H2 frame send, direction-specific FSM checks, stream reset on interrupted wire frame. Production-server integration tests exercise withheld response credit (1 KiB H2 window, 256 KiB download, successful concurrent upload and FIN) and eight open tunnels on one H2 connection with one cancelled stream and byte-exact sibling transfers. These are bounded regression tests, not a peak-RSS or large-scale benchmark; await Linux/Windows CI.
