@@ -63,10 +63,14 @@ impl DualProbeReport {
                     && h2.evidence.tls13 == Observation::Verified
                     && h2.evidence.trusted_chain == Observation::Verified
                     && h2.evidence.sni_san_match == Observation::Verified
+                    && h2.evidence.certificate_current == Observation::Verified
+                    && h2.evidence.reachable == Observation::Verified
                     && h2.evidence.alpn_h2 == Observation::Verified
                     && h3.evidence.tls13 == Observation::Verified
                     && h3.evidence.trusted_chain == Observation::Verified
                     && h3.evidence.sni_san_match == Observation::Verified
+                    && h3.evidence.certificate_current == Observation::Verified
+                    && h3.evidence.reachable == Observation::Verified
                     && h3.evidence.alpn_h3 == Observation::Verified
         )
     }
