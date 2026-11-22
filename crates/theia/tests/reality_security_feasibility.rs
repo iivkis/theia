@@ -210,6 +210,7 @@ async fn verified_h3_quic_exporter_matches_both_peers_with_domain_separation() {
         let mut roots = RootCertStore::empty();
         roots.add(der).unwrap();
         let client = client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server_task = tokio::spawn(async move {
             let incoming = server.accept().await.unwrap();
@@ -222,6 +223,7 @@ async fn verified_h3_quic_exporter_matches_both_peers_with_domain_separation() {
             connection
                 .export_keying_material(&mut other, EXPORTER_LABEL, b"other context")
                 .unwrap();
+            done_rx.await.unwrap();
             connection.close(0u32.into(), b"finished");
             (derived, other)
         });
@@ -234,6 +236,7 @@ async fn verified_h3_quic_exporter_matches_both_peers_with_domain_separation() {
         connection
             .export_keying_material(&mut other, EXPORTER_LABEL, b"other context")
             .unwrap();
+        done_tx.send(()).unwrap();
         let (mut server_derived, mut server_other) = server_task.await.unwrap();
         assert_eq!(derived, server_derived);
         assert_eq!(other, server_other);
