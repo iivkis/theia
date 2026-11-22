@@ -4,7 +4,8 @@
 //! No service reload, network or OS proxy effect.
 use crate::{
     tui_candidate_batch::CandidateBatchPanel, tui_candidates::CandidateReview,
-    tui_discovery::DiscoveryPanel, tui_editor::Editor, tui_probe::ProbePanel, Role,
+    tui_discovery::DiscoveryPanel, tui_domain::DomainPanel, tui_editor::Editor,
+    tui_probe::ProbePanel, Role,
 };
 use crossterm::{
     cursor::{Hide, Show},
@@ -184,6 +185,7 @@ struct Interaction {
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
     candidate_batch: Option<CandidateBatchPanel>,
+    domain: Option<DomainPanel>,
     probe: Option<ProbePanel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
@@ -197,6 +199,7 @@ impl Interaction {
             discovery: None,
             candidates: None,
             candidate_batch: None,
+            domain: None,
             probe: None,
             pending: None,
             saving: None,
@@ -249,6 +252,28 @@ impl Interaction {
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press || self.saving.is_some() {
+            return false;
+        }
+        if let Some(domain) = self.domain.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    if domain.back_or_close() {
+                        self.domain = None;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => domain.next(),
+                KeyCode::Up | KeyCode::Char('k') => domain.previous(),
+                KeyCode::Char(' ') => domain.toggle_current(),
+                KeyCode::Enter => domain.ask_confirmation(),
+                KeyCode::Char('y') if domain.is_dns_confirming() => {
+                    domain.confirm_dns_and_start();
+                }
+                KeyCode::Char('y') if domain.is_probe_confirming() => {
+                    domain.confirm_probes_and_start();
+                }
+                KeyCode::Char('n') => domain.decline(),
+                _ => {}
+            }
             return false;
         }
         if let Some(batch) = self.candidate_batch.as_mut() {
@@ -305,6 +330,8 @@ impl Interaction {
                     review.batch_preview(),
                     server_name,
                 ));
+            } else if key.code == KeyCode::Char('d') {
+                self.domain = Some(DomainPanel::new(review.batch_preview()));
             }
             return false;
         }
@@ -633,7 +660,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: вручную выбрать до 8 IP (Space) и отдельно одобрить обе TLS/H2 и QUIC/H3 проверки, t: один IP H2+H3. Ни один шаг не применяет настройки. Runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ни один шаг не применяет настройки. Runtime и системный прокси не изменяются.",
             true,
         ),
     }
@@ -658,6 +685,14 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             parts[1],
             "Не сохранено: подтвердите переход",
             "s: сохранить и продолжить\nd: отменить изменения и продолжить\nEsc: остаться в редакторе\n\nНи одна опция не применяет конфигурацию к runtime.",
+            true,
+        );
+    } else if let Some(domain) = interaction.and_then(|ui| ui.domain.as_ref()) {
+        panel(
+            frame,
+            parts[1],
+            "F-18: каталог HTTPS доменов, согласие DNS и pinned H2+H3",
+            &domain.body(),
             true,
         );
     } else if let Some(batch) = interaction.and_then(|ui| ui.candidate_batch.as_ref()) {
@@ -695,7 +730,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  u: пользователь  p: сеть/IP  r/b: кандидаты  Ctrl+S: сохранить",
+            "j/k: запись  Tab: поле  Enter/e: ввод  u: пользователь  p: сеть/IP  r/b/d: кандидаты  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
@@ -804,6 +839,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(batch) = interaction.candidate_batch.as_mut() {
             batch.poll();
+        }
+        if let Some(domain) = interaction.domain.as_mut() {
+            domain.poll();
         }
         terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
         if event::poll(Duration::from_millis(50))? {
@@ -1428,6 +1466,50 @@ mod tests {
         assert!(!ui.candidate_batch.as_ref().unwrap().is_running());
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.candidate_batch.is_none());
+    }
+
+    #[test]
+    fn domain_catalog_opens_offline_and_requires_distinct_dns_confirmation() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        ui.update(&mut model, press(KeyCode::Char('p')));
+        ui.update(&mut model, press(KeyCode::Char('r')));
+        ui.update(&mut model, press(KeyCode::Char('d')));
+        assert!(ui.domain.is_some());
+        assert!(!ui.domain.as_ref().unwrap().is_running());
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("каталог") || screen.contains("Каталог"));
+        assert!(screen.contains("DNS ещё НЕ выполнялся"));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        assert!(!ui.domain.as_ref().unwrap().is_running());
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.domain.as_ref().unwrap().is_dns_confirming());
+        ui.update(&mut model, press(KeyCode::Char('n')));
+        assert!(!ui.domain.as_ref().unwrap().is_dns_confirming());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.domain.is_none());
+        assert!(ui.candidates.is_some());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.candidates.is_none());
+    }
+
+    #[test]
+    fn domain_resolver_is_inaccessible_from_client_or_active_cidr_editor() {
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(None);
+        ui.update(&mut model, press(KeyCode::Char('d')));
+        assert!(ui.domain.is_none());
+        model.screen = Screen::Server;
+        ui.update(&mut model, press(KeyCode::Char('p')));
+        ui.update(&mut model, press(KeyCode::Char('r')));
+        ui.update(&mut model, press(KeyCode::Char('a')));
+        assert!(ui.candidates.as_ref().unwrap().is_editing());
+        ui.update(&mut model, press(KeyCode::Char('d')));
+        assert!(ui.domain.is_none());
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Char('d')));
+        assert!(ui.domain.is_some());
+        assert!(!ui.domain.as_ref().unwrap().is_running());
     }
 
     #[test]
