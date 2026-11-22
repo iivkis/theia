@@ -29,6 +29,20 @@ Because Chromium is only a **reference frame generator** and the server uses a d
 - Given the M3.4f Theia baseline `[(6,8192)]`, when the Chromium reference is obtained, then its SETTINGS are compared separately and its pseudo-name order is printed (names only). A differing browser profile is evidence of the gap, **not** evidence that Theia now matches Chrome.
 - Given a browser test script or Chromium binary missing on either platform, the mandatory job fails rather than silently skipping. No CI job may be marked successful by a synthetic fixture that pretends to be Chromium.
 
+## Confirmed actual Chromium reference (native Linux and Windows)
+
+The first-pass Chromium reference test passed **on both OSes**, with Playwright `1.65.2` provisioning Chrome for Testing **159.0.8154.6**, headless Chromium revision `1255`. On each runner, the actual browser visited the isolated HTTPS origin, received the expected HTTP 200/DOM content and emitted:
+
+| On-wire field | Chromium reference | Existing Theia production H2 baseline (M3.4f) |
+| --- | --- | --- |
+| First SETTINGS in wire order | `[(1,65536),(2,0),(4,6291456),(6,262144)]` | `[(6,8192)]` |
+| Recognized pseudo-name order | `:method,:authority,:scheme,:path` | `:method,:scheme,:authority,:path` |
+| Pre-first-HEADERS frame type observed | `[8]` (WINDOW_UPDATE) | `[]` (optional SETTINGS ACK excluded) |
+| Ordinary headers, name count only | 14 | 2 |
+| HEADERS END_STREAM | `true` (GET without body) | `false` (SmartTheia POST with open duplex body) |
+
+The four ordered SETTINGS and four recognized pseudo names are now **exact regression assertions** on the Playwright 1.65.2/Chromium 159 reference. WINDOW_UPDATE timing and header **count** are observations only, not stable acceptance criteria: the browser GET and Theia POST are different workloads. Any Chromium revision bump requires deliberate comparison and test revision. A CI passing result on this reference does **not** establish browser-like Theia profile, TLS cipher-suite fidelity, X.509 trust for the browser, or H3/QUIC Initial.
+
 ## Release guards
 
 No implementation of Chrome's exact SETTINGS/priority/window/HPACK policy, no TLS cipher-suite/extension equality, no H3/QUIC Initial profile, no default BoringSSL backend, no config migration. This experiment measures browser GET vs authenticated Theia POST, so header/END_STREAM differences due to **different request semantics** must not be interpreted as fingerprint gaps independent of workload. Later matching must use a like-for-like request and actual verified reference profile, with regression E2E across Linux and Windows. F-13 and M5 remain open.
