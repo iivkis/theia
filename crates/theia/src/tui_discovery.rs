@@ -52,6 +52,16 @@ impl DiscoveryPanel {
         }
     }
 
+    /// Expose only local observations to the separate operator-reviewed
+    /// TLS probe chooser. An ipify witness is not an assigned interface.
+    pub(crate) fn assigned_interfaces(&self) -> &NativeInterfaces {
+        &self.native
+    }
+
+    pub(crate) fn may_review_probe(&self) -> bool {
+        matches!(self.phase, Phase::Passive | Phase::Complete(_))
+    }
+
     pub(crate) fn is_consent_pending(&self) -> bool {
         matches!(self.phase, Phase::Confirm)
     }
