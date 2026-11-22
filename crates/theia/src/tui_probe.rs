@@ -56,7 +56,11 @@ fn describe_h2_evidence(evidence: &TlsEvidence) -> String {
         "H2 score: {}/100, confidence: {}%, eligible: {eligible}.\nПричины: {}.",
         rating.score,
         rating.confidence,
-        if reasons.is_empty() { "нет" } else { &reasons }
+        if reasons.is_empty() {
+            "нет"
+        } else {
+            &reasons
+        }
     )
 }
 
