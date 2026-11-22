@@ -273,6 +273,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut builder = h2::client::Builder::new();
+    // Theia never accepts server push. Advertise that explicitly instead
+    // of allowing a peer to reserve unsolicited streams. This matches the
+    // safe SETTINGS_ENABLE_PUSH=0 part of the measured Chromium reference,
+    // while retaining Theia's strict 8 KiB response-header limit and
+    // bounded default receive windows. No named browser profile is claimed.
+    builder.enable_push(false);
     builder.max_header_list_size(8192);
     let (sender, connection) = builder
         .handshake(tls)
