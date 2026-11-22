@@ -161,7 +161,7 @@ mod tests {
             .collect();
         let ips = vet_dns_answers(&addresses).unwrap();
         assert_eq!(ips.len(), MAX_PINNED_IPS);
-        assert_eq!(ips[0], "93.184.216.1".parse().unwrap());
-        assert_eq!(ips[7], "93.184.216.8".parse().unwrap());
+        assert_eq!(ips[0], "93.184.216.1".parse::<IpAddr>().unwrap());
+        assert_eq!(ips[7], "93.184.216.8".parse::<IpAddr>().unwrap());
     }
 }
