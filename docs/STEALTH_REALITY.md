@@ -17,6 +17,10 @@
 - `TlsEvidence::suitability(H2|H3)` вычисляет прозрачный **эвристический** score/confidence/блокирующие причины из *внешних проверенных наблюдений*. По умолчанию все поля `Unknown`, score=0, confidence=0, `eligible=false`; ни популярность домена, ни IP не превращаются в реальный TLS certificate/fingerprint proof. Разные ALPN h2/h3 оцениваются независимо. Поле `theia_fingerprint_match` не заполняется этим модулем: F-13 открыто.
 - Реальный сбор интерфейсов, DNS/CT/RDAP, HTTPS/TLS рукопожатия, certificate chain/SAN/expiry, разрешение оператора на сетевые проверки, бюджеты probe/SSRF, scoring calibration, TUI «два клика», REALITY-like handshake и TLS-in-TLS flow shaping **ещё не реализованы**. Модуль возвращает **план кандидатов**, а не результаты сканирования или готовую мимикрию.
 
+## M3.5b2b1 — назначенные Linux-интерфейсы и маски (ещё не scanner)
+
+`camouflage_interfaces::collect_assigned_interfaces` читает только локальные UP IPv4/IPv6 интерфейсы и настоящие непрерывные маски через Linux `getifaddrs`, ограничивая количество записей 4096; нулевая/неправильная маска исключается, внешний egress NAT и BGP/RDAP ownership не определяются. `server_snapshot()` выдаёт `egress=None` и пустые inferred-prefixes, не выдаёт операторского approval и не создаёт сетевую очередь самостоятельно. На Windows пока только Unsupported; CI проверяет общий parser и отказ. [ADR-0025](adr/0025-m3-5b2b1-linux-interface-collector.md). F-18/F-19 по-прежнему открыты, активных сетевых проверок нет.
+
 ## M3.5b2a — локальное определение маршрута и явный TLS/H2 probe (реализованный экспериментальный library API)
 
 `crates/theia/src/camouflage_probe.rs` содержит **настоящий**, ограниченный по времени TLS 1.3/H2 клиентский handshake через закреплённый `SocketAddr`. Это исследовательский программный API, **не** законченный сканер или видимая пользователю кнопка. Integration tests `crates/theia/tests/camouflage_probe.rs` используют исключительно loopback и временные тестовые CA; публичных доменов и чужих диапазонов в CI никто не сканирует. ADR-0023 фиксирует границы.

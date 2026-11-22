@@ -2,6 +2,8 @@
 
 **Правило CI-only:** все проверки выполняются автоматически в GitHub Actions. Разработчик и пользователь не должны запускать тесты или вручную подтверждать сценарии. Тестирование предшествует сборке релизных артефактов. CI не должен маскировать отсутствие сетевой Rust-реализации. С M1.1 корневой workspace и `Cargo.lock` существуют: Linux `rust-tests` и Windows `windows-smoke` должны запускаться. CLI `--help`/`--version` работают; с M1.2 `config validate` выполняет структурную TOML v1 validation (exit 0/2) без чтения секретов. Команда `tui` (M4.1a) запускает только read-only ratatui навигацию при интерактивном TTY; без TTY возвращает ненулевой статус без сетевых и системных эффектов; M2.2b добавляет `client run` в explicit H2 (CI pending); с M2.1 `server run` — реальный TLS1.3/H2 сервер с bearer/inbound ACL + TCP dial и ненулевым exit на invalid config/PEM. До M1.1 Rust jobs были skipped.
 
+**M3.5b2b1 collector CI:** `crates/theia/tests/camouflage_interfaces.rs` проверяет локально обнаруженный Linux loopback, mask provenance, отказ от эмуляции NAT egress, непрерывные IPv4/IPv6 masks и негативные noncontiguous/zero masks; Windows гарантированно компилирует model и возвращает Unsupported (не пропускает тест). Ни один тест не обращается к внешним серверам или не требует ручных IP/CIDR, режим scanner не включён. Дополнительный native Windows collector остаётся отдельным этапом.
+
 ## 1. Test pyramid
 
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)

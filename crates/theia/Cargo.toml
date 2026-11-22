@@ -32,3 +32,6 @@ tokio-rustls = "=0.26.6"
 
 [dev-dependencies]
 rcgen = "=0.13.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.191"
