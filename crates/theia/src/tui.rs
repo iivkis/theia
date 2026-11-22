@@ -1,8 +1,8 @@
-//! M4.1a: read-only, keyboard-first terminal landing.
+//! M4.1: keyboard-first terminal landing and bounded config editor.
 //!
-//! The model and renderer are pure: no configuration loading, service starts,
-//! management IPC or OS proxy side effects occur in this phase.
-use crate::Role;
+//! M4.1b supports an explicitly selected configuration file and one safe
+//! non-secret field per role. No service starts, reload, IPC or OS proxy effects.
+use crate::{tui_editor::Editor, Role};
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -19,12 +19,14 @@ use ratatui::{
 use std::{
     fmt,
     io::{self, IsTerminal},
+    path::Path,
 };
 
 #[derive(Debug)]
 pub enum TuiError {
     NotInteractive,
     Io,
+    Configuration(&'static str),
 }
 
 impl TuiError {
@@ -32,6 +34,7 @@ impl TuiError {
         match self {
             Self::NotInteractive => "interactive terminal required (stdin and stdout must be TTY)",
             Self::Io => "terminal initialization, drawing or input failed",
+            Self::Configuration(reason) => reason,
         }
     }
 }
@@ -157,6 +160,94 @@ impl Model {
     }
 }
 
+/// UI dispatch is separate from all configuration/OS effects. A queued
+/// transition never runs until the user saves, discards or cancels explicitly.
+struct Interaction {
+    editor: Option<Editor>,
+    pending: Option<KeyEvent>,
+}
+
+impl Interaction {
+    fn new(editor: Option<Editor>) -> Self {
+        Self {
+            editor,
+            pending: None,
+        }
+    }
+
+    fn editor_for<'a>(&'a self, role: Role) -> Option<&'a Editor> {
+        self.editor.as_ref().filter(|edit| edit.role() == role)
+    }
+
+    fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        let Some(editor) = self.editor.as_mut() else {
+            return model.update(key);
+        };
+        if let Some(original) = self.pending {
+            match key.code {
+                KeyCode::Char('s') => {
+                    if editor.save() {
+                        self.pending = None;
+                        return model.update(original);
+                    }
+                }
+                KeyCode::Char('d') => {
+                    editor.discard();
+                    self.pending = None;
+                    return model.update(original);
+                }
+                KeyCode::Esc => {
+                    self.pending = None;
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        if editor.editing {
+            match key.code {
+                KeyCode::Esc => editor.cancel(),
+                KeyCode::Enter => {
+                    editor.accept();
+                }
+                KeyCode::Backspace => editor.backspace(),
+                KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                    editor.insert(ch);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        let active = matches!(
+            (model.screen, editor.role()),
+            (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
+        );
+        if active {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+                editor.save();
+                return false;
+            }
+            if matches!(key.code, KeyCode::Enter | KeyCode::Char('e')) {
+                editor.begin();
+                return false;
+            }
+        }
+        let navigation = matches!(
+            key.code,
+            KeyCode::Char('q' | '1' | '2') | KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab
+        ) || key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        if editor.dirty() && navigation {
+            self.pending = Some(key);
+            return false;
+        }
+        model.update(key)
+    }
+}
+
 fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bool) {
     let style = if focused {
         Style::default()
@@ -178,7 +269,7 @@ fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bo
     );
 }
 
-fn draw(frame: &mut Frame<'_>, model: &Model) {
+fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>) {
     let area = frame.area();
     if area.width < 32 || area.height < 10 {
         frame.render_widget(
@@ -227,20 +318,32 @@ fn draw(frame: &mut Frame<'_>, model: &Model) {
                 model.selected == Role::Client,
             );
         }
-        Screen::Server => panel(
-            frame,
-            parts[1],
-            "Для сервера",
-            "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: состояние неизвестно (IPC ещё не реализован)\n\nЭтот экран только для чтения. Запуск сервера, редактирование и reload пока недоступны.",
-            true,
-        ),
-        Screen::Client => panel(
-            frame,
-            parts[1],
-            "Для клиента",
-            "Профиль: не выбран\nЛокальный прокси: состояние неизвестно\nТранспорт: не проверялся\nСистемный прокси Windows: не изменён\n\nЭтот экран только для чтения. Подключение, редактирование и управление системным прокси пока недоступны.",
-            true,
-        ),
+        Screen::Server => {
+            if let Some(editor) = interaction.and_then(|ui| ui.editor_for(Role::Server)) {
+                draw_editor(frame, parts[1], editor);
+            } else {
+                panel(
+                    frame,
+                    parts[1],
+                    "Для сервера",
+                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: состояние неизвестно (IPC ещё не реализован)\n\nЭтот экран только для чтения. Запуск сервера, редактирование и reload пока недоступны.",
+                    true,
+                );
+            }
+        }
+        Screen::Client => {
+            if let Some(editor) = interaction.and_then(|ui| ui.editor_for(Role::Client)) {
+                draw_editor(frame, parts[1], editor);
+            } else {
+                panel(
+                    frame,
+                    parts[1],
+                    "Для клиента",
+                    "Профиль: не выбран\nЛокальный прокси: состояние неизвестно\nТранспорт: не проверялся\nСистемный прокси Windows: не изменён\n\nЭтот экран только для чтения. Подключение, редактирование и управление системным прокси пока недоступны.",
+                    true,
+                );
+            }
+        }
         Screen::Help => panel(
             frame,
             parts[1],
@@ -249,25 +352,66 @@ fn draw(frame: &mut Frame<'_>, model: &Model) {
             true,
         ),
     }
+    if interaction.is_some_and(|ui| ui.pending.is_some()) {
+        panel(
+            frame,
+            parts[1],
+            "Не сохранено: подтвердите переход",
+            "s: сохранить и продолжить\nd: отменить изменения и продолжить\nEsc: остаться в редакторе\n\nНи одна опция не применяет конфигурацию к runtime.",
+            true,
+        );
+    }
     frame.render_widget(
-        Paragraph::new("1/2: панель  Tab: выбор  Enter: открыть  Esc: назад  ?: помощь  q: выход")
+        Paragraph::new("1/2: панель  Enter/e: поле  Ctrl+S: сохранить  Esc: назад  ?: помощь  q: выход")
             .block(Block::default().borders(Borders::ALL)),
         parts[2],
     );
 }
 
-/// TUI deliberately does not start the server/client or touch system proxy.
-pub fn run(role: Option<Role>) -> Result<(), TuiError> {
+fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
+    let dirty = if editor.dirty() { "* Не сохранено" } else { "Сохранено" };
+    let value = if editor.editing {
+        editor.input.as_str()
+    } else {
+        editor.field_value()
+    };
+    let message = format!(
+        "Поле: {}\nЗначение: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: состояние неизвестно; reload не выполнялся.\nСекреты, ACL и системный прокси не редактируются.",
+        editor.field_name(),
+        value,
+        dirty,
+        if editor.editing {
+            "Ввод: символы / Backspace / Enter: проверить / Esc: отменить"
+        } else {
+            "Enter/e: изменить поле   Ctrl+S: проверить и сохранить"
+        },
+        editor.notice,
+        editor.error.as_deref().unwrap_or(""),
+    );
+    panel(frame, area, "Редактор TOML (только указанный файл)", &message, true);
+}
+
+/// Edit only when both role and a config path are explicitly supplied.
+/// No service or OS-proxy changes; a separate IPC transaction is future work.
+pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(TuiError::NotInteractive);
     }
+    let editor = match (role, config_path) {
+        (Some(role), Some(path)) => {
+            Some(Editor::load(role, path).map_err(TuiError::Configuration)?)
+        }
+        (None, Some(_)) => return Err(TuiError::Configuration("TUI config requires explicit role")),
+        _ => None,
+    };
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut model = Model::new(role);
+    let mut interaction = Interaction::new(editor);
     loop {
-        terminal.draw(|frame| draw(frame, &model))?;
+        terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
         if let Event::Key(key) = event::read()? {
-            if model.update(key) {
+            if interaction.update(&mut model, key) {
                 return Ok(());
             }
         }
@@ -286,7 +430,7 @@ mod tests {
     fn render(width: u16, height: u16, model: Model) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, &model)).unwrap();
+        terminal.draw(|f| draw(f, &model, None)).unwrap();
         let buffer = terminal.backend().buffer();
         buffer
             .content()
@@ -337,6 +481,80 @@ mod tests {
             assert!(!snapshot.contains("TOKEN"));
         }
         assert!(render(20, 6, model).contains("Терминал"));
+    }
+
+
+    #[test]
+    fn dirty_draft_guards_quit_and_navigation_while_editing_is_isolated() {
+        use crate::config;
+        use sha2::{Digest, Sha256};
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "theia-tui-ui-{}.toml",
+            std::process::id()
+        ));
+        let source = include_str!("../../../examples/server.toml").replace(
+            "REPLACE_WITH_64_LOWERCASE_HEX",
+            &format!("{:x}", Sha256::digest([0x42; 32])),
+        );
+        fs::write(&path, &source).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let mut interaction = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+        assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
+        assert!(interaction.editor.as_ref().unwrap().editing);
+        assert!(!interaction.update(&mut model, press(KeyCode::Char('q'))));
+        assert!(interaction.editor.as_ref().unwrap().input.ends_with('q'));
+        assert_eq!(model.screen, Screen::Server);
+        assert!(!interaction.update(&mut model, press(KeyCode::Esc)));
+        assert!(!interaction.editor.as_ref().unwrap().editing);
+        assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
+        interaction.editor.as_mut().unwrap().input = "new.example.org".into();
+        assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
+        assert!(interaction.editor.as_ref().unwrap().dirty());
+        assert!(!interaction.update(&mut model, press(KeyCode::Char('q'))));
+        assert!(interaction.pending.is_some());
+        assert_eq!(model.screen, Screen::Server);
+        assert!(!interaction.update(&mut model, press(KeyCode::Esc)));
+        assert!(interaction.pending.is_none());
+        assert!(!interaction.update(&mut model, press(KeyCode::Char('q'))));
+        assert!(!interaction.update(&mut model, press(KeyCode::Char('d'))));
+        assert!(!interaction.editor.as_ref().unwrap().dirty());
+        assert_eq!(fs::read(&path).unwrap(), source.as_bytes());
+        assert_eq!(config::read_file(&path).unwrap().validate(), Ok(()));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rendered_editor_shows_only_nonsecret_field_and_dirty_status() {
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "theia-tui-client-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut editor = Editor::load(Role::Client, &path).unwrap();
+        editor.begin();
+        editor.input = "changed.example.org:443".into();
+        assert!(editor.accept());
+        let interaction = Interaction::new(Some(editor));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let model = Model::new(Some(Role::Client));
+        terminal
+            .draw(|f| draw(f, &model, Some(&interaction)))
+            .unwrap();
+        let picture = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(picture.contains("Не сохранено"));
+        assert!(picture.contains("client.profiles[active].server"));
+        assert!(!picture.contains("THEIA_AUTH_TOKEN"));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
