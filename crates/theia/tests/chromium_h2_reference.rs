@@ -210,9 +210,9 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
         assert!(observation.ordinary_fields > 0);
         assert!(observation.request_end_stream, "browser GET is bodyless");
         // Observations from M3.4f: the production h2 0.4.19 client advertises
-        // only SETTINGS_MAX_HEADER_LIST_SIZE=8192. This assertion detects the
+        // SETTINGS_ENABLE_PUSH=0 and MAX_HEADER_LIST_SIZE=8192. This assertion detects the
         // currently measurable gap, not a claim of Chromium compatibility.
-        let theia_settings = [(6, 8192)];
+        let theia_settings = [(2, 0), (6, 8192)];
         assert_ne!(
             observation.settings, theia_settings,
             "Chromium SETTINGS unexpectedly equal Theia; re-evaluate F-13"
