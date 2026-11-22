@@ -117,6 +117,8 @@ pub struct Profile {
     pub server_name: String,
     pub auth_token: String,
     pub tls_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca: Option<String>,
     pub transport: Transport,
     pub quic_connect_timeout_ms: u32,
     pub quic_negative_cache_ttl_s: u32,
@@ -478,6 +480,14 @@ impl ClientDocument {
                 valid_secret_ref(&profile.auth_token),
                 format!("{field}.auth_token"),
                 "expected env:NAME or absolute file: reference",
+            )?;
+            ensure(
+                profile
+                    .tls_ca
+                    .as_ref()
+                    .is_none_or(|path| valid_file_ref(path)),
+                format!("{field}.tls_ca"),
+                "expected absolute file: reference to PEM CA bundle",
             )?;
             ensure(
                 profile.tls_profile == "default",

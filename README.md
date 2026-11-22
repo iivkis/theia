@@ -2,7 +2,7 @@
 
 **Specification-first · Rust · one binary · TOML · ratatui · SmartTheia**
 
-**M2.1:** `theia server run --config server.toml` принимает только TLS 1.3 + ALPN `h2` на `server.inbounds[].h2_listen`; сертификат и ключ должны существовать (`file:` absolute path), Unix private key должен быть недоступен группе/прочим. Для реальной работы замените шаблонный digest токена на SHA-256 декодированных 32 случайных байт. Сервер не запускает QUIC/HTTP3. По умолчанию частные/локальные назначения запрещены; тесты используют явный `allow_private_ips=true` на loopback. M2.2a добавляет клиентское H2-ядро; локальный proxy и клиентский CLI пока не готовы.
+**M2.1:** `theia server run --config server.toml` принимает только TLS 1.3 + ALPN `h2` на `server.inbounds[].h2_listen`; сертификат и ключ должны существовать (`file:` absolute path), Unix private key должен быть недоступен группе/прочим. Для реальной работы замените шаблонный digest токена на SHA-256 декодированных 32 случайных байт. Сервер не запускает QUIC/HTTP3. По умолчанию частные/локальные назначения запрещены; тесты используют явный `allow_private_ips=true` на loopback. M2.2 добавляет клиентское H2-ядро и локальные CONNECT/SOCKS5 listeners (pending CI).
 
 **M1.3:** добавлена чистая реализация SmartTheia v1 frame codec + incremental decoder + per-stream FSM в `crates/theia/src/protocol.rs` с golden/negative тестами. Она **не** открывает HTTP/TLS сессии, не проверяет токены и не запускает прокси. TUI и `server/client run` по-прежнему возвращают ошибку вместо фиктивного запуска.
 
@@ -53,7 +53,7 @@ theia config validate --config client.toml
 theia --version
 ```
 
-`theia config validate --config FILE` выполняет структурную проверку TOML v1 и возвращает 0 при успехе, 2 при ошибке. **Проверка не раскрывает секреты и не читает содержимое `env:`/`file:` refs**; сертификаты, bearer и их доступность будут проверены отдельным диагностическим этапом. `tui` и `client run` всё ещё завершаются с кодом 3 (`not implemented`). `server run` запускает только H2/TLS inbound и требует действующую серверную конфигурацию и PEM файлы; при ошибке выходит с кодом 2. `--help`/`--version` возвращают код 0. Отдельный Rust workspace расположен в `crates/theia/`; `spikes/m0_1/` исключён из production workspace. Все проверки выполняются автоматически в GitHub Actions на PR и push в main; статус `ci-gate` относится к конкретному коммиту. Пользователю и разработчику не нужно запускать тесты вручную.
+`theia config validate --config FILE` выполняет структурную проверку TOML v1 и возвращает 0 при успехе, 2 при ошибке. **Проверка не раскрывает секреты и не читает содержимое `env:`/`file:` refs**; сертификаты, bearer и их доступность будут проверены отдельным диагностическим этапом. `tui` пока завершается с кодом 3 (`not implemented`). `client run` поддерживает explicit H2 с `tls_ca`; ошибки startup возвращают 2. `server run` запускает только H2/TLS inbound и требует действующую серверную конфигурацию и PEM файлы; при ошибке выходит с кодом 2. `--help`/`--version` возвращают код 0. Отдельный Rust workspace расположен в `crates/theia/`; `spikes/m0_1/` исключён из production workspace. Все проверки выполняются автоматически в GitHub Actions на PR и push в main; статус `ci-gate` относится к конкретному коммиту. Пользователю и разработчику не нужно запускать тесты вручную.
 
 ## Приоритеты
 
@@ -64,3 +64,5 @@ theia --version
 5. **Измерять**, а не обещать скорость или невозможность DPI-классификации.
 
 Пример конфигураций содержит заменяемые значения и не предназначен для реального деплоя без создания сертификата и секретов. Лицензия ещё не выбрана; перед распространением добавить `LICENSE`.
+
+**M2.2b (pending CI):** explicit H2 client mode supports loopback CONNECT and SOCKS5, configured `tls_ca` PEM trust bundle and `auth_token` refs. `transport=auto/h3` still fail closed; TUI/OS proxy remain unavailable. All verification occurs in CI; no manual test steps.

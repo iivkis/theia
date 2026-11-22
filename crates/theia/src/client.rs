@@ -1,4 +1,4 @@
-//! M2.2a: authenticated H2 client transport. No local proxy listeners yet.
+//! Authenticated H2 client transport used by the local proxy listeners.
 //! Trust anchors are supplied by the caller; this API never disables PKI.
 use crate::protocol::{self, Address, Decoder, Direction, ErrorCode, Frame, Role, Session};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};

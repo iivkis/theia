@@ -305,6 +305,24 @@ class SpecContractTests(unittest.TestCase):
         self.assertNotIn("ручным smoke-тестом", read("docs/IMPLEMENTATION_SPEC.md"))
         self.assertNotIn("## 3. Локальная проверка", read("docs/TESTING_CI.md"))
 
+    def test_m22_local_proxy_gate_and_cli_wiring(self):
+        implementation = read("crates/theia/src/local_proxy.rs")
+        client = read("crates/theia/src/client.rs")
+        tests = read("crates/theia/tests/client_h2.rs")
+        self.assertIn("local_proxy::run_file(", read("crates/theia/src/main.rs"))
+        self.assertIn("profile.transport != Transport::H2", implementation)
+        self.assertIn("client.open(address, port).await", implementation)
+        self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
+        self.assertIn("local_connect_and_socks5_relay_real_tcp_with_half_close", tests)
+        self.assertIn("local_proxies_never_acknowledge_policy_denial_or_invalid_protocol", tests)
+        self.assertIn("client_binary_curl_connect_and_socks5h", tests)
+        self.assertIn("CARGO_BIN_EXE_theia", tests)
+        self.assertIn("client_binary_chromium_socks5", tests)
+        workflow = read(".github/workflows/ci.yml")
+        self.assertIn("browser-e2e", workflow.split("\n  ci-gate:\n", 1)[1])
+        self.assertIn("client_binary_chromium_socks5 -- --ignored --exact", workflow)
+        self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
+
 
 if __name__ == "__main__":
     unittest.main()

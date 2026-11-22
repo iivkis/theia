@@ -122,3 +122,5 @@ language = "ru"
 6. Snapshot хранится с per-user ACL и версией схемы и включает все исходные поля (PAC/AutoDetect/bypass). Неуспех сохранения snapshot блокирует активацию. После изменения сигнализировать WinINet о смене настроек; не путать per-user WinINet и WinHTTP.
 
 Microsoft references: https://learn.microsoft.com/en-us/windows/win32/wininet/enabling-internet-functionality , https://learn.microsoft.com/en-us/windows/win32/winhttp/setting-wininet-proxy-configurations-in-winhttp
+
+M2.2b: optional `client.profiles[].tls_ca` is an absolute `file:` reference to a trusted PEM CA bundle. Structural validation does not read it; explicit `transport="h2"` runtime requires it, nonempty and valid (up to 1 MiB), verifies TLS name/chain and never falls back to insecure verification. Platform roots loading remains open. `auth_token` is read from env or regular non-symlink file (exactly 43 canonical bytes, no newline; private Unix file permissions, trusted directory; Windows ACL must be provisioned). `auto`/`h3` fail before binding until the actual selector exists. Both loopback ports bind before serving; system proxy is untouched.

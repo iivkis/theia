@@ -1,6 +1,6 @@
 # Testing strategy и CI
 
-**Правило CI-only:** все проверки выполняются автоматически в GitHub Actions. Разработчик и пользователь не должны запускать тесты или вручную подтверждать сценарии. Тестирование предшествует сборке релизных артефактов. CI не должен маскировать отсутствие сетевой Rust-реализации. С M1.1 корневой workspace и `Cargo.lock` существуют: Linux `rust-tests` и Windows `windows-smoke` должны запускаться. CLI `--help`/`--version` работают; с M1.2 `config validate` выполняет структурную TOML v1 validation (exit 0/2) без чтения секретов. Команды `tui` и `client run` возвращают `not implemented` (exit 3); с M2.1 `server run` — реальный TLS1.3/H2 сервер с bearer/inbound ACL + TCP dial и ненулевым exit на invalid config/PEM. До M1.1 Rust jobs были skipped.
+**Правило CI-only:** все проверки выполняются автоматически в GitHub Actions. Разработчик и пользователь не должны запускать тесты или вручную подтверждать сценарии. Тестирование предшествует сборке релизных артефактов. CI не должен маскировать отсутствие сетевой Rust-реализации. С M1.1 корневой workspace и `Cargo.lock` существуют: Linux `rust-tests` и Windows `windows-smoke` должны запускаться. CLI `--help`/`--version` работают; с M1.2 `config validate` выполняет структурную TOML v1 validation (exit 0/2) без чтения секретов. Команда `tui` возвращает `not implemented` (exit 3); M2.2b добавляет `client run` в explicit H2 (CI pending); с M2.1 `server run` — реальный TLS1.3/H2 сервер с bearer/inbound ACL + TCP dial и ненулевым exit на invalid config/PEM. До M1.1 Rust jobs были skipped.
 
 ## 1. Test pyramid
 
@@ -54,7 +54,7 @@ Workflow автоматически запускается для PR, обнов
 
 Тяжёлые benchmark/fuzz/GUI/OS recovery сценарии автоматизируются отдельными scheduled/release workflows по мере реализации; штатная проверка не требует ручного запуска. Использовать временные профили, loopback/изолированные сети, ephemeral credentials, автоматический cleanup и машинно-проверяемые assertions. Будущие автоматические security/audit checks также не требуют локальных команд. До появления и успеха необходимой автоматической проверки соответствующая функция не считается готовой.
 
-Статус `ci-gate` агрегирует результаты пяти jobs текущего workflow. Failure, skipped и cancelled обязательного job запрещают зелёный gate. Это не заменяет будущие ещё не реализованные release jobs. Для приёмки учитывать успешный run именно проверяемого head SHA, а не старого коммита.
+Статус `ci-gate` агрегирует результаты шести групп jobs текущего workflow (browser-e2e включает два обязательных runner). Failure, skipped и cancelled обязательного job запрещают зелёный gate. Это не заменяет будущие ещё не реализованные release jobs. Для приёмки учитывать успешный run именно проверяемого head SHA, а не старого коммита.
 
 ## 4. Правила мержа и качества
 
@@ -68,3 +68,9 @@ M2.1 hardening: preflight certificate SAN matches configured DNS name (not full 
 M2.1 relay regression: independently driven TCP read/write halves, bounded H2 frame send, direction-specific FSM checks, stream reset on interrupted wire frame. Production-server integration tests exercise withheld response credit (1 KiB H2 window, 256 KiB download, successful concurrent upload and FIN) and eight open tunnels on one H2 connection with one cancelled stream and byte-exact sibling transfers. These are bounded regression tests, not a peak-RSS or large-scale benchmark; await Linux/Windows CI.
 
 M2.2a: production client core tests in `crates/theia/tests/client_h2.rs` exercise TLS1.3/H2 against the real server, DNS OPEN_TCP, 256 KiB byte-exact relay/FIN, wrong hostname/untrusted CA/token and private ACL denial before any target dial. Trust roots are explicitly injected in this slice; no local listeners or client CLI/runtime yet. Tests use ephemeral loopback certificates, not TLS verification bypass.
+
+M2.2b adds automated local CONNECT/SOCKS5 loopback regression against production H2 client/server. Local success is emitted only after OPEN_OK, policy rejection returns HTTP403/SOCKS REP2, CONNECT does not consume pipelined bytes. Tests run only in CI. Explicit CA + env/file token runtime, no default platform roots or auto/H3. Browser/curl and OS-specific automation remain open; no user smoke test required.
+
+M2.2b black-box CI: `client_binary_curl_connect_and_socks5h` launches the built `theia client run` with a temporary TOML, generated trusted PEM and child-only env token. Real curl uses HTTP CONNECT (`--proxytunnel`) and SOCKS5h, receives exact HTTP origin bytes on loopback, bypass disabled. Native Linux/Windows runner commands are mandatory (missing curl fails); subprocesses/fixtures cleaned up automatically. Browser automation is added in the mandatory browser-e2e matrix, pending CI.
+
+Chromium CI: `browser-e2e` runs the pinned Playwright 1.65.2 Chromium fixture on Linux and Windows. A test-only SOCKS gate limits destinations to the generated loopback origin and forwards the permitted request to the running Theia client, then verifies HTTP 200, DOM marker and actual SOCKS success. All other page requests are blocked. Dedicated CI explicitly runs the ignored test; the aggregate ci-gate requires browser-e2e success. No change to browser TLS fingerprint or OS proxy is claimed.

@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod config;
+pub mod local_proxy;
 pub mod protocol;
 pub mod server;
 
@@ -35,6 +36,7 @@ pub enum CliError {
     NotImplemented(&'static str),
     Config(config::ConfigError),
     Server(server::ServerError),
+    Client(client::ClientError),
 }
 
 impl CliError {
@@ -58,6 +60,7 @@ impl fmt::Display for CliError {
             Self::NonUtf8Argument => write!(f, "arguments must be UTF-8"),
             Self::Config(error) => write!(f, "configuration invalid: {error}"),
             Self::Server(error) => write!(f, "server failed: {error}"),
+            Self::Client(error) => write!(f, "client failed: {error}"),
             Self::NotImplemented(feature) => write!(
                 f,
                 "{feature} is not implemented; no network or system proxy was started"
@@ -112,15 +115,15 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
     }
 }
 
-const HELP: &str = "Theia 0.1.0 (M2.1 H2 server inbound; client/H3 unavailable)\n\
+const HELP: &str = "Theia 0.1.0 (M2.2 H2 server inbound and local client; H3 unavailable)\n\
 Usage:\n\
   theia --help | --version\n\
   theia tui [--role server|client]\n\
   theia server run --config <path>\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
-\n--help, --version, config validate, and server run (TLS 1.3/H2 only) are operational.\n\
-Client, H3, and TUI remain unavailable; system proxy is never modified.";
+\n--help, --version, config validate, server run and client run (explicit H2 only) are implemented.\n\
+Client requires explicit H2 and tls_ca PEM bundle. H3/auto and TUI unavailable; system proxy is never modified.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
@@ -130,10 +133,10 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client]\nTUI is not implemented.")
         }
         Command::Help(Some("server")) => {
-            Ok("Usage: theia server run --config <path>\nServer runtime is not implemented.")
+            Ok("Usage: theia server run --config <path>\nTLS 1.3/H2 server inbound only.")
         }
         Command::Help(Some("client")) => {
-            Ok("Usage: theia client run --config <path>\nClient runtime is not implemented.")
+            Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via explicit H2; requires tls_ca PEM bundle.")
         }
         Command::Help(Some("config")) => {
             Ok("Usage: theia config validate --config <path>\nValidate TOML v1 without reading secret values.")
