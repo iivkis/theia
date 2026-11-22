@@ -41,12 +41,10 @@ impl Controller {
 
     fn configure(self, config: &mut quinn::TransportConfig) {
         match self {
-            Self::Bbr => config.congestion_controller_factory(Arc::new(
-                quinn::congestion::BbrConfig::default(),
-            )),
-            Self::Cubic => config.congestion_controller_factory(Arc::new(
-                quinn::congestion::CubicConfig::default(),
-            )),
+            Self::Bbr => config
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+            Self::Cubic => config
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
         };
     }
 
@@ -160,7 +158,7 @@ impl AsyncUdpSocket for Impairment {
             0
         } else {
             // Deterministic per-attempt jitter. Still subject to OS timers.
-            (sequence.wrapping_mul(7) % (self.condition.jitter_ms + 1))
+            sequence.wrapping_mul(7) % (self.condition.jitter_ms + 1)
         };
         let delay = Duration::from_millis(self.condition.delay_ms + jitter);
         self.delayed.fetch_add(1, Ordering::Relaxed);
@@ -230,8 +228,7 @@ struct Sample {
 
 impl Sample {
     fn csv(&self) -> String {
-        let throughput_mbps =
-            (PAYLOAD_LEN as f64 * 8.0) / self.elapsed.as_secs_f64() / 1_000_000.0;
+        let throughput_mbps = (PAYLOAD_LEN as f64 * 8.0) / self.elapsed.as_secs_f64() / 1_000_000.0;
         format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.4}\n",
             self.controller,
@@ -270,9 +267,8 @@ fn endpoints(
     .unwrap();
     tls.alpn_protocols = vec![ALPN.to_vec()];
     tls.max_early_data_size = 0;
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(tls).unwrap(),
-    ));
+    let mut server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
     let mut transport = quinn::TransportConfig::default();
     controller.configure(&mut transport);
     server_config.transport_config(Arc::new(transport));
@@ -301,9 +297,8 @@ fn endpoints(
     .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
     tls.enable_early_data = false;
-    let mut client_config = quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(tls).unwrap(),
-    ));
+    let mut client_config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
     let mut transport = quinn::TransportConfig::default();
     controller.configure(&mut transport);
     client_config.transport_config(Arc::new(transport));
