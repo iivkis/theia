@@ -54,7 +54,7 @@ Workflow автоматически запускается для PR, обнов
 
 Тяжёлые benchmark/fuzz/GUI/OS recovery сценарии автоматизируются отдельными scheduled/release workflows по мере реализации; штатная проверка не требует ручного запуска. Использовать временные профили, loopback/изолированные сети, ephemeral credentials, автоматический cleanup и машинно-проверяемые assertions. Будущие автоматические security/audit checks также не требуют локальных команд. До появления и успеха необходимой автоматической проверки соответствующая функция не считается готовой.
 
-Статус `ci-gate` агрегирует результаты пяти jobs текущего workflow. Failure, skipped и cancelled обязательного job запрещают зелёный gate. Это не заменяет будущие ещё не реализованные release jobs. Для приёмки учитывать успешный run именно проверяемого head SHA, а не старого коммита.
+Статус `ci-gate` агрегирует результаты шести групп jobs текущего workflow (browser-e2e включает два обязательных runner). Failure, skipped и cancelled обязательного job запрещают зелёный gate. Это не заменяет будущие ещё не реализованные release jobs. Для приёмки учитывать успешный run именно проверяемого head SHA, а не старого коммита.
 
 ## 4. Правила мержа и качества
 
@@ -71,4 +71,6 @@ M2.2a: production client core tests in `crates/theia/tests/client_h2.rs` exercis
 
 M2.2b adds automated local CONNECT/SOCKS5 loopback regression against production H2 client/server. Local success is emitted only after OPEN_OK, policy rejection returns HTTP403/SOCKS REP2, CONNECT does not consume pipelined bytes. Tests run only in CI. Explicit CA + env/file token runtime, no default platform roots or auto/H3. Browser/curl and OS-specific automation remain open; no user smoke test required.
 
-M2.2b black-box CI: `client_binary_curl_connect_and_socks5h` launches the built `theia client run` with a temporary TOML, generated trusted PEM and child-only env token. Real curl uses HTTP CONNECT (`--proxytunnel`) and SOCKS5h, receives exact HTTP origin bytes on loopback, bypass disabled. Native Linux/Windows runner commands are mandatory (missing curl fails); subprocesses/fixtures cleaned up automatically. No browser automation claimed yet.
+M2.2b black-box CI: `client_binary_curl_connect_and_socks5h` launches the built `theia client run` with a temporary TOML, generated trusted PEM and child-only env token. Real curl uses HTTP CONNECT (`--proxytunnel`) and SOCKS5h, receives exact HTTP origin bytes on loopback, bypass disabled. Native Linux/Windows runner commands are mandatory (missing curl fails); subprocesses/fixtures cleaned up automatically. Browser automation is added in the mandatory browser-e2e matrix, pending CI.
+
+Chromium CI: `browser-e2e` runs the pinned Playwright 1.51.1 Chromium fixture on Linux and Windows. A test-only SOCKS gate limits destinations to the generated loopback origin and forwards the permitted request to the running Theia client, then verifies HTTP 200, DOM marker and actual SOCKS success. All other page requests are blocked. Dedicated CI explicitly runs the ignored test; the aggregate ci-gate requires browser-e2e success. No change to browser TLS fingerprint or OS proxy is claimed.

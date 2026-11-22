@@ -340,10 +340,7 @@ impl Drop for ChildProcess {
     }
 }
 
-async fn wait_for_proxy(
-    address: std::net::SocketAddr,
-    child: &mut ChildProcess,
-) {
+async fn wait_for_proxy(address: std::net::SocketAddr, child: &mut ChildProcess) {
     timeout(Duration::from_secs(10), async {
         loop {
             assert!(
@@ -358,6 +355,65 @@ async fn wait_for_proxy(
     })
     .await
     .expect("client listener startup deadline");
+}
+
+async fn launch_client(
+    endpoint: String,
+    pem: String,
+    label: &str,
+) -> (
+    TestDirectory,
+    ChildProcess,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+) {
+    let dir = TestDirectory(
+        std::env::temp_dir().join(format!("theia-{label}-ci-{}", std::process::id())),
+    );
+    std::fs::create_dir(&dir.0).unwrap();
+    let ca_path = dir.0.join("trust.pem");
+    std::fs::write(&ca_path, pem).unwrap();
+
+    // Reserve two different ports, then transfer them to the child.
+    // Only isolated loopback listeners are used; no OS proxy settings.
+    let http_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http = http_reservation.local_addr().unwrap();
+    let socks = socks_reservation.local_addr().unwrap();
+    let theia::config::Config::Client(mut doc) =
+        theia::config::parse(include_str!("../../../examples/client.toml")).unwrap()
+    else {
+        panic!("client fixture has wrong role");
+    };
+    let profile = &mut doc.client.profiles[0];
+    profile.server = endpoint;
+    profile.server_name = "localhost".into();
+    profile.transport = theia::config::Transport::H2;
+    profile.tls_ca = Some(format!("file:{}", ca_path.display()));
+    profile.auth_token = "env:THEIA_CI_TEST_TOKEN".into();
+    doc.client.proxy.http_listen = http.to_string();
+    doc.client.proxy.socks5_listen = socks.to_string();
+    let config = dir.0.join("client.toml");
+    theia::config::atomic_write(&config, &theia::config::Config::Client(doc)).unwrap();
+    drop(http_reservation);
+    drop(socks_reservation);
+    let mut child = ChildProcess(
+        std::process::Command::new(env!("CARGO_BIN_EXE_theia"))
+            .arg("client")
+            .arg("run")
+            .arg("--config")
+            .arg(&config)
+            .env("THEIA_CI_TEST_TOKEN", token())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_proxy(http, &mut child).await;
+    wait_for_proxy(socks, &mut child).await;
+    (dir, child, http, socks)
+
 }
 
 /// Black-box curl tests run on both native CI runners. No external service,
@@ -387,52 +443,7 @@ async fn client_binary_curl_connect_and_socks5h() {
                 socket.shutdown().await.unwrap();
             }
         });
-        let dir = TestDirectory(std::env::temp_dir().join(format!(
-            "theia-curl-ci-{}",
-            std::process::id()
-        )));
-        std::fs::create_dir(&dir.0).unwrap();
-        let ca_path = dir.0.join("trust.pem");
-        std::fs::write(&ca_path, pem).unwrap();
-
-        // Reserve two different ports, then transfer them to the child.
-        // Only isolated loopback listeners are used; no OS proxy settings.
-        let http_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let socks_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let http = http_reservation.local_addr().unwrap();
-        let socks = socks_reservation.local_addr().unwrap();
-        let theia::config::Config::Client(mut doc) =
-            theia::config::parse(include_str!("../../../examples/client.toml")).unwrap()
-        else {
-            panic!("client fixture has wrong role");
-        };
-        let profile = &mut doc.client.profiles[0];
-        profile.server = endpoint;
-        profile.server_name = "localhost".into();
-        profile.transport = theia::config::Transport::H2;
-        profile.tls_ca = Some(format!("file:{}", ca_path.display()));
-        profile.auth_token = "env:THEIA_CI_TEST_TOKEN".into();
-        doc.client.proxy.http_listen = http.to_string();
-        doc.client.proxy.socks5_listen = socks.to_string();
-        let config = dir.0.join("client.toml");
-        theia::config::atomic_write(&config, &theia::config::Config::Client(doc)).unwrap();
-        drop(http_reservation);
-        drop(socks_reservation);
-        let mut child = ChildProcess(
-            std::process::Command::new(env!("CARGO_BIN_EXE_theia"))
-                .arg("client")
-                .arg("run")
-                .arg("--config")
-                .arg(&config)
-                .env("THEIA_CI_TEST_TOKEN", token())
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        wait_for_proxy(http, &mut child).await;
-        wait_for_proxy(socks, &mut child).await;
+        let (_dir, mut child, http, socks) = launch_client(endpoint, pem, "curl").await;
 
         // --disable ignores any user curlrc. --noproxy "" prevents the
         // standard localhost bypass. HTTP mode must actually use CONNECT.
@@ -455,7 +466,10 @@ async fn client_binary_curl_connect_and_socks5h() {
                 if tunnel {
                     command.arg("--proxytunnel");
                 }
-                command.arg(url).output().expect("curl must be installed on CI")
+                command
+                    .arg(url)
+                    .output()
+                    .expect("curl must be installed on CI")
             })
             .await
             .unwrap();
@@ -473,4 +487,82 @@ async fn client_binary_curl_connect_and_socks5h() {
     })
     .await
     .expect("bounded executable + curl CI scenario");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "mandatory dedicated CI browser-e2e job provisions Playwright and Chromium"]
+async fn client_binary_chromium_socks5() {
+    timeout(Duration::from_secs(75), async {
+        let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
+        let (_dir, mut child, _http, socks) = launch_client(endpoint, pem, "browser").await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let origin = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    result = requests.join_next(), if !requests.is_empty() => {
+                        if matches!(result, Some(Ok(true))) {
+                            return;
+                        }
+                    }
+                    accepted = target.accept() => {
+                        let (mut socket, _) = accepted.unwrap();
+                        requests.spawn(async move {
+                            let mut head = Vec::new();
+                            while !head.ends_with(b"\r\n\r\n") {
+                                if head.len() >= 8192 {
+                                    return false;
+                                }
+                                match socket.read_u8().await {
+                                    Ok(byte) => head.push(byte),
+                                    Err(_) => return false,
+                                }
+                            }
+                            if !head.starts_with(b"GET /ci-browser HTTP/1.") {
+                                return false;
+                            }
+                            let body = b"<html><body><main id='result'>theia-browser-ci-ok</main></body></html>";
+                            let reply = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            socket.write_all(reply.as_bytes()).await.unwrap();
+                            socket.write_all(body).await.unwrap();
+                            socket.shutdown().await.unwrap();
+                            true
+                        });
+                    }
+                }
+            }
+        });
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/e2e/chromium_socks.py");
+        let mut process = ChildProcess(
+            std::process::Command::new("python")
+                .arg(script)
+                .arg(socks.to_string())
+                .arg(port.to_string())
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("CI Python and Playwright must be installed"),
+        );
+        let status = timeout(Duration::from_secs(60), async {
+            loop {
+                if let Some(status) = process.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Chromium fixture deadline");
+        assert!(status.success(), "Chromium SOCKS5 scenario failed");
+        origin.await.unwrap();
+        assert!(child.0.try_wait().unwrap().is_none());
+        drop(child);
+        server.abort();
+    })
+    .await
+    .expect("bounded executable + Chromium CI scenario");
 }

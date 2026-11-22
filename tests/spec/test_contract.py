@@ -317,6 +317,11 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("local_proxies_never_acknowledge_policy_denial_or_invalid_protocol", tests)
         self.assertIn("client_binary_curl_connect_and_socks5h", tests)
         self.assertIn("CARGO_BIN_EXE_theia", tests)
+        self.assertIn("client_binary_chromium_socks5", tests)
+        workflow = read(".github/workflows/ci.yml")
+        self.assertIn("browser-e2e", workflow.split("\n  ci-gate:\n", 1)[1])
+        self.assertIn("client_binary_chromium_socks5 -- --ignored --exact", workflow)
+        self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
 
 
 if __name__ == "__main__":

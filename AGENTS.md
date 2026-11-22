@@ -88,3 +88,5 @@ M2.2a client transport: `H2Client::open` only yields a `Tunnel` after strict ver
 M2.2b: explicit `h2` runtime binds both loopback listeners before accepting; bounded 64 local sessions, negotiation and write deadlines, strict CONNECT authority and SOCKS5 CONNECT-only, success after `H2Client::open`, no OS side effects. CA PEM reference required for runtime, token read from env/file; no silent `auto`/H3 fallback. Automatic CI tests are mandatory; platform roots and browser automation remain open.
 
 M2.2b CI executable regression: real curl through the compiled client over CONNECT and SOCKS5h to an isolated loopback origin, using generated PKI and child-only token. CI must fail if curl or the binary is unavailable, not skip the test. No browser E2E claim until automated browser coverage exists.
+
+CI-only browser regression: Playwright/Chromium in a mandatory Linux/Windows matrix (no production dependency), navigation through a test-only single-origin guard and real Theia SOCKS5 listener, compiled CLI and actual H2 server. Browser connectivity is not proof of a browser-like TLS fingerprint; fingerprint gate remains open.
