@@ -482,7 +482,10 @@ impl ClientDocument {
                 "expected env:NAME or absolute file: reference",
             )?;
             ensure(
-                profile.tls_ca.as_ref().is_none_or(|path| valid_file_ref(path)),
+                profile
+                    .tls_ca
+                    .as_ref()
+                    .is_none_or(|path| valid_file_ref(path)),
                 format!("{field}.tls_ca"),
                 "expected absolute file: reference to PEM CA bundle",
             )?;

@@ -278,10 +278,15 @@ async fn local_proxies_never_acknowledge_policy_denial_or_invalid_protocol() {
         let (http, socks, proxy) = local_listeners(client).await;
         let mut connect = TcpStream::connect(http).await.unwrap();
         connect
-            .write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes())
+            .write_all(
+                format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+                    .as_bytes(),
+            )
             .await
             .unwrap();
-        assert!(response_head(&mut connect).await.starts_with("HTTP/1.1 403 "));
+        assert!(response_head(&mut connect)
+            .await
+            .starts_with("HTTP/1.1 403 "));
         let mut sock = TcpStream::connect(socks).await.unwrap();
         assert_eq!(socks_connect_request(&mut sock, port).await[1], 2);
 
@@ -290,16 +295,25 @@ async fn local_proxies_never_acknowledge_policy_denial_or_invalid_protocol() {
             .write_all(b"CONNECT localhost:443 HTTP/1.1\r\nHost: wrong.example:443\r\n\r\n")
             .await
             .unwrap();
-        assert!(response_head(&mut malformed).await.starts_with("HTTP/1.1 400 "));
+        assert!(response_head(&mut malformed)
+            .await
+            .starts_with("HTTP/1.1 400 "));
         let mut method = TcpStream::connect(http).await.unwrap();
-        method.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
-        assert!(response_head(&mut method).await.starts_with("HTTP/1.1 405 "));
+        method
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(response_head(&mut method)
+            .await
+            .starts_with("HTTP/1.1 405 "));
         let mut unsupported = TcpStream::connect(socks).await.unwrap();
         unsupported.write_all(&[5, 1, 2]).await.unwrap();
         let mut reply = [0; 2];
         unsupported.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply, [5, 0xff]);
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
         proxy.abort();
         server.abort();
     })

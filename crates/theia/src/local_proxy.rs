@@ -28,14 +28,23 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const CA_LIMIT: usize = 1024 * 1024;
 
 const HTTP_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-const HTTP_BAD: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-const HTTP_METHOD: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-const HTTP_DENIED: &[u8] = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-const HTTP_FAILED: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-const HTTP_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const HTTP_BAD: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const HTTP_METHOD: &[u8] =
+    b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const HTTP_DENIED: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const HTTP_FAILED: &[u8] =
+    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const HTTP_TIMEOUT: &[u8] =
+    b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 fn load_file(reference: &str, limit: usize, secret: bool) -> Result<Vec<u8>, ClientError> {
-    let path = Path::new(reference.strip_prefix("file:").ok_or(ClientError::Configuration)?);
+    let path = Path::new(
+        reference
+            .strip_prefix("file:")
+            .ok_or(ClientError::Configuration)?,
+    );
     let metadata = std::fs::symlink_metadata(path).map_err(|_| ClientError::Configuration)?;
     if !metadata.file_type().is_file() || metadata.len() > limit as u64 {
         return Err(ClientError::Configuration);
@@ -67,7 +76,10 @@ fn load_client(profile: &Profile) -> Result<H2Client, ClientError> {
         return Err(ClientError::Configuration);
     }
     let cert = load_file(
-        profile.tls_ca.as_deref().ok_or(ClientError::Configuration)?,
+        profile
+            .tls_ca
+            .as_deref()
+            .ok_or(ClientError::Configuration)?,
         CA_LIMIT,
         false,
     )?;
@@ -156,7 +168,11 @@ fn parse_authority(raw: &str) -> Result<(Address, u16), ClientError> {
     let (host, port) = raw.rsplit_once(':').ok_or(ClientError::Protocol)?;
     let port = port.parse::<u16>().map_err(|_| ClientError::Protocol)?;
     let address = if let Some(host) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        Address::V6(host.parse::<Ipv6Addr>().map_err(|_| ClientError::Protocol)?.octets())
+        Address::V6(
+            host.parse::<Ipv6Addr>()
+                .map_err(|_| ClientError::Protocol)?
+                .octets(),
+        )
     } else if let Ok(ip) = host.parse::<Ipv4Addr>() {
         Address::V4(ip.octets())
     } else {
@@ -198,9 +214,7 @@ async fn http_target(socket: &mut TcpStream) -> Result<(Address, u16), &'static 
         let name = http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| HTTP_BAD)?;
         let value = value.trim_matches([' ', '\t']);
         http::HeaderValue::from_str(value).map_err(|_| HTTP_BAD)?;
-        if name == http::header::TRANSFER_ENCODING
-            || name == http::header::CONTENT_LENGTH
-        {
+        if name == http::header::TRANSFER_ENCODING || name == http::header::CONTENT_LENGTH {
             return Err(HTTP_BAD);
         }
         if name == http::header::HOST {
@@ -226,20 +240,35 @@ async fn socks_reply(socket: &mut TcpStream, code: u8) -> Result<(), ClientError
 
 async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientError> {
     let mut greeting = [0; 2];
-    socket.read_exact(&mut greeting).await.map_err(|_| ClientError::Io)?;
+    socket
+        .read_exact(&mut greeting)
+        .await
+        .map_err(|_| ClientError::Io)?;
     if greeting[0] != 5 || greeting[1] == 0 {
         return Err(ClientError::Protocol);
     }
     let mut methods = vec![0; usize::from(greeting[1])];
-    socket.read_exact(&mut methods).await.map_err(|_| ClientError::Io)?;
+    socket
+        .read_exact(&mut methods)
+        .await
+        .map_err(|_| ClientError::Io)?;
     if !methods.contains(&0) {
-        socket.write_all(&[5, 0xff]).await.map_err(|_| ClientError::Io)?;
+        socket
+            .write_all(&[5, 0xff])
+            .await
+            .map_err(|_| ClientError::Io)?;
         return Err(ClientError::Protocol);
     }
     // Local no-auth is allowed only on loopback. Remote auth is mandatory.
-    socket.write_all(&[5, 0]).await.map_err(|_| ClientError::Io)?;
+    socket
+        .write_all(&[5, 0])
+        .await
+        .map_err(|_| ClientError::Io)?;
     let mut request = [0; 4];
-    socket.read_exact(&mut request).await.map_err(|_| ClientError::Io)?;
+    socket
+        .read_exact(&mut request)
+        .await
+        .map_err(|_| ClientError::Io)?;
     if request[0] != 5 || request[2] != 0 {
         socks_reply(socket, 1).await?;
         return Err(ClientError::Protocol);
@@ -251,18 +280,27 @@ async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientEr
     let address = match request[3] {
         1 => {
             let mut addr = [0; 4];
-            socket.read_exact(&mut addr).await.map_err(|_| ClientError::Io)?;
+            socket
+                .read_exact(&mut addr)
+                .await
+                .map_err(|_| ClientError::Io)?;
             Address::V4(addr)
         }
         4 => {
             let mut addr = [0; 16];
-            socket.read_exact(&mut addr).await.map_err(|_| ClientError::Io)?;
+            socket
+                .read_exact(&mut addr)
+                .await
+                .map_err(|_| ClientError::Io)?;
             Address::V6(addr)
         }
         3 => {
             let len = socket.read_u8().await.map_err(|_| ClientError::Io)?;
             let mut name = vec![0; usize::from(len)];
-            socket.read_exact(&mut name).await.map_err(|_| ClientError::Io)?;
+            socket
+                .read_exact(&mut name)
+                .await
+                .map_err(|_| ClientError::Io)?;
             match String::from_utf8(name) {
                 Ok(name) => Address::Dns(name),
                 Err(_) => {
@@ -286,7 +324,11 @@ async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientEr
     }
 }
 
-async fn handle(mut socket: TcpStream, is_http: bool, client: &H2Client) -> Result<(), ClientError> {
+async fn handle(
+    mut socket: TcpStream,
+    is_http: bool,
+    client: &H2Client,
+) -> Result<(), ClientError> {
     let (address, port) = if is_http {
         match timeout(NEGOTIATE_TIMEOUT, http_target(&mut socket)).await {
             Ok(Ok(target)) => target,
@@ -319,8 +361,12 @@ async fn handle(mut socket: TcpStream, is_http: bool, client: &H2Client) -> Resu
         Err(error) => {
             if is_http {
                 let reply = match error {
-                    ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => HTTP_DENIED,
-                    ClientError::Timeout | ClientError::Open(ErrorCode::DialTimeout) => HTTP_TIMEOUT,
+                    ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => {
+                        HTTP_DENIED
+                    }
+                    ClientError::Timeout | ClientError::Open(ErrorCode::DialTimeout) => {
+                        HTTP_TIMEOUT
+                    }
                     _ => HTTP_FAILED,
                 };
                 let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
