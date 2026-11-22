@@ -1,3 +1,97 @@
+//! M4.5h: one explicitly consented DNS A/AAAA observation for a single
+//! known catalogue domain. Safe, bounded, local OS resolver only.
+//!
+//! Does NOT authorize active TLS probing. Follow-up TLS/QUIC requests must
+//! separately approve each pinned public IP:443 and matching domain SNI.
+//! DNS answers are never treated as ownership or REALITY compatibility.
+use crate::camouflage_discovery::{plausible_public_address, POPULAR_HTTPS_DOMAINS};
+use std::{collections::HashSet, net::{IpAddr, SocketAddr}, time::Duration};
+use tokio::time::timeout;
+
+pub const MAX_DNS_RECORDS: usize = 64;
+pub const MAX_PINNED_IPS: usize = 8;
+pub const DNS_DEADLINE: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsConsent {
+    Denied,
+    Approved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsError {
+    NotApproved,
+    NotCatalogued,
+    TimedOut,
+    LookupFailed,
+    NoPublicAddresses,
+    UnsafeAddress,
+    TooManyAnswers,
+}
+
+/// Strict, case-sensitive bounded static whitelist; not an ownership grant.
+/// No DNS when the caller has not collected separate prior consent.
+pub fn validate_dns_request(domain: &str, consent: DnsConsent) -> Result<(), DnsError> {
+    if consent != DnsConsent::Approved {
+        return Err(DnsError::NotApproved);
+    }
+    if !POPULAR_HTTPS_DOMAINS.contains(&domain) {
+        return Err(DnsError::NotCatalogued);
+    }
+    Ok(())
+}
+
+/// Converts an already acquired DNS answer set into a bounded list of exact
+/// public IPs for *review*, not for automatic network probing. Reject the
+/// whole set if any answer is private, special-purpose, invalid or not 443.
+/// Never permit a mixed good+bad answer to smuggle an SSRF destination.
+pub fn vet_dns_answers(answers: &[SocketAddr]) -> Result<Vec<IpAddr>, DnsError> {
+    if answers.len() > MAX_DNS_RECORDS {
+        return Err(DnsError::TooManyAnswers);
+    }
+    let mut ips = Vec::new();
+    let mut seen = HashSet::new();
+    for address in answers {
+        if address.port() != 443 || !plausible_public_address(address.ip()) {
+            return Err(DnsError::UnsafeAddress);
+        }
+        if seen.insert(address.ip()) && ips.len() < MAX_PINNED_IPS {
+            ips.push(address.ip());
+        }
+    }
+    if ips.is_empty() {
+        return Err(DnsError::NoPublicAddresses);
+    }
+    Ok(ips)
+}
+
+/// Exactly one OS resolver lookup for an operator-selected catalogue domain.
+/// No retries, redirects, remote HTTP or connection to any returned IP.
+/// Timeout covers lookup + filtering; only up to 64 answers are materialized
+/// and all are inspected for unsafe addresses. The active TLS/QUIC path must
+/// pin an explicitly selected IP, never invoke DNS again.
+pub async fn resolve_catalogued_domain(
+    domain: &'static str,
+    consent: DnsConsent,
+) -> Result<Vec<IpAddr>, DnsError> {
+    validate_dns_request(domain, consent)?;
+    timeout(DNS_DEADLINE, async move {
+        let resolved = tokio::net::lookup_host((domain, 443))
+            .await
+            .map_err(|_| DnsError::LookupFailed)?;
+        let mut addresses = Vec::new();
+        for address in resolved {
+            if addresses.len() == MAX_DNS_RECORDS {
+                return Err(DnsError::TooManyAnswers);
+            }
+            addresses.push(address);
+        }
+        vet_dns_answers(&addresses)
+    })
+    .await
+    .map_err(|_| DnsError::TimedOut)?
+}
+
 // M4.5h tests first: never query DNS or probe a third party implicitly.
 #[cfg(test)]
 mod tests {
