@@ -1,7 +1,7 @@
 # ADR-0013: M3.4i window credit observation and immutable h2 pseudo-header order
 
 **Date:** 2026-11-22
-**Status:** research-only PR awaiting native exact-SHA CI. F-13/F-11/M5 remain BLOCKED.
+**Status:** research-only measurement, exact-SHA native CI acceptance recorded in PR #37. F-13/F-11/M5 remain BLOCKED.
 **Depends on:** ADR-0009 through ADR-0012.
 
 ## Evidence and trust boundary
