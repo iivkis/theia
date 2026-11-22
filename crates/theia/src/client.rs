@@ -268,9 +268,7 @@ impl H2Client {
 
 /// Same HTTP/2 transport engine and ownership regardless of verified TLS
 /// backend. The SmartTheia HELLO/OPEN_OK state machine below is shared.
-async fn start_h2<S>(
-    tls: S,
-) -> Result<(h2::client::SendRequest<Bytes>, Driver), ClientError>
+async fn start_h2<S>(tls: S) -> Result<(h2::client::SendRequest<Bytes>, Driver), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
