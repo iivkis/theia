@@ -225,7 +225,7 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_INCREMENTAL: "0"
-      THEIA_BBR_RESULTS_PATH: ${{ runner.temp }}/theia-bbr-${{ runner.os }}.csv
+      THEIA_BBR_RESULTS_PATH: theia-bbr-${{ matrix.os }}.csv
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -247,7 +247,7 @@ jobs:
         if: always()
         with:
           name: m3-3-quic-comparison-${{ runner.os }}
-          path: ${{ runner.temp }}/theia-bbr-${{ runner.os }}.csv
+          path: theia-bbr-${{ matrix.os }}.csv
           if-no-files-found: error
 
   ci-gate:
