@@ -193,6 +193,69 @@ mod tests {
     }
 
     #[test]
+    fn seeded_domain_needs_exact_host_and_ip_authority_before_network() {
+        use crate::camouflage_interfaces::NativeInterfaces;
+        use crate::camouflage_workflow::{build_preview, PreviewScope};
+        let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+        let ip: IpAddr = "93.184.216.10".parse().unwrap();
+        let candidate = DualProbeTarget {
+            request: ProbeRequest {
+                address: SocketAddr::new(ip, 443),
+                server_name: "google.com".to_owned(),
+                deadline: Duration::from_secs(2),
+            },
+            roots: RootCertStore::empty(),
+            approval: ProbeApproval::public_https_ip(ip),
+        };
+        let approved = CandidateConsent::PinnedDomain {
+            domain: "google.com",
+            pinned_ip: ip,
+        };
+        assert_eq!(
+            validate_dual_target(&preview, &candidate, CandidateConsent::PlannedIp),
+            Err(DualProbeError::UnplannedAddress)
+        );
+        assert_eq!(
+            validate_dual_target(&preview, &candidate, approved),
+            Err(DualProbeError::NoTrustAnchors)
+        );
+        assert_eq!(
+            validate_dual_target(
+                &preview,
+                &candidate,
+                CandidateConsent::PinnedDomain {
+                    domain: "google.com",
+                    pinned_ip: "93.184.216.11".parse().unwrap(),
+                },
+            ),
+            Err(DualProbeError::DomainAddressMismatch)
+        );
+        assert_eq!(
+            validate_dual_target(
+                &preview,
+                &candidate,
+                CandidateConsent::PinnedDomain {
+                    domain: "unlisted.example",
+                    pinned_ip: ip,
+                },
+            ),
+            Err(DualProbeError::UnplannedDomain)
+        );
+        let mut wrong_name = candidate.clone();
+        wrong_name.request.server_name = "github.com".to_owned();
+        assert_eq!(
+            validate_dual_target(&preview, &wrong_name, approved),
+            Err(DualProbeError::DomainNameMismatch)
+        );
+        let mut denied = candidate;
+        denied.approval = ProbeApproval::Denied;
+        assert_eq!(
+            validate_dual_target(&preview, &denied, approved),
+            Err(DualProbeError::NotApproved)
+        );
+    }
+
+    #[test]
     fn denied_forged_public_approval_is_redacted_in_debug() {
         let target = DualProbeTarget {
             request: ProbeRequest {
