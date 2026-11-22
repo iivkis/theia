@@ -4,14 +4,12 @@
 //! approved lookup; TCP and UDP each require further disclosure of selected
 //! exact public IPs and affirmative consent, no re-resolution, no Apply.
 use crate::{
-    camouflage_discovery::{CandidateHost, CandidateSource, Observation, Transport, POPULAR_HTTPS_DOMAINS},
-    camouflage_domain_dns::{
-        resolve_catalogued_domain, DnsConsent, DnsError, MAX_PINNED_IPS,
+    camouflage_discovery::{
+        CandidateHost, CandidateSource, Observation, Transport, POPULAR_HTTPS_DOMAINS,
     },
+    camouflage_domain_dns::{resolve_catalogued_domain, DnsConsent, DnsError, MAX_PINNED_IPS},
     camouflage_dual::{CandidateConsent, DualProbeTarget},
-    camouflage_dual_batch::{
-        probe_dual_batch, DualBatchError, DualBatchReport, DualBatchTarget,
-    },
+    camouflage_dual_batch::{probe_dual_batch, DualBatchError, DualBatchReport, DualBatchTarget},
     camouflage_probe::{ProbeApproval, ProbeRequest},
     camouflage_workflow::DiscoveryPreview,
 };
@@ -144,8 +142,8 @@ impl DomainPanel {
     pub(crate) fn previous(&mut self) {
         match self.state {
             DomainState::Catalog if !self.domains.is_empty() => {
-                self.domain_index = (self.domain_index + self.domains.len() - 1)
-                    % self.domains.len();
+                self.domain_index =
+                    (self.domain_index + self.domains.len() - 1) % self.domains.len();
                 self.reset_pins();
             }
             DomainState::Resolved if !self.addresses.is_empty() => {
@@ -327,9 +325,7 @@ impl DomainPanel {
         let completed = match &self.state {
             DomainState::DnsRunning { result, .. } => match result.try_recv() {
                 Ok(reply) => Some(Finished::Dns(reply)),
-                Err(TryRecvError::Disconnected) => {
-                    Some(Finished::Dns(Err(DnsError::LookupFailed)))
-                }
+                Err(TryRecvError::Disconnected) => Some(Finished::Dns(Err(DnsError::LookupFailed))),
                 Err(TryRecvError::Empty) => None,
             },
             DomainState::ProbeRunning { result, .. } => match result.try_recv() {
@@ -367,8 +363,7 @@ impl DomainPanel {
 
     pub(crate) fn cancel(&mut self) {
         match &mut self.state {
-            DomainState::DnsRunning { cancel, .. }
-            | DomainState::ProbeRunning { cancel, .. } => {
+            DomainState::DnsRunning { cancel, .. } | DomainState::ProbeRunning { cancel, .. } => {
                 if let Some(signal) = cancel.take() {
                     let _ = signal.send(());
                 }
@@ -584,7 +579,11 @@ mod tests {
     };
 
     fn panel() -> DomainPanel {
-        let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+        let preview = build_preview(
+            &NativeInterfaces::default(),
+            None,
+            PreviewScope::PassiveOnly,
+        );
         DomainPanel::new(preview)
     }
 
@@ -780,10 +779,10 @@ mod tests {
     #[test]
     fn reported_h2_only_or_h3_only_failure_is_never_reality_ready() {
         use crate::{
-            camouflage_dual::{DualProbeReport, DualProbeError},
-            camouflage_dual_batch::{DualBatchReport, DualBatchOutcome},
-            camouflage_probe::ProbeError,
+            camouflage_dual::{DualProbeError, DualProbeReport},
+            camouflage_dual_batch::{DualBatchOutcome, DualBatchReport},
             camouflage_h3_probe::H3ProbeError,
+            camouflage_probe::ProbeError,
         };
         let ip: IpAddr = "93.184.216.10".parse().unwrap();
         let mut panel = panel();
