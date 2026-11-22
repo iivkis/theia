@@ -79,7 +79,11 @@ pub fn contiguous_netmask_prefix(mask: IpAddr) -> Option<u8> {
 /// service. Only Linux servers currently have a collector implementation.
 #[cfg(target_os = "linux")]
 pub fn collect_assigned_interfaces() -> io::Result<NativeInterfaces> {
-    use std::{ffi::CStr, net::{Ipv4Addr, Ipv6Addr}, ptr};
+    use std::{
+        ffi::CStr,
+        net::{Ipv4Addr, Ipv6Addr},
+        ptr,
+    };
 
     struct IfAddrsGuard(*mut libc::ifaddrs);
     impl Drop for IfAddrsGuard {
@@ -149,9 +153,7 @@ pub fn collect_assigned_interfaces() -> io::Result<NativeInterfaces> {
             let Some(prefix_len) = contiguous_netmask_prefix(mask) else {
                 continue;
             };
-            let interface_name = CStr::from_ptr(item.ifa_name)
-                .to_string_lossy()
-                .into_owned();
+            let interface_name = CStr::from_ptr(item.ifa_name).to_string_lossy().into_owned();
             if interface_name.is_empty() {
                 continue;
             }
