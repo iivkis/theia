@@ -335,6 +335,8 @@ jobs:
         run: |
           cargo test --workspace --locked --features experimental-btls-h2 --test client_btls_h2 -- --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Production BoringSSL H2/OPEN_OK regressions failed' }
+          cargo test --workspace --locked --features experimental-btls-h2 --test h2_wire_fingerprint -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4f actual H2 SETTINGS and pseudo-header capture failed' }
       - name: Rustfmt and feature Clippy fail on warnings
         shell: pwsh
         run: |
