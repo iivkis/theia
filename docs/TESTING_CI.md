@@ -8,6 +8,8 @@
 
 **M3.5b2b3 bounded exact-target batch CI (Linux/Windows):** `crates/theia/tests/camouflage_batch.rs` создаёт только loopback TLS1.3 fixtures и проверяет позитивный одновременный H2 batch, порядок результатов, независимые негативные TLS/ALPN/timeout ответы, all-handshakes fail-closed, отказ при отсутствии явного разрешения, IP вне offline preview, duplicate socket, пустой и превышающий лимит списки. Публичная сеть/DNS/seed домены не затрагиваются; runtime scanner/UI отсутствует. Обязательные `cargo test/fmt/clippy`, ОС-матрица и точный `ci-gate` должны быть успешны.
 
+**M3.5b2b4 default ipify CI:** `crates/theia/tests/camouflage_default_ipify.rs` проверяет точный URL `https://api64.ipify.org/`, path `/`, установленный лимит времени, отсутствие DNS/сети при `IpifyConsent::Denied` и отсутствии CA, реальные loopback TLS1.3/http1.1 fixture с сертификатом/SAN `api64.ipify.org`, правильные Host/SNI, IPv4/IPv6 plain-text ответы, запрет private-IP и отсутствие утечки hostname через Debug. Windows/Linux обязательны; никаких реальных запросов к ipify в CI. Только положительный `ci-gate` на финальном SHA разрешает merge.
+
 ## 1. Test pyramid
 
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)

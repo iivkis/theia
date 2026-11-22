@@ -21,6 +21,21 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 
+/// Official dual-stack ipify endpoint; IPv4 or IPv6 is returned depending on
+/// the outbound connection's address family. The root path is plain-text IP,
+/// not JSON. This is a *configured default*, never an automatic network call.
+pub const DEFAULT_EGRESS_SERVICE_HOST: &str = "api64.ipify.org";
+pub const DEFAULT_EGRESS_SERVICE_URL: &str = "https://api64.ipify.org/";
+
+/// Consent is specifically for contacting the default external ipify
+/// service. A non-consenting call performs neither DNS nor TCP/TLS traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpifyConsent {
+    #[default]
+    Denied,
+    Approved,
+}
+
 const MAX_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_HEADER: usize = 4096;
 const MAX_RESPONSE_BODY: usize = 64;
@@ -147,6 +162,55 @@ impl fmt::Debug for EgressObservation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("EgressObservation(<redacted>)")
     }
+}
+
+/// Construct the canonical ipify request with an already pinned address.
+/// Caller approval is always checked separately by observe_public_egress.
+/// No DNS, I/O or implicit consent occurs here.
+pub fn default_ipify_request(pinned_address: SocketAddr) -> EgressRequest {
+    EgressRequest {
+        address: pinned_address,
+        server_name: DEFAULT_EGRESS_SERVICE_HOST.to_owned(),
+        path: "/".to_owned(),
+        deadline: MAX_DEADLINE,
+    }
+}
+
+/// Resolve and query the official dual-stack ipify service only after an
+/// explicit opt-in. Resolution and TLS/HTTP share the same five-second total
+/// deadline. No hardcoded CDN IP, private destination, redirects, DNS-to-IP
+/// re-resolution or address-family fallback: select one public resolved IP,
+/// pin TCP to it, and authenticate api64.ipify.org with normal TLS 1.3 PKI.
+///
+/// The caller supplies its approved CA root store. HTTPS authenticates the
+/// witness, not independent ownership, NAT type or IP-CIDR scan permission.
+pub async fn observe_default_ipify(
+    roots: RootCertStore,
+    consent: IpifyConsent,
+) -> Result<EgressObservation, EgressError> {
+    if consent != IpifyConsent::Approved {
+        return Err(EgressError::NotApproved);
+    }
+    if roots.is_empty() {
+        return Err(EgressError::NoTrustAnchors);
+    }
+    timeout(MAX_DEADLINE, async move {
+        let peers = tokio::net::lookup_host((DEFAULT_EGRESS_SERVICE_HOST, 443))
+            .await
+            .map_err(|_| EgressError::ConnectFailed)?;
+        let pinned = peers
+            .into_iter()
+            .find(|peer| peer.port() == 443 && plausible_public_address(peer.ip()))
+            .ok_or(EgressError::ConnectFailed)?;
+        observe_public_egress(
+            default_ipify_request(pinned),
+            roots,
+            EgressApproval::public_https_ip(pinned.ip()),
+        )
+        .await
+    })
+    .await
+    .map_err(|_| EgressError::TimedOut)?
 }
 
 fn valid_path(path: &str) -> bool {
