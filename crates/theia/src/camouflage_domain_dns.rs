@@ -5,7 +5,11 @@
 //! separately approve each pinned public IP:443 and matching domain SNI.
 //! DNS answers are never treated as ownership or REALITY compatibility.
 use crate::camouflage_discovery::{plausible_public_address, POPULAR_HTTPS_DOMAINS};
-use std::{collections::HashSet, net::{IpAddr, SocketAddr}, time::Duration};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 use tokio::time::timeout;
 
 pub const MAX_DNS_RECORDS: usize = 64;
@@ -99,10 +103,22 @@ mod tests {
 
     #[test]
     fn catalogue_membership_and_distinct_consent_are_required_before_lookup() {
-        assert_eq!(validate_dns_request("google.com", DnsConsent::Denied), Err(DnsError::NotApproved));
-        assert_eq!(validate_dns_request("unlisted.example", DnsConsent::Approved), Err(DnsError::NotCatalogued));
-        assert_eq!(validate_dns_request("google.com", DnsConsent::Approved), Ok(()));
-        assert_eq!(validate_dns_request("Google.com", DnsConsent::Approved), Err(DnsError::NotCatalogued));
+        assert_eq!(
+            validate_dns_request("google.com", DnsConsent::Denied),
+            Err(DnsError::NotApproved)
+        );
+        assert_eq!(
+            validate_dns_request("unlisted.example", DnsConsent::Approved),
+            Err(DnsError::NotCatalogued)
+        );
+        assert_eq!(
+            validate_dns_request("google.com", DnsConsent::Approved),
+            Ok(())
+        );
+        assert_eq!(
+            validate_dns_request("Google.com", DnsConsent::Approved),
+            Err(DnsError::NotCatalogued)
+        );
     }
 
     #[tokio::test]
@@ -141,7 +157,11 @@ mod tests {
         ] {
             let mut mixed = valid.to_vec();
             mixed.push(bad.parse().unwrap());
-            assert_eq!(vet_dns_answers(&mixed), Err(DnsError::UnsafeAddress), "{bad}");
+            assert_eq!(
+                vet_dns_answers(&mixed),
+                Err(DnsError::UnsafeAddress),
+                "{bad}"
+            );
         }
     }
 
