@@ -12,6 +12,8 @@
 
 **M4.5a TUI consented discovery CI:** pure state-machine/tui tests verify p on server screen opens **passive** native interface+14 domain preview, no worker/DNS by default, i shows disclosure for exact `api64.ipify.org`, n denies, Esc drops/cancels flow, client/Home/Help cannot trigger discovery, dirty typed TOML editor refuses navigation. `tui_discovery` tests verify no worker starts before explicit confirmation and safe cleanup. Existing `camouflage_default_ipify` tests perform real loopback TLS1.3/SNI/Host/IPv4/IPv6 PKI and forbidden reply checks; **never** access public ipify in CI. Production worker loads pinned `rustls-native-certs=0.8.5` CA without disabling trust verification; native Windows and Linux CI, fmt/clippy and full exact-head gate mandatory.
 
+**M4.5b exact-target TLS/H2 UI CI:** `tui.rs` проверяет `p → t` в серверной панели даже без TOML: review показывает требование загруженного server inbound/SNI, одиночное `y` ничего не запускает, Esc возвращает пассивную панель. `tui_probe.rs` проверяет реальные локально *предоставленные* интерфейсные метаданные: invalid/down/private исключены, только public UP+valid prefix может быть выбран, список ≤8, j/k → Enter/t → отдельный y (в тестах не нажимается), n отказывает, error/timeout не даёт позитивного TLS статуса, Drop отменяет worker через oneshot. Реальные TLS1.3/PKI/ALPN позитивные/негативные handshakes перепроверяются существующими loopback tests в `camouflage_batch.rs`. Никаких публичных TLS endpoints или DNS в CI; mandatory native Linux/Windows cargo test/fmt/clippy, full BoringSSL/BBR/Chromium E2E + exact-head ci-gate.
+
 ## 1. Test pyramid
 
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)
