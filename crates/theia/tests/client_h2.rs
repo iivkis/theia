@@ -690,3 +690,166 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
     .await
     .expect("H3 executable E2E deadline");
 }
+
+async fn auto_connect(proxy: std::net::SocketAddr, port: u16) -> String {
+    let mut socket = TcpStream::connect(proxy).await.unwrap();
+    socket
+        .write_all(
+            format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    response_head(&mut socket).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_falls_back_only_after_udp_silence_and_uses_negative_cache() {
+    timeout(Duration::from_secs(25), async {
+        let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
+        let udp = tokio::net::UdpSocket::bind(&endpoint).await.unwrap();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = probes.clone();
+        let blackhole = tokio::spawn(async move {
+            let mut data = [0; 2048];
+            loop {
+                udp.recv_from(&mut data).await.unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Deliberately never return any datagram.
+            }
+        });
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let origin = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut tcp, _) = target.accept().await.unwrap();
+                tcp.shutdown().await.unwrap();
+            }
+        });
+        let (_dir, _child, http, _socks) = launch_client(
+            endpoint,
+            pem,
+            "auto-blackhole",
+            theia::config::Transport::Auto,
+        )
+        .await;
+        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
+        let first = probes.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(first > 0, "auto must actually attempt QUIC before H2");
+        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            first,
+            "negative cache must suppress a new UDP handshake"
+        );
+        origin.await.unwrap();
+        blackhole.abort();
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_wrong_h3_certificate_never_retries_working_h2() {
+    timeout(Duration::from_secs(20), async {
+        let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
+        // H2 is trusted by the CLI fixture. H3 uses a different certificate
+        // with the same SAN, so only chain validation distinguishes it.
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let udp = theia::quic_transport::server_endpoint(
+            endpoint.parse().unwrap(),
+            vec![der],
+            key.into(),
+        )
+        .unwrap();
+        let quic = tokio::spawn(async move {
+            let incoming = udp.accept().await.unwrap();
+            assert!(theia::quic_transport::accept(incoming).await.is_err());
+        });
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let (_dir, _child, http, _socks) = launch_client(
+            endpoint,
+            pem,
+            "auto-untrusted",
+            theia::config::Transport::Auto,
+        )
+        .await;
+        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 502 "));
+        quic.await.unwrap();
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_denied_h3_bearer_never_retries_working_h2() {
+    timeout(Duration::from_secs(20), async {
+        // One certificate trusted by both transports, with different test
+        // inbound grants so a forbidden H3 request would succeed over H2.
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![der.clone()], key.clone_key().into())
+        .unwrap();
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let udp = theia::quic_transport::server_endpoint(remote, vec![der], key.into()).unwrap();
+        let mut inbound = Inbound {
+            id: "h2-test".into(),
+            allowed_user_ids: vec!["client".into()],
+            h2_listen: remote.to_string(),
+            quic_listen: remote.to_string(),
+            server_name: "localhost".into(),
+            tls_cert: "unused".into(),
+            tls_key: "unused".into(),
+        };
+        let user = User {
+            id: "client".into(),
+            token_sha256: format!("{:x}", Sha256::digest(TOKEN)),
+            disabled: false,
+        };
+        let policy = ServerPolicy {
+            allow_private_ips: true,
+            max_connections_per_user: 8,
+            max_connections_total: 8,
+            connect_timeout_ms: 1500,
+        };
+        let h2_context = Arc::new(ServerContext::new(&inbound, std::slice::from_ref(&user), &policy));
+        inbound.allowed_user_ids.clear();
+        let h3_context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
+        let h2 = tokio::spawn(serve(listener, TlsAcceptor::from(Arc::new(tls)), h2_context));
+        let h3 = tokio::spawn(theia::h3_server::serve(udp, h3_context));
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let (_dir, _child, http, _socks) = launch_client(
+            remote.to_string(),
+            cert.cert.pem(),
+            "auto-denied",
+            theia::config::Transport::Auto,
+        )
+        .await;
+        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 403 "));
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
+        h2.abort();
+        h3.abort();
+    })
+    .await
+    .unwrap();
+}

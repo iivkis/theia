@@ -356,6 +356,19 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("h3_server_and_client_binaries_curl_both_local_proxies",
                       read("crates/theia/tests/client_h2.rs"))
 
+    def test_m32_auto_selector_is_fail_closed(self):
+        proxy = read("crates/theia/src/local_proxy.rs")
+        quic = read("crates/theia/src/quic_transport.rs")
+        self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
+        self.assertIn("self.observation.sent.load", quic)
+        self.assertIn("!self.observation.received.load", quic)
+        self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", proxy)
+        tests = read("crates/theia/tests/client_h2.rs")
+        for name in ("auto_falls_back_only_after_udp_silence_and_uses_negative_cache",
+                     "auto_wrong_h3_certificate_never_retries_working_h2",
+                     "auto_denied_h3_bearer_never_retries_working_h2"):
+            self.assertIn(name, tests)
+
 
 if __name__ == "__main__":
     unittest.main()

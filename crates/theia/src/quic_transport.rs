@@ -90,8 +90,9 @@ pub fn server_endpoint(
 }
 
 pub fn client_endpoint(bind: SocketAddr, roots: RootCertStore) -> Result<Endpoint, QuicError> {
+    let config = client_config(roots)?;
     let mut endpoint = Endpoint::client(bind).map_err(|_| QuicError::Bind)?;
-    endpoint.set_default_client_config(client_config(roots)?);
+    endpoint.set_default_client_config(config);
     Ok(endpoint)
 }
 

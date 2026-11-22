@@ -168,6 +168,7 @@ impl AutoClient {
             match self.h3.open(address.clone(), port).await {
                 Ok(tunnel) => {
                     *self.negative.lock().map_err(|_| ClientError::Configuration)? = None;
+                    eprintln!("transport=h3");
                     return Ok(ProxyTunnel::H3(Box::new(tunnel)));
                 }
                 Err(ClientError::QuicUnreachable) => {
@@ -512,5 +513,34 @@ async fn handle(
             }
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    #[test]
+    fn negative_cache_expires_and_zero_ttl_disables_it() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let token = URL_SAFE_NO_PAD.encode([1; 32]);
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let mut client = AutoClient {
+            h2: Arc::new(H2Client::new("127.0.0.1:443", "localhost", &token, roots.clone()).unwrap()),
+            h3: Arc::new(H3Client::new(remote, "localhost", &token, roots).unwrap()),
+            ttl: Duration::from_secs(5),
+            negative: Mutex::new(None),
+        };
+        let now = Instant::now();
+        assert!(!client.cached(now).unwrap());
+        client.record(now).unwrap();
+        assert!(client.cached(now + Duration::from_secs(4)).unwrap());
+        assert!(!client.cached(now + Duration::from_secs(5)).unwrap());
+        client.ttl = Duration::ZERO;
+        client.record(now).unwrap();
+        assert!(!client.cached(now).unwrap());
     }
 }
