@@ -2,7 +2,7 @@
 
 **Specification-first · Rust · one binary · TOML · ratatui · SmartTheia**
 
-**Состояние M4.1b (после M3.4j):** единый Rust-бинарник поддерживает H2/TLS и H3/QUIC server/client, локальные HTTP CONNECT/SOCKS5 и строгий QUIC-first fallback. BBR включён на обоих QUIC endpoints, но полноценный release benchmark ещё открыт. Добавлен стартовый TUI и ограниченный редактор явно выбранного TOML: один не-секретный параметр на роль, валидация, несохранённые изменения и атомарная запись. Полноценные формы, IPC, Windows system proxy и browser-like fingerprint остаются не реализованными.
+**Состояние M4.1c (после M3.4j):** единый Rust-бинарник поддерживает H2/TLS и H3/QUIC server/client, локальные HTTP CONNECT/SOCKS5 и строгий QUIC-first fallback. BBR включён на обоих QUIC endpoints, но полноценный release benchmark ещё открыт. Добавлен стартовый TUI и ограниченный редактор явно выбранного TOML: по три безопасных поля выбранного inbound/профиля, валидация, несохранённые изменения и атомарная запись. Создание/удаление записей, управление пользователями/секретами, IPC, Windows system proxy и browser-like fingerprint остаются не реализованными.
 
 **M3.4a–M3.4j:** на Linux/Windows проверены реальные TLS/H2 first-flight, Chromium159 SETTINGS/WINDOW_UPDATE/pseudo порядок и опциональный BoringSSL H2. Default rustls и порядок заголовков стандартного h2 пока не соответствуют Chrome. Это измерения и исследовательский feature, **не** готовый именованный browser-like профиль.
 
@@ -47,15 +47,15 @@ applications → local HTTP/SOCKS → SmartTheia over HTTP/3 (QUIC + BBR)
 theia tui                              # стартовое меню, только чтение
 theia tui --role server                # обзор серверной панели, только чтение
 theia tui --role client                # обзор клиентской панели, только чтение
-theia tui --role server --config /path/to/server.toml  # поле DNS имени первого inbound
-theia tui --role client --config /path/to/client.toml  # endpoint активного профиля
+theia tui --role server --config /path/to/server.toml  # поля DNS имени/H2 TCP/H3 UDP у выбранного inbound
+theia tui --role client --config /path/to/client.toml  # endpoint/TLS SNI/transport выбранного профиля
 theia server run --config server.toml  # headless сервер
 theia client run --config client.toml  # headless клиент
 theia config validate --config client.toml
 theia --version
 ```
 
-`theia config validate --config FILE` структурно проверяет TOML v1 (exit 0/2) без чтения содержимого секретов. `tui` работает в интерактивном терминале, а без TTY отказывает с exit 2, не меняя окружение. Без `--config` это только навигация. С `--role` и `--config` можно изменить только одно разрешённое поле на роль, проверить черновик и сохранить TOML (без reload и запуска службы); при внешнем изменении файла запись блокируется. `server run` и `client run` поддерживают H2/H3 с аутентификацией, TLS-проверками и TCP relay; `auto` использует QUIC-first с ограниченным H2 fallback исключительно при сетевой UDP-недоступности до аутентификации. Локальные CONNECT/SOCKS5 работают только на loopback, для H2 требуется явно доверенная CA. Автоматические тесты выполняются GitHub Actions на Linux и Windows; ручных smoke нет. Исходный код CLI расположен в `crates/theia/`, исследовательский `spikes/m0_1/` не входит в production workspace.
+`theia config validate --config FILE` структурно проверяет TOML v1 (exit 0/2) без чтения содержимого секретов. `tui` работает в интерактивном терминале, а без TTY отказывает с exit 2, не меняя окружение. Без `--config` это только навигация. С `--role` и `--config` можно выбирать существующий inbound/профиль (↑/↓, j/k), переключать три поля (Tab/Shift+Tab), проверить черновик и сохранить TOML (без reload и запуска службы); при внешнем изменении файла запись блокируется. `server run` и `client run` поддерживают H2/H3 с аутентификацией, TLS-проверками и TCP relay; `auto` использует QUIC-first с ограниченным H2 fallback исключительно при сетевой UDP-недоступности до аутентификации. Локальные CONNECT/SOCKS5 работают только на loopback, для H2 требуется явно доверенная CA. Автоматические тесты выполняются GitHub Actions на Linux и Windows; ручных smoke нет. Исходный код CLI расположен в `crates/theia/`, исследовательский `spikes/m0_1/` не входит в production workspace.
 
 ## Приоритеты
 
@@ -67,4 +67,4 @@ theia --version
 
 Пример конфигураций содержит заменяемые значения и не предназначен для реального деплоя без создания сертификата и секретов. Лицензия ещё не выбрана; перед распространением добавить `LICENSE`.
 
-**M3.4j (merged):** реальные Chromium159 H2 SETTINGS, WINDOW_UPDATE и HPACK pseudo order измерены и сравнены со стандартным h2 0.4.19 на Linux/Windows. Обычная перестановка заголовков и параметров окна не обеспечивает Chrome-порядок; релизный F-13 остаётся заблокированным. **M4.1a (merged):** read-only TUI. **M4.1b (in review):** узкий typed TOML editor с dirty, validation, save/discard/stay и отказом при внешнем изменении файла; без управления сервисами.
+**M3.4j (merged):** реальные Chromium159 H2 SETTINGS, WINDOW_UPDATE и HPACK pseudo order измерены и сравнены со стандартным h2 0.4.19 на Linux/Windows. Обычная перестановка заголовков и параметров окна не обеспечивает Chrome-порядок; релизный F-13 остаётся заблокированным. **M4.1a (merged):** read-only TUI. **M4.1b (merged):** typed TOML editor с dirty, validation, save/discard/stay. **M4.1c (in review):** выбор существующих inbound/profiles и редактирование трёх безопасных полей на запись; без создания/удаления, применения к runtime и управления системным прокси.

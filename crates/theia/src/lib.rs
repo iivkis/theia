@@ -130,7 +130,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
     }
 }
 
-const HELP: &str = "Theia 0.1.0 (H2 server inbound, H3 inbound, client and M4.1a read-only TUI)\n\
+const HELP: &str = "Theia 0.1.0 (H2 server inbound, H3 inbound, client and M4.1c typed TUI)\n\
 Usage:\n\
   theia --help | --version\n\
   theia tui [--role server|client] [--config <path>]\n\
@@ -138,14 +138,14 @@ Usage:\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
-Client requires tls_ca PEM bundle. TUI edits one safe field only with explicit role+config; system proxy is never modified.";
+Client requires tls_ca PEM bundle. TUI selects records and edits 3 safe fields with explicit role+config; system proxy is never modified.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
     match command {
         Command::Help(None) => Ok(HELP),
         Command::Help(Some("tui")) => {
-            Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith both --role and --config, edit one non-secret field and save validated TOML; no reload, network or system proxy changes.")
+            Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith both --role and --config, choose existing records and edit 3 non-secret fields per record; save validated TOML without reload, network or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
             Ok("Usage: theia server run --config <path>\nTLS 1.3/H2 and QUIC/H3 server inbounds.")
