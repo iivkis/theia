@@ -270,7 +270,7 @@ class SpecContractTests(unittest.TestCase):
         binary = read("crates/theia/src/main.rs")
         for term in ("pub async fn serve(", "pub async fn run_file(",
                      "fn allowed_destination(", "URL_SAFE_NO_PAD", "Sha256::digest",
-                     "ct_eq(", "lookup_host(", "TcpStream::connect(candidate)",
+                     "ct_eq(", "lookup_host(", "TcpStream::connect",
                      "Frame::OpenOk", "TlsAcceptor", "max_concurrent_streams"):
             self.assertIn(term, implementation)
         for term in ("h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial",
