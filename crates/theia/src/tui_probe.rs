@@ -3,7 +3,9 @@
 //! Nothing scans a CIDR or resolves a seed domain; no probe runs on startup.
 use crate::{
     camouflage_batch::{probe_explicit_batch, BatchError, BatchTarget, MAX_EXPLICIT_BATCH},
-    camouflage_discovery::{plausible_public_address, CandidateHost, CandidateSource},
+    camouflage_discovery::{
+        plausible_public_address, CandidateHost, CandidateSource, TlsEvidence, Transport,
+    },
     camouflage_interfaces::NativeInterfaces,
     camouflage_probe::{ProbeApproval, ProbeError, ProbeReport, ProbeRequest},
     camouflage_workflow::{build_preview, DiscoveryPreview, PreviewScope},
@@ -13,9 +15,57 @@ use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::mpsc::{self, Receiver, TryRecvError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
+
+/// All diagnostic labels are fixed from the local evidence rubric.
+/// They never include IP/SNI, certificate contents, tokens or user input.
+fn translated_blocker(blocker: &str, transport: Transport) -> &'static str {
+    match blocker {
+        "TLS1.3 not measured" => "TLS1.3 не измерен",
+        "TLS1.3 rejected" => "TLS1.3 отклонён",
+        "certificate chain unverified" => "цепочка сертификата не проверена",
+        "untrusted certificate chain" => "цепочка сертификата не доверена",
+        "SNI/SAN not measured" => "SNI/SAN не измерены",
+        "SNI/SAN mismatch" => "SNI/SAN не совпадают",
+        "certificate validity unverified" => "срок действия сертификата не проверен",
+        "certificate expired or not yet valid" => "сертификат просрочен или ещё не действует",
+        "reachability unverified" => "доступность не измерена",
+        "endpoint unreachable" => "адрес недоступен",
+        "ALPN not measured" if transport == Transport::H3 => "H3 ALPN не измерен",
+        "ALPN not measured" => "H2 ALPN не измерен",
+        "ALPN not supported" if transport == Transport::H3 => "H3 ALPN не поддерживается",
+        "ALPN not supported" => "H2 ALPN не поддерживается",
+        "Theia fingerprint not measured" => "fingerprint Theia не измерен",
+        "Theia fingerprint mismatch" => "fingerprint Theia не совпадает",
+        _ => "неподтверждённый критерий",
+    }
+}
+
+/// This score is derived exclusively from actual structured evidence supplied
+/// by strict TLS/H2. It is not a bypass probability, REALITY capability or
+/// permission to apply the candidate. H3 and fingerprint remain Unknown.
+fn describe_evidence(transport: Transport, evidence: &TlsEvidence) -> String {
+    let rating = evidence.suitability(transport);
+    let name = match transport {
+        Transport::H2 => "H2",
+        Transport::H3 => "H3",
+    };
+    let eligible = if rating.eligible { "ДА" } else { "НЕТ" };
+    let reasons = rating
+        .blockers
+        .iter()
+        .map(|reason| translated_blocker(reason, transport))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "{name} score: {}/100, confidence: {}%, eligible: {eligible}.\nПричины: {}.",
+        rating.score,
+        rating.confidence,
+        if reasons.is_empty() { "нет" } else { &reasons }
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeUiError {
@@ -52,6 +102,7 @@ pub(crate) struct ProbePanel {
     targets: Vec<IpAddr>,
     selected: usize,
     state: ProbeState,
+    observed_at: Option<Instant>,
 }
 
 impl ProbePanel {
@@ -85,6 +136,7 @@ impl ProbePanel {
             targets,
             selected: 0,
             state: ProbeState::Select,
+            observed_at: None,
         }
     }
 
@@ -146,6 +198,7 @@ impl ProbePanel {
             self.state = ProbeState::Select;
             return;
         };
+        self.observed_at = None;
         let preview = self.preview.clone();
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -224,6 +277,7 @@ impl ProbePanel {
             _ => None,
         };
         if let Some((address, outcome)) = received {
+            self.observed_at = Some(Instant::now());
             self.state = ProbeState::Complete { address, outcome };
         }
     }
@@ -276,11 +330,25 @@ impl ProbePanel {
             ProbeState::Complete {
                 address,
                 outcome: Ok(report),
-            } => body.push_str(&format!(
-                "\nTLS 1.3 подтверждён для {}:443: CA/SNI/SAN/ALPN=h2 проверены.\nВремя handshake: {} мс. Fingerprint/REALITY/DPI всё ещё неизвестны.\n\nEnter/t: повторить только с новым согласием  Esc: назад",
-                address,
-                report.handshake_elapsed.as_millis()
-            )),
+            } => {
+                if report.connected_ip != *address {
+                    body.push_str(
+                        "\nIP результата не совпадает с выбранной целью.\nНикакие TLS-свойства этого IP не подтверждены; score: Unknown.\n\nEsc: назад",
+                    );
+                } else {
+                    let age = self.observed_at.map_or_else(
+                        || "возраст измерения неизвестен".to_owned(),
+                        |instant| format!("{} сек назад", instant.elapsed().as_secs()),
+                    );
+                    body.push_str(&format!(
+                        "\nTLS 1.3 подтверждён для {}:443: CA/SNI/SAN/ALPN=h2 проверены.\nВремя handshake: {} мс. Измерение: {age}.\n{}\n{}\nScore не является вероятностью обхода DPI; REALITY и TLS-in-TLS всё ещё НЕ проверены.\n\nEnter/t: повторить только с новым согласием  Esc: назад",
+                        address,
+                        report.handshake_elapsed.as_millis(),
+                        describe_evidence(Transport::H2, &report.evidence),
+                        describe_evidence(Transport::H3, &report.evidence),
+                    ));
+                }
+            },
             ProbeState::Complete {
                 outcome: Err(error),
                 ..
@@ -308,7 +376,7 @@ impl ProbePanel {
                     ProbeUiError::Handshake(ProbeError::WrongAlpn) => "нет ALPN h2",
                 };
                 body.push_str(&format!(
-                    "\nTLS/H2 проверка НЕ прошла: {code}. Никакая пригодность не подтверждена.\n\nEnter/t: повторить только с новым согласием  Esc: назад"
+                    "\nTLS/H2 проверка НЕ прошла: {code}. Никакая пригодность не подтверждена.\nH2/H3 score: Unknown, данные handshake отсутствуют; нельзя приписывать положительные баллы.\n\nEnter/t: повторить только с новым согласием  Esc: назад"
                 ));
             }
         }
