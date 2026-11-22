@@ -870,19 +870,19 @@ pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
     let mut prepared = Vec::new();
     for inbound in &document.server.inbounds {
         let addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
-        let udp_addr: SocketAddr = inbound.quic_listen.parse().map_err(|_| ServerError::Config)?;
+        let udp_addr: SocketAddr = inbound
+            .quic_listen
+            .parse()
+            .map_err(|_| ServerError::Config)?;
         let material = tls_material(inbound)?;
         let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         let listener = TcpListener::bind(addr).await.map_err(|_| ServerError::Io)?;
-        let endpoint = crate::quic_transport::server_endpoint(
-            udp_addr,
-            material.certs,
-            material.key,
-        )
-        .map_err(|error| match error {
-            crate::quic_transport::QuicError::Bind => ServerError::Io,
-            _ => ServerError::Tls,
-        })?;
+        let endpoint =
+            crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
+                .map_err(|error| match error {
+                    crate::quic_transport::QuicError::Bind => ServerError::Io,
+                    _ => ServerError::Tls,
+                })?;
         let context = Arc::new(ServerContext::with_limits(
             inbound,
             &document.server.users,

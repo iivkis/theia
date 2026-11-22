@@ -2,8 +2,8 @@
 //! No system proxy changes, destination DNS lookups or protocol fallback.
 use crate::{
     client::{ClientError, H2Client, Tunnel},
-    h3_client::{H3Client, H3Tunnel},
     config::{self, Config, Profile, Transport},
+    h3_client::{H3Client, H3Tunnel},
     protocol::{self, Address, ErrorCode, Frame},
 };
 use rustls::RootCertStore;
@@ -130,8 +130,16 @@ enum ProxyTunnel {
 impl ProxyClient {
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
-            Self::H2(client) => client.open(address, port).await.map(Box::new).map(ProxyTunnel::H2),
-            Self::H3(client) => client.open(address, port).await.map(Box::new).map(ProxyTunnel::H3),
+            Self::H2(client) => client
+                .open(address, port)
+                .await
+                .map(Box::new)
+                .map(ProxyTunnel::H2),
+            Self::H3(client) => client
+                .open(address, port)
+                .await
+                .map(Box::new)
+                .map(ProxyTunnel::H3),
         }
     }
 }

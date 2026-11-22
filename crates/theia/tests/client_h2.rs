@@ -443,7 +443,8 @@ async fn client_binary_curl_connect_and_socks5h() {
                 socket.shutdown().await.unwrap();
             }
         });
-        let (_dir, mut child, http, socks) = launch_client(endpoint, pem, "curl", theia::config::Transport::H2).await;
+        let (_dir, mut child, http, socks) =
+            launch_client(endpoint, pem, "curl", theia::config::Transport::H2).await;
 
         // --disable ignores any user curlrc. --noproxy "" prevents the
         // standard localhost bypass. HTTP mode must actually use CONNECT.
@@ -589,7 +590,8 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
         {
             use std::io::Write;
             let mut key = options.open(&key_path).unwrap();
-            key.write_all(cert.key_pair.serialize_pem().as_bytes()).unwrap();
+            key.write_all(cert.key_pair.serialize_pem().as_bytes())
+                .unwrap();
         }
         let tcp_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let udp_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -599,8 +601,7 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
             "REPLACE_WITH_64_LOWERCASE_HEX",
             &format!("{:x}", Sha256::digest(TOKEN)),
         );
-        let theia::config::Config::Server(mut doc) = theia::config::parse(&source).unwrap()
-        else {
+        let theia::config::Config::Server(mut doc) = theia::config::parse(&source).unwrap() else {
             panic!("server fixture has wrong role");
         };
         let inbound = &mut doc.server.inbounds[0];

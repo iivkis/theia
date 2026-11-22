@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use theia::{
     client::ClientError,
-    h3_client::H3Client,
     config::{Inbound, ServerPolicy, User},
+    h3_client::H3Client,
     h3_server,
     protocol::{self, Address, Decoder, ErrorCode, Frame},
     quic_transport,
@@ -298,8 +298,7 @@ async fn production_h3_client_rejects_tls_bearer_and_acl_failures() {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
         let address = Address::V4([127, 0, 0, 1]);
-        let wrong_name =
-            H3Client::new(remote, "wrong.example", &token(), roots.clone()).unwrap();
+        let wrong_name = H3Client::new(remote, "wrong.example", &token(), roots.clone()).unwrap();
         assert!(matches!(
             wrong_name.open(address.clone(), port).await,
             Err(ClientError::Tls)
