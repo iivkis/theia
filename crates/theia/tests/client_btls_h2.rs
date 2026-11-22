@@ -22,7 +22,7 @@ use theia::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     task::JoinHandle,
     time::timeout,
 };
