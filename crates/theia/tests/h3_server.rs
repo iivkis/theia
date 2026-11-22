@@ -6,6 +6,8 @@ use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use theia::{
+    client::ClientError,
+    h3_client::H3Client,
     config::{Inbound, ServerPolicy, User},
     h3_server,
     protocol::{self, Address, Decoder, ErrorCode, Frame},
@@ -28,6 +30,11 @@ fn token() -> String {
 }
 
 fn fixture(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask) {
+    let (client, remote, task, _roots) = fixture_with_roots(private);
+    (client, remote, task)
+}
+
+fn fixture_with_roots(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask, RootCertStore) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let der = cert.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
@@ -36,7 +43,7 @@ fn fixture(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask) {
     let remote = endpoint.local_addr().unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(der).unwrap();
-    let client = quic_transport::client_endpoint(bind, roots).unwrap();
+    let client = quic_transport::client_endpoint(bind, roots.clone()).unwrap();
     let inbound = Inbound {
         id: "test".into(),
         allowed_user_ids: vec!["allowed".into()],
@@ -66,7 +73,7 @@ fn fixture(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask) {
     };
     let context = Arc::new(ServerContext::new(&inbound, &users, &policy));
     let server = tokio::spawn(h3_server::serve(endpoint, context));
-    (client, remote, server)
+    (client, remote, server, roots)
 }
 
 fn request(auth: Option<&str>) -> Request<()> {
@@ -241,4 +248,122 @@ async fn h3_rejects_missing_wrong_and_ungranted_bearers_and_denied_tcp() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_h3_client_and_server_relay_exact_bytes() {
+    timeout(Duration::from_secs(20), async {
+        let (_endpoint, remote, server, roots) = fixture_with_roots(true);
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let echo = tokio::spawn(async move {
+            let (mut tcp, _) = target.accept().await.unwrap();
+            let mut early = [0; 5];
+            tcp.read_exact(&mut early).await.unwrap();
+            tcp.write_all(&early).await.unwrap();
+            let mut rest = Vec::new();
+            tcp.read_to_end(&mut rest).await.unwrap();
+            tcp.write_all(&rest).await.unwrap();
+            tcp.shutdown().await.unwrap();
+        });
+        let client = H3Client::new(remote, "localhost", &token(), roots).unwrap();
+        let tunnel = client
+            .open(Address::Dns("localhost".into()), port)
+            .await
+            .unwrap();
+        let (mut app, local) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(tunnel.relay(local));
+        app.write_all(b"early").await.unwrap();
+        let mut reply = [0; 5];
+        app.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"early");
+        let payload: Vec<_> = (0..256 * 1024).map(|n| (n % 251) as u8).collect();
+        app.write_all(&payload).await.unwrap();
+        app.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        app.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+        relay.await.unwrap().unwrap();
+        echo.await.unwrap();
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_h3_client_rejects_tls_bearer_and_acl_failures() {
+    timeout(Duration::from_secs(20), async {
+        let (_endpoint, remote, server, roots) = fixture_with_roots(false);
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let address = Address::V4([127, 0, 0, 1]);
+        let wrong_name =
+            H3Client::new(remote, "wrong.example", &token(), roots.clone()).unwrap();
+        assert!(matches!(
+            wrong_name.open(address.clone(), port).await,
+            Err(ClientError::Tls)
+        ));
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut unrelated = RootCertStore::empty();
+        unrelated.add(cert.cert.der().clone()).unwrap();
+        let wrong_ca = H3Client::new(remote, "localhost", &token(), unrelated).unwrap();
+        assert!(matches!(
+            wrong_ca.open(address.clone(), port).await,
+            Err(ClientError::Tls)
+        ));
+        let wrong_bearer = H3Client::new(
+            remote,
+            "localhost",
+            &URL_SAFE_NO_PAD.encode([0x44; 32]),
+            roots.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            wrong_bearer.open(address.clone(), port).await,
+            Err(ClientError::Unauthorized)
+        ));
+        let ungranted = H3Client::new(
+            remote,
+            "localhost",
+            &URL_SAFE_NO_PAD.encode([0x43; 32]),
+            roots.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ungranted.open(address.clone(), port).await,
+            Err(ClientError::Unauthorized)
+        ));
+        let valid = H3Client::new(remote, "localhost", &token(), roots).unwrap();
+        assert!(matches!(
+            valid.open(address, port).await,
+            Err(ClientError::Open(ErrorCode::PolicyDenied))
+        ));
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn production_h3_client_rejects_invalid_configuration() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let remote = "127.0.0.1:443".parse().unwrap();
+    assert!(matches!(
+        H3Client::new(remote, "localhost", &token(), RootCertStore::empty()),
+        Err(ClientError::Configuration)
+    ));
+    assert!(matches!(
+        H3Client::new(remote, "localhost", &format!("{}=", token()), roots.clone()),
+        Err(ClientError::Configuration)
+    ));
+    assert!(matches!(
+        H3Client::new(remote, "127.0.0.1", &token(), roots),
+        Err(ClientError::Configuration)
+    ));
 }

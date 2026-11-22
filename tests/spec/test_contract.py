@@ -336,6 +336,16 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("authenticated_h3_server_relays_tcp_before_request_fin_and_after_half_close", tests)
         self.assertIn("h3_rejects_missing_wrong_and_ungranted_bearers_and_denied_tcp", tests)
 
+    def test_m31_h3_client_gate(self):
+        client = read("crates/theia/src/h3_client.rs")
+        self.assertIn("quic_transport::connect", client)
+        self.assertIn("bearer_header(token)?", client)
+        self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
+        self.assertIn("tokio::try_join!(upload, download)", client)
+        tests = read("crates/theia/tests/h3_server.rs")
+        self.assertIn("production_h3_client_and_server_relay_exact_bytes", tests)
+        self.assertIn("production_h3_client_rejects_tls_bearer_and_acl_failures", tests)
+
 
 if __name__ == "__main__":
     unittest.main()
