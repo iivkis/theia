@@ -145,7 +145,10 @@ struct AutoClient {
 
 impl AutoClient {
     fn cached(&self, now: Instant) -> Result<bool, ClientError> {
-        let mut negative = self.negative.lock().map_err(|_| ClientError::Configuration)?;
+        let mut negative = self
+            .negative
+            .lock()
+            .map_err(|_| ClientError::Configuration)?;
         if negative.is_some_and(|until| now < until) {
             return Ok(true);
         }
@@ -154,7 +157,10 @@ impl AutoClient {
     }
 
     fn record(&self, now: Instant) -> Result<(), ClientError> {
-        let mut negative = self.negative.lock().map_err(|_| ClientError::Configuration)?;
+        let mut negative = self
+            .negative
+            .lock()
+            .map_err(|_| ClientError::Configuration)?;
         *negative = if self.ttl.is_zero() {
             None
         } else {
@@ -167,7 +173,10 @@ impl AutoClient {
         if !self.cached(Instant::now())? {
             match self.h3.open(address.clone(), port).await {
                 Ok(tunnel) => {
-                    *self.negative.lock().map_err(|_| ClientError::Configuration)? = None;
+                    *self
+                        .negative
+                        .lock()
+                        .map_err(|_| ClientError::Configuration)? = None;
                     eprintln!("transport=h3");
                     return Ok(ProxyTunnel::H3(Box::new(tunnel)));
                 }
@@ -178,14 +187,21 @@ impl AutoClient {
                 Err(error) => {
                     // PKI, auth, partial handshakes, protocol, ACL and all
                     // post-handshake failures never permit retry over H2.
-                    *self.negative.lock().map_err(|_| ClientError::Configuration)? = None;
+                    *self
+                        .negative
+                        .lock()
+                        .map_err(|_| ClientError::Configuration)? = None;
                     return Err(error);
                 }
             }
         } else {
             eprintln!("transport=h2 reason=quic_negative_cache");
         }
-        self.h2.open(address, port).await.map(Box::new).map(ProxyTunnel::H2)
+        self.h2
+            .open(address, port)
+            .await
+            .map(Box::new)
+            .map(ProxyTunnel::H2)
     }
 }
 
@@ -495,9 +511,9 @@ async fn handle(
                     ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => {
                         HTTP_DENIED
                     }
-                    ClientError::Timeout | ClientError::QuicUnreachable | ClientError::Open(ErrorCode::DialTimeout) => {
-                        HTTP_TIMEOUT
-                    }
+                    ClientError::Timeout
+                    | ClientError::QuicUnreachable
+                    | ClientError::Open(ErrorCode::DialTimeout) => HTTP_TIMEOUT,
                     _ => HTTP_FAILED,
                 };
                 let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
@@ -529,7 +545,9 @@ mod selector_tests {
         let token = URL_SAFE_NO_PAD.encode([1; 32]);
         let remote = "127.0.0.1:443".parse().unwrap();
         let mut client = AutoClient {
-            h2: Arc::new(H2Client::new("127.0.0.1:443", "localhost", &token, roots.clone()).unwrap()),
+            h2: Arc::new(
+                H2Client::new("127.0.0.1:443", "localhost", &token, roots.clone()).unwrap(),
+            ),
             h3: Arc::new(H3Client::new(remote, "localhost", &token, roots).unwrap()),
             ttl: Duration::from_secs(5),
             negative: Mutex::new(None),

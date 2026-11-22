@@ -829,10 +829,18 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
             max_connections_total: 8,
             connect_timeout_ms: 1500,
         };
-        let h2_context = Arc::new(ServerContext::new(&inbound, std::slice::from_ref(&user), &policy));
+        let h2_context = Arc::new(ServerContext::new(
+            &inbound,
+            std::slice::from_ref(&user),
+            &policy,
+        ));
         inbound.allowed_user_ids.clear();
         let h3_context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
-        let h2 = tokio::spawn(serve(listener, TlsAcceptor::from(Arc::new(tls)), h2_context));
+        let h2 = tokio::spawn(serve(
+            listener,
+            TlsAcceptor::from(Arc::new(tls)),
+            h2_context,
+        ));
         let h3 = tokio::spawn(theia::h3_server::serve(udp, h3_context));
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();

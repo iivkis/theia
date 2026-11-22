@@ -1,5 +1,6 @@
 //! M3.1a: QUIC/TLS composition root for both H3 peers.
 //! A separately observed UDP handshake permits conservative fallback.
+use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
     crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig},
     AsyncUdpSocket, Connection, Endpoint, EndpointConfig, Runtime, TokioRuntime, TransportConfig,
@@ -21,7 +22,6 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use quinn::udp::{RecvMeta, Transmit};
 use tokio::time::timeout;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
