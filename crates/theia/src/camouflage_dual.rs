@@ -8,7 +8,10 @@ use crate::{
     camouflage_workflow::DiscoveryPreview,
 };
 use rustls::{pki_types::ServerName, RootCertStore};
-use std::{fmt, net::{IpAddr, SocketAddr}};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 #[derive(Clone)]
 pub struct DualProbeTarget {
@@ -254,7 +257,11 @@ mod tests {
     fn seeded_domain_needs_exact_host_and_ip_authority_before_network() {
         use crate::camouflage_interfaces::NativeInterfaces;
         use crate::camouflage_workflow::{build_preview, PreviewScope};
-        let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+        let preview = build_preview(
+            &NativeInterfaces::default(),
+            None,
+            PreviewScope::PassiveOnly,
+        );
         let ip: IpAddr = "93.184.216.10".parse().unwrap();
         let candidate = DualProbeTarget {
             request: ProbeRequest {
