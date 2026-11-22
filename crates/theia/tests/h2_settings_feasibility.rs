@@ -58,7 +58,7 @@ async fn experimental_h2_builder_can_encode_real_chromium159_settings_but_not_sa
         builder.initial_window_size(6_291_456);
         builder.max_header_list_size(262_144);
 
-        let (_sender, driver) = builder.handshake(client_io).await.unwrap();
+        let (_sender, driver) = builder.handshake::<_, bytes::Bytes>(client_io).await.unwrap();
         let task = tokio::spawn(async move {
             let _ = driver.await;
         });
