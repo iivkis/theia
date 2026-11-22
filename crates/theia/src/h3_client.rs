@@ -86,7 +86,11 @@ impl H3Client {
             .build::<_, _, Bytes>(h3_quinn::Connection::new(connection))
             .await
             .map_err(|_| ClientError::Http3)?;
+        // h3 closes the connection when the final SendRequest is dropped.
+        // Keep a sender alive with the owned driver throughout relay.
+        let keep_sender = sender.clone();
         let driver = Driver(tokio::spawn(async move {
+            let _keep_sender = keep_sender;
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         }));
         let request = Request::post(self.uri.clone())
