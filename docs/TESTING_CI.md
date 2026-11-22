@@ -14,6 +14,8 @@
 
 **M4.5b exact-target TLS/H2 UI CI:** `tui.rs` проверяет `p → t` в серверной панели даже без TOML: review показывает требование загруженного server inbound/SNI, одиночное `y` ничего не запускает, Esc возвращает пассивную панель. `tui_probe.rs` проверяет реальные локально *предоставленные* интерфейсные метаданные: invalid/down/private исключены, только public UP+valid prefix может быть выбран, список ≤8, j/k → Enter/t → отдельный y (в тестах не нажимается), n отказывает, error/timeout не даёт позитивного TLS статуса, Drop отменяет worker через oneshot. Реальные TLS1.3/PKI/ALPN позитивные/негативные handshakes перепроверяются существующими loopback tests в `camouflage_batch.rs`. Никаких публичных TLS endpoints или DNS в CI; mandatory native Linux/Windows cargo test/fmt/clippy, full BoringSSL/BBR/Chromium E2E + exact-head ci-gate.
 
+**M4.5c F-18 offline candidate review CI:** чистый `tui_candidates.rs` Given/When/Then проверяет группировку 1 назначенного публичного IP, 14 seed-доменов и 0 дополнительных; никакого verified TLS evidence до probe, score 0/100, confidence 0%; отдельный Enter/y при ручном `93.184.216.10/29` канонизирует к `93.184.216.8/29`, даёт 5 соседних usable IP только в памяти, n/Esc отменяют. Негативные тесты для /23, /24 шире назначенного /29, private/unassigned CIDR, IPv6, invalid input/empty interface, /0, /33, bounded 64 input, /32 (0 новых), UI Client/Home/ipify-confirm cannot trigger review. Не запускается внешний DNS, HTTP, TLS или network scan; full locked cargo test/fmt/clippy, native Linux/Windows browser/BoringSSL/BBR и `ci-gate` mandatory.
+
 ## 1. Test pyramid
 
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)
