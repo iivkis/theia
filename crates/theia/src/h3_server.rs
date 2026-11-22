@@ -149,11 +149,7 @@ async fn handle_request(
     }
 
     let (mut tx, mut rx) = stream.split();
-    let result = timeout(
-        SESSION_TIMEOUT,
-        handle_frames(&mut tx, &mut rx, context),
-    )
-    .await;
+    let result = timeout(SESSION_TIMEOUT, handle_frames(&mut tx, &mut rx, context)).await;
     if matches!(result, Ok(Ok(()))) {
         if !matches!(timeout(CLOSE_TIMEOUT, tx.finish()).await, Ok(Ok(()))) {
             tx.stop_stream(Code::H3_REQUEST_CANCELLED);

@@ -200,7 +200,12 @@ impl ServerContext {
         if request.method() != Method::POST
             || request.uri().path() != "/v1/session"
             || request.uri().query().is_some()
-            || request.headers().get_all(header::CONTENT_TYPE).iter().count() != 1
+            || request
+                .headers()
+                .get_all(header::CONTENT_TYPE)
+                .iter()
+                .count()
+                != 1
             || request
                 .headers()
                 .get(header::CONTENT_TYPE)
