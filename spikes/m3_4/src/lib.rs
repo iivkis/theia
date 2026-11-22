@@ -15,7 +15,7 @@ use btls::{
 /// have been configured. On-wire resemblance must be measured separately.
 pub fn h2_candidate(trusted_ca_pem: &[u8]) -> Result<ConnectConfiguration, ErrorStack> {
     let certificate = X509::from_pem(trusted_ca_pem)?;
-    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_verify(SslVerifyMode::PEER);
