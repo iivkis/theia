@@ -17,8 +17,8 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::{
-    io::{self, IsTerminal},
     fmt,
+    io::{self, IsTerminal},
 };
 
 #[derive(Debug)]
@@ -167,7 +167,12 @@ fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bo
     };
     frame.render_widget(
         Paragraph::new(body)
-            .block(Block::default().title(title).borders(Borders::ALL).border_style(style))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(style),
+            )
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -185,7 +190,11 @@ fn draw(frame: &mut Frame<'_>, model: &Model) {
     }
     let parts = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(4), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
         .split(area);
     frame.render_widget(
         Paragraph::new("THEIA 0.1  |  Локальное управление  |  Состояние сервиса: неизвестно")
