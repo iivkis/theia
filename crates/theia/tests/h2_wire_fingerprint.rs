@@ -77,7 +77,11 @@ impl<T: AsyncRead + Unpin> AsyncRead for Tap<T> {
 }
 
 impl<T: AsyncWrite + Unpin> AsyncWrite for Tap<T> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -234,8 +238,15 @@ async fn measure(backend: Backend) -> Observation {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_default_h2_settings_and_pseudo_headers_are_measured() {
     let observed = measure(Backend::Rustls).await;
-    assert!(observed.settings.len() <= 16);
-    assert!(observed.ordinary_fields >= 2); // content type and bearer header names
+    // Exact client-wire baseline from native Linux CI, not a Chrome profile.
+    // Guard against silent change of H2 settings, pseudo order or extra frames.
+    assert_eq!(observed.settings, [(6, 8192)]);
+    assert_eq!(
+        observed.pseudo_headers,
+        [":method", ":scheme", ":authority", ":path"]
+    );
+    assert!(observed.frames_before_headers.is_empty());
+    assert_eq!(observed.ordinary_fields, 2); // content type and bearer names
 }
 
 #[cfg(feature = "experimental-btls-h2")]
@@ -252,8 +263,10 @@ async fn real_experimental_btls_and_rustls_share_h2_engine_not_chrome_profile() 
     // NEGATIVE CONTROL, not a Chrome133 HTTP/2 reference capture.
     let go_probe_settings: &[(u16, u32)] = &[];
     let go_probe_pseudo = [":method", ":scheme", ":path", ":authority"];
+    assert_ne!(btls.settings, go_probe_settings);
+    assert_ne!(btls.pseudo_headers, go_probe_pseudo);
     eprintln!(
         "M3.4f control: minimal Go H2 SETTINGS={go_probe_settings:?}, pseudo_names={go_probe_pseudo:?}; Go uTLS HelloChrome_133 only defines TCP/TLS, not Chrome H2 SETTINGS. F-13 blocked."
     );
-    assert!(btls.ordinary_fields >= 2);
+    assert_eq!(btls.ordinary_fields, 2);
 }
