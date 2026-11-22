@@ -128,12 +128,12 @@ class SpecContractTests(unittest.TestCase):
         ci = read("docs/TESTING_CI.md")
         adr = read("docs/adr/0020-reality-like-and-tls-in-tls.md")
         for needle in (
-            "Автоматическое обнаружение", "назначенных префиксов IPv4/IPv6",
+            "Автоматическое обнаружение", "назначенные префиксы IPv4/IPv6",
             "NAT", "RDAP/BGP", "без SNI", "TLS1.3", "SAN",
             "ALPN", "серверная подсеть", "популярные домены",
             "google.com", "samsung.com", "amd.com", "microsoft.com",
             "cloudflare.com", "github.com", "mozilla.org", "wikipedia.org",
-            "без отдельного согласия", "приватного ключа",
+            "лишь с согласия", "приватного ключа",
         ):
             with self.subTest(needle=needle):
                 self.assertIn(needle.lower(), model.lower())
