@@ -236,8 +236,8 @@ async fn handshake_timeout_is_bounded_and_does_not_emit_success() {
 async fn reject_invalid_sni_and_empty_deadline_without_connecting() {
     let f = fixture(b"h2").await;
     let consent = ProbeApproval::isolated_loopback_fixture(f.address);
-    let request = request(f.address, "");
-    let invalid = probe_tls_h2(request, roots(f.certificate.clone()), consent).await;
+    let bad_name = request(f.address, "");
+    let invalid = probe_tls_h2(bad_name, roots(f.certificate.clone()), consent).await;
     assert!(matches!(invalid, Err(ProbeError::InvalidServerName)));
     let mut request = request(f.address, "localhost");
     request.deadline = Duration::ZERO;
