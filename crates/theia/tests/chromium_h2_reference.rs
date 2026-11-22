@@ -194,11 +194,19 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
             String::from_utf8_lossy(&process.stderr)
         );
         let observation: Observation = server.await.expect("Chromium TLS H2 server task");
-        assert!(
-            !observation.settings.is_empty() && observation.settings.len() <= 16,
-            "real browser SETTINGS must be observed, not synthesized"
+        // Pin stable first-flight semantics of the *actual* Chromium
+        // 159.0.8154.6 bundled by Playwright 1.65.2, observed identically
+        // on native Linux/Windows. An upgrade must be reviewed deliberately.
+        assert_eq!(
+            observation.settings,
+            [(1, 65536), (2, 0), (4, 6291456), (6, 262144)]
         );
-        assert_eq!(observation.pseudo_headers.len(), 4);
+        assert_eq!(
+            observation.pseudo_headers,
+            [":method", ":authority", ":scheme", ":path"]
+        );
+        // Frame scheduling (including WINDOW_UPDATE and SETTINGS ACK) may
+        // vary; record rather than pin unstable relative frame timing.
         assert!(observation.ordinary_fields > 0);
         assert!(observation.request_end_stream, "browser GET is bodyless");
         // Observations from M3.4f: the production h2 0.4.19 client advertises
