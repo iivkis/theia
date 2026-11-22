@@ -358,6 +358,25 @@ mod tests {
     }
 
     #[test]
+    fn valid_but_ungranted_user_cannot_receive_selected_inbound_invite() {
+        let mut server = server_with_token(&[0x42; 32]);
+        let other = [0x31; 32];
+        let Config::Server(doc) = &mut server else {
+            panic!("server");
+        };
+        doc.server.users.push(crate::config::User {
+            id: "ungranted".into(),
+            token_sha256: format!("{:x}", Sha256::digest(other)),
+            disabled: false,
+        });
+        assert_eq!(server.validate(), Ok(()));
+        assert_eq!(
+            Invitation::issued_from_server(&server, "public", "ungranted", &other).unwrap_err(),
+            InviteError::Unavailable
+        );
+    }
+
+    #[test]
     fn incompatible_h2_h3_ports_are_rejected_instead_of_broken_auto_profile() {
         let mut server = server_with_token(&[0x42; 32]);
         assert!(Invitation::public_from_server(&server, "missing").is_err());
