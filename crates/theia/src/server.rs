@@ -14,8 +14,8 @@ use std::{
     io::BufReader,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -31,6 +31,46 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PEM_BYTES: u64 = 1024 * 1024;
 const MAX_H2_STREAMS: u32 = 32;
+const MAX_HEADER_BYTES: u32 = 8192;
+const AUTH_WINDOW: Duration = Duration::from_secs(60);
+const AUTH_ATTEMPTS: u32 = 120;
+const MAX_TRACKED_PEERS: usize = 4096;
+const MAX_DNS_RESULTS: usize = 64;
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Fixed-window admission limiter, shared across listeners. The table never
+/// grows beyond MAX_TRACKED_PEERS; a full table rejects unknown active peers.
+#[derive(Default)]
+struct PeerBudget {
+    peers: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+}
+
+impl PeerBudget {
+    fn admit(&self, ip: IpAddr, now: Instant) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            IpAddr::V4(_) => ip,
+        };
+        let Ok(mut peers) = self.peers.lock() else {
+            return false;
+        };
+        if !peers.contains_key(&ip) && peers.len() >= MAX_TRACKED_PEERS {
+            peers.retain(|_, (start, _)| now.saturating_duration_since(*start) < AUTH_WINDOW);
+            if peers.len() >= MAX_TRACKED_PEERS {
+                return false;
+            }
+        }
+        let entry = peers.entry(ip).or_insert((now, 0));
+        if now.saturating_duration_since(entry.0) >= AUTH_WINDOW {
+            *entry = (now, 0);
+        }
+        if entry.1 >= AUTH_ATTEMPTS {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerError {
@@ -84,6 +124,7 @@ pub struct ServerContext {
     global_streams: Arc<Semaphore>,
     user_streams: Arc<HashMap<String, Arc<Semaphore>>>,
     connection_slots: Arc<Semaphore>,
+    peer_budget: Arc<PeerBudget>,
 }
 
 pub struct SessionPermit {
@@ -109,6 +150,7 @@ impl ServerContext {
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
             Arc::new(all_users),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
+            Arc::new(PeerBudget::default()),
         )
     }
 
@@ -119,6 +161,7 @@ impl ServerContext {
         global_streams: Arc<Semaphore>,
         user_streams: Arc<HashMap<String, Arc<Semaphore>>>,
         connection_slots: Arc<Semaphore>,
+        peer_budget: Arc<PeerBudget>,
     ) -> Self {
         Self {
             inbound_id: inbound.id.clone(),
@@ -128,6 +171,7 @@ impl ServerContext {
             global_streams,
             user_streams,
             connection_slots,
+            peer_budget,
         }
     }
 
@@ -207,19 +251,25 @@ fn decode_digest(raw: &str) -> Option<[u8; 32]> {
 /// Private/loopback, link-local, multicast, reserved and documentation ranges
 /// are rejected by default; only explicit allow_private_ips permits them.
 pub fn allowed_destination(ip: IpAddr, allow_private_ips: bool) -> bool {
+    if let IpAddr::V6(v6) = ip {
+        if let Some(mapped) = v6.to_ipv4_mapped() {
+            return allowed_destination(IpAddr::V4(mapped), allow_private_ips);
+        }
+    }
     if allow_private_ips {
         return !ip.is_unspecified() && !ip.is_multicast();
     }
     match ip {
         IpAddr::V4(v4) => allowed_v4(v4),
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return allowed_v4(mapped);
-            }
             let segments = v6.segments();
             let global_unicast = (segments[0] & 0xe000) == 0x2000;
             let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
-            let special = segments[0] == 0x2001 && segments[1] == 0;
+            // Reject transition/tunneling and special-use ranges rather than
+            // relying on embedded IPv4 routing or future address assignments.
+            let special = (segments[0] == 0x2001 && segments[1] < 0x0200)
+                || segments[0] == 0x2002
+                || (segments[0] == 0x3fff && segments[1] < 0x1000);
             global_unicast && !documentation && !special
         }
     }
@@ -241,39 +291,54 @@ fn allowed_v4(ip: Ipv4Addr) -> bool {
         || (a == 255 && b == 255 && c == 255 && d == 255))
 }
 
+/// All DNS and dial attempts consume one deadline. The result list is bounded;
+/// no second resolution can change the addresses checked by the policy.
 async fn connect_target(
     address: &Address,
     port: u16,
     policy: &ServerPolicy,
 ) -> Result<TcpStream, ErrorCode> {
     let duration = Duration::from_millis(u64::from(policy.connect_timeout_ms));
-    let candidates: Vec<SocketAddr> = match address {
-        Address::V4(ip) => vec![SocketAddr::from((*ip, port))],
-        Address::V6(ip) => vec![SocketAddr::from((*ip, port))],
-        Address::Dns(name) => {
-            let resolved = timeout(duration, lookup_host((name.as_str(), port)))
+    timeout(duration, async {
+        let candidates: Vec<SocketAddr> = match address {
+            Address::V4(ip) => vec![SocketAddr::from((*ip, port))],
+            Address::V6(ip) => vec![SocketAddr::from((*ip, port))],
+            Address::Dns(name) => lookup_host((name.as_str(), port))
                 .await
-                .map_err(|_| ErrorCode::DialTimeout)?
-                .map_err(|_| ErrorCode::DialFailed)?;
-            resolved.collect()
+                .map_err(|_| ErrorCode::DialFailed)?
+                .take(MAX_DNS_RESULTS + 1)
+                .collect(),
+        };
+        let permitted = permitted_candidates(candidates, policy.allow_private_ips)?;
+        for candidate in permitted {
+            // Pin the ACL-checked SocketAddr. Never resolve the hostname again.
+            if let Ok(stream) = TcpStream::connect(candidate).await {
+                return Ok(stream);
+            }
         }
-    };
+        Err(ErrorCode::DialFailed)
+    })
+    .await
+    .map_err(|_| ErrorCode::DialTimeout)?
+}
+
+fn permitted_candidates(
+    candidates: Vec<SocketAddr>,
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>, ErrorCode> {
+    if candidates.len() > MAX_DNS_RESULTS {
+        return Err(ErrorCode::ResourceLimit);
+    }
+    let mut seen = HashSet::new();
     let permitted: Vec<_> = candidates
         .into_iter()
-        .filter(|candidate| allowed_destination(candidate.ip(), policy.allow_private_ips))
+        .filter(|candidate| allowed_destination(candidate.ip(), allow_private))
+        .filter(|candidate| seen.insert(*candidate))
         .collect();
     if permitted.is_empty() {
         return Err(ErrorCode::PolicyDenied);
     }
-    for candidate in permitted {
-        // Pin the ACL-checked SocketAddr. Never resolve the hostname again.
-        match timeout(duration, TcpStream::connect(candidate)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(_)) => continue,
-            Err(_) => return Err(ErrorCode::DialTimeout),
-        }
-    }
-    Err(ErrorCode::DialFailed)
+    Ok(permitted)
 }
 
 pub async fn serve(
@@ -281,38 +346,57 @@ pub async fn serve(
     acceptor: TlsAcceptor,
     context: Arc<ServerContext>,
 ) -> Result<(), ServerError> {
+    // JoinSet ownership makes cancellation of serve cancel all of its
+    // connections, which in turn cancel all of their stream handlers.
+    let mut connections = JoinSet::new();
     loop {
-        let (socket, _) = listener.accept().await.map_err(|_| ServerError::Io)?;
-        let Ok(slot) = context.connection_slots.clone().try_acquire_owned() else {
-            continue;
-        };
-        let tls_acceptor = acceptor.clone();
-        let context = context.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
-            let Ok(Ok(tls)) = timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(socket)).await else {
-                return;
-            };
-            if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-                return;
-            }
-            let Ok(mut connection) = h2::server::Builder::new()
-                .max_concurrent_streams(MAX_H2_STREAMS)
-                .handshake(tls)
-                .await
-            else {
-                return;
-            };
-            while let Some(result) = connection.accept().await {
-                let Ok((request, respond)) = result else {
-                    break;
+        tokio::select! {
+            _ = connections.join_next(), if !connections.is_empty() => {}
+            accepted = listener.accept() => {
+                let (socket, peer) = accepted.map_err(|_| ServerError::Io)?;
+                let Ok(slot) = context.connection_slots.clone().try_acquire_owned() else {
+                    continue;
                 };
+                let tls_acceptor = acceptor.clone();
                 let context = context.clone();
-                tokio::spawn(async move {
-                    let _ = handle_request(request, respond, context).await;
+                connections.spawn(async move {
+                    let _slot = slot;
+                    let Ok(Ok(tls)) = timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(socket)).await else {
+                        return;
+                    };
+                    if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+                        return;
+                    }
+                    let mut builder = h2::server::Builder::new();
+                    builder.max_concurrent_streams(MAX_H2_STREAMS);
+                    builder.max_header_list_size(MAX_HEADER_BYTES);
+                    let Ok(Ok(mut connection)) = timeout(HANDSHAKE_TIMEOUT, builder.handshake(tls)).await else {
+                        return;
+                    };
+                    let mut handlers = JoinSet::new();
+                    loop {
+                        let accepted = if handlers.is_empty() {
+                            match timeout(AUTH_WINDOW, connection.accept()).await {
+                                Ok(accepted) => accepted,
+                                Err(_) => break,
+                            }
+                        } else {
+                            tokio::select! {
+                                _ = handlers.join_next() => continue,
+                                accepted = connection.accept() => accepted,
+                            }
+                        };
+                        let Some(Ok((request, respond))) = accepted else {
+                            break;
+                        };
+                        let context = context.clone();
+                        handlers.spawn(async move {
+                            let _ = handle_request(request, respond, context, peer.ip()).await;
+                        });
+                    }
                 });
             }
-        });
+        }
     }
 }
 
@@ -334,7 +418,11 @@ async fn handle_request(
     request: Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
     context: Arc<ServerContext>,
+    peer: IpAddr,
 ) -> Result<(), ServerError> {
+    if !context.peer_budget.admit(peer, Instant::now()) {
+        return reject(&mut respond, StatusCode::TOO_MANY_REQUESTS).await;
+    }
     if request.method() != Method::POST
         || request.uri().path() != "/v1/session"
         || request.uri().query().is_some()
@@ -382,8 +470,25 @@ async fn handle_request(
         handle_frames(&mut inbound, &mut outgoing, &context),
     )
     .await;
+    // A timeout or transport failure can interrupt an already partially
+    // written frame. Reset rather than appending an ABORT to corrupt bytes.
+    if matches!(
+        result,
+        Err(_) | Ok(Err(ServerError::TimedOut | ServerError::Http2))
+    ) {
+        outgoing.send_reset(h2::Reason::CANCEL);
+        return Ok(());
+    }
     if !matches!(result, Ok(Ok(()))) {
-        let _ = send_frame(&mut outgoing, &Frame::Abort(ErrorCode::ProtocolError)).await;
+        let sent = timeout(
+            CLOSE_TIMEOUT,
+            send_frame(&mut outgoing, &Frame::Abort(ErrorCode::ProtocolError)),
+        )
+        .await;
+        if !matches!(sent, Ok(Ok(()))) {
+            outgoing.send_reset(h2::Reason::CANCEL);
+            return Ok(());
+        }
     }
     let _ = outgoing.send_data(Bytes::new(), true);
     drop(permit);
@@ -490,7 +595,13 @@ async fn handle_frames(
     .await
     .map_err(|_| ServerError::TimedOut)??;
     let (address, port) = opened;
-    let mut tcp = match connect_target(&address, port, &context.policy).await {
+    let dial = tokio::select! {
+        result = connect_target(&address, port, &context.policy) => result,
+        _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
+            return Err(ServerError::Http2);
+        }
+    };
+    let tcp = match dial {
         Ok(tcp) => tcp,
         Err(code) => {
             let failure = Frame::OpenError(code);
@@ -506,59 +617,103 @@ async fn handle_frames(
         .map_err(|_| ServerError::Protocol)?;
     send_frame(outgoing, &Frame::OpenOk).await?;
 
-    let mut buffer = [0_u8; 4096];
-    let mut inbound_eof = false;
-    let mut remote_eof = false;
-    let mut received_fin = false;
-    loop {
-        if state.is_closed() {
-            return Ok(());
-        }
-        tokio::select! {
-            message = decoder.next(incoming), if !inbound_eof => {
-                match message? {
-                    Some(Frame::Data(data)) => {
-                        state.apply(Direction::Receive, &Frame::Data(data.clone()))
-                            .map_err(|_| ServerError::Protocol)?;
-                        timeout(FRAME_IDLE_TIMEOUT, tcp.write_all(&data))
-                            .await.map_err(|_| ServerError::TimedOut)?
-                            .map_err(|_| ServerError::Io)?;
-                    }
-                    Some(Frame::Fin) => {
-                        state.apply(Direction::Receive, &Frame::Fin)
-                            .map_err(|_| ServerError::Protocol)?;
-                        received_fin = true;
-                        tcp.shutdown().await.map_err(|_| ServerError::Io)?;
-                    }
-                    Some(Frame::Abort(code)) => {
-                        state.apply(Direction::Receive, &Frame::Abort(code))
-                            .map_err(|_| ServerError::Protocol)?;
-                        return Ok(());
-                    }
-                    Some(_) => return Err(ServerError::Protocol),
-                    None => {
-                        if !received_fin {
-                            return Err(ServerError::Protocol);
-                        }
-                        inbound_eof = true;
-                    }
+    relay_tcp(tcp, incoming, outgoing, decoder, state).await
+}
+
+/// Drive the two TCP directions independently. In particular, lack of H2
+/// response credit must never block writes to the target TCP connection.
+/// Each directional FSM starts at OPEN_OK; only its own DATA/FIN transitions
+/// are applied. Both tasks must finish successfully for graceful completion.
+async fn relay_tcp(
+    tcp: TcpStream,
+    incoming: &mut h2::RecvStream,
+    outgoing: &mut h2::SendStream<Bytes>,
+    mut decoder: IncomingFrames,
+    mut state: Session,
+) -> Result<(), ServerError> {
+    let (mut read, mut write) = tcp.into_split();
+    let mut rx_state = state.clone();
+    let mut tx_state = state.clone();
+    let (download_done, mut download_finished) = tokio::sync::oneshot::channel();
+    let upload = async {
+        loop {
+            let frame = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
+            rx_state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            match frame {
+                Frame::Data(data) => {
+                    timeout(FRAME_IDLE_TIMEOUT, write.write_all(&data))
+                        .await
+                        .map_err(|_| ServerError::TimedOut)?
+                        .map_err(|_| ServerError::Io)?;
                 }
-            }
-            count = timeout(FRAME_IDLE_TIMEOUT, tcp.read(&mut buffer)), if !remote_eof => {
-                let size = count.map_err(|_| ServerError::TimedOut)?.map_err(|_| ServerError::Io)?;
-                if size == 0 {
-                    state.apply(Direction::Send, &Frame::Fin)
-                        .map_err(|_| ServerError::Protocol)?;
-                    send_frame(outgoing, &Frame::Fin).await?;
-                    remote_eof = true;
-                } else {
-                    let frame = Frame::Data(buffer[..size].to_vec());
-                    state.apply(Direction::Send, &frame).map_err(|_| ServerError::Protocol)?;
-                    send_frame(outgoing, &frame).await?;
+                Frame::Fin => {
+                    timeout(FRAME_IDLE_TIMEOUT, write.shutdown())
+                        .await
+                        .map_err(|_| ServerError::TimedOut)?
+                        .map_err(|_| ServerError::Io)?;
+                    break;
                 }
+                Frame::Abort(_) => return Err(ServerError::Http2),
+                _ => return Err(ServerError::Protocol),
             }
         }
-    }
+        // FIN half-closes TCP upload, not the HTTP request itself. Keep
+        // watching for reset, trailing frames or request EOF while downloading.
+        let tail = tokio::select! {
+            result = decoder.next(incoming) => result?,
+            _ = &mut download_finished => {
+                timeout(CLOSE_TIMEOUT, decoder.next(incoming))
+                    .await
+                    .map_err(|_| ServerError::TimedOut)??
+            }
+        };
+        if tail.is_some() {
+            return Err(ServerError::Protocol);
+        }
+        Ok::<(), ServerError>(())
+    };
+    let download = async {
+        let mut buffer = [0u8; 4096];
+        loop {
+            let size = tokio::select! {
+                result = timeout(FRAME_IDLE_TIMEOUT, read.read(&mut buffer)) => {
+                    result.map_err(|_| ServerError::TimedOut)?
+                        .map_err(|_| ServerError::Io)?
+                }
+                _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
+                    return Err(ServerError::Http2);
+                }
+            };
+            let frame = if size == 0 {
+                Frame::Fin
+            } else {
+                Frame::Data(buffer[..size].to_vec())
+            };
+            tx_state
+                .apply(Direction::Send, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &frame))
+                .await
+                .map_err(|_| ServerError::TimedOut)??;
+            if size == 0 {
+                let _ = download_done.send(());
+                return Ok::<(), ServerError>(());
+            }
+        }
+    };
+
+    // An error can cancel send_frame halfway through an H2 window. Reset
+    // the stream instead of appending an ABORT to a partially written frame.
+    tokio::try_join!(upload, download).map_err(|_| ServerError::Http2)?;
+    state
+        .apply(Direction::Receive, &Frame::Fin)
+        .map_err(|_| ServerError::Protocol)?;
+    state
+        .apply(Direction::Send, &Frame::Fin)
+        .map_err(|_| ServerError::Protocol)?;
+    state.finish().map_err(|_| ServerError::Protocol)
 }
 
 fn pem_data(reference: &str, private_key: bool) -> Result<Vec<u8>, ServerError> {
@@ -582,6 +737,16 @@ fn pem_data(reference: &str, private_key: bool) -> Result<Vec<u8>, ServerError> 
     Ok(bytes)
 }
 
+fn check_certificate_name(
+    leaf: &rustls::pki_types::CertificateDer<'_>,
+    name: &str,
+) -> Result<(), ServerError> {
+    let name = rustls::pki_types::ServerName::try_from(name.to_owned())
+        .map_err(|_| ServerError::Config)?;
+    let cert = rustls::server::ParsedCertificate::try_from(leaf).map_err(|_| ServerError::Tls)?;
+    rustls::client::verify_server_name(&cert, &name).map_err(|_| ServerError::Tls)
+}
+
 fn tls_acceptor(inbound: &Inbound) -> Result<TlsAcceptor, ServerError> {
     let cert_bytes = pem_data(&inbound.tls_cert, false)?;
     let key_bytes = pem_data(&inbound.tls_key, true)?;
@@ -589,9 +754,8 @@ fn tls_acceptor(inbound: &Inbound) -> Result<TlsAcceptor, ServerError> {
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
         .map_err(|_| ServerError::Config)?;
-    if certs.is_empty() {
-        return Err(ServerError::Config);
-    }
+    let leaf = certs.first().ok_or(ServerError::Config)?;
+    check_certificate_name(leaf, &inbound.server_name)?;
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes.as_slice()))
         .map_err(|_| ServerError::Config)?
         .ok_or(ServerError::Config)?;
@@ -604,6 +768,7 @@ fn tls_acceptor(inbound: &Inbound) -> Result<TlsAcceptor, ServerError> {
     .with_single_cert(certs, key)
     .map_err(|_| ServerError::Tls)?;
     tls.alpn_protocols = vec![b"h2".to_vec()];
+    tls.max_early_data_size = 0;
     Ok(TlsAcceptor::from(Arc::new(tls)))
 }
 
@@ -622,6 +787,7 @@ pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
         return Err(ServerError::Config);
     }
     let policy = document.server.policy;
+    let peer_budget = Arc::new(PeerBudget::default());
     let global = Arc::new(Semaphore::new(policy.max_connections_total as usize));
     let connections = Arc::new(Semaphore::new(policy.max_connections_total as usize));
     let per_user: Arc<HashMap<_, _>> = Arc::new(
@@ -649,6 +815,7 @@ pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
             global.clone(),
             per_user.clone(),
             connections.clone(),
+            peer_budget.clone(),
         ));
         prepared.push((listener, acceptor, context));
     }
@@ -659,5 +826,66 @@ pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
     match tasks.join_next().await {
         Some(Ok(result)) => result,
         _ => Err(ServerError::Io),
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn peer_budget_is_bounded_and_ipv4_mapped_shares_quota() {
+        let budget = PeerBudget::default();
+        let now = Instant::now();
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        for _ in 0..AUTH_ATTEMPTS {
+            assert!(budget.admit(ip, now));
+        }
+        assert!(!budget.admit(mapped, now));
+        assert!(budget.admit(mapped, now + AUTH_WINDOW));
+        for n in 1..MAX_TRACKED_PEERS {
+            let peer = IpAddr::V4(Ipv4Addr::new(10, 0, (n >> 8) as u8, n as u8));
+            assert!(budget.admit(peer, now));
+        }
+        let other = "192.0.2.1".parse().unwrap();
+        assert!(!budget.admit(other, now));
+        assert_eq!(budget.peers.lock().unwrap().len(), MAX_TRACKED_PEERS);
+        assert!(budget.admit(other, now + AUTH_WINDOW));
+    }
+
+    #[test]
+    fn dns_candidate_filter_pins_public_ips_and_caps_results() {
+        let mixed: Vec<SocketAddr> = [
+            "127.0.0.1:443",
+            "8.8.8.8:443",
+            "8.8.8.8:443",
+            "[::ffff:169.254.169.254]:443",
+            "[2002:7f00:1::]:443",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        assert_eq!(
+            permitted_candidates(mixed, false).unwrap(),
+            vec!["8.8.8.8:443".parse().unwrap()]
+        );
+        let denied = vec!["127.0.0.1:443".parse().unwrap()];
+        assert_eq!(
+            permitted_candidates(denied, false),
+            Err(ErrorCode::PolicyDenied)
+        );
+        let many = vec!["8.8.8.8:443".parse().unwrap(); MAX_DNS_RESULTS + 1];
+        assert_eq!(
+            permitted_candidates(many, false),
+            Err(ErrorCode::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn configured_name_must_match_certificate_san() {
+        let cert = rcgen::generate_simple_self_signed(vec!["theia.example".into()]).unwrap();
+        assert!(check_certificate_name(cert.cert.der(), "theia.example").is_ok());
+        assert!(check_certificate_name(cert.cert.der(), "other.example").is_err());
     }
 }
