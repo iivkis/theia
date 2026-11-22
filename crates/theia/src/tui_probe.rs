@@ -63,7 +63,11 @@ fn describe_evidence(transport: Transport, evidence: &TlsEvidence) -> String {
         "{name} score: {}/100, confidence: {}%, eligible: {eligible}.\nПричины: {}.",
         rating.score,
         rating.confidence,
-        if reasons.is_empty() { "нет" } else { &reasons }
+        if reasons.is_empty() {
+            "нет"
+        } else {
+            &reasons
+        }
     )
 }
 
@@ -613,7 +617,8 @@ mod tests {
             receiver: rx,
             cancel: Some(cancel),
         };
-        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut))).unwrap();
+        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut)))
+            .unwrap();
         panel.poll();
         let text = panel.body();
         assert!(text.contains("таймаут TLS"));
