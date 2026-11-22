@@ -4,7 +4,7 @@
 //! approved lookup; TCP and UDP each require further disclosure of selected
 //! exact public IPs and affirmative consent, no re-resolution, no Apply.
 use crate::{
-    camouflage_discovery::{CandidateHost, CandidateSource, POPULAR_HTTPS_DOMAINS},
+    camouflage_discovery::{CandidateHost, CandidateSource, Observation, Transport, POPULAR_HTTPS_DOMAINS},
     camouflage_domain_dns::{
         resolve_catalogued_domain, DnsConsent, DnsError, MAX_PINNED_IPS,
     },
@@ -71,7 +71,7 @@ impl DomainPanel {
             .filter(|name| {
                 preview.plan.candidates.iter().any(|candidate| {
                     candidate.source == CandidateSource::PopularDomain
-                        && candidate.host == CandidateHost::Domain(name)
+                        && candidate.host == CandidateHost::Domain(*name)
                 })
             })
             .collect();
@@ -406,6 +406,9 @@ impl DomainPanel {
             out.push_str("Нет доменов каталога. Запросы не выполняются. Esc: назад");
             return out;
         };
+        if self.is_running() {
+            out.push_str("Работает фоновый DNS или TLS worker. Esc отменяет запрос.\n");
+        }
         match &self.state {
             DomainState::Catalog => {
                 out.push_str(&format!(
@@ -512,17 +515,41 @@ impl DomainPanel {
                 for candidate in &report.results {
                     match &candidate.result {
                         Ok(result) if result.address == candidate.address => {
-                            let h2 = result.h2.as_ref().is_ok_and(|p| {
+                            let h2 = result.h2.as_ref().filter(|p| {
                                 p.connected_ip == candidate.address.ip()
+                                    && p.evidence.tls13 == Observation::Verified
+                                    && p.evidence.trusted_chain == Observation::Verified
+                                    && p.evidence.sni_san_match == Observation::Verified
+                                    && p.evidence.certificate_current == Observation::Verified
+                                    && p.evidence.reachable == Observation::Verified
+                                    && p.evidence.alpn_h2 == Observation::Verified
                             });
-                            let h3 = result.h3.as_ref().is_ok_and(|p| {
+                            let h3 = result.h3.as_ref().filter(|p| {
                                 p.connected_ip == candidate.address.ip()
+                                    && p.evidence.tls13 == Observation::Verified
+                                    && p.evidence.trusted_chain == Observation::Verified
+                                    && p.evidence.sni_san_match == Observation::Verified
+                                    && p.evidence.certificate_current == Observation::Verified
+                                    && p.evidence.reachable == Observation::Verified
+                                    && p.evidence.alpn_h3 == Observation::Verified
                             });
+                            let h2_display = h2.map_or_else(
+                                || "H2: отказ/Unknown".to_owned(),
+                                |p| {
+                                    let rating = p.evidence.suitability(Transport::H2);
+                                    format!("H2: {}/100, {}% confidence", rating.score, rating.confidence)
+                                },
+                            );
+                            let h3_display = h3.map_or_else(
+                                || "H3: отказ/Unknown".to_owned(),
+                                |p| {
+                                    let rating = p.evidence.suitability(Transport::H3);
+                                    format!("H3: {}/100, {}% confidence", rating.score, rating.confidence)
+                                },
+                            );
                             out.push_str(&format!(
-                                "{} H2: {}  H3: {}  dual: {}\n",
+                                "{} {h2_display}  {h3_display}  dual: {}\n",
                                 candidate.address,
-                                if h2 { "TLS OK" } else { "отказ/Unknown" },
-                                if h3 { "QUIC OK" } else { "отказ/Unknown" },
                                 if result.both_transports_verified() { "оба подтверждены" } else { "НЕ прошёл" }
                             ));
                         }
@@ -697,6 +724,57 @@ mod tests {
         };
         drop(panel);
         assert!(notify.try_recv().is_ok());
+    }
+
+    #[test]
+    fn both_transport_evidence_is_scored_only_after_independent_verified_tls() {
+        use crate::{
+            camouflage_discovery::{Observation, TlsEvidence},
+            camouflage_dual::DualProbeReport,
+            camouflage_dual_batch::{DualBatchOutcome, DualBatchReport},
+            camouflage_h3_probe::H3ProbeReport,
+            camouflage_probe::ProbeReport,
+        };
+        let ip: IpAddr = "93.184.216.10".parse().unwrap();
+        let h2 = TlsEvidence {
+            tls13: Observation::Verified,
+            trusted_chain: Observation::Verified,
+            sni_san_match: Observation::Verified,
+            certificate_current: Observation::Verified,
+            reachable: Observation::Verified,
+            alpn_h2: Observation::Verified,
+            alpn_h3: Observation::Unknown,
+            theia_fingerprint_match: Observation::Unknown,
+        };
+        let h3 = TlsEvidence {
+            alpn_h2: Observation::Unknown,
+            alpn_h3: Observation::Verified,
+            ..h2
+        };
+        let mut panel = panel();
+        panel.state = DomainState::Complete(Ok(DualBatchReport {
+            results: vec![DualBatchOutcome {
+                address: SocketAddr::new(ip, 443),
+                result: Ok(DualProbeReport {
+                    address: SocketAddr::new(ip, 443),
+                    h2: Ok(ProbeReport {
+                        connected_ip: ip,
+                        handshake_elapsed: Duration::from_millis(40),
+                        evidence: h2,
+                    }),
+                    h3: Ok(H3ProbeReport {
+                        connected_ip: ip,
+                        handshake_elapsed: Duration::from_millis(50),
+                        evidence: h3,
+                    }),
+                }),
+            }],
+        }));
+        let out = panel.body();
+        assert!(out.contains("Оба H2+H3: 1/1"));
+        assert!(out.contains("H2: 80/100, 85% confidence"));
+        assert!(out.contains("H3: 80/100, 85% confidence"));
+        assert!(out.contains("REALITY: НЕ готов"));
     }
 
     #[test]
