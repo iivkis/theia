@@ -23,6 +23,7 @@ pub mod protocol;
 pub mod quic_transport;
 pub mod server;
 pub mod tui;
+pub(crate) mod tui_candidate_batch;
 pub(crate) mod tui_candidates;
 pub(crate) mod tui_discovery;
 pub mod tui_editor;
