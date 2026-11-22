@@ -2,7 +2,8 @@
 //! TCP/TLS1.3/h2 AND UDP/QUIC/TLS1.3/h3 observations.
 //! No DNS, CIDR expansion, domain sweep, fallback or REALITY claim.
 use crate::{
-    camouflage_discovery::Observation,
+    camouflage_discovery::{CandidateHost, CandidateSource, Observation},
+    camouflage_workflow::DiscoveryPreview,
     camouflage_h3_probe::{probe_quic_h3, H3ProbeError, H3ProbeReport},
     camouflage_probe::{probe_tls_h2, ProbeApproval, ProbeError, ProbeReport, ProbeRequest},
 };
@@ -28,6 +29,7 @@ pub enum DualProbeError {
     InvalidServerName,
     InvalidDeadline,
     NoTrustAnchors,
+    UnplannedAddress,
 }
 
 /// Both observations are retained independently, including a timeout or
@@ -81,10 +83,22 @@ impl DualProbeReport {
 /// Both must use the exact same IP, port, SNI and trusted roots. Running both
 /// does not mean they can substitute for a true REALITY-like security mode.
 pub async fn probe_dual_h2_h3(
+    preview: &DiscoveryPreview,
     target: DualProbeTarget,
 ) -> Result<DualProbeReport, DualProbeError> {
     if !target.approval.allows(target.request.address) {
         return Err(DualProbeError::NotApproved);
+    }
+    if matches!(target.approval, ProbeApproval::PublicHttpsIp(_))
+        && !preview.plan.candidates.iter().any(|candidate| {
+            candidate.host == CandidateHost::Ip(target.request.address.ip())
+                && matches!(
+                    candidate.source,
+                    CandidateSource::ServerAddress | CandidateSource::AuthorizedSubnet
+                )
+        })
+    {
+        return Err(DualProbeError::UnplannedAddress);
     }
     if target.request.deadline.is_zero() {
         return Err(DualProbeError::InvalidDeadline);
