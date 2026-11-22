@@ -184,3 +184,26 @@ jobs:
       - name: Native Windows release compilation only after main merge
         if: github.event_name != 'pull_request'
         run: cargo build --workspace --release --locked
+
+  ci-gate:
+    name: ci-gate
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require success of every mandatory CI job
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          results = json.loads(os.environ["JOB_RESULTS"])
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke"}
+          failed = [name for name in sorted(expected) if results.get(name, {}).get("result") != "success"]
+          if failed:
+              raise SystemExit("Required CI jobs did not succeed: " + ", ".join(failed))
+          print("All required CI jobs succeeded.")
+          PY

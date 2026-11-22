@@ -19,7 +19,7 @@
 | M3.4 | P0: uTLS-like fingerprint profile | Go uTLS v1.8.2 HelloChrome_133 служит воспроизводимым эталоном H2/TLS без захватов браузера; отдельный QUIC/H3 эталон, реально настроенный named TLS/HTTP profile Windows/Linux и проверка фактического выхода Theia + отчёт расхождений обязательны. Если backend не позволяет, M5 заблокирован |
 | M4.1 | ratatui landing + server/client panels | focus/resize/dirty/save/validation UI tests, two independent modes |
 | M4.2 | Local management IPC + reload | ACL, status, transactional apply, rollback, no open admin TCP port |
-| M4.3 | Windows system proxy integration | WinINet user settings backup/apply/CAS restore, manual Windows smoke tests |
+| M4.3 | Windows system proxy integration | WinINet user settings backup/apply/CAS restore, automated Windows CI smoke/recovery on disposable profile/VM |
 | M5 | Hardening/release (все P0 обязаны пройти) | Linux/Windows E2E, BBR + named fingerprint evidence, Windows proxy recovery, security checklist, release notes |
 | P1+ | UDP relay, fingerprint profiles, UX extras | protocol extension and reproducible fingerprint comparison, separate PRs |
 
@@ -34,7 +34,7 @@
 - **Дизайн:** границы библиотек и все изменения wire/TOML/API до написания кода.
 - **Threats:** доверенные/недоверенные inputs, отказ TLS/auth, exhausted resources.
 - **Tests:** сначала failing test, затем код, затем регрессии.
-- **Exit criteria:** команды CI, manual smoke если OS-specific, документация и known limitations.
+- **Exit criteria:** все проверки автоматически в CI, включая OS-specific smoke/E2E и recovery; документация и known limitations. Ручные тесты не требуются, незавершённая автоматизация блокирует приёмку.
 
 ### Пример: M3.2 fallback
 

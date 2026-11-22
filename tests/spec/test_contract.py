@@ -290,6 +290,21 @@ class SpecContractTests(unittest.TestCase):
                         workflow.index("cargo clippy"))
         self.assertIn("Cargo.lock", workflow)
 
+    def test_ci_only_acceptance_contract(self):
+        workflow = read(".github/workflows/ci.yml")
+        gate = workflow.split("\n  ci-gate:\n", 1)[1]
+        for job in ("specification", "m0-1-api-spike", "m0-1-windows-spike",
+                    "rust-tests", "windows-smoke"):
+            self.assertIn(job, gate.split("if:", 1)[0])
+        self.assertIn("always()", gate)
+        self.assertIn('get("result") != "success"', gate)
+        self.assertIn("raise SystemExit", gate)
+        self.assertIn("CI-only", read("AGENTS.md"))
+        self.assertIn("CI-only", read("docs/TESTING_CI.md"))
+        self.assertNotIn("manual Windows smoke tests", read("docs/IMPLEMENTATION_PLAN.md"))
+        self.assertNotIn("ручным smoke-тестом", read("docs/IMPLEMENTATION_SPEC.md"))
+        self.assertNotIn("## 3. Локальная проверка", read("docs/TESTING_CI.md"))
+
 
 if __name__ == "__main__":
     unittest.main()
