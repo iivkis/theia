@@ -58,7 +58,10 @@ async fn pinned_loopback_h3_requires_real_quic_tls13_ca_sni_and_alpn() {
         assert_eq!(report.evidence.sni_san_match, Observation::Verified);
         assert_eq!(report.evidence.alpn_h3, Observation::Verified);
         assert_eq!(report.evidence.alpn_h2, Observation::Unknown);
-        assert_eq!(report.evidence.theia_fingerprint_match, Observation::Unknown);
+        assert_eq!(
+            report.evidence.theia_fingerprint_match,
+            Observation::Unknown
+        );
         assert!(report.handshake_elapsed <= Duration::from_secs(2));
         worker.await.unwrap();
     })
@@ -122,13 +125,19 @@ async fn explicit_consent_and_bounds_are_enforced_before_udp_io() {
             H3ProbeError::InvalidServerName,
         ),
         (
-            ProbeRequest { deadline: Duration::ZERO, ..request(address, "localhost") },
+            ProbeRequest {
+                deadline: Duration::ZERO,
+                ..request(address, "localhost")
+            },
             roots.clone(),
             ProbeApproval::isolated_loopback_fixture(address),
             H3ProbeError::InvalidDeadline,
         ),
     ] {
-        assert_eq!(probe_quic_h3(request, trust, approval).await.unwrap_err(), expected);
+        assert_eq!(
+            probe_quic_h3(request, trust, approval).await.unwrap_err(),
+            expected
+        );
     }
     // Public exact-IP approval cannot be repurposed for an arbitrary port or
     // a non-public address, including an unrecognized loopback fixture.
@@ -160,7 +169,10 @@ async fn silent_udp_peer_times_out_without_false_success_or_http_fallback() {
             ProbeApproval::isolated_loopback_fixture(address),
         )
         .await;
-        assert!(matches!(result, Err(H3ProbeError::TimedOut) | Err(H3ProbeError::UdpUnavailable)));
+        assert!(matches!(
+            result,
+            Err(H3ProbeError::TimedOut) | Err(H3ProbeError::UdpUnavailable)
+        ));
     })
     .await
     .unwrap();
