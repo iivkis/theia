@@ -510,7 +510,8 @@ mod tests {
     #[test]
     fn no_server_config_and_empty_preview_refuse_consent_or_network() {
         let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
-        let mut unavailable = CandidateBatchPanel::new(preview, None);
+        let mut unavailable =
+            CandidateBatchPanel::new(preview, Some("proxy.example.org".into()));
         assert_eq!(unavailable.available_count(), 0);
         unavailable.toggle_current();
         unavailable.ask_confirmation();
