@@ -75,14 +75,13 @@ impl H2Client {
         if raw.len() != 32 || URL_SAFE_NO_PAD.encode(&raw) != token {
             return Err(ClientError::Configuration);
         }
-        let authority: http::uri::Authority = endpoint
-            .parse()
-            .map_err(|_| ClientError::Configuration)?;
+        let authority: http::uri::Authority =
+            endpoint.parse().map_err(|_| ClientError::Configuration)?;
         if authority.port_u16().unwrap_or(0) == 0 || authority.host().is_empty() {
             return Err(ClientError::Configuration);
         }
-        let server_name = ServerName::try_from(name.to_owned())
-            .map_err(|_| ClientError::Configuration)?;
+        let server_name =
+            ServerName::try_from(name.to_owned()).map_err(|_| ClientError::Configuration)?;
         let uri = http::Uri::builder()
             .scheme("https")
             .authority(name)
@@ -167,17 +166,31 @@ impl H2Client {
             version: protocol::VERSION,
             capabilities: 0,
         };
-        state.apply(Direction::Send, &hello).map_err(|_| ClientError::Protocol)?;
+        state
+            .apply(Direction::Send, &hello)
+            .map_err(|_| ClientError::Protocol)?;
         send_frame(&mut outgoing, &hello, false).await?;
-        let ack = decoder.next(&mut incoming).await?.ok_or(ClientError::Protocol)?;
-        state.apply(Direction::Receive, &ack).map_err(|_| ClientError::Protocol)?;
+        let ack = decoder
+            .next(&mut incoming)
+            .await?
+            .ok_or(ClientError::Protocol)?;
+        state
+            .apply(Direction::Receive, &ack)
+            .map_err(|_| ClientError::Protocol)?;
         if !matches!(ack, Frame::HelloAck { .. }) {
             return Err(ClientError::Protocol);
         }
-        state.apply(Direction::Send, &open).map_err(|_| ClientError::Protocol)?;
+        state
+            .apply(Direction::Send, &open)
+            .map_err(|_| ClientError::Protocol)?;
         send_frame(&mut outgoing, &open, false).await?;
-        let result = decoder.next(&mut incoming).await?.ok_or(ClientError::Protocol)?;
-        state.apply(Direction::Receive, &result).map_err(|_| ClientError::Protocol)?;
+        let result = decoder
+            .next(&mut incoming)
+            .await?
+            .ok_or(ClientError::Protocol)?;
+        state
+            .apply(Direction::Receive, &result)
+            .map_err(|_| ClientError::Protocol)?;
         match result {
             Frame::OpenOk if state.tunnel_open() => Ok(Tunnel {
                 incoming,
@@ -334,7 +347,9 @@ impl IncomingFrames {
             };
             let chunk = chunk.map_err(|_| ClientError::Http2)?;
             self.ready.extend(
-                self.decoder.feed(&chunk).map_err(|_| ClientError::Protocol)?,
+                self.decoder
+                    .feed(&chunk)
+                    .map_err(|_| ClientError::Protocol)?,
             );
             incoming
                 .flow_control()
