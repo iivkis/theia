@@ -197,6 +197,52 @@ impl Editor {
         }
     }
 
+    /// Render only the three explicitly whitelisted non-secret fields.
+    /// Never include token refs, TLS key refs, grants, or config file paths.
+    pub fn fields_overview(&self) -> String {
+        let labels = match self.role {
+            Role::Server => ["TLS DNS", "H2 TCP", "H3 UDP"],
+            Role::Client => ["Endpoint", "TLS SNI", "Transport"],
+        };
+        let values: [String; 3] = match &self.draft {
+            Config::Server(doc) => doc
+                .server
+                .inbounds
+                .get(self.selected_record)
+                .map(|inbound| [
+                    inbound.server_name.clone(),
+                    inbound.h2_listen.clone(),
+                    inbound.quic_listen.clone(),
+                ])
+                .unwrap_or_default(),
+            Config::Client(doc) => doc
+                .client
+                .profiles
+                .get(self.selected_record)
+                .map(|p| [
+                    p.server.clone(),
+                    p.server_name.clone(),
+                    match p.transport {
+                        Transport::Auto => "auto".to_owned(),
+                        Transport::H2 => "h2".to_owned(),
+                        Transport::H3 => "h3".to_owned(),
+                    },
+                ])
+                .unwrap_or_default(),
+        };
+        let mut output = String::new();
+        for (index, (label, value)) in labels.iter().zip(values).enumerate() {
+            let marker = if self.selected_field == index { '>' } else { ' ' };
+            let value = if self.editing && self.selected_field == index {
+                self.input.as_str()
+            } else {
+                value.as_str()
+            };
+            output.push_str(&format!("{marker} {}: {value}\n", label));
+        }
+        output
+    }
+
     pub fn dirty(&self) -> bool {
         self.draft != self.original
     }
