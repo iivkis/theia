@@ -73,6 +73,7 @@ jobs:
           go run . "$RUNNER_TEMP/theia-utls-h2-hello.bin"
           popd
           THEIA_UTLS_HELLO_PATH="$RUNNER_TEMP/theia-utls-h2-hello.bin" cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_reference -- --ignored --nocapture
+          THEIA_UTLS_HELLO_PATH="$RUNNER_TEMP/theia-utls-h2-hello.bin" cargo test --workspace --locked --test fingerprint_h2 -- --ignored --nocapture
           rm -f "$RUNNER_TEMP/theia-utls-h2-hello.bin"
       - name: Real Go uTLS H2 request and strict certificate verification against Rust server
         shell: bash
@@ -130,6 +131,8 @@ jobs:
           $env:THEIA_UTLS_HELLO_PATH = $hello
           cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_reference -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Rust comparison to Go uTLS failed' }
+          cargo test --workspace --locked --test fingerprint_h2 -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Live Theia H2 fingerprint comparison failed' }
           Remove-Item $hello -Force
       - name: Real Windows Go uTLS H2 handshake and PKI negative tests
         shell: pwsh
