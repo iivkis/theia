@@ -1,7 +1,7 @@
 //! M4.1: keyboard-first terminal landing and bounded config editor.
 //!
-//! M4.1b supports an explicitly selected configuration file and one safe
-//! non-secret field per role. No service starts, reload, IPC or OS proxy effects.
+//! M4.1c selects an existing inbound or profile and edits three strictly
+//! whitelisted non-secret fields. No service starts, reload, IPC or OS proxy effects.
 use crate::{tui_editor::Editor, Role};
 use crossterm::{
     cursor::{Hide, Show},
@@ -264,6 +264,27 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            // Focus is navigation inside the explicitly loaded typed form,
+            // not a write and not a role switch. Never intercept text input.
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    editor.select_record(true);
+                    return false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    editor.select_record(false);
+                    return false;
+                }
+                KeyCode::Tab => {
+                    editor.select_field(true);
+                    return false;
+                }
+                KeyCode::BackTab => {
+                    editor.select_field(false);
+                    return false;
+                }
+                _ => {}
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
                 self.start_save();
                 return false;
@@ -386,7 +407,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config доступно редактирование одного поля TOML. Сеть, runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k или ↑/↓ выбирают inbound/профиль, Tab/Shift+Tab выбирают поле, Enter/e редактирует. Сеть, runtime и системный прокси не изменяются.",
             true,
         ),
     }
@@ -409,7 +430,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "1/2: панель  Enter/e: поле  Ctrl+S: сохранить  Esc: назад  ?: помощь  q: выход",
+            "j/k: запись  Tab: поле  Enter/e: ввод  Ctrl+S: сохранить  Esc: назад  q: выход",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
@@ -422,20 +443,16 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     } else {
         "Сохранено"
     };
-    let value = if editor.editing {
-        editor.input.as_str()
-    } else {
-        editor.field_value()
-    };
     let message = format!(
-        "Поле: {}\nЗначение: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: состояние неизвестно; reload не выполнялся.\nСекреты, ACL и системный прокси не редактируются.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: состояние неизвестно; reload не выполнялся.\nСекреты, ACL и системный прокси не редактируются.",
+        editor.selection_summary(),
+        editor.fields_overview(),
         editor.field_name(),
-        value,
         dirty,
         if editor.editing {
-            "Ввод: символы / Backspace / Enter: проверить / Esc: отменить"
+            "Ввод: символы/Backspace | Enter: проверить | Esc: отменить"
         } else {
-            "Enter/e: изменить поле   Ctrl+S: проверить и сохранить"
+            "↑/↓ или j/k: запись | Tab/Shift+Tab: поле | Enter/e: изменить | Ctrl+S: сохранить"
         },
         editor.notice,
         editor.error.as_deref().unwrap_or(""),
@@ -443,7 +460,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     panel(
         frame,
         area,
-        "Редактор TOML (только указанный файл)",
+        "Редактор TOML (указанный файл, 3 поля)",
         &message,
         true,
     );
@@ -650,8 +667,94 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(picture.contains("Не сохранено"));
-        assert!(picture.contains("client.profiles[active].server"));
+        assert!(picture.contains("client.profiles[0].server"));
         assert!(!picture.contains("THEIA_AUTH_TOKEN"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn form_keyboard_selects_record_and_field_without_implicit_activation() {
+        use crate::config::{self, Config};
+        use std::fs;
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-tui-m41c-{}.toml",
+            std::process::id()
+        ));
+        let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+            panic!("client");
+        };
+        let mut second = doc.client.profiles[0].clone();
+        second.id = "backup".into();
+        second.server = "backup.example.org:443".into();
+        doc.client.profiles.push(second);
+        fs::write(&path, Config::Client(doc).to_toml().unwrap()).unwrap();
+
+        let mut interaction = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        assert!(!interaction.update(&mut model, press(KeyCode::Down)));
+        assert_eq!(interaction.editor.as_ref().unwrap().selected_record_id(), "backup");
+        assert!(!interaction.editor.as_ref().unwrap().selected_record_is_active());
+        assert!(!interaction.update(&mut model, press(KeyCode::Tab)));
+        assert_eq!(
+            interaction.editor.as_ref().unwrap().field_name(),
+            "client.profiles[1].server_name"
+        );
+        assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
+        assert!(interaction.editor.as_ref().unwrap().editing);
+        assert!(!interaction.update(&mut model, press(KeyCode::Char('q'))));
+        assert!(interaction.editor.as_ref().unwrap().input.ends_with('q'));
+        assert!(!interaction.update(&mut model, press(KeyCode::Esc)));
+        assert!(!interaction.update(&mut model, press(KeyCode::BackTab)));
+        assert_eq!(
+            interaction.editor.as_ref().unwrap().field_name(),
+            "client.profiles[1].server"
+        );
+        assert!(!interaction.update(&mut model, press(KeyCode::Up)));
+        assert_eq!(interaction.editor.as_ref().unwrap().selected_record_id(), "home");
+        assert_eq!(model.screen, Screen::Client);
+        assert!(!interaction.editor.as_ref().unwrap().dirty());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn form_renders_multiple_selected_fields_without_secret_references() {
+        use crate::config::{self, Config};
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "theia-tui-m41c-snapshot-{}.toml",
+            std::process::id()
+        ));
+        let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+            panic!("client");
+        };
+        let mut profile = doc.client.profiles[0].clone();
+        profile.id = "backup".into();
+        profile.server_name = "backup.example.org".into();
+        doc.client.profiles.push(profile);
+        fs::write(&path, Config::Client(doc).to_toml().unwrap()).unwrap();
+        let mut editor = Editor::load(Role::Client, &path).unwrap();
+        editor.select_record(true);
+        editor.select_field(true);
+        let interaction = Interaction::new(Some(editor));
+        let model = Model::new(Some(Role::Client));
+        for (width, height) in [(60, 18), (80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &model, Some(&interaction))).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(usize::from(width))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(screen.contains("backup"), "{width}x{height}");
+            assert!(screen.contains("Endpoint"), "{width}x{height}");
+            assert!(screen.contains("TLS SNI"), "{width}x{height}");
+            assert!(!screen.contains("THEIA_AUTH_TOKEN"), "{width}x{height}");
+            assert!(!screen.contains("token_sha256"), "{width}x{height}");
+        }
         fs::remove_file(path).unwrap();
     }
 
