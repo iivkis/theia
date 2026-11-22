@@ -6,7 +6,7 @@
 //! then an additional y; no automatic subnet sweep, DNS or configuration Apply.
 use crate::{
     camouflage_discovery::{CandidateHost, CandidateSource},
-    camouflage_dual::{CandidateConsent, DualProbeError, DualProbeTarget},
+    camouflage_dual::{CandidateConsent, DualProbeTarget},
     camouflage_dual_batch::{
         probe_dual_batch, DualBatchError, DualBatchReport, DualBatchTarget, MAX_DUAL_BATCH,
     },
