@@ -9,7 +9,7 @@ use crate::{
 use rustls::RootCertStore;
 use std::{
     io::{BufReader, Read},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -123,7 +123,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 h2,
                 h3,
                 ttl: Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s)),
-                negative: Mutex::new(None),
+                negative: Mutex::new(NegativeCache::default()),
             })))
         }
     }
@@ -136,61 +136,116 @@ enum ProxyClient {
     Auto(Arc<AutoClient>),
 }
 
+/// The OS chooses the UDP source address for the pinned server. Connecting
+/// this temporary socket sends no application datagram and performs no DNS.
+/// Preserve IPv6 scope, discard the ephemeral local port. A failed observation
+/// must never authorize reuse of an earlier negative cache entry.
+fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
+    let bind = if remote.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0u16; 8], 0))
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(remote).ok()?;
+    let mut local = socket.local_addr().ok()?;
+    if local.ip().is_unspecified() {
+        return None;
+    }
+    local.set_port(0);
+    Some(local)
+}
+
+#[derive(Default)]
+struct NegativeCache {
+    route: Option<SocketAddr>,
+    generation: u64,
+    expires: Option<Instant>,
+}
+
+impl NegativeCache {
+    fn observe(&mut self, route: Option<SocketAddr>, now: Instant) -> (u64, bool) {
+        if route.is_none() || self.route != route {
+            self.route = route;
+            self.invalidate();
+        }
+        if self.expires.is_some_and(|until| now >= until) {
+            self.expires = None;
+        }
+        (self.generation, self.expires.is_some())
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.expires = None;
+    }
+
+    fn record(&mut self, generation: u64, now: Instant, ttl: Duration) {
+        if self.generation == generation && self.route.is_some() && !ttl.is_zero() {
+            self.expires = now.checked_add(ttl);
+        }
+    }
+}
+
 struct AutoClient {
     h2: Arc<H2Client>,
     h3: Arc<H3Client>,
     ttl: Duration,
-    negative: Mutex<Option<Instant>>,
+    negative: Mutex<NegativeCache>,
 }
 
 impl AutoClient {
-    fn cached(&self, now: Instant) -> Result<bool, ClientError> {
-        let mut negative = self
+    fn observe(&self) -> Result<(u64, bool), ClientError> {
+        let mut cache = self
             .negative
             .lock()
             .map_err(|_| ClientError::Configuration)?;
-        if negative.is_some_and(|until| now < until) {
-            return Ok(true);
-        }
-        *negative = None;
-        Ok(false)
+        Ok(cache.observe(route_source(self.h3.remote()), Instant::now()))
     }
 
-    fn record(&self, now: Instant) -> Result<(), ClientError> {
-        let mut negative = self
+    fn complete(&self, generation: u64, unreachable: bool) -> Result<bool, ClientError> {
+        let mut cache = self
             .negative
             .lock()
             .map_err(|_| ClientError::Configuration)?;
-        *negative = if self.ttl.is_zero() {
-            None
-        } else {
-            Some(now + self.ttl)
-        };
-        Ok(())
+        let current = route_source(self.h3.remote());
+        // Unknown routing is never cached. A known changed route must not
+        // inherit a fallback decision obtained on the previous network.
+        if current != cache.route {
+            cache.route = current;
+            cache.invalidate();
+        }
+        if !unreachable {
+            if cache.generation == generation {
+                cache.invalidate();
+            }
+            return Ok(false);
+        }
+        if cache.generation != generation {
+            return Ok(false);
+        }
+        cache.record(generation, Instant::now(), self.ttl);
+        Ok(true)
     }
 
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
-        if !self.cached(Instant::now())? {
+        let (generation, cached) = self.observe()?;
+        if !cached {
             match self.h3.open(address.clone(), port).await {
                 Ok(tunnel) => {
-                    *self
-                        .negative
-                        .lock()
-                        .map_err(|_| ClientError::Configuration)? = None;
+                    self.complete(generation, false)?;
                     eprintln!("transport=h3");
                     return Ok(ProxyTunnel::H3(Box::new(tunnel)));
                 }
                 Err(ClientError::QuicUnreachable) => {
-                    self.record(Instant::now())?;
+                    if !self.complete(generation, true)? {
+                        return Err(ClientError::QuicUnreachable);
+                    }
                     eprintln!("transport=h2 reason=quic_unreachable");
                 }
                 Err(error) => {
-                    // PKI, auth, partial handshakes, protocol, ACL and all
-                    // post-handshake failures never permit retry over H2.
-                    *self
-                        .negative
-                        .lock()
-                        .map_err(|_| ClientError::Configuration)? = None;
+                    // All errors except observed UDP silence remain terminal.
+                    self.complete(generation, false)?;
                     return Err(error);
                 }
             }
@@ -538,27 +593,63 @@ mod selector_tests {
 
     #[test]
     fn negative_cache_expires_and_zero_ttl_disables_it() {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(cert.cert.der().clone()).unwrap();
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        let token = URL_SAFE_NO_PAD.encode([1; 32]);
-        let remote = "127.0.0.1:443".parse().unwrap();
-        let mut client = AutoClient {
-            h2: Arc::new(
-                H2Client::new("127.0.0.1:443", "localhost", &token, roots.clone()).unwrap(),
-            ),
-            h3: Arc::new(H3Client::new(remote, "localhost", &token, roots).unwrap()),
-            ttl: Duration::from_secs(5),
-            negative: Mutex::new(None),
-        };
+        let mut cache = NegativeCache::default();
+        let route = Some("192.0.2.1:0".parse().unwrap());
         let now = Instant::now();
-        assert!(!client.cached(now).unwrap());
-        client.record(now).unwrap();
-        assert!(client.cached(now + Duration::from_secs(4)).unwrap());
-        assert!(!client.cached(now + Duration::from_secs(5)).unwrap());
-        client.ttl = Duration::ZERO;
-        client.record(now).unwrap();
-        assert!(!client.cached(now).unwrap());
+        let ttl = Duration::from_secs(5);
+        let (generation, cached) = cache.observe(route, now);
+        assert!(!cached);
+        cache.record(generation, now, ttl);
+        assert!(cache.observe(route, now + Duration::from_secs(4)).1);
+        assert!(!cache.observe(route, now + ttl).1);
+        cache.record(generation, now, Duration::ZERO);
+        assert!(!cache.observe(route, now).1);
+    }
+
+    #[test]
+    fn route_change_rejects_stale_results_and_unknown_route_disables_cache() {
+        let mut cache = NegativeCache::default();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(900);
+        let a = Some("192.0.2.1:0".parse().unwrap());
+        let b = Some("198.51.100.1:0".parse().unwrap());
+        let (old, _) = cache.observe(a, now);
+        cache.record(old, now, ttl);
+        assert!(cache.observe(a, now).1);
+        let (new, cached) = cache.observe(b, now);
+        assert_ne!(old, new);
+        assert!(!cached);
+        cache.record(old, now, ttl);
+        assert!(!cache.observe(b, now).1);
+        cache.record(new, now, ttl);
+        assert!(cache.observe(b, now).1);
+        let (unknown, cached) = cache.observe(None, now);
+        assert!(!cached);
+        cache.record(unknown, now, ttl);
+        assert!(!cache.observe(None, now).1);
+        assert!(!cache.observe(b, now).1);
+    }
+
+    #[test]
+    fn successful_or_terminal_probe_invalidates_prior_failure_generation() {
+        let mut cache = NegativeCache::default();
+        let now = Instant::now();
+        let route = Some("127.0.0.1:0".parse().unwrap());
+        let (old, _) = cache.observe(route, now);
+        cache.invalidate();
+        cache.record(old, now, Duration::from_secs(900));
+        assert!(!cache.observe(route, now).1);
+    }
+
+    #[test]
+    fn route_source_uses_os_loopback_route_without_application_traffic() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let remote = peer.local_addr().unwrap();
+        assert_eq!(route_source(remote), Some("127.0.0.1:0".parse().unwrap()));
+        assert_eq!(
+            peer.recv_from(&mut [0; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

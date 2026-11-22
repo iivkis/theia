@@ -363,6 +363,8 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("self.observation.sent.load", quic)
         self.assertIn("!self.observation.received.load", quic)
         self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", proxy)
+        self.assertIn("route_change_rejects_stale_results_and_unknown_route_disables_cache", proxy)
+        self.assertIn("route_source(self.h3.remote())", proxy)
         tests = read("crates/theia/tests/client_h2.rs")
         for name in ("auto_falls_back_only_after_udp_silence_and_uses_negative_cache",
                      "auto_wrong_h3_certificate_never_retries_working_h2",
