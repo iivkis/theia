@@ -260,6 +260,138 @@ mod tests {
         )
     }
 
+    fn two_inbounds() -> String {
+        let Config::Server(mut doc) = config::parse(&server_source()).unwrap() else {
+            panic!("server fixture");
+        };
+        let mut second = doc.server.inbounds[0].clone();
+        second.id = "backup".into();
+        second.h2_listen = "0.0.0.0:8443".into();
+        second.quic_listen = "0.0.0.0:8443".into();
+        doc.server.inbounds.push(second);
+        Config::Server(doc).to_toml().unwrap()
+    }
+
+    fn two_profiles() -> String {
+        let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+            panic!("client fixture");
+        };
+        let mut second = doc.client.profiles[0].clone();
+        second.id = "work".into();
+        second.server = "work.example.org:443".into();
+        second.server_name = "work.example.org".into();
+        doc.client.profiles.push(second);
+        Config::Client(doc).to_toml().unwrap()
+    }
+
+    #[test]
+    fn selects_second_inbound_and_edits_three_fields_without_changing_first() {
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert_eq!(editor.record_count(), 2);
+        assert_eq!(editor.selected_record_id(), "public");
+        assert_eq!(editor.field_name(), "server.inbounds[0].server_name");
+        editor.select_record(true);
+        assert_eq!(editor.selected_record_id(), "backup");
+        assert_eq!(editor.field_name(), "server.inbounds[1].server_name");
+        editor.begin();
+        editor.input = "backup.example.org".into();
+        assert!(editor.accept());
+        editor.select_field(true);
+        assert_eq!(editor.field_name(), "server.inbounds[1].h2_listen");
+        editor.begin();
+        editor.input = "0.0.0.0:9443".into();
+        assert!(editor.accept());
+        editor.select_field(true);
+        assert_eq!(editor.field_name(), "server.inbounds[1].quic_listen");
+        editor.begin();
+        editor.input = "0.0.0.0:9444".into();
+        assert!(editor.accept());
+        assert!(editor.dirty());
+        assert!(editor.save());
+        let Config::Server(saved) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert_eq!(saved.server.inbounds[0].server_name, "edge.example.org");
+        assert_eq!(saved.server.inbounds[1].server_name, "backup.example.org");
+        assert_eq!(saved.server.inbounds[1].h2_listen, "0.0.0.0:9443");
+        assert_eq!(saved.server.inbounds[1].quic_listen, "0.0.0.0:9444");
+        assert_eq!(saved.server.inbounds[1].allowed_user_ids, ["device-a"]);
+    }
+
+    #[test]
+    fn selectable_non_active_client_profile_keeps_active_pointer_and_secret_references() {
+        let temp = Temp::write(&two_profiles());
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        assert_eq!(editor.record_count(), 2);
+        assert_eq!(editor.selected_record_id(), "home");
+        assert!(editor.selected_record_is_active());
+        editor.select_record(true);
+        assert_eq!(editor.selected_record_id(), "work");
+        assert!(!editor.selected_record_is_active());
+        assert_eq!(editor.field_name(), "client.profiles[1].server");
+        editor.begin();
+        editor.input = "new-work.example.org:8443".into();
+        assert!(editor.accept());
+        editor.select_field(true);
+        assert_eq!(editor.field_name(), "client.profiles[1].server_name");
+        editor.begin();
+        editor.input = "new-work.example.org".into();
+        assert!(editor.accept());
+        editor.select_field(true);
+        assert_eq!(editor.field_name(), "client.profiles[1].transport");
+        editor.begin();
+        editor.input = "h2".into();
+        assert!(editor.accept());
+        assert_eq!(editor.field_value(), "h2");
+        assert!(editor.save());
+        let Config::Client(saved) = config::read_file(&temp.0).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(saved.client.active_profile, "home");
+        assert_eq!(saved.client.profiles[0].server, "edge.example.org:443");
+        assert_eq!(saved.client.profiles[1].server, "new-work.example.org:8443");
+        assert_eq!(saved.client.profiles[1].server_name, "new-work.example.org");
+        assert_eq!(saved.client.profiles[1].transport, config::Transport::H2);
+        assert_eq!(saved.client.profiles[1].auth_token, "env:THEIA_AUTH_TOKEN");
+    }
+
+    #[test]
+    fn duplicate_inbound_listeners_and_unknown_transport_reject_without_file_change() {
+        let temp = Temp::write(&two_inbounds());
+        let before = fs::read(&temp.0).unwrap();
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.select_record(true);
+        editor.select_field(true);
+        editor.begin();
+        editor.input = "0.0.0.0:443".into();
+        assert!(!editor.accept());
+        assert!(editor.editing);
+        assert!(editor.error.as_deref().unwrap().contains("h2_listen"));
+        editor.cancel();
+        assert!(!editor.dirty());
+        assert_eq!(fs::read(&temp.0).unwrap(), before);
+
+        let other = Temp::write(&two_profiles());
+        let mut client = Editor::load(Role::Client, &other.0).unwrap();
+        client.select_record(true);
+        client.select_field(true);
+        client.select_field(true);
+        client.begin();
+        client.input = "h4".into();
+        assert!(!client.accept());
+        assert!(client.error.as_deref().unwrap().contains("transport"));
+        assert!(!client.dirty());
+        client.cancel();
+        client.select_record(true);
+        assert_eq!(client.selected_record_id(), "home");
+        client.select_field(true);
+        assert_eq!(client.field_name(), "client.profiles[0].server_name");
+        client.select_field(true);
+        client.select_field(true);
+        assert_eq!(client.field_name(), "client.profiles[0].server");
+    }
+
     #[test]
     fn client_typed_edit_validates_saves_and_never_applies() {
         let temp = Temp::write(include_str!("../../../examples/client.toml"));
