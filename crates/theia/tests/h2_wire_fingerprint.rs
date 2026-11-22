@@ -239,9 +239,12 @@ async fn measure(backend: Backend) -> Observation {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_default_h2_settings_and_pseudo_headers_are_measured() {
     let observed = measure(Backend::Rustls).await;
+    // New fail-closed baseline: reject unsolicited H2 server PUSH_PROMISE
+    // without relaxing Theia's 8 KiB response-header decoding budget.
+    // This is NOT a Chrome-like H2/TLS browser profile.
     // Exact client-wire baseline from native Linux CI, not a Chrome profile.
     // Guard against silent change of H2 settings, pseudo order or extra frames.
-    assert_eq!(observed.settings, [(6, 8192)]);
+    assert_eq!(observed.settings, [(2, 0), (6, 8192)]);
     assert_eq!(
         observed.pseudo_headers,
         [":method", ":scheme", ":authority", ":path"]
@@ -257,6 +260,7 @@ async fn real_experimental_btls_and_rustls_share_h2_engine_not_chrome_profile() 
     let btls = measure(Backend::BoringSsl).await;
     // Both production H2Client backends use the same h2::client::Builder.
     assert_eq!(btls.settings, rustls.settings);
+    assert_eq!(btls.settings, [(2, 0), (6, 8192)]);
     assert_eq!(btls.pseudo_headers, rustls.pseudo_headers);
     assert_eq!(btls.frames_before_headers, rustls.frames_before_headers);
     assert_eq!(btls.ordinary_fields, rustls.ordinary_fields);

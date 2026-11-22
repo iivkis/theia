@@ -48,3 +48,7 @@ The four ordered SETTINGS and four recognized pseudo names are now **exact regre
 No implementation of Chrome's exact SETTINGS/priority/window/HPACK policy, no TLS cipher-suite/extension equality, no H3/QUIC Initial profile, no default BoringSSL backend, no config migration. This experiment measures browser GET vs authenticated Theia POST, so header/END_STREAM differences due to **different request semantics** must not be interpreted as fingerprint gaps independent of workload. Later matching must use a like-for-like request and actual verified reference profile, with regression E2E across Linux and Windows. F-13 and M5 remain open.
 
 Rollback: remove the test-only Rust/Python files, the added browser-e2e step and this ADR; production code unchanged.
+
+## Follow-up safety alignment, ADR-0012 (M3.4h)
+
+The original Chromium159 and Theia measurements in this ADR remain historical evidence of the pre-M3.4h production client. ADR-0012 changes exactly one **production** H2 setting to disable server push; the new Theia initial SETTINGS become `[(2,0),(6,8192)]`, while Chromium159 reference stays `[(1,65536),(2,0),(4,6291456),(6,262144)]`. Theia's 8KiB response header and default credit bounds remain unchanged. The independent first-flight tests enforce the new baseline and the full Chrome-like profile remains blocked.
