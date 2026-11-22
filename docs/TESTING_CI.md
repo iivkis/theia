@@ -4,6 +4,8 @@
 
 **M3.5b2b1 collector CI:** `crates/theia/tests/camouflage_interfaces.rs` проверяет локально обнаруженный Linux loopback, mask provenance, отказ от эмуляции NAT egress, непрерывные IPv4/IPv6 masks и негативные noncontiguous/zero masks; Windows гарантированно компилирует model и возвращает Unsupported (не пропускает тест). Ни один тест не обращается к внешним серверам или не требует ручных IP/CIDR, режим scanner не включён. Дополнительный native Windows collector остаётся отдельным этапом.
 
+**M3.5b2b2 native Linux/Windows mandatory tests:** `crates/theia/tests/camouflage_egress.rs` проводит настоящие TLS1.3/http1.1 handshake с локальными CI-only сертификатами, проверяет явный pinned exact-socket consent, нормальный IPv4/IPv6 IP echo, timeout, неверный CA/SNI/ALPN, redirect, private/doc IP ответ, пустой trust store и HTTP injection rejection. Никаких сторонних сервисов, DNS или автоматического сканирования. `crates/theia/tests/camouflage_workflow.rs` проверяет пассивный план vs одобренный маленький CIDR, реальную /32 блокировку, фильтр down/invalid/private interface, native Linux collection и Windows Unsupported. Успех всех обязательных job + `ci-gate` только на exact head SHA.
+
 ## 1. Test pyramid
 
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)
