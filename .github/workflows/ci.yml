@@ -160,14 +160,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Bootstrap pinned optional BoringSSL root lockfile (temporary)
-        shell: pwsh
-        run: |
-          cargo metadata --format-version 1 --features experimental-btls-h2 | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'M3.4e dependency resolution failed' }
-          Write-Output 'THEIA_M34E_LOCK_BEGIN'
-          Get-Content Cargo.lock
-          Write-Output 'THEIA_M34E_LOCK_END'
       - name: Tests first
         run: cargo test --workspace --all-targets --locked
       - name: Formatting
