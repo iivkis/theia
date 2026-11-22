@@ -8,7 +8,7 @@ use crate::{
     camouflage_workflow::DiscoveryPreview,
 };
 use rustls::{pki_types::ServerName, RootCertStore};
-use std::{fmt, net::SocketAddr};
+use std::{fmt, net::{IpAddr, SocketAddr}};
 
 #[derive(Clone)]
 pub struct DualProbeTarget {
@@ -23,6 +23,18 @@ impl fmt::Debug for DualProbeTarget {
     }
 }
 
+/// One reviewed source. The source is not a blanket network permission:
+/// every actual IP/port additionally needs an exact ProbeApproval. The domain
+/// variant never does DNS and binds both SNI and the pinned socket address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateConsent {
+    PlannedIp,
+    PinnedDomain {
+        domain: &'static str,
+        pinned_ip: IpAddr,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DualProbeError {
     NotApproved,
@@ -30,6 +42,9 @@ pub enum DualProbeError {
     InvalidDeadline,
     NoTrustAnchors,
     UnplannedAddress,
+    UnplannedDomain,
+    DomainNameMismatch,
+    DomainAddressMismatch,
 }
 
 /// Both observations are retained independently, including a timeout or
@@ -82,6 +97,64 @@ impl DualProbeReport {
     }
 }
 
+/// Validate source consent, the explicitly pinned destination and security
+/// prerequisites without any DNS or network traffic. Domain names must be
+/// in the passive candidate catalogue, and the selected SNI must match the
+/// separately approved exact domain/IP pair. Even a catalogue hit is not
+/// evidence of domain ownership; callers must obtain operator consent.
+pub fn validate_dual_target(
+    preview: &DiscoveryPreview,
+    target: &DualProbeTarget,
+    consent: CandidateConsent,
+) -> Result<(), DualProbeError> {
+    let address = target.request.address;
+    if !target.approval.allows(address) {
+        return Err(DualProbeError::NotApproved);
+    }
+    if target.request.deadline.is_zero() {
+        return Err(DualProbeError::InvalidDeadline);
+    }
+    if !matches!(
+        ServerName::try_from(target.request.server_name.as_str()),
+        Ok(ServerName::DnsName(_))
+    ) {
+        return Err(DualProbeError::InvalidServerName);
+    }
+    match consent {
+        CandidateConsent::PlannedIp => {
+            if matches!(target.approval, ProbeApproval::PublicHttpsIp(_))
+                && !preview.plan.candidates.iter().any(|candidate| {
+                    candidate.host == CandidateHost::Ip(address.ip())
+                        && matches!(
+                            candidate.source,
+                            CandidateSource::ServerAddress | CandidateSource::AuthorizedSubnet
+                        )
+                })
+            {
+                return Err(DualProbeError::UnplannedAddress);
+            }
+        }
+        CandidateConsent::PinnedDomain { domain, pinned_ip } => {
+            if !preview.plan.candidates.iter().any(|candidate| {
+                candidate.host == CandidateHost::Domain(domain)
+                    && candidate.source == CandidateSource::PopularDomain
+            }) {
+                return Err(DualProbeError::UnplannedDomain);
+            }
+            if target.request.server_name != domain {
+                return Err(DualProbeError::DomainNameMismatch);
+            }
+            if address.ip() != pinned_ip {
+                return Err(DualProbeError::DomainAddressMismatch);
+            }
+        }
+    }
+    if target.roots.is_empty() {
+        return Err(DualProbeError::NoTrustAnchors);
+    }
+    Ok(())
+}
+
 /// Validate both transports' shared exact-target approval BEFORE either TCP
 /// or UDP socket exists, then independently probe TCP/443 and UDP/443.
 /// Both must use the exact same IP, port, SNI and trusted roots. Running both
@@ -90,33 +163,18 @@ pub async fn probe_dual_h2_h3(
     preview: &DiscoveryPreview,
     target: DualProbeTarget,
 ) -> Result<DualProbeReport, DualProbeError> {
-    if !target.approval.allows(target.request.address) {
-        return Err(DualProbeError::NotApproved);
-    }
-    if matches!(target.approval, ProbeApproval::PublicHttpsIp(_))
-        && !preview.plan.candidates.iter().any(|candidate| {
-            candidate.host == CandidateHost::Ip(target.request.address.ip())
-                && matches!(
-                    candidate.source,
-                    CandidateSource::ServerAddress | CandidateSource::AuthorizedSubnet
-                )
-        })
-    {
-        return Err(DualProbeError::UnplannedAddress);
-    }
-    if target.request.deadline.is_zero() {
-        return Err(DualProbeError::InvalidDeadline);
-    }
-    if target.roots.is_empty() {
-        return Err(DualProbeError::NoTrustAnchors);
-    }
-    if !matches!(
-        ServerName::try_from(target.request.server_name.as_str()),
-        Ok(ServerName::DnsName(_))
-    ) {
-        return Err(DualProbeError::InvalidServerName);
-    }
+    probe_dual_h2_h3_with_consent(preview, target, CandidateConsent::PlannedIp).await
+}
 
+/// Source-aware API: exactly the same H2 and QUIC/H3 conditions, with
+/// independent approval for the domain+IP pair when a seed-domain candidate
+/// is manually selected. Never follows DNS resolution or redirects.
+pub async fn probe_dual_h2_h3_with_consent(
+    preview: &DiscoveryPreview,
+    target: DualProbeTarget,
+    consent: CandidateConsent,
+) -> Result<DualProbeReport, DualProbeError> {
+    validate_dual_target(preview, &target, consent)?;
     let address = target.request.address;
     let (h2, h3) = tokio::join!(
         probe_tls_h2(
