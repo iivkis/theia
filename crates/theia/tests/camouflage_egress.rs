@@ -6,6 +6,9 @@ use std::{net::{IpAddr, SocketAddr}, sync::Arc, time::Duration};
 use theia::camouflage_egress::{
     observe_public_egress, EgressApproval, EgressError, EgressRequest,
 };
+use theia::camouflage_discovery::{CandidateHost, CandidateSource, Warning, POPULAR_HTTPS_DOMAINS};
+use theia::camouflage_interfaces::{InterfaceSource, NativeInterfaces, ObservedInterface};
+use theia::camouflage_workflow::{build_preview, EgressAssessment, PreviewScope};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, task::JoinHandle, time::timeout};
 use tokio_rustls::TlsAcceptor;
 
@@ -81,6 +84,44 @@ async fn verified_pinned_https_echo_returns_only_remote_observation() {
         assert_eq!(report.source().pinned_ip(), f.address.ip());
         assert_eq!(report.source().server_name(), "localhost");
         assert!(report.observed_at() <= std::time::SystemTime::now());
+
+        // Only the witness claim is added to a passive preview. A mismatched
+        // assigned interface is *not* proof of NAT, permission or CIDR scope.
+        let assigned = NativeInterfaces {
+            interfaces: vec![ObservedInterface {
+                interface_name: "eth-ci".into(),
+                address: "10.0.0.5".parse().unwrap(),
+                prefix_len: 24,
+                is_up: true,
+                source: InterfaceSource::LinuxGetifaddrs,
+            }],
+        };
+        let preview = build_preview(&assigned, Some(&report), PreviewScope::PassiveOnly);
+        assert_eq!(preview.egress_assessment, EgressAssessment::DiffersFromAssignedAddress);
+        assert!(preview.egress_observed_at.is_some());
+        assert_eq!(preview.assigned_public_addresses, 0);
+        assert_eq!(preview.plan.candidates.len(), POPULAR_HTTPS_DOMAINS.len() + 1);
+        assert!(preview.plan.warnings.contains(&Warning::NatEgressUnverified));
+        assert!(preview.plan.candidates.iter().any(|candidate| {
+            candidate.host == CandidateHost::Ip(report.ip())
+                && candidate.source == CandidateSource::ServerAddress
+        }));
+        assert!(!preview.plan.candidates.iter().any(|candidate| {
+            candidate.source == CandidateSource::AuthorizedSubnet
+        }));
+        let matching = NativeInterfaces {
+            interfaces: vec![ObservedInterface {
+                interface_name: "eth-ci".into(),
+                address: report.ip(),
+                prefix_len: 32,
+                is_up: true,
+                source: InterfaceSource::LinuxGetifaddrs,
+            }],
+        };
+        assert_eq!(
+            build_preview(&matching, Some(&report), PreviewScope::PassiveOnly).egress_assessment,
+            EgressAssessment::MatchesAssignedAddress
+        );
         f.server.await.unwrap();
     })
     .await
