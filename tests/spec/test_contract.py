@@ -346,6 +346,16 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("production_h3_client_and_server_relay_exact_bytes", tests)
         self.assertIn("production_h3_client_rejects_tls_bearer_and_acl_failures", tests)
 
+    def test_m31_explicit_h3_cli_wiring(self):
+        proxy = read("crates/theia/src/local_proxy.rs")
+        self.assertIn("ProxyClient::H3", proxy)
+        self.assertIn("Transport::Auto => Err(ClientError::Configuration)", proxy)
+        server = read("crates/theia/src/server.rs")
+        self.assertIn("crate::h3_server::serve(endpoint, context)", server)
+        self.assertIn("tasks.spawn(serve(listener, acceptor, context.clone()))", server)
+        self.assertIn("h3_server_and_client_binaries_curl_both_local_proxies",
+                      read("crates/theia/tests/client_h2.rs"))
+
 
 if __name__ == "__main__":
     unittest.main()
