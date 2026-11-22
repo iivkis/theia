@@ -2,11 +2,13 @@
 //! No external CI calls, no DNS, no CIDR sweep or implicit target selection.
 use rcgen::generate_simple_self_signed;
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
-use std::{net::{IpAddr, SocketAddr}, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use theia::{
-    camouflage_batch::{
-        probe_explicit_batch, BatchError, BatchTarget, MAX_EXPLICIT_BATCH,
-    },
+    camouflage_batch::{probe_explicit_batch, BatchError, BatchTarget, MAX_EXPLICIT_BATCH},
     camouflage_discovery::Observation,
     camouflage_interfaces::NativeInterfaces,
     camouflage_probe::{ProbeApproval, ProbeError, ProbeRequest},
@@ -43,7 +45,11 @@ async fn fixture(alpn: &[u8]) -> Fixture {
         let (tcp, _) = listener.accept().await.unwrap();
         let _ = acceptor.accept(tcp).await;
     });
-    Fixture { address, roots, server }
+    Fixture {
+        address,
+        roots,
+        server,
+    }
 }
 
 fn target(address: SocketAddr, roots: RootCertStore, approval: ProbeApproval) -> BatchTarget {
@@ -63,14 +69,28 @@ async fn explicitly_approved_exact_loopback_peers_are_tested_in_stable_order() {
     timeout(Duration::from_secs(10), async {
         let a = fixture(b"h2").await;
         let b = fixture(b"h2").await;
-        let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+        let preview = build_preview(
+            &NativeInterfaces::default(),
+            None,
+            PreviewScope::PassiveOnly,
+        );
         let report = probe_explicit_batch(
             &preview,
             vec![
-                target(a.address, a.roots, ProbeApproval::isolated_loopback_fixture(a.address)),
-                target(b.address, b.roots, ProbeApproval::isolated_loopback_fixture(b.address)),
+                target(
+                    a.address,
+                    a.roots,
+                    ProbeApproval::isolated_loopback_fixture(a.address),
+                ),
+                target(
+                    b.address,
+                    b.roots,
+                    ProbeApproval::isolated_loopback_fixture(b.address),
+                ),
             ],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.results.len(), 2);
         assert!(report.all_handshakes_verified);
@@ -79,11 +99,16 @@ async fn explicitly_approved_exact_loopback_peers_are_tested_in_stable_order() {
         for result in &report.results {
             let observed = result.result.as_ref().unwrap();
             assert_eq!(observed.evidence.alpn_h2, Observation::Verified);
-            assert_eq!(observed.evidence.theia_fingerprint_match, Observation::Unknown);
+            assert_eq!(
+                observed.evidence.theia_fingerprint_match,
+                Observation::Unknown
+            );
         }
         a.server.await.unwrap();
         b.server.await.unwrap();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -91,14 +116,28 @@ async fn individual_tls_failure_is_preserved_without_fake_batch_success() {
     timeout(Duration::from_secs(10), async {
         let good = fixture(b"h2").await;
         let bad = fixture(b"h3").await;
-        let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+        let preview = build_preview(
+            &NativeInterfaces::default(),
+            None,
+            PreviewScope::PassiveOnly,
+        );
         let report = probe_explicit_batch(
             &preview,
             vec![
-                target(good.address, good.roots, ProbeApproval::isolated_loopback_fixture(good.address)),
-                target(bad.address, bad.roots, ProbeApproval::isolated_loopback_fixture(bad.address)),
+                target(
+                    good.address,
+                    good.roots,
+                    ProbeApproval::isolated_loopback_fixture(good.address),
+                ),
+                target(
+                    bad.address,
+                    bad.roots,
+                    ProbeApproval::isolated_loopback_fixture(bad.address),
+                ),
             ],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert!(!report.all_handshakes_verified);
         assert!(report.results[0].result.is_ok());
         assert!(matches!(
@@ -107,23 +146,35 @@ async fn individual_tls_failure_is_preserved_without_fake_batch_success() {
         ));
         good.server.await.unwrap();
         bad.server.await.unwrap();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn deny_missing_consent_before_tcp_or_tls() {
     let a = fixture(b"h2").await;
-    let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+    let preview = build_preview(
+        &NativeInterfaces::default(),
+        None,
+        PreviewScope::PassiveOnly,
+    );
     let result = probe_explicit_batch(
-        &preview, vec![target(a.address, a.roots, ProbeApproval::Denied)]
-    ).await;
+        &preview,
+        vec![target(a.address, a.roots, ProbeApproval::Denied)],
+    )
+    .await;
     assert!(matches!(result, Err(BatchError::NotApproved)));
     a.server.abort();
 }
 
 #[tokio::test]
 async fn no_implicit_public_targets_even_if_caller_constructs_a_valid_approval() {
-    let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+    let preview = build_preview(
+        &NativeInterfaces::default(),
+        None,
+        PreviewScope::PassiveOnly,
+    );
     let ip: IpAddr = "93.184.216.42".parse().unwrap();
     let request = ProbeRequest {
         address: SocketAddr::new(ip, 443),
@@ -133,15 +184,22 @@ async fn no_implicit_public_targets_even_if_caller_constructs_a_valid_approval()
     let result = probe_explicit_batch(
         &preview,
         vec![BatchTarget {
-            request, roots: RootCertStore::empty(), approval: ProbeApproval::public_https_ip(ip)
+            request,
+            roots: RootCertStore::empty(),
+            approval: ProbeApproval::public_https_ip(ip),
         }],
-    ).await;
+    )
+    .await;
     assert!(matches!(result, Err(BatchError::UnplannedAddress)));
 }
 
 #[tokio::test]
 async fn duplicate_socket_and_oversized_or_empty_batch_fail_before_network() {
-    let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+    let preview = build_preview(
+        &NativeInterfaces::default(),
+        None,
+        PreviewScope::PassiveOnly,
+    );
     assert!(matches!(
         probe_explicit_batch(&preview, vec![]).await,
         Err(BatchError::Empty)
@@ -156,8 +214,14 @@ async fn duplicate_socket_and_oversized_or_empty_batch_fail_before_network() {
         probe_explicit_batch(&preview, duplicate).await,
         Err(BatchError::DuplicateAddress)
     ));
-    let overflowing = (0..MAX_EXPLICIT_BATCH+1)
-        .map(|_| target(fixture.address, RootCertStore::empty(), ProbeApproval::Denied))
+    let overflowing = (0..MAX_EXPLICIT_BATCH + 1)
+        .map(|_| {
+            target(
+                fixture.address,
+                RootCertStore::empty(),
+                ProbeApproval::Denied,
+            )
+        })
         .collect();
     assert!(matches!(
         probe_explicit_batch(&preview, overflowing).await,
@@ -179,13 +243,24 @@ async fn individual_timeout_does_not_make_unobserved_fingerprint_eligible() {
         let mut roots = RootCertStore::empty();
         roots.add(signed.cert.der().clone()).unwrap();
         let mut request = target(
-            address, roots, ProbeApproval::isolated_loopback_fixture(address)
+            address,
+            roots,
+            ProbeApproval::isolated_loopback_fixture(address),
         );
         request.request.deadline = Duration::from_millis(80);
-        let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+        let preview = build_preview(
+            &NativeInterfaces::default(),
+            None,
+            PreviewScope::PassiveOnly,
+        );
         let outcome = probe_explicit_batch(&preview, vec![request]).await.unwrap();
         assert!(!outcome.all_handshakes_verified);
-        assert!(matches!(&outcome.results[0].result, Err(ProbeError::TimedOut)));
+        assert!(matches!(
+            &outcome.results[0].result,
+            Err(ProbeError::TimedOut)
+        ));
         server.abort();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
