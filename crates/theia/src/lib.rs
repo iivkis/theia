@@ -21,6 +21,7 @@ pub mod quic_transport;
 pub mod server;
 pub mod tui;
 pub(crate) mod tui_discovery;
+pub(crate) mod tui_probe;
 pub mod tui_editor;
 
 use std::fmt;
