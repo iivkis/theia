@@ -515,7 +515,7 @@ impl DomainPanel {
                 for candidate in &report.results {
                     match &candidate.result {
                         Ok(result) if result.address == candidate.address => {
-                            let h2 = result.h2.as_ref().filter(|p| {
+                            let h2 = result.h2.as_ref().ok().filter(|p| {
                                 p.connected_ip == candidate.address.ip()
                                     && p.evidence.tls13 == Observation::Verified
                                     && p.evidence.trusted_chain == Observation::Verified
@@ -524,7 +524,7 @@ impl DomainPanel {
                                     && p.evidence.reachable == Observation::Verified
                                     && p.evidence.alpn_h2 == Observation::Verified
                             });
-                            let h3 = result.h3.as_ref().filter(|p| {
+                            let h3 = result.h3.as_ref().ok().filter(|p| {
                                 p.connected_ip == candidate.address.ip()
                                     && p.evidence.tls13 == Observation::Verified
                                     && p.evidence.trusted_chain == Observation::Verified
