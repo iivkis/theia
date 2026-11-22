@@ -100,6 +100,45 @@ fn authorized_small_ipv4_subnet_creates_a_bounded_deduplicated_queue() {
 }
 
 #[test]
+fn approved_ipv4_range_cannot_expand_beyond_assigned_interface_prefix() {
+    // A server may be assigned one /32 in a provider's /24. Containing the
+    // server IP and operator approval alone must not enumerate neighbors.
+    for assigned_prefix in [0, 28, 32, 33] {
+        let plan = build_plan(
+            &server("93.184.216.10", assigned_prefix),
+            &["93.184.216.0/24".parse().unwrap()],
+        );
+        assert_eq!(
+            plan.candidates.len(),
+            POPULAR_HTTPS_DOMAINS.len() + 1,
+            "prefix {assigned_prefix} expanded beyond the assigned range"
+        );
+        assert!(plan.warnings.contains(&Warning::RangeExceedsAssignedPrefix));
+    }
+
+    // A subset of the assigned /29 is still eligible with explicit approval.
+    let plan = build_plan(
+        &server("93.184.216.10", 29),
+        &["93.184.216.8/30".parse().unwrap()],
+    );
+    assert!(plan.candidates.iter().any(|candidate| {
+        candidate.host == CandidateHost::Ip("93.184.216.9".parse().unwrap())
+            && candidate.source == CandidateSource::AuthorizedSubnet
+    }));
+    assert!(!plan.candidates.iter().any(|candidate| {
+        candidate.host == CandidateHost::Ip("93.184.216.11".parse().unwrap())
+    }));
+
+    // A genuinely assigned /32 never needs neighbor expansion.
+    let single = build_plan(
+        &server("93.184.216.10", 32),
+        &["93.184.216.10/32".parse().unwrap()],
+    );
+    assert_eq!(single.candidates.len(), POPULAR_HTTPS_DOMAINS.len() + 1);
+    assert!(single.warnings.is_empty());
+}
+
+#[test]
 fn broad_provider_range_and_unrelated_authorization_never_expand() {
     let mut snapshot = server("93.184.216.10", 24);
     snapshot
