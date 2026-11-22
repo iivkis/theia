@@ -86,16 +86,23 @@ fn tls_pair() -> (TlsAcceptor, TlsConnector) {
 }
 
 async fn send(stream: &mut h2::SendStream<Bytes>, frame: &Frame, end: bool) {
-    let bytes = Bytes::from(theia::protocol::encode(frame).unwrap());
-    stream.reserve_capacity(bytes.len());
-    while stream.capacity() < bytes.len() {
-        let available = std::future::poll_fn(|cx| stream.poll_capacity(cx))
-            .await
-            .expect("h2 stream open")
-            .expect("flow control");
-        assert!(available > 0);
+    let mut bytes = Bytes::from(theia::protocol::encode(frame).unwrap());
+    while !bytes.is_empty() {
+        stream.reserve_capacity(bytes.len());
+        let available = if stream.capacity() == 0 {
+            std::future::poll_fn(|cx| stream.poll_capacity(cx))
+                .await
+                .expect("h2 stream open")
+                .expect("flow control")
+        } else {
+            stream.capacity()
+        };
+        if available == 0 {
+            continue;
+        }
+        let part = bytes.split_to(available.min(bytes.len()));
+        stream.send_data(part, end && bytes.is_empty()).unwrap();
     }
-    stream.send_data(bytes, end).unwrap();
 }
 
 async fn next_frame(
