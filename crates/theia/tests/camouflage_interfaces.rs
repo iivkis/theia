@@ -1,9 +1,9 @@
 //! M3.5b2b1: native Linux interface+prefix observations, with no active
 //! scanning, remote IP lookup, user consent inference or OS proxy changes.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use theia::camouflage_interfaces::{collect_assigned_interfaces, contiguous_netmask_prefix};
 #[cfg(target_os = "linux")]
 use theia::camouflage_interfaces::InterfaceSource;
+use theia::camouflage_interfaces::{collect_assigned_interfaces, contiguous_netmask_prefix};
 
 #[test]
 fn contiguous_ipv4_and_ipv6_netmasks_only() {
