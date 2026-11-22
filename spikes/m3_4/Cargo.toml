@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "theia-m3-4-btls-feasibility"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Separate research workspace; never linked into production Theia.
+[dependencies]
+btls = "=0.5.6"
+
+[dev-dependencies]
+tokio-btls = "=0.5.6"
+tokio = { version = "=1.52.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+rcgen = "=0.13.2"
+rustls = { version = "=0.23.46", features = ["ring"] }
+tokio-rustls = "=0.26.6"

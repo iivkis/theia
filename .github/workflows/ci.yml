@@ -253,9 +253,67 @@ jobs:
           path: ${{ github.workspace }}/theia-bbr-${{ matrix.os }}.csv
           if-no-files-found: error
 
+  m3-4-btls-spike:
+    name: m3-4-btls-spike (${{ matrix.os }})
+    needs: specification
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "spikes/m3_4 -> target"
+          key: "m3-4-btls"
+      - name: Real BoringSSL TCP first flight and strict TLS certificate matrix
+        shell: pwsh
+        run: |
+          cargo test --manifest-path spikes/m3_4/Cargo.toml --locked
+          if ($LASTEXITCODE -ne 0) { throw 'BoringSSL candidate regressions failed' }
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+      - name: Compare real BoringSSL ClientHello to pinned Go uTLS Chrome133 reference
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hello = Join-Path $env:RUNNER_TEMP "theia-m3-4-utls-hello.bin"
+          try {
+            Push-Location spikes/m0_1/utls_reference
+            try {
+              go mod verify
+              if ($LASTEXITCODE -ne 0) { throw 'Go dependency verification failed' }
+              go run . $hello
+              if ($LASTEXITCODE -ne 0) { throw 'Go ClientHello fixture generation failed' }
+            } finally {
+              Pop-Location
+            }
+            $env:THEIA_UTLS_HELLO_PATH = $hello
+            cargo test --manifest-path spikes/m3_4/Cargo.toml --locked --test btls_h2 -- --ignored --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'BoringSSL on-wire comparison failed' }
+          } finally {
+            Remove-Item $hello -Force -ErrorAction SilentlyContinue
+          }
+      - name: Isolated Rust formatting and clippy
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4 rustfmt drift' }
+          cargo clippy --manifest-path spikes/m3_4/Cargo.toml --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4 clippy failed' }
+
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, browser-e2e, m3-3-bbr-comparison]
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, browser-e2e, m3-3-bbr-comparison, m3-4-btls-spike]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -269,7 +327,7 @@ jobs:
           import os
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "browser-e2e", "m3-3-bbr-comparison"}
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "browser-e2e", "m3-3-bbr-comparison", "m3-4-btls-spike"}
           failed = [name for name in sorted(expected) if results.get(name, {}).get("result") != "success"]
           if failed:
               raise SystemExit("Required CI jobs did not succeed: " + ", ".join(failed))
