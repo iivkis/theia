@@ -209,30 +209,38 @@ impl Editor {
                 .server
                 .inbounds
                 .get(self.selected_record)
-                .map(|inbound| [
-                    inbound.server_name.clone(),
-                    inbound.h2_listen.clone(),
-                    inbound.quic_listen.clone(),
-                ])
+                .map(|inbound| {
+                    [
+                        inbound.server_name.clone(),
+                        inbound.h2_listen.clone(),
+                        inbound.quic_listen.clone(),
+                    ]
+                })
                 .unwrap_or_default(),
             Config::Client(doc) => doc
                 .client
                 .profiles
                 .get(self.selected_record)
-                .map(|p| [
-                    p.server.clone(),
-                    p.server_name.clone(),
-                    match p.transport {
-                        Transport::Auto => "auto".to_owned(),
-                        Transport::H2 => "h2".to_owned(),
-                        Transport::H3 => "h3".to_owned(),
-                    },
-                ])
+                .map(|p| {
+                    [
+                        p.server.clone(),
+                        p.server_name.clone(),
+                        match p.transport {
+                            Transport::Auto => "auto".to_owned(),
+                            Transport::H2 => "h2".to_owned(),
+                            Transport::H3 => "h3".to_owned(),
+                        },
+                    ]
+                })
                 .unwrap_or_default(),
         };
         let mut output = String::new();
         for (index, (label, value)) in labels.iter().zip(values).enumerate() {
-            let marker = if self.selected_field == index { '>' } else { ' ' };
+            let marker = if self.selected_field == index {
+                '>'
+            } else {
+                ' '
+            };
             let value = if self.editing && self.selected_field == index {
                 self.input.as_str()
             } else {
@@ -309,9 +317,7 @@ impl Editor {
                             "h2" => Transport::H2,
                             "h3" => Transport::H3,
                             _ => {
-                                self.error = Some(format!(
-                                    "{field}: expected auto, h2 or h3"
-                                ));
+                                self.error = Some(format!("{field}: expected auto, h2 or h3"));
                                 return false;
                             }
                         };
@@ -458,7 +464,9 @@ mod tests {
     }
 
     fn two_profiles() -> String {
-        let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+        let Config::Client(mut doc) =
+            config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
             panic!("client fixture");
         };
         let mut second = doc.client.profiles[0].clone();

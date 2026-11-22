@@ -677,11 +677,10 @@ mod tests {
         use crate::config::{self, Config};
         use std::fs;
 
-        let path = std::env::temp_dir().join(format!(
-            "theia-tui-m41c-{}.toml",
-            std::process::id()
-        ));
-        let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+        let path = std::env::temp_dir().join(format!("theia-tui-m41c-{}.toml", std::process::id()));
+        let Config::Client(mut doc) =
+            config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
             panic!("client");
         };
         let mut second = doc.client.profiles[0].clone();
@@ -693,8 +692,15 @@ mod tests {
         let mut interaction = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
         assert!(!interaction.update(&mut model, press(KeyCode::Down)));
-        assert_eq!(interaction.editor.as_ref().unwrap().selected_record_id(), "backup");
-        assert!(!interaction.editor.as_ref().unwrap().selected_record_is_active());
+        assert_eq!(
+            interaction.editor.as_ref().unwrap().selected_record_id(),
+            "backup"
+        );
+        assert!(!interaction
+            .editor
+            .as_ref()
+            .unwrap()
+            .selected_record_is_active());
         assert!(!interaction.update(&mut model, press(KeyCode::Tab)));
         assert_eq!(
             interaction.editor.as_ref().unwrap().field_name(),
@@ -711,7 +717,10 @@ mod tests {
             "client.profiles[1].server"
         );
         assert!(!interaction.update(&mut model, press(KeyCode::Up)));
-        assert_eq!(interaction.editor.as_ref().unwrap().selected_record_id(), "home");
+        assert_eq!(
+            interaction.editor.as_ref().unwrap().selected_record_id(),
+            "home"
+        );
         assert_eq!(model.screen, Screen::Client);
         assert!(!interaction.editor.as_ref().unwrap().dirty());
         fs::remove_file(path).unwrap();
@@ -725,7 +734,9 @@ mod tests {
             "theia-tui-m41c-snapshot-{}.toml",
             std::process::id()
         ));
-        let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+        let Config::Client(mut doc) =
+            config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
             panic!("client");
         };
         let mut profile = doc.client.profiles[0].clone();
@@ -740,7 +751,9 @@ mod tests {
         let model = Model::new(Some(Role::Client));
         for (width, height) in [(60, 18), (80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|f| draw(f, &model, Some(&interaction))).unwrap();
+            terminal
+                .draw(|f| draw(f, &model, Some(&interaction)))
+                .unwrap();
             let screen = terminal
                 .backend()
                 .buffer()
