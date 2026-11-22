@@ -443,6 +443,15 @@ impl ProbePanel {
                     ProbeUiError::Dual(DualProbeError::UnplannedAddress) => {
                         "адрес не входит в разрешённый офлайн-план"
                     }
+                    ProbeUiError::Dual(DualProbeError::UnplannedDomain) => {
+                        "домен не входит в каталог кандидатов"
+                    }
+                    ProbeUiError::Dual(DualProbeError::DomainNameMismatch) => {
+                        "SNI не соответствует явно выбранному домену"
+                    }
+                    ProbeUiError::Dual(DualProbeError::DomainAddressMismatch) => {
+                        "закреплённый IP домена не соответствует цели"
+                    }
                 };
                 body.push_str(&format!(
                     "\nПроверка H2/H3 НЕ прошла: {code}. Оба транспорта НЕ подтверждены.\nH2/H3 score: Unknown, положительных доказательств нет.\n\nEnter/t: повторить только с новым согласием  Esc: назад"
