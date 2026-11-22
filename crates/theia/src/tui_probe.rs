@@ -3,13 +3,11 @@
 //! Nothing scans a CIDR or resolves a seed domain; no probe runs on startup.
 use crate::{
     camouflage_batch::MAX_EXPLICIT_BATCH,
-    camouflage_dual::{
-        probe_dual_h2_h3, DualProbeError, DualProbeReport, DualProbeTarget,
-    },
-    camouflage_h3_probe::H3ProbeError,
     camouflage_discovery::{
         plausible_public_address, CandidateHost, CandidateSource, TlsEvidence, Transport,
     },
+    camouflage_dual::{probe_dual_h2_h3, DualProbeError, DualProbeReport, DualProbeTarget},
+    camouflage_h3_probe::H3ProbeError,
     camouflage_interfaces::NativeInterfaces,
     camouflage_probe::{ProbeApproval, ProbeError, ProbeRequest},
     camouflage_workflow::{build_preview, DiscoveryPreview, PreviewScope},
@@ -81,7 +79,11 @@ fn describe_h3_evidence(evidence: &TlsEvidence) -> String {
         "H3 score: {}/100, confidence: {}%, eligible: НЕТ.\nПричины: {}.",
         rating.score,
         rating.confidence,
-        if reasons.is_empty() { "нет" } else { &reasons }
+        if reasons.is_empty() {
+            "нет"
+        } else {
+            &reasons
+        }
     )
 }
 
@@ -571,18 +573,18 @@ mod tests {
             receiver: rx,
             cancel: Some(cancel_tx),
         };
-        tx.send(Ok(failed_dual("93.184.216.10".parse().unwrap(), ProbeError::TimedOut)))
-            .unwrap();
+        tx.send(Ok(failed_dual(
+            "93.184.216.10".parse().unwrap(),
+            ProbeError::TimedOut,
+        )))
+        .unwrap();
         p.poll();
         let text = p.body();
         assert!(text.contains("таймаут TLS"));
         assert!(!text.contains("TLS 1.3 подтверждён"));
         assert!(matches!(
             p.state,
-            ProbeState::Complete {
-                outcome: Ok(_),
-                ..
-            }
+            ProbeState::Complete { outcome: Ok(_), .. }
         ));
     }
 
@@ -777,8 +779,7 @@ mod tests {
             receiver: rx,
             cancel: Some(cancel),
         };
-        tx.send(Ok(failed_dual(ip, ProbeError::TimedOut)))
-            .unwrap();
+        tx.send(Ok(failed_dual(ip, ProbeError::TimedOut))).unwrap();
         panel.poll();
         let text = panel.body();
         assert!(text.contains("таймаут TLS"));
