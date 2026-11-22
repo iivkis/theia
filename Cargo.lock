@@ -1566,6 +1566,7 @@ dependencies = [
  "ratatui",
  "rcgen",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "sha2",
