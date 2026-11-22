@@ -2,7 +2,7 @@
 //!
 //! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
 //! No service reload, network or OS proxy effect.
-use crate::{tui_discovery::DiscoveryPanel, tui_editor::Editor, Role};
+use crate::{tui_discovery::DiscoveryPanel, tui_editor::Editor, tui_probe::ProbePanel, Role};
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -179,6 +179,7 @@ struct Interaction {
     editor: Option<Editor>,
     issuance: Option<IssueFlow>,
     discovery: Option<DiscoveryPanel>,
+    probe: Option<ProbePanel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
 }
@@ -189,6 +190,7 @@ impl Interaction {
             editor,
             issuance: None,
             discovery: None,
+            probe: None,
             pending: None,
             saving: None,
         }
@@ -242,6 +244,21 @@ impl Interaction {
         if key.kind != KeyEventKind::Press || self.saving.is_some() {
             return false;
         }
+        if let Some(probe) = self.probe.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    probe.cancel();
+                    self.probe = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => probe.next(),
+                KeyCode::Up | KeyCode::Char('k') => probe.previous(),
+                KeyCode::Enter | KeyCode::Char('t') => probe.ask_confirmation(),
+                KeyCode::Char('y') if probe.is_consent_pending() => probe.confirm_and_start(),
+                KeyCode::Char('n') => probe.decline(),
+                _ => {}
+            }
+            return false;
+        }
         if let Some(panel) = self.discovery.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -249,6 +266,18 @@ impl Interaction {
                     self.discovery = None;
                 }
                 KeyCode::Char('i') => panel.ask_consent(),
+                KeyCode::Char('t') if panel.may_review_probe() => {
+                    let server_name = self
+                        .editor
+                        .as_ref()
+                        .filter(|editor| editor.role() == Role::Server)
+                        .and_then(Editor::selected_server_name)
+                        .map(str::to_owned);
+                    self.probe = Some(ProbePanel::new(
+                        panel.assigned_interfaces().clone(),
+                        server_name,
+                    ));
+                }
                 KeyCode::Char('n') => panel.decline(),
                 KeyCode::Char('y') if panel.is_consent_pending() => panel.confirm_and_start(),
                 _ => {}
@@ -536,7 +565,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p открывает пассивный просмотр IP/подсети (внешний сервис только после подтверждения). Runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p открывает пассивный просмотр IP/подсети (i: отдельный запрос к ipify); t: выбрать собственный IP и запросить явное разрешение на один TLS/H2 handshake. Ни один шаг не применяет настройки. Runtime и системный прокси не изменяются.",
             true,
         ),
     }
@@ -561,6 +590,14 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             parts[1],
             "Не сохранено: подтвердите переход",
             "s: сохранить и продолжить\nd: отменить изменения и продолжить\nEsc: остаться в редакторе\n\nНи одна опция не применяет конфигурацию к runtime.",
+            true,
+        );
+    } else if let Some(probe) = interaction.and_then(|ui| ui.probe.as_ref()) {
+        panel(
+            frame,
+            parts[1],
+            "TLS/H2: только один разрешённый IP:443",
+            &probe.body(),
             true,
         );
     } else if let Some(discovery) = interaction.and_then(|ui| ui.discovery.as_ref()) {
@@ -677,6 +714,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(discovery) = interaction.discovery.as_mut() {
             discovery.poll();
+        }
+        if let Some(probe) = interaction.probe.as_mut() {
+            probe.poll();
         }
         terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
         if event::poll(Duration::from_millis(50))? {
@@ -1183,6 +1223,27 @@ mod tests {
             .unwrap()
             .contains("Сохраните"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_tls_probe_review_requires_server_context_not_ipify_consent() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_some());
+        assert!(ui.probe.is_none());
+        assert!(!ui.update(&mut model, press(KeyCode::Char('t'))));
+        assert!(ui.probe.is_some());
+        let review = rendered_interaction(120, 40, &model, &ui);
+        assert!(review.contains("TLS/H2"));
+        assert!(review.contains("конфигурация"));
+        // A standalone y without a selected target and explicit confirmation
+        // can never open sockets or mark TLS as verified.
+        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("TLS 1.3 подтверждён"));
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.probe.is_none());
+        assert!(ui.discovery.is_some());
     }
 
     #[test]

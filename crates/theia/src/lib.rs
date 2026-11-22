@@ -22,6 +22,7 @@ pub mod server;
 pub mod tui;
 pub(crate) mod tui_discovery;
 pub mod tui_editor;
+pub(crate) mod tui_probe;
 
 use std::fmt;
 use std::path::Path;
