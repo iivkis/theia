@@ -71,8 +71,9 @@ impl CandidateReview {
     }
 
     pub(crate) fn insert(&mut self, ch: char) {
+        let within_limit = self.input_length() < MAX_CIDR_TEXT;
         if let ScopeState::Input(input) = &mut self.scope {
-            if input.len() < MAX_CIDR_TEXT && ch.is_ascii_graphic() {
+            if within_limit && ch.is_ascii_graphic() {
                 input.push(ch);
             }
         }
@@ -237,6 +238,9 @@ impl CandidateReview {
             rating.score,
             rating.confidence,
         );
+        if self.has_scope() {
+            body.push_str("\nВременный scope активен только в этом offline-просмотре.\n");
+        }
         match &self.scope {
             ScopeState::Overview => body.push_str(
                 "\nНет разрешения на активные проверки. Маска интерфейса не доказывает владение CIDR.\n\na: ввести собственный IPv4 CIDR только для offline-плана\nEsc: вернуться",
