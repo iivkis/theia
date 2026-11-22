@@ -70,6 +70,7 @@ pub fn server_endpoint(
     let crypto = QuicServerConfig::try_from(tls).map_err(|_| QuicError::Configuration)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(transport_config());
+    config.migration(false);
     Endpoint::server(config, bind).map_err(|_| QuicError::Bind)
 }
 

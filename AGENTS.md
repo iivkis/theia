@@ -92,3 +92,5 @@ M2.2b CI executable regression: real curl through the compiled client over CONNE
 CI-only browser regression: Playwright/Chromium in a mandatory Linux/Windows matrix (no production dependency), navigation through a test-only single-origin guard and real Theia SOCKS5 listener, compiled CLI and actual H2 server. Browser connectivity is not proof of a browser-like TLS fingerprint; fingerprint gate remains open.
 
 M3.1a: production QUIC composition root only; strict full TLS1.3 handshake, ALPN h3, active BBR on both peers, bounded stream/connection credit, no early data and no H2 fallback inference from handshake errors. CI-only H3 HELLO/ACK and PKI regressions. No H3 runtime enablement until auth/ACL/OPEN_OK/TCP relay, quotas and E2E are integrated.
+
+M3.1b: both H2/H3 share a single request authorization/admission routine and ServerContext quotas. H3 library server accepts verified QUIC, limits headers/handlers/session, dials only vetted candidates, sends OPEN_OK after TCP success, owns connection/stream tasks. No H3 CLI or selector yet; tests must pass before claiming working H3 server. No weakening TLS or bearer/ACL.
