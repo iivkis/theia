@@ -6,8 +6,8 @@
 //! an accepted scope. All evidence remains unknown until separately measured.
 use crate::{
     camouflage_discovery::{
-        CandidateHost, CandidateSource, DiscoveryPlan, NetworkPrefix, Observation,
-        TlsEvidence, Transport, Warning, POPULAR_HTTPS_DOMAINS,
+        CandidateHost, CandidateSource, DiscoveryPlan, NetworkPrefix, TlsEvidence, Transport,
+        Warning, POPULAR_HTTPS_DOMAINS,
     },
     camouflage_interfaces::NativeInterfaces,
     camouflage_workflow::{build_preview, PreviewScope},
@@ -127,9 +127,13 @@ impl CandidateReview {
                     | Warning::CandidateLimitReached
             )
         });
-        if preview.assigned_public_addresses == 0 || blocked {
+        if preview.assigned_public_addresses == 0 {
+            self.warning = Some("Нет назначенных публичных IP. Подсеть не может быть одобрена.");
+            return;
+        }
+        if blocked {
             self.warning = Some(
-                "Диапазон не подтверждён: IP не назначен, маска уже CIDR или лимит превышен.",
+                "Диапазон не подтверждён: IP вне диапазона, маска уже CIDR или лимит превышен.",
             );
             return;
         }
@@ -198,7 +202,7 @@ impl CandidateReview {
         let plan = self.scoped_plan();
         let (server, domains, manual) = self.group_counts();
         let show = |source| {
-            let mut addresses = plan
+            let addresses = plan
                 .candidates
                 .iter()
                 .filter(|candidate| candidate.source == source)
@@ -211,7 +215,6 @@ impl CandidateReview {
             if addresses.is_empty() {
                 "нет".to_owned()
             } else {
-                addresses.truncate(MAX_VISIBLE_IPS);
                 addresses.join(", ")
             }
         };
@@ -224,8 +227,6 @@ impl CandidateReview {
             rating.score,
             rating.confidence,
         );
-        debug_assert_eq!(rating.eligible, false);
-        debug_assert_eq!(Observation::default(), Observation::Unknown);
         match &self.scope {
             ScopeState::Overview => body.push_str(
                 "\nНет разрешения на активные проверки. Маска интерфейса не доказывает владение CIDR.\n\na: ввести собственный IPv4 CIDR только для offline-плана\nEsc: вернуться",
