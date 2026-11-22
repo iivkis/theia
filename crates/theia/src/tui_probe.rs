@@ -460,6 +460,72 @@ mod tests {
     }
 
     #[test]
+    fn verified_h2_gives_only_partial_measured_evidence_not_dpi_eligibility() {
+        let mut panel = ProbePanel::new(assigned(), Some("proxy.example.org".to_owned()));
+        let ip: IpAddr = "93.184.216.10".parse().unwrap();
+        let evidence = crate::camouflage_discovery::TlsEvidence {
+            tls13: crate::camouflage_discovery::Observation::Verified,
+            trusted_chain: crate::camouflage_discovery::Observation::Verified,
+            sni_san_match: crate::camouflage_discovery::Observation::Verified,
+            certificate_current: crate::camouflage_discovery::Observation::Verified,
+            reachable: crate::camouflage_discovery::Observation::Verified,
+            alpn_h2: crate::camouflage_discovery::Observation::Verified,
+            alpn_h3: crate::camouflage_discovery::Observation::Unknown,
+            theia_fingerprint_match: crate::camouflage_discovery::Observation::Unknown,
+        };
+        panel.state = ProbeState::Complete {
+            address: ip,
+            outcome: Ok(ProbeReport {
+                connected_ip: ip,
+                handshake_elapsed: Duration::from_millis(120),
+                evidence,
+            }),
+        };
+        panel.observed_at = Some(Instant::now());
+        let text = panel.body();
+        assert!(text.contains("H2 score: 80/100"));
+        assert!(text.contains("confidence: 85%"));
+        assert!(text.contains("H3 score: 65/100"));
+        assert!(text.contains("confidence: 71%"));
+        assert!(text.contains("fingerprint Theia не измерен"));
+        assert!(text.contains("H3 ALPN не измерен"));
+        assert!(text.contains("eligible: НЕТ"));
+        assert!(!text.contains("eligible: ДА"));
+        assert!(text.contains("не является вероятностью"));
+        assert!(text.contains("120 мс"));
+        assert!(text.contains("сек назад"));
+    }
+
+    #[test]
+    fn rejected_and_timeout_tls_do_not_get_verified_score_or_stale_report() {
+        let mut panel = ProbePanel::new(assigned(), Some("proxy.example.org".to_owned()));
+        let ip: IpAddr = "93.184.216.10".parse().unwrap();
+        panel.state = ProbeState::Complete {
+            address: ip,
+            outcome: Err(ProbeUiError::Handshake(ProbeError::WrongAlpn)),
+        };
+        let text = panel.body();
+        assert!(text.contains("нет ALPN h2"));
+        assert!(text.contains("score: Unknown"));
+        assert!(!text.contains("H2 score: 80/100"));
+        assert!(!text.contains("TLS 1.3 подтверждён"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+        panel.state = ProbeState::Running {
+            address: ip,
+            receiver: rx,
+            cancel: Some(cancel),
+        };
+        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut))).unwrap();
+        panel.poll();
+        let text = panel.body();
+        assert!(text.contains("таймаут TLS"));
+        assert!(text.contains("score: Unknown"));
+        assert!(!text.contains("H2 score: 80/100"));
+        assert!(panel.observed_at.is_some());
+    }
+
+    #[test]
     fn drop_cancels_a_running_probe_without_touching_network_in_test() {
         let mut p = ProbePanel::new(assigned(), Some("proxy.example.org".into()));
         let (_result_tx, result_rx) = std::sync::mpsc::channel();
