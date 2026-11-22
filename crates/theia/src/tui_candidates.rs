@@ -1,10 +1,261 @@
+//! M4.5c: explicitly reviewed, zero-I/O preview of server IP,
+//! popular HTTPS seeds and *self-declared planning-only* IPv4 CIDR scope.
+//!
+//! A local assigned mask is NOT proof of ownership or permission to scan.
+//! This model never provides active ProbeApproval, sends packets or persists
+//! an accepted scope. All evidence remains unknown until separately measured.
+use crate::{
+    camouflage_discovery::{
+        CandidateHost, CandidateSource, DiscoveryPlan, NetworkPrefix, Observation,
+        TlsEvidence, Transport, Warning, POPULAR_HTTPS_DOMAINS,
+    },
+    camouflage_interfaces::NativeInterfaces,
+    camouflage_workflow::{build_preview, PreviewScope},
+};
+use std::net::IpAddr;
+
+pub(crate) const MAX_CIDR_TEXT: usize = 64;
+const MAX_VISIBLE_IPS: usize = 6;
+
+enum ScopeState {
+    Overview,
+    Input(String),
+    Confirm {
+        prefix: NetworkPrefix,
+        additional: usize,
+    },
+    Accepted(NetworkPrefix),
+}
+
+/// Pure UI state for the planning review. Confirmation is deliberately scoped
+/// to a disposable offline preview and never becomes scan authorization.
+pub(crate) struct CandidateReview {
+    native: NativeInterfaces,
+    scope: ScopeState,
+    warning: Option<&'static str>,
+}
+
+impl CandidateReview {
+    pub(crate) fn new(native: NativeInterfaces) -> Self {
+        Self {
+            native,
+            scope: ScopeState::Overview,
+            warning: None,
+        }
+    }
+
+    pub(crate) fn has_scope(&self) -> bool {
+        matches!(self.scope, ScopeState::Accepted(_))
+    }
+
+    pub(crate) fn is_editing(&self) -> bool {
+        matches!(self.scope, ScopeState::Input(_))
+    }
+
+    pub(crate) fn is_confirming(&self) -> bool {
+        matches!(self.scope, ScopeState::Confirm { .. })
+    }
+
+    pub(crate) fn input_length(&self) -> usize {
+        match &self.scope {
+            ScopeState::Input(input) => input.len(),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn begin_cidr(&mut self) {
+        if matches!(self.scope, ScopeState::Overview | ScopeState::Accepted(_)) {
+            self.scope = ScopeState::Input(String::new());
+            self.warning = None;
+        }
+    }
+
+    pub(crate) fn insert(&mut self, ch: char) {
+        if let ScopeState::Input(input) = &mut self.scope {
+            if input.len() < MAX_CIDR_TEXT && ch.is_ascii_graphic() {
+                input.push(ch);
+            }
+        }
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if let ScopeState::Input(input) = &mut self.scope {
+            input.pop();
+        }
+    }
+
+    fn scoped_plan(&self) -> DiscoveryPlan {
+        match self.scope {
+            ScopeState::Accepted(prefix) => {
+                build_preview(&self.native, None, PreviewScope::OperatorApprovedCidrs(&[prefix]))
+                    .plan
+            }
+            _ => build_preview(&self.native, None, PreviewScope::PassiveOnly).plan,
+        }
+    }
+
+    /// Dry-run the existing M3.5 offline planner with a candidate CIDR.
+    /// A range must be /24..=/32, contain a real public assigned local IP,
+    /// stay within that IP's observed prefix, and not exceed candidate caps.
+    /// No DNS or TLS connection is made, and preview scope is not a network
+    /// approval, even when the operator later confirms this stage.
+    pub(crate) fn review_input(&mut self) {
+        let ScopeState::Input(text) = &self.scope else {
+            return;
+        };
+        let Ok(prefix) = text.parse::<NetworkPrefix>() else {
+            self.warning = Some("Некорректный CIDR. Укажите публичный IPv4/префикс.");
+            return;
+        };
+        let valid_v4 = text
+            .split_once('/')
+            .and_then(|(ip, mask)| Some((ip.parse::<IpAddr>().ok()?, mask.parse::<u8>().ok()?)))
+            .is_some_and(|(ip, mask)| matches!(ip, IpAddr::V4(_)) && (24..=32).contains(&mask));
+        if !valid_v4 {
+            self.warning = Some("Только IPv4 /24..=/32. IPv6 соседей нельзя перечислять.");
+            return;
+        }
+        let preview =
+            build_preview(&self.native, None, PreviewScope::OperatorApprovedCidrs(&[prefix]));
+        let blocked = preview.plan.warnings.iter().any(|warning| {
+            matches!(
+                warning,
+                Warning::RangeNotOnServer
+                    | Warning::RangeTooBroad
+                    | Warning::RangeExceedsAssignedPrefix
+                    | Warning::Ipv6EnumerationUnsupported
+                    | Warning::CandidateLimitReached
+            )
+        });
+        if preview.assigned_public_addresses == 0 || blocked {
+            self.warning = Some(
+                "Диапазон не подтверждён: IP не назначен, маска уже CIDR или лимит превышен.",
+            );
+            return;
+        }
+        let any_assigned = preview.plan.candidates.iter().any(|candidate| {
+            candidate.source == CandidateSource::ServerAddress
+                && matches!(candidate.host, CandidateHost::Ip(ip) if prefix.contains(ip))
+        });
+        if !any_assigned {
+            self.warning = Some("Нет назначенных публичных IP в этом диапазоне.");
+            return;
+        }
+        let additional = preview
+            .plan
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source == CandidateSource::AuthorizedSubnet)
+            .count();
+        self.scope = ScopeState::Confirm { prefix, additional };
+        self.warning = None;
+    }
+
+    pub(crate) fn confirm_scope(&mut self) {
+        if let ScopeState::Confirm { prefix, .. } = self.scope {
+            self.scope = ScopeState::Accepted(prefix);
+        }
+    }
+
+    pub(crate) fn decline(&mut self) {
+        if matches!(self.scope, ScopeState::Confirm { .. }) {
+            self.scope = ScopeState::Overview;
+            self.warning = None;
+        }
+    }
+
+    /// Esc discards unconfirmed text/preview first, then closes the pane.
+    /// The accepted scope also vanishes when the pane is dropped.
+    pub(crate) fn back_or_close(&mut self) -> bool {
+        if matches!(self.scope, ScopeState::Input(_) | ScopeState::Confirm { .. }) {
+            self.scope = ScopeState::Overview;
+            self.warning = None;
+            false
+        } else {
+            true
+        }
+    }
+
+    pub(crate) fn group_counts(&self) -> (usize, usize, usize) {
+        let plan = self.scoped_plan();
+        (
+            plan.candidates
+                .iter()
+                .filter(|candidate| candidate.source == CandidateSource::ServerAddress)
+                .count(),
+            plan.candidates
+                .iter()
+                .filter(|candidate| candidate.source == CandidateSource::PopularDomain)
+                .count(),
+            plan.candidates
+                .iter()
+                .filter(|candidate| candidate.source == CandidateSource::AuthorizedSubnet)
+                .count(),
+        )
+    }
+
+    pub(crate) fn body(&self) -> String {
+        let plan = self.scoped_plan();
+        let (server, domains, manual) = self.group_counts();
+        let show = |source| {
+            let mut addresses = plan
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.source == source)
+                .filter_map(|candidate| match candidate.host {
+                    CandidateHost::Ip(ip) => Some(ip.to_string()),
+                    CandidateHost::Domain(_) => None,
+                })
+                .take(MAX_VISIBLE_IPS)
+                .collect::<Vec<_>>();
+            if addresses.is_empty() {
+                "нет".to_owned()
+            } else {
+                addresses.truncate(MAX_VISIBLE_IPS);
+                addresses.join(", ")
+            }
+        };
+        let rating = TlsEvidence::default().suitability(Transport::H2);
+        let mut body = format!(
+            "Пассивный разбор F-18: источники кандидатов (без сети)\n\nПодсеть сервера: {server} назначенных публичных IP\n  {}\nПопулярные домены: {domains} (только каталог, без DNS)\n  {}\nДобавленные вручную: {manual} дополнительных IP\n  {}\n\nTLS/H2: неизвестно, score {}/100, confidence {}%, eligible: НЕТ.\nБалл НЕ означает вероятность обхода DPI.\n",
+            show(CandidateSource::ServerAddress),
+            POPULAR_HTTPS_DOMAINS.join(", "),
+            show(CandidateSource::AuthorizedSubnet),
+            rating.score,
+            rating.confidence,
+        );
+        debug_assert_eq!(rating.eligible, false);
+        debug_assert_eq!(Observation::default(), Observation::Unknown);
+        match &self.scope {
+            ScopeState::Overview => body.push_str(
+                "\nНет разрешения на активные проверки. Маска интерфейса не доказывает владение CIDR.\n\na: ввести собственный IPv4 CIDR только для offline-плана\nEsc: вернуться",
+            ),
+            ScopeState::Input(input) => body.push_str(&format!(
+                "\nВведите IPv4 CIDR (/24..=/32, максимум {MAX_CIDR_TEXT} символа):\n{input}\n{}\n\nEnter: проверить пределы офлайн  Backspace: удалить  Esc: отменить",
+                self.warning.unwrap_or("Ожидается явный ввод диапазона; никакой автоматической проверки сети.")
+            )),
+            ScopeState::Confirm { prefix, additional } => body.push_str(&format!(
+                "\nПодтвердить офлайн-план для {prefix}?\n{additional} дополнительных IP-кандидатов.\n\nПОДТВЕРЖДЕНИЕ ОПЕРАТОРА: доступ к этому диапазону необходимо\nподтвердить независимо. Эта отметка не доказывает право владения\nи не является разрешением на активное сканирование.\n\ny: добавить только в offline-просмотр  n: отказаться  Esc: отменить",
+            )),
+            ScopeState::Accepted(prefix) => body.push_str(&format!(
+                "\nЛокально заявленный диапазон: {prefix}.\nЭто не является разрешением на активное сканирование.\nНикакие CIDR-адреса не подключались и не сохранялись.\n\na: изменить диапазон (новое согласие)  Esc: закрыть/стереть",
+            )),
+        }
+        if !matches!(self.scope, ScopeState::Input(_)) {
+            if let Some(warning) = self.warning {
+                body.push_str(&format!("\n{warning}"));
+            }
+        }
+        body
+    }
+}
+
 //! M4.5c: offline candidate groups and explicit *planning-only* CIDR scope.
 //! Test-first invariants. No active probing or ownership inference.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::camouflage_interfaces::{InterfaceSource, ObservedInterface};
-    use std::net::IpAddr;
 
     fn fixture() -> NativeInterfaces {
         NativeInterfaces {
@@ -159,6 +410,5 @@ mod tests {
         assert_eq!(rating.score, 0);
         assert_eq!(rating.confidence, 0);
         assert!(!rating.eligible);
-        let _unused: IpAddr = "93.184.216.10".parse().unwrap();
     }
 }
