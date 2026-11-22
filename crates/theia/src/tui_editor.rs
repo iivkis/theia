@@ -328,10 +328,18 @@ mod tests {
         assert!(editor.error.as_deref().unwrap().contains("client.profiles"));
         editor.input = "gateway.example.org:443".into();
         assert!(editor.accept());
-        fs::write(&temp.0, "# external change\n".to_owned() + include_str!("../../../examples/client.toml")).unwrap();
+        fs::write(
+            &temp.0,
+            "# external change\n".to_owned() + include_str!("../../../examples/client.toml"),
+        )
+        .unwrap();
         let external = fs::read(&temp.0).unwrap();
         assert!(!editor.save());
-        assert!(editor.error.as_deref().unwrap().contains("changed externally"));
+        assert!(editor
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("changed externally"));
         assert_eq!(fs::read(&temp.0).unwrap(), external);
     }
 

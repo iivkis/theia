@@ -214,7 +214,9 @@ impl Interaction {
                     editor.accept();
                 }
                 KeyCode::Backspace => editor.backspace(),
-                KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                KeyCode::Char(ch)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
                     editor.insert(ch);
                 }
                 _ => {}
@@ -239,7 +241,8 @@ impl Interaction {
         let navigation = matches!(
             key.code,
             KeyCode::Char('q' | '1' | '2') | KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab
-        ) || key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        ) || key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c');
         if editor.dirty() && navigation {
             self.pending = Some(key);
             return false;
@@ -362,14 +365,20 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     }
     frame.render_widget(
-        Paragraph::new("1/2: панель  Enter/e: поле  Ctrl+S: сохранить  Esc: назад  ?: помощь  q: выход")
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(
+            "1/2: панель  Enter/e: поле  Ctrl+S: сохранить  Esc: назад  ?: помощь  q: выход",
+        )
+        .block(Block::default().borders(Borders::ALL)),
         parts[2],
     );
 }
 
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
-    let dirty = if editor.dirty() { "* Не сохранено" } else { "Сохранено" };
+    let dirty = if editor.dirty() {
+        "* Не сохранено"
+    } else {
+        "Сохранено"
+    };
     let value = if editor.editing {
         editor.input.as_str()
     } else {
@@ -388,7 +397,13 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         editor.notice,
         editor.error.as_deref().unwrap_or(""),
     );
-    panel(frame, area, "Редактор TOML (только указанный файл)", &message, true);
+    panel(
+        frame,
+        area,
+        "Редактор TOML (только указанный файл)",
+        &message,
+        true,
+    );
 }
 
 /// Edit only when both role and a config path are explicitly supplied.
@@ -401,7 +416,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         (Some(role), Some(path)) => {
             Some(Editor::load(role, path).map_err(TuiError::Configuration)?)
         }
-        (None, Some(_)) => return Err(TuiError::Configuration("TUI config requires explicit role")),
+        (None, Some(_)) => {
+            return Err(TuiError::Configuration("TUI config requires explicit role"))
+        }
         _ => None,
     };
     let _guard = TerminalGuard::enter()?;
@@ -483,16 +500,12 @@ mod tests {
         assert!(render(20, 6, model).contains("Терминал"));
     }
 
-
     #[test]
     fn dirty_draft_guards_quit_and_navigation_while_editing_is_isolated() {
         use crate::config;
         use sha2::{Digest, Sha256};
         use std::fs;
-        let path = std::env::temp_dir().join(format!(
-            "theia-tui-ui-{}.toml",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("theia-tui-ui-{}.toml", std::process::id()));
         let source = include_str!("../../../examples/server.toml").replace(
             "REPLACE_WITH_64_LOWERCASE_HEX",
             &format!("{:x}", Sha256::digest([0x42; 32])),
@@ -528,10 +541,8 @@ mod tests {
     #[test]
     fn rendered_editor_shows_only_nonsecret_field_and_dirty_status() {
         use std::fs;
-        let path = std::env::temp_dir().join(format!(
-            "theia-tui-client-ui-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("theia-tui-client-ui-{}.toml", std::process::id()));
         fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
         let mut editor = Editor::load(Role::Client, &path).unwrap();
         editor.begin();
