@@ -478,6 +478,101 @@ mod tests {
     }
 
     #[test]
+    fn new_user_is_scoped_to_selected_inbound_and_link_is_one_time_after_save() {
+        use crate::invite::Invitation;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.select_record(true);
+        assert_eq!(editor.selected_record_id(), "backup");
+        assert!(editor.issue_user("new-device").is_ok());
+        assert!(editor.dirty());
+        assert!(!editor.issued_ready());
+        assert!(editor.take_issued().is_none());
+        assert!(editor.begin_new_user_denied_while_pending());
+        let before = fs::read_to_string(&temp.0).unwrap();
+        assert!(!before.contains("new-device"));
+        assert!(editor.save());
+        assert!(editor.issued_ready());
+        let invitation = editor.take_issued().unwrap();
+        assert!(editor.take_issued().is_none());
+        let raw_token = invitation.token_bytes().unwrap();
+        let link = invitation.encode().unwrap();
+        assert!(Invitation::decode(&link).unwrap().has_token());
+        let stored = fs::read_to_string(&temp.0).unwrap();
+        assert!(!stored.contains(&URL_SAFE_NO_PAD.encode(raw_token)));
+        let Config::Server(doc) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert_eq!(doc.server.inbounds[0].allowed_user_ids, ["device-a"]);
+        assert_eq!(
+            doc.server.inbounds[1].allowed_user_ids,
+            ["device-a", "new-device"]
+        );
+        assert_eq!(doc.server.users.len(), 2);
+        assert_eq!(doc.server.users[1].id, "new-device");
+        assert_eq!(
+            doc.server.users[1].token_sha256,
+            format!("{:x}", Sha256::digest(raw_token))
+        );
+        assert!(!doc.server.users[1].disabled);
+    }
+
+    #[test]
+    fn invalid_duplicate_or_dirty_issuance_is_rejected_without_modifying_draft() {
+        let temp = Temp::write(&server_source());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        for id in ["", "bad id", "device-a", "bad\nname"] {
+            assert!(editor.issue_user(id).is_err(), "{id:?}");
+            assert!(!editor.dirty());
+        }
+        editor.begin();
+        editor.input = "new.example.org".into();
+        assert!(editor.accept());
+        assert!(editor.issue_user("new-device").is_err());
+        editor.discard();
+        assert!(!editor.dirty());
+        assert!(editor.issue_user("new-device").is_ok());
+        assert!(editor.issue_user("another").is_err());
+        editor.discard();
+        assert!(editor.take_issued().is_none());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), server_source());
+    }
+
+    #[test]
+    fn external_change_blocks_issued_link_until_successful_write() {
+        let temp = Temp::write(&server_source());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.issue_user("new-device").is_ok());
+        fs::write(&temp.0, "# changed externally\n".to_string() + &server_source()).unwrap();
+        assert!(!editor.save());
+        assert!(!editor.issued_ready());
+        assert!(editor.take_issued().is_none());
+        editor.discard();
+        assert_eq!(
+            config::read_file(&temp.0).unwrap().validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn new_user_gets_independent_random_token_and_existing_token_is_never_exported() {
+        let temp = Temp::write(&server_source());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.issue_user("new-device").is_ok());
+        assert!(editor.save());
+        let first = editor.take_issued().unwrap().token_bytes().unwrap();
+        assert!(editor.issue_user("next-device").is_ok());
+        assert!(editor.save());
+        let second = editor.take_issued().unwrap().token_bytes().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, [0; 32]);
+        assert_ne!(second, [0; 32]);
+        assert!(editor.issue_user("device-a").is_err());
+    }
+
+    #[test]
     fn selects_second_inbound_and_edits_three_fields_without_changing_first() {
         let temp = Temp::write(&two_inbounds());
         let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
