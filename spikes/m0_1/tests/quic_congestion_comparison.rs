@@ -65,7 +65,7 @@ impl Controller {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Condition {
     name: &'static str,
     drop_every: u64,
@@ -358,7 +358,6 @@ async fn trial(controller: Controller, condition: Condition, repetition: usize) 
         reply.finish().unwrap();
         ack_tx.send(()).unwrap();
         let sample = send_task.await.unwrap();
-        assert_eq!(sample.dropped, 0u64.max(sample.dropped));
         assert!(sample.sent_packets > 0);
         if condition.drop_every > 0 {
             assert!(sample.dropped > 0, "loss injection must activate");
