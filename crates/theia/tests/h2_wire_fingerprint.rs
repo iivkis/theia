@@ -119,6 +119,7 @@ fn tls_fixture() -> (TlsAcceptor, String, RootCertStore) {
     (TlsAcceptor::from(Arc::new(tls)), ca.pem(), roots)
 }
 
+#[derive(Clone, Copy)]
 enum Backend {
     Rustls,
     #[cfg(feature = "experimental-btls-h2")]
@@ -128,6 +129,8 @@ enum Backend {
 async fn measure(backend: Backend) -> Observation {
     timeout(DEADLINE, async {
         let (acceptor, ca_pem, roots) = tls_fixture();
+        #[cfg(not(feature = "experimental-btls-h2"))]
+        let _ = &ca_pem;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
