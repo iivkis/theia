@@ -24,7 +24,7 @@ use theia::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
@@ -212,7 +212,7 @@ async fn measure(backend: Backend) -> Observation {
         let observation = server.await.expect("capture server complete");
         // No raw wire bytes, header values, SNI or secrets are printed.
         eprintln!(
-            "M3.4f H2 first-flight backend={} SETTINGS={:?} preceding_frame_types={:?} pseudo_names={:?} ordinary_fields={} END_STREAM={}",
+            "M3.4f H2 first-flight backend={} SETTINGS={:?} preceding_frame_types={:?} optional_settings_ack={} pseudo_names={:?} ordinary_fields={} END_STREAM={}",
             match backend {
                 Backend::Rustls => "rustls",
                 #[cfg(feature = "experimental-btls-h2")]
@@ -220,6 +220,7 @@ async fn measure(backend: Backend) -> Observation {
             },
             observation.settings,
             observation.frames_before_headers,
+            observation.settings_ack_before_headers,
             observation.pseudo_headers,
             observation.ordinary_fields,
             observation.request_end_stream
