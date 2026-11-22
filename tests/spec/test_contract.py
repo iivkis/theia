@@ -120,6 +120,23 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("BBR", text)
         self.assertIn("browser-like", text)
 
+    def test_m35b1_code_contract_does_not_claim_active_scan_or_reality(self):
+        code = read("crates/theia/src/camouflage_discovery.rs")
+        tests = read("crates/theia/tests/camouflage_discovery.rs")
+        adr = read("docs/adr/0022-m3-5b1-offline-discovery-and-evidence.md")
+        self.assertIn("pub mod camouflage_discovery;", read("crates/theia/src/lib.rs"))
+        for token in ("MAX_CANDIDATES", "POPULAR_HTTPS_DOMAINS", "pub fn build_plan",
+                      "pub fn suitability", "ProviderPrefixNotAuthorization", "Unknown",
+                      "Ipv6EnumerationUnsupported"):
+            self.assertIn(token, code)
+        for token in ("google.com", "samsung.com", "amd.com",
+                      "zero-I/O", "не", "REALITY"):
+            self.assertIn(token.lower(), (code + tests + adr).lower())
+        self.assertIn("M3.5b1", read("docs/IMPLEMENTATION_PLAN.md"))
+        self.assertIn("M3.5b1", read("docs/STEALTH_REALITY.md"))
+        self.assertIn("M3.5b1", read("README.md"))
+        self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
+
     def test_f18_picker_discovers_server_range_and_popular_domains_without_manual_seed(self):
         model = read("docs/STEALTH_REALITY.md")
         spec = read("docs/IMPLEMENTATION_SPEC.md")
