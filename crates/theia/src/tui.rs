@@ -1163,10 +1163,8 @@ mod tests {
     #[test]
     fn unsaved_server_form_cannot_hide_inside_discovery_without_guard() {
         use std::fs;
-        let path = std::env::temp_dir().join(format!(
-            "theia-m45a-discovery-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("theia-m45a-discovery-{}.toml", std::process::id()));
         fs::write(&path, server_issuance_fixture()).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
         let mut model = Model::new(Some(Role::Server));
@@ -1176,7 +1174,14 @@ mod tests {
         assert!(ui.editor.as_ref().unwrap().dirty());
         assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
         assert!(ui.discovery.is_none());
-        assert!(ui.editor.as_ref().unwrap().error.as_deref().unwrap().contains("Сохраните"));
+        assert!(ui
+            .editor
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Сохраните"));
         fs::remove_file(path).unwrap();
     }
 
