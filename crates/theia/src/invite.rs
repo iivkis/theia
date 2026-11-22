@@ -1,7 +1,7 @@
 //! Strict, versioned Theia v1 connection invitation. Never log secret-bearing URIs.
 use crate::config::{
-    ClientDocument, ClientSettings, Config, LocalProxy, Management, Profile, SystemProxy, Transport,
-    Ui,
+    ClientDocument, ClientSettings, Config, LocalProxy, Management, Profile, SystemProxy,
+    Transport, Ui,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -83,12 +83,19 @@ impl Invitation {
         if !doc.server.enabled {
             return Err(InviteError::Unavailable);
         }
-        let inbound = doc.server.inbounds.iter()
+        let inbound = doc
+            .server
+            .inbounds
+            .iter()
             .find(|item| item.id == inbound_id)
             .ok_or(InviteError::Unavailable)?;
-        let h2 = inbound.h2_listen.parse::<SocketAddr>()
+        let h2 = inbound
+            .h2_listen
+            .parse::<SocketAddr>()
             .map_err(|_| InviteError::Unavailable)?;
-        let h3 = inbound.quic_listen.parse::<SocketAddr>()
+        let h3 = inbound
+            .quic_listen
+            .parse::<SocketAddr>()
             .map_err(|_| InviteError::Unavailable)?;
         if h2.port() != h3.port() {
             return Err(InviteError::IncompatiblePorts);
@@ -107,16 +114,25 @@ impl Invitation {
     /// Caller must supply the freshly generated 256-bit token at issuance
     /// or rotation. The stored SHA-256 digest cannot recover an old token.
     pub fn issued_from_server(
-        config: &Config, inbound_id: &str, user_id: &str, token: &[u8; 32],
+        config: &Config,
+        inbound_id: &str,
+        user_id: &str,
+        token: &[u8; 32],
     ) -> Result<Self, InviteError> {
         let mut invite = Self::public_from_server(config, inbound_id)?;
         let Config::Server(doc) = config else {
             return Err(InviteError::Unavailable);
         };
-        let inbound = doc.server.inbounds.iter()
+        let inbound = doc
+            .server
+            .inbounds
+            .iter()
             .find(|item| item.id == inbound_id)
             .ok_or(InviteError::Unavailable)?;
-        let user = doc.server.users.iter()
+        let user = doc
+            .server
+            .users
+            .iter()
             .find(|item| item.id == user_id && !item.disabled)
             .ok_or(InviteError::Unavailable)?;
         if !inbound.allowed_user_ids.iter().any(|id| id == user_id) {
@@ -160,10 +176,16 @@ impl Invitation {
             return Err(InviteError::Invalid);
         }
         let encoded = uri.strip_prefix(PREFIX).ok_or(InviteError::Invalid)?;
-        if encoded.is_empty() || encoded.bytes().any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_') {
+        if encoded.is_empty()
+            || encoded
+                .bytes()
+                .any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_')
+        {
             return Err(InviteError::Invalid);
         }
-        let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| InviteError::Invalid)?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| InviteError::Invalid)?;
         if bytes.len() > MAX_DATA || URL_SAFE_NO_PAD.encode(&bytes) != encoded {
             return Err(InviteError::Invalid);
         }
@@ -174,7 +196,9 @@ impl Invitation {
         }
         let token = match wire.token {
             Some(raw) => {
-                let value = URL_SAFE_NO_PAD.decode(&raw).map_err(|_| InviteError::Invalid)?;
+                let value = URL_SAFE_NO_PAD
+                    .decode(&raw)
+                    .map_err(|_| InviteError::Invalid)?;
                 if value.len() != 32 || URL_SAFE_NO_PAD.encode(&value) != raw {
                     return Err(InviteError::Invalid);
                 }
@@ -204,7 +228,11 @@ impl Invitation {
 
     /// Convert only non-secret profile fields. The caller must provision
     /// the token as a secure env/file reference; never embed it in TOML.
-    pub fn to_profile(&self, secret_ref: &str, tls_ca: Option<String>) -> Result<Profile, InviteError> {
+    pub fn to_profile(
+        &self,
+        secret_ref: &str,
+        tls_ca: Option<String>,
+    ) -> Result<Profile, InviteError> {
         self.check()?;
         validate_profile(Profile {
             id: self.id.clone(),
@@ -220,10 +248,15 @@ impl Invitation {
     }
 
     fn check(&self) -> Result<(), InviteError> {
-        self.to_profile_unchecked("env:THEIA_INVITE_TOKEN".into(), None).map(|_| ())
+        self.to_profile_unchecked("env:THEIA_INVITE_TOKEN".into(), None)
+            .map(|_| ())
     }
 
-    fn to_profile_unchecked(&self, auth_token: String, tls_ca: Option<String>) -> Result<Profile, InviteError> {
+    fn to_profile_unchecked(
+        &self,
+        auth_token: String,
+        tls_ca: Option<String>,
+    ) -> Result<Profile, InviteError> {
         validate_profile(Profile {
             id: self.id.clone(),
             server: self.endpoint.clone(),
@@ -255,7 +288,9 @@ fn validate_profile(profile: Profile) -> Result<Profile, InviteError> {
             ipc: "auto".into(),
             log_level: "info".into(),
         },
-        ui: Ui { language: "ru".into() },
+        ui: Ui {
+            language: "ru".into(),
+        },
     });
     config.validate().map_err(|_| InviteError::Invalid)?;
     Ok(profile)
@@ -284,7 +319,9 @@ mod tests {
         let received = Invitation::decode(&encoded).unwrap();
         assert_eq!(received.token_bytes(), Some(token));
         assert!(!format!("{received:?}").contains(&URL_SAFE_NO_PAD.encode(token)));
-        let profile = received.to_profile("file:/trusted/theia-token", None).unwrap();
+        let profile = received
+            .to_profile("file:/trusted/theia-token", None)
+            .unwrap();
         assert_eq!(profile.server, "edge.example.org:443");
         assert_eq!(profile.auth_token, "file:/trusted/theia-token");
         assert_eq!(profile.transport, Transport::Auto);
@@ -292,11 +329,16 @@ mod tests {
 
     #[test]
     fn public_share_has_no_secret_and_requires_auth_reference() {
-        let invite = Invitation::public_from_server(&server_with_token(&[0x42; 32]), "public").unwrap();
-        assert!(!Invitation::decode(&invite.encode().unwrap()).unwrap().has_token());
+        let invite =
+            Invitation::public_from_server(&server_with_token(&[0x42; 32]), "public").unwrap();
+        assert!(!Invitation::decode(&invite.encode().unwrap())
+            .unwrap()
+            .has_token());
         assert!(invite.to_profile("literal-token", None).is_err());
         assert!(invite.to_profile("env:THEIA_AUTH_TOKEN", None).is_ok());
-        assert!(invite.to_profile("env:THEIA_AUTH_TOKEN", Some("file:relative.pem".into())).is_err());
+        assert!(invite
+            .to_profile("env:THEIA_AUTH_TOKEN", Some("file:relative.pem".into()))
+            .is_err());
     }
 
     #[test]
@@ -305,35 +347,60 @@ mod tests {
         let server = server_with_token(&token);
         assert!(Invitation::issued_from_server(&server, "public", "device-a", &[0; 32]).is_err());
         assert!(Invitation::issued_from_server(&server, "public", "missing", &token).is_err());
-        let Config::Server(mut doc) = server else { panic!("server"); };
+        let Config::Server(mut doc) = server else {
+            panic!("server");
+        };
         doc.server.users[0].disabled = true;
-        assert!(Invitation::issued_from_server(&Config::Server(doc), "public", "device-a", &token).is_err());
+        assert!(
+            Invitation::issued_from_server(&Config::Server(doc), "public", "device-a", &token)
+                .is_err()
+        );
     }
 
     #[test]
     fn incompatible_h2_h3_ports_are_rejected_instead_of_broken_auto_profile() {
         let mut server = server_with_token(&[0x42; 32]);
         assert!(Invitation::public_from_server(&server, "missing").is_err());
-        let Config::Server(doc) = &mut server else { panic!("server"); };
+        let Config::Server(doc) = &mut server else {
+            panic!("server");
+        };
         doc.server.inbounds[0].quic_listen = "0.0.0.0:444".into();
-        assert_eq!(Invitation::public_from_server(&server, "public").unwrap_err(), InviteError::IncompatiblePorts);
+        assert_eq!(
+            Invitation::public_from_server(&server, "public").unwrap_err(),
+            InviteError::IncompatiblePorts
+        );
     }
 
     #[test]
     fn malformed_links_unknown_fields_versions_and_token_bytes_fail_closed() {
         let inv = Invitation::issued_from_server(
-            &server_with_token(&[0x42; 32]), "public", "device-a", &[0x42; 32],
-        ).unwrap();
+            &server_with_token(&[0x42; 32]),
+            "public",
+            "device-a",
+            &[0x42; 32],
+        )
+        .unwrap();
         let uri = inv.encode().unwrap();
-        for bad in ["theia://v2/aA", "theia://v1/", "theia://v1/Zg==", "https://example.test", "theia://v1/??"] {
+        for bad in [
+            "theia://v2/aA",
+            "theia://v1/",
+            "theia://v1/Zg==",
+            "https://example.test",
+            "theia://v1/??",
+        ] {
             assert!(Invitation::decode(bad).is_err());
         }
-        let bytes = URL_SAFE_NO_PAD.decode(uri.strip_prefix(PREFIX).unwrap()).unwrap();
+        let bytes = URL_SAFE_NO_PAD
+            .decode(uri.strip_prefix(PREFIX).unwrap())
+            .unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         for altered in [
             text.replace("version = 1", "version = 2"),
             text.replace("tls_profile = \"default\"", "tls_profile = \"chrome133\""),
-            text.replace("server_name = \"edge.example.org\"", "server_name = \"127.0.0.1\""),
+            text.replace(
+                "server_name = \"edge.example.org\"",
+                "server_name = \"127.0.0.1\"",
+            ),
             format!("{text}unknown = \"extra\"\n"),
             text.replace(
                 &format!("token = \"{}\"", URL_SAFE_NO_PAD.encode([0x42; 32])),
