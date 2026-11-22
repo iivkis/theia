@@ -100,3 +100,5 @@ M3.1c: H3Client uses explicit server SocketAddr, verified full QUIC handshake be
 M3.1d: explicit H3 server/client CLI integration, one common local proxy parser and OPEN_OK acknowledgement gate; shared inbound/global connection and user quotas for TCP/H2 and UDP/H3. Auto still fails closed. No claimed fallback or browser TLS fingerprint; only CI checks acceptance.
 
 M3.2a: auto fallback is strictly pre-auth, actual UDP transmit and no observed receive at configured handshake deadline. Generic timeout, TLS/ALPN, auth, protocol, OPEN and all post-handshake failures are never retryable. Profile-local monotonic negative TTL; no live tunnel migration. OS network change invalidation remains pending. CI-only acceptance.
+
+M3.2b: on every new auto tunnel observe local source address for the pinned server; invalidate negative cache on changes and uncertain route, reject stale generation updates; no probing application traffic or active session migration. Same-IP network changes and server DNS refresh remain open. CI-only.

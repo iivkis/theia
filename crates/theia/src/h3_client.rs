@@ -61,6 +61,10 @@ impl H3Client {
         })
     }
 
+    pub(crate) fn remote(&self) -> SocketAddr {
+        self.remote
+    }
+
     pub fn with_connect_timeout(mut self, duration: Duration) -> Result<Self, ClientError> {
         if !(Duration::from_millis(500)..=Duration::from_secs(15)).contains(&duration) {
             return Err(ClientError::Configuration);
