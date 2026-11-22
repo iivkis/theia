@@ -259,9 +259,8 @@ impl CandidateBatchPanel {
     }
 
     pub(crate) fn body(&self) -> String {
-        let mut out = String::from(
-            "F-18: выбранные вручную IP из offline-плана, H2 + H3 (без DNS)\n\n",
-        );
+        let mut out =
+            String::from("F-18: выбранные вручную IP из offline-плана, H2 + H3 (без DNS)\n\n");
         if self.server_name.is_none() {
             out.push_str("Нет серверной конфигурации или SNI выбранного inbound.\nНикакие TLS-запросы не выполняются. Esc: назад");
             return out;
@@ -426,7 +425,11 @@ mod tests {
         let native = native();
         let preview = if with_cidr {
             let subnet: NetworkPrefix = "93.184.216.10/29".parse().unwrap();
-            build_preview(&native, None, PreviewScope::OperatorApprovedCidrs(&[subnet]))
+            build_preview(
+                &native,
+                None,
+                PreviewScope::OperatorApprovedCidrs(&[subnet]),
+            )
         } else {
             build_preview(&native, None, PreviewScope::PassiveOnly)
         };
@@ -492,8 +495,7 @@ mod tests {
         let mut native = native();
         native.interfaces[0].prefix_len = 24;
         let range: NetworkPrefix = "93.184.216.0/24".parse().unwrap();
-        let preview =
-            build_preview(&native, None, PreviewScope::OperatorApprovedCidrs(&[range]));
+        let preview = build_preview(&native, None, PreviewScope::OperatorApprovedCidrs(&[range]));
         let mut panel = CandidateBatchPanel::new(preview, Some("proxy.example.org".into()));
         assert!(panel.available_count() > MAX_DUAL_BATCH);
         for _ in 0..32 {
@@ -509,7 +511,11 @@ mod tests {
 
     #[test]
     fn no_server_config_and_empty_preview_refuse_consent_or_network() {
-        let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
+        let preview = build_preview(
+            &NativeInterfaces::default(),
+            None,
+            PreviewScope::PassiveOnly,
+        );
         let mut unavailable =
             CandidateBatchPanel::new(preview, Some("proxy.example.org".into()));
         assert_eq!(unavailable.available_count(), 0);
@@ -538,8 +544,13 @@ mod tests {
         assert_eq!(targets[0], "93.184.216.10".parse::<IpAddr>().unwrap());
         assert_eq!(targets[1], "93.184.216.9".parse::<IpAddr>().unwrap());
         assert_eq!(
-            panel.preview.plan.candidates.iter().filter(|c|
-                c.source == CandidateSource::AuthorizedSubnet).count(),
+            panel
+                .preview
+                .plan
+                .candidates
+                .iter()
+                .filter(|c| c.source == CandidateSource::AuthorizedSubnet)
+                .count(),
             5
         );
         panel.ask_confirmation();
