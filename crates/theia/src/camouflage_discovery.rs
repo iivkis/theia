@@ -94,12 +94,8 @@ pub struct NetworkPrefix {
 impl NetworkPrefix {
     pub fn contains(self, address: IpAddr) -> bool {
         match (self.network, address) {
-            (IpAddr::V4(network), IpAddr::V4(address)) => {
-                mask_v4(address, self.bits) == network
-            }
-            (IpAddr::V6(network), IpAddr::V6(address)) => {
-                mask_v6(address, self.bits) == network
-            }
+            (IpAddr::V4(network), IpAddr::V4(address)) => mask_v4(address, self.bits) == network,
+            (IpAddr::V6(network), IpAddr::V6(address)) => mask_v6(address, self.bits) == network,
             _ => false,
         }
     }
@@ -110,7 +106,9 @@ impl FromStr for NetworkPrefix {
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let (address, bits) = text.split_once('/').ok_or(PrefixError::Invalid)?;
-        let address = address.parse::<IpAddr>().map_err(|_| PrefixError::Invalid)?;
+        let address = address
+            .parse::<IpAddr>()
+            .map_err(|_| PrefixError::Invalid)?;
         let bits = bits.parse::<u8>().map_err(|_| PrefixError::Invalid)?;
         let network = match address {
             IpAddr::V4(address) if bits <= 32 => IpAddr::V4(mask_v4(address, bits)),
@@ -184,7 +182,11 @@ fn note(warnings: &mut Vec<Warning>, warning: Warning) {
 }
 
 fn add_candidate(plan: &mut DiscoveryPlan, host: CandidateHost, source: CandidateSource) {
-    if plan.candidates.iter().any(|candidate| candidate.host == host) {
+    if plan
+        .candidates
+        .iter()
+        .any(|candidate| candidate.host == host)
+    {
         return;
     }
     if plan.candidates.len() == MAX_CANDIDATES {
@@ -231,7 +233,11 @@ pub fn build_plan(snapshot: &ServerSnapshot, approved: &[NetworkPrefix]) -> Disc
     }
     if let Some(egress) = snapshot.egress {
         if plausible_public_address(egress) {
-            if !snapshot.interfaces.iter().any(|iface| iface.address == egress) {
+            if !snapshot
+                .interfaces
+                .iter()
+                .any(|iface| iface.address == egress)
+            {
                 note(&mut plan.warnings, Warning::NatEgressUnverified);
             }
             add_candidate(
@@ -246,9 +252,10 @@ pub fn build_plan(snapshot: &ServerSnapshot, approved: &[NetworkPrefix]) -> Disc
     }
 
     for prefix in approved {
-        let attached = snapshot.interfaces.iter().any(|iface| {
-            plausible_public_address(iface.address) && prefix.contains(iface.address)
-        });
+        let attached = snapshot
+            .interfaces
+            .iter()
+            .any(|iface| plausible_public_address(iface.address) && prefix.contains(iface.address));
         if !attached {
             note(&mut plan.warnings, Warning::RangeNotOnServer);
             continue;
@@ -335,12 +342,37 @@ impl TlsEvidence {
         };
         let checks = [
             (self.tls13, 15, "TLS1.3 not measured", "TLS1.3 rejected"),
-            (self.trusted_chain, 15, "certificate chain unverified", "untrusted certificate chain"),
-            (self.sni_san_match, 15, "SNI/SAN not measured", "SNI/SAN mismatch"),
-            (self.certificate_current, 10, "certificate validity unverified", "certificate expired or not yet valid"),
-            (self.reachable, 10, "reachability unverified", "endpoint unreachable"),
+            (
+                self.trusted_chain,
+                15,
+                "certificate chain unverified",
+                "untrusted certificate chain",
+            ),
+            (
+                self.sni_san_match,
+                15,
+                "SNI/SAN not measured",
+                "SNI/SAN mismatch",
+            ),
+            (
+                self.certificate_current,
+                10,
+                "certificate validity unverified",
+                "certificate expired or not yet valid",
+            ),
+            (
+                self.reachable,
+                10,
+                "reachability unverified",
+                "endpoint unreachable",
+            ),
             (alpn, 15, "ALPN not measured", "ALPN not supported"),
-            (self.theia_fingerprint_match, 20, "Theia fingerprint not measured", "Theia fingerprint mismatch"),
+            (
+                self.theia_fingerprint_match,
+                20,
+                "Theia fingerprint not measured",
+                "Theia fingerprint mismatch",
+            ),
         ];
         let mut score = 0u8;
         let mut observed = 0u8;
@@ -360,7 +392,7 @@ impl TlsEvidence {
         }
         Suitability {
             score,
-            confidence: observed * 100 / 7,
+            confidence: (u16::from(observed) * 100 / 7) as u8,
             eligible: blockers.is_empty(),
             blockers,
         }

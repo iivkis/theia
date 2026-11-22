@@ -63,10 +63,13 @@ fn public_server_addresses_are_discovered_but_neighbors_are_not_probed_by_defaul
                 && c.source == CandidateSource::ServerAddress
         }));
     }
-    assert!(!plan.candidates.iter().any(|c| {
-        c.host == CandidateHost::Ip("93.184.216.11".parse().unwrap())
-    }));
-    assert!(plan.warnings.contains(&Warning::ProviderPrefixNotAuthorization));
+    assert!(!plan
+        .candidates
+        .iter()
+        .any(|c| { c.host == CandidateHost::Ip("93.184.216.11".parse().unwrap()) }));
+    assert!(plan
+        .warnings
+        .contains(&Warning::ProviderPrefixNotAuthorization));
     assert_eq!(plan.candidates.len(), POPULAR_HTTPS_DOMAINS.len() + 2);
 }
 
@@ -111,13 +114,23 @@ fn broad_provider_range_and_unrelated_authorization_never_expand() {
     );
     assert!(plan.warnings.contains(&Warning::RangeTooBroad));
     assert!(plan.warnings.contains(&Warning::RangeNotOnServer));
-    assert!(plan.warnings.contains(&Warning::ProviderPrefixNotAuthorization));
+    assert!(plan
+        .warnings
+        .contains(&Warning::ProviderPrefixNotAuthorization));
     assert_eq!(plan.candidates.len(), POPULAR_HTTPS_DOMAINS.len() + 1);
 }
 
 #[test]
 fn private_cgnat_documentation_ranges_and_nat_do_not_authorize_neighbor_sweeps() {
-    for address in ["10.1.2.3", "100.96.0.2", "172.17.8.1", "192.168.0.1", "198.51.100.9", "203.0.113.5", "127.0.0.1"] {
+    for address in [
+        "10.1.2.3",
+        "100.96.0.2",
+        "172.17.8.1",
+        "192.168.0.1",
+        "198.51.100.9",
+        "203.0.113.5",
+        "127.0.0.1",
+    ] {
         let plan = build_plan(&server(address, 24), &[]);
         assert_eq!(plan.candidates.len(), POPULAR_HTTPS_DOMAINS.len());
         assert!(plan.warnings.contains(&Warning::NoPublicServerAddress));
@@ -152,14 +165,22 @@ fn candidates_are_capped_even_with_multiple_approved_subnets() {
     let plan = build_plan(&snapshot, &approved);
     assert!(plan.candidates.len() <= MAX_CANDIDATES);
     assert!(plan.warnings.contains(&Warning::CandidateLimitReached));
-    assert!(plan.candidates.iter().any(|c| c.host == CandidateHost::Domain("google.com")));
+    assert!(plan
+        .candidates
+        .iter()
+        .any(|c| c.host == CandidateHost::Domain("google.com")));
 }
 
 #[test]
 fn malformed_prefixes_are_rejected_without_panicking() {
     for raw in [
-        "", "93.184.216.0", "93.184.216.0/33", "93.184.216.0/-1",
-        "2606:4700::/129", "localhost/24", "93.184.216.0/a",
+        "",
+        "93.184.216.0",
+        "93.184.216.0/33",
+        "93.184.216.0/-1",
+        "2606:4700::/129",
+        "localhost/24",
+        "93.184.216.0/a",
     ] {
         assert!(NetworkPrefix::from_str(raw).is_err(), "{raw}");
     }
