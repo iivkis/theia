@@ -5,7 +5,7 @@ mod client_hello;
 
 use btls::ssl::SslVersion;
 use client_hello::{parse_handshake, parse_tls_records, ParseError};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::{sync::Arc, time::Duration};
 use theia_m3_4_btls_feasibility::h2_candidate;
@@ -23,14 +23,27 @@ fn certificate_fixture() -> (String, String, rustls::ServerConfig) {
     let mut ca_params = CertificateParams::new(vec!["theia-test-ca".into()]).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    // rcgen's default CN is identical for both certificates. If unchanged,
+    // BoringSSL sees the leaf Subject == Issuer and rejects it as self-signed.
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "theia-fixture-root");
     let ca_key = KeyPair::generate().unwrap();
     let ca = ca_params.self_signed(&ca_key).unwrap();
 
     let leaf_key = KeyPair::generate().unwrap();
-    let leaf = CertificateParams::new(vec!["localhost".into()])
-        .unwrap()
-        .signed_by(&leaf_key, &ca, &ca_key)
-        .unwrap();
+    let mut leaf_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    leaf_params.distinguished_name = DistinguishedName::new();
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "theia-fixture-leaf");
+    let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    assert_ne!(
+        leaf.params().distinguished_name,
+        ca.params().distinguished_name,
+        "distinct CA and leaf subjects are required for X.509 chain fixture"
+    );
 
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
