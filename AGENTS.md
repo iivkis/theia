@@ -98,3 +98,5 @@ M3.1b: both H2/H3 share a single request authorization/admission routine and Ser
 M3.1c: H3Client uses explicit server SocketAddr, verified full QUIC handshake before auth, active BBR, shared bearer header validation and private OPEN_OK-gated H3Tunnel. Dedicated owned endpoint and driver cancel on drop. No fallback or CLI enabling before integration; no local DNS for targets. CI-only tests against production H3 server.
 
 M3.1d: explicit H3 server/client CLI integration, one common local proxy parser and OPEN_OK acknowledgement gate; shared inbound/global connection and user quotas for TCP/H2 and UDP/H3. Auto still fails closed. No claimed fallback or browser TLS fingerprint; only CI checks acceptance.
+
+M3.2a: auto fallback is strictly pre-auth, actual UDP transmit and no observed receive at configured handshake deadline. Generic timeout, TLS/ALPN, auth, protocol, OPEN and all post-handshake failures are never retryable. Profile-local monotonic negative TTL; no live tunnel migration. OS network change invalidation remains pending. CI-only acceptance.

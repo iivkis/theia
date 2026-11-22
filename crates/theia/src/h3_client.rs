@@ -2,7 +2,7 @@
 use crate::{
     client::{bearer_header, ClientError},
     protocol::{self, Address, Decoder, Direction, Frame, Role, Session},
-    quic_transport::{self, QuicError},
+    quic_transport::{ObservedEndpoint, QuicError},
 };
 use bytes::{Buf, Bytes};
 use h3::{client::RequestStream, quic};
@@ -27,6 +27,7 @@ pub struct H3Client {
     uri: Uri,
     authorization: HeaderValue,
     roots: RootCertStore,
+    connect_timeout: Duration,
 }
 
 impl H3Client {
@@ -56,7 +57,16 @@ impl H3Client {
             uri,
             authorization: bearer_header(token)?,
             roots,
+            connect_timeout: Duration::from_secs(10),
         })
+    }
+
+    pub fn with_connect_timeout(mut self, duration: Duration) -> Result<Self, ClientError> {
+        if !(Duration::from_millis(500)..=Duration::from_secs(15)).contains(&duration) {
+            return Err(ClientError::Configuration);
+        }
+        self.connect_timeout = duration;
+        Ok(self)
     }
 
     pub async fn open(&self, address: Address, port: u16) -> Result<H3Tunnel, ClientError> {
@@ -73,11 +83,10 @@ impl H3Client {
         } else {
             SocketAddr::from(([0u16; 8], 0))
         };
-        let endpoint = EndpointGuard(
-            quic_transport::client_endpoint(bind, self.roots.clone()).map_err(quic_error)?,
-        );
+        let endpoint = ObservedEndpoint::new(bind, self.roots.clone()).map_err(quic_error)?;
         // No credential/request data until verified full handshake and BBR.
-        let connection = quic_transport::connect(&endpoint.0, self.remote, &self.name)
+        let connection = endpoint
+            .connect(self.remote, &self.name, self.connect_timeout)
             .await
             .map_err(quic_error)?;
         let mut builder = h3::client::builder();
@@ -160,18 +169,12 @@ fn quic_error(error: QuicError) -> ClientError {
         QuicError::Configuration => ClientError::Configuration,
         QuicError::Bind => ClientError::Io,
         QuicError::Timeout => ClientError::Timeout,
+        QuicError::Unreachable => ClientError::QuicUnreachable,
         QuicError::Handshake | QuicError::Alpn => ClientError::Tls,
         QuicError::CongestionController => ClientError::Http3,
     }
 }
 
-struct EndpointGuard(quinn::Endpoint);
-
-impl Drop for EndpointGuard {
-    fn drop(&mut self) {
-        self.0.close(0u32.into(), b"client closed");
-    }
-}
 struct Driver(JoinHandle<()>);
 
 impl Drop for Driver {
@@ -188,7 +191,7 @@ pub struct H3Tunnel {
     decoder: Incoming,
     state: Session,
     _driver: Driver,
-    _endpoint: EndpointGuard,
+    _endpoint: ObservedEndpoint,
 }
 
 impl H3Tunnel {

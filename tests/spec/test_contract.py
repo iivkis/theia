@@ -310,7 +310,7 @@ class SpecContractTests(unittest.TestCase):
         client = read("crates/theia/src/client.rs")
         tests = read("crates/theia/tests/client_h2.rs")
         self.assertIn("local_proxy::run_file(", read("crates/theia/src/main.rs"))
-        self.assertIn("profile.transport == Transport::Auto", implementation)
+        self.assertIn("Transport::H3 | Transport::Auto", implementation)
         self.assertIn("client.open(address, port).await", implementation)
         self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
         self.assertIn("local_connect_and_socks5_relay_real_tcp_with_half_close", tests)
@@ -338,7 +338,7 @@ class SpecContractTests(unittest.TestCase):
 
     def test_m31_h3_client_gate(self):
         client = read("crates/theia/src/h3_client.rs")
-        self.assertIn("quic_transport::connect", client)
+        self.assertIn("ObservedEndpoint::new", client)
         self.assertIn("bearer_header(token)?", client)
         self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
         self.assertIn("tokio::try_join!(upload, download)", client)
@@ -349,12 +349,25 @@ class SpecContractTests(unittest.TestCase):
     def test_m31_explicit_h3_cli_wiring(self):
         proxy = read("crates/theia/src/local_proxy.rs")
         self.assertIn("ProxyClient::H3", proxy)
-        self.assertIn("Transport::Auto => Err(ClientError::Configuration)", proxy)
+        self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
         server = read("crates/theia/src/server.rs")
         self.assertIn("crate::h3_server::serve(endpoint, context)", server)
         self.assertIn("tasks.spawn(serve(listener, acceptor, context.clone()))", server)
         self.assertIn("h3_server_and_client_binaries_curl_both_local_proxies",
                       read("crates/theia/tests/client_h2.rs"))
+
+    def test_m32_auto_selector_is_fail_closed(self):
+        proxy = read("crates/theia/src/local_proxy.rs")
+        quic = read("crates/theia/src/quic_transport.rs")
+        self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
+        self.assertIn("self.observation.sent.load", quic)
+        self.assertIn("!self.observation.received.load", quic)
+        self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", proxy)
+        tests = read("crates/theia/tests/client_h2.rs")
+        for name in ("auto_falls_back_only_after_udp_silence_and_uses_negative_cache",
+                     "auto_wrong_h3_certificate_never_retries_working_h2",
+                     "auto_denied_h3_bearer_never_retries_working_h2"):
+            self.assertIn(name, tests)
 
 
 if __name__ == "__main__":

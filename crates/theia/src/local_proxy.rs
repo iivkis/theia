@@ -1,5 +1,5 @@
-//! Local loopback-only CONNECT and SOCKS5 listeners for explicit H2 or H3 mode.
-//! No system proxy changes, destination DNS lookups or protocol fallback.
+//! Local loopback-only CONNECT and SOCKS5 listeners for H2, H3 or conservative QUIC-first auto mode.
+//! No system proxy changes, destination DNS lookups or live tunnel migration.
 use crate::{
     client::{ClientError, H2Client, Tunnel},
     config::{self, Config, Profile, Transport},
@@ -11,8 +11,8 @@ use std::{
     io::{BufReader, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -72,10 +72,6 @@ fn load_file(reference: &str, limit: usize, secret: bool) -> Result<Vec<u8>, Cli
 }
 
 async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
-    // Auto remains fail-closed pending explicit fallback classification.
-    if profile.transport == Transport::Auto {
-        return Err(ClientError::Configuration);
-    }
     let cert = load_file(
         profile
             .tls_ca
@@ -100,7 +96,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
         Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)
             .map(Arc::new)
             .map(ProxyClient::H2),
-        Transport::H3 => {
+        Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
             let remote = timeout(NEGOTIATE_TIMEOUT, tokio::net::lookup_host(&profile.server))
                 .await
@@ -108,11 +104,28 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 .map_err(|_| ClientError::Io)?
                 .next()
                 .ok_or(ClientError::Io)?;
-            H3Client::new(remote, &profile.server_name, &token, roots)
-                .map(Arc::new)
-                .map(ProxyClient::H3)
+            let h3 = Arc::new(
+                H3Client::new(remote, &profile.server_name, &token, roots.clone())?
+                    .with_connect_timeout(Duration::from_millis(u64::from(
+                        profile.quic_connect_timeout_ms,
+                    )))?,
+            );
+            if profile.transport == Transport::H3 {
+                return Ok(ProxyClient::H3(h3));
+            }
+            let h2 = Arc::new(H2Client::new(
+                &profile.server,
+                &profile.server_name,
+                &token,
+                roots,
+            )?);
+            Ok(ProxyClient::Auto(Arc::new(AutoClient {
+                h2,
+                h3,
+                ttl: Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s)),
+                negative: Mutex::new(None),
+            })))
         }
-        Transport::Auto => Err(ClientError::Configuration),
     }
 }
 
@@ -120,6 +133,76 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
 enum ProxyClient {
     H2(Arc<H2Client>),
     H3(Arc<H3Client>),
+    Auto(Arc<AutoClient>),
+}
+
+struct AutoClient {
+    h2: Arc<H2Client>,
+    h3: Arc<H3Client>,
+    ttl: Duration,
+    negative: Mutex<Option<Instant>>,
+}
+
+impl AutoClient {
+    fn cached(&self, now: Instant) -> Result<bool, ClientError> {
+        let mut negative = self
+            .negative
+            .lock()
+            .map_err(|_| ClientError::Configuration)?;
+        if negative.is_some_and(|until| now < until) {
+            return Ok(true);
+        }
+        *negative = None;
+        Ok(false)
+    }
+
+    fn record(&self, now: Instant) -> Result<(), ClientError> {
+        let mut negative = self
+            .negative
+            .lock()
+            .map_err(|_| ClientError::Configuration)?;
+        *negative = if self.ttl.is_zero() {
+            None
+        } else {
+            Some(now + self.ttl)
+        };
+        Ok(())
+    }
+
+    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+        if !self.cached(Instant::now())? {
+            match self.h3.open(address.clone(), port).await {
+                Ok(tunnel) => {
+                    *self
+                        .negative
+                        .lock()
+                        .map_err(|_| ClientError::Configuration)? = None;
+                    eprintln!("transport=h3");
+                    return Ok(ProxyTunnel::H3(Box::new(tunnel)));
+                }
+                Err(ClientError::QuicUnreachable) => {
+                    self.record(Instant::now())?;
+                    eprintln!("transport=h2 reason=quic_unreachable");
+                }
+                Err(error) => {
+                    // PKI, auth, partial handshakes, protocol, ACL and all
+                    // post-handshake failures never permit retry over H2.
+                    *self
+                        .negative
+                        .lock()
+                        .map_err(|_| ClientError::Configuration)? = None;
+                    return Err(error);
+                }
+            }
+        } else {
+            eprintln!("transport=h2 reason=quic_negative_cache");
+        }
+        self.h2
+            .open(address, port)
+            .await
+            .map(Box::new)
+            .map(ProxyTunnel::H2)
+    }
 }
 
 enum ProxyTunnel {
@@ -140,6 +223,7 @@ impl ProxyClient {
                 .await
                 .map(Box::new)
                 .map(ProxyTunnel::H3),
+            Self::Auto(client) => client.open(address, port).await,
         }
     }
 }
@@ -427,9 +511,9 @@ async fn handle(
                     ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => {
                         HTTP_DENIED
                     }
-                    ClientError::Timeout | ClientError::Open(ErrorCode::DialTimeout) => {
-                        HTTP_TIMEOUT
-                    }
+                    ClientError::Timeout
+                    | ClientError::QuicUnreachable
+                    | ClientError::Open(ErrorCode::DialTimeout) => HTTP_TIMEOUT,
                     _ => HTTP_FAILED,
                 };
                 let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
@@ -445,5 +529,36 @@ async fn handle(
             }
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    #[test]
+    fn negative_cache_expires_and_zero_ttl_disables_it() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let token = URL_SAFE_NO_PAD.encode([1; 32]);
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let mut client = AutoClient {
+            h2: Arc::new(
+                H2Client::new("127.0.0.1:443", "localhost", &token, roots.clone()).unwrap(),
+            ),
+            h3: Arc::new(H3Client::new(remote, "localhost", &token, roots).unwrap()),
+            ttl: Duration::from_secs(5),
+            negative: Mutex::new(None),
+        };
+        let now = Instant::now();
+        assert!(!client.cached(now).unwrap());
+        client.record(now).unwrap();
+        assert!(client.cached(now + Duration::from_secs(4)).unwrap());
+        assert!(!client.cached(now + Duration::from_secs(5)).unwrap());
+        client.ttl = Duration::ZERO;
+        client.record(now).unwrap();
+        assert!(!client.cached(now).unwrap());
     }
 }

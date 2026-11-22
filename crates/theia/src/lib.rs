@@ -125,8 +125,8 @@ Usage:\n\
   theia server run --config <path>\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
-\n--help, --version, config validate, server run and client run (explicit H2/H3) are implemented.\n\
-Client requires explicit H2 or H3 and tls_ca PEM bundle. Auto and TUI unavailable; system proxy is never modified.";
+\n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
+Client requires tls_ca PEM bundle. TUI unavailable; system proxy is never modified.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
@@ -139,7 +139,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia server run --config <path>\nTLS 1.3/H2 and QUIC/H3 server inbounds.")
         }
         Command::Help(Some("client")) => {
-            Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via explicit H2 or H3; requires tls_ca PEM bundle.")
+            Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")
         }
         Command::Help(Some("config")) => {
             Ok("Usage: theia config validate --config <path>\nValidate TOML v1 without reading secret values.")
