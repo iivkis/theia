@@ -1,5 +1,7 @@
 //! M3.5b2b2: zero-I/O network candidate preview, explicit planning scopes.
-use std::{io::ErrorKind, net::IpAddr};
+use std::net::IpAddr;
+#[cfg(not(target_os = "linux"))]
+use std::io::ErrorKind;
 use theia::{
     camouflage_discovery::{CandidateHost, CandidateSource, NetworkPrefix, Warning, POPULAR_HTTPS_DOMAINS},
     camouflage_interfaces::{InterfaceSource, NativeInterfaces, ObservedInterface},
