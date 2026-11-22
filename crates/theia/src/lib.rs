@@ -12,6 +12,7 @@ pub mod local_proxy;
 pub mod protocol;
 pub mod quic_transport;
 pub mod server;
+pub mod tui;
 
 use std::fmt;
 use std::path::Path;
@@ -42,6 +43,7 @@ pub enum CliError {
     Config(config::ConfigError),
     Server(server::ServerError),
     Client(client::ClientError),
+    Tui(&'static str),
 }
 
 impl CliError {
@@ -66,6 +68,7 @@ impl fmt::Display for CliError {
             Self::Config(error) => write!(f, "configuration invalid: {error}"),
             Self::Server(error) => write!(f, "server failed: {error}"),
             Self::Client(error) => write!(f, "client failed: {error}"),
+            Self::Tui(message) => write!(f, "TUI failed: {message}"),
             Self::NotImplemented(feature) => write!(
                 f,
                 "{feature} is not implemented; no network or system proxy was started"
@@ -120,7 +123,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
     }
 }
 
-const HELP: &str = "Theia 0.1.0 (M3.1 H2 server inbound, H3 inbound and local client)\n\
+const HELP: &str = "Theia 0.1.0 (H2/H3 network runtime and M4.1a read-only TUI)\n\
 Usage:\n\
   theia --help | --version\n\
   theia tui [--role server|client]\n\
@@ -128,14 +131,14 @@ Usage:\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
-Client requires tls_ca PEM bundle. TUI unavailable; system proxy is never modified.";
+Client requires tls_ca PEM bundle. TUI is read-only; system proxy is never modified.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
     match command {
         Command::Help(None) => Ok(HELP),
         Command::Help(Some("tui")) => {
-            Ok("Usage: theia tui [--role server|client]\nTUI is not implemented.")
+            Ok("Usage: theia tui [--role server|client]\nRead-only keyboard navigation; no configuration editing or system proxy changes.")
         }
         Command::Help(Some("server")) => {
             Ok("Usage: theia server run --config <path>\nTLS 1.3/H2 and QUIC/H3 server inbounds.")

@@ -1,0 +1,22 @@
+# Temporary PR-only dependency-lock probe. Delete before merge.
+name: M4.1a temporary lockfile probe
+on:
+  push:
+    branches:
+      - feat/m4-1a-tui-landing
+permissions:
+  contents: read
+jobs:
+  lock-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve dependencies and print Cargo.lock for branch update
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch
+          echo THEIA_BEGIN_LOCK
+          base64 -w 2000 Cargo.lock
+          echo THEIA_END_LOCK
