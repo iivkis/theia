@@ -1,14 +1,27 @@
 //! M3.1a: QUIC/TLS composition root for both H3 peers.
-//! Not yet wired into client/server runtime or the transport selector.
+//! A separately observed UDP handshake permits conservative fallback.
 use quinn::{
     crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig},
-    Connection, Endpoint, TransportConfig, VarInt,
+    AsyncUdpSocket, Connection, Endpoint, EndpointConfig, Runtime, TokioRuntime, TransportConfig,
+    UdpPoller, VarInt,
 };
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
     RootCertStore,
 };
-use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    io::{self, IoSliceMut},
+    net::{SocketAddr, UdpSocket},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+use quinn::udp::{RecvMeta, Transmit};
 use tokio::time::timeout;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -20,6 +33,7 @@ pub enum QuicError {
     Bind,
     Handshake,
     Timeout,
+    Unreachable,
     Alpn,
     CongestionController,
 }
@@ -32,6 +46,7 @@ impl fmt::Display for QuicError {
             Self::Bind => "UDP bind failed",
             Self::Handshake => "QUIC handshake failed",
             Self::Timeout => "QUIC handshake timed out",
+            Self::Unreachable => "quic_unreachable",
             Self::Alpn => "QUIC ALPN mismatch",
             Self::CongestionController => "QUIC BBR controller unavailable",
         })
@@ -75,6 +90,12 @@ pub fn server_endpoint(
 }
 
 pub fn client_endpoint(bind: SocketAddr, roots: RootCertStore) -> Result<Endpoint, QuicError> {
+    let mut endpoint = Endpoint::client(bind).map_err(|_| QuicError::Bind)?;
+    endpoint.set_default_client_config(client_config(roots)?);
+    Ok(endpoint)
+}
+
+fn client_config(roots: RootCertStore) -> Result<quinn::ClientConfig, QuicError> {
     if roots.is_empty() {
         return Err(QuicError::Configuration);
     }
@@ -90,9 +111,7 @@ pub fn client_endpoint(bind: SocketAddr, roots: RootCertStore) -> Result<Endpoin
     let crypto = QuicClientConfig::try_from(tls).map_err(|_| QuicError::Configuration)?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(transport_config());
-    let mut endpoint = Endpoint::client(bind).map_err(|_| QuicError::Bind)?;
-    endpoint.set_default_client_config(config);
-    Ok(endpoint)
+    Ok(config)
 }
 
 /// Verify the actually negotiated protocol and active controller, not just
@@ -153,4 +172,121 @@ pub async fn accept(incoming: quinn::Incoming) -> Result<Connection, QuicError> 
         .map_err(|_| QuicError::Timeout)?
         .map_err(|_| QuicError::Handshake)?;
     checked(connection)
+}
+
+/// A fresh socket for exactly one candidate. Any received datagram, even an
+/// invalid one, disables no-response fallback. This is intentionally stricter
+/// than interpreting every QUIC timeout as blocked UDP.
+#[derive(Debug)]
+struct Observation {
+    io: Arc<dyn AsyncUdpSocket>,
+    sent: AtomicBool,
+    received: AtomicBool,
+}
+
+impl AsyncUdpSocket for Observation {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        self.io.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+        self.io.try_send(transmit)?;
+        self.sent.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let result = self.io.poll_recv(cx, bufs, meta);
+        if matches!(&result, Poll::Ready(Ok(n)) if *n > 0) {
+            self.received.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.io.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.io.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.io.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.io.may_fragment()
+    }
+}
+
+pub(crate) struct ObservedEndpoint {
+    pub endpoint: Endpoint,
+    observation: Arc<Observation>,
+}
+
+impl ObservedEndpoint {
+    pub fn new(bind: SocketAddr, roots: RootCertStore) -> Result<Self, QuicError> {
+        let config = client_config(roots)?;
+        let runtime = Arc::new(TokioRuntime);
+        let udp = UdpSocket::bind(bind).map_err(|_| QuicError::Bind)?;
+        udp.set_nonblocking(true).map_err(|_| QuicError::Bind)?;
+        let io = runtime.wrap_udp_socket(udp).map_err(|_| QuicError::Bind)?;
+        let observation = Arc::new(Observation {
+            io,
+            sent: AtomicBool::new(false),
+            received: AtomicBool::new(false),
+        });
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            observation.clone(),
+            runtime,
+        )
+        .map_err(|_| QuicError::Bind)?;
+        endpoint.set_default_client_config(config);
+        Ok(Self {
+            endpoint,
+            observation,
+        })
+    }
+
+    pub async fn connect(
+        &self,
+        remote: SocketAddr,
+        name: &str,
+        deadline: Duration,
+    ) -> Result<Connection, QuicError> {
+        if !matches!(ServerName::try_from(name), Ok(ServerName::DnsName(_))) {
+            return Err(QuicError::Configuration);
+        }
+        let pending = self
+            .endpoint
+            .connect(remote, name)
+            .map_err(|_| QuicError::Configuration)?;
+        match timeout(deadline, pending).await {
+            Ok(Ok(connection)) => checked(connection),
+            Ok(Err(quinn::ConnectionError::TimedOut)) | Err(_) => {
+                if self.observation.sent.load(Ordering::SeqCst)
+                    && !self.observation.received.load(Ordering::SeqCst)
+                {
+                    Err(QuicError::Unreachable)
+                } else {
+                    Err(QuicError::Timeout)
+                }
+            }
+            Ok(Err(_)) => Err(QuicError::Handshake),
+        }
+    }
+}
+
+impl Drop for ObservedEndpoint {
+    fn drop(&mut self) {
+        self.endpoint.close(0u32.into(), b"client closed");
+    }
 }
