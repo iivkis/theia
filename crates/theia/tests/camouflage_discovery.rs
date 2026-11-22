@@ -113,6 +113,7 @@ fn approved_ipv4_range_cannot_expand_beyond_assigned_interface_prefix() {
             POPULAR_HTTPS_DOMAINS.len() + 1,
             "prefix {assigned_prefix} expanded beyond the assigned range"
         );
+        assert!(plan.warnings.contains(&Warning::RangeExceedsAssignedPrefix));
     }
 
     // A subset of the assigned /29 is still eligible with explicit approval.
