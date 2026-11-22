@@ -160,9 +160,11 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
             }
             observation
         });
+        let reference_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/e2e/chromium_h2_reference.py");
         let launched = tokio::task::spawn_blocking(move || {
             Command::new("python")
-                .arg("tests/e2e/chromium_h2_reference.py")
+                .arg(reference_script)
                 .arg(&endpoint)
                 .output()
                 .expect("Playwright Chromium runner available in CI")
