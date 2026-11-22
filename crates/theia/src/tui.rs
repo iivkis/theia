@@ -1393,8 +1393,10 @@ mod tests {
         assert!(ui.candidate_batch.is_some());
         assert!(!ui.candidate_batch.as_ref().unwrap().is_running());
         let displayed = rendered_interaction(120, 40, &model, &ui);
-        assert!(displayed.contains("нет серверной конфигурации") ||
-                displayed.contains("Нет серверной конфигурации"));
+        assert!(
+            displayed.contains("нет серверной конфигурации")
+                || displayed.contains("Нет серверной конфигурации")
+        );
         ui.update(&mut model, press(KeyCode::Enter));
         ui.update(&mut model, press(KeyCode::Char('y')));
         assert!(!ui.candidate_batch.as_ref().unwrap().is_running());
