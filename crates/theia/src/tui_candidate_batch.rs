@@ -516,8 +516,7 @@ mod tests {
             None,
             PreviewScope::PassiveOnly,
         );
-        let mut unavailable =
-            CandidateBatchPanel::new(preview, Some("proxy.example.org".into()));
+        let mut unavailable = CandidateBatchPanel::new(preview, Some("proxy.example.org".into()));
         assert_eq!(unavailable.available_count(), 0);
         unavailable.toggle_current();
         unavailable.ask_confirmation();
