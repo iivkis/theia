@@ -210,13 +210,11 @@ async fn connection_window_update_is_a_separate_resource_risk_not_an_h2_settings
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chromium159_settings_with_separate_research_connection_credit() {
-    let observed = capture_first_flight(H2Shape::Chrome159SettingsWithResearchCredit, post(true)).await;
+    let observed =
+        capture_first_flight(H2Shape::Chrome159SettingsWithResearchCredit, post(true)).await;
     assert_eq!(observed.observation.settings, CHROME159_SETTINGS);
     assert_eq!(observed.observation.frames_before_headers, [8]);
-    assert_eq!(
-        observed.connection_updates,
-        [RESEARCH_CONNECTION_INCREMENT]
-    );
+    assert_eq!(observed.connection_updates, [RESEARCH_CONNECTION_INCREMENT]);
     // SETTINGS and flow credit can match; pseudo-header order cannot be
     // configured via documented h2::client::Builder APIs in h2 0.4.19.
     assert_eq!(observed.observation.pseudo_headers, THEIA_PSEUDOS);
