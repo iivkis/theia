@@ -69,14 +69,24 @@ pub(crate) fn bearer_header(token: &str) -> Result<HeaderValue, ClientError> {
     Ok(authorization)
 }
 
-/// One explicit H2 endpoint. Each opened tunnel currently uses its own
-/// TLS connection and owns its driver; no automatic fallback or pooling.
+enum H2Tls {
+    Rustls(TlsConnector),
+    #[cfg(feature = "experimental-btls-h2")]
+    Btls {
+        server_name: String,
+        trusted_ca_pem: Arc<[u8]>,
+    },
+}
+
+/// One explicit H2 endpoint. Every tunnel owns a dedicated, verified TLS/H2
+/// connection driver. The default backend remains rustls; an experimental
+/// BoringSSL backend is only available through an explicit feature-gated API.
 pub struct H2Client {
     endpoint: String,
     server_name: ServerName<'static>,
     uri: http::Uri,
     authorization: HeaderValue,
-    connector: TlsConnector,
+    connector: H2Tls,
 }
 
 impl H2Client {
@@ -89,6 +99,51 @@ impl H2Client {
         if roots.is_empty() {
             return Err(ClientError::Configuration);
         }
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| ClientError::Tls)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        tls.enable_early_data = false;
+        Self::with_connector(
+            endpoint,
+            name,
+            token,
+            H2Tls::Rustls(TlsConnector::from(Arc::new(tls))),
+        )
+    }
+
+    /// Experimental API only: build a separately verified BoringSSL connector
+    /// with one explicit CA PEM. Not selected by TOML, H3 or the default CLI;
+    /// never treat this as a named Chrome/browser fingerprint.
+    #[cfg(feature = "experimental-btls-h2")]
+    pub fn new_experimental_btls(
+        endpoint: &str,
+        name: &str,
+        token: &str,
+        trusted_ca_pem: &[u8],
+    ) -> Result<Self, ClientError> {
+        crate::h2_btls::validate_ca(trusted_ca_pem)?;
+        Self::with_connector(
+            endpoint,
+            name,
+            token,
+            H2Tls::Btls {
+                server_name: name.to_owned(),
+                trusted_ca_pem: Arc::from(trusted_ca_pem),
+            },
+        )
+    }
+
+    fn with_connector(
+        endpoint: &str,
+        name: &str,
+        token: &str,
+        connector: H2Tls,
+    ) -> Result<Self, ClientError> {
         let authorization = bearer_header(token)?;
         let authority: http::uri::Authority =
             endpoint.parse().map_err(|_| ClientError::Configuration)?;
@@ -103,21 +158,12 @@ impl H2Client {
             .path_and_query("/v1/session")
             .build()
             .map_err(|_| ClientError::Configuration)?;
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| ClientError::Tls)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        tls.alpn_protocols = vec![b"h2".to_vec()];
-        tls.enable_early_data = false;
         Ok(Self {
             endpoint: endpoint.to_owned(),
             server_name,
             uri,
             authorization,
-            connector: TlsConnector::from(Arc::new(tls)),
+            connector,
         })
     }
 
@@ -136,25 +182,28 @@ impl H2Client {
         let socket = TcpStream::connect(self.endpoint.as_str())
             .await
             .map_err(|_| ClientError::Io)?;
-        let tls = self
-            .connector
-            .connect(self.server_name.clone(), socket)
-            .await
-            .map_err(|_| ClientError::Tls)?;
-        if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-            return Err(ClientError::Tls);
-        }
-        let mut builder = h2::client::Builder::new();
-        builder.max_header_list_size(8192);
-        let (mut sender, connection) = builder
-            .handshake(tls)
-            .await
-            .map_err(|_| ClientError::Http2)?;
-        let driver = Driver(tokio::spawn(async move {
-            let _ = connection.await;
-        }));
-        // The request, including the credential, is constructed and sent
-        // only after rustls has verified certificate, name and TLS handshake.
+        let (mut sender, driver) = match &self.connector {
+            H2Tls::Rustls(connector) => {
+                let tls = connector
+                    .connect(self.server_name.clone(), socket)
+                    .await
+                    .map_err(|_| ClientError::Tls)?;
+                if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+                    return Err(ClientError::Tls);
+                }
+                start_h2(tls).await?
+            }
+            #[cfg(feature = "experimental-btls-h2")]
+            H2Tls::Btls {
+                server_name,
+                trusted_ca_pem,
+            } => {
+                let tls = crate::h2_btls::connect(socket, server_name, trusted_ca_pem).await?;
+                start_h2(tls).await?
+            }
+        };
+        // Build and send the credential-bearing POST ONLY after the selected
+        // backend verified TLS identity and ALPN and established HTTP/2.
         let request = Request::post(self.uri.clone())
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::AUTHORIZATION, self.authorization.clone())
@@ -215,6 +264,26 @@ impl H2Client {
             _ => Err(ClientError::Protocol),
         }
     }
+}
+
+/// Same HTTP/2 transport engine and ownership regardless of verified TLS
+/// backend. The SmartTheia HELLO/OPEN_OK state machine below is shared.
+async fn start_h2<S>(
+    tls: S,
+) -> Result<(h2::client::SendRequest<Bytes>, Driver), ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut builder = h2::client::Builder::new();
+    builder.max_header_list_size(8192);
+    let (sender, connection) = builder
+        .handshake(tls)
+        .await
+        .map_err(|_| ClientError::Http2)?;
+    let driver = Driver(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
+    Ok((sender, driver))
 }
 
 struct Driver(JoinHandle<()>);
