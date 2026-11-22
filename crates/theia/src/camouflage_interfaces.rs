@@ -39,6 +39,13 @@ impl NativeInterfaces {
             interfaces: self
                 .interfaces
                 .iter()
+                .filter(|observed| {
+                    observed.is_up
+                        && match observed.address {
+                            IpAddr::V4(_) => (1..=32).contains(&observed.prefix_len),
+                            IpAddr::V6(_) => (1..=128).contains(&observed.prefix_len),
+                        }
+                })
                 .map(|observed| InterfaceAddress {
                     address: observed.address,
                     prefix_len: observed.prefix_len,
