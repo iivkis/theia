@@ -323,6 +323,19 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("client_binary_chromium_socks5 -- --ignored --exact", workflow)
         self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
 
+    def test_m31_h3_server_reuses_security_boundary(self):
+        h2 = read("crates/theia/src/server.rs")
+        h3 = read("crates/theia/src/h3_server.rs")
+        self.assertIn("context.authorize_request", h2)
+        self.assertIn("context.authorize_request", h3)
+        self.assertIn("context.dial_target", h2)
+        self.assertIn("context.dial_target", h3)
+        self.assertIn("Frame::OpenOk", h3)
+        self.assertIn("tokio::try_join!(upload, download)", h3)
+        tests = read("crates/theia/tests/h3_server.rs")
+        self.assertIn("authenticated_h3_server_relays_tcp_before_request_fin_and_after_half_close", tests)
+        self.assertIn("h3_rejects_missing_wrong_and_ungranted_bearers_and_denied_tcp", tests)
+
 
 if __name__ == "__main__":
     unittest.main()
