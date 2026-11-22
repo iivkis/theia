@@ -800,7 +800,12 @@ fn check_certificate_name(
     rustls::client::verify_server_name(&cert, &name).map_err(|_| ServerError::Tls)
 }
 
-fn tls_acceptor(inbound: &Inbound) -> Result<TlsAcceptor, ServerError> {
+struct TlsMaterial {
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     let cert_bytes = pem_data(&inbound.tls_cert, false)?;
     let key_bytes = pem_data(&inbound.tls_key, true)?;
     let mut cert_reader = BufReader::new(cert_bytes.as_slice());
@@ -812,6 +817,13 @@ fn tls_acceptor(inbound: &Inbound) -> Result<TlsAcceptor, ServerError> {
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes.as_slice()))
         .map_err(|_| ServerError::Config)?
         .ok_or(ServerError::Config)?;
+    Ok(TlsMaterial { certs, key })
+}
+
+fn tls_acceptor(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<TlsAcceptor, ServerError> {
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -825,8 +837,7 @@ fn tls_acceptor(inbound: &Inbound) -> Result<TlsAcceptor, ServerError> {
     Ok(TlsAcceptor::from(Arc::new(tls)))
 }
 
-/// Bind and prepare all H2 listeners before launching tasks. H3 remains an
-/// explicit missing milestone; this function does not claim QUIC readiness.
+/// Prepare all TCP and UDP listeners and TLS identity before launching tasks.
 pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
     let parsed = config::read_file(config_path).map_err(|_| ServerError::Config)?;
     let Config::Server(document) = parsed else {
@@ -859,8 +870,19 @@ pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
     let mut prepared = Vec::new();
     for inbound in &document.server.inbounds {
         let addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
-        let acceptor = tls_acceptor(inbound)?;
+        let udp_addr: SocketAddr = inbound.quic_listen.parse().map_err(|_| ServerError::Config)?;
+        let material = tls_material(inbound)?;
+        let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         let listener = TcpListener::bind(addr).await.map_err(|_| ServerError::Io)?;
+        let endpoint = crate::quic_transport::server_endpoint(
+            udp_addr,
+            material.certs,
+            material.key,
+        )
+        .map_err(|error| match error {
+            crate::quic_transport::QuicError::Bind => ServerError::Io,
+            _ => ServerError::Tls,
+        })?;
         let context = Arc::new(ServerContext::with_limits(
             inbound,
             &document.server.users,
@@ -870,11 +892,12 @@ pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
             connections.clone(),
             peer_budget.clone(),
         ));
-        prepared.push((listener, acceptor, context));
+        prepared.push((listener, acceptor, endpoint, context));
     }
     let mut tasks = JoinSet::new();
-    for (listener, acceptor, context) in prepared {
-        tasks.spawn(serve(listener, acceptor, context));
+    for (listener, acceptor, endpoint, context) in prepared {
+        tasks.spawn(serve(listener, acceptor, context.clone()));
+        tasks.spawn(crate::h3_server::serve(endpoint, context));
     }
     match tasks.join_next().await {
         Some(Ok(result)) => result,

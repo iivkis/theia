@@ -310,7 +310,7 @@ class SpecContractTests(unittest.TestCase):
         client = read("crates/theia/src/client.rs")
         tests = read("crates/theia/tests/client_h2.rs")
         self.assertIn("local_proxy::run_file(", read("crates/theia/src/main.rs"))
-        self.assertIn("profile.transport != Transport::H2", implementation)
+        self.assertIn("profile.transport == Transport::Auto", implementation)
         self.assertIn("client.open(address, port).await", implementation)
         self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
         self.assertIn("local_connect_and_socks5_relay_real_tcp_with_half_close", tests)
