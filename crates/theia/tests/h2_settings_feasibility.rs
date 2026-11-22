@@ -9,10 +9,10 @@ use tokio::{
 };
 
 const CHROMIUM_SETTINGS: [(u16, u32); 4] = [
-    (1, 65_536),  // HPACK header table size, Chromium 159 control
-    (2, 0),       // server push disabled
+    (1, 65_536),    // HPACK header table size, Chromium 159 control
+    (2, 0),         // server push disabled
     (4, 6_291_456), // per-stream receive credit, NOT a safe default
-    (6, 262_144), // max header list, 32x Theia's 8 KiB security budget
+    (6, 262_144),   // max header list, 32x Theia's 8 KiB security budget
 ];
 const MAX_HEADER_LIST_THEIA: u32 = 8_192;
 const DEFAULT_STREAM_WINDOW: u32 = 65_535;
@@ -23,10 +23,11 @@ async fn read_first_client_settings(peer: &mut DuplexStream) -> Vec<(u16, u32)> 
     assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 
     let mut frame = [0u8; 9];
-    peer.read_exact(&mut frame).await.expect("SETTINGS frame header");
-    let length = (usize::from(frame[0]) << 16)
-        | (usize::from(frame[1]) << 8)
-        | usize::from(frame[2]);
+    peer.read_exact(&mut frame)
+        .await
+        .expect("SETTINGS frame header");
+    let length =
+        (usize::from(frame[0]) << 16) | (usize::from(frame[1]) << 8) | usize::from(frame[2]);
     assert_eq!(frame[3], 4, "first frame must be SETTINGS");
     assert_eq!(frame[4], 0, "client initial SETTINGS cannot be ACK");
     assert_eq!(&frame[5..], &[0, 0, 0, 0], "SETTINGS must use stream zero");
