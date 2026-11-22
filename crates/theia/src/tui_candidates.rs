@@ -87,8 +87,12 @@ impl CandidateReview {
     fn scoped_plan(&self) -> DiscoveryPlan {
         match self.scope {
             ScopeState::Accepted(prefix) => {
-                build_preview(&self.native, None, PreviewScope::OperatorApprovedCidrs(&[prefix]))
-                    .plan
+                build_preview(
+                    &self.native,
+                    None,
+                    PreviewScope::OperatorApprovedCidrs(&[prefix]),
+                )
+                .plan
             }
             _ => build_preview(&self.native, None, PreviewScope::PassiveOnly).plan,
         }
@@ -115,8 +119,11 @@ impl CandidateReview {
             self.warning = Some("Только IPv4 /24..=/32. IPv6 соседей нельзя перечислять.");
             return;
         }
-        let preview =
-            build_preview(&self.native, None, PreviewScope::OperatorApprovedCidrs(&[prefix]));
+        let preview = build_preview(
+            &self.native,
+            None,
+            PreviewScope::OperatorApprovedCidrs(&[prefix]),
+        );
         let blocked = preview.plan.warnings.iter().any(|warning| {
             matches!(
                 warning,
@@ -171,7 +178,10 @@ impl CandidateReview {
     /// Esc discards unconfirmed text/preview first, then closes the pane.
     /// The accepted scope also vanishes when the pane is dropped.
     pub(crate) fn back_or_close(&mut self) -> bool {
-        if matches!(self.scope, ScopeState::Input(_) | ScopeState::Confirm { .. }) {
+        if matches!(
+            self.scope,
+            ScopeState::Input(_) | ScopeState::Confirm { .. }
+        ) {
             self.scope = ScopeState::Overview;
             self.warning = None;
             false
