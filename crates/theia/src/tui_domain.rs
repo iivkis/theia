@@ -69,7 +69,7 @@ impl DomainPanel {
             .filter(|name| {
                 preview.plan.candidates.iter().any(|candidate| {
                     candidate.source == CandidateSource::PopularDomain
-                        && candidate.host == CandidateHost::Domain(*name)
+                        && candidate.host == CandidateHost::Domain(name)
                 })
             })
             .collect();
