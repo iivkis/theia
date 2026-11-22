@@ -60,7 +60,11 @@ impl DualBatchReport {
     pub fn dual_verified_count(&self) -> usize {
         self.results
             .iter()
-            .filter(|item| item.result.as_ref().is_ok_and(|r| r.both_transports_verified()))
+            .filter(|item| {
+                item.result
+                    .as_ref()
+                    .is_ok_and(|r| r.both_transports_verified())
+            })
             .count()
     }
 
@@ -130,8 +134,7 @@ pub async fn probe_dual_batch(
             let plan = preview.clone();
             tasks.spawn(async move {
                 let address = item.target.request.address;
-                let result =
-                    probe_dual_h2_h3_with_consent(&plan, item.target, item.consent).await;
+                let result = probe_dual_h2_h3_with_consent(&plan, item.target, item.consent).await;
                 (index, DualBatchOutcome { address, result })
             });
         }
