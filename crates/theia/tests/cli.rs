@@ -23,9 +23,10 @@ fn help_and_version_exit_successfully() {
 #[test]
 fn accepted_runtime_commands_fail_closed() {
     let result = invoke(&["tui", "--role", "client"]);
-    assert_eq!(result.status.code(), Some(3));
+    // Non-interactive CI process must fail before raw mode, network or OS changes.
+    assert_eq!(result.status.code(), Some(2));
     assert!(result.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("not implemented"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("interactive terminal required"));
 }
 
 #[test]

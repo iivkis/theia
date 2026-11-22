@@ -1,5 +1,5 @@
 use std::path::Path;
-use theia::{execute, local_proxy, parse, server, CliError, Command};
+use theia::{execute, local_proxy, parse, server, tui, CliError, Command};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -8,6 +8,9 @@ async fn main() {
         .map(|arg| arg.into_string().map_err(|_| CliError::NonUtf8Argument))
         .collect();
     let result = match args.and_then(|args| parse(&args)) {
+        Ok(Command::Tui { role }) => tui::run(role)
+            .map(|_| "tui closed")
+            .map_err(|error| CliError::Tui(error.message())),
         Ok(Command::ServerRun { config }) => server::run_file(Path::new(&config))
             .await
             .map(|_| "server stopped")
