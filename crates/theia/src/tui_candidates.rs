@@ -251,8 +251,7 @@ impl CandidateReview {
     }
 }
 
-//! M4.5c: offline candidate groups and explicit *planning-only* CIDR scope.
-//! Test-first invariants. No active probing or ownership inference.
+// M4.5c tests: offline CIDR review without network or ownership inference.
 #[cfg(test)]
 mod tests {
     use super::*;
