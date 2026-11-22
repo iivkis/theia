@@ -160,14 +160,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Generate exact Tokio 1.52.1 root lockfile (temporary bootstrap)
-        shell: pwsh
-        run: |
-          cargo update -p tokio --precise 1.52.1
-          if ($LASTEXITCODE -ne 0) { throw 'Tokio root lockfile update failed' }
-          Write-Output 'THEIA_TOKIO_LOCK_BEGIN'
-          Get-Content Cargo.lock
-          Write-Output 'THEIA_TOKIO_LOCK_END'
       - name: Tests first
         run: cargo test --workspace --all-targets --locked
       - name: Formatting
