@@ -586,18 +586,14 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-
     #[test]
     fn ctrl_s_saves_in_worker_then_navigation_continues() {
         use crate::config::{self, Config};
         use std::{fs, thread, time::Instant};
-        let path = std::env::temp_dir().join(format!(
-            "theia-tui-save-ui-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("theia-tui-save-ui-{}.toml", std::process::id()));
         fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
-        let mut interaction =
-            Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut interaction = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
         assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
         interaction.editor.as_mut().unwrap().input = "changed.example.org:443".into();
@@ -617,7 +613,10 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         };
-        assert!(finished, "save must complete queued quit after confirmed write");
+        assert!(
+            finished,
+            "save must complete queued quit after confirmed write"
+        );
         assert!(interaction.editor.as_ref().unwrap().error.is_none());
         let Config::Client(doc) = config::read_file(&path).unwrap() else {
             panic!("client expected");
