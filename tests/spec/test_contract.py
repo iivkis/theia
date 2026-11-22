@@ -310,7 +310,7 @@ class SpecContractTests(unittest.TestCase):
         client = read("crates/theia/src/client.rs")
         tests = read("crates/theia/tests/client_h2.rs")
         self.assertIn("local_proxy::run_file(", read("crates/theia/src/main.rs"))
-        self.assertIn("profile.transport != Transport::H2", implementation)
+        self.assertIn("profile.transport == Transport::Auto", implementation)
         self.assertIn("client.open(address, port).await", implementation)
         self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
         self.assertIn("local_connect_and_socks5_relay_real_tcp_with_half_close", tests)
@@ -345,6 +345,16 @@ class SpecContractTests(unittest.TestCase):
         tests = read("crates/theia/tests/h3_server.rs")
         self.assertIn("production_h3_client_and_server_relay_exact_bytes", tests)
         self.assertIn("production_h3_client_rejects_tls_bearer_and_acl_failures", tests)
+
+    def test_m31_explicit_h3_cli_wiring(self):
+        proxy = read("crates/theia/src/local_proxy.rs")
+        self.assertIn("ProxyClient::H3", proxy)
+        self.assertIn("Transport::Auto => Err(ClientError::Configuration)", proxy)
+        server = read("crates/theia/src/server.rs")
+        self.assertIn("crate::h3_server::serve(endpoint, context)", server)
+        self.assertIn("tasks.spawn(serve(listener, acceptor, context.clone()))", server)
+        self.assertIn("h3_server_and_client_binaries_curl_both_local_proxies",
+                      read("crates/theia/tests/client_h2.rs"))
 
 
 if __name__ == "__main__":

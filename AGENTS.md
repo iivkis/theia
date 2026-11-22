@@ -96,3 +96,5 @@ M3.1a: production QUIC composition root only; strict full TLS1.3 handshake, ALPN
 M3.1b: both H2/H3 share a single request authorization/admission routine and ServerContext quotas. H3 library server accepts verified QUIC, limits headers/handlers/session, dials only vetted candidates, sends OPEN_OK after TCP success, owns connection/stream tasks. No H3 CLI or selector yet; tests must pass before claiming working H3 server. No weakening TLS or bearer/ACL.
 
 M3.1c: H3Client uses explicit server SocketAddr, verified full QUIC handshake before auth, active BBR, shared bearer header validation and private OPEN_OK-gated H3Tunnel. Dedicated owned endpoint and driver cancel on drop. No fallback or CLI enabling before integration; no local DNS for targets. CI-only tests against production H3 server.
+
+M3.1d: explicit H3 server/client CLI integration, one common local proxy parser and OPEN_OK acknowledgement gate; shared inbound/global connection and user quotas for TCP/H2 and UDP/H3. Auto still fails closed. No claimed fallback or browser TLS fingerprint; only CI checks acceptance.

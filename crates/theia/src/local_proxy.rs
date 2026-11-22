@@ -1,8 +1,9 @@
-//! Local loopback-only CONNECT and SOCKS5 listeners for explicit H2 mode.
+//! Local loopback-only CONNECT and SOCKS5 listeners for explicit H2 or H3 mode.
 //! No system proxy changes, destination DNS lookups or protocol fallback.
 use crate::{
-    client::{ClientError, H2Client},
+    client::{ClientError, H2Client, Tunnel},
     config::{self, Config, Profile, Transport},
+    h3_client::{H3Client, H3Tunnel},
     protocol::{self, Address, ErrorCode, Frame},
 };
 use rustls::RootCertStore;
@@ -70,9 +71,9 @@ fn load_file(reference: &str, limit: usize, secret: bool) -> Result<Vec<u8>, Cli
     Ok(data)
 }
 
-fn load_client(profile: &Profile) -> Result<H2Client, ClientError> {
-    // Auto is not H2. The missing H3 selector must not silently downgrade.
-    if profile.transport != Transport::H2 {
+async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
+    // Auto remains fail-closed pending explicit fallback classification.
+    if profile.transport == Transport::Auto {
         return Err(ClientError::Configuration);
     }
     let cert = load_file(
@@ -95,7 +96,61 @@ fn load_client(profile: &Profile) -> Result<H2Client, ClientError> {
         let token = load_file(&profile.auth_token, 43, true)?;
         String::from_utf8(token).map_err(|_| ClientError::Configuration)?
     };
-    H2Client::new(&profile.server, &profile.server_name, &token, roots)
+    match profile.transport {
+        Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)
+            .map(Arc::new)
+            .map(ProxyClient::H2),
+        Transport::H3 => {
+            // Resolve the configured server only, never the requested target.
+            let remote = timeout(NEGOTIATE_TIMEOUT, tokio::net::lookup_host(&profile.server))
+                .await
+                .map_err(|_| ClientError::Timeout)?
+                .map_err(|_| ClientError::Io)?
+                .next()
+                .ok_or(ClientError::Io)?;
+            H3Client::new(remote, &profile.server_name, &token, roots)
+                .map(Arc::new)
+                .map(ProxyClient::H3)
+        }
+        Transport::Auto => Err(ClientError::Configuration),
+    }
+}
+
+#[derive(Clone)]
+enum ProxyClient {
+    H2(Arc<H2Client>),
+    H3(Arc<H3Client>),
+}
+
+enum ProxyTunnel {
+    H2(Box<Tunnel>),
+    H3(Box<H3Tunnel>),
+}
+
+impl ProxyClient {
+    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+        match self {
+            Self::H2(client) => client
+                .open(address, port)
+                .await
+                .map(Box::new)
+                .map(ProxyTunnel::H2),
+            Self::H3(client) => client
+                .open(address, port)
+                .await
+                .map(Box::new)
+                .map(ProxyTunnel::H3),
+        }
+    }
+}
+
+impl ProxyTunnel {
+    async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
+        match self {
+            Self::H2(tunnel) => tunnel.relay(socket).await,
+            Self::H3(tunnel) => tunnel.relay(socket).await,
+        }
+    }
 }
 
 pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
@@ -110,7 +165,7 @@ pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
         .iter()
         .find(|p| p.id == document.client.active_profile)
         .ok_or(ClientError::Configuration)?;
-    let client = Arc::new(load_client(profile)?);
+    let client = load_client(profile).await?;
     // All startup validation and both binds must succeed before accepting.
     let http = TcpListener::bind(&document.client.proxy.http_listen)
         .await
@@ -118,13 +173,21 @@ pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
     let socks = TcpListener::bind(&document.client.proxy.socks5_listen)
         .await
         .map_err(|_| ClientError::Io)?;
-    serve(http, socks, client).await
+    serve_proxy(http, socks, client).await
 }
 
 pub async fn serve(
     http: TcpListener,
     socks: TcpListener,
     client: Arc<H2Client>,
+) -> Result<(), ClientError> {
+    serve_proxy(http, socks, ProxyClient::H2(client)).await
+}
+
+async fn serve_proxy(
+    http: TcpListener,
+    socks: TcpListener,
+    client: ProxyClient,
 ) -> Result<(), ClientError> {
     // Preserve the boundary even for callers bypassing TOML validation.
     for listener in [&http, &socks] {
@@ -327,7 +390,7 @@ async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientEr
 async fn handle(
     mut socket: TcpStream,
     is_http: bool,
-    client: &H2Client,
+    client: &ProxyClient,
 ) -> Result<(), ClientError> {
     let (address, port) = if is_http {
         match timeout(NEGOTIATE_TIMEOUT, http_target(&mut socket)).await {

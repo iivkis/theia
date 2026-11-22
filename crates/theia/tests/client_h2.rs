@@ -361,6 +361,7 @@ async fn launch_client(
     endpoint: String,
     pem: String,
     label: &str,
+    transport: theia::config::Transport,
 ) -> (
     TestDirectory,
     ChildProcess,
@@ -388,7 +389,7 @@ async fn launch_client(
     let profile = &mut doc.client.profiles[0];
     profile.server = endpoint;
     profile.server_name = "localhost".into();
-    profile.transport = theia::config::Transport::H2;
+    profile.transport = transport;
     profile.tls_ca = Some(format!("file:{}", ca_path.display()));
     profile.auth_token = "env:THEIA_CI_TEST_TOKEN".into();
     doc.client.proxy.http_listen = http.to_string();
@@ -442,7 +443,8 @@ async fn client_binary_curl_connect_and_socks5h() {
                 socket.shutdown().await.unwrap();
             }
         });
-        let (_dir, mut child, http, socks) = launch_client(endpoint, pem, "curl").await;
+        let (_dir, mut child, http, socks) =
+            launch_client(endpoint, pem, "curl", theia::config::Transport::H2).await;
 
         // --disable ignores any user curlrc. --noproxy "" prevents the
         // standard localhost bypass. HTTP mode must actually use CONNECT.
@@ -493,7 +495,7 @@ async fn client_binary_curl_connect_and_socks5h() {
 async fn client_binary_chromium_socks5() {
     timeout(Duration::from_secs(75), async {
         let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
-        let (_dir, mut child, _http, socks) = launch_client(endpoint, pem, "browser").await;
+        let (_dir, mut child, _http, socks) = launch_client(endpoint, pem, "browser", theia::config::Transport::H2).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
         let origin = tokio::spawn(async move {
@@ -564,4 +566,127 @@ async fn client_binary_chromium_socks5() {
     })
     .await
     .expect("bounded executable + Chromium CI scenario");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h3_server_and_client_binaries_curl_both_local_proxies() {
+    timeout(Duration::from_secs(60), async {
+        let dir = TestDirectory(
+            std::env::temp_dir().join(format!("theia-h3-server-ci-{}", std::process::id())),
+        );
+        std::fs::create_dir(&dir.0).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let pem = cert.cert.pem();
+        let cert_path = dir.0.join("cert.pem");
+        let key_path = dir.0.join("key.pem");
+        std::fs::write(&cert_path, &pem).unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        {
+            use std::io::Write;
+            let mut key = options.open(&key_path).unwrap();
+            key.write_all(cert.key_pair.serialize_pem().as_bytes())
+                .unwrap();
+        }
+        let tcp_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tcp = tcp_reservation.local_addr().unwrap();
+        let udp = udp_reservation.local_addr().unwrap();
+        let source = include_str!("../../../examples/server.toml").replace(
+            "REPLACE_WITH_64_LOWERCASE_HEX",
+            &format!("{:x}", Sha256::digest(TOKEN)),
+        );
+        let theia::config::Config::Server(mut doc) = theia::config::parse(&source).unwrap() else {
+            panic!("server fixture has wrong role");
+        };
+        let inbound = &mut doc.server.inbounds[0];
+        inbound.h2_listen = tcp.to_string();
+        inbound.quic_listen = udp.to_string();
+        inbound.server_name = "localhost".into();
+        inbound.tls_cert = format!("file:{}", cert_path.display());
+        inbound.tls_key = format!("file:{}", key_path.display());
+        doc.server.policy.allow_private_ips = true;
+        let config = dir.0.join("server.toml");
+        theia::config::atomic_write(&config, &theia::config::Config::Server(doc)).unwrap();
+        drop(tcp_reservation);
+        drop(udp_reservation);
+        let mut server = ChildProcess(
+            std::process::Command::new(env!("CARGO_BIN_EXE_theia"))
+                .args(["server", "run", "--config"])
+                .arg(config)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        // A successful H2 TCP bind is a readiness barrier: UDP must already
+        // have been prepared as part of the same atomic startup.
+        wait_for_proxy(tcp, &mut server).await;
+        let (_client_dir, mut client, http, socks) = launch_client(
+            udp.to_string(),
+            pem,
+            "h3-curl",
+            theia::config::Transport::H3,
+        )
+        .await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let body = b"theia-h3-cli-ci-origin";
+        let origin = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = target.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 8192);
+                    head.push(socket.read_u8().await.unwrap());
+                }
+                assert!(head.starts_with(b"GET /ci HTTP/1."));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let curl = if cfg!(windows) { "curl.exe" } else { "curl" };
+        for (proxy, tunnel) in [
+            (format!("http://{http}"), true),
+            (format!("socks5h://{socks}"), false),
+        ] {
+            let url = format!("http://localhost:{port}/ci");
+            let output = tokio::task::spawn_blocking(move || {
+                let mut command = std::process::Command::new(curl);
+                command
+                    .args(["--disable", "--fail", "--silent", "--show-error"])
+                    .args(["--max-time", "15", "--noproxy", "", "--proxy", &proxy]);
+                if tunnel {
+                    command.arg("--proxytunnel");
+                }
+                command.arg(url).output().expect("CI must provide curl")
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "H3 curl failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, body);
+        }
+        origin.await.unwrap();
+        assert!(client.0.try_wait().unwrap().is_none());
+        assert!(server.0.try_wait().unwrap().is_none());
+        drop(client);
+        drop(server);
+    })
+    .await
+    .expect("H3 executable E2E deadline");
 }

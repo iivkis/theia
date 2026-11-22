@@ -11,9 +11,9 @@ server_name = "edge.example.org"
 # THEIA_AUTH_TOKEN must contain base64url(no-padding) of 32 random bytes.
 auth_token = "env:THEIA_AUTH_TOKEN"
 tls_profile = "default"
-# Explicit CA bundle for M2.2 H2-only runtime (optional for structural validation).
+# Explicit CA bundle for explicit H2/H3 runtime (optional for structural validation).
 # tls_ca = "file:/absolute/path/to/ca-bundle.pem"
-# Set transport = "h2" for this stage; auto/h3 intentionally fail closed.
+# Set transport = "h2" or "h3"; auto intentionally fails closed.
 transport = "auto"
 quic_connect_timeout_ms = 1600
 quic_negative_cache_ttl_s = 900
