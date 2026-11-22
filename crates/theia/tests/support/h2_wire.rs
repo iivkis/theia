@@ -170,7 +170,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Observation, &'static str> {
                 return Err("client preface must start with SETTINGS");
             }
             let mut entries = Vec::new();
-            for pair in payload.chunks_exact(6) {
+            for pair in payload.as_chunks::<6>().0 {
                 entries.push((
                     u16::from_be_bytes(pair[..2].try_into().unwrap()),
                     u32::from_be_bytes(pair[2..].try_into().unwrap()),
