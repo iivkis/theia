@@ -720,9 +720,7 @@ async fn auto_falls_back_only_after_udp_silence_and_uses_negative_cache() {
         // excluded for UDP (WSAEACCES/10013), so blind second bind is flaky.
         let mut pair = None;
         for _ in 0..64 {
-            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0")
-                .await
-                .unwrap();
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
                 pair = Some((udp, tcp));
                 break;
