@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fmt, net::SocketAddr};
 use subtle::ConstantTimeEq;
+use zeroize::Zeroize;
 
 const PREFIX: &str = "theia://v1/";
 const MAX_DATA: usize = 3072;
@@ -43,6 +44,15 @@ impl fmt::Debug for Invitation {
             .field("transport", &self.transport)
             .field("contains_token", &self.has_token())
             .finish()
+    }
+}
+
+// Wipe the raw bearer when an issued invitation is discarded.
+impl Drop for Invitation {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.as_mut() {
+            token.zeroize();
+        }
     }
 }
 

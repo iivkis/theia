@@ -1573,6 +1573,7 @@ dependencies = [
  "tokio-btls",
  "tokio-rustls",
  "toml",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 //! M4.1: keyboard-first terminal landing and bounded config editor.
 //!
-//! M4.1c selects an existing inbound or profile and edits three strictly
-//! whitelisted non-secret fields. No service starts, reload, IPC or OS proxy effects.
+//! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
+//! No service reload, network or OS proxy effect.
 use crate::{tui_editor::Editor, Role};
 use crossterm::{
     cursor::{Hide, Show},
@@ -23,6 +23,7 @@ use std::{
     sync::mpsc::{self, TryRecvError},
     time::Duration,
 };
+use zeroize::Zeroizing;
 
 #[derive(Debug)]
 pub enum TuiError {
@@ -162,10 +163,21 @@ impl Model {
     }
 }
 
+/// Confidential bearer issuance is isolated from ordinary editor commands.
+enum IssueFlow {
+    Input(String),
+    Confirm(String),
+    Saving,
+    SaveFailed,
+    Offer,
+    Showing(Zeroizing<String>),
+}
+
 /// UI dispatch is separate from all configuration/OS effects. A queued
 /// transition never runs until the user saves, discards or cancels explicitly.
 struct Interaction {
     editor: Option<Editor>,
+    issuance: Option<IssueFlow>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
 }
@@ -174,6 +186,7 @@ impl Interaction {
     fn new(editor: Option<Editor>) -> Self {
         Self {
             editor,
+            issuance: None,
             pending: None,
             saving: None,
         }
@@ -200,6 +213,13 @@ impl Interaction {
             Ok((editor, saved)) => {
                 self.saving = None;
                 self.editor = Some(editor);
+                if matches!(self.issuance, Some(IssueFlow::Saving)) {
+                    self.issuance = Some(if saved {
+                        IssueFlow::Offer
+                    } else {
+                        IssueFlow::SaveFailed
+                    });
+                }
                 if saved {
                     if let Some(original) = self.pending.take() {
                         return Ok(model.update(original));
@@ -223,6 +243,76 @@ impl Interaction {
         let Some(editor) = self.editor.as_mut() else {
             return model.update(key);
         };
+        if let Some(flow) = self.issuance.take() {
+            match flow {
+                IssueFlow::Input(mut id) => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter if !id.is_empty() => {
+                        self.issuance = Some(IssueFlow::Confirm(id));
+                    }
+                    KeyCode::Backspace => {
+                        id.pop();
+                        self.issuance = Some(IssueFlow::Input(id));
+                    }
+                    KeyCode::Char(ch)
+                        if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                            && ch.is_ascii_graphic()
+                            && id.len() < 64 =>
+                    {
+                        id.push(ch);
+                        self.issuance = Some(IssueFlow::Input(id));
+                    }
+                    _ => self.issuance = Some(IssueFlow::Input(id)),
+                },
+                IssueFlow::Confirm(id) => match key.code {
+                    KeyCode::Char('y') => {
+                        if editor.issue_user(&id).is_ok() {
+                            self.issuance = Some(IssueFlow::Saving);
+                            self.start_save();
+                        } else {
+                            self.issuance = Some(IssueFlow::Input(id));
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {}
+                    _ => self.issuance = Some(IssueFlow::Confirm(id)),
+                },
+                IssueFlow::Saving => self.issuance = Some(IssueFlow::Saving),
+                IssueFlow::SaveFailed => match key.code {
+                    KeyCode::Char('r') => {
+                        self.issuance = Some(IssueFlow::Saving);
+                        self.start_save();
+                    }
+                    KeyCode::Char('d') => editor.discard(),
+                    _ => self.issuance = Some(IssueFlow::SaveFailed),
+                },
+                IssueFlow::Offer => match key.code {
+                    KeyCode::Char('y') => {
+                        if let Some(invite) = editor.take_issued() {
+                            match invite.encode() {
+                                Ok(link) => {
+                                    self.issuance = Some(IssueFlow::Showing(Zeroizing::new(link)))
+                                }
+                                Err(_) => {
+                                    editor.error = Some("Не удалось сформировать ссылку.".into());
+                                    editor.clear_issued();
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => editor.clear_issued(),
+                    _ => self.issuance = Some(IssueFlow::Offer),
+                },
+                IssueFlow::Showing(link) => {
+                    if key.code == KeyCode::Esc {
+                        editor.clear_issued();
+                    } else {
+                        self.issuance = Some(IssueFlow::Showing(link));
+                    }
+                }
+            }
+            return false;
+        }
+
         if let Some(original) = self.pending {
             match key.code {
                 KeyCode::Char('s') => {
@@ -264,6 +354,16 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            if editor.role() == Role::Server && key.code == KeyCode::Char('u') {
+                if editor.dirty() {
+                    editor.error =
+                        Some("Сохраните или отмените черновик перед выдачей токена.".into());
+                } else {
+                    editor.error = None;
+                    self.issuance = Some(IssueFlow::Input(String::new()));
+                }
+                return false;
+            }
             // Focus is navigation inside the explicitly loaded typed form,
             // not a write and not a role switch. Never intercept text input.
             match key.code {
@@ -407,7 +507,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k или ↑/↓ выбирают inbound/профиль, Tab/Shift+Tab выбирают поле, Enter/e редактирует. Сеть, runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя и после успешной записи одноразово показывает ссылку. Runtime и системный прокси не изменяются.",
             true,
         ),
     }
@@ -418,6 +518,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             "Сохранение конфигурации",
             "Проверка изменений и атомарная запись TOML выполняются.\nRuntime не перезагружается.\nДождитесь результата операции.",
             true,
+        );
+    } else if let Some(flow) = interaction.and_then(|ui| ui.issuance.as_ref()) {
+        draw_issuance(
+            frame,
+            parts[1],
+            flow,
+            interaction.and_then(|ui| ui.editor.as_ref()),
         );
     } else if interaction.is_some_and(|ui| ui.pending.is_some()) {
         panel(
@@ -430,11 +537,53 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  Ctrl+S: сохранить  Esc: назад  q: выход",
+            "j/k: запись  Tab: поле  Enter/e: ввод  u: новый пользователь  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
     );
+}
+
+fn draw_issuance(frame: &mut Frame<'_>, area: Rect, flow: &IssueFlow, editor: Option<&Editor>) {
+    let (title, body) = match flow {
+        IssueFlow::Input(id) => (
+            "Новый пользователь для выбранного inbound",
+            format!(
+                "ID пользователя: {id}\n\nСгенерировать 256-битный токен и назначить доступ только к выбранному inbound.\n\nEnter: продолжить  Backspace: удалить  Esc: отменить\n\n{}",
+                editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        IssueFlow::Confirm(id) => (
+            "Подтверждение нового пользователя",
+            format!(
+                "Пользователь: {id}\nInbound: {}\n\nСоздать токен CSPRNG и сохранить новую запись в server.toml?\nЭто НЕ перезагружает сервер.\n\n y: подтвердить  n/Esc: отменить",
+                editor.map_or("", |e| e.selected_record_id())
+            ),
+        ),
+        IssueFlow::Saving => (
+            "Сохранение",
+            "Сохранение выполняется; конфиденциальная ссылка скрыта.".into(),
+        ),
+        IssueFlow::SaveFailed => (
+            "Сохранение НЕ удалось: ссылка заблокирована",
+            format!(
+                "Новый пользователь НЕ записан. Токен не показывался.\n\n{}\n\nr: повторить запись  d: удалить черновик и токен",
+                editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        IssueFlow::Offer => (
+            "Одноразовая выдача конфиденциальной ссылки",
+            "server.toml сохранён. Runtime ещё не обновлён.\nСсылка содержит действующий bearer-токен. Не публиковать.\nПовторного показа после закрытия не будет.\n\n y: показать ссылку один раз\n n/Esc: отказаться и уничтожить токен в памяти".into(),
+        ),
+        IssueFlow::Showing(link) => (
+            "СЕКРЕТ: ссылка подключения (однократный просмотр)",
+            format!(
+                "КОНФИДЕНЦИАЛЬНО. Скопируйте ссылку целиком.\nТерминал/SSH и экран должны быть доверенными.\n\n{link}\n\nEsc: скрыть и стереть из памяти.\nRuntime не перезагружен.",
+                link = link.as_str()
+            ),
+        ),
+    };
+    panel(frame, area, title, &body, true);
 }
 
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
@@ -444,7 +593,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: состояние неизвестно; reload не выполнялся.\nСекреты, ACL и системный прокси не редактируются.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: состояние неизвестно; reload не выполнялся.\nНовый пользователь и grant: клавиша u. Runtime и системный прокси не изменяются.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
@@ -768,6 +917,164 @@ mod tests {
             assert!(!screen.contains("THEIA_AUTH_TOKEN"), "{width}x{height}");
             assert!(!screen.contains("token_sha256"), "{width}x{height}");
         }
+        fs::remove_file(path).unwrap();
+    }
+
+    fn server_issuance_fixture() -> String {
+        use sha2::{Digest, Sha256};
+        include_str!("../../../examples/server.toml").replace(
+            "REPLACE_WITH_64_LOWERCASE_HEX",
+            &format!("{:x}", Sha256::digest([0x42; 32])),
+        )
+    }
+
+    fn rendered_interaction(width: u16, height: u16, model: &Model, ui: &Interaction) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, model, Some(ui))).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|line| line.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn server_issuance_modal_hides_secret_until_durable_save_and_explicit_reveal() {
+        use crate::config::{self, Config};
+        use crate::invite::Invitation;
+        use sha2::{Digest, Sha256};
+        use std::{fs, thread, time::Instant};
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b-issuance-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('u'))));
+        assert!(matches!(ui.issuance, Some(IssueFlow::Input(_))));
+        for ch in "new-device".chars() {
+            assert!(!ui.update(&mut model, press(KeyCode::Char(ch))));
+        }
+        assert!(!ui.update(&mut model, press(KeyCode::Enter)));
+        assert!(matches!(ui.issuance, Some(IssueFlow::Confirm(_))));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        assert!(ui.saving.is_some());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        let start = Instant::now();
+        while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ui.saving.is_none());
+        assert!(matches!(ui.issuance, Some(IssueFlow::Offer)));
+        assert!(ui.editor.as_ref().unwrap().issued_ready());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        let Config::Server(doc) = config::read_file(&path).unwrap() else {
+            panic!("server");
+        };
+        assert!(doc.server.inbounds[0]
+            .allowed_user_ids
+            .contains(&"new-device".to_owned()));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        let IssueFlow::Showing(uri) = ui.issuance.as_ref().unwrap() else {
+            panic!("explicit one-time reveal expected");
+        };
+        let invitation = Invitation::decode(uri).unwrap();
+        let bytes = invitation.token_bytes().unwrap();
+        let saved_user = doc
+            .server
+            .users
+            .iter()
+            .find(|u| u.id == "new-device")
+            .unwrap();
+        assert_eq!(
+            saved_user.token_sha256,
+            format!("{:x}", Sha256::digest(bytes))
+        );
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('q'))));
+        assert_eq!(model.screen, Screen::Server);
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.issuance.is_none());
+        assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn conflict_after_issuance_refuses_reveal_and_requires_retry_or_discard() {
+        use std::{fs, thread, time::Instant};
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b-conflict-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        editor.issue_user("new-device").unwrap();
+        fs::write(
+            &path,
+            "# external writer\n".to_string() + &server_issuance_fixture(),
+        )
+        .unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+        ui.issuance = Some(IssueFlow::Saving);
+        ui.start_save();
+        let start = Instant::now();
+        while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(ui.issuance, Some(IssueFlow::SaveFailed)));
+        assert!(!ui.editor.as_ref().unwrap().issued_ready());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        assert!(matches!(ui.issuance, Some(IssueFlow::SaveFailed)));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('d'))));
+        assert!(ui.issuance.is_none());
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
+        assert!(!fs::read_to_string(&path).unwrap().contains("new-device"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn client_panel_cannot_open_server_issuance_and_dirty_draft_is_guarded() {
+        use std::fs;
+        let path =
+            std::env::temp_dir().join(format!("theia-m44b-client-ui-{}.toml", std::process::id()));
+        fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('u'))));
+        assert!(ui.issuance.is_none());
+        fs::remove_file(path).unwrap();
+
+        let path =
+            std::env::temp_dir().join(format!("theia-m44b-dirty-ui-{}.toml", std::process::id()));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.editor.as_mut().unwrap().begin();
+        ui.editor.as_mut().unwrap().input = "other.example.org".into();
+        assert!(!ui.update(&mut model, press(KeyCode::Enter)));
+        assert!(ui.editor.as_ref().unwrap().dirty());
+        assert!(!ui.update(&mut model, press(KeyCode::Char('u'))));
+        assert!(ui.issuance.is_none());
+        assert!(ui
+            .editor
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("черновик"));
         fs::remove_file(path).unwrap();
     }
 

@@ -4,14 +4,17 @@
 //! secret references, token hashes or path in diagnostics. All writes go
 //! through the existing strict validator and atomic store.
 use crate::{
-    config::{self, Config, Transport},
+    config::{self, Config, Transport, User},
+    invite::Invitation,
     Role,
 };
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
 };
+use zeroize::Zeroizing;
 
 const MAX_DOCUMENT: u64 = 1024 * 1024;
 const MAX_INPUT: usize = 255;
@@ -22,6 +25,8 @@ pub struct Editor {
     source: Vec<u8>,
     original: Config,
     draft: Config,
+    issued: Option<Invitation>,
+    issued_ready: bool,
     selected_record: usize,
     selected_field: usize,
     pub input: String,
@@ -58,6 +63,8 @@ impl Editor {
             source,
             original: parsed.clone(),
             draft: parsed,
+            issued: None,
+            issued_ready: false,
             selected_record,
             selected_field: 0,
             input: String::new(),
@@ -65,6 +72,92 @@ impl Editor {
             error: None,
             notice: "Загружено. Изменения не применяются к runtime.",
         })
+    }
+
+    /// Issue a new user with a cryptographically random 32-byte bearer.
+    /// A saved digest is not a bearer and cannot be re-exported later.
+    /// No invitation is revealable until the file write succeeds.
+    pub fn issue_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+        let result = self.try_issue_user(user_id);
+        if let Err(message) = result {
+            self.error = Some(message.to_owned());
+        }
+        result
+    }
+
+    fn try_issue_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+        if self.role != Role::Server || self.editing || self.dirty() || self.issued.is_some() {
+            return Err("Finish or discard edits and pending issuance first");
+        }
+        let Config::Server(doc) = &self.draft else {
+            return Err("Server configuration required");
+        };
+        if user_id.is_empty()
+            || user_id.len() > 64
+            || !user_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            return Err("User ID must use 1..64 ASCII letters, digits, - or _");
+        }
+        if doc.server.users.iter().any(|u| u.id == user_id) {
+            return Err("User ID already exists");
+        }
+        let inbound_id = self.selected_record_id().to_owned();
+        // Reject unusable auto invitations before consuming random input or
+        // changing the draft (e.g., different H2/H3 public port numbers).
+        Invitation::public_from_server(&self.draft, &inbound_id)
+            .map_err(|_| "Selected inbound cannot issue auto invitations")?;
+
+        let mut token = Zeroizing::new([0u8; 32]);
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(&mut token[..])
+            .map_err(|_| "Secure random generator unavailable")?;
+        let digest = format!("{:x}", Sha256::digest(&token[..]));
+        let mut candidate = self.draft.clone();
+        let Config::Server(candidate_doc) = &mut candidate else {
+            return Err("Server configuration required");
+        };
+        let Some(inbound) = candidate_doc.server.inbounds.get_mut(self.selected_record) else {
+            return Err("Inbound missing");
+        };
+        inbound.allowed_user_ids.push(user_id.to_owned());
+        candidate_doc.server.users.push(User {
+            id: user_id.to_owned(),
+            token_sha256: digest,
+            disabled: false,
+        });
+        candidate
+            .validate()
+            .map_err(|_| "New user or grants did not pass validation")?;
+        let invitation = Invitation::issued_from_server(&candidate, &inbound_id, user_id, &token)
+            .map_err(|_| "Cannot issue invitation for selected inbound")?;
+        // Commit draft only when all validations and permission checks succeed.
+        self.draft = candidate;
+        self.issued = Some(invitation);
+        self.issued_ready = false;
+        self.error = None;
+        self.notice = "Новый пользователь: сохранить TOML перед выдачей ссылки.";
+        Ok(())
+    }
+
+    pub fn issued_ready(&self) -> bool {
+        self.issued.is_some() && self.issued_ready && !self.dirty()
+    }
+
+    /// Exactly one successful retrieval, only after a durable store.
+    pub fn take_issued(&mut self) -> Option<Invitation> {
+        if !self.issued_ready() {
+            return None;
+        }
+        self.issued_ready = false;
+        self.issued.take()
+    }
+
+    pub fn clear_issued(&mut self) {
+        self.issued = None;
+        self.issued_ready = false;
     }
 
     pub fn role(&self) -> Role {
@@ -128,7 +221,7 @@ impl Editor {
 
     /// Record and field focus never change the typed configuration.
     pub fn select_record(&mut self, forward: bool) {
-        if self.editing {
+        if self.editing || self.issued.is_some() {
             return;
         }
         let count = self.record_count();
@@ -145,7 +238,7 @@ impl Editor {
     }
 
     pub fn select_field(&mut self, forward: bool) {
-        if self.editing {
+        if self.editing || self.issued.is_some() {
             return;
         }
         self.selected_field = if forward {
@@ -256,6 +349,10 @@ impl Editor {
     }
 
     pub fn begin(&mut self) {
+        if self.issued.is_some() {
+            self.error = Some("Завершите одноразовую выдачу ссылки.".into());
+            return;
+        }
         if self.record_count() == 0 {
             self.error = Some("Нет записей для редактирования".into());
             return;
@@ -341,6 +438,7 @@ impl Editor {
 
     pub fn discard(&mut self) {
         self.draft = self.original.clone();
+        self.clear_issued();
         self.cancel();
         self.notice = "Изменения отменены.";
     }
@@ -393,6 +491,7 @@ impl Editor {
         self.original = self.draft.clone();
         self.error = None;
         self.notice = "Сохранено в TOML; runtime ещё не обновлён.";
+        self.issued_ready = self.issued.is_some();
         true
     }
 }
@@ -475,6 +574,103 @@ mod tests {
         second.server_name = "work.example.org".into();
         doc.client.profiles.push(second);
         Config::Client(doc).to_toml().unwrap()
+    }
+
+    #[test]
+    fn new_user_is_scoped_to_selected_inbound_and_link_is_one_time_after_save() {
+        use crate::invite::Invitation;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.select_record(true);
+        assert_eq!(editor.selected_record_id(), "backup");
+        assert!(editor.issue_user("new-device").is_ok());
+        assert!(editor.dirty());
+        assert!(!editor.issued_ready());
+        assert!(editor.take_issued().is_none());
+        editor.begin();
+        assert!(!editor.editing);
+        let before = fs::read_to_string(&temp.0).unwrap();
+        assert!(!before.contains("new-device"));
+        assert!(editor.save());
+        assert!(editor.issued_ready());
+        let invitation = editor.take_issued().unwrap();
+        assert!(editor.take_issued().is_none());
+        let raw_token = invitation.token_bytes().unwrap();
+        let link = invitation.encode().unwrap();
+        assert!(Invitation::decode(&link).unwrap().has_token());
+        let stored = fs::read_to_string(&temp.0).unwrap();
+        assert!(!stored.contains(&URL_SAFE_NO_PAD.encode(raw_token)));
+        let Config::Server(doc) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert_eq!(doc.server.inbounds[0].allowed_user_ids, ["device-a"]);
+        assert_eq!(
+            doc.server.inbounds[1].allowed_user_ids,
+            ["device-a", "new-device"]
+        );
+        assert_eq!(doc.server.users.len(), 2);
+        assert_eq!(doc.server.users[1].id, "new-device");
+        assert_eq!(
+            doc.server.users[1].token_sha256,
+            format!("{:x}", Sha256::digest(raw_token))
+        );
+        assert!(!doc.server.users[1].disabled);
+    }
+
+    #[test]
+    fn invalid_duplicate_or_dirty_issuance_is_rejected_without_modifying_draft() {
+        let temp = Temp::write(&server_source());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        for id in ["", "bad id", "device-a", "bad\nname"] {
+            assert!(editor.issue_user(id).is_err(), "{id:?}");
+            assert!(!editor.dirty());
+        }
+        editor.begin();
+        editor.input = "new.example.org".into();
+        assert!(editor.accept());
+        assert!(editor.issue_user("new-device").is_err());
+        editor.discard();
+        assert!(!editor.dirty());
+        assert!(editor.issue_user("new-device").is_ok());
+        assert!(editor.issue_user("another").is_err());
+        editor.discard();
+        assert!(editor.take_issued().is_none());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), server_source());
+    }
+
+    #[test]
+    fn external_change_blocks_issued_link_until_successful_write() {
+        let temp = Temp::write(&server_source());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.issue_user("new-device").is_ok());
+        fs::write(
+            &temp.0,
+            "# changed externally\n".to_string() + &server_source(),
+        )
+        .unwrap();
+        assert!(!editor.save());
+        assert!(!editor.issued_ready());
+        assert!(editor.take_issued().is_none());
+        editor.discard();
+        assert_eq!(config::read_file(&temp.0).unwrap().validate(), Ok(()));
+    }
+
+    #[test]
+    fn new_user_gets_independent_random_token_and_existing_token_is_never_exported() {
+        let temp = Temp::write(&server_source());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.issue_user("new-device").is_ok());
+        assert!(editor.save());
+        let first = editor.take_issued().unwrap().token_bytes().unwrap();
+        assert!(editor.issue_user("next-device").is_ok());
+        assert!(editor.save());
+        let second = editor.take_issued().unwrap().token_bytes().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, [0; 32]);
+        assert_ne!(second, [0; 32]);
+        assert!(editor.issue_user("device-a").is_err());
     }
 
     #[test]

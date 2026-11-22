@@ -139,14 +139,14 @@ Usage:\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
-Client requires tls_ca PEM bundle. TUI selects records and edits 3 safe fields with explicit role+config; system proxy is never modified.";
+Client requires tls_ca PEM bundle. TUI edits 3 safe fields; server role+config supports u for new user and one-time token link after save; system proxy never changed.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
     match command {
         Command::Help(None) => Ok(HELP),
         Command::Help(Some("tui")) => {
-            Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith both --role and --config, choose existing records and edit 3 non-secret fields per record; save validated TOML without reload, network or OS proxy changes.")
+            Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
             Ok("Usage: theia server run --config <path>\nTLS 1.3/H2 and QUIC/H3 server inbounds.")
