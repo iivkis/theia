@@ -55,7 +55,7 @@ impl ProbeApproval {
         Self::IsolatedLoopbackFixture(address)
     }
 
-    fn allows(self, address: SocketAddr) -> bool {
+    pub(crate) fn allows(self, address: SocketAddr) -> bool {
         match self {
             Self::Denied => false,
             Self::PublicHttpsIp(ip) => {
