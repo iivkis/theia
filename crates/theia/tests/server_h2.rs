@@ -434,3 +434,130 @@ async fn tls_wrong_hostname_and_untrusted_ca_fail_closed() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_peer_request_budget_returns_429_on_same_connection() {
+    timeout(Duration::from_secs(15), async {
+        let (acceptor, connector) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, acceptor, Arc::new(context(false))));
+        let (mut sender, driver) = client(address, connector).await;
+        for _ in 0..120 {
+            sender = sender.ready().await.unwrap();
+            let (response, _) = sender
+                .send_request(request("invalid"), true)
+                .unwrap();
+            assert_eq!(response.await.unwrap().status(), http::StatusCode::UNAUTHORIZED);
+        }
+        sender = sender.ready().await.unwrap();
+        let (response, _) = sender.send_request(request(&bearer()), true).unwrap();
+        assert_eq!(response.await.unwrap().status(), http::StatusCode::TOO_MANY_REQUESTS);
+        driver.abort();
+        server.abort();
+        let _ = server.await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_listener_releases_live_tunnel_and_session_permits() {
+    timeout(Duration::from_secs(12), async {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = target.local_addr().unwrap();
+        let (acceptor, connector) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let context = Arc::new(context(true));
+        let server = tokio::spawn(serve(listener, acceptor, context.clone()));
+        let (mut sender, driver) = client(address, connector).await;
+        let (response, mut tx) = sender.send_request(request(&bearer()), false).unwrap();
+        send(
+            &mut tx,
+            &Frame::Hello { version: VERSION, capabilities: 0 },
+            false,
+        ).await;
+        let mut rx = response.await.unwrap().into_body();
+        let mut decoder = Decoder::new();
+        let mut queue = VecDeque::new();
+        assert!(matches!(
+            next_frame(&mut rx, &mut decoder, &mut queue).await,
+            Frame::HelloAck { .. }
+        ));
+        send(
+            &mut tx,
+            &Frame::OpenTcp {
+                address: Address::V4([127, 0, 0, 1]),
+                port: destination.port(),
+            },
+            false,
+        ).await;
+        assert_eq!(next_frame(&mut rx, &mut decoder, &mut queue).await, Frame::OpenOk);
+        let (mut remote, _) = target.accept().await.unwrap();
+        let held = context.authorize(Some(&bearer())).unwrap();
+        assert!(matches!(context.authorize(Some(&bearer())), Err(AuthFailure::Busy)));
+        server.abort();
+        let _ = server.await;
+        let mut byte = [0u8; 1];
+        assert_eq!(remote.read(&mut byte).await.unwrap(), 0);
+        // Drop recursion in JoinSet is asynchronous; wait for child permit release.
+        let recovered = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(permit) = context.authorize(Some(&bearer())) {
+                    break permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        drop(recovered);
+        drop(held);
+        driver.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_acl_checks_server_resolved_localhost_before_dial() {
+    timeout(Duration::from_secs(12), async {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = target.local_addr().unwrap();
+        let (acceptor, connector) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, acceptor, Arc::new(context(false))));
+        let (mut sender, driver) = client(address, connector).await;
+        let (response, mut tx) = sender.send_request(request(&bearer()), false).unwrap();
+        send(
+            &mut tx,
+            &Frame::Hello { version: VERSION, capabilities: 0 },
+            false,
+        ).await;
+        let mut rx = response.await.unwrap().into_body();
+        let mut decoder = Decoder::new();
+        let mut queue = VecDeque::new();
+        assert!(matches!(
+            next_frame(&mut rx, &mut decoder, &mut queue).await,
+            Frame::HelloAck { .. }
+        ));
+        send(
+            &mut tx,
+            &Frame::OpenTcp {
+                address: Address::Dns("localhost".into()),
+                port: destination.port(),
+            },
+            true,
+        ).await;
+        assert_eq!(
+            next_frame(&mut rx, &mut decoder, &mut queue).await,
+            Frame::OpenError(ErrorCode::PolicyDenied)
+        );
+        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        driver.abort();
+        server.abort();
+        let _ = server.await;
+    })
+    .await
+    .unwrap();
+}

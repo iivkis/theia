@@ -470,6 +470,12 @@ async fn handle_request(
         handle_frames(&mut inbound, &mut outgoing, &context),
     )
     .await;
+    // A timeout or transport failure can interrupt an already partially
+    // written frame. Reset rather than appending an ABORT to corrupt bytes.
+    if matches!(result, Err(_) | Ok(Err(ServerError::TimedOut | ServerError::Http2))) {
+        outgoing.send_reset(h2::Reason::CANCEL);
+        return Ok(());
+    }
     if !matches!(result, Ok(Ok(()))) {
         let sent = timeout(
             CLOSE_TIMEOUT,
