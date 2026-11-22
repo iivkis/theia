@@ -5,7 +5,9 @@ mod client_hello;
 
 use btls::ssl::SslVersion;
 use client_hello::{parse_handshake, parse_tls_records, ParseError};
-use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
+};
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::{sync::Arc, time::Duration};
 use theia_m3_4_btls_feasibility::h2_candidate;
