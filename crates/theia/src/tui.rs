@@ -2,7 +2,10 @@
 //!
 //! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
 //! No service reload, network or OS proxy effect.
-use crate::{tui_discovery::DiscoveryPanel, tui_editor::Editor, tui_probe::ProbePanel, Role};
+use crate::{
+    tui_candidates::CandidateReview, tui_discovery::DiscoveryPanel, tui_editor::Editor,
+    tui_probe::ProbePanel, Role,
+};
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -179,6 +182,7 @@ struct Interaction {
     editor: Option<Editor>,
     issuance: Option<IssueFlow>,
     discovery: Option<DiscoveryPanel>,
+    candidates: Option<CandidateReview>,
     probe: Option<ProbePanel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
@@ -190,6 +194,7 @@ impl Interaction {
             editor,
             issuance: None,
             discovery: None,
+            candidates: None,
             probe: None,
             pending: None,
             saving: None,
@@ -244,6 +249,35 @@ impl Interaction {
         if key.kind != KeyEventKind::Press || self.saving.is_some() {
             return false;
         }
+        if let Some(review) = self.candidates.as_mut() {
+            if key.code == KeyCode::Esc {
+                if review.back_or_close() {
+                    self.candidates = None;
+                }
+                return false;
+            }
+            if review.is_editing() {
+                match key.code {
+                    KeyCode::Enter => review.review_input(),
+                    KeyCode::Backspace => review.backspace(),
+                    KeyCode::Char(ch)
+                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        review.insert(ch);
+                    }
+                    _ => {}
+                }
+            } else if review.is_confirming() {
+                match key.code {
+                    KeyCode::Char('y') => review.confirm_scope(),
+                    KeyCode::Char('n') => review.decline(),
+                    _ => {}
+                }
+            } else if key.code == KeyCode::Char('a') {
+                review.begin_cidr();
+            }
+            return false;
+        }
         if let Some(probe) = self.probe.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -266,6 +300,10 @@ impl Interaction {
                     self.discovery = None;
                 }
                 KeyCode::Char('i') => panel.ask_consent(),
+                KeyCode::Char('r') if panel.may_review_probe() => {
+                    self.candidates =
+                        Some(CandidateReview::new(panel.assigned_interfaces().clone()));
+                }
                 KeyCode::Char('t') if panel.may_review_probe() => {
                     let server_name = self
                         .editor
@@ -565,7 +603,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p открывает пассивный просмотр IP/подсети (i: отдельный запрос к ipify); t: выбрать собственный IP и запросить явное разрешение на один TLS/H2 handshake. Ни один шаг не применяет настройки. Runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), t: отдельное разрешение на один TLS/H2 handshake. Ни один шаг не применяет настройки. Runtime и системный прокси не изменяются.",
             true,
         ),
     }
@@ -590,6 +628,14 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             parts[1],
             "Не сохранено: подтвердите переход",
             "s: сохранить и продолжить\nd: отменить изменения и продолжить\nEsc: остаться в редакторе\n\nНи одна опция не применяет конфигурацию к runtime.",
+            true,
+        );
+    } else if let Some(review) = interaction.and_then(|ui| ui.candidates.as_ref()) {
+        panel(
+            frame,
+            parts[1],
+            "F-18: группы кандидатов и ручная область CIDR (офлайн)",
+            &review.body(),
             true,
         );
     } else if let Some(probe) = interaction.and_then(|ui| ui.probe.as_ref()) {
@@ -1244,6 +1290,55 @@ mod tests {
         assert!(!ui.update(&mut model, press(KeyCode::Esc)));
         assert!(ui.probe.is_none());
         assert!(ui.discovery.is_some());
+    }
+
+    #[test]
+    fn server_review_groups_are_passive_and_cidr_confirmation_cannot_be_skipped() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('r'))));
+        assert!(ui.candidates.is_some());
+        let text = rendered_interaction(120, 40, &model, &ui);
+        assert!(text.contains("Подсеть сервера"));
+        assert!(text.contains("Популярные домены"));
+        assert!(text.contains("Добавленные вручную"));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        assert!(!ui.candidates.as_ref().unwrap().has_scope());
+        assert!(!ui.update(&mut model, press(KeyCode::Char('a'))));
+        assert!(ui.candidates.as_ref().unwrap().is_editing());
+        for ch in "bad-addr".chars() {
+            assert!(!ui.update(&mut model, press(KeyCode::Char(ch))));
+        }
+        assert!(!ui.update(&mut model, press(KeyCode::Enter)));
+        assert!(!ui.candidates.as_ref().unwrap().is_confirming());
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(!ui.candidates.as_ref().unwrap().is_editing());
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.candidates.is_none());
+        assert!(ui.discovery.is_some());
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.discovery.is_none());
+    }
+
+    #[test]
+    fn review_hotkey_is_not_available_outside_passive_server_discovery() {
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(None);
+        ui.update(&mut model, press(KeyCode::Char('r')));
+        assert!(ui.candidates.is_none());
+        model.update(press(KeyCode::Char('1')));
+        ui.update(&mut model, press(KeyCode::Char('r')));
+        assert!(ui.candidates.is_none());
+        ui.update(&mut model, press(KeyCode::Char('p')));
+        assert!(ui.discovery.is_some());
+        ui.update(&mut model, press(KeyCode::Char('i')));
+        assert!(ui.discovery.as_ref().unwrap().is_consent_pending());
+        ui.update(&mut model, press(KeyCode::Char('r')));
+        assert!(ui.candidates.is_none());
+        ui.update(&mut model, press(KeyCode::Char('n')));
+        ui.update(&mut model, press(KeyCode::Char('r')));
+        assert!(ui.candidates.is_some());
     }
 
     #[test]

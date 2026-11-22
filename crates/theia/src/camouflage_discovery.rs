@@ -104,6 +104,12 @@ impl NetworkPrefix {
     }
 }
 
+impl std::fmt::Display for NetworkPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.bits)
+    }
+}
+
 impl FromStr for NetworkPrefix {
     type Err = PrefixError;
 

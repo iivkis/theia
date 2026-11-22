@@ -172,7 +172,7 @@ impl DiscoveryPanel {
         match &self.phase {
             Phase::Passive => {
                 body.push_str(&format!(
-                    "\nСервис по умолчанию: {DEFAULT_EGRESS_SERVICE_URL}\nЗапрос пока НЕ отправлялся.\n\ni: внешний IP через ipify  t: TLS/H2 одного своего IP  Esc: назад"
+                    "\nСервис по умолчанию: {DEFAULT_EGRESS_SERVICE_URL}\nЗапрос пока НЕ отправлялся.\n\ni: внешний IP ipify  r: группы/CIDR офлайн  t: один TLS/H2 IP  Esc: назад"
                 ));
             }
             Phase::Confirm => {
@@ -185,7 +185,7 @@ impl DiscoveryPanel {
             ),
             Phase::Complete(Ok(report)) => {
                 body.push_str(&format!(
-                    "\nВнешний IP по утверждению ipify: {}\nTLS-проверка сертификата пройдена. Время: локальное наблюдение.\nРезультат не является разрешением активного сканирования.\n\ni: повторить запрос ipify  t: TLS/H2 своего IP  Esc: назад",
+                    "\nВнешний IP по утверждению ipify: {}\nTLS-проверка сертификата пройдена. Время: локальное наблюдение.\nРезультат не является разрешением активного сканирования.\n\ni: повторить ipify  r: группы/CIDR офлайн  t: TLS/H2 своего IP  Esc: назад",
                     report.ip()
                 ));
             }
@@ -201,7 +201,7 @@ impl DiscoveryPanel {
                     EgressError::UnusableAddress => "сервис вернул непригодный IP",
                 };
                 body.push_str(&format!(
-                    "\nОпределение внешнего IP НЕ удалось: {description}.\nНет подтверждённого нового адреса.\n\ni: повторить запрос ipify  t: TLS/H2 своего IP  Esc: назад"
+                    "\nОпределение внешнего IP НЕ удалось: {description}.\nНет подтверждённого нового адреса.\n\ni: повторить ipify  r: группы/CIDR офлайн  t: TLS/H2 своего IP  Esc: назад"
                 ));
             }
         }
