@@ -142,7 +142,7 @@ impl DiscoveryPanel {
             Phase::Complete(Ok(report)) => Some(report),
             _ => None,
         };
-        let preview = build_preview(&self.native, egress.copied(), PreviewScope::PassiveOnly);
+        let preview = build_preview(&self.native, egress, PreviewScope::PassiveOnly);
         let assessment = match preview.egress_assessment {
             EgressAssessment::Unknown => "не определено",
             EgressAssessment::MatchesAssignedAddress => "совпадает с назначенным адресом",
