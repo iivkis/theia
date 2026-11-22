@@ -19,9 +19,9 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-/// All diagnostic labels are fixed from the local evidence rubric.
-/// They never include IP/SNI, certificate contents, tokens or user input.
-fn translated_blocker(blocker: &str, transport: Transport) -> &'static str {
+/// Fixed rubric labels only: never render untrusted network strings or
+/// reveal TLS headers, certificate contents, private keys or bearer secrets.
+fn translated_h2_blocker(blocker: &str) -> &'static str {
     match blocker {
         "TLS1.3 not measured" => "TLS1.3 не измерен",
         "TLS1.3 rejected" => "TLS1.3 отклонён",
@@ -33,9 +33,7 @@ fn translated_blocker(blocker: &str, transport: Transport) -> &'static str {
         "certificate expired or not yet valid" => "сертификат просрочен или ещё не действует",
         "reachability unverified" => "доступность не измерена",
         "endpoint unreachable" => "адрес недоступен",
-        "ALPN not measured" if transport == Transport::H3 => "H3 ALPN не измерен",
         "ALPN not measured" => "H2 ALPN не измерен",
-        "ALPN not supported" if transport == Transport::H3 => "H3 ALPN не поддерживается",
         "ALPN not supported" => "H2 ALPN не поддерживается",
         "Theia fingerprint not measured" => "fingerprint Theia не измерен",
         "Theia fingerprint mismatch" => "fingerprint Theia не совпадает",
@@ -43,31 +41,22 @@ fn translated_blocker(blocker: &str, transport: Transport) -> &'static str {
     }
 }
 
-/// This score is derived exclusively from actual structured evidence supplied
-/// by strict TLS/H2. It is not a bypass probability, REALITY capability or
-/// permission to apply the candidate. H3 and fingerprint remain Unknown.
-fn describe_evidence(transport: Transport, evidence: &TlsEvidence) -> String {
-    let rating = evidence.suitability(transport);
-    let name = match transport {
-        Transport::H2 => "H2",
-        Transport::H3 => "H3",
-    };
+/// The only transport measured by the current probe is H2 over TCP/TLS1.3.
+/// No H2 TLS fields may be credited to H3, which needs a separate QUIC probe.
+fn describe_h2_evidence(evidence: &TlsEvidence) -> String {
+    let rating = evidence.suitability(Transport::H2);
     let eligible = if rating.eligible { "ДА" } else { "НЕТ" };
     let reasons = rating
         .blockers
         .iter()
-        .map(|reason| translated_blocker(reason, transport))
+        .map(|reason| translated_h2_blocker(reason))
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "{name} score: {}/100, confidence: {}%, eligible: {eligible}.\nПричины: {}.",
+        "H2 score: {}/100, confidence: {}%, eligible: {eligible}.\nПричины: {}.",
         rating.score,
         rating.confidence,
-        if reasons.is_empty() {
-            "нет"
-        } else {
-            &reasons
-        }
+        if reasons.is_empty() { "нет" } else { &reasons }
     )
 }
 
@@ -345,11 +334,10 @@ impl ProbePanel {
                         |instant| format!("{} сек назад", instant.elapsed().as_secs()),
                     );
                     body.push_str(&format!(
-                        "\nTLS 1.3 подтверждён для {}:443: CA/SNI/SAN/ALPN=h2 проверены.\nВремя handshake: {} мс. Измерение: {age}.\n{}\n{}\nScore не является вероятностью обхода DPI; REALITY и TLS-in-TLS всё ещё НЕ проверены.\n\nEnter/t: повторить только с новым согласием  Esc: назад",
+                        "\nTLS 1.3 подтверждён для {}:443: CA/SNI/SAN/ALPN=h2 проверены.\nВремя handshake: {} мс. Измерение: {age}.\n{}\nH3 score: Unknown, confidence: 0%, eligible: НЕТ.\nПричины: H3 ALPN не измерен; QUIC/H3 не проверялся. H2 данные нельзя переносить на H3.\nScore не является вероятностью обхода DPI; REALITY и TLS-in-TLS всё ещё НЕ проверены.\n\nEnter/t: повторить только с новым согласием  Esc: назад",
                         address,
                         report.handshake_elapsed.as_millis(),
-                        describe_evidence(Transport::H2, &report.evidence),
-                        describe_evidence(Transport::H3, &report.evidence),
+                        describe_h2_evidence(&report.evidence),
                     ));
                 }
             },
@@ -557,8 +545,8 @@ mod tests {
         let text = panel.body();
         assert!(text.contains("H2 score: 80/100"));
         assert!(text.contains("confidence: 85%"));
-        assert!(text.contains("H3 score: 65/100"));
-        assert!(text.contains("confidence: 71%"));
+        assert!(text.contains("H3 score: Unknown"));
+        assert!(text.contains("H3 score: Unknown, confidence: 0%"));
         assert!(text.contains("fingerprint Theia не измерен"));
         assert!(text.contains("H3 ALPN не измерен"));
         assert!(text.contains("eligible: НЕТ"));
