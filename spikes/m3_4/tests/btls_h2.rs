@@ -98,9 +98,10 @@ async fn capture_hello() -> client_hello::ClientHelloSummary {
         let (pem, _, _) = certificate_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let attempt = tokio::spawn(async move {
-            connect(address, "localhost", pem.as_bytes()).await.is_err()
-        });
+        let attempt =
+            tokio::spawn(
+                async move { connect(address, "localhost", pem.as_bytes()).await.is_err() },
+            );
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut raw = Vec::new();
         let observed = loop {
@@ -136,9 +137,15 @@ async fn btls_candidate_emits_real_grease_and_new_alps_over_tcp() {
     assert_eq!(hello.legacy_version, 0x0303);
     assert!(hello.supported_versions.contains(&0x0304));
     assert_eq!(hello.alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
-    assert!(hello.has_grease_extension(), "actual TCP flight needs GREASE");
+    assert!(
+        hello.has_grease_extension(),
+        "actual TCP flight needs GREASE"
+    );
     assert!(hello.has_alps(), "actual TCP flight needs ALPS");
-    assert!(hello.extensions_in_wire_order.contains(&17_613), "new ALPS codepoint");
+    assert!(
+        hello.extensions_in_wire_order.contains(&17_613),
+        "new ALPS codepoint"
+    );
     assert!(!hello.quic_transport_parameters_present);
     eprintln!(
         "BoringSSL H2 candidate actual first flight: GREASE=yes ALPS_17613=yes, ciphers={} extensions={} groups={}; no Chrome match claimed",
