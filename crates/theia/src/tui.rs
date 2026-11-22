@@ -505,7 +505,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k или ↑/↓ выбирают inbound/профиль, Tab/Shift+Tab выбирают поле, Enter/e редактирует. Сеть, runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя и после успешной записи одноразово показывает ссылку. Runtime и системный прокси не изменяются.",
             true,
         ),
     }
@@ -516,6 +516,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             "Сохранение конфигурации",
             "Проверка изменений и атомарная запись TOML выполняются.\nRuntime не перезагружается.\nДождитесь результата операции.",
             true,
+        );
+    } else if let Some(flow) = interaction.and_then(|ui| ui.issuance.as_ref()) {
+        draw_issuance(
+            frame,
+            parts[1],
+            flow,
+            interaction.and_then(|ui| ui.editor.as_ref()),
         );
     } else if interaction.is_some_and(|ui| ui.pending.is_some()) {
         panel(
@@ -528,11 +535,52 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  Ctrl+S: сохранить  Esc: назад  q: выход",
+            "j/k: запись  Tab: поле  Enter/e: ввод  u: новый пользователь  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
     );
+}
+
+fn draw_issuance(frame: &mut Frame<'_>, area: Rect, flow: &IssueFlow, editor: Option<&Editor>) {
+    let (title, body) = match flow {
+        IssueFlow::Input(id) => (
+            "Новый пользователь для выбранного inbound",
+            format!(
+                "ID пользователя: {id}\n\nСгенерировать 256-битный токен и назначить доступ только к выбранному inbound.\n\nEnter: продолжить  Backspace: удалить  Esc: отменить\n\n{}",
+                editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        IssueFlow::Confirm(id) => (
+            "Подтверждение нового пользователя",
+            format!(
+                "Пользователь: {id}\nInbound: {}\n\nСоздать токен CSPRNG и сохранить новую запись в server.toml?\nЭто НЕ перезагружает сервер.\n\n y: подтвердить  n/Esc: отменить",
+                editor.map_or("", |e| e.selected_record_id())
+            ),
+        ),
+        IssueFlow::Saving => (
+            "Сохранение",
+            "Сохранение выполняется; конфиденциальная ссылка скрыта.".into(),
+        ),
+        IssueFlow::SaveFailed => (
+            "Сохранение НЕ удалось: ссылка заблокирована",
+            format!(
+                "Новый пользователь НЕ записан. Токен не показывался.\n\n{}\n\nr: повторить запись  d: удалить черновик и токен",
+                editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        IssueFlow::Offer => (
+            "Одноразовая выдача конфиденциальной ссылки",
+            "server.toml сохранён. Runtime ещё не обновлён.\nСсылка содержит действующий bearer-токен. Не публиковать.\nПовторного показа после закрытия не будет.\n\n y: показать ссылку один раз\n n/Esc: отказаться и уничтожить токен в памяти".into(),
+        ),
+        IssueFlow::Showing(link) => (
+            "СЕКРЕТ: ссылка подключения (однократный просмотр)",
+            format!(
+                "КОНФИДЕНЦИАЛЬНО. Скопируйте ссылку целиком.\nТерминал/SSH и экран должны быть доверенными.\n\n{link}\n\nEsc: скрыть и стереть из памяти.\nRuntime не перезагружен."
+            ),
+        ),
+    };
+    panel(frame, area, title, &body, true);
 }
 
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
@@ -542,7 +590,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: состояние неизвестно; reload не выполнялся.\nСекреты, ACL и системный прокси не редактируются.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: состояние неизвестно; reload не выполнялся.\nНовый пользователь и grant: клавиша u. Runtime и системный прокси не изменяются.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
