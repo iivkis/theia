@@ -39,6 +39,13 @@ struct Capture {
     frozen: bool,
 }
 
+impl Drop for Capture {
+    fn drop(&mut self) {
+        // Also scrub on early TLS/H2 test failure, not only successful parse.
+        self.raw.fill(0);
+    }
+}
+
 struct Tap<T> {
     inner: T,
     capture: Arc<Mutex<Capture>>,
