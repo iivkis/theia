@@ -216,6 +216,8 @@ jobs:
         run: python -m playwright install chromium
       - name: Verify Chromium navigation through the built Theia client
         run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5 -- --ignored --exact --nocapture
+      - name: Capture actual Chromium H2 SETTINGS and HPACK pseudo names on loopback
+        run: cargo test --workspace --locked --test chromium_h2_reference actual_chromium_h2_settings_and_pseudo_order_reference -- --ignored --exact --nocapture
 
   m3-3-bbr-comparison:
     name: m3-3-bbr-comparison (${{ matrix.os }})
