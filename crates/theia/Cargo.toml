@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+# CI-only, API-level opt-in. Never enabled by runtime TOML or default binary.
+experimental-btls-h2 = ["dep:btls", "dep:tokio-btls"]
+
 [dependencies]
+btls = { version = "=0.5.6", optional = true }
+tokio-btls = { version = "=0.5.6", optional = true }
 serde = { version = "=1.0.228", features = ["derive"] }
 toml = "=0.8.23"
 base64 = "=0.22.1"

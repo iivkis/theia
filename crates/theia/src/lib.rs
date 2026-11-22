@@ -4,6 +4,8 @@
 
 pub mod client;
 pub mod config;
+#[cfg(feature = "experimental-btls-h2")]
+mod h2_btls;
 pub mod h3_client;
 pub mod h3_server;
 pub mod local_proxy;

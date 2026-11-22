@@ -311,9 +311,41 @@ jobs:
           cargo clippy --manifest-path spikes/m3_4/Cargo.toml --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw 'M3.4 clippy failed' }
 
+  m3-4e-btls-production-feature:
+    name: m3-4e-btls-production-feature (${{ matrix.os }})
+    needs: specification
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "m3-4e-feature"
+      - name: Verify production H2Client using optional BoringSSL TLS and real SmartTheia
+        shell: pwsh
+        run: |
+          cargo test --workspace --locked --features experimental-btls-h2 --test client_btls_h2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Production BoringSSL H2/OPEN_OK regressions failed' }
+      - name: Rustfmt and feature Clippy fail on warnings
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4e rustfmt drift' }
+          cargo clippy --workspace --all-targets --features experimental-btls-h2 -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4e feature Clippy failed' }
+
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, browser-e2e, m3-3-bbr-comparison, m3-4-btls-spike]
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, browser-e2e, m3-3-bbr-comparison, m3-4-btls-spike, m3-4e-btls-production-feature]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -327,7 +359,7 @@ jobs:
           import os
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "browser-e2e", "m3-3-bbr-comparison", "m3-4-btls-spike"}
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "browser-e2e", "m3-3-bbr-comparison", "m3-4-btls-spike", "m3-4e-btls-production-feature"}
           failed = [name for name in sorted(expected) if results.get(name, {}).get("result") != "success"]
           if failed:
               raise SystemExit("Required CI jobs did not succeed: " + ", ".join(failed))
