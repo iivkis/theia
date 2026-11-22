@@ -6,6 +6,8 @@
 
 **M3.5b2b2 native Linux/Windows mandatory tests:** `crates/theia/tests/camouflage_egress.rs` проводит настоящие TLS1.3/http1.1 handshake с локальными CI-only сертификатами, проверяет явный pinned exact-socket consent, нормальный IPv4/IPv6 IP echo, timeout, неверный CA/SNI/ALPN, redirect, private/doc IP ответ, пустой trust store и HTTP injection rejection. Никаких сторонних сервисов, DNS или автоматического сканирования. `crates/theia/tests/camouflage_workflow.rs` проверяет пассивный план vs одобренный маленький CIDR, реальную /32 блокировку, фильтр down/invalid/private interface, native Linux collection и Windows Unsupported. Успех всех обязательных job + `ci-gate` только на exact head SHA.
 
+**M3.5b2b3 bounded exact-target batch CI (Linux/Windows):** `crates/theia/tests/camouflage_batch.rs` создаёт только loopback TLS1.3 fixtures и проверяет позитивный одновременный H2 batch, порядок результатов, независимые негативные TLS/ALPN/timeout ответы, all-handshakes fail-closed, отказ при отсутствии явного разрешения, IP вне offline preview, duplicate socket, пустой и превышающий лимит списки. Публичная сеть/DNS/seed домены не затрагиваются; runtime scanner/UI отсутствует. Обязательные `cargo test/fmt/clippy`, ОС-матрица и точный `ci-gate` должны быть успешны.
+
 ## 1. Test pyramid
 
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)
