@@ -315,6 +315,8 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
         self.assertIn("local_connect_and_socks5_relay_real_tcp_with_half_close", tests)
         self.assertIn("local_proxies_never_acknowledge_policy_denial_or_invalid_protocol", tests)
+        self.assertIn("client_binary_curl_connect_and_socks5h", tests)
+        self.assertIn("CARGO_BIN_EXE_theia", tests)
 
 
 if __name__ == "__main__":
