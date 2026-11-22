@@ -3,9 +3,9 @@
 //! No DNS, CIDR expansion, domain sweep, fallback or REALITY claim.
 use crate::{
     camouflage_discovery::{CandidateHost, CandidateSource, Observation},
-    camouflage_workflow::DiscoveryPreview,
     camouflage_h3_probe::{probe_quic_h3, H3ProbeError, H3ProbeReport},
     camouflage_probe::{probe_tls_h2, ProbeApproval, ProbeError, ProbeReport, ProbeRequest},
+    camouflage_workflow::DiscoveryPreview,
 };
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{fmt, net::SocketAddr};
@@ -186,7 +186,10 @@ mod tests {
         assert!(!report.both_transports_verified());
         report.h3 = Err(H3ProbeError::TimedOut);
         assert!(!report.both_transports_verified());
-        assert_eq!(format!("{report:?}"), "DualProbeReport { h2_verified: true, h3_verified: false }");
+        assert_eq!(
+            format!("{report:?}"),
+            "DualProbeReport { h2_verified: true, h3_verified: false }"
+        );
     }
 
     #[test]
