@@ -10,7 +10,7 @@ use crate::{
         Warning, POPULAR_HTTPS_DOMAINS,
     },
     camouflage_interfaces::NativeInterfaces,
-    camouflage_workflow::{build_preview, PreviewScope},
+    camouflage_workflow::{build_preview, DiscoveryPreview, PreviewScope},
 };
 use std::net::IpAddr;
 
@@ -85,18 +85,22 @@ impl CandidateReview {
         }
     }
 
-    fn scoped_plan(&self) -> DiscoveryPlan {
+    /// The confirmed manual scope is *only* part of this disposable offline
+    /// plan. Opening the active batch chooser still requires per-IP checkboxes
+    /// and a separate exact TCP+UDP disclosure/approval.
+    pub(crate) fn batch_preview(&self) -> DiscoveryPreview {
         match self.scope {
-            ScopeState::Accepted(prefix) => {
-                build_preview(
-                    &self.native,
-                    None,
-                    PreviewScope::OperatorApprovedCidrs(&[prefix]),
-                )
-                .plan
-            }
-            _ => build_preview(&self.native, None, PreviewScope::PassiveOnly).plan,
+            ScopeState::Accepted(prefix) => build_preview(
+                &self.native,
+                None,
+                PreviewScope::OperatorApprovedCidrs(&[prefix]),
+            ),
+            _ => build_preview(&self.native, None, PreviewScope::PassiveOnly),
         }
+    }
+
+    fn scoped_plan(&self) -> DiscoveryPlan {
+        self.batch_preview().plan
     }
 
     /// Dry-run the existing M3.5 offline planner with a candidate CIDR.
@@ -243,7 +247,7 @@ impl CandidateReview {
         }
         match &self.scope {
             ScopeState::Overview => body.push_str(
-                "\nНет разрешения на активные проверки. Маска интерфейса не доказывает владение CIDR.\n\na: ввести собственный IPv4 CIDR только для offline-плана\nEsc: вернуться",
+                "\nНет разрешения на активные проверки. Маска интерфейса не доказывает владение CIDR.\n\na: ввести собственный IPv4 CIDR только для offline-плана\nEsc: вернуться\n\nb: вручную выбрать IP для H2+H3 (отдельное согласие)",
             ),
             ScopeState::Input(input) => body.push_str(&format!(
                 "\nВведите IPv4 CIDR (/24..=/32, максимум {MAX_CIDR_TEXT} символа):\n{input}\n{}\n\nEnter: проверить пределы офлайн  Backspace: удалить  Esc: отменить",
@@ -253,7 +257,7 @@ impl CandidateReview {
                 "\nПодтвердить офлайн-план для {prefix}?\n{additional} дополнительных IP-кандидатов.\n\nПОДТВЕРЖДЕНИЕ ОПЕРАТОРА: доступ к этому диапазону необходимо\nподтвердить независимо. Эта отметка не доказывает право владения\nи не является разрешением на активное сканирование.\n\ny: добавить только в offline-просмотр  n: отказаться  Esc: отменить",
             )),
             ScopeState::Accepted(prefix) => body.push_str(&format!(
-                "\nЛокально заявленный диапазон: {prefix}.\nЭто не является разрешением на активное сканирование.\nНикакие CIDR-адреса не подключались и не сохранялись.\n\na: изменить диапазон (новое согласие)  Esc: закрыть/стереть",
+                "\nЛокально заявленный диапазон: {prefix}.\nЭто не является разрешением на активное сканирование.\nНикакие CIDR-адреса не подключались и не сохранялись.\n\na: изменить диапазон  b: выбрать IP и запросить отдельное H2+H3 согласие  Esc: закрыть/стереть",
             )),
         }
         if !matches!(self.scope, ScopeState::Input(_)) {

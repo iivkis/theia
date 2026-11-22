@@ -3,8 +3,8 @@
 //! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
 //! No service reload, network or OS proxy effect.
 use crate::{
-    tui_candidates::CandidateReview, tui_discovery::DiscoveryPanel, tui_editor::Editor,
-    tui_probe::ProbePanel, Role,
+    tui_candidate_batch::CandidateBatchPanel, tui_candidates::CandidateReview,
+    tui_discovery::DiscoveryPanel, tui_editor::Editor, tui_probe::ProbePanel, Role,
 };
 use crossterm::{
     cursor::{Hide, Show},
@@ -183,6 +183,7 @@ struct Interaction {
     issuance: Option<IssueFlow>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
+    candidate_batch: Option<CandidateBatchPanel>,
     probe: Option<ProbePanel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
@@ -195,6 +196,7 @@ impl Interaction {
             issuance: None,
             discovery: None,
             candidates: None,
+            candidate_batch: None,
             probe: None,
             pending: None,
             saving: None,
@@ -249,6 +251,23 @@ impl Interaction {
         if key.kind != KeyEventKind::Press || self.saving.is_some() {
             return false;
         }
+        if let Some(batch) = self.candidate_batch.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    if batch.back_or_close() {
+                        self.candidate_batch = None;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => batch.next(),
+                KeyCode::Up | KeyCode::Char('k') => batch.previous(),
+                KeyCode::Char(' ') => batch.toggle_current(),
+                KeyCode::Enter => batch.ask_confirmation(),
+                KeyCode::Char('y') if batch.is_confirming() => batch.confirm_and_start(),
+                KeyCode::Char('n') => batch.decline(),
+                _ => {}
+            }
+            return false;
+        }
         if let Some(review) = self.candidates.as_mut() {
             if key.code == KeyCode::Esc {
                 if review.back_or_close() {
@@ -275,6 +294,17 @@ impl Interaction {
                 }
             } else if key.code == KeyCode::Char('a') {
                 review.begin_cidr();
+            } else if key.code == KeyCode::Char('b') {
+                let server_name = self
+                    .editor
+                    .as_ref()
+                    .filter(|editor| editor.role() == Role::Server)
+                    .and_then(Editor::selected_server_name)
+                    .map(str::to_owned);
+                self.candidate_batch = Some(CandidateBatchPanel::new(
+                    review.batch_preview(),
+                    server_name,
+                ));
             }
             return false;
         }
@@ -603,7 +633,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), t: отдельное разрешение на один TLS/H2 handshake. Ни один шаг не применяет настройки. Runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: вручную выбрать до 8 IP (Space) и отдельно одобрить обе TLS/H2 и QUIC/H3 проверки, t: один IP H2+H3. Ни один шаг не применяет настройки. Runtime и системный прокси не изменяются.",
             true,
         ),
     }
@@ -628,6 +658,14 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             parts[1],
             "Не сохранено: подтвердите переход",
             "s: сохранить и продолжить\nd: отменить изменения и продолжить\nEsc: остаться в редакторе\n\nНи одна опция не применяет конфигурацию к runtime.",
+            true,
+        );
+    } else if let Some(batch) = interaction.and_then(|ui| ui.candidate_batch.as_ref()) {
+        panel(
+            frame,
+            parts[1],
+            "F-18: ручной список до 8 точных IP для TCP/H2 + UDP/H3",
+            &batch.body(),
             true,
         );
     } else if let Some(review) = interaction.and_then(|ui| ui.candidates.as_ref()) {
@@ -657,7 +695,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  u: новый пользователь  p: сеть/IP  Ctrl+S: сохранить",
+            "j/k: запись  Tab: поле  Enter/e: ввод  u: пользователь  p: сеть/IP  r/b: кандидаты  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
@@ -763,6 +801,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(probe) = interaction.probe.as_mut() {
             probe.poll();
+        }
+        if let Some(batch) = interaction.candidate_batch.as_mut() {
+            batch.poll();
         }
         terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
         if event::poll(Duration::from_millis(50))? {
@@ -1339,6 +1380,54 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Char('n')));
         ui.update(&mut model, press(KeyCode::Char('r')));
         assert!(ui.candidates.is_some());
+    }
+
+    #[test]
+    fn server_batch_chooser_remains_offline_until_individual_ip_checks_and_final_y() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        ui.update(&mut model, press(KeyCode::Char('p')));
+        ui.update(&mut model, press(KeyCode::Char('r')));
+        assert!(ui.candidates.is_some());
+        ui.update(&mut model, press(KeyCode::Char('b')));
+        assert!(ui.candidate_batch.is_some());
+        assert!(!ui.candidate_batch.as_ref().unwrap().is_running());
+        let displayed = rendered_interaction(120, 40, &model, &ui);
+        assert!(
+            displayed.contains("нет серверной конфигурации")
+                || displayed.contains("Нет серверной конфигурации")
+        );
+        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        assert!(!ui.candidate_batch.as_ref().unwrap().is_running());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.candidate_batch.is_none());
+        assert!(ui.candidates.is_some());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.candidates.is_none());
+        assert!(ui.discovery.is_some());
+    }
+
+    #[test]
+    fn batch_modal_cannot_open_while_editing_or_confirming_cidr_and_esc_unwinds() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        ui.update(&mut model, press(KeyCode::Char('p')));
+        ui.update(&mut model, press(KeyCode::Char('r')));
+        ui.update(&mut model, press(KeyCode::Char('a')));
+        assert!(ui.candidates.as_ref().unwrap().is_editing());
+        ui.update(&mut model, press(KeyCode::Char('b')));
+        assert!(ui.candidate_batch.is_none());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(!ui.candidates.as_ref().unwrap().is_editing());
+        ui.update(&mut model, press(KeyCode::Char('b')));
+        assert!(ui.candidate_batch.is_some());
+        ui.update(&mut model, press(KeyCode::Char(' ')));
+        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        assert!(!ui.candidate_batch.as_ref().unwrap().is_running());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.candidate_batch.is_none());
     }
 
     #[test]
