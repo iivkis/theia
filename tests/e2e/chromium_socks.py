@@ -23,9 +23,14 @@ async def read_address(reader, atyp):
     raise ValueError("invalid SOCKS address type")
 
 
-async def copy(reader, writer):
+async def copy(reader, writer, marker, matched):
+    tail = b""
     try:
         while data := await reader.read(16384):
+            combined = tail + data
+            if marker in combined:
+                matched.set()
+            tail = combined[-(len(marker) - 1):]
             writer.write(data)
             await writer.drain()
         if writer.can_write_eof():
@@ -38,6 +43,8 @@ async def scenario(proxy, port):
     host, proxy_port = proxy.rsplit(":", 1)
     assert host == "127.0.0.1"
     success = asyncio.Event()
+    request_seen = asyncio.Event()
+    response_seen = asyncio.Event()
     tasks = set()
 
     async def guard(reader, writer):
@@ -74,7 +81,10 @@ async def scenario(proxy, port):
             if reply[1] != 0:
                 return
             success.set()
-            await asyncio.gather(copy(reader, upstream), copy(upstream_reader, writer))
+            await asyncio.gather(
+                copy(reader, upstream, b"GET /ci-browser HTTP/1.", request_seen),
+                copy(upstream_reader, writer, b"theia-browser-ci-ok", response_seen),
+            )
         except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
             pass
         finally:
@@ -121,6 +131,7 @@ async def scenario(proxy, port):
                 assert response is not None and response.status == 200
                 assert await page.locator("#result").inner_text(timeout=5000) == "theia-browser-ci-ok"
                 assert success.is_set(), "browser bypassed the Theia SOCKS5 path"
+                assert request_seen.is_set() and response_seen.is_set(), "navigation bytes did not traverse Theia"
                 await context.close()
                 print("Chromium DOM and Theia SOCKS5 CONNECT verified")
             finally:

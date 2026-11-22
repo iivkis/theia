@@ -413,7 +413,6 @@ async fn launch_client(
     wait_for_proxy(http, &mut child).await;
     wait_for_proxy(socks, &mut child).await;
     (dir, child, http, socks)
-
 }
 
 /// Black-box curl tests run on both native CI runners. No external service,
