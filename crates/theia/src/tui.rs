@@ -20,6 +20,8 @@ use std::{
     fmt,
     io::{self, IsTerminal},
     path::Path,
+    sync::mpsc::{self, TryRecvError},
+    time::Duration,
 };
 
 #[derive(Debug)]
@@ -165,6 +167,7 @@ impl Model {
 struct Interaction {
     editor: Option<Editor>,
     pending: Option<KeyEvent>,
+    saving: Option<mpsc::Receiver<(Editor, bool)>>,
 }
 
 impl Interaction {
@@ -172,6 +175,40 @@ impl Interaction {
         Self {
             editor,
             pending: None,
+            saving: None,
+        }
+    }
+
+    fn start_save(&mut self) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.saving = Some(rx);
+        // File I/O and fsync never block terminal rendering or key dispatch.
+        std::thread::spawn(move || {
+            let saved = editor.save();
+            let _ = tx.send((editor, saved));
+        });
+    }
+
+    fn poll_save(&mut self, model: &mut Model) -> Result<bool, TuiError> {
+        let Some(receiver) = self.saving.as_ref() else {
+            return Ok(false);
+        };
+        match receiver.try_recv() {
+            Ok((editor, saved)) => {
+                self.saving = None;
+                self.editor = Some(editor);
+                if saved {
+                    if let Some(original) = self.pending.take() {
+                        return Ok(model.update(original));
+                    }
+                }
+                Ok(false)
+            }
+            Err(TryRecvError::Empty) => Ok(false),
+            Err(TryRecvError::Disconnected) => Err(TuiError::Io),
         }
     }
 
@@ -180,7 +217,7 @@ impl Interaction {
     }
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
-        if key.kind != KeyEventKind::Press {
+        if key.kind != KeyEventKind::Press || self.saving.is_some() {
             return false;
         }
         let Some(editor) = self.editor.as_mut() else {
@@ -189,10 +226,8 @@ impl Interaction {
         if let Some(original) = self.pending {
             match key.code {
                 KeyCode::Char('s') => {
-                    if editor.save() {
-                        self.pending = None;
-                        return model.update(original);
-                    }
+                    self.start_save();
+                    return false;
                 }
                 KeyCode::Char('d') => {
                     editor.discard();
@@ -230,7 +265,7 @@ impl Interaction {
         );
         if active {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-                editor.save();
+                self.start_save();
                 return false;
             }
             if matches!(key.code, KeyCode::Enter | KeyCode::Char('e')) {
@@ -355,7 +390,15 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         ),
     }
-    if interaction.is_some_and(|ui| ui.pending.is_some()) {
+    if interaction.is_some_and(|ui| ui.saving.is_some()) {
+        panel(
+            frame,
+            parts[1],
+            "Сохранение конфигурации",
+            "Проверка изменений и атомарная запись TOML выполняются.\nRuntime не перезагружается.\nДождитесь результата операции.",
+            true,
+        );
+    } else if interaction.is_some_and(|ui| ui.pending.is_some()) {
         panel(
             frame,
             parts[1],
@@ -426,10 +469,15 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
     let mut model = Model::new(role);
     let mut interaction = Interaction::new(editor);
     loop {
+        if interaction.poll_save(&mut model)? {
+            return Ok(());
+        }
         terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
-        if let Event::Key(key) = event::read()? {
-            if interaction.update(&mut model, key) {
-                return Ok(());
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if interaction.update(&mut model, key) {
+                    return Ok(());
+                }
             }
         }
     }
@@ -535,6 +583,46 @@ mod tests {
         assert!(!interaction.editor.as_ref().unwrap().dirty());
         assert_eq!(fs::read(&path).unwrap(), source.as_bytes());
         assert_eq!(config::read_file(&path).unwrap().validate(), Ok(()));
+        fs::remove_file(path).unwrap();
+    }
+
+
+    #[test]
+    fn ctrl_s_saves_in_worker_then_navigation_continues() {
+        use crate::config::{self, Config};
+        use std::{fs, thread, time::Instant};
+        let path = std::env::temp_dir().join(format!(
+            "theia-tui-save-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut interaction =
+            Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
+        interaction.editor.as_mut().unwrap().input = "changed.example.org:443".into();
+        assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
+        assert!(interaction.editor.as_ref().unwrap().dirty());
+        assert!(!interaction.update(&mut model, press(KeyCode::Char('q'))));
+        assert!(interaction.pending.is_some());
+        assert!(!interaction.update(&mut model, press(KeyCode::Char('s'))));
+        assert!(interaction.saving.is_some());
+        let start = Instant::now();
+        let finished = loop {
+            if interaction.poll_save(&mut model).unwrap() {
+                break true;
+            }
+            if interaction.saving.is_none() || start.elapsed() > Duration::from_secs(5) {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(finished, "save must complete queued quit after confirmed write");
+        assert!(interaction.editor.as_ref().unwrap().error.is_none());
+        let Config::Client(doc) = config::read_file(&path).unwrap() else {
+            panic!("client expected");
+        };
+        assert_eq!(doc.client.profiles[0].server, "changed.example.org:443");
         fs::remove_file(path).unwrap();
     }
 
