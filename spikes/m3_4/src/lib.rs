@@ -3,6 +3,8 @@
 //! pass on Linux and Windows, the HTTP/2 stream adapter is integrated, and
 //! the independent H3/QUIC requirements are met.
 
+pub mod h2_transport;
+
 use btls::{
     error::ErrorStack,
     ssl::{ConnectConfiguration, SslConnector, SslMethod, SslVerifyMode, SslVersion},
