@@ -84,6 +84,10 @@ async fn verified_pinned_https_echo_returns_only_remote_observation() {
         assert_eq!(report.source().pinned_ip(), f.address.ip());
         assert_eq!(report.source().server_name(), "localhost");
         assert!(report.observed_at() <= std::time::SystemTime::now());
+        // Diagnostic formatting cannot disclose witness host or observed IP.
+        let debug = format!("{report:?}");
+        assert!(!debug.contains("93.184.216.34"));
+        assert!(!debug.contains("localhost"));
 
         // Only the witness claim is added to a passive preview. A mismatched
         // assigned interface is *not* proof of NAT, permission or CIDR scope.
@@ -135,7 +139,7 @@ async fn valid_ipv6_public_echo_is_supported_without_scanning_ipv6() {
         request(f.address), f.roots,
         EgressApproval::isolated_loopback_fixture(f.address),
     ).await.unwrap();
-    assert_eq!(report.ip(), "2606:4700:4700::1111".parse().unwrap());
+    assert_eq!(report.ip(), "2606:4700:4700::1111".parse::<IpAddr>().unwrap());
     f.server.await.unwrap();
 }
 
@@ -223,6 +227,24 @@ async fn redirects_and_private_echo_and_wrong_alpn_are_not_trusted() {
                 EgressApproval::isolated_loopback_fixture(f.address)
             ).await.unwrap_err(),
             error
+        );
+        f.server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn oversized_body_and_malformed_echo_are_rejected() {
+    // A witness must not turn the discovery API into a large response
+    // consumer or produce a positive observation from non-IP content.
+    let oversized: &'static [u8] = b"99999999999999999999999999999999999999999999999999999999999999999";
+    for body in [oversized, &b"not-an-ip"[..], &b""[..]] {
+        let f = fixture(body, "200 OK", b"http/1.1").await;
+        assert_eq!(
+            observe_public_egress(
+                request(f.address), f.roots,
+                EgressApproval::isolated_loopback_fixture(f.address)
+            ).await.unwrap_err(),
+            EgressError::InvalidResponse
         );
         f.server.await.unwrap();
     }
