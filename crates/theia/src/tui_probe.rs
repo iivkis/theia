@@ -323,7 +323,7 @@ impl Drop for ProbePanel {
     }
 }
 
-//! M4.5b: server-only exact assigned public-IP TLS/H2 check UI state.
+// M4.5b tests: exact assigned public-IP TLS/H2 check UI state.
 #[cfg(test)]
 mod tests {
     use super::*;
