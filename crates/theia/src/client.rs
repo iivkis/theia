@@ -23,6 +23,7 @@ pub enum ClientError {
     Io,
     Tls,
     Http2,
+    Http3,
     Unauthorized,
     Rejected(u16),
     Protocol,
@@ -34,10 +35,11 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Never display credential, request headers, endpoint or target values.
         match self {
-            Self::Configuration => f.write_str("invalid H2 client configuration"),
+            Self::Configuration => f.write_str("invalid client configuration"),
             Self::Io => f.write_str("client TCP operation failed"),
             Self::Tls => f.write_str("TLS identity or ALPN verification failed"),
             Self::Http2 => f.write_str("HTTP/2 transport failed"),
+            Self::Http3 => f.write_str("HTTP/3 transport failed"),
             Self::Unauthorized => f.write_str("server rejected authentication"),
             Self::Rejected(status) => write!(f, "server rejected request (HTTP {status})"),
             Self::Protocol => f.write_str("SmartTheia protocol violation"),
@@ -48,6 +50,22 @@ impl fmt::Display for ClientError {
 }
 
 impl std::error::Error for ClientError {}
+
+pub(crate) fn bearer_header(token: &str) -> Result<HeaderValue, ClientError> {
+    if token.len() != 43 || token.contains('=') {
+        return Err(ClientError::Configuration);
+    }
+    let raw = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| ClientError::Configuration)?;
+    if raw.len() != 32 || URL_SAFE_NO_PAD.encode(&raw) != token {
+        return Err(ClientError::Configuration);
+    }
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| ClientError::Configuration)?;
+    authorization.set_sensitive(true);
+    Ok(authorization)
+}
 
 /// One explicit H2 endpoint. Each opened tunnel currently uses its own
 /// TLS connection and owns its driver; no automatic fallback or pooling.
@@ -66,15 +84,10 @@ impl H2Client {
         token: &str,
         roots: RootCertStore,
     ) -> Result<Self, ClientError> {
-        if roots.is_empty() || token.len() != 43 || token.contains('=') {
+        if roots.is_empty() {
             return Err(ClientError::Configuration);
         }
-        let raw = URL_SAFE_NO_PAD
-            .decode(token)
-            .map_err(|_| ClientError::Configuration)?;
-        if raw.len() != 32 || URL_SAFE_NO_PAD.encode(&raw) != token {
-            return Err(ClientError::Configuration);
-        }
+        let authorization = bearer_header(token)?;
         let authority: http::uri::Authority =
             endpoint.parse().map_err(|_| ClientError::Configuration)?;
         if authority.port_u16().unwrap_or(0) == 0 || authority.host().is_empty() {
@@ -88,9 +101,6 @@ impl H2Client {
             .path_and_query("/v1/session")
             .build()
             .map_err(|_| ClientError::Configuration)?;
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| ClientError::Configuration)?;
-        authorization.set_sensitive(true);
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))

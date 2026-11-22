@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod config;
+pub mod h3_client;
 pub mod h3_server;
 pub mod local_proxy;
 pub mod protocol;
