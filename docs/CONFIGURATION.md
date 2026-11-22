@@ -117,6 +117,10 @@ language = "ru"
 - Ссылка не распределяет доверенные корни CA сама по себе. Перед реальным соединением клиент проверяет серверный TLS/SNI и доверенную CA из локального хранилища. Использование invalid или unauthenticated CA, отключение TLS verification, transport downgrade при auth error запрещены. CA bundle/chain provisioning остаётся отдельным шагом до безопасного импортного соединения.
 - Один серверный пользователь с токеном не получает автоматический доступ ко всем inbounds; экспорт выдаётся только при явном allowed_user_ids в выбранной inbound. Не менять system_proxy, активный профиль или runtime при импорте.
 
+## 4.2. Будущие F-18/F-19 поля (не изменять TOML v1 до реализации)
+
+REALITY-подобный security mode, криптографическая идентичность сервера и pin **публичного** ключа, выбранный TLS образец target/SNI, версия протокола, fingerprint и anti-TLS-in-TLS policy off/optional/required требуют отдельного ADR с точными типами, схемой миграции и versioned invitation. В существующем строгом schema_version=1 клиентский tls_profile=default и экспорт theia://v1 остаются единственными разрешёнными; нельзя пропускать новые поля или выдавать стандартный TLS за REALITY. Server private key должен храниться через защищённый env/file; не помещать его в приглашение, логи, результаты сканера. Клиент должен проверять server identity без снятия верификации TLS; при неподдерживаемом required — отказ. См. docs/STEALTH_REALITY.md.
+
 ## 5. Windows system proxy
 
 Реализация через Windows APIs (WinINet/user Internet Settings), а не `netsh winhttp` как замену пользовательскому прокси: WinHTTP и WinINet — не одно и то же. Настраивать адрес локального HTTP proxy для HTTP и HTTPS, bypass для loopback/intranet при необходимости, уведомлять систему об изменении.

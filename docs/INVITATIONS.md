@@ -44,3 +44,7 @@ Fields: `version` must be 1, `id` a v1-compatible profile ID, `endpoint` a valid
 ## Security tests and limitations of M4.4a
 
 The pure codec rejects wrong prefix/version, noncanonical/oversized base64, unknown fields, non-256-bit token, bad endpoint/SNI, unknown TLS profile, invalid env/file references and mismatched/disabled/ungranted server users. The computed full client profile is checked with the existing typed config validator; importing never trusts a provided CA path from the URI. The encoded token is held in memory for import, so the raw link and process memory must be treated as confidential. M4.4a has **no** CSPRNG issuance, file/clipboard UI, ACL, QR, import transaction, runtime reload or service connection; these remain open P0.
+
+## Будущие F-18/F-19 (не реализовано)
+
+REALITY-подобный отдельный security mode и anti-TLS-in-TLS требуют **нового versioned invitation contract** с подтверждённой identity сервера, а не молчаливого расширения theia://v1. Текущий invite v1 разрешает только стандартный TLS с tls_profile=default и строгой проверкой cert/SNI; не принимает неизвестные поля. Новый scanner не экспортирует ключи сервера, bearer или пользовательские URL. См. docs/STEALTH_REALITY.md.
