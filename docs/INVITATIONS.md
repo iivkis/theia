@@ -1,6 +1,6 @@
 # Theia connection invitations: portable v1 (F-14, P0)
 
-**Normative target, 2026-11-22.** M4.4a delivers the safe Rust domain codec and conversion, not an end-user TUI/CLI import/export workflow. Do not call F-14 complete until M4.4b–d have passing Linux/Windows CI.
+**Normative target, 2026-11-22.** M4.4a delivers the codec; M4.4b1 adds server TUI new-user issuance and one-time confidential link display after durable TOML save. Existing-user rotation/revocation, secure export files/clipboard and client import remain missing. Do not call F-14 P0 complete until M4.4b2/M4.4c/d pass Linux/Windows CI.
 
 ## User model
 
@@ -30,7 +30,8 @@ Fields: `version` must be 1, `id` a v1-compatible profile ID, `endpoint` a valid
 - To issue, require valid server config, enabled server/user, existing inbound and **explicit user ID in inbound.allowed_user_ids**. Verify the digest matches freshly supplied bytes in constant time. Never accept a digest as bearer.
 - v1 shared endpoint uses `inbound.server_name` and the common numeric port of TCP/H2 and UDP/H3. If the port numbers differ, **reject auto invitation**, do not silently generate an unusable profile or disable fallback. This also assumes the publicly reachable address/port matches configured DNS and listener; proxies, NAT port mapping, split DNS and port overrides need an explicit future profile flow.
 - Public/secretless export is default. Confidential export requires a separate explicit operator confirmation, can be viewed/copied/exported only once, and must be hidden/cleared when the view closes. QR of the same URI can be added as P1 opt-in. URI with a token is a credential; do not print in ordinary logs, crash dumps, shell history or default stdout. Protect exported files and clipboard.
-- Server creation/rotation, TUI export and persisted secret handling are **M4.4b**, not M4.4a.
+- **M4.4b1 server issuance in review:** on a valid clean server TOML, select inbound, press `u`, enter a unique ASCII ID, Enter and confirm `y`. Use the pinned rustls/ring SecureRandom provider to create a fresh 32-byte bearer, append SHA-256 digest user with `disabled=false` and an explicit grant on this inbound only. Strict document validation and existing background guarded atomic write must finish successfully before a separate `y` reveals the full `theia://v1/...` link exactly once. `n`/Esc abandons the unseen secret; Esc closes the shown secret. On conflict: `r` retries or `d` discards, with no link disclosure. This neither reloads runtime nor auto-enables a proxy.
+- **Limitations:** user *creation* only, not existing-user rotation/revoke. Protected file export, QR and clipboard, Windows client import, cert/CA provisioning, service reload and cross-host E2E are still P0 blockers. If operator closes/declines the one-time link before recording it, token cannot be reconstructed from the SHA-256 digest. Best-effort `zeroize` of freshly generated token, invitation bearer on drop and displayed URI string does not guarantee scrubbing serde/base64/TOML buffers or terminal/SSH scrollback.
 
 ## Client: import and TLS trust
 
