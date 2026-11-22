@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod protocol;
+pub mod server;
 
 use std::fmt;
 use std::path::Path;
@@ -32,6 +33,7 @@ pub enum CliError {
     NonUtf8Argument,
     NotImplemented(&'static str),
     Config(config::ConfigError),
+    Server(server::ServerError),
 }
 
 impl CliError {
@@ -54,6 +56,7 @@ impl fmt::Display for CliError {
             Self::InvalidConfigPath => write!(f, "missing or invalid --config path"),
             Self::NonUtf8Argument => write!(f, "arguments must be UTF-8"),
             Self::Config(error) => write!(f, "configuration invalid: {error}"),
+            Self::Server(error) => write!(f, "server failed: {error}"),
             Self::NotImplemented(feature) => write!(
                 f,
                 "{feature} is not implemented; no network or system proxy was started"
@@ -108,17 +111,17 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
     }
 }
 
-const HELP: &str = "Theia 0.1.0 (M1.2 typed config; no proxy runtime)\n\
+const HELP: &str = "Theia 0.1.0 (M2.1 H2 server inbound; client/H3 unavailable)\n\
 Usage:\n\
   theia --help | --version\n\
   theia tui [--role server|client]\n\
   theia server run --config <path>\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
-\n--help, --version and config validate are operational. Server/client runtimes and TUI\n\
-remain unavailable. Validation never starts a network listener or system proxy.";
+\n--help, --version, config validate, and server run (TLS 1.3/H2 only) are operational.\n\
+Client, H3, and TUI remain unavailable; system proxy is never modified.";
 
-/// Introspection and structural TOML validation work; network/TUI commands fail closed.
+/// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
     match command {
         Command::Help(None) => Ok(HELP),
@@ -167,7 +170,7 @@ mod tests {
         assert!(execute(Command::Version).unwrap().starts_with("theia "));
         assert!(execute(Command::Help(None))
             .unwrap()
-            .contains("no proxy runtime"));
+            .contains("H2 server inbound"));
     }
 
     #[test]
@@ -245,9 +248,6 @@ mod tests {
             Command::Tui { role: None },
             Command::Tui {
                 role: Some(Role::Server),
-            },
-            Command::ServerRun {
-                config: "server.toml".into(),
             },
             Command::ClientRun {
                 config: "client.toml".into(),

@@ -1,6 +1,6 @@
 # TOML configuration: v1 schema
 
-**Статус:** M1.2 typed TOML schema + structural validator and atomic file store реализованы в `crates/theia/src/config.rs`. Существование/доступность секретов, совпадение TLS сертификата с именем, runtime reload и Windows ACL ещё **не проверяются**. Отсутствие БД — обязательное ограничение.
+**Статус:** M1.2 typed TOML schema + structural validator and atomic file store реализованы в `crates/theia/src/config.rs`. M2.1 `server run` дополнительно читает PEM cert/key и создаёт TLS1.3/H2 listener (только server mode); при отсутствии/ошибке ключа или занятом порту отказывает. Существование/доступность секретов, совпадение TLS сертификата с именем, runtime reload и Windows ACL ещё **не проверяются**. Отсутствие БД — обязательное ограничение.
 
 ## 1. Файлы и расположения
 

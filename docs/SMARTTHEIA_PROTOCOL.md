@@ -1,6 +1,6 @@
 # SmartTheia v1: wire и transport контракт
 
-**Версия:** 1 (реализованы чистый frame codec и stream FSM в `crates/theia/src/protocol.rs`; HTTP/TLS транспорт, auth, policy и dial ещё не реализованы). **Область:** прикладной протокол проксирования поверх аутентифицированных TLS/QUIC HTTP-streams. Не собственный аналог TLS или QUIC.
+**Версия:** 1 (pure frame codec и FSM в `crates/theia/src/protocol.rs`; M2.1 добавляет реальный TLS1.3/HTTP2 server inbound с bearer auth, policy и TCP dial, но **без** H3, полноценного локального клиента и QUIC fallback). **Область:** прикладной протокол проксирования поверх аутентифицированных TLS/QUIC HTTP-streams. Не собственный аналог TLS или QUIC.
 
 ## 1. Transport embedding
 
