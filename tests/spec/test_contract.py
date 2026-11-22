@@ -236,6 +236,16 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("accepted_runtime_commands_fail_closed", integration)
         self.assertIn("rejected_arguments_cannot_start_a_runtime", integration)
 
+    def test_m12_typed_toml_implementation_is_strict(self):
+        manifest = tomllib.loads(read("crates/theia/Cargo.toml"))
+        self.assertIn("serde", manifest["dependencies"])
+        self.assertIn("toml", manifest["dependencies"])
+        implementation = read("crates/theia/src/config.rs")
+        for required in ("deny_unknown_fields", "allowed_user_ids", "overlaps(",
+                         "Ipv6Addr::UNSPECIFIED", "atomic_write", "file.sync_all()",
+                         "secret", "SystemProxy", "MAX_BYTES"):
+            self.assertIn(required, implementation)
+
     def test_ci_tests_first_and_cached(self):
         workflow = read(".github/workflows/ci.yml")
         self.assertIn("Swatinem/rust-cache@v2", workflow)

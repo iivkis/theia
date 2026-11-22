@@ -56,6 +56,8 @@
 
 - **M1.1 CLI shell:** корневой workspace `crates/theia` с зафиксированным `Cargo.lock`; отдельный `spikes/m0_1` не входит в production workspace. Работают только `--help` и `--version`. Распознаваемые `tui`, `server/client run`, `config validate` обязаны завершаться nonzero без сети, TUI и модификации OS proxy, пока реализация соответствующих M1.2/M2/M4 этапов отсутствует. Проверять unit + CLI integration tests на Linux/Windows; не называть синтаксический parser реализацией proxy.
 
+- **M1.2 typed TOML:** `config.rs` содержит строгую serde-модель, безопасные проверки grants/binds/secret refs, upper bound 1 МиБ и атомарную запись. `config validate` структурная проверка без чтения secret content; не считать отсутствие проверки base64url токена из env/file полной runtime validation. Запуск client/server остаётся fail-closed.
+
 ## Definition of Done (для каждого среза)
 
 - [ ] Есть автоматизированный позитивный и негативный тест; пограничные значения покрыты.

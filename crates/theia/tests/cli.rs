@@ -26,7 +26,6 @@ fn accepted_runtime_commands_fail_closed() {
         vec!["tui", "--role", "client"],
         vec!["server", "run", "--config", "missing.toml"],
         vec!["client", "run", "--config", "missing.toml"],
-        vec!["config", "validate", "--config", "missing.toml"],
     ] {
         let result = invoke(&args);
         assert_eq!(result.status.code(), Some(3), "{args:?}");
@@ -36,6 +35,30 @@ fn accepted_runtime_commands_fail_closed() {
             "{args:?}"
         );
     }
+}
+
+#[test]
+fn validates_client_toml_and_rejects_unknown_fields() {
+    let path = std::env::temp_dir().join(format!("theia-m12-cli-{}.toml", std::process::id()));
+    let valid = include_str!("../../../examples/client.toml");
+    std::fs::write(&path, valid).unwrap();
+    let path_str = path.to_str().unwrap();
+    let output = invoke(&["config", "validate", "--config", path_str]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("structurally valid"));
+    std::fs::write(
+        &path,
+        valid.replace("system_proxy = \"off\"", "system_proxy = \"on\""),
+    )
+    .unwrap();
+    let output = invoke(&["config", "validate", "--config", path_str]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("THEIA_AUTH_TOKEN"));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
