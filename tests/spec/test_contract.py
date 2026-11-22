@@ -371,6 +371,19 @@ class SpecContractTests(unittest.TestCase):
                      "auto_denied_h3_bearer_never_retries_working_h2"):
             self.assertIn(name, tests)
 
+    def test_m33_quic_congestion_comparison_is_mandatory(self):
+        workflow = read(".github/workflows/ci.yml")
+        gate = workflow.split("\n  ci-gate:\n", 1)[1]
+        self.assertIn("m3-3-bbr-comparison", gate)
+        self.assertIn("m3-3-bbr-comparison", workflow.split("\n  ci-gate:\n")[0])
+        benchmark = read("spikes/m0_1/tests/quic_congestion_comparison.rs")
+        for expected in ("quinn::congestion::Bbr", "quinn::congestion::Cubic",
+                         "loss_delay_jitter", "max_transmit_segments",
+                         "THEIA_BBR_RESULTS_PATH", "MAX_PENDING_DATAGRAMS"):
+            self.assertIn(expected, benchmark)
+        checker = read("tests/benchmark/check_bbr_comparison.py")
+        self.assertIn("no relative performance ranking", checker)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -102,3 +102,5 @@ M3.1d: explicit H3 server/client CLI integration, one common local proxy parser 
 M3.2a: auto fallback is strictly pre-auth, actual UDP transmit and no observed receive at configured handshake deadline. Generic timeout, TLS/ALPN, auth, protocol, OPEN and all post-handshake failures are never retryable. Profile-local monotonic negative TTL; no live tunnel migration. OS network change invalidation remains pending. CI-only acceptance.
 
 M3.2b: on every new auto tunnel observe local source address for the pinned server; invalidate negative cache on changes and uncertain route, reject stale generation updates; no probing application traffic or active session migration. Same-IP network changes and server DNS refresh remain open. CI-only.
+
+M3.3: mandatory CI-only exploratory BBR/CUBIC comparison jobs Linux+Windows record byte-exact QUIC transfer and synthetic UDP loss/delay/jitter to machine-readable artifacts. A green comparison is evidence the experiments executed, not evidence BBR is faster or F-11 release acceptance. Dedicated bandwidth/RTT/pacing/fairness/CPU/RSS benchmark gates remain open; never weaken them to declare the MVP complete.

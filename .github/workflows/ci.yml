@@ -214,9 +214,45 @@ jobs:
       - name: Verify Chromium navigation through the built Theia client
         run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5 -- --ignored --exact --nocapture
 
+  m3-3-bbr-comparison:
+    name: m3-3-bbr-comparison (${{ matrix.os }})
+    needs: specification
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      THEIA_BBR_RESULTS_PATH: ${{ github.workspace }}/theia-bbr-${{ matrix.os }}.csv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "spikes/m0_1 -> target"
+          key: "m3-3-comparison"
+      - name: Compare verified QUIC BBR and CUBIC with deterministic UDP impairment
+        shell: pwsh
+        run: |
+          cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test quic_congestion_comparison comparison_records_all_controller_scenarios_ci_only -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'QUIC comparison failed' }
+      - name: Validate reproducibility and evidence coverage
+        shell: pwsh
+        run: |
+          python tests/benchmark/check_bbr_comparison.py $env:THEIA_BBR_RESULTS_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'QUIC comparison validation failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m3-3-quic-comparison-${{ runner.os }}
+          path: ${{ github.workspace }}/theia-bbr-${{ matrix.os }}.csv
+          if-no-files-found: error
+
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, browser-e2e]
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, browser-e2e, m3-3-bbr-comparison]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -230,7 +266,7 @@ jobs:
           import os
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "browser-e2e"}
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "browser-e2e", "m3-3-bbr-comparison"}
           failed = [name for name in sorted(expected) if results.get(name, {}).get("result") != "success"]
           if failed:
               raise SystemExit("Required CI jobs did not succeed: " + ", ".join(failed))
