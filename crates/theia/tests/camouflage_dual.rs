@@ -48,7 +48,11 @@ async fn fixture(both: bool) -> Loopback {
         let endpoint = quic_transport::server_endpoint(address, vec![cert], key.into()).unwrap();
         tokio::spawn(async move {
             let incoming = endpoint.accept().await.unwrap();
-            let conn = quic_transport::accept(incoming).await.unwrap();
+            let Ok(conn) = quic_transport::accept(incoming).await else {
+                // Client intentionally rejects the certificate in the negative
+                // PKI fixture; server authentication must fail closed too.
+                return;
+            };
             tokio::time::sleep(Duration::from_millis(120)).await;
             drop(conn);
         })
