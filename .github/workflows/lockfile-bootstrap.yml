@@ -1,0 +1,18 @@
+# Temporary dependency migration aid. Normal CI stays --locked.
+name: QUIC lockfile bootstrap
+on:
+  pull_request:
+jobs:
+  candidate:
+    if: github.head_ref == 'feat/m3-1-quic-transport'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve pinned dependencies and print candidate lockfile
+        run: |
+          cargo update --workspace
+          echo 'THEIA_LOCKFILE_BEGIN'
+          cat Cargo.lock
+          echo 'THEIA_LOCKFILE_END'

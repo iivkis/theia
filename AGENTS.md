@@ -90,3 +90,5 @@ M2.2b: explicit `h2` runtime binds both loopback listeners before accepting; bou
 M2.2b CI executable regression: real curl through the compiled client over CONNECT and SOCKS5h to an isolated loopback origin, using generated PKI and child-only token. CI must fail if curl or the binary is unavailable, not skip the test. No browser E2E claim until automated browser coverage exists.
 
 CI-only browser regression: Playwright/Chromium in a mandatory Linux/Windows matrix (no production dependency), navigation through a test-only single-origin guard and real Theia SOCKS5 listener, compiled CLI and actual H2 server. Browser connectivity is not proof of a browser-like TLS fingerprint; fingerprint gate remains open.
+
+M3.1a: production QUIC composition root only; strict full TLS1.3 handshake, ALPN h3, active BBR on both peers, bounded stream/connection credit, no early data and no H2 fallback inference from handshake errors. CI-only H3 HELLO/ACK and PKI regressions. No H3 runtime enablement until auth/ACL/OPEN_OK/TCP relay, quotas and E2E are integrated.
