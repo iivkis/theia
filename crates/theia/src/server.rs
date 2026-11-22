@@ -472,7 +472,10 @@ async fn handle_request(
     .await;
     // A timeout or transport failure can interrupt an already partially
     // written frame. Reset rather than appending an ABORT to corrupt bytes.
-    if matches!(result, Err(_) | Ok(Err(ServerError::TimedOut | ServerError::Http2))) {
+    if matches!(
+        result,
+        Err(_) | Ok(Err(ServerError::TimedOut | ServerError::Http2))
+    ) {
         outgoing.send_reset(h2::Reason::CANCEL);
         return Ok(());
     }
@@ -710,8 +713,7 @@ fn check_certificate_name(
 ) -> Result<(), ServerError> {
     let name = rustls::pki_types::ServerName::try_from(name.to_owned())
         .map_err(|_| ServerError::Config)?;
-    let cert = rustls::server::ParsedCertificate::try_from(leaf)
-        .map_err(|_| ServerError::Tls)?;
+    let cert = rustls::server::ParsedCertificate::try_from(leaf).map_err(|_| ServerError::Tls)?;
     rustls::client::verify_server_name(&cert, &name).map_err(|_| ServerError::Tls)
 }
 
@@ -825,8 +827,11 @@ mod hardening_tests {
     #[test]
     fn dns_candidate_filter_pins_public_ips_and_caps_results() {
         let mixed: Vec<SocketAddr> = [
-            "127.0.0.1:443", "8.8.8.8:443", "8.8.8.8:443",
-            "[::ffff:169.254.169.254]:443", "[2002:7f00:1::]:443",
+            "127.0.0.1:443",
+            "8.8.8.8:443",
+            "8.8.8.8:443",
+            "[::ffff:169.254.169.254]:443",
+            "[2002:7f00:1::]:443",
         ]
         .iter()
         .map(|s| s.parse().unwrap())
@@ -836,9 +841,15 @@ mod hardening_tests {
             vec!["8.8.8.8:443".parse().unwrap()]
         );
         let denied = vec!["127.0.0.1:443".parse().unwrap()];
-        assert_eq!(permitted_candidates(denied, false), Err(ErrorCode::PolicyDenied));
+        assert_eq!(
+            permitted_candidates(denied, false),
+            Err(ErrorCode::PolicyDenied)
+        );
         let many = vec!["8.8.8.8:443".parse().unwrap(); MAX_DNS_RESULTS + 1];
-        assert_eq!(permitted_candidates(many, false), Err(ErrorCode::ResourceLimit));
+        assert_eq!(
+            permitted_candidates(many, false),
+            Err(ErrorCode::ResourceLimit)
+        );
     }
 
     #[test]

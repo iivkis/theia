@@ -445,14 +445,18 @@ async fn h2_peer_request_budget_returns_429_on_same_connection() {
         let (mut sender, driver) = client(address, connector).await;
         for _ in 0..120 {
             sender = sender.ready().await.unwrap();
-            let (response, _) = sender
-                .send_request(request("invalid"), true)
-                .unwrap();
-            assert_eq!(response.await.unwrap().status(), http::StatusCode::UNAUTHORIZED);
+            let (response, _) = sender.send_request(request("invalid"), true).unwrap();
+            assert_eq!(
+                response.await.unwrap().status(),
+                http::StatusCode::UNAUTHORIZED
+            );
         }
         sender = sender.ready().await.unwrap();
         let (response, _) = sender.send_request(request(&bearer()), true).unwrap();
-        assert_eq!(response.await.unwrap().status(), http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.await.unwrap().status(),
+            http::StatusCode::TOO_MANY_REQUESTS
+        );
         driver.abort();
         server.abort();
         let _ = server.await;
@@ -475,9 +479,13 @@ async fn cancelling_listener_releases_live_tunnel_and_session_permits() {
         let (response, mut tx) = sender.send_request(request(&bearer()), false).unwrap();
         send(
             &mut tx,
-            &Frame::Hello { version: VERSION, capabilities: 0 },
+            &Frame::Hello {
+                version: VERSION,
+                capabilities: 0,
+            },
             false,
-        ).await;
+        )
+        .await;
         let mut rx = response.await.unwrap().into_body();
         let mut decoder = Decoder::new();
         let mut queue = VecDeque::new();
@@ -492,11 +500,18 @@ async fn cancelling_listener_releases_live_tunnel_and_session_permits() {
                 port: destination.port(),
             },
             false,
-        ).await;
-        assert_eq!(next_frame(&mut rx, &mut decoder, &mut queue).await, Frame::OpenOk);
+        )
+        .await;
+        assert_eq!(
+            next_frame(&mut rx, &mut decoder, &mut queue).await,
+            Frame::OpenOk
+        );
         let (mut remote, _) = target.accept().await.unwrap();
         let held = context.authorize(Some(&bearer())).unwrap();
-        assert!(matches!(context.authorize(Some(&bearer())), Err(AuthFailure::Busy)));
+        assert!(matches!(
+            context.authorize(Some(&bearer())),
+            Err(AuthFailure::Busy)
+        ));
         server.abort();
         let _ = server.await;
         let mut byte = [0u8; 1];
@@ -509,7 +524,9 @@ async fn cancelling_listener_releases_live_tunnel_and_session_permits() {
                 }
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         drop(recovered);
         drop(held);
         driver.abort();
@@ -531,9 +548,13 @@ async fn default_acl_checks_server_resolved_localhost_before_dial() {
         let (response, mut tx) = sender.send_request(request(&bearer()), false).unwrap();
         send(
             &mut tx,
-            &Frame::Hello { version: VERSION, capabilities: 0 },
+            &Frame::Hello {
+                version: VERSION,
+                capabilities: 0,
+            },
             false,
-        ).await;
+        )
+        .await;
         let mut rx = response.await.unwrap().into_body();
         let mut decoder = Decoder::new();
         let mut queue = VecDeque::new();
@@ -548,12 +569,15 @@ async fn default_acl_checks_server_resolved_localhost_before_dial() {
                 port: destination.port(),
             },
             true,
-        ).await;
+        )
+        .await;
         assert_eq!(
             next_frame(&mut rx, &mut decoder, &mut queue).await,
             Frame::OpenError(ErrorCode::PolicyDenied)
         );
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
         driver.abort();
         server.abort();
         let _ = server.await;
