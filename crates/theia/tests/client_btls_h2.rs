@@ -73,10 +73,7 @@ fn tls_fixture(alpn: &[u8]) -> (TlsAcceptor, String) {
     (TlsAcceptor::from(Arc::new(config)), ca.pem())
 }
 
-async fn production_listener(
-    allow_private: bool,
-    alpn: &[u8],
-) -> (String, String, ServerTask) {
+async fn production_listener(allow_private: bool, alpn: &[u8]) -> (String, String, ServerTask) {
     let (acceptor, pem) = tls_fixture(alpn);
     let inbound = Inbound {
         id: "test".into(),
@@ -159,13 +156,9 @@ async fn experimental_btls_never_opens_after_wrong_ca_name_auth_or_acl() {
             Err(ClientError::Tls)
         ));
         let (_, unrelated) = tls_fixture(b"h2");
-        let wrong_ca = H2Client::new_experimental_btls(
-            &endpoint,
-            "localhost",
-            &token(),
-            unrelated.as_bytes(),
-        )
-        .unwrap();
+        let wrong_ca =
+            H2Client::new_experimental_btls(&endpoint, "localhost", &token(), unrelated.as_bytes())
+                .unwrap();
         assert!(matches!(
             wrong_ca.open(address.clone(), port).await,
             Err(ClientError::Tls)
@@ -183,13 +176,9 @@ async fn experimental_btls_never_opens_after_wrong_ca_name_auth_or_acl() {
             Err(ClientError::Unauthorized)
         ));
 
-        let correct = H2Client::new_experimental_btls(
-            &endpoint,
-            "localhost",
-            &token(),
-            pem.as_bytes(),
-        )
-        .unwrap();
+        let correct =
+            H2Client::new_experimental_btls(&endpoint, "localhost", &token(), pem.as_bytes())
+                .unwrap();
         assert!(matches!(
             correct.open(address, port).await,
             Err(ClientError::Open(ErrorCode::PolicyDenied))
