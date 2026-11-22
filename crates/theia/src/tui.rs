@@ -16,7 +16,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
-use zeroize::Zeroizing;
 use std::{
     fmt,
     io::{self, IsTerminal},
@@ -24,6 +23,7 @@ use std::{
     sync::mpsc::{self, TryRecvError},
     time::Duration,
 };
+use zeroize::Zeroizing;
 
 #[derive(Debug)]
 pub enum TuiError {
@@ -289,8 +289,9 @@ impl Interaction {
                     KeyCode::Char('y') => {
                         if let Some(invite) = editor.take_issued() {
                             match invite.encode() {
-                                Ok(link) => self.issuance =
-                                    Some(IssueFlow::Showing(Zeroizing::new(link))),
+                                Ok(link) => {
+                                    self.issuance = Some(IssueFlow::Showing(Zeroizing::new(link)))
+                                }
                                 Err(_) => {
                                     editor.error = Some("Не удалось сформировать ссылку.".into());
                                     editor.clear_issued();
@@ -355,7 +356,8 @@ impl Interaction {
         if active {
             if editor.role() == Role::Server && key.code == KeyCode::Char('u') {
                 if editor.dirty() {
-                    editor.error = Some("Сохраните или отмените черновик перед выдачей токена.".into());
+                    editor.error =
+                        Some("Сохраните или отмените черновик перед выдачей токена.".into());
                 } else {
                     editor.error = None;
                     self.issuance = Some(IssueFlow::Input(String::new()));
@@ -976,15 +978,25 @@ mod tests {
         let Config::Server(doc) = config::read_file(&path).unwrap() else {
             panic!("server");
         };
-        assert!(doc.server.inbounds[0].allowed_user_ids.contains(&"new-device".to_owned()));
+        assert!(doc.server.inbounds[0]
+            .allowed_user_ids
+            .contains(&"new-device".to_owned()));
         assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
         let IssueFlow::Showing(uri) = ui.issuance.as_ref().unwrap() else {
             panic!("explicit one-time reveal expected");
         };
         let invitation = Invitation::decode(uri).unwrap();
         let bytes = invitation.token_bytes().unwrap();
-        let saved_user = doc.server.users.iter().find(|u| u.id == "new-device").unwrap();
-        assert_eq!(saved_user.token_sha256, format!("{:x}", Sha256::digest(bytes)));
+        let saved_user = doc
+            .server
+            .users
+            .iter()
+            .find(|u| u.id == "new-device")
+            .unwrap();
+        assert_eq!(
+            saved_user.token_sha256,
+            format!("{:x}", Sha256::digest(bytes))
+        );
         assert!(rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
         assert!(!ui.update(&mut model, press(KeyCode::Char('q'))));
         assert_eq!(model.screen, Screen::Server);
@@ -1005,7 +1017,11 @@ mod tests {
         fs::write(&path, server_issuance_fixture()).unwrap();
         let mut editor = Editor::load(Role::Server, &path).unwrap();
         editor.issue_user("new-device").unwrap();
-        fs::write(&path, "# external writer\n".to_string() + &server_issuance_fixture()).unwrap();
+        fs::write(
+            &path,
+            "# external writer\n".to_string() + &server_issuance_fixture(),
+        )
+        .unwrap();
         let mut ui = Interaction::new(Some(editor));
         let mut model = Model::new(Some(Role::Server));
         ui.issuance = Some(IssueFlow::Saving);
@@ -1031,10 +1047,8 @@ mod tests {
     #[test]
     fn client_panel_cannot_open_server_issuance_and_dirty_draft_is_guarded() {
         use std::fs;
-        let path = std::env::temp_dir().join(format!(
-            "theia-m44b-client-ui-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("theia-m44b-client-ui-{}.toml", std::process::id()));
         fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
@@ -1042,10 +1056,8 @@ mod tests {
         assert!(ui.issuance.is_none());
         fs::remove_file(path).unwrap();
 
-        let path = std::env::temp_dir().join(format!(
-            "theia-m44b-dirty-ui-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("theia-m44b-dirty-ui-{}.toml", std::process::id()));
         fs::write(&path, server_issuance_fixture()).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
         let mut model = Model::new(Some(Role::Server));
@@ -1055,7 +1067,14 @@ mod tests {
         assert!(ui.editor.as_ref().unwrap().dirty());
         assert!(!ui.update(&mut model, press(KeyCode::Char('u'))));
         assert!(ui.issuance.is_none());
-        assert!(ui.editor.as_ref().unwrap().error.as_deref().unwrap().contains("черновик"));
+        assert!(ui
+            .editor
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("черновик"));
         fs::remove_file(path).unwrap();
     }
 

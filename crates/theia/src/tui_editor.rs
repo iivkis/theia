@@ -9,12 +9,12 @@ use crate::{
     Role,
 };
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
 use std::{
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
 };
+use zeroize::Zeroizing;
 
 const MAX_DOCUMENT: u64 = 1024 * 1024;
 const MAX_INPUT: usize = 255;
@@ -94,7 +94,9 @@ impl Editor {
         };
         if user_id.is_empty()
             || user_id.len() > 64
-            || !user_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            || !user_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
         {
             return Err("User ID must use 1..64 ASCII letters, digits, - or _");
         }
@@ -126,10 +128,11 @@ impl Editor {
             token_sha256: digest,
             disabled: false,
         });
-        candidate.validate().map_err(|_| "New user or grants did not pass validation")?;
-        let invitation = Invitation::issued_from_server(
-            &candidate, &inbound_id, user_id, &token,
-        ).map_err(|_| "Cannot issue invitation for selected inbound")?;
+        candidate
+            .validate()
+            .map_err(|_| "New user or grants did not pass validation")?;
+        let invitation = Invitation::issued_from_server(&candidate, &inbound_id, user_id, &token)
+            .map_err(|_| "Cannot issue invitation for selected inbound")?;
         // Commit draft only when all validations and permission checks succeed.
         self.draft = candidate;
         self.issued = Some(invitation);
@@ -642,15 +645,16 @@ mod tests {
         let temp = Temp::write(&server_source());
         let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
         assert!(editor.issue_user("new-device").is_ok());
-        fs::write(&temp.0, "# changed externally\n".to_string() + &server_source()).unwrap();
+        fs::write(
+            &temp.0,
+            "# changed externally\n".to_string() + &server_source(),
+        )
+        .unwrap();
         assert!(!editor.save());
         assert!(!editor.issued_ready());
         assert!(editor.take_issued().is_none());
         editor.discard();
-        assert_eq!(
-            config::read_file(&temp.0).unwrap().validate(),
-            Ok(())
-        );
+        assert_eq!(config::read_file(&temp.0).unwrap().validate(), Ok(()));
     }
 
     #[test]
