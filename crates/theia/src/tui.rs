@@ -1186,6 +1186,27 @@ mod tests {
     }
 
     #[test]
+    fn explicit_tls_probe_review_requires_server_context_not_ipify_consent() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_some());
+        assert!(ui.probe.is_none());
+        assert!(!ui.update(&mut model, press(KeyCode::Char('t'))));
+        assert!(ui.probe.is_some());
+        let review = rendered_interaction(120, 40, &model, &ui);
+        assert!(review.contains("TLS/H2"));
+        assert!(review.contains("конфигурация"));
+        // A standalone y without a selected target and explicit confirmation
+        // can never open sockets or mark TLS as verified.
+        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("TLS 1.3 подтверждён"));
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.probe.is_none());
+        assert!(ui.discovery.is_some());
+    }
+
+    #[test]
     fn key_release_and_non_relevant_keys_do_not_navigate() {
         let mut model = Model::new(None);
         let mut key = press(KeyCode::Char('2'));
