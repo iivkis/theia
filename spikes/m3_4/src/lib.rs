@@ -6,7 +6,7 @@
 use btls::{
     error::ErrorStack,
     ssl::{ConnectConfiguration, SslConnector, SslMethod, SslVerifyMode, SslVersion},
-    x509::X509,
+    x509::{store::X509StoreBuilder, X509},
 };
 
 /// An explicit, strict TLS 1.3 H2 candidate. No insecure verifier, fallback,
@@ -15,11 +15,15 @@ use btls::{
 /// have been configured. On-wire resemblance must be measured separately.
 pub fn h2_candidate(trusted_ca_pem: &[u8]) -> Result<ConnectConfiguration, ErrorStack> {
     let certificate = X509::from_pem(trusted_ca_pem)?;
+    // Pin an explicit verification store. The default context store is not
+    // the same as the peer verification store in this BoringSSL binding.
+    let mut roots = X509StoreBuilder::new()?;
+    roots.add_cert(certificate)?;
     let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_verify(SslVerifyMode::PEER);
-    builder.cert_store_mut().add_cert(certificate)?;
+    builder.set_verify_cert_store(roots.build())?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
     builder.set_alpn_protos(b"\x02h2\x08http/1.1")?;
