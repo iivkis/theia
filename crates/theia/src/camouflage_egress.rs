@@ -7,6 +7,7 @@
 use crate::camouflage_discovery::plausible_public_address;
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{
+    fmt,
     net::{IpAddr, SocketAddr},
     str,
     sync::Arc,
@@ -28,7 +29,7 @@ static ACTIVE_EGRESS_REQUESTS: Semaphore = Semaphore::const_new(2);
 /// Caller-granted scope, not automatically derived from a local interface,
 /// provider CIDR, popular domain, or external service response. Only a single
 /// explicit public TCP/443 IP can be used; loopback variant is for CI only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EgressApproval {
     Denied,
     PublicHttpsIp(IpAddr),
@@ -59,7 +60,7 @@ impl EgressApproval {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EgressRequest {
     /// Exact pinned IP:port; no name resolution is performed.
     pub address: SocketAddr,
@@ -83,7 +84,7 @@ pub enum EgressError {
     UnusableAddress,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EgressSource {
     server_name: String,
     pinned_ip: IpAddr,
@@ -103,7 +104,7 @@ impl EgressSource {
 /// is supplied by that witness, and is not cryptographic proof of ownership,
 /// NAT configuration, network reachability from another vantage, or right to
 /// scan any surrounding address range.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EgressObservation {
     ip: IpAddr,
     source: EgressSource,
@@ -121,6 +122,32 @@ impl EgressObservation {
 
     pub fn observed_at(&self) -> SystemTime {
         self.observed_at
+    }
+}
+
+// Errors are safe codes, but arbitrary request/response peer IPs and DNS
+// targets must never be emitted by default debug/log formatting.
+impl fmt::Debug for EgressApproval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EgressApproval(<redacted>)")
+    }
+}
+
+impl fmt::Debug for EgressRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EgressRequest(<redacted>)")
+    }
+}
+
+impl fmt::Debug for EgressSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EgressSource(<redacted>)")
+    }
+}
+
+impl fmt::Debug for EgressObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EgressObservation(<redacted>)")
     }
 }
 
