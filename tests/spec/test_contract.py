@@ -120,6 +120,33 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("BBR", text)
         self.assertIn("browser-like", text)
 
+    def test_f18_picker_discovers_server_range_and_popular_domains_without_manual_seed(self):
+        model = read("docs/STEALTH_REALITY.md")
+        spec = read("docs/IMPLEMENTATION_SPEC.md")
+        plan = read("docs/IMPLEMENTATION_PLAN.md")
+        ui = read("docs/TUI_UX.md")
+        ci = read("docs/TESTING_CI.md")
+        adr = read("docs/adr/0020-reality-like-and-tls-in-tls.md")
+        for needle in (
+            "Автоматическое обнаружение", "назначенных префиксов IPv4/IPv6",
+            "NAT", "RDAP/BGP", "без SNI", "TLS1.3", "SAN",
+            "ALPN", "серверная подсеть", "популярные домены",
+            "google.com", "samsung.com", "amd.com", "microsoft.com",
+            "cloudflare.com", "github.com", "mozilla.org", "wikipedia.org",
+            "без отдельного согласия", "приватного ключа",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle.lower(), model.lower())
+        self.assertIn("вручную вводить список не нужно", spec)
+        self.assertIn("M3.5b", plan)
+        self.assertIn("google.com", plan)
+        self.assertIn("google.com", ui)
+        self.assertIn("CIDR", ci)
+        self.assertIn("google.com", adr)
+        self.assertIn("не реализовано", read("README.md"))
+        # Research and docs do not enable any new production security mode.
+        self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
+
     def test_future_reality_like_and_tls_in_tls_are_p0_but_not_claimed_live(self):
         spec = read("docs/IMPLEMENTATION_SPEC.md")
         plan = read("docs/IMPLEMENTATION_PLAN.md")
