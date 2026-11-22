@@ -175,7 +175,7 @@ impl Interaction {
         }
     }
 
-    fn editor_for<'a>(&'a self, role: Role) -> Option<&'a Editor> {
+    fn editor_for(&self, role: Role) -> Option<&Editor> {
         self.editor.as_ref().filter(|edit| edit.role() == role)
     }
 
