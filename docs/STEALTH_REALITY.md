@@ -19,7 +19,7 @@
 
 ## M4.5d — доказательные H2/H3 статусы после strict TLS probe
 
-Успешный строго проверенный TCP/TLS1.3/CA/SAN/SNI/ALPN=h2 ответ `ProbeReport` выводится только после проверки совпадения pinned target IP с `connected_ip`. По существующим seven-field weights это **H2 80/100, confidence 85%, eligible NO** (unknown fingerprint), **H3 65/100, confidence 71%, eligible NO** (unknown H3 ALPN + fingerprint); это не вероятность обхода DPI и не полноценная F-18/F-19 readiness. Возраст результата отсчитывается монотонно с момента получения TUI, сбрасывается перед новым согласованным probe. Ошибки PKI/ALPN/timeout/mismatched IP дают **score Unknown**, не сулят частичное Verified без evidence. Нет активного domain/CIDR scanner, H3 или REALITY режима, Apply/IPC. [ADR-0032](adr/0032-m4-5d-evidence-score-tui.md).
+Успешный строго проверенный TCP/TLS1.3/CA/SAN/SNI/ALPN=h2 ответ `ProbeReport` выводится только после проверки совпадения pinned target IP с `connected_ip`. По существующим seven-field weights это **H2 80/100, confidence 85%, eligible NO** (unknown fingerprint), **H3 score Unknown, confidence 0%, eligible NO** (QUIC/H3 не проверен, H2 TLS доказательства не переносим на H3); это не вероятность обхода DPI и не полноценная F-18/F-19 readiness. Возраст результата отсчитывается монотонно с момента получения TUI, сбрасывается перед новым согласованным probe. Ошибки PKI/ALPN/timeout/mismatched IP дают **score Unknown**, не сулят частичное Verified без evidence. Нет активного domain/CIDR scanner, H3 или REALITY режима, Apply/IPC. [ADR-0032](adr/0032-m4-5d-evidence-score-tui.md).
 
 ## M4.5c — источники кандидатов и ограниченный ручной offline CIDR
 
