@@ -72,8 +72,8 @@ pub async fn connect_verified_h2(
     trusted_ca_pem: &[u8],
 ) -> Result<VerifiedH2, H2CandidateError> {
     timeout(HANDSHAKE_DEADLINE, async {
-        let config = h2_candidate(trusted_ca_pem)
-            .map_err(|_| H2CandidateError::InvalidTrustAnchor)?;
+        let config =
+            h2_candidate(trusted_ca_pem).map_err(|_| H2CandidateError::InvalidTrustAnchor)?;
         let ssl = config
             .into_ssl(server_name)
             .map_err(|_| H2CandidateError::InvalidServerName)?;
