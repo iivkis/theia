@@ -8,6 +8,7 @@
 use crate::camouflage_discovery::{InterfaceAddress, ServerSnapshot};
 use std::{io, net::IpAddr};
 
+#[cfg(target_os = "linux")]
 const MAX_INTERFACE_ADDRESSES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
