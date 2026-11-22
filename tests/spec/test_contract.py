@@ -127,7 +127,7 @@ class SpecContractTests(unittest.TestCase):
         adr = read("docs/adr/0020-reality-like-and-tls-in-tls.md")
         for feature in ("F-18", "F-19"):
             with self.subTest(feature=feature):
-                self.assertRegex(spec, rf"(?m)^\\| {feature} \\| P0 \\|")
+                self.assertIn(f"| {feature} | P0 |", spec)
                 self.assertIn(feature, model)
                 self.assertIn(feature, plan)
                 self.assertIn(feature, adr)
