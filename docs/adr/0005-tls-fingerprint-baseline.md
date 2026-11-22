@@ -14,6 +14,14 @@
 
 Результат **не** является Chrome/Firefox/Safari fingerprint, JA3/JA4 validation, браузерной имитацией, гарантией обмана DPI или реализацией HTTP/2/HTTP/3 fingerprint.
 
+## M3.4a: наблюдение настоящего production H2 ClientHello (negative control)
+
+`crates/theia/tests/fingerprint_h2.rs` запускает production `H2Client::open` к loopback TCP listener, считывает его первый TLS ClientHello и проверяет TLS fail-closed: тестовый peer никогда не заканчивает handshake. Тест повторно использует ограниченный парсер `spikes/m0_1/src/client_hello.rs` через test-only module. Сырые байты содержат случайность, SNI и key shares: они не логируются, не публикуются, не сохраняются в файлы и удаляются после разбора.
+
+Обычные Linux/Windows Rust tests проверяют ALPN h2, TLS 1.3, SNI и отсутствие GREASE/ALPS у текущего default rustls. Это **отрицательный контроль**, а не подтверждение browser-like профиля. В обязательных M0.1 CI jobs для Linux и Windows уже генерируется приватный Go uTLS v1.8.2 HelloChrome_133 эталон; дополнительный шаг вызывает `THEIA_UTLS_HELLO_PATH=<private-fixture> cargo test --workspace --locked --test fingerprint_h2 -- --ignored --nocapture`. Он сопоставляет характеристики *реального сетевого выхода Theia* с Go reference, не сравнивая рандомизированные TLS байты и не выводя секретные поля.
+
+**Границы:** тест не подтверждает H2 SETTINGS/pseudo-headers, H3 QUIC Initial, TLS/HTTP named profile, DPI-устойчивость или соответствие современному Chrome. Для реального M3.4/F-13 потребуются рабочий browser-like backend внутри одного Rust binary, отдельный H3 reference и положительные Windows/Linux acceptance тесты. До успешного CI на head SHA изменения лишь предложены в PR, а F-13 остаётся **P0 BLOCKED**.
+
 ## Матрица
 
 | Проверка | Статус |

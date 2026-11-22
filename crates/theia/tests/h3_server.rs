@@ -227,9 +227,19 @@ async fn h3_rejects_missing_wrong_and_ungranted_bearers_and_denied_tcp() {
             (Some(other.as_str()), StatusCode::FORBIDDEN),
         ] {
             let mut stream = sender.send_request(request(auth)).await.unwrap();
-            stream.finish().await.unwrap();
+            // Authorization must reject from request headers without waiting
+            // for request EOF. Finishing the upload races the server's
+            // intentional STOP_SENDING(H3_REQUEST_CANCELLED) on Windows.
             assert_eq!(stream.recv_response().await.unwrap().status(), status);
-            assert!(stream.recv_data().await.unwrap().is_none());
+            // The server sends an HTTP denial and stops reading the rejected
+            // request. Depending on the QUIC scheduler, the response body may
+            // end with FIN or the expected cancellation; neither carries DATA.
+            match stream.recv_data().await {
+                Ok(None) => {}
+                Err(h3::error::StreamError::RemoteTerminate { code, .. })
+                    if code == h3::error::Code::H3_REQUEST_CANCELLED => {}
+                _ => panic!("denied H3 response must have no body or unexpected reset"),
+            }
         }
 
         let mut stream = sender.send_request(request(Some(&token()))).await.unwrap();
