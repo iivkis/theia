@@ -76,3 +76,6 @@
 Нельзя закрывать задачу заглушкой, возвращающей успех, snapshot-тестом без проверки поведения, ложным счётчиком скорости, «поддержкой uTLS» через единственный заголовок или fallback при любом исключении.
 
 **Сначала минимальный защищённый TCP-туннель с тестами. Перед объявлением MVP готовым обязательно завершить P0 BBR и проверенный browser-like fingerprint профиль; ни один из этапов нельзя выдавать за уже реализованный.**
+
+
+M2.1 hardening: preflight certificate SAN matches configured DNS name (not full PKI chain/time validation), bounded shared IP request budget (120/min; 4096 peers; fixed windows; all requests), 8 KiB H2 header limit, H2/TLS handshake deadlines, single DNS/dial deadline with at most 64 results, task ownership via JoinSet, and bounded abort/drain. Remaining stress and full PKI checks are not claimed complete.

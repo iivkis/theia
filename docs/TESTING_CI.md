@@ -68,3 +68,6 @@ TDD = сначала red test на требование, затем green code, 
 Branch protection следует включить владельцу репозитория после создания workflow: required check `specification` (сейчас), `rust-tests` и `windows-smoke` (после появления Rust workspace). Запретить merge при красном CI, секретах, расхождении wire/TOML с docs и непокрытых негативных тестах. Не требовать сборку бинарников от docs-only состояния.
 
 Каждый релиз требует матрицу Linux server + Windows client на настоящих хостах, сертификат на test domain, валидную ревокацию токена, fallback при недоступном UDP, отказ при wrong cert, проверку Windows proxy recovery, и documented limitations.
+
+
+M2.1 hardening: preflight certificate SAN matches configured DNS name (not full PKI chain/time validation), bounded shared IP request budget (120/min; 4096 peers; fixed windows; all requests), 8 KiB H2 header limit, H2/TLS handshake deadlines, single DNS/dial deadline with at most 64 results, task ownership via JoinSet, and bounded abort/drain. Remaining stress and full PKI checks are not claimed complete.
