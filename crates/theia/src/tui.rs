@@ -2,7 +2,7 @@
 //!
 //! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
 //! No service reload, network or OS proxy effect.
-use crate::{tui_editor::Editor, Role};
+use crate::{tui_discovery::DiscoveryPanel, tui_editor::Editor, Role};
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -178,6 +178,7 @@ enum IssueFlow {
 struct Interaction {
     editor: Option<Editor>,
     issuance: Option<IssueFlow>,
+    discovery: Option<DiscoveryPanel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
 }
@@ -187,6 +188,7 @@ impl Interaction {
         Self {
             editor,
             issuance: None,
+            discovery: None,
             pending: None,
             saving: None,
         }
@@ -240,7 +242,24 @@ impl Interaction {
         if key.kind != KeyEventKind::Press || self.saving.is_some() {
             return false;
         }
+        if let Some(panel) = self.discovery.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    panel.cancel();
+                    self.discovery = None;
+                }
+                KeyCode::Char('i') => panel.ask_consent(),
+                KeyCode::Char('n') => panel.decline(),
+                KeyCode::Char('y') if panel.is_consent_pending() => panel.confirm_and_start(),
+                _ => {}
+            }
+            return false;
+        }
         let Some(editor) = self.editor.as_mut() else {
+            if model.screen == Screen::Server && key.code == KeyCode::Char('p') {
+                self.discovery = Some(DiscoveryPanel::new());
+                return false;
+            }
             return model.update(key);
         };
         if let Some(flow) = self.issuance.take() {
@@ -354,6 +373,16 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            if editor.role() == Role::Server && key.code == KeyCode::Char('p') {
+                if editor.dirty() {
+                    editor.error =
+                        Some("Сохраните или отмените черновик перед просмотром сети.".into());
+                } else {
+                    editor.error = None;
+                    self.discovery = Some(DiscoveryPanel::new());
+                }
+                return false;
+            }
             if editor.role() == Role::Server && key.code == KeyCode::Char('u') {
                 if editor.dirty() {
                     editor.error =
@@ -507,7 +536,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя и после успешной записи одноразово показывает ссылку. Runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p открывает пассивный просмотр IP/подсети (внешний сервис только после подтверждения). Runtime и системный прокси не изменяются.",
             true,
         ),
     }
@@ -534,10 +563,18 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             "s: сохранить и продолжить\nd: отменить изменения и продолжить\nEsc: остаться в редакторе\n\nНи одна опция не применяет конфигурацию к runtime.",
             true,
         );
+    } else if let Some(discovery) = interaction.and_then(|ui| ui.discovery.as_ref()) {
+        panel(
+            frame,
+            parts[1],
+            "Публичный IP и план кандидатов (без сканирования)",
+            &discovery.body(),
+            true,
+        );
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  u: новый пользователь  Ctrl+S: сохранить",
+            "j/k: запись  Tab: поле  Enter/e: ввод  u: новый пользователь  p: сеть/IP  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
@@ -637,6 +674,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
     loop {
         if interaction.poll_save(&mut model)? {
             return Ok(());
+        }
+        if let Some(discovery) = interaction.discovery.as_mut() {
+            discovery.poll();
         }
         terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
         if event::poll(Duration::from_millis(50))? {
@@ -1075,6 +1115,73 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("черновик"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn server_discovery_panel_is_passive_until_separate_ipify_consent() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        assert!(ui.discovery.is_none());
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert_eq!(model.screen, Screen::Server);
+        assert!(ui.discovery.is_some());
+        assert!(!ui.discovery.as_ref().unwrap().is_consent_pending());
+        let passive = rendered_interaction(120, 40, &model, &ui);
+        assert!(passive.contains("Пассивный"));
+        assert!(passive.contains("14"));
+        assert!(passive.contains("api64.ipify.org"));
+        assert!(!passive.contains("ЗАПРОС ВЫПОЛНЕН"));
+
+        assert!(!ui.update(&mut model, press(KeyCode::Char('i'))));
+        assert!(ui.discovery.as_ref().unwrap().is_consent_pending());
+        let ask = rendered_interaction(120, 40, &model, &ui);
+        assert!(ask.contains("СОГЛАСИЕ"));
+        assert!(ask.contains("api64.ipify.org"));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('n'))));
+        assert!(!ui.discovery.as_ref().unwrap().is_consent_pending());
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.discovery.is_none());
+        assert_eq!(model.screen, Screen::Server);
+    }
+
+    #[test]
+    fn ip_discovery_is_not_triggered_from_client_help_or_home() {
+        let mut ui = Interaction::new(None);
+        let mut model = Model::new(None);
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_none());
+        model.update(press(KeyCode::Char('2')));
+        assert_eq!(model.screen, Screen::Client);
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_none());
+        model.update(press(KeyCode::Char('?')));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_none());
+    }
+
+    #[test]
+    fn unsaved_server_form_cannot_hide_inside_discovery_without_guard() {
+        use std::fs;
+        let path =
+            std::env::temp_dir().join(format!("theia-m45a-discovery-{}.toml", std::process::id()));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.editor.as_mut().unwrap().begin();
+        ui.editor.as_mut().unwrap().input = "changed.example.org".into();
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.editor.as_ref().unwrap().dirty());
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_none());
+        assert!(ui
+            .editor
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Сохраните"));
         fs::remove_file(path).unwrap();
     }
 
