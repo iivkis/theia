@@ -8,6 +8,15 @@
 
 **Вывод:** H2 и H3 обладают примитивом channel binding, но он **не** заменяет REALITY-модифицированное TLS-рукопожатие, pinned server identity, replay/active-probing defense или согласованный внешний QUIC/HTTP fingerprint. Из-за этого **F-18/F-19 остаются открытыми P0**. Следующий M3.5a1 — проектирование/audit протокола идентичности и real first-flight modified handshake feasibility; M3.5a2 — отдельная возможность QUIC/H3. Нельзя выставлять новый tls_profile или разрешать insecure verifier на основании exporter tests.
 
+## M3.5b1 — чистый offline planner кандидатов (реализован частично)
+
+Файл `crates/theia/src/camouflage_discovery.rs`, integration tests `crates/theia/tests/camouflage_discovery.rs`, ADR-0022. Код в текущем *едином* Rust binary (library module) без новых зависимостей, не имеет ни socket/DNS/HTTP/TLS вызовов, ни CLI/TUI команды:
+
+- `build_plan(ServerSnapshot, approved CIDRs)` запускается только по **уже предоставленным** данным интерфейсов/egress; будущий OS collector пока отсутствует. Каталог из 14 доменов (`google.com`, `samsung.com`, `amd.com`, и т.д.) включается всегда без ручного seed; адреса интерфейсов добавляются только если выглядят публично-маршрутизируемыми. Неизвестный/NAT egress показывает предупреждение.
+- Предположительно определённый provider prefix **не** позволяет перечислить IP. Только явно переданный caller-ом approval и совпадение с реально указанным публичным *локальным интерфейсом* допускают построение списка для IPv4 CIDR `/24` либо уже. Это **не** сама проверка права владеть подсетью: будущий TUI/permission collector отвечает за явную авторизацию. IPv6 `/64` не перечисляется; reserved/private/CGNAT/documentation адреса консервативно исключаются. Очередь ограничена `MAX_CANDIDATES=256` с dedup и диагностикой усечения.
+- `TlsEvidence::suitability(H2|H3)` вычисляет прозрачный **эвристический** score/confidence/блокирующие причины из *внешних проверенных наблюдений*. По умолчанию все поля `Unknown`, score=0, confidence=0, `eligible=false`; ни популярность домена, ни IP не превращаются в реальный TLS certificate/fingerprint proof. Разные ALPN h2/h3 оцениваются независимо. Поле `theia_fingerprint_match` не заполняется этим модулем: F-13 открыто.
+- Реальный сбор интерфейсов, DNS/CT/RDAP, HTTPS/TLS рукопожатия, certificate chain/SAN/expiry, разрешение оператора на сетевые проверки, бюджеты probe/SSRF, scoring calibration, TUI «два клика», REALITY-like handshake и TLS-in-TLS flow shaping **ещё не реализованы**. Модуль возвращает **план кандидатов**, а не результаты сканирования или готовую мимикрию.
+
 ## 1. Цель и модель угроз
 
 Theia должен предлагать отдельно от обычных H2/H3-TLS профилей **REALITY-подобный защищённый режим SmartTheia**, позволяющий согласовать публичный TLS-профиль и наблюдаемое поведение сервиса с реально существующим, стабильным HTTPS-классом трафика. По смыслу функциональность похожа на XTLS REALITY, но **не использует VLESS/REALITY wire protocol и не обещает совместимость с Xray/sing-box**. Нельзя включать заглушку под именем REALITY: без настоящей модели аутентификации сервера и сетевых измерений этот режим не существует.
