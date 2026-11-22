@@ -109,6 +109,14 @@ language = "ru"
 - Токен при создании пользователя показывать **один раз**, предоставить secure copy/export с предупреждением; хранить на сервере только digest. Токен не выводить в crash reports/trace.
 - Бэкапы config и snapshot настроек Windows допускаются как TOML-файлы, но не как скрытая БД. Backups с секретами защищать file permissions.
 
+## 4.1. F-14 P0: переносимые приглашения и секреты
+
+- Публичный экспорт по умолчанию содержит только необходимые не-секретные endpoint/SNI/transport/профиль (без TLS private keys, digests и bearer). Конфиденциальная ссылка theia://v1/... с сырым 32-байтным bearer создаётся **только в контексте новой выдачи/ротации** пользователя, после подтверждения и проверки grants; из token_sha256 её восстановить нельзя.
+- Ссылка не является URI для HTTP-загрузки; импорт — локальный строго ограниченный base64url + версионированный payload. Ограничить размер, запрещать unknown fields/versions, повторные поля, некорректный host, неверный canonical token и скрытые side effects. Никаких строк URI/токена в CLI argv, shell history, stdout/stderr, tracing, crash diagnostics и обычном TUI.
+- Для импорта со встроенным токеном сохранить точные 32 bytes как canonical base64url (43 ASCII-байта без перевода строки) в новый уникальный файл trusted directory с Unix 0600 или Windows per-user ACL. В client.toml сохраняется **только** file:/env: reference; действия сбоя защищают от частичного применения и от перезаписи существующего секрета. Без полного Windows ACL и crash-test не заявлять завершение F-14.
+- Ссылка не распределяет доверенные корни CA сама по себе. Перед реальным соединением клиент проверяет серверный TLS/SNI и доверенную CA из локального хранилища. Использование invalid или unauthenticated CA, отключение TLS verification, transport downgrade при auth error запрещены. CA bundle/chain provisioning остаётся отдельным шагом до безопасного импортного соединения.
+- Один серверный пользователь с токеном не получает автоматический доступ ко всем inbounds; экспорт выдаётся только при явном allowed_user_ids в выбранной inbound. Не менять system_proxy, активный профиль или runtime при импорте.
+
 ## 5. Windows system proxy
 
 Реализация через Windows APIs (WinINet/user Internet Settings), а не `netsh winhttp` как замену пользовательскому прокси: WinHTTP и WinINet — не одно и то же. Настраивать адрес локального HTTP proxy для HTTP и HTTPS, bypass для loopback/intranet при необходимости, уведомлять систему об изменении.
