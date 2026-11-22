@@ -10,10 +10,9 @@
 
 - [ ] Падающий тест сформулирован до реализации (Given/When/Then)
 - [ ] Positive, negative, boundary и security checks добавлены
-- [ ] `bash scripts/check-spec.sh`
-- [ ] `cargo test --workspace --all-targets --locked` (после появления Rust)
-- [ ] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- [ ] Linux/Windows тесты, если менялся platform layer
+- [ ] Автоматический CI для текущего head SHA: specification, Linux/Windows tests, fmt, clippy, M0.1 regression jobs и итоговый ci-gate
+- [ ] OS-specific/E2E/performance сценарии автоматизированы в CI, если требуются этим PR
+- [ ] Нет обязательных ручных тестов; незавершённые автоматические сценарии отмечены как blockers
 
 ## Контракты и безопасность
 

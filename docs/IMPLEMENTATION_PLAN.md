@@ -12,14 +12,14 @@
 | M1.2 | Typed TOML v1 + validator + atomic store | **Реализуется отдельным PR:** serde/toml typed model, strict unknown keys, ID/grants, listener overlap including IPv6 wildcard, safe loopback/local proxy, secret reference syntax, atomic write with fsync. Secret contents, certificate/CA validation и live transactional reload остаются отдельным этапом |
 | M1.3 | SmartTheia pure frame codec + FSM | **Реализовано в PR M1.3 (ожидает CI):** zero-IO Rust codec (8 типов), 6-byte header / 65 536 payload cap, streaming decoder across arbitrary chunks, strict version/flags/codes/ASCII DNS/length checks; client/server per-stream FSM, half-close, OPEN_OK gate, terminal OPEN_ERROR/ABORT. Golden vectors, split boundary, fuzz-like deterministic no-panic и negative FSM tests. **Это не HTTP/TLS runtime** |
 | M2.1 | TLS/H2 server inbound + bearer auth + TCP dial + ACL | **PR M2.1, тестируется:** реальный TLS1.3/h2 server run + HTTP/2 full-duplex SmartTheia, canonical 32-byte bearer SHA-256 constant-time compare, inbound-scoped grants, DNS resolve then pinned SocketAddr TCP dial + ACL, quota/timeout, loopback echo with explicit allow-private, rejected local targets by default, negative TLS/auth. **Не считать этап полностью завершённым до CI и hardening:** hardening PR adds scoped cancellation, SAN/name check at startup, bounded per-peer request limiter (120/min; all attempts), one DNS/dial deadline and 64 candidates; follow-up adds independent read/write pumps and 8 simultaneous tunnels with reset isolation, slow reader with 1 KiB H2 window / 256 KiB byte-exact response; pending CI. Remaining: hundreds-of-streams stress/peak RSS measurements, complete PKI lifecycle, exhaustive DNS rebinding/fuzz. H3 и local proxy не входят в этот PR |
-| M2.2 | Local HTTP CONNECT/SOCKS5 + client H2 | browser/curl E2E Windows/Linux; local 200/SOCKS success **only after** OPEN_OK; remote DNS, half-close, cancellation |
+| M2.2 | Local HTTP CONNECT/SOCKS5 + client H2 | M2.2a: H2 client core with injected trust anchors, TLS1.3/name/ALPN verification, canonical bearer, OPEN_OK gate, independent relay/FIN, owned connection driver, DNS target passed without lookup. Pending CI. Remaining M2.2b: platform roots and secret refs, local CONNECT/SOCKS5 listeners, CLI and browser/curl E2E Windows/Linux; no H3 fallback yet |
 | M3.1 | H3/QUIC transport with same app frames | H3↔server loopback E2E, HTTP/3 state and security invariants |
 | M3.2 | QUIC-first selector + safe H2 fallback | UDP blocked → H2; wrong cert/token → no fallback; TTL; network change |
 | M3.3 | P0: BBR verified on chosen quinn version | client+server send controllers verified, packet loss benchmarks, no silent CUBIC substitute |
 | M3.4 | P0: uTLS-like fingerprint profile | Go uTLS v1.8.2 HelloChrome_133 служит воспроизводимым эталоном H2/TLS без захватов браузера; отдельный QUIC/H3 эталон, реально настроенный named TLS/HTTP profile Windows/Linux и проверка фактического выхода Theia + отчёт расхождений обязательны. Если backend не позволяет, M5 заблокирован |
 | M4.1 | ratatui landing + server/client panels | focus/resize/dirty/save/validation UI tests, two independent modes |
 | M4.2 | Local management IPC + reload | ACL, status, transactional apply, rollback, no open admin TCP port |
-| M4.3 | Windows system proxy integration | WinINet user settings backup/apply/CAS restore, manual Windows smoke tests |
+| M4.3 | Windows system proxy integration | WinINet user settings backup/apply/CAS restore, automated Windows CI smoke/recovery on disposable profile/VM |
 | M5 | Hardening/release (все P0 обязаны пройти) | Linux/Windows E2E, BBR + named fingerprint evidence, Windows proxy recovery, security checklist, release notes |
 | P1+ | UDP relay, fingerprint profiles, UX extras | protocol extension and reproducible fingerprint comparison, separate PRs |
 
@@ -34,7 +34,7 @@
 - **Дизайн:** границы библиотек и все изменения wire/TOML/API до написания кода.
 - **Threats:** доверенные/недоверенные inputs, отказ TLS/auth, exhausted resources.
 - **Tests:** сначала failing test, затем код, затем регрессии.
-- **Exit criteria:** команды CI, manual smoke если OS-specific, документация и known limitations.
+- **Exit criteria:** все проверки автоматически в CI, включая OS-specific smoke/E2E и recovery; документация и known limitations. Ручные тесты не требуются, незавершённая автоматизация блокирует приёмку.
 
 ### Пример: M3.2 fallback
 

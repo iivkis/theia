@@ -1,5 +1,7 @@
 # ADR-0004: M0.1 транспортный feasibility spike
 
+**CI-only:** команды и сценарии ниже описывают исполнение внутри автоматических CI jobs; разработчик и пользователь не запускают их вручную. Ещё не автоматизированные проверки остаются открытыми требованиями.
+
 **Дата исследования:** 2026-11-22  
 **Статус:** partial feasibility **verified**; production transport stack **not approved for release**.  
 **Связанные требования:** F-04 / F-05 / F-11 / F-13 / F-16.
@@ -85,7 +87,7 @@ Go uTLS v1.8.2 HelloChrome_133 уже предоставляет воспрои�
 - [x] Реальное Go uTLS TLS1.3/H2 TCP→Rust h2 E2E: GET/204, наблюдаемые GREASE/ALPS, отказ при wrong-hostname/untrusted CA; Linux/Windows (test-only helper, не Rust client backend).
 - [ ] Один проверяемый кросс-платформенный uTLS-like profile для H2 **и** H3; отдельный QUIC/H3 эталон, сравнение реального сетевого выхода Theia и отчёт о поддерживаемых/несовпадающих полях.
 - [x] Windows native spike CI пройден (API/H2).
-- [ ] Windows system proxy VM smoke (M4.3) — не относится к scope spike.
+- [ ] Автоматический Windows CI VM smoke/recovery (M4.3) — не относится к scope spike.
 - [ ] Security audit и лицензии всех production dependency candidates.
 
 Только после выполнения этих пунктов агент имеет право пометить `M0.1` как **complete**. До этого — **partial**; принцип «не изображать готовность» обязателен.

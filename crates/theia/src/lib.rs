@@ -2,6 +2,7 @@
 //! are intentionally unavailable until their respective implementation stages.
 //! Parsing must never trigger networking, file I/O, or OS proxy modifications.
 
+pub mod client;
 pub mod config;
 pub mod protocol;
 pub mod server;

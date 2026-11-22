@@ -16,6 +16,7 @@
 ## Неизменяемые требования
 
 - **Один конечный бинарник `theia`**; сервер и клиент — режимы одного приложения. Не создавать две поставляемые программы.
+- **CI-only:** все тесты, smoke/E2E, системные и нагрузочные проверки, fuzz, security regressions и release benchmarks выполняются автоматически в GitHub Actions. Проверки на компьютере разработчика или пользователя не требуются и не являются доказательством готовности. Если сценарий нельзя выполнить автоматически, автоматизируй его в изолированном runner/VM: до этого требование остаётся незавершённым.
 - **Rust**, асинхронная сеть на Tokio, TUI на ratatui, человекочитаемые TOML без БД и внешнего control plane.
 - SmartTheia v1 — прикладные фреймы внутри стандартных **HTTP/3 (QUIC)** и **HTTP/2 (TLS)**. Не вводить самодельную криптографию, TLS, HTTP/2 или QUIC.
 - QUIC-first, H2-fallback **только по сетевой недоступности UDP/QUIC**, никогда вследствие отказа авторизации, ошибки сертификата или явной несовместимости протокола. Нельзя молча ослаблять проверки.
@@ -33,7 +34,7 @@
 2. Сначала сформулируй поведение (Given/When/Then), угрозы и отрицательные кейсы.
 3. Напиши падающий тест; затем минимальную реализацию; затем рефакторинг.
 4. Обнови TOML-примеры, wire-документацию, help/UX и тесты **в том же PR**, если изменился контракт.
-5. Запусти проверки, перечисленные в `docs/TESTING_CI.md`. Не пропускай тесты без явной причины.
+5. Отправь изменения в PR и проверь автоматический CI (red/green для TDD). Не перекладывай запуск тестов на разработчика или пользователя. Пропуск, отмена или сбой обязательного job не являются успехом.
 6. PR должен описывать: что добавлено, что **ещё не реализовано**, миграции, тесты, риски, производительность.
 
 ## Код и архитектура
@@ -50,7 +51,7 @@
 
 - Фиксировать версии в `Cargo.lock`; сначала выбрать минимальное количество зрелых crates. Проверять их API по текущей документации.
 - `spikes/m0_1` — **изолированный исследовательский crate**, а не production workspace. Реальные Linux/Windows loopback тесты подтверждают HTTP/2 over TCP/TLS 1.3, HTTP/3 over QUIC/TLS, strict hostname/ALPN и активный BBR class на обоих peers. Контролируемый синтетический UDP drop test показывает recovery 768 КиБ, H2 credit-window тест подтверждает 1 МиБ/half-close, а Linux/Windows CI проходит 8 concurrent H2/H3 streams и единичную отмену stream с живым sibling request. Также проверена остановка и возобновление H2/H3 response при одном медленном читателе с ограниченными окнами, **без измерения peak RSS**. Дополнительно создан bounded default rustls ClientHello parser и H2/H3 engine-only baseline. Отрицательный тест проверяет отсутствие GREASE и обоих BoringSSL ALPS codepoints у текущего H2 rustls, он **не** доказывает реальный browser-like profile, см. `docs/adr/0005-tls-fingerprint-baseline.md`. Это **не** готовый proxy и **не** сравнительный P0 BBR RTT/jitter/throughput benchmark или uTLS-like profile. Перед переносом кода в один бинарник свериться с `docs/adr/0004-m0-1-feasibility.md`.
-- Базовые команды: `cargo test --workspace --all-targets --locked`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+- Базовые команды внутри CI jobs: `cargo test --workspace --all-targets --locked`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 - CI сначала проверяет спецификацию и тесты, затем lint/build; кэш cargo/target через `Swatinem/rust-cache`; Windows проверяется нативно.
 - Никакой микрооптимизации без замеров и регрессий в тестах. Производительность в `docs/TESTING_CI.md` — измеряется на одинаковых условиях.
 
@@ -68,7 +69,7 @@
 - [ ] Код соответствует спецификации; отклонения объяснены ADR, а не спрятаны.
 - [ ] Проведены проверки безопасности (аутентификация, таймауты, валидация, файловые права).
 - [ ] Тексты ошибок, UX и TOML обновлены, когда требуется.
-- [ ] `cargo test`, `fmt`, `clippy` и целевые платформы проходят в CI.
+- [ ] `cargo test`, `fmt`, `clippy` и целевые платформы проходят в CI; итоговый `ci-gate` успешен для точного head SHA. Нет ручных шагов тестирования.
 - [ ] Нереализованные функции не доступны как работающие и не заявлены в README.
 
 ## Запрет на «фиктивную готовность»
@@ -81,3 +82,5 @@
 M2.1 hardening: preflight certificate SAN matches configured DNS name (not full PKI chain/time validation), bounded shared IP request budget (120/min; 4096 peers; fixed windows; all requests), 8 KiB H2 header limit, H2/TLS handshake deadlines, single DNS/dial deadline with at most 64 results, task ownership via JoinSet, and bounded abort/drain. Remaining stress and full PKI checks are not claimed complete.
 
 M2.1 relay regression: independently driven TCP read/write halves, bounded H2 frame send, direction-specific FSM checks, stream reset on interrupted wire frame. Production-server integration tests exercise withheld response credit (1 KiB H2 window, 256 KiB download, successful concurrent upload and FIN) and eight open tunnels on one H2 connection with one cancelled stream and byte-exact sibling transfers. These are bounded regression tests, not a peak-RSS or large-scale benchmark; await Linux/Windows CI.
+
+M2.2a client transport: `H2Client::open` only yields a `Tunnel` after strict verified TLS1.3/ALPN + HTTP auth/HELLO/OPEN_OK. Client target DNS is never resolved locally. Caller-owned RootCertStore (nonempty); no insecure verification. Local CONNECT/SOCKS5/CLI, platform trust loading, and config secret resolution remain M2.2b. Do not claim browser-ready client until those are integrated and tested.

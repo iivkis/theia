@@ -1,5 +1,7 @@
 # M0.1 Rust transport API spike
 
+**CI-only:** команды и сценарии ниже описывают исполнение внутри автоматических CI jobs; разработчик и пользователь не запускают их вручную. Ещё не автоматизированные проверки остаются открытыми требованиями.
+
 **Not production Theia.** The isolated crate proves 1) `quinn::congestion::BbrConfig` is constructible and can be attached to client/server configs, 2) real in-memory HTTP/2 responds before request EOF and accepts later request chunks, and 3) the current HTTP/3 API exposes split send/receive halves.
 
 ```sh

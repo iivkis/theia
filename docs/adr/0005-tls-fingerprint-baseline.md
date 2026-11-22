@@ -1,5 +1,7 @@
 # ADR-0005: baseline TLS ClientHello перед browser-like fingerprint
 
+**CI-only:** команды и сценарии ниже описывают исполнение внутри автоматических CI jobs; разработчик и пользователь не запускают их вручную. Ещё не автоматизированные проверки остаются открытыми требованиями.
+
 **Дата:** 2026-11-22  
 **Статус:** default rustls fingerprint **measured**; именованный browser-like TLS/HTTP profile **P0 BLOCKED**.  
 **Связанные требования:** F-13 P0, M0.1, M3.4.
