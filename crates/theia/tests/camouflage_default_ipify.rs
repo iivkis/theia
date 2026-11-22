@@ -1,14 +1,21 @@
 //! M3.5b2b4: default ipify.org provider, explicit approval, local-only TLS tests.
 use rcgen::generate_simple_self_signed;
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
-use std::{net::{IpAddr, SocketAddr}, sync::Arc};
+use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 use theia::camouflage_egress::{
     default_ipify_request, observe_default_ipify, observe_public_egress, EgressApproval,
     EgressError, IpifyConsent, DEFAULT_EGRESS_SERVICE_HOST, DEFAULT_EGRESS_SERVICE_URL,
 };
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::timeout,
+};
 use tokio_rustls::TlsAcceptor;
-use std::time::Duration;
 
 #[test]
 fn default_service_is_exact_dual_stack_ipify_org_and_plain_text() {
@@ -38,7 +45,9 @@ async fn no_consent_or_roots_never_starts_dns_or_connect() {
 
 /// Real loopback TLS 1.3 verification of the *exact production preset*
 /// (SNI, Host, URI path), without reaching ipify or any public endpoint.
-async fn ipify_fixture(body: &'static [u8]) -> (SocketAddr, RootCertStore, tokio::task::JoinHandle<()>) {
+async fn ipify_fixture(
+    body: &'static [u8],
+) -> (SocketAddr, RootCertStore, tokio::task::JoinHandle<()>) {
     let signed = generate_simple_self_signed(vec![DEFAULT_EGRESS_SERVICE_HOST.into()]).unwrap();
     let cert = signed.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(signed.key_pair.serialize_der());
@@ -82,8 +91,14 @@ async fn ipify_fixture(body: &'static [u8]) -> (SocketAddr, RootCertStore, tokio
 async fn default_preset_real_tls_fixture_accepts_ipv4_and_ipv6_plain_text() {
     timeout(Duration::from_secs(10), async {
         for (text, expected) in [
-            (&b"93.184.216.34\n"[..], "93.184.216.34".parse::<IpAddr>().unwrap()),
-            (&b"2606:4700:4700::1111\n"[..], "2606:4700:4700::1111".parse::<IpAddr>().unwrap()),
+            (
+                &b"93.184.216.34\n"[..],
+                "93.184.216.34".parse::<IpAddr>().unwrap(),
+            ),
+            (
+                &b"2606:4700:4700::1111\n"[..],
+                "2606:4700:4700::1111".parse::<IpAddr>().unwrap(),
+            ),
         ] {
             let (address, roots, server) = ipify_fixture(text).await;
             let report = observe_public_egress(
@@ -98,7 +113,9 @@ async fn default_preset_real_tls_fixture_accepts_ipv4_and_ipv6_plain_text() {
             assert_eq!(report.source().pinned_ip(), address.ip());
             server.await.unwrap();
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -106,9 +123,11 @@ async fn default_preset_rejects_bad_witness_value_without_positive_evidence() {
     let (address, roots, server) = ipify_fixture(b"10.0.0.123").await;
     assert!(matches!(
         observe_public_egress(
-            default_ipify_request(address), roots,
+            default_ipify_request(address),
+            roots,
             EgressApproval::isolated_loopback_fixture(address)
-        ).await,
+        )
+        .await,
         Err(EgressError::UnusableAddress)
     ));
     server.await.unwrap();
