@@ -180,7 +180,11 @@ async fn btls_h2_rejects_wrong_name_untrusted_ca_and_downgraded_alpn() {
                 "TLS identity, trust or ALPN failure must not create an H2 sender"
             );
             let server_accepted = server.await.unwrap();
-            assert_eq!(server_accepted, alpn == b"http/1.1");
+            if alpn == b"http/1.1" {
+                assert!(server_accepted, "TLS can succeed only to be rejected by the h2 ALPN gate");
+            }
+            // A server may observe TLS success before receiving the client's
+            // bad-certificate alert; only the client rejection is invariant.
         }
     })
     .await
