@@ -42,7 +42,9 @@ fn read_string<'a>(data: &'a [u8], cursor: &mut usize) -> Result<(&'a [u8], bool
     let huffman = data.get(*cursor).ok_or("truncated HPACK string")? & 0x80 != 0;
     let length = read_int(data, cursor, 7)?;
     let end = cursor.checked_add(length).ok_or("HPACK string overflow")?;
-    let bytes = data.get(*cursor..end).ok_or("truncated HPACK string body")?;
+    let bytes = data
+        .get(*cursor..end)
+        .ok_or("truncated HPACK string body")?;
     *cursor = end;
     Ok((bytes, huffman))
 }
@@ -139,7 +141,9 @@ pub fn inspect(bytes: &[u8]) -> Result<Observation, &'static str> {
     let mut end_stream = false;
     loop {
         let header_end = cursor.checked_add(9).ok_or("H2 frame overflow")?;
-        let frame = bytes.get(cursor..header_end).ok_or("incomplete H2 frame header")?;
+        let frame = bytes
+            .get(cursor..header_end)
+            .ok_or("incomplete H2 frame header")?;
         cursor = header_end;
         let length =
             (usize::from(frame[0]) << 16) | (usize::from(frame[1]) << 8) | usize::from(frame[2]);
@@ -147,7 +151,9 @@ pub fn inspect(bytes: &[u8]) -> Result<Observation, &'static str> {
             return Err("H2 frame size exceeds default limit");
         }
         let end = cursor.checked_add(length).ok_or("H2 frame overflow")?;
-        let payload = bytes.get(cursor..end).ok_or("incomplete H2 frame payload")?;
+        let payload = bytes
+            .get(cursor..end)
+            .ok_or("incomplete H2 frame payload")?;
         cursor = end;
         let kind = frame[3];
         let flags = frame[4];
