@@ -175,6 +175,61 @@ impl ServerContext {
         }
     }
 
+    pub(crate) fn connection_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.connection_slots.clone().try_acquire_owned().ok()
+    }
+
+    pub(crate) async fn dial_target(
+        &self,
+        address: &Address,
+        port: u16,
+    ) -> Result<TcpStream, ErrorCode> {
+        connect_target(address, port, &self.policy).await
+    }
+
+    /// Identical admission, route, content type, credential and user quota
+    /// policy for H2 and H3. The listener context, never Host, chooses grants.
+    pub(crate) fn authorize_request<T>(
+        &self,
+        request: &Request<T>,
+        peer: IpAddr,
+    ) -> Result<SessionPermit, StatusCode> {
+        if !self.peer_budget.admit(peer, Instant::now()) {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        if request.method() != Method::POST
+            || request.uri().path() != "/v1/session"
+            || request.uri().query().is_some()
+            || request
+                .headers()
+                .get_all(header::CONTENT_TYPE)
+                .iter()
+                .count()
+                != 1
+            || request
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes())
+                != Some(b"application/octet-stream".as_slice())
+        {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        if request
+            .headers()
+            .get_all(header::AUTHORIZATION)
+            .iter()
+            .count()
+            != 1
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let auth = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        self.authorize(auth).map_err(AuthFailure::status)
+    }
+
     /// Raw token digest is the SHA-256 of exactly 32 decoded bytes, not the
     /// base64url text or a 64-character hex digest presented as a credential.
     /// Check all configured hashes using constant-time comparison and never
@@ -382,7 +437,7 @@ pub async fn serve(
             _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 let (socket, peer) = accepted.map_err(|_| ServerError::Io)?;
-                let Ok(slot) = context.connection_slots.clone().try_acquire_owned() else {
+                let Some(slot) = context.connection_slot() else {
                     continue;
                 };
                 let tls_acceptor = acceptor.clone();
@@ -448,41 +503,9 @@ async fn handle_request(
     context: Arc<ServerContext>,
     peer: IpAddr,
 ) -> Result<(), ServerError> {
-    if !context.peer_budget.admit(peer, Instant::now()) {
-        return reject(&mut respond, StatusCode::TOO_MANY_REQUESTS).await;
-    }
-    if request.method() != Method::POST
-        || request.uri().path() != "/v1/session"
-        || request.uri().query().is_some()
-        || request
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .map(|value| value.as_bytes())
-            != Some(b"application/octet-stream".as_slice())
-    {
-        reject(&mut respond, StatusCode::NOT_FOUND).await?;
-        return Ok(());
-    }
-    if request
-        .headers()
-        .get_all(header::AUTHORIZATION)
-        .iter()
-        .count()
-        != 1
-    {
-        reject(&mut respond, StatusCode::UNAUTHORIZED).await?;
-        return Ok(());
-    }
-    let auth = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    let permit = match context.authorize(auth) {
+    let permit = match context.authorize_request(&request, peer) {
         Ok(permit) => permit,
-        Err(failure) => {
-            reject(&mut respond, failure.status()).await?;
-            return Ok(());
-        }
+        Err(status) => return reject(&mut respond, status).await,
     };
     let mut inbound = request.into_body();
     let response = Response::builder()
@@ -624,7 +647,7 @@ async fn handle_frames(
     .map_err(|_| ServerError::TimedOut)??;
     let (address, port) = opened;
     let dial = tokio::select! {
-        result = connect_target(&address, port, &context.policy) => result,
+        result = context.dial_target(&address, port) => result,
         _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
             return Err(ServerError::Http2);
         }
