@@ -22,6 +22,21 @@ M3.4e добавил экспериментальный, не включённы
 - Отдельно документировать известную ручную Go минимальную последовательность как отрицательный контроль и не считать её Chrome. Пока нет воспроизводимого проверенного Chrome H2/H3 эталона, выпуск с named fingerprint блокируется.
 - Приёмка: default `cargo test --workspace --all-targets --locked` (включает rustls измерение); обязательный feature job на **каждом** native Linux/Windows выполняет `--test h2_wire_fingerprint --features experimental-btls-h2` вместе с прошлым M3.4e E2E; rustfmt/clippy `-D warnings`, Chromium proxy E2E, BBR/H3 и exact-SHA `ci-gate` сохраняются.
 
+## Измеренный first-flight baseline, Linux и Windows
+
+В первоначальном PR CI получены **одинаковые** результаты для `H2Client::new` (rustls) и `H2Client::new_experimental_btls` (btls) на обеих ОС:
+
+| Поле на реальном HTTP/2/TLS соединении | Значение |
+| --- | --- |
+| Первый клиентский SETTINGS | `[(6, 8192)]`, то есть `SETTINGS_MAX_HEADER_LIST_SIZE = 8192` |
+| Фреймы между первым SETTINGS и HEADERS | Нет |
+| Псевдозаголовки в точном HPACK порядке | `:method, :scheme, :authority, :path` |
+| Обычные HPACK заголовки | 2 (имена, не значения) |
+| `END_STREAM` на HEADERS | `false` (полнодуплексный POST) |
+| Ответ тестового сервера до EOF | HTTP 403, клиент возвращает `Unauthorized`, без `OPEN_OK` |
+
+Эти факты теперь закреплены регрессионными проверками для реального production H2-движка. Это **не** эталон браузера. Для сравнения ручной Go uTLS TCP/H2 smoke-процесс из репозитория отправляет пустой SETTINGS и `:method, :scheme, :path, :authority`, поскольку специально не реализует Chrome H2 fingerprint. Иные TLS настройки Go `HelloChrome_133` не меняют этот факт. До документированного независимого Chrome HTTP/2 SETTINGS/HPACK эталона F-13 остаётся заблокированным.
+
 ## Границы и нерешённые требования
 
 1. Это измерение **HTTP/2 после TLS**, не Chrome HTTP/2 сравнение. Метаданные ALPN/TLS уже проверены отдельно (ADR-0009), это не H3 QUIC fingerprint.
