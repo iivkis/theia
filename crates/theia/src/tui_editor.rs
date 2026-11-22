@@ -1,10 +1,10 @@
-//! M4.1b typed, bounded, single-field configuration drafts.
+//! M4.1c typed, bounded, selectable inbound/profile configuration forms.
 //!
 //! A user-provided configuration file is explicit. Never print its contents,
 //! secret references, token hashes or path in diagnostics. All writes go
 //! through the existing strict validator and atomic store.
 use crate::{
-    config::{self, Config},
+    config::{self, Config, Transport},
     Role,
 };
 use std::{
@@ -22,6 +22,8 @@ pub struct Editor {
     source: Vec<u8>,
     original: Config,
     draft: Config,
+    selected_record: usize,
+    selected_field: usize,
     pub input: String,
     pub editing: bool,
     pub error: Option<String>,
@@ -41,12 +43,23 @@ impl Editor {
         if !role_matches(role, &parsed) {
             return Err("configuration role does not match selected panel");
         }
+        let selected_record = match &parsed {
+            Config::Server(_) => 0,
+            Config::Client(doc) => doc
+                .client
+                .profiles
+                .iter()
+                .position(|p| p.id == doc.client.active_profile)
+                .unwrap_or(0),
+        };
         Ok(Self {
             role,
             path: path.to_owned(),
             source,
             original: parsed.clone(),
             draft: parsed,
+            selected_record,
+            selected_field: 0,
             input: String::new(),
             editing: false,
             error: None,
@@ -58,28 +71,129 @@ impl Editor {
         self.role
     }
 
-    pub fn field_name(&self) -> &'static str {
-        match self.role {
-            Role::Server => "server.inbounds[0].server_name",
-            Role::Client => "client.profiles[active].server",
+    pub fn record_count(&self) -> usize {
+        match &self.draft {
+            Config::Server(doc) => doc.server.inbounds.len(),
+            Config::Client(doc) => doc.client.profiles.len(),
         }
     }
 
-    pub fn field_value(&self) -> &str {
+    pub fn selected_record_id(&self) -> &str {
         match &self.draft {
             Config::Server(doc) => doc
                 .server
                 .inbounds
-                .first()
-                .map(|inbound| inbound.server_name.as_str())
-                .unwrap_or(""),
+                .get(self.selected_record)
+                .map_or("", |inbound| inbound.id.as_str()),
             Config::Client(doc) => doc
                 .client
                 .profiles
-                .iter()
-                .find(|p| p.id == doc.client.active_profile)
-                .map(|profile| profile.server.as_str())
-                .unwrap_or(""),
+                .get(self.selected_record)
+                .map_or("", |profile| profile.id.as_str()),
+        }
+    }
+
+    pub fn selected_record_is_active(&self) -> bool {
+        match &self.draft {
+            Config::Client(doc) => doc.client.active_profile == self.selected_record_id(),
+            Config::Server(_) => false,
+        }
+    }
+
+    pub fn selection_summary(&self) -> String {
+        match self.role {
+            Role::Server => format!(
+                "Inbound {}/{}: {}",
+                self.selected_record + 1,
+                self.record_count(),
+                self.selected_record_id(),
+            ),
+            Role::Client => format!(
+                "Профиль {}/{}: {}{}",
+                self.selected_record + 1,
+                self.record_count(),
+                self.selected_record_id(),
+                if self.selected_record_is_active() {
+                    " [активный]"
+                } else {
+                    " [неактивный]"
+                },
+            ),
+        }
+    }
+
+    pub fn field_count(&self) -> usize {
+        3
+    }
+
+    /// Record and field focus never change the typed configuration.
+    pub fn select_record(&mut self, forward: bool) {
+        if self.editing {
+            return;
+        }
+        let count = self.record_count();
+        if count == 0 {
+            return;
+        }
+        self.selected_record = if forward {
+            (self.selected_record + 1) % count
+        } else {
+            (self.selected_record + count - 1) % count
+        };
+        self.selected_field = 0;
+        self.error = None;
+    }
+
+    pub fn select_field(&mut self, forward: bool) {
+        if self.editing {
+            return;
+        }
+        self.selected_field = if forward {
+            (self.selected_field + 1) % self.field_count()
+        } else {
+            (self.selected_field + self.field_count() - 1) % self.field_count()
+        };
+        self.error = None;
+    }
+
+    pub fn field_name(&self) -> String {
+        let suffix = match self.role {
+            Role::Server => ["server_name", "h2_listen", "quic_listen"][self.selected_field],
+            Role::Client => ["server", "server_name", "transport"][self.selected_field],
+        };
+        let records = match self.role {
+            Role::Server => "server.inbounds",
+            Role::Client => "client.profiles",
+        };
+        format!("{records}[{}].{suffix}", self.selected_record)
+    }
+
+    pub fn field_value(&self) -> String {
+        match &self.draft {
+            Config::Server(doc) => doc
+                .server
+                .inbounds
+                .get(self.selected_record)
+                .map(|inbound| match self.selected_field {
+                    0 => inbound.server_name.clone(),
+                    1 => inbound.h2_listen.clone(),
+                    _ => inbound.quic_listen.clone(),
+                })
+                .unwrap_or_default(),
+            Config::Client(doc) => doc
+                .client
+                .profiles
+                .get(self.selected_record)
+                .map(|profile| match self.selected_field {
+                    0 => profile.server.clone(),
+                    1 => profile.server_name.clone(),
+                    _ => match profile.transport {
+                        Transport::Auto => "auto".to_owned(),
+                        Transport::H2 => "h2".to_owned(),
+                        Transport::H3 => "h3".to_owned(),
+                    },
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -88,7 +202,11 @@ impl Editor {
     }
 
     pub fn begin(&mut self) {
-        self.input = self.field_value().to_owned();
+        if self.record_count() == 0 {
+            self.error = Some("Нет записей для редактирования".into());
+            return;
+        }
+        self.input = self.field_value();
         self.editing = true;
         self.error = None;
     }
@@ -111,26 +229,47 @@ impl Editor {
         self.error = None;
     }
 
-    /// Validate an updated typed document before accepting a visible field.
+    /// Every field edit validates the *whole* typed document, including
+    /// overlapping inbound TCP/UDP binds and client TLS/profile constraints.
     pub fn accept(&mut self) -> bool {
         if !self.editing {
             return false;
         }
         let mut candidate = self.draft.clone();
+        let field = self.field_name();
         match &mut candidate {
             Config::Server(doc) => {
-                if let Some(inbound) = doc.server.inbounds.first_mut() {
-                    inbound.server_name.clone_from(&self.input);
+                let Some(inbound) = doc.server.inbounds.get_mut(self.selected_record) else {
+                    self.error = Some("server.inbounds: selected record missing".into());
+                    return false;
+                };
+                match self.selected_field {
+                    0 => inbound.server_name.clone_from(&self.input),
+                    1 => inbound.h2_listen.clone_from(&self.input),
+                    _ => inbound.quic_listen.clone_from(&self.input),
                 }
             }
             Config::Client(doc) => {
-                if let Some(profile) = doc
-                    .client
-                    .profiles
-                    .iter_mut()
-                    .find(|p| p.id == doc.client.active_profile)
-                {
-                    profile.server.clone_from(&self.input);
+                let Some(profile) = doc.client.profiles.get_mut(self.selected_record) else {
+                    self.error = Some("client.profiles: selected record missing".into());
+                    return false;
+                };
+                match self.selected_field {
+                    0 => profile.server.clone_from(&self.input),
+                    1 => profile.server_name.clone_from(&self.input),
+                    _ => {
+                        profile.transport = match self.input.as_str() {
+                            "auto" => Transport::Auto,
+                            "h2" => Transport::H2,
+                            "h3" => Transport::H3,
+                            _ => {
+                                self.error = Some(format!(
+                                    "{field}: expected auto, h2 or h3"
+                                ));
+                                return false;
+                            }
+                        };
+                    }
                 }
             }
         }
@@ -397,7 +536,7 @@ mod tests {
         let temp = Temp::write(include_str!("../../../examples/client.toml"));
         let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
         assert!(!editor.dirty());
-        assert_eq!(editor.field_name(), "client.profiles[active].server");
+        assert_eq!(editor.field_name(), "client.profiles[0].server");
         editor.begin();
         editor.input = "new.example.org:8443".into();
         assert!(editor.accept());
