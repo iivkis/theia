@@ -299,6 +299,7 @@ async fn connect_target(
     policy: &ServerPolicy,
 ) -> Result<TcpStream, ErrorCode> {
     let duration = Duration::from_millis(u64::from(policy.connect_timeout_ms));
+    let deadline = tokio::time::Instant::now() + duration;
     timeout(duration, async {
         let candidates: Vec<SocketAddr> = match address {
             Address::V4(ip) => vec![SocketAddr::from((*ip, port))],
@@ -310,16 +311,43 @@ async fn connect_target(
                 .collect(),
         };
         let permitted = permitted_candidates(candidates, policy.allow_private_ips)?;
-        for candidate in permitted {
-            // Pin the ACL-checked SocketAddr. Never resolve the hostname again.
-            if let Ok(stream) = TcpStream::connect(candidate).await {
-                return Ok(stream);
-            }
-        }
-        Err(ErrorCode::DialFailed)
+        // Pin each ACL-checked SocketAddr. Share the remaining deadline
+        // between candidates so an unresponsive IPv6 route cannot starve IPv4.
+        dial_candidates(&permitted, deadline, |candidate| TcpStream::connect(candidate)).await
     })
     .await
     .map_err(|_| ErrorCode::DialTimeout)?
+}
+
+async fn dial_candidates<T, F, Fut>(
+    candidates: &[SocketAddr],
+    deadline: tokio::time::Instant,
+    mut dial: F,
+) -> Result<T, ErrorCode>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut timed_out = false;
+    for (index, candidate) in candidates.iter().copied().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ErrorCode::DialTimeout);
+        }
+        // At most 64 candidates. Attempts are sequential; never establish
+        // multiple competing connections to the remote target.
+        let budget = remaining / (candidates.len() - index) as u32;
+        match timeout(budget, dial(candidate)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(_)) => {}
+            Err(_) => timed_out = true,
+        }
+    }
+    Err(if timed_out {
+        ErrorCode::DialTimeout
+    } else {
+        ErrorCode::DialFailed
+    })
 }
 
 fn permitted_candidates(
@@ -730,6 +758,8 @@ fn pem_data(reference: &str, private_key: bool) -> Result<Vec<u8>, ServerError> 
             return Err(ServerError::Config);
         }
     }
+    #[cfg(not(unix))]
+    let _ = private_key;
     let bytes = std::fs::read(path).map_err(|_| ServerError::Config)?;
     if bytes.len() as u64 > MAX_PEM_BYTES {
         return Err(ServerError::Config);
@@ -880,6 +910,22 @@ mod hardening_tests {
             permitted_candidates(many, false),
             Err(ErrorCode::ResourceLimit)
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_first_dns_candidate_does_not_starve_second() {
+        let first: SocketAddr = "[::1]:443".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let result = dial_candidates(&[first, second], deadline, |candidate| async move {
+            if candidate == first {
+                std::future::pending::<std::io::Result<SocketAddr>>().await
+            } else {
+                Ok(candidate)
+            }
+        })
+        .await;
+        assert_eq!(result, Ok(second));
     }
 
     #[test]
