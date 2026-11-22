@@ -102,7 +102,7 @@ async fn individual_tls_failure_is_preserved_without_fake_batch_success() {
         assert!(!report.all_handshakes_verified);
         assert!(report.results[0].result.is_ok());
         assert!(matches!(
-            report.results[1].result,
+            &report.results[1].result,
             Err(ProbeError::TlsRejected) | Err(ProbeError::WrongAlpn)
         ));
         good.server.await.unwrap();
@@ -185,7 +185,7 @@ async fn individual_timeout_does_not_make_unobserved_fingerprint_eligible() {
         let preview = build_preview(&NativeInterfaces::default(), None, PreviewScope::PassiveOnly);
         let outcome = probe_explicit_batch(&preview, vec![request]).await.unwrap();
         assert!(!outcome.all_handshakes_verified);
-        assert!(matches!(outcome.results[0].result, Err(ProbeError::TimedOut)));
+        assert!(matches!(&outcome.results[0].result, Err(ProbeError::TimedOut)));
         server.abort();
     }).await.unwrap();
 }
