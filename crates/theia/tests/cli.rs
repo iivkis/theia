@@ -22,15 +22,10 @@ fn help_and_version_exit_successfully() {
 
 #[test]
 fn accepted_runtime_commands_fail_closed() {
-    for args in [vec!["tui", "--role", "client"]] {
-        let result = invoke(&args);
-        assert_eq!(result.status.code(), Some(3), "{args:?}");
-        assert!(result.stdout.is_empty(), "{args:?}");
-        assert!(
-            String::from_utf8_lossy(&result.stderr).contains("not implemented"),
-            "{args:?}"
-        );
-    }
+    let result = invoke(&["tui", "--role", "client"]);
+    assert_eq!(result.status.code(), Some(3));
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("not implemented"));
 }
 
 #[test]

@@ -11,7 +11,7 @@ use theia::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     task::JoinHandle,
     time::timeout,
 };
@@ -175,4 +175,134 @@ fn rejects_missing_trust_and_noncanonical_token() {
         ),
         Err(ClientError::Configuration)
     ));
+}
+
+async fn local_listeners(
+    client: H2Client,
+) -> (
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    JoinHandle<Result<(), ClientError>>,
+) {
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http.local_addr().unwrap();
+    let socks_addr = socks.local_addr().unwrap();
+    let task = tokio::spawn(theia::local_proxy::serve(http, socks, Arc::new(client)));
+    (http_addr, socks_addr, task)
+}
+
+async fn response_head(socket: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(head.len() < 8192);
+        head.push(socket.read_u8().await.unwrap());
+    }
+    String::from_utf8(head).unwrap()
+}
+
+async fn socks_connect_request(socket: &mut TcpStream, port: u16) -> [u8; 10] {
+    socket.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0; 2];
+    socket.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 0]);
+    let mut request = vec![5, 1, 0, 3, 9];
+    request.extend_from_slice(b"localhost");
+    request.extend_from_slice(&port.to_be_bytes());
+    socket.write_all(&request).await.unwrap();
+    let mut reply = [0; 10];
+    socket.read_exact(&mut reply).await.unwrap();
+    reply
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_connect_and_socks5_relay_real_tcp_with_half_close() {
+    timeout(Duration::from_secs(20), async {
+        let (endpoint, roots, server) = listener(true).await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let echo = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let (mut socket, _) = target.accept().await.unwrap();
+                tasks.spawn(async move {
+                    let mut input = Vec::new();
+                    socket.read_to_end(&mut input).await.unwrap();
+                    socket.write_all(&input).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        });
+        let client = H2Client::new(&endpoint, "localhost", &token(), roots).unwrap();
+        let (http, socks, proxy) = local_listeners(client).await;
+        let mut connect = TcpStream::connect(http).await.unwrap();
+        let head = format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n");
+        let mut pipelined = head.into_bytes();
+        let http_payload = b"pipelined application bytes";
+        pipelined.extend_from_slice(http_payload);
+        connect.write_all(&pipelined).await.unwrap();
+        assert_eq!(
+            response_head(&mut connect).await,
+            "HTTP/1.1 200 Connection Established\r\n\r\n"
+        );
+        let mut sock = TcpStream::connect(socks).await.unwrap();
+        assert_eq!(socks_connect_request(&mut sock, port).await[1], 0);
+        let socks_payload = vec![0x5a; 128 * 1024];
+        sock.write_all(&socks_payload).await.unwrap();
+        sock.shutdown().await.unwrap();
+        connect.shutdown().await.unwrap();
+        let mut http_result = Vec::new();
+        let mut socks_result = Vec::new();
+        connect.read_to_end(&mut http_result).await.unwrap();
+        sock.read_to_end(&mut socks_result).await.unwrap();
+        assert_eq!(http_result, http_payload);
+        assert_eq!(socks_result, socks_payload);
+        echo.await.unwrap();
+        proxy.abort();
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_proxies_never_acknowledge_policy_denial_or_invalid_protocol() {
+    timeout(Duration::from_secs(15), async {
+        let (endpoint, roots, server) = listener(false).await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let client = H2Client::new(&endpoint, "localhost", &token(), roots).unwrap();
+        let (http, socks, proxy) = local_listeners(client).await;
+        let mut connect = TcpStream::connect(http).await.unwrap();
+        connect
+            .write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(response_head(&mut connect).await.starts_with("HTTP/1.1 403 "));
+        let mut sock = TcpStream::connect(socks).await.unwrap();
+        assert_eq!(socks_connect_request(&mut sock, port).await[1], 2);
+
+        let mut malformed = TcpStream::connect(http).await.unwrap();
+        malformed
+            .write_all(b"CONNECT localhost:443 HTTP/1.1\r\nHost: wrong.example:443\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(response_head(&mut malformed).await.starts_with("HTTP/1.1 400 "));
+        let mut method = TcpStream::connect(http).await.unwrap();
+        method.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        assert!(response_head(&mut method).await.starts_with("HTTP/1.1 405 "));
+        let mut unsupported = TcpStream::connect(socks).await.unwrap();
+        unsupported.write_all(&[5, 1, 2]).await.unwrap();
+        let mut reply = [0; 2];
+        unsupported.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [5, 0xff]);
+        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        proxy.abort();
+        server.abort();
+    })
+    .await
+    .unwrap();
 }

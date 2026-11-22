@@ -305,6 +305,17 @@ class SpecContractTests(unittest.TestCase):
         self.assertNotIn("ручным smoke-тестом", read("docs/IMPLEMENTATION_SPEC.md"))
         self.assertNotIn("## 3. Локальная проверка", read("docs/TESTING_CI.md"))
 
+    def test_m22_local_proxy_gate_and_cli_wiring(self):
+        implementation = read("crates/theia/src/local_proxy.rs")
+        client = read("crates/theia/src/client.rs")
+        tests = read("crates/theia/tests/client_h2.rs")
+        self.assertIn("local_proxy::run_file(", read("crates/theia/src/main.rs"))
+        self.assertIn("profile.transport != Transport::H2", implementation)
+        self.assertIn("client.open(address, port).await", implementation)
+        self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
+        self.assertIn("local_connect_and_socks5_relay_real_tcp_with_half_close", tests)
+        self.assertIn("local_proxies_never_acknowledge_policy_denial_or_invalid_protocol", tests)
+
 
 if __name__ == "__main__":
     unittest.main()
