@@ -237,9 +237,8 @@ impl ProbePanel {
     }
 
     pub(crate) fn body(&self) -> String {
-        let mut body = String::from(
-            "TLS/H2: явная одиночная проверка локального публичного IP\n\n",
-        );
+        let mut body =
+            String::from("TLS/H2: явная одиночная проверка локального публичного IP\n\n");
         let Some(server_name) = &self.server_name else {
             body.push_str(
                 "Недоступно: нужна серверная конфигурация с выбранным inbound и проверенным TLS SNI.\nКонфигурация не загружена. Без SNI TLS не проверяется.\n\nEsc: назад",
@@ -379,7 +378,10 @@ mod tests {
     fn public_assigned_ip_only_and_explicit_confirm_are_required() {
         let mut panel = ProbePanel::new(assigned(), Some("proxy.example.org".to_owned()));
         assert!(panel.is_available());
-        assert_eq!(panel.selected_address(), Some("93.184.216.10".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            panel.selected_address(),
+            Some("93.184.216.10".parse::<IpAddr>().unwrap())
+        );
         assert!(panel.body().contains("93.184.216.10"));
         assert!(!panel.body().contains("10.0.0.1"));
         assert!(!panel.body().contains("93.184.216.12"));
@@ -387,7 +389,10 @@ mod tests {
         assert!(!panel.is_consent_pending());
 
         panel.next();
-        assert_eq!(panel.selected_address(), Some("93.184.216.11".parse().unwrap()));
+        assert_eq!(
+            panel.selected_address(),
+            Some("93.184.216.11".parse().unwrap())
+        );
         panel.ask_confirmation();
         assert!(panel.is_consent_pending());
         assert!(panel.body().contains("СОГЛАСИЕ"));
@@ -422,12 +427,19 @@ mod tests {
             receiver: rx,
             cancel: Some(cancel_tx),
         };
-        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut))).unwrap();
+        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut)))
+            .unwrap();
         p.poll();
         let text = p.body();
         assert!(text.contains("таймаут TLS"));
         assert!(!text.contains("TLS 1.3 подтверждён"));
-        assert!(matches!(p.state, ProbeState::Complete { outcome: Err(_), .. }));
+        assert!(matches!(
+            p.state,
+            ProbeState::Complete {
+                outcome: Err(_),
+                ..
+            }
+        ));
     }
 
     #[test]
