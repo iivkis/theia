@@ -3,6 +3,7 @@
 //! Parsing must never trigger networking, file I/O, or OS proxy modifications.
 
 pub mod camouflage_batch;
+pub mod camouflage_domain_dns;
 pub mod camouflage_discovery;
 pub mod camouflage_dual;
 pub mod camouflage_dual_batch;
@@ -25,6 +26,7 @@ pub mod server;
 pub mod tui;
 pub(crate) mod tui_candidate_batch;
 pub(crate) mod tui_candidates;
+pub(crate) mod tui_domain;
 pub(crate) mod tui_discovery;
 pub mod tui_editor;
 pub(crate) mod tui_probe;
