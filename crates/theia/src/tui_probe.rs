@@ -687,7 +687,7 @@ mod tests {
         assert!(body.contains("H2+H3: ОБА TLS/ALPN handshake подтверждены"));
         assert!(body.contains("REALITY готов: НЕТ"));
         assert!(!body.contains("eligible: ДА"));
-        assert!(!body.contains("вероятностью обхода DPI"));
+        assert!(body.contains("не является вероятностью обхода DPI"));
     }
 
     #[test]
