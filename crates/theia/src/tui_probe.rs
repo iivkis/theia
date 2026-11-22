@@ -633,7 +633,7 @@ mod tests {
         let text = panel.body();
         assert!(text.contains("H2 score: 80/100"));
         assert!(text.contains("confidence: 85%"));
-        assert!(text.contains("H3 score: Unknown"));
+        assert!(text.contains("H3: UDP недоступен"));
         assert!(text.contains("H3: UDP недоступен, score: Unknown"));
         assert!(text.contains("fingerprint Theia не измерен"));
         assert!(text.contains("H2+H3: НЕ подтверждены оба транспорта"));
