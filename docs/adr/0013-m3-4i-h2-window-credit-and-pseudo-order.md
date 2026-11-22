@@ -27,6 +27,12 @@ The pinned [h2 v0.4.19 `client::Builder::initial_connection_window_size`](https:
 - **Given** a research-only h2 builder with a 15 MiB target, **when** its driver sends connection setup bytes, **then** the first SETTINGS are unchanged and next actual frame is a 4-byte stream-0 WINDOW_UPDATE credit 15,663,105. No production setting is modified.
 - **Given** wrong TLS cert/ALPN/token/ACL and the real 128 KiB full-duplex FIN scenario, **when** mandatory CI runs, **then** the established strict negative/protocol tests remain green on Linux and Windows.
 
+## Verified numeric Chromium159 WINDOW_UPDATE (CI evidence)
+
+The initial independent native Linux and Windows Chromium reference runs both produced the **same actual HTTP/2 connection WINDOW_UPDATE increment**: `15_663_105` on stream zero (frame type 8). Combined with the standard initial connection window of `65_535`, Chromium's first observed target is exactly `15_728_640` bytes (15 MiB). The HTTP/2 first-flight in each case also had SETTINGS `[(1,65536),(2,0),(4,6291456),(6,262144)]` and pseudo names `:method,:authority,:scheme,:path`. The independent bounded `h2 0.4.19` test-only builder emitted the **same** `15_663_105` credit using its public `initial_connection_window_size(15_728_640)` API.
+
+A new browser regression asserts the increment **if it appears before first HEADERS**, while allowing the entire WINDOW_UPDATE to occur later because network event ordering varies. It still rejects any malformed early WINDOW_UPDATE frame or unexpected increment. A timing-dependent absence never constitutes proof of identical Chrome/Theia browser fingerprint. These results are confirmed on **native Linux and Windows CI** and do not establish memory safety at 15 MiB.
+
 ## Risks and remaining blockers
 
 - **Do not ship a 15 MiB connection window or 6 MiB per-stream credit without concurrent slow-reader, flooding, header-bomb and peak-RSS evidence.** This is a capacity and DoS boundary, not just a fingerprint field.
