@@ -1,7 +1,7 @@
 # ADR-0006: M3.4b кандидаты TLS/H2 browser-like backend (исследовательская ветка)
 
 **Дата:** 2026-11-22  
-**Статус:** кандидаты рассмотрены, BoringSSL feasibility тесты **ожидают CI**; F-13 P0 **НЕ выполнен**.  
+**Статус:** BoringSSL feasibility-тесты подтверждены нативным Linux/Windows CI в PR #29 (real TCP ClientHello, strict PKI, Go uTLS comparison, fmt, clippy); F-13 P0 **НЕ выполнен**.  
 **Связанные требования:** F-06, F-11, F-13, M3.4, ADR-0005.
 
 ## Контекст
