@@ -59,6 +59,9 @@ pub enum Warning {
     ProviderPrefixNotAuthorization,
     RangeNotOnServer,
     RangeTooBroad,
+    /// The approved range contains a local IP but exceeds its observed
+    /// assigned interface prefix (or that prefix is unknown/invalid).
+    RangeExceedsAssignedPrefix,
     Ipv6EnumerationUnsupported,
     CandidateLimitReached,
 }
@@ -202,7 +205,9 @@ fn add_candidate(plan: &mut DiscoveryPlan, host: CandidateHost, source: Candidat
 ///
 /// Approvals must be explicitly collected by the future UI and cannot be
 /// inferred from BGP/RDAP data. A CIDR must contain a *public assigned local
-/// interface* before it is expanded. A NAT egress alone does not qualify.
+/// interface* before it is expanded, and must fit within that interface's
+/// observed assigned prefix. A NAT egress alone does not qualify. Observed
+/// interface netmasks do not by themselves prove ownership or consent.
 /// We don't enumerate IPv6 and never expand IPv4 ranges broader than /24.
 /// No sockets, DNS requests or TLS probes are used by this function.
 pub fn build_plan(snapshot: &ServerSnapshot, approved: &[NetworkPrefix]) -> DiscoveryPlan {
@@ -268,6 +273,21 @@ pub fn build_plan(snapshot: &ServerSnapshot, approved: &[NetworkPrefix]) -> Disc
                 note(&mut plan.warnings, Warning::RangeTooBroad);
             }
             IpAddr::V4(start) => {
+                // An IP within the requested CIDR is not sufficient to
+                // authorize its neighbors. A /32 or unknown interface mask
+                // must never silently manufacture a wider owned subnet.
+                // The caller's explicit CIDR approval is still required.
+                let inside_assigned_prefix = snapshot.interfaces.iter().any(|iface| {
+                    matches!(iface.address, IpAddr::V4(_))
+                        && (1..=32).contains(&iface.prefix_len)
+                        && iface.prefix_len <= prefix.bits
+                        && plausible_public_address(iface.address)
+                        && prefix.contains(iface.address)
+                });
+                if !inside_assigned_prefix {
+                    note(&mut plan.warnings, Warning::RangeExceedsAssignedPrefix);
+                    continue;
+                }
                 // At most 256 IPv4 values, even for malformed input or /0.
                 let count = 1u32 << (32 - prefix.bits);
                 let base = u32::from(start);
