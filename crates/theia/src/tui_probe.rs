@@ -462,6 +462,7 @@ impl Drop for ProbePanel {
 mod tests {
     use super::*;
     use crate::camouflage_interfaces::{InterfaceSource, ObservedInterface};
+    use crate::camouflage_probe::ProbeReport;
     use std::net::IpAddr;
 
     fn assigned() -> NativeInterfaces {
@@ -496,6 +497,14 @@ mod tests {
                     source: InterfaceSource::LinuxGetifaddrs,
                 },
             ],
+        }
+    }
+
+    fn failed_dual(ip: IpAddr, h2_error: ProbeError) -> DualProbeReport {
+        DualProbeReport {
+            address: SocketAddr::new(ip, 443),
+            h2: Err(h2_error),
+            h3: Err(H3ProbeError::TimedOut),
         }
     }
 
@@ -562,7 +571,7 @@ mod tests {
             receiver: rx,
             cancel: Some(cancel_tx),
         };
-        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut)))
+        tx.send(Ok(failed_dual("93.184.216.10".parse().unwrap(), ProbeError::TimedOut)))
             .unwrap();
         p.poll();
         let text = p.body();
@@ -571,7 +580,7 @@ mod tests {
         assert!(matches!(
             p.state,
             ProbeState::Complete {
-                outcome: Err(_),
+                outcome: Ok(_),
                 ..
             }
         ));
@@ -610,10 +619,14 @@ mod tests {
         };
         panel.state = ProbeState::Complete {
             address: ip,
-            outcome: Ok(ProbeReport {
-                connected_ip: ip,
-                handshake_elapsed: Duration::from_millis(120),
-                evidence,
+            outcome: Ok(DualProbeReport {
+                address: SocketAddr::new(ip, 443),
+                h2: Ok(ProbeReport {
+                    connected_ip: ip,
+                    handshake_elapsed: Duration::from_millis(120),
+                    evidence,
+                }),
+                h3: Err(H3ProbeError::UdpUnavailable),
             }),
         };
         panel.observed_at = Some(Instant::now());
@@ -648,10 +661,14 @@ mod tests {
         };
         panel.state = ProbeState::Complete {
             address: requested,
-            outcome: Ok(ProbeReport {
-                connected_ip: other,
-                handshake_elapsed: Duration::from_millis(30),
-                evidence,
+            outcome: Ok(DualProbeReport {
+                address: SocketAddr::new(requested, 443),
+                h2: Ok(ProbeReport {
+                    connected_ip: other,
+                    handshake_elapsed: Duration::from_millis(30),
+                    evidence,
+                }),
+                h3: Err(H3ProbeError::UdpUnavailable),
             }),
         };
         let text = panel.body();
@@ -666,7 +683,7 @@ mod tests {
         let ip: IpAddr = "93.184.216.10".parse().unwrap();
         panel.state = ProbeState::Complete {
             address: ip,
-            outcome: Err(ProbeUiError::Handshake(ProbeError::WrongAlpn)),
+            outcome: Ok(failed_dual(ip, ProbeError::WrongAlpn)),
         };
         let text = panel.body();
         assert!(text.contains("нет ALPN h2"));
@@ -680,7 +697,7 @@ mod tests {
             receiver: rx,
             cancel: Some(cancel),
         };
-        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut)))
+        tx.send(Ok(failed_dual(ip, ProbeError::TimedOut)))
             .unwrap();
         panel.poll();
         let text = panel.body();
