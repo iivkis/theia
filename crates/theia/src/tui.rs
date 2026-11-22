@@ -1079,6 +1079,68 @@ mod tests {
     }
 
     #[test]
+    fn server_discovery_panel_is_passive_until_separate_ipify_consent() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        assert!(ui.discovery.is_none());
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert_eq!(model.screen, Screen::Server);
+        assert!(ui.discovery.is_some());
+        assert!(!ui.discovery.as_ref().unwrap().is_consent_pending());
+        let passive = rendered_interaction(120, 40, &model, &ui);
+        assert!(passive.contains("Пассивный"));
+        assert!(passive.contains("14"));
+        assert!(passive.contains("api64.ipify.org"));
+        assert!(!passive.contains("ЗАПРОС ВЫПОЛНЕН"));
+
+        assert!(!ui.update(&mut model, press(KeyCode::Char('i'))));
+        assert!(ui.discovery.as_ref().unwrap().is_consent_pending());
+        let ask = rendered_interaction(120, 40, &model, &ui);
+        assert!(ask.contains("СОГЛАСИЕ"));
+        assert!(ask.contains("api64.ipify.org"));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('n'))));
+        assert!(!ui.discovery.as_ref().unwrap().is_consent_pending());
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.discovery.is_none());
+        assert_eq!(model.screen, Screen::Server);
+    }
+
+    #[test]
+    fn ip_discovery_is_not_triggered_from_client_help_or_home() {
+        let mut ui = Interaction::new(None);
+        let mut model = Model::new(None);
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_none());
+        model.update(press(KeyCode::Char('2')));
+        assert_eq!(model.screen, Screen::Client);
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_none());
+        model.update(press(KeyCode::Char('?')));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_none());
+    }
+
+    #[test]
+    fn unsaved_server_form_cannot_hide_inside_discovery_without_guard() {
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "theia-m45a-discovery-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.editor.as_mut().unwrap().begin();
+        ui.editor.as_mut().unwrap().input = "changed.example.org".into();
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.editor.as_ref().unwrap().dirty());
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        assert!(ui.discovery.is_none());
+        assert!(ui.editor.as_ref().unwrap().error.as_deref().unwrap().contains("Сохраните"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn key_release_and_non_relevant_keys_do_not_navigate() {
         let mut model = Model::new(None);
         let mut key = press(KeyCode::Char('2'));
