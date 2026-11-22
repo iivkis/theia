@@ -12,6 +12,9 @@ const MAX_HEADERS: usize = 32_768;
 pub struct Observation {
     pub settings: Vec<(u16, u32)>,
     pub frames_before_headers: Vec<u8>,
+    /// Timing-dependent acknowledgement of the server's SETTINGS; not a
+    /// client fingerprint parameter, so excluded from frame-order matching.
+    pub settings_ack_before_headers: bool,
     pub pseudo_headers: Vec<&'static str>,
     pub ordinary_fields: usize,
     pub request_end_stream: bool,
@@ -138,6 +141,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Observation, &'static str> {
     let mut prior = Vec::new();
     let mut headers = Vec::new();
     let mut in_headers = false;
+    let mut settings_ack_before_headers = false;
     let mut end_stream = false;
     loop {
         let header_end = cursor.checked_add(9).ok_or("H2 frame overflow")?;
@@ -178,6 +182,16 @@ pub fn inspect(bytes: &[u8]) -> Result<Observation, &'static str> {
 
         if in_headers && (kind != 9 || stream != 1) {
             return Err("non-CONTINUATION frame inside HEADERS");
+        }
+        // A client may ACK the server's SETTINGS before or after its first
+        // HEADERS depending on scheduling. This is a valid control response,
+        // not a stable H2 fingerprint parameter. Never accept malformed ACK.
+        if kind == 4 && !in_headers {
+            if stream != 0 || flags != 1 || length != 0 {
+                return Err("unexpected/malformed subsequent client SETTINGS");
+            }
+            settings_ack_before_headers = true;
+            continue;
         }
         if kind == 1 && !in_headers {
             if stream != 1 {
@@ -222,6 +236,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Observation, &'static str> {
             return Ok(Observation {
                 settings: settings.unwrap(),
                 frames_before_headers: prior,
+                settings_ack_before_headers,
                 pseudo_headers,
                 ordinary_fields,
                 request_end_stream: end_stream,
@@ -266,6 +281,23 @@ mod tests {
             [":method", ":scheme", ":path", ":authority"]
         );
         assert!(!summary.request_end_stream);
+    }
+
+    #[test]
+    fn ignores_valid_timing_dependent_settings_ack_but_rejects_malformed_ack() {
+        let mut raw = CLIENT_PREFACE.to_vec();
+        raw.extend(frame(4, 0, 0, &[0, 6, 0, 0, 0x20, 0]));
+        raw.extend(frame(4, 1, 0, &[])); // valid SETTINGS ACK, not H2 profile
+        raw.extend(frame(1, 4, 1, &[0x83, 0x87, 0x84, 0x81]));
+        let observed = inspect(&raw).unwrap();
+        assert!(observed.settings_ack_before_headers);
+        assert!(observed.frames_before_headers.is_empty());
+        let mut malformed = raw;
+        // Nonempty SETTINGS ACK payload is forbidden, even if it arrives early.
+        malformed[CLIENT_PREFACE.len() + 9 + 6] = 0;
+        malformed[CLIENT_PREFACE.len() + 9 + 6 + 1] = 0;
+        malformed[CLIENT_PREFACE.len() + 9 + 6 + 2] = 1;
+        assert!(inspect(&malformed).is_err());
     }
 
     #[test]
