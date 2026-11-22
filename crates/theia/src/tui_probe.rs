@@ -329,7 +329,7 @@ impl ProbePanel {
 
     pub(crate) fn body(&self) -> String {
         let mut body =
-            String::from("TLS/H2: явная одиночная проверка локального публичного IP\n\n");
+            String::from("TLS/H2 + QUIC/H3: явные проверки одного локального публичного IP\n\n");
         let Some(server_name) = &self.server_name else {
             body.push_str(
                 "Недоступно: нужна серверная конфигурация с выбранным inbound и проверенным TLS SNI.\nКонфигурация не загружена. Без SNI TLS не проверяется.\n\nEsc: назад",
@@ -634,14 +634,94 @@ mod tests {
         assert!(text.contains("H2 score: 80/100"));
         assert!(text.contains("confidence: 85%"));
         assert!(text.contains("H3 score: Unknown"));
-        assert!(text.contains("H3 score: Unknown, confidence: 0%"));
+        assert!(text.contains("H3: UDP недоступен, score: Unknown"));
         assert!(text.contains("fingerprint Theia не измерен"));
-        assert!(text.contains("H3 ALPN не измерен"));
+        assert!(text.contains("H2+H3: НЕ подтверждены оба транспорта"));
         assert!(text.contains("eligible: НЕТ"));
         assert!(!text.contains("eligible: ДА"));
         assert!(text.contains("не является вероятностью"));
         assert!(text.contains("120 мс"));
         assert!(text.contains("сек назад"));
+    }
+
+    #[test]
+    fn truly_verified_h2_and_h3_on_one_ip_have_independent_evidence_and_dual_gate() {
+        use crate::camouflage_discovery::{Observation, TlsEvidence};
+        use crate::camouflage_h3_probe::H3ProbeReport;
+        let ip: IpAddr = "93.184.216.10".parse().unwrap();
+        let h2 = TlsEvidence {
+            tls13: Observation::Verified,
+            trusted_chain: Observation::Verified,
+            sni_san_match: Observation::Verified,
+            certificate_current: Observation::Verified,
+            reachable: Observation::Verified,
+            alpn_h2: Observation::Verified,
+            alpn_h3: Observation::Unknown,
+            theia_fingerprint_match: Observation::Unknown,
+        };
+        let h3 = TlsEvidence {
+            alpn_h2: Observation::Unknown,
+            alpn_h3: Observation::Verified,
+            ..h2
+        };
+        let mut panel = ProbePanel::new(assigned(), Some("proxy.example.org".into()));
+        panel.state = ProbeState::Complete {
+            address: ip,
+            outcome: Ok(DualProbeReport {
+                address: SocketAddr::new(ip, 443),
+                h2: Ok(ProbeReport {
+                    connected_ip: ip,
+                    handshake_elapsed: Duration::from_millis(70),
+                    evidence: h2,
+                }),
+                h3: Ok(H3ProbeReport {
+                    connected_ip: ip,
+                    handshake_elapsed: Duration::from_millis(85),
+                    evidence: h3,
+                }),
+            }),
+        };
+        let body = panel.body();
+        assert!(body.contains("H2 score: 80/100, confidence: 85%"));
+        assert!(body.contains("H3 score: 80/100, confidence: 85%"));
+        assert!(body.contains("H2+H3: ОБА TLS/ALPN handshake подтверждены"));
+        assert!(body.contains("REALITY готов: НЕТ"));
+        assert!(!body.contains("eligible: ДА"));
+        assert!(!body.contains("вероятностью обхода DPI"));
+    }
+
+    #[test]
+    fn an_h3_only_success_cannot_replace_failed_tcp_h2() {
+        use crate::camouflage_discovery::{Observation, TlsEvidence};
+        use crate::camouflage_h3_probe::H3ProbeReport;
+        let ip: IpAddr = "93.184.216.10".parse().unwrap();
+        let mut panel = ProbePanel::new(assigned(), Some("proxy.example.org".into()));
+        panel.state = ProbeState::Complete {
+            address: ip,
+            outcome: Ok(DualProbeReport {
+                address: SocketAddr::new(ip, 443),
+                h2: Err(ProbeError::WrongAlpn),
+                h3: Ok(H3ProbeReport {
+                    connected_ip: ip,
+                    handshake_elapsed: Duration::from_millis(65),
+                    evidence: TlsEvidence {
+                        tls13: Observation::Verified,
+                        trusted_chain: Observation::Verified,
+                        sni_san_match: Observation::Verified,
+                        certificate_current: Observation::Verified,
+                        reachable: Observation::Verified,
+                        alpn_h2: Observation::Unknown,
+                        alpn_h3: Observation::Verified,
+                        theia_fingerprint_match: Observation::Unknown,
+                    },
+                }),
+            }),
+        };
+        let body = panel.body();
+        assert!(body.contains("H2: нет ALPN h2, score: Unknown"));
+        assert!(body.contains("H3 score: 80/100"));
+        assert!(body.contains("H2+H3: НЕ подтверждены оба транспорта"));
+        assert!(body.contains("REALITY готов: НЕТ"));
     }
 
     #[test]
