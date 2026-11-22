@@ -18,6 +18,7 @@ use std::{sync::Arc, time::Duration};
 use theia::{
     config::{self, Config},
     invite::Invitation,
+    quic_transport::{accept as accept_quic, client_endpoint, connect as connect_quic, server_endpoint},
 };
 use tokio::{net::{TcpListener, TcpStream}, time::timeout};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -187,6 +188,64 @@ async fn verified_h2_tls_exporter_is_identical_on_peers_and_context_separated() 
     })
     .await
     .expect("test-only TLS exporter handshake completed within deadline");
+}
+
+/// QUIC has its own exporter API and network fingerprint. A successful
+/// exporter probe is not evidence that REALITY's modified handshake can be
+/// carried over QUIC/H3, only that ordinary verified QUIC TLS1.3 can be
+/// bound to a session-specific context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verified_h3_quic_exporter_matches_both_peers_with_domain_separation() {
+    timeout(DEADLINE, async {
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let server = server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![der.clone()],
+            key.into(),
+        )
+        .unwrap();
+        let remote = server.local_addr().unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(der).unwrap();
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let connection = accept_quic(incoming).await.unwrap();
+            let mut derived = [0u8; 32];
+            let mut other = [0u8; 32];
+            connection
+                .export_keying_material(&mut derived, EXPORTER_LABEL, CONTEXT)
+                .unwrap();
+            connection
+                .export_keying_material(&mut other, EXPORTER_LABEL, b"other context")
+                .unwrap();
+            connection.close(0u32.into(), b"finished");
+            (derived, other)
+        });
+        let connection = connect_quic(&client, remote, "localhost").await.unwrap();
+        let mut derived = [0u8; 32];
+        let mut other = [0u8; 32];
+        connection
+            .export_keying_material(&mut derived, EXPORTER_LABEL, CONTEXT)
+            .unwrap();
+        connection
+            .export_keying_material(&mut other, EXPORTER_LABEL, b"other context")
+            .unwrap();
+        let (mut server_derived, mut server_other) = server_task.await.unwrap();
+        assert_eq!(derived, server_derived);
+        assert_eq!(other, server_other);
+        assert_ne!(derived, other);
+        derived.zeroize();
+        other.zeroize();
+        server_derived.zeroize();
+        server_other.zeroize();
+        client.close(0u32.into(), b"done");
+    })
+    .await
+    .expect("test-only QUIC exporter completed within deadline");
 }
 
 /// Independently prove that an exporter's existence cannot justify bypassing
