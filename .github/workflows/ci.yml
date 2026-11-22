@@ -273,16 +273,6 @@ jobs:
         with:
           workspaces: "spikes/m3_4 -> target"
           key: "m3-4-btls"
-      - name: Bootstrap independent Cargo lockfile (to be committed)
-        shell: pwsh
-        run: |
-          cargo generate-lockfile --manifest-path spikes/m3_4/Cargo.toml
-          if ($LASTEXITCODE -ne 0) { throw 'M3.4 lockfile generation failed' }
-          if ($env:RUNNER_OS -eq 'Linux') {
-            Write-Output 'THEIA_M34_LOCK_BEGIN'
-            Get-Content spikes/m3_4/Cargo.lock
-            Write-Output 'THEIA_M34_LOCK_END'
-          }
       - name: Real BoringSSL TCP first flight and strict TLS certificate matrix
         shell: pwsh
         run: |
