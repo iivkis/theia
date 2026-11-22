@@ -47,6 +47,44 @@ async fn read_first_client_settings(peer: &mut DuplexStream) -> Vec<(u16, u32)> 
         .collect()
 }
 
+const DEFAULT_CONNECTION_WINDOW: u32 = 65_535;
+// Research-only candidate: 15 MiB initial connection credit, matching a
+// commonly used Chromium window target. The exact browser increment is
+// separately measured from real Chromium, never presumed from this number.
+const RESEARCH_CONNECTION_WINDOW: u32 = 15_728_640;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_builder_emits_real_connection_window_update_without_shipping_large_credit() {
+    timeout(Duration::from_secs(12), async {
+        let (client_io, mut peer) = tokio::io::duplex(64 * 1024);
+        let mut builder = h2::client::Builder::new();
+        builder.enable_push(false);
+        builder.max_header_list_size(8_192);
+        // Test-only: larger connection credit is not a safe Theia default.
+        builder.initial_connection_window_size(RESEARCH_CONNECTION_WINDOW);
+        let (_sender, driver) = builder.handshake::<_, bytes::Bytes>(client_io).await.unwrap();
+        let task = tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        let settings = read_first_client_settings(&mut peer).await;
+        assert_eq!(settings, [(2, 0), (6, 8_192)]);
+        let mut header = [0u8; 9];
+        peer.read_exact(&mut header).await.expect("WINDOW_UPDATE frame");
+        assert_eq!(header, [0, 0, 4, 8, 0, 0, 0, 0, 0]);
+        let mut body = [0u8; 4];
+        peer.read_exact(&mut body).await.expect("WINDOW_UPDATE credit");
+        let increment = u32::from_be_bytes(body);
+        assert_eq!(increment, RESEARCH_CONNECTION_WINDOW - DEFAULT_CONNECTION_WINDOW);
+        assert_eq!(increment, 15_663_105);
+        task.abort();
+        eprintln!(
+            "M3.4i h2-only test target=15728640 WINDOW_UPDATE=15663105; production credit unchanged at 65535"
+        );
+    })
+    .await
+    .expect("bounded connection-window feasibility");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn experimental_h2_builder_can_encode_real_chromium159_settings_but_not_safely_ship_them() {
     timeout(Duration::from_secs(12), async {
