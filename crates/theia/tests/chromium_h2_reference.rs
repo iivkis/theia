@@ -218,9 +218,10 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
             "Chromium SETTINGS unexpectedly equal Theia; re-evaluate F-13"
         );
         eprintln!(
-            "M3.4g real Chromium H2 SETTINGS={:?} pre_HEAD_sequence={:?} optional_SETTINGS_ACK={} pseudo_names={:?} ordinary_name_count={} END_STREAM={}; Theia baseline SETTINGS={theia_settings:?} pseudo_names=[:method,:scheme,:authority,:path]; comparison is research only, F-13 blocked",
+            "M3.4i actual Chromium159 H2 SETTINGS={:?} pre_HEAD_sequence={:?} connection_WINDOW_UPDATE_increments={:?} optional_SETTINGS_ACK={} pseudo_names={:?} ordinary_name_count={} END_STREAM={}; Theia baseline SETTINGS={theia_settings:?} pseudo_names=[:method,:scheme,:authority,:path]; browser reference only, F-13 blocked",
             observation.settings,
             observation.frames_before_headers,
+            observation.connection_window_updates,
             observation.settings_ack_before_headers,
             observation.pseudo_headers,
             observation.ordinary_fields,
