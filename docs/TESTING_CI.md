@@ -10,6 +10,8 @@
 
 **M3.5b2b4 default ipify CI:** `crates/theia/tests/camouflage_default_ipify.rs` проверяет точный URL `https://api64.ipify.org/`, path `/`, установленный лимит времени, отсутствие DNS/сети при `IpifyConsent::Denied` и отсутствии CA, реальные loopback TLS1.3/http1.1 fixture с сертификатом/SAN `api64.ipify.org`, правильные Host/SNI, IPv4/IPv6 plain-text ответы, запрет private-IP и отсутствие утечки hostname через Debug. Windows/Linux обязательны; никаких реальных запросов к ipify в CI. Только положительный `ci-gate` на финальном SHA разрешает merge.
 
+**M4.5a TUI consented discovery CI:** pure state-machine/tui tests verify p on server screen opens **passive** native interface+14 domain preview, no worker/DNS by default, i shows disclosure for exact `api64.ipify.org`, n denies, Esc drops/cancels flow, client/Home/Help cannot trigger discovery, dirty typed TOML editor refuses navigation. `tui_discovery` tests verify no worker starts before explicit confirmation and safe cleanup. Existing `camouflage_default_ipify` tests perform real loopback TLS1.3/SNI/Host/IPv4/IPv6 PKI and forbidden reply checks; **never** access public ipify in CI. Production worker loads pinned `rustls-native-certs=0.8.5` CA without disabling trust verification; native Windows and Linux CI, fmt/clippy and full exact-head gate mandatory.
+
 ## 1. Test pyramid
 
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)
