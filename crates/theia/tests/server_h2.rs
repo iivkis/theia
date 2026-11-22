@@ -148,10 +148,7 @@ async fn client_with_window(
     assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
     let mut builder = h2::client::Builder::new();
     builder.initial_window_size(window);
-    let (sender, connection) = builder
-        .handshake(tls)
-        .await
-        .expect("h2 client handshake");
+    let (sender, connection) = builder.handshake(tls).await.expect("h2 client handshake");
     let driver = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -607,7 +604,12 @@ async fn default_acl_checks_server_resolved_localhost_before_dial() {
 async fn open_tunnel(
     sender: &mut h2::client::SendRequest<Bytes>,
     port: u16,
-) -> (h2::SendStream<Bytes>, h2::RecvStream, Decoder, VecDeque<Frame>) {
+) -> (
+    h2::SendStream<Bytes>,
+    h2::RecvStream,
+    Decoder,
+    VecDeque<Frame>,
+) {
     let (response, mut tx) = sender.send_request(request(&bearer()), false).unwrap();
     send(
         &mut tx,
@@ -656,9 +658,7 @@ async fn slow_h2_response_reader_does_not_block_tcp_upload() {
         let (mut tx, mut rx, mut decoder, mut queue) = open_tunnel(&mut sender, port).await;
         let (remote, _) = target.accept().await.unwrap();
         let (mut read, mut write) = remote.into_split();
-        let payload = (0..256 * 1024)
-            .map(|n| (n % 251) as u8)
-            .collect::<Vec<_>>();
+        let payload = (0..256 * 1024).map(|n| (n % 251) as u8).collect::<Vec<_>>();
         let expected = payload.clone();
         let writer = tokio::spawn(async move {
             write.write_all(&payload).await.unwrap();
@@ -669,7 +669,12 @@ async fn slow_h2_response_reader_does_not_block_tcp_upload() {
         // Withhold all response window credit. The server must still accept
         // an upload while its download cannot finish even a 4 KiB frame.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        send(&mut tx, &Frame::Data(b"upload under backpressure".to_vec()), false).await;
+        send(
+            &mut tx,
+            &Frame::Data(b"upload under backpressure".to_vec()),
+            false,
+        )
+        .await;
         send(&mut tx, &Frame::Fin, true).await;
         let mut upload = Vec::new();
         timeout(Duration::from_secs(3), read.read_to_end(&mut upload))
@@ -734,9 +739,15 @@ async fn eight_h2_tunnels_survive_one_stream_reset() {
         let closed = timeout(Duration::from_secs(3), cancelled_peer.read(&mut byte))
             .await
             .expect("reset must close upstream TCP");
-        assert!(matches!(closed, Ok(0)) || closed.is_err_and(|e| {
-            matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted)
-        }));
+        assert!(
+            matches!(closed, Ok(0))
+                || closed.is_err_and(|e| {
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    )
+                })
+        );
 
         let mut echo_tasks = tokio::task::JoinSet::new();
         for mut socket in sockets {
@@ -778,7 +789,10 @@ async fn eight_h2_tunnels_survive_one_stream_reset() {
         // Connection remains usable after all eight sessions finish.
         sender = sender.ready().await.unwrap();
         let (response, _) = sender.send_request(request("invalid"), true).unwrap();
-        assert_eq!(response.await.unwrap().status(), http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.await.unwrap().status(),
+            http::StatusCode::UNAUTHORIZED
+        );
         driver.abort();
         server.abort();
         let _ = server.await;
