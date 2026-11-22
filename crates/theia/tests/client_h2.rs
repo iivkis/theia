@@ -27,6 +27,16 @@ async fn listener(private: bool) -> (String, RootCertStore, ServerTask) {
 }
 
 async fn listener_with_pem(private: bool) -> (String, RootCertStore, String, ServerTask) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener_with_pem_bound(private, listener)
+}
+
+/// Shares the same server fixture when tests need a pre-reserved TCP+UDP port.
+/// Windows ephemeral TCP and UDP availability must not be assumed identical.
+fn listener_with_pem_bound(
+    private: bool,
+    listener: TcpListener,
+) -> (String, RootCertStore, String, ServerTask) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let pem = cert.cert.pem();
     let der = cert.cert.der().clone();
@@ -63,7 +73,6 @@ async fn listener_with_pem(private: bool) -> (String, RootCertStore, String, Ser
         connect_timeout_ms: 1500,
     };
     let context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap().to_string();
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let task = tokio::spawn(serve(listener, acceptor, context));
@@ -706,8 +715,19 @@ async fn auto_connect(proxy: std::net::SocketAddr, port: u16) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_falls_back_only_after_udp_silence_and_uses_negative_cache() {
     timeout(Duration::from_secs(25), async {
-        let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
-        let udp = tokio::net::UdpSocket::bind(&endpoint).await.unwrap();
+        // Reserve an available UDP port first, then bind the TCP server to
+        // that *same* port. On Windows a random TCP ephemeral port may be
+        // excluded for UDP (WSAEACCES/10013), so blind second bind is flaky.
+        let mut pair = None;
+        for _ in 0..64 {
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
+                pair = Some((udp, tcp));
+                break;
+            }
+        }
+        let (udp, tcp) = pair.expect("native CI must provide one shared TCP/UDP loopback port");
+        let (endpoint, _roots, pem, server) = listener_with_pem_bound(true, tcp);
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = probes.clone();
         let blackhole = tokio::spawn(async move {

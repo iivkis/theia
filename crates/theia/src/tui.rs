@@ -642,7 +642,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(
             frame,
             parts[1],
-            "TLS/H2: только один разрешённый IP:443",
+            "TLS/H2 + QUIC/H3: только один разрешённый IP:443",
             &probe.body(),
             true,
         );

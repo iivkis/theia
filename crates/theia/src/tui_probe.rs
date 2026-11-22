@@ -1,13 +1,15 @@
-//! M4.5b: one explicitly authorized TLS1.3/h2 observation of a local
-//! public IP selected by the operator in server TUI.
+//! M4.5e: two separate opt-in TLS1.3/h2 (TCP) and QUIC/TLS1.3/h3 (UDP)
+//! observations of one identical pinned local public IP in server TUI.
 //! Nothing scans a CIDR or resolves a seed domain; no probe runs on startup.
 use crate::{
-    camouflage_batch::{probe_explicit_batch, BatchError, BatchTarget, MAX_EXPLICIT_BATCH},
+    camouflage_batch::MAX_EXPLICIT_BATCH,
     camouflage_discovery::{
         plausible_public_address, CandidateHost, CandidateSource, TlsEvidence, Transport,
     },
+    camouflage_dual::{probe_dual_h2_h3, DualProbeError, DualProbeReport, DualProbeTarget},
+    camouflage_h3_probe::H3ProbeError,
     camouflage_interfaces::NativeInterfaces,
-    camouflage_probe::{ProbeApproval, ProbeError, ProbeReport, ProbeRequest},
+    camouflage_probe::{ProbeApproval, ProbeError, ProbeRequest},
     camouflage_workflow::{build_preview, DiscoveryPreview, PreviewScope},
 };
 use rustls::RootCertStore;
@@ -64,13 +66,59 @@ fn describe_h2_evidence(evidence: &TlsEvidence) -> String {
     )
 }
 
+/// Only QUIC/TLS1.3/h3 ALPN on the verified exact IP receives H3 credit.
+fn describe_h3_evidence(evidence: &TlsEvidence) -> String {
+    let rating = evidence.suitability(Transport::H3);
+    let reasons = rating
+        .blockers
+        .iter()
+        .map(|reason| translated_h2_blocker(reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "H3 score: {}/100, confidence: {}%, eligible: НЕТ.\nПричины: {}.",
+        rating.score,
+        rating.confidence,
+        if reasons.is_empty() {
+            "нет"
+        } else {
+            &reasons
+        }
+    )
+}
+
+fn h2_failure(error: ProbeError) -> &'static str {
+    match error {
+        ProbeError::NotApproved => "нет согласия",
+        ProbeError::InvalidServerName => "SNI некорректен",
+        ProbeError::InvalidDeadline => "нет deadline",
+        ProbeError::NoTrustAnchors => "нет доверенных CA",
+        ProbeError::TimedOut => "таймаут TLS",
+        ProbeError::ConnectFailed => "TCP недоступен",
+        ProbeError::TlsRejected => "TLS/сертификат отклонён",
+        ProbeError::WrongAlpn => "нет ALPN h2",
+    }
+}
+
+fn h3_failure(error: H3ProbeError) -> &'static str {
+    match error {
+        H3ProbeError::NotApproved => "нет согласия",
+        H3ProbeError::InvalidServerName => "SNI некорректен",
+        H3ProbeError::InvalidDeadline => "нет deadline",
+        H3ProbeError::NoTrustAnchors => "нет доверенных CA",
+        H3ProbeError::TimedOut => "таймаут QUIC",
+        H3ProbeError::UdpUnavailable => "UDP недоступен",
+        H3ProbeError::BindFailed => "ошибка UDP сокета",
+        H3ProbeError::HandshakeRejected => "QUIC/TLS сертификат или ALPN h3 отклонены",
+        H3ProbeError::WrongPeer => "IP QUIC peer не совпал с выбранным",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeUiError {
     NoTrustAnchors,
     RuntimeUnavailable,
-    MissingResult,
-    Batch(BatchError),
-    Handshake(ProbeError),
+    Dual(DualProbeError),
 }
 
 enum ProbeState {
@@ -80,12 +128,12 @@ enum ProbeState {
     },
     Running {
         address: IpAddr,
-        receiver: Receiver<Result<ProbeReport, ProbeUiError>>,
+        receiver: Receiver<Result<DualProbeReport, ProbeUiError>>,
         cancel: Option<oneshot::Sender<()>>,
     },
     Complete {
         address: IpAddr,
-        outcome: Result<ProbeReport, ProbeUiError>,
+        outcome: Result<DualProbeReport, ProbeUiError>,
     },
 }
 
@@ -184,8 +232,8 @@ impl ProbePanel {
         }
     }
 
-    /// No network until the separate exact target and SNI disclosure is
-    /// approved with y. Strict TLS/PKI and batch quotas are reused unchanged.
+    /// No TCP or UDP until the operator confirms both exact IP/SNI checks.
+    /// Strict TLS/PKI and separate bounded transport quotas are enforced.
     pub(crate) fn confirm_and_start(&mut self) {
         let address = match self.state {
             ProbeState::Confirm { address } => address,
@@ -200,7 +248,7 @@ impl ProbePanel {
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let started = std::thread::Builder::new()
-            .name("theia-exact-h2-probe".to_owned())
+            .name("theia-exact-h2-h3-probe".to_owned())
             .spawn(move || {
                 let outcome = (|| {
                     let certs = rustls_native_certs::load_native_certs();
@@ -222,7 +270,7 @@ impl ProbePanel {
                             server_name,
                             deadline: Duration::from_secs(5),
                         };
-                        let target = BatchTarget {
+                        let target = DualProbeTarget {
                             request,
                             roots,
                             approval: ProbeApproval::public_https_ip(address),
@@ -230,14 +278,8 @@ impl ProbePanel {
                         tokio::select! {
                             biased;
                             _ = cancel_rx => None,
-                            completed = probe_explicit_batch(&preview, vec![target]) => {
-                                Some(completed
-                                    .map_err(ProbeUiError::Batch)
-                                    .and_then(|batch| {
-                                        batch.results.into_iter().next()
-                                            .ok_or(ProbeUiError::MissingResult)?
-                                            .result.map_err(ProbeUiError::Handshake)
-                                    }))
+                            completed = probe_dual_h2_h3(&preview, target) => {
+                                Some(completed.map_err(ProbeUiError::Dual))
                             }
                         }
                     })
@@ -289,7 +331,7 @@ impl ProbePanel {
 
     pub(crate) fn body(&self) -> String {
         let mut body =
-            String::from("TLS/H2: явная одиночная проверка локального публичного IP\n\n");
+            String::from("TLS/H2 + QUIC/H3: явные проверки одного локального публичного IP\n\n");
         let Some(server_name) = &self.server_name else {
             body.push_str(
                 "Недоступно: нужна серверная конфигурация с выбранным inbound и проверенным TLS SNI.\nКонфигурация не загружена. Без SNI TLS не проверяется.\n\nEsc: назад",
@@ -306,7 +348,7 @@ impl ProbePanel {
             return body;
         };
         body.push_str(&format!(
-            "Источники: только UP IP, назначенные локальному интерфейсу; никаких CIDR sweep.\nЦель {}/{}: {}:443\nTLS SNI/SAN: {}\nПроверка CA/TLS1.3/ALPN=h2; максимум 5 секунд.\nОбычный TLS успех НЕ доказывает browser fingerprint, REALITY или обход DPI.\n",
+            "Источники: только UP IP, назначенные локальному интерфейсу; никаких CIDR sweep.\nЦель {}/{}: {}:443 (TCP H2 + UDP H3)\nTLS SNI/SAN: {}\nДВЕ проверки: TLS1.3/ALPN=h2 и QUIC/TLS1.3/ALPN=h3; до 5 секунд на каждую.\nУспех обоих транспортов НЕ доказывает browser fingerprint, REALITY или обход DPI.\n",
             self.selected + 1,
             self.targets.len(),
             selected,
@@ -317,18 +359,27 @@ impl ProbePanel {
                 "\n↑/↓ или j/k: выбрать адрес  Enter/t: запросить согласие  Esc: назад",
             ),
             ProbeState::Confirm { address } => body.push_str(&format!(
-                "\nСОГЛАСИЕ НА АКТИВНУЮ TLS/H2 ПРОВЕРКУ\n\nОператор подтверждает право проверить ОДИН назначенный IP {}:443\nс SNI {}. Будет отправлен один TLS1.3 handshake без HTTP запроса.\nНи соседние IP, ни популярные домены, ни другие порты не затрагиваются.\n\ny: согласиться и запустить  n: отказаться  Esc: назад",
+                "\nСОГЛАСИЕ НА АКТИВНЫЕ H2 И H3 ПРОВЕРКИ\n\nОператор подтверждает право проверить ОДИН назначенный IP {}:443\nс SNI {} по ДВУМ транспортам: TCP/TLS1.3 ALPN=h2 и UDP/QUIC TLS1.3 ALPN=h3.\nДва handshake без HTTP-запросов; ни соседние IP, ни домены, ни другие порты не затрагиваются.\n\ny: согласиться на ОБА запроса  n: отказаться  Esc: назад",
                 address, server_name
             )),
             ProbeState::Running { address, .. } => body.push_str(&format!(
-                "\nПроверка {}:443 выполняется в отдельном потоке.\nEsc: отменить и вернуться",
+                "\nПроверки TCP/H2 и UDP/H3 для {}:443 выполняются в отдельном потоке.\nEsc: отменить оба запроса и вернуться",
                 address
             )),
             ProbeState::Complete {
                 address,
                 outcome: Ok(report),
             } => {
-                if report.connected_ip != *address {
+                if report.address != SocketAddr::new(*address, 443)
+                    || report
+                        .h2
+                        .as_ref()
+                        .is_ok_and(|h2| h2.connected_ip != *address)
+                    || report
+                        .h3
+                        .as_ref()
+                        .is_ok_and(|h3| h3.connected_ip != *address)
+                {
                     body.push_str(
                         "\nIP результата не совпадает с выбранной целью.\nНикакие TLS-свойства этого IP не подтверждены; score: Unknown.\n\nEsc: назад",
                     );
@@ -338,41 +389,63 @@ impl ProbePanel {
                         |instant| format!("{} сек назад", instant.elapsed().as_secs()),
                     );
                     body.push_str(&format!(
-                        "\nTLS 1.3 подтверждён для {}:443: CA/SNI/SAN/ALPN=h2 проверены.\nВремя handshake: {} мс. Измерение: {age}.\n{}\nH3 score: Unknown, confidence: 0%, eligible: НЕТ.\nПричины: H3 ALPN не измерен; QUIC/H3 не проверялся. H2 данные нельзя переносить на H3.\nScore не является вероятностью обхода DPI; REALITY и TLS-in-TLS всё ещё НЕ проверены.\n\nEnter/t: повторить только с новым согласием  Esc: назад",
-                        address,
-                        report.handshake_elapsed.as_millis(),
-                        describe_h2_evidence(&report.evidence),
+                        "\nНезависимые результаты TCP/H2 и UDP/H3. Измерение: {age}.\n"
                     ));
+                    match &report.h2 {
+                        Ok(h2) => body.push_str(&format!(
+                            "TLS 1.3 подтверждён для {}:443 по TCP, время handshake: {} мс.\n{}\n",
+                            address,
+                            h2.handshake_elapsed.as_millis(),
+                            describe_h2_evidence(&h2.evidence),
+                        )),
+                        Err(error) => body.push_str(&format!(
+                            "H2: {}, score: Unknown.\n",
+                            h2_failure(*error),
+                        )),
+                    }
+                    match &report.h3 {
+                        Ok(h3) => body.push_str(&format!(
+                            "QUIC/TLS 1.3 + ALPN=h3 подтверждены для {}:443 по UDP, время handshake: {} мс.\n{}\n",
+                            address,
+                            h3.handshake_elapsed.as_millis(),
+                            describe_h3_evidence(&h3.evidence),
+                        )),
+                        Err(error) => body.push_str(&format!(
+                            "H3: {}, score: Unknown.\n",
+                            h3_failure(*error),
+                        )),
+                    }
+                    if report.both_transports_verified() {
+                        body.push_str(
+                            "H2+H3: ОБА TLS/ALPN handshake подтверждены для одного IP/SNI.\n",
+                        );
+                    } else {
+                        body.push_str(
+                            "H2+H3: НЕ подтверждены оба транспорта; кандидат НЕ проходит dual-transport gate.\n",
+                        );
+                    }
+                    body.push_str(
+                        "REALITY готов: НЕТ. HTTP/3 semantics, fingerprint/identity и anti-DPI НЕ проверены.\nScore не является вероятностью обхода DPI.\n\nEnter/t: повторить только с новым согласием  Esc: назад",
+                    );
                 }
-            },
+            }
             ProbeState::Complete {
                 outcome: Err(error),
                 ..
             } => {
                 let code = match error {
-                    ProbeUiError::NoTrustAnchors => "не найдено доверенных системных CA",
+                    ProbeUiError::NoTrustAnchors => "не найдены доверенные системные CA",
                     ProbeUiError::RuntimeUnavailable => "невозможно запустить worker",
-                    ProbeUiError::MissingResult => "нет результата проверки",
-                    ProbeUiError::Batch(BatchError::Empty) => "пустая очередь",
-                    ProbeUiError::Batch(BatchError::TooManyTargets) => "лимит целей превышен",
-                    ProbeUiError::Batch(BatchError::DuplicateAddress) => "повтор цели",
-                    ProbeUiError::Batch(BatchError::NotApproved) => "отсутствует одобрение",
-                    ProbeUiError::Batch(BatchError::UnplannedAddress) => {
-                        "адрес отсутствует в offline-плане"
+                    ProbeUiError::Dual(DualProbeError::NotApproved) => "нет согласия на оба транспорта",
+                    ProbeUiError::Dual(DualProbeError::InvalidServerName) => "некорректный SNI",
+                    ProbeUiError::Dual(DualProbeError::InvalidDeadline) => "некорректный deadline",
+                    ProbeUiError::Dual(DualProbeError::NoTrustAnchors) => "отсутствуют CA",
+                    ProbeUiError::Dual(DualProbeError::UnplannedAddress) => {
+                        "адрес не входит в разрешённый офлайн-план"
                     }
-                    ProbeUiError::Batch(BatchError::TaskFailed) => "ошибка worker",
-                    ProbeUiError::Batch(BatchError::BatchTimedOut) => "таймаут группы",
-                    ProbeUiError::Handshake(ProbeError::NotApproved) => "нет разрешения",
-                    ProbeUiError::Handshake(ProbeError::InvalidServerName) => "некорректный SNI",
-                    ProbeUiError::Handshake(ProbeError::InvalidDeadline) => "нет deadline",
-                    ProbeUiError::Handshake(ProbeError::NoTrustAnchors) => "отсутствуют CA",
-                    ProbeUiError::Handshake(ProbeError::TimedOut) => "таймаут TLS",
-                    ProbeUiError::Handshake(ProbeError::ConnectFailed) => "TCP недоступен",
-                    ProbeUiError::Handshake(ProbeError::TlsRejected) => "TLS/сертификат отклонён",
-                    ProbeUiError::Handshake(ProbeError::WrongAlpn) => "нет ALPN h2",
                 };
                 body.push_str(&format!(
-                    "\nTLS/H2 проверка НЕ прошла: {code}. Никакая пригодность не подтверждена.\nH2/H3 score: Unknown, данные handshake отсутствуют; нельзя приписывать положительные баллы.\n\nEnter/t: повторить только с новым согласием  Esc: назад"
+                    "\nПроверка H2/H3 НЕ прошла: {code}. Оба транспорта НЕ подтверждены.\nH2/H3 score: Unknown, положительных доказательств нет.\n\nEnter/t: повторить только с новым согласием  Esc: назад"
                 ));
             }
         }
@@ -391,6 +464,7 @@ impl Drop for ProbePanel {
 mod tests {
     use super::*;
     use crate::camouflage_interfaces::{InterfaceSource, ObservedInterface};
+    use crate::camouflage_probe::ProbeReport;
     use std::net::IpAddr;
 
     fn assigned() -> NativeInterfaces {
@@ -425,6 +499,14 @@ mod tests {
                     source: InterfaceSource::LinuxGetifaddrs,
                 },
             ],
+        }
+    }
+
+    fn failed_dual(ip: IpAddr, h2_error: ProbeError) -> DualProbeReport {
+        DualProbeReport {
+            address: SocketAddr::new(ip, 443),
+            h2: Err(h2_error),
+            h3: Err(H3ProbeError::TimedOut),
         }
     }
 
@@ -491,18 +573,18 @@ mod tests {
             receiver: rx,
             cancel: Some(cancel_tx),
         };
-        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut)))
-            .unwrap();
+        tx.send(Ok(failed_dual(
+            "93.184.216.10".parse().unwrap(),
+            ProbeError::TimedOut,
+        )))
+        .unwrap();
         p.poll();
         let text = p.body();
         assert!(text.contains("таймаут TLS"));
         assert!(!text.contains("TLS 1.3 подтверждён"));
         assert!(matches!(
             p.state,
-            ProbeState::Complete {
-                outcome: Err(_),
-                ..
-            }
+            ProbeState::Complete { outcome: Ok(_), .. }
         ));
     }
 
@@ -539,25 +621,109 @@ mod tests {
         };
         panel.state = ProbeState::Complete {
             address: ip,
-            outcome: Ok(ProbeReport {
-                connected_ip: ip,
-                handshake_elapsed: Duration::from_millis(120),
-                evidence,
+            outcome: Ok(DualProbeReport {
+                address: SocketAddr::new(ip, 443),
+                h2: Ok(ProbeReport {
+                    connected_ip: ip,
+                    handshake_elapsed: Duration::from_millis(120),
+                    evidence,
+                }),
+                h3: Err(H3ProbeError::UdpUnavailable),
             }),
         };
         panel.observed_at = Some(Instant::now());
         let text = panel.body();
         assert!(text.contains("H2 score: 80/100"));
         assert!(text.contains("confidence: 85%"));
-        assert!(text.contains("H3 score: Unknown"));
-        assert!(text.contains("H3 score: Unknown, confidence: 0%"));
+        assert!(text.contains("H3: UDP недоступен"));
+        assert!(text.contains("H3: UDP недоступен, score: Unknown"));
         assert!(text.contains("fingerprint Theia не измерен"));
-        assert!(text.contains("H3 ALPN не измерен"));
+        assert!(text.contains("H2+H3: НЕ подтверждены оба транспорта"));
         assert!(text.contains("eligible: НЕТ"));
         assert!(!text.contains("eligible: ДА"));
         assert!(text.contains("не является вероятностью"));
         assert!(text.contains("120 мс"));
         assert!(text.contains("сек назад"));
+    }
+
+    #[test]
+    fn truly_verified_h2_and_h3_on_one_ip_have_independent_evidence_and_dual_gate() {
+        use crate::camouflage_discovery::{Observation, TlsEvidence};
+        use crate::camouflage_h3_probe::H3ProbeReport;
+        let ip: IpAddr = "93.184.216.10".parse().unwrap();
+        let h2 = TlsEvidence {
+            tls13: Observation::Verified,
+            trusted_chain: Observation::Verified,
+            sni_san_match: Observation::Verified,
+            certificate_current: Observation::Verified,
+            reachable: Observation::Verified,
+            alpn_h2: Observation::Verified,
+            alpn_h3: Observation::Unknown,
+            theia_fingerprint_match: Observation::Unknown,
+        };
+        let h3 = TlsEvidence {
+            alpn_h2: Observation::Unknown,
+            alpn_h3: Observation::Verified,
+            ..h2
+        };
+        let mut panel = ProbePanel::new(assigned(), Some("proxy.example.org".into()));
+        panel.state = ProbeState::Complete {
+            address: ip,
+            outcome: Ok(DualProbeReport {
+                address: SocketAddr::new(ip, 443),
+                h2: Ok(ProbeReport {
+                    connected_ip: ip,
+                    handshake_elapsed: Duration::from_millis(70),
+                    evidence: h2,
+                }),
+                h3: Ok(H3ProbeReport {
+                    connected_ip: ip,
+                    handshake_elapsed: Duration::from_millis(85),
+                    evidence: h3,
+                }),
+            }),
+        };
+        let body = panel.body();
+        assert!(body.contains("H2 score: 80/100, confidence: 85%"));
+        assert!(body.contains("H3 score: 80/100, confidence: 85%"));
+        assert!(body.contains("H2+H3: ОБА TLS/ALPN handshake подтверждены"));
+        assert!(body.contains("REALITY готов: НЕТ"));
+        assert!(!body.contains("eligible: ДА"));
+        assert!(body.contains("не является вероятностью обхода DPI"));
+    }
+
+    #[test]
+    fn an_h3_only_success_cannot_replace_failed_tcp_h2() {
+        use crate::camouflage_discovery::{Observation, TlsEvidence};
+        use crate::camouflage_h3_probe::H3ProbeReport;
+        let ip: IpAddr = "93.184.216.10".parse().unwrap();
+        let mut panel = ProbePanel::new(assigned(), Some("proxy.example.org".into()));
+        panel.state = ProbeState::Complete {
+            address: ip,
+            outcome: Ok(DualProbeReport {
+                address: SocketAddr::new(ip, 443),
+                h2: Err(ProbeError::WrongAlpn),
+                h3: Ok(H3ProbeReport {
+                    connected_ip: ip,
+                    handshake_elapsed: Duration::from_millis(65),
+                    evidence: TlsEvidence {
+                        tls13: Observation::Verified,
+                        trusted_chain: Observation::Verified,
+                        sni_san_match: Observation::Verified,
+                        certificate_current: Observation::Verified,
+                        reachable: Observation::Verified,
+                        alpn_h2: Observation::Unknown,
+                        alpn_h3: Observation::Verified,
+                        theia_fingerprint_match: Observation::Unknown,
+                    },
+                }),
+            }),
+        };
+        let body = panel.body();
+        assert!(body.contains("H2: нет ALPN h2, score: Unknown"));
+        assert!(body.contains("H3 score: 80/100"));
+        assert!(body.contains("H2+H3: НЕ подтверждены оба транспорта"));
+        assert!(body.contains("REALITY готов: НЕТ"));
     }
 
     #[test]
@@ -577,10 +743,14 @@ mod tests {
         };
         panel.state = ProbeState::Complete {
             address: requested,
-            outcome: Ok(ProbeReport {
-                connected_ip: other,
-                handshake_elapsed: Duration::from_millis(30),
-                evidence,
+            outcome: Ok(DualProbeReport {
+                address: SocketAddr::new(requested, 443),
+                h2: Ok(ProbeReport {
+                    connected_ip: other,
+                    handshake_elapsed: Duration::from_millis(30),
+                    evidence,
+                }),
+                h3: Err(H3ProbeError::UdpUnavailable),
             }),
         };
         let text = panel.body();
@@ -595,7 +765,7 @@ mod tests {
         let ip: IpAddr = "93.184.216.10".parse().unwrap();
         panel.state = ProbeState::Complete {
             address: ip,
-            outcome: Err(ProbeUiError::Handshake(ProbeError::WrongAlpn)),
+            outcome: Ok(failed_dual(ip, ProbeError::WrongAlpn)),
         };
         let text = panel.body();
         assert!(text.contains("нет ALPN h2"));
@@ -609,8 +779,7 @@ mod tests {
             receiver: rx,
             cancel: Some(cancel),
         };
-        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut)))
-            .unwrap();
+        tx.send(Ok(failed_dual(ip, ProbeError::TimedOut))).unwrap();
         panel.poll();
         let text = panel.body();
         assert!(text.contains("таймаут TLS"));
