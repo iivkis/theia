@@ -265,7 +265,10 @@ async fn real_experimental_btls_and_rustls_share_h2_engine_not_chrome_profile() 
     assert_eq!(btls.settings, [(2, 0), (6, 8192)]);
     assert_eq!(btls.pseudo_headers, rustls.pseudo_headers);
     assert_eq!(btls.frames_before_headers, rustls.frames_before_headers);
-    assert_eq!(btls.connection_window_updates, rustls.connection_window_updates);
+    assert_eq!(
+        btls.connection_window_updates,
+        rustls.connection_window_updates
+    );
     assert!(btls.connection_window_updates.is_empty());
     assert_eq!(btls.ordinary_fields, rustls.ordinary_fields);
     // The Go uTLS repository's minimal H2 probe is a standards-compliant
