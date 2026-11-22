@@ -413,6 +413,41 @@ mod tests {
     }
 
     #[test]
+    fn stalled_tls_probe_result_remains_failure_without_positive_fingerprint_claim() {
+        let mut p = ProbePanel::new(assigned(), Some("proxy.example.org".into()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cancel_tx, _cancelled) = tokio::sync::oneshot::channel();
+        p.state = ProbeState::Running {
+            address: "93.184.216.10".parse().unwrap(),
+            receiver: rx,
+            cancel: Some(cancel_tx),
+        };
+        tx.send(Err(ProbeUiError::Handshake(ProbeError::TimedOut))).unwrap();
+        p.poll();
+        let text = p.body();
+        assert!(text.contains("таймаут TLS"));
+        assert!(!text.contains("TLS 1.3 подтверждён"));
+        assert!(matches!(p.state, ProbeState::Complete { outcome: Err(_), .. }));
+    }
+
+    #[test]
+    fn public_target_choices_are_bounded_even_with_large_interface_inventory() {
+        let mut n = NativeInterfaces::default();
+        for octet in 10..40 {
+            n.interfaces.push(ObservedInterface {
+                interface_name: "eth-multi".into(),
+                address: format!("93.184.216.{octet}").parse().unwrap(),
+                prefix_len: 24,
+                is_up: true,
+                source: InterfaceSource::LinuxGetifaddrs,
+            });
+        }
+        let p = ProbePanel::new(n, Some("proxy.example.org".into()));
+        assert_eq!(p.targets.len(), MAX_EXPLICIT_BATCH);
+        assert_eq!(p.selected_address(), Some("93.184.216.10".parse().unwrap()));
+    }
+
+    #[test]
     fn drop_cancels_a_running_probe_without_touching_network_in_test() {
         let mut p = ProbePanel::new(assigned(), Some("proxy.example.org".into()));
         let (_result_tx, result_rx) = std::sync::mpsc::channel();
