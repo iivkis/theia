@@ -108,6 +108,10 @@ pub async fn probe_dual_batch(
         if !seen.insert((addr, item.target.request.server_name.clone())) {
             return Err(DualBatchError::DuplicateTarget);
         }
+    }
+    // Every target is validated before any socket. Separate structural
+    // duplicate rejection so invalid entries cannot hide duplicate targets.
+    for item in &candidates {
         validate_dual_target(preview, &item.target, item.consent)
             .map_err(DualBatchError::Target)?;
     }
