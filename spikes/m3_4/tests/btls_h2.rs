@@ -60,11 +60,16 @@ async fn connect(
     let ssl = config.into_ssl(name).map_err(|_| "invalid target name")?;
     let socket = TcpStream::connect(address).await.map_err(|_| "connect")?;
     let mut stream = Box::pin(SslStream::new(ssl, socket).map_err(|_| "TLS setup")?);
-    stream
-        .as_mut()
-        .connect()
-        .await
-        .map_err(|_| "verified TLS handshake failed")?;
+    if let Err(error) = stream.as_mut().connect().await {
+        // Safe test-only diagnostic: never print SNI, peer cert, key material,
+        // TLS record bytes, error stacks or credential contents.
+        eprintln!(
+            "BoringSSL handshake rejected: ssl_code={:?}, x509_verify={:?}",
+            error.code(),
+            stream.ssl().verify_result()
+        );
+        return Err("verified TLS handshake failed");
+    }
     if stream.ssl().version2() != Some(SslVersion::TLS1_3)
         || stream.ssl().selected_alpn_protocol() != Some(b"h2".as_slice())
     {
@@ -145,10 +150,14 @@ async fn btls_candidate_validates_chain_name_and_tls13_h2() {
                 acceptor.accept(socket).await.is_ok()
             });
             let result = connect(address, name, roots).await;
-            assert_eq!(result.is_ok(), accepted, "strict certificate/name gate");
             // The client may abort a rejected handshake, but success is
             // always reflected on the server for the accepted case.
             let server_result = server.await.unwrap();
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "strict certificate/name gate: {result:?}, server_accepted={server_result}"
+            );
             if accepted {
                 assert!(server_result, "verified TLS peer must finish handshake");
             }
