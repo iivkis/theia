@@ -917,6 +917,147 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    fn server_issuance_fixture() -> String {
+        use sha2::{Digest, Sha256};
+        include_str!("../../../examples/server.toml").replace(
+            "REPLACE_WITH_64_LOWERCASE_HEX",
+            &format!("{:x}", Sha256::digest([0x42; 32])),
+        )
+    }
+
+    fn rendered_interaction(width: u16, height: u16, model: &Model, ui: &Interaction) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, model, Some(ui))).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|line| line.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn server_issuance_modal_hides_secret_until_durable_save_and_explicit_reveal() {
+        use crate::config::{self, Config};
+        use crate::invite::Invitation;
+        use sha2::{Digest, Sha256};
+        use std::{fs, thread, time::Instant};
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b-issuance-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('u'))));
+        assert!(matches!(ui.issuance, Some(IssueFlow::Input(_))));
+        for ch in "new-device".chars() {
+            assert!(!ui.update(&mut model, press(KeyCode::Char(ch))));
+        }
+        assert!(!ui.update(&mut model, press(KeyCode::Enter)));
+        assert!(matches!(ui.issuance, Some(IssueFlow::Confirm(_))));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        assert!(ui.saving.is_some());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        let start = Instant::now();
+        while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ui.saving.is_none());
+        assert!(matches!(ui.issuance, Some(IssueFlow::Offer)));
+        assert!(ui.editor.as_ref().unwrap().issued_ready());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        let Config::Server(doc) = config::read_file(&path).unwrap() else {
+            panic!("server");
+        };
+        assert!(doc.server.inbounds[0].allowed_user_ids.contains(&"new-device".to_owned()));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        let IssueFlow::Showing(uri) = ui.issuance.as_ref().unwrap() else {
+            panic!("explicit one-time reveal expected");
+        };
+        let invitation = Invitation::decode(uri).unwrap();
+        let bytes = invitation.token_bytes().unwrap();
+        let saved_user = doc.server.users.iter().find(|u| u.id == "new-device").unwrap();
+        assert_eq!(saved_user.token_sha256, format!("{:x}", Sha256::digest(bytes)));
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('q'))));
+        assert_eq!(model.screen, Screen::Server);
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.issuance.is_none());
+        assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn conflict_after_issuance_refuses_reveal_and_requires_retry_or_discard() {
+        use std::{fs, thread, time::Instant};
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b-conflict-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        editor.issue_user("new-device").unwrap();
+        fs::write(&path, "# external writer\n".to_string() + &server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+        ui.issuance = Some(IssueFlow::Saving);
+        ui.start_save();
+        let start = Instant::now();
+        while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(ui.issuance, Some(IssueFlow::SaveFailed)));
+        assert!(!ui.editor.as_ref().unwrap().issued_ready());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        assert!(matches!(ui.issuance, Some(IssueFlow::SaveFailed)));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('d'))));
+        assert!(ui.issuance.is_none());
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
+        assert!(!fs::read_to_string(&path).unwrap().contains("new-device"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn client_panel_cannot_open_server_issuance_and_dirty_draft_is_guarded() {
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b-client-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        assert!(!ui.update(&mut model, press(KeyCode::Char('u'))));
+        assert!(ui.issuance.is_none());
+        fs::remove_file(path).unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b-dirty-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.editor.as_mut().unwrap().begin();
+        ui.editor.as_mut().unwrap().input = "other.example.org".into();
+        assert!(!ui.update(&mut model, press(KeyCode::Enter)));
+        assert!(ui.editor.as_ref().unwrap().dirty());
+        assert!(!ui.update(&mut model, press(KeyCode::Char('u'))));
+        assert!(ui.issuance.is_none());
+        assert!(ui.editor.as_ref().unwrap().error.as_deref().unwrap().contains("черновик"));
+        fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn key_release_and_non_relevant_keys_do_not_navigate() {
         let mut model = Model::new(None);
