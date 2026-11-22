@@ -186,7 +186,7 @@ impl Interaction {
         let (tx, rx) = mpsc::channel();
         self.saving = Some(rx);
         // File I/O and fsync never block terminal rendering or key dispatch.
-        std::thread::spawn(move || {
+        let _save_worker = std::thread::spawn(move || {
             let saved = editor.save();
             let _ = tx.send((editor, saved));
         });
