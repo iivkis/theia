@@ -91,15 +91,25 @@ fn header_order(block: &[u8]) -> Result<(Vec<&'static str>, usize), &'static str
             let name = if name_index == 0 {
                 let (raw, huffman) = read_string(block, &mut cursor)?;
                 if huffman {
-                    return Err("unsupported Huffman-literal HPACK name");
-                }
-                match raw {
-                    b":authority" => Some(":authority"),
-                    b":method" => Some(":method"),
-                    b":path" => Some(":path"),
-                    b":scheme" => Some(":scheme"),
-                    _ if raw.starts_with(b":") => return Err("unknown request pseudo-header"),
-                    _ => None,
+                    // Chromium compresses ordinary header *names*. The
+                    // observer never decodes or logs those bytes. Refuse
+                    // unknown Huffman names until all four recognized
+                    // pseudo fields are present; no name order is guessed.
+                    if pseudo.len() != 4 {
+                        return Err("Huffman name before complete pseudo-header set");
+                    }
+                    None
+                } else {
+                    match raw {
+                        b":authority" => Some(":authority"),
+                        b":method" => Some(":method"),
+                        b":path" => Some(":path"),
+                        b":scheme" => Some(":scheme"),
+                        _ if raw.starts_with(b":") => {
+                            return Err("unknown request pseudo-header");
+                        }
+                        _ => None,
+                    }
                 }
             } else {
                 static_name(name_index)?
@@ -298,6 +308,28 @@ mod tests {
         malformed[CLIENT_PREFACE.len() + 9 + 6 + 1] = 0;
         malformed[CLIENT_PREFACE.len() + 9 + 6 + 2] = 1;
         assert!(inspect(&malformed).is_err());
+    }
+
+    #[test]
+    fn allows_huffman_literal_ordinary_header_name_only_after_all_pseudos() {
+        // Four indexed pseudo headers followed by one Huffman-literal name.
+        // Its contents are NEVER decoded, copied into Observation or logged.
+        let mut valid = CLIENT_PREFACE.to_vec();
+        valid.extend(frame(4, 0, 0, &[0, 6, 0, 0, 0x20, 0]));
+        valid.extend(frame(
+            1,
+            4,
+            1,
+            &[0x83, 0x87, 0x81, 0x84, 0, 0x81, 0xff, 0],
+        ));
+        let obs = inspect(&valid).unwrap();
+        assert_eq!(obs.pseudo_headers.len(), 4);
+        assert_eq!(obs.ordinary_fields, 1);
+
+        let mut premature = CLIENT_PREFACE.to_vec();
+        premature.extend(frame(4, 0, 0, &[]));
+        premature.extend(frame(1, 4, 1, &[0, 0x81, 0xff, 0, 0x83, 0x87, 0x81, 0x84]));
+        assert!(inspect(&premature).is_err());
     }
 
     #[test]
