@@ -88,7 +88,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Tap<T> {
 #[ignore = "required native browser-e2e CI matrix provisions pinned Playwright/Chromium"]
 async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
     timeout(Duration::from_secs(80), async {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -106,8 +108,24 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
         let endpoint = listener.local_addr().unwrap().to_string();
 
         let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.expect("loopback browser TCP");
-            let tls = tls_acceptor.accept(socket).await.expect("browser TLS1.3 handshake");
+            // Chromium may open a speculative TLS connection before the
+            // navigation context's one-off test certificate exception applies.
+            // A rejected speculative connection must not kill the reference
+            // listener. Retry only loopback, with strictly bounded attempts.
+            let mut verified = None;
+            for _ in 0..8 {
+                let (socket, _) = listener.accept().await.expect("loopback browser TCP");
+                if let Ok(Ok(tls)) = timeout(
+                    Duration::from_secs(5),
+                    tls_acceptor.accept(socket),
+                )
+                .await
+                {
+                    verified = Some(tls);
+                    break;
+                }
+            }
+            let tls = verified.expect("a real Chromium h2 TLS connection must succeed");
             assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
             assert_eq!(
                 tls.get_ref().1.protocol_version(),
