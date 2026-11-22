@@ -7,9 +7,7 @@ use rcgen::{
 };
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::{future::poll_fn, sync::Arc, time::Duration};
-use theia_m3_4_btls_feasibility::h2_transport::{
-    connect_verified_h2, H2CandidateError,
-};
+use theia_m3_4_btls_feasibility::h2_transport::{connect_verified_h2, H2CandidateError};
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use tokio_rustls::TlsAcceptor;
 
@@ -84,7 +82,9 @@ async fn btls_h2_full_duplex_response_before_request_end_stream() {
                 tls.get_ref().1.protocol_version(),
                 Some(rustls::ProtocolVersion::TLSv1_3)
             );
-            let mut h2 = h2::server::handshake(tls).await.expect("server H2 handshake");
+            let mut h2 = h2::server::handshake(tls)
+                .await
+                .expect("server H2 handshake");
             let (request, mut responder) = h2
                 .accept()
                 .await
@@ -98,17 +98,26 @@ async fn btls_h2_full_duplex_response_before_request_end_stream() {
                 let mut incoming = request.into_body();
                 let first = incoming.data().await.unwrap().unwrap();
                 assert_eq!(first, Bytes::from_static(b"client-first"));
-                incoming.flow_control().release_capacity(first.len()).unwrap();
+                incoming
+                    .flow_control()
+                    .release_capacity(first.len())
+                    .unwrap();
 
                 // Send response without request END_STREAM: proves full duplex.
                 let mut outgoing = responder
-                    .send_response(http::Response::builder().status(200).body(()).unwrap(), false)
+                    .send_response(
+                        http::Response::builder().status(200).body(()).unwrap(),
+                        false,
+                    )
                     .expect("response headers while request body remains open");
                 bounded_send(&mut outgoing, Bytes::from_static(b"server-first"), false).await;
 
                 let second = incoming.data().await.unwrap().unwrap();
                 assert_eq!(second, Bytes::from_static(b"client-second"));
-                incoming.flow_control().release_capacity(second.len()).unwrap();
+                incoming
+                    .flow_control()
+                    .release_capacity(second.len())
+                    .unwrap();
                 assert!(incoming.data().await.is_none(), "request half-close");
                 bounded_send(&mut outgoing, Bytes::from_static(b"server-second"), true).await;
             });
@@ -140,13 +149,19 @@ async fn btls_h2_full_duplex_response_before_request_end_stream() {
         let mut download = reply.into_body();
         let first = download.data().await.unwrap().unwrap();
         assert_eq!(first, Bytes::from_static(b"server-first"));
-        download.flow_control().release_capacity(first.len()).unwrap();
+        download
+            .flow_control()
+            .release_capacity(first.len())
+            .unwrap();
 
         // The request remains writable after response HEADERS and DATA.
         bounded_send(&mut upload, Bytes::from_static(b"client-second"), true).await;
         let second = download.data().await.unwrap().unwrap();
         assert_eq!(second, Bytes::from_static(b"server-second"));
-        download.flow_control().release_capacity(second.len()).unwrap();
+        download
+            .flow_control()
+            .release_capacity(second.len())
+            .unwrap();
         assert!(download.data().await.is_none(), "response half-close");
         client_done_tx.send(()).expect("server driver still alive");
         server.await.expect("server completed");
@@ -181,7 +196,10 @@ async fn btls_h2_rejects_wrong_name_untrusted_ca_and_downgraded_alpn() {
             );
             let server_accepted = server.await.unwrap();
             if alpn == b"http/1.1" {
-                assert!(server_accepted, "TLS can succeed only to be rejected by the h2 ALPN gate");
+                assert!(
+                    server_accepted,
+                    "TLS can succeed only to be rejected by the h2 ALPN gate"
+                );
             }
             // A server may observe TLS success before receiving the client's
             // bad-certificate alert; only the client rejection is invariant.
