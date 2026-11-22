@@ -199,8 +199,8 @@ pub async fn observe_default_ipify(
             .await
             .map_err(|_| EgressError::ConnectFailed)?;
         let pinned = peers
-            .filter(|peer| peer.port() == 443 && plausible_public_address(peer.ip()))
-            .next()
+            .into_iter()
+            .find(|peer| peer.port() == 443 && plausible_public_address(peer.ip()))
             .ok_or(EgressError::ConnectFailed)?;
         observe_public_egress(
             default_ipify_request(pinned),
