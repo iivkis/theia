@@ -417,5 +417,28 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("no relative performance ranking", checker)
 
 
+    def test_m35a_test_only_feasibility_never_claims_security_mode(self):
+        spec = read("docs/STEALTH_REALITY.md")
+        adr = read("docs/adr/0021-m3-5a-rustls-quic-auth-feasibility.md")
+        tests = read("crates/theia/tests/reality_security_feasibility.rs")
+        config = read("crates/theia/src/config.rs")
+        invite = read("crates/theia/src/invite.rs")
+        self.assertIn("M3.5a0", spec)
+        self.assertIn("M3.5a1", adr)
+        for name in (
+            "verified_h2_tls_exporter_is_identical_on_peers_and_context_separated",
+            "verified_h3_quic_exporter_matches_both_peers_with_domain_separation",
+            "tls_exporter_is_unavailable_for_untrusted_certificates",
+            "v1_toml_refuses_unsupported_server_security_and_shaping_fields",
+            "v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile",
+            "v1_invite_rejects_new_mode_and_identity_injection_without_a_version_bump",
+        ):
+            self.assertIn(name, tests)
+        self.assertIn('profile.tls_profile == "default"', config)
+        self.assertIn('wire.tls_profile != "default"', invite)
+        self.assertIn("Никакой REALITY-подобный режим", adr)
+        self.assertIn("F-18/F-19", read("docs/IMPLEMENTATION_PLAN.md"))
+
+
 if __name__ == "__main__":
     unittest.main()
