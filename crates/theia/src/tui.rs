@@ -348,7 +348,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nНастройки, сеть и системный прокси этим интерфейсом не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config доступно редактирование одного поля TOML. Сеть, runtime и системный прокси не изменяются.",
             true,
         ),
     }
@@ -518,7 +518,7 @@ mod tests {
         assert!(!interaction.update(&mut model, press(KeyCode::Esc)));
         assert!(interaction.pending.is_none());
         assert!(!interaction.update(&mut model, press(KeyCode::Char('q'))));
-        assert!(!interaction.update(&mut model, press(KeyCode::Char('d'))));
+        assert!(interaction.update(&mut model, press(KeyCode::Char('d'))));
         assert!(!interaction.editor.as_ref().unwrap().dirty());
         assert_eq!(fs::read(&path).unwrap(), source.as_bytes());
         assert_eq!(config::read_file(&path).unwrap().validate(), Ok(()));
