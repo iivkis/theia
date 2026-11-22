@@ -1,7 +1,7 @@
 //! M4.1: keyboard-first terminal landing and bounded config editor.
 //!
-//! M4.1c selects an existing inbound or profile and edits three strictly
-//! whitelisted non-secret fields. No service starts, reload, IPC or OS proxy effects.
+//! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
+//! No service reload, network or OS proxy effect.
 use crate::{tui_editor::Editor, Role};
 use crossterm::{
     cursor::{Hide, Show},
@@ -16,6 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
+use zeroize::Zeroizing;
 use std::{
     fmt,
     io::{self, IsTerminal},
@@ -162,10 +163,21 @@ impl Model {
     }
 }
 
+/// Confidential bearer issuance is isolated from ordinary editor commands.
+enum IssueFlow {
+    Input(String),
+    Confirm(String),
+    Saving,
+    SaveFailed,
+    Offer,
+    Showing(Zeroizing<String>),
+}
+
 /// UI dispatch is separate from all configuration/OS effects. A queued
 /// transition never runs until the user saves, discards or cancels explicitly.
 struct Interaction {
     editor: Option<Editor>,
+    issuance: Option<IssueFlow>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
 }
@@ -174,6 +186,7 @@ impl Interaction {
     fn new(editor: Option<Editor>) -> Self {
         Self {
             editor,
+            issuance: None,
             pending: None,
             saving: None,
         }
@@ -200,6 +213,13 @@ impl Interaction {
             Ok((editor, saved)) => {
                 self.saving = None;
                 self.editor = Some(editor);
+                if matches!(self.issuance, Some(IssueFlow::Saving)) {
+                    self.issuance = Some(if saved {
+                        IssueFlow::Offer
+                    } else {
+                        IssueFlow::SaveFailed
+                    });
+                }
                 if saved {
                     if let Some(original) = self.pending.take() {
                         return Ok(model.update(original));
@@ -223,6 +243,75 @@ impl Interaction {
         let Some(editor) = self.editor.as_mut() else {
             return model.update(key);
         };
+        if let Some(flow) = self.issuance.take() {
+            match flow {
+                IssueFlow::Input(mut id) => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter if !id.is_empty() => {
+                        self.issuance = Some(IssueFlow::Confirm(id));
+                    }
+                    KeyCode::Backspace => {
+                        id.pop();
+                        self.issuance = Some(IssueFlow::Input(id));
+                    }
+                    KeyCode::Char(ch)
+                        if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                            && ch.is_ascii_graphic()
+                            && id.len() < 64 =>
+                    {
+                        id.push(ch);
+                        self.issuance = Some(IssueFlow::Input(id));
+                    }
+                    _ => self.issuance = Some(IssueFlow::Input(id)),
+                },
+                IssueFlow::Confirm(id) => match key.code {
+                    KeyCode::Char('y') => {
+                        if editor.issue_user(&id).is_ok() {
+                            self.issuance = Some(IssueFlow::Saving);
+                            self.start_save();
+                        } else {
+                            self.issuance = Some(IssueFlow::Input(id));
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {}
+                    _ => self.issuance = Some(IssueFlow::Confirm(id)),
+                },
+                IssueFlow::Saving => self.issuance = Some(IssueFlow::Saving),
+                IssueFlow::SaveFailed => match key.code {
+                    KeyCode::Char('r') => {
+                        self.issuance = Some(IssueFlow::Saving);
+                        self.start_save();
+                    }
+                    KeyCode::Char('d') => editor.discard(),
+                    _ => self.issuance = Some(IssueFlow::SaveFailed),
+                },
+                IssueFlow::Offer => match key.code {
+                    KeyCode::Char('y') => {
+                        if let Some(invite) = editor.take_issued() {
+                            match invite.encode() {
+                                Ok(link) => self.issuance =
+                                    Some(IssueFlow::Showing(Zeroizing::new(link))),
+                                Err(_) => {
+                                    editor.error = Some("Не удалось сформировать ссылку.".into());
+                                    editor.clear_issued();
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => editor.clear_issued(),
+                    _ => self.issuance = Some(IssueFlow::Offer),
+                },
+                IssueFlow::Showing(link) => {
+                    if key.code == KeyCode::Esc {
+                        editor.clear_issued();
+                    } else {
+                        self.issuance = Some(IssueFlow::Showing(link));
+                    }
+                }
+            }
+            return false;
+        }
+
         if let Some(original) = self.pending {
             match key.code {
                 KeyCode::Char('s') => {
@@ -264,6 +353,15 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            if editor.role() == Role::Server && key.code == KeyCode::Char('u') {
+                if editor.dirty() {
+                    editor.error = Some("Сохраните или отмените черновик перед выдачей токена.".into());
+                } else {
+                    editor.error = None;
+                    self.issuance = Some(IssueFlow::Input(String::new()));
+                }
+                return false;
+            }
             // Focus is navigation inside the explicitly loaded typed form,
             // not a write and not a role switch. Never intercept text input.
             match key.code {
