@@ -8,7 +8,10 @@ async fn main() {
         .map(|arg| arg.into_string().map_err(|_| CliError::NonUtf8Argument))
         .collect();
     let result = match args.and_then(|args| parse(&args)) {
-        Ok(Command::Tui { role }) => tui::run(role)
+        Ok(Command::Tui { role }) => tui::run(role, None)
+            .map(|_| "tui closed")
+            .map_err(|error| CliError::Tui(error.message())),
+        Ok(Command::TuiEdit { role, config }) => tui::run(Some(role), Some(Path::new(&config)))
             .map(|_| "tui closed")
             .map_err(|error| CliError::Tui(error.message())),
         Ok(Command::ServerRun { config }) => server::run_file(Path::new(&config))

@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod quic_transport;
 pub mod server;
 pub mod tui;
+pub mod tui_editor;
 
 use std::fmt;
 use std::path::Path;
@@ -28,6 +29,7 @@ pub enum Command {
     Help(Option<&'static str>),
     Version,
     Tui { role: Option<Role> },
+    TuiEdit { role: Role, config: String },
     ServerRun { config: String },
     ClientRun { config: String },
     ConfigValidate { config: String },
@@ -110,6 +112,11 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["tui", "--role", selected] => Ok(Command::Tui {
             role: Some(role(selected)?),
         }),
+        ["tui", "--role", selected, "--config", path]
+        | ["tui", "--config", path, "--role", selected] => Ok(Command::TuiEdit {
+            role: role(selected)?,
+            config: config_path(path)?,
+        }),
         ["server", "run", "--config", path] => Ok(Command::ServerRun {
             config: config_path(path)?,
         }),
@@ -126,19 +133,19 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
 const HELP: &str = "Theia 0.1.0 (H2 server inbound, H3 inbound, client and M4.1a read-only TUI)\n\
 Usage:\n\
   theia --help | --version\n\
-  theia tui [--role server|client]\n\
+  theia tui [--role server|client] [--config <path>]\n\
   theia server run --config <path>\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
-Client requires tls_ca PEM bundle. TUI is read-only; system proxy is never modified.";
+Client requires tls_ca PEM bundle. TUI edits one safe field only with explicit role+config; system proxy is never modified.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
     match command {
         Command::Help(None) => Ok(HELP),
         Command::Help(Some("tui")) => {
-            Ok("Usage: theia tui [--role server|client]\nRead-only keyboard navigation; no configuration editing or system proxy changes.")
+            Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith both --role and --config, edit one non-secret field and save validated TOML; no reload, network or system proxy changes.")
         }
         Command::Help(Some("server")) => {
             Ok("Usage: theia server run --config <path>\nTLS 1.3/H2 and QUIC/H3 server inbounds.")
@@ -151,7 +158,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
         }
         Command::Help(Some(_)) => Err(CliError::InvalidArguments),
         Command::Version => Ok(concat!("theia ", env!("CARGO_PKG_VERSION"))),
-        Command::Tui { .. } => Err(CliError::NotImplemented("TUI")),
+        Command::Tui { .. } | Command::TuiEdit { .. } => Err(CliError::NotImplemented("TUI")),
         Command::ServerRun { .. } => Err(CliError::NotImplemented("server runtime")),
         Command::ClientRun { .. } => Err(CliError::NotImplemented("client runtime")),
         Command::ConfigValidate { config } => {
@@ -200,6 +207,28 @@ mod tests {
             Ok(Command::Tui {
                 role: Some(Role::Client)
             })
+        );
+        assert_eq!(
+            command(&["tui", "--role", "client", "--config", "client.toml"]),
+            Ok(Command::TuiEdit {
+                role: Role::Client,
+                config: "client.toml".into(),
+            })
+        );
+        assert_eq!(
+            command(&["tui", "--config", "server.toml", "--role", "server"]),
+            Ok(Command::TuiEdit {
+                role: Role::Server,
+                config: "server.toml".into(),
+            })
+        );
+        assert_eq!(
+            command(&["tui", "--config", "client.toml"]),
+            Err(CliError::InvalidArguments)
+        );
+        assert_eq!(
+            command(&["tui", "--role", "client", "--config", ""]),
+            Err(CliError::InvalidConfigPath)
         );
         assert_eq!(
             command(&["tui", "--role", "admin"]),

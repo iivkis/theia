@@ -30,6 +30,20 @@ fn accepted_runtime_commands_fail_closed() {
 }
 
 #[test]
+fn tui_editor_non_tty_rejects_before_opening_config() {
+    for args in [
+        vec!["tui", "--role", "server", "--config", "does-not-exist.toml"],
+        vec!["tui", "--role", "client", "--config", "does-not-exist.toml"],
+    ] {
+        let output = invoke(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal required"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("does-not-exist"));
+    }
+}
+
+#[test]
 fn validates_client_toml_and_rejects_unknown_fields() {
     let path = std::env::temp_dir().join(format!("theia-m12-cli-{}.toml", std::process::id()));
     let valid = include_str!("../../../examples/client.toml");
