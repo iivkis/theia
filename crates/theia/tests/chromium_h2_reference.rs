@@ -208,6 +208,16 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
         // Frame scheduling (including WINDOW_UPDATE and SETTINGS ACK) may
         // vary; record rather than pin unstable relative frame timing.
         assert!(observation.ordinary_fields > 0);
+        // Independently measured on *both* native CI runners using actual
+        // Chromium 159. WINDOW_UPDATE timing is not pinned: a valid browser
+        // first-flight may place it after HEADERS, outside this capture.
+        if !observation.connection_window_updates.is_empty() {
+            assert_eq!(
+                observation.connection_window_updates,
+                [15_663_105],
+                "Chromium159 connection WINDOW_UPDATE credit changed"
+            );
+        }
         assert!(observation.request_end_stream, "browser GET is bodyless");
         // Observations from M3.4f: the production h2 0.4.19 client advertises
         // SETTINGS_ENABLE_PUSH=0 and MAX_HEADER_LIST_SIZE=8192. This assertion detects the
