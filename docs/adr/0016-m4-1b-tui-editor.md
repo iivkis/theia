@@ -16,6 +16,10 @@ Only `theia tui --role server|client --config FILE` opens the editor. The role m
 - Dirty transitions including quit require confirmation: `s` save and continue, `d` discard and continue, Esc stay. While typing, `q`, `1` and `2` are text, not hotkeys. Validation errors show only field and static reason; never file contents or secret references.
 - Reject mismatched role, missing/invalid configuration, source symlink and externally changed files. No secret access, network/IPC/OS proxy changes, or automatic unsafe fallback.
 
+## UI file I/O isolation
+
+The initial config file is read before raw terminal mode. Actual save (full validation, conflict check and atomic fsync write) runs on a dedicated one-shot worker thread with channel-returned result; the terminal event loop continues to poll and draw a progress panel. Navigation after save resumes only when the worker confirms success. An uncatchable process termination can still interrupt persistence; no success is shown before confirmation.
+
 ## Threats and remaining gaps
 
 The existing atomic store is not an atomic compare-and-swap with an external writer. Source-file byte comparison reduces accidental lost updates but not an adversarial race or hostile parent directory. The caller must supply a trusted config path/directory; production multiuser hardening remains open. Typed serialization does not preserve TOML comments. Rewriting a valid configuration does not imply that referenced certificates, CA or secrets exist or that runtime has accepted them. Full multi-field forms, multiple inbound/profile selection, secrets/user rotation, transactional reload and Windows system proxy remain out of scope. BBR/F-11, named browser fingerprint/F-13 and M5 remain blockers.
