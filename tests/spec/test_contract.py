@@ -436,7 +436,7 @@ class SpecContractTests(unittest.TestCase):
             self.assertIn(name, tests)
         self.assertIn('profile.tls_profile == "default"', config)
         self.assertIn('wire.tls_profile != "default"', invite)
-        self.assertIn("НЕ REALITY", adr)
+        self.assertIn("Никакой REALITY-подобный режим", adr)
         self.assertIn("F-18/F-19", read("docs/IMPLEMENTATION_PLAN.md"))
 
 
