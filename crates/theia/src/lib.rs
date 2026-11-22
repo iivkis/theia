@@ -123,7 +123,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
     }
 }
 
-const HELP: &str = "Theia 0.1.0 (H2/H3 network runtime and M4.1a read-only TUI)\n\
+const HELP: &str = "Theia 0.1.0 (H2 server inbound, H3 inbound, client and M4.1a read-only TUI)\n\
 Usage:\n\
   theia --help | --version\n\
   theia tui [--role server|client]\n\
