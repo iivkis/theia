@@ -1,5 +1,5 @@
 use std::path::Path;
-use theia::{execute, parse, server, CliError, Command};
+use theia::{execute, local_proxy, parse, server, CliError, Command};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -12,6 +12,10 @@ async fn main() {
             .await
             .map(|_| "server stopped")
             .map_err(CliError::Server),
+        Ok(Command::ClientRun { config }) => local_proxy::run_file(Path::new(&config))
+            .await
+            .map(|_| "client stopped")
+            .map_err(CliError::Client),
         Ok(command) => execute(command),
         Err(error) => Err(error),
     };

@@ -22,10 +22,7 @@ fn help_and_version_exit_successfully() {
 
 #[test]
 fn accepted_runtime_commands_fail_closed() {
-    for args in [
-        vec!["tui", "--role", "client"],
-        vec!["client", "run", "--config", "missing.toml"],
-    ] {
+    for args in [vec!["tui", "--role", "client"]] {
         let result = invoke(&args);
         assert_eq!(result.status.code(), Some(3), "{args:?}");
         assert!(result.stdout.is_empty(), "{args:?}");
@@ -86,6 +83,14 @@ fn rejected_arguments_cannot_start_a_runtime() {
 fn errors_do_not_echo_argument_content() {
     let secret = "secret-token-DO-NOT-LOG";
     let result = invoke(&["client", "run", "--config", secret]);
-    assert_eq!(result.status.code(), Some(3));
+    assert_eq!(result.status.code(), Some(2));
     assert!(!String::from_utf8_lossy(&result.stderr).contains(secret));
+}
+
+#[test]
+fn client_run_missing_config_fails_before_binding() {
+    let result = invoke(&["client", "run", "--config", "missing-m22.toml"]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("client failed"));
+    assert!(result.stdout.is_empty());
 }

@@ -64,3 +64,5 @@ theia --version
 5. **Измерять**, а не обещать скорость или невозможность DPI-классификации.
 
 Пример конфигураций содержит заменяемые значения и не предназначен для реального деплоя без создания сертификата и секретов. Лицензия ещё не выбрана; перед распространением добавить `LICENSE`.
+
+**M2.2b (pending CI):** explicit H2 client mode supports loopback CONNECT and SOCKS5, configured `tls_ca` PEM trust bundle and `auth_token` refs. `transport=auto/h3` still fail closed; TUI/OS proxy remain unavailable. All verification occurs in CI; no manual test steps.
