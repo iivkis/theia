@@ -17,8 +17,14 @@ fn contiguous_ipv4_and_ipv6_netmasks_only() {
     assert_eq!(contiguous_netmask_prefix(v4("255.0.255.0")), None);
     assert_eq!(contiguous_netmask_prefix(v4("255.255.255.1")), None);
 
-    assert_eq!(contiguous_netmask_prefix(v6("ffff:ffff:ffff:ffff::")), Some(64));
-    assert_eq!(contiguous_netmask_prefix(v6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")), Some(128));
+    assert_eq!(
+        contiguous_netmask_prefix(v6("ffff:ffff:ffff:ffff::")),
+        Some(64)
+    );
+    assert_eq!(
+        contiguous_netmask_prefix(v6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")),
+        Some(128)
+    );
     assert_eq!(contiguous_netmask_prefix(v6("::")), None);
     assert_eq!(contiguous_netmask_prefix(v6("ffff:ffff::1")), None);
 }
@@ -29,9 +35,11 @@ fn linux_collects_actual_loopback_assignment_without_remote_io_or_egress_guess()
     let observed = collect_assigned_interfaces().expect("Linux getifaddrs must work");
     // The CI Linux runner must have its ordinary loopback, or it is not an
     // acceptable environment for the collector integration regression.
-    let local = observed.interfaces.iter().find(|entry| {
-        entry.address == IpAddr::V4(Ipv4Addr::LOCALHOST)
-    }).expect("native loopback assignment expected");
+    let local = observed
+        .interfaces
+        .iter()
+        .find(|entry| entry.address == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .expect("native loopback assignment expected");
     assert!(!local.interface_name.is_empty());
     assert_eq!(local.source, InterfaceSource::LinuxGetifaddrs);
     assert!((1..=32).contains(&local.prefix_len));
@@ -39,16 +47,20 @@ fn linux_collects_actual_loopback_assignment_without_remote_io_or_egress_guess()
     assert!(observed.interfaces.len() <= 4096);
 
     let snapshot = observed.server_snapshot();
-    assert!(snapshot.egress.is_none(), "interface collection cannot prove NAT egress");
+    assert!(
+        snapshot.egress.is_none(),
+        "interface collection cannot prove NAT egress"
+    );
     assert!(snapshot.inferred_provider_prefixes.is_empty());
     assert_eq!(snapshot.interfaces.len(), observed.interfaces.len());
     for entry in &observed.interfaces {
         assert!(!entry.interface_name.is_empty());
         assert!(entry.prefix_len >= 1);
         assert!(entry.prefix_len <= if entry.address.is_ipv4() { 32 } else { 128 });
-        assert!(snapshot.interfaces.iter().any(|s| {
-            s.address == entry.address && s.prefix_len == entry.prefix_len
-        }));
+        assert!(snapshot
+            .interfaces
+            .iter()
+            .any(|s| { s.address == entry.address && s.prefix_len == entry.prefix_len }));
     }
 }
 
