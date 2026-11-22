@@ -253,7 +253,9 @@ impl CandidateBatchPanel {
             self.decline();
             false
         } else {
-            self.cancel();
+            if self.is_running() {
+                self.cancel();
+            }
             true
         }
     }
@@ -265,7 +267,7 @@ impl CandidateBatchPanel {
             out.push_str("Нет серверной конфигурации или SNI выбранного inbound.\nНикакие TLS-запросы не выполняются. Esc: назад");
             return out;
         }
-        if self.entries.is_empty() {
+        if self.available_count() == 0 {
             out.push_str(
                 "Нет доступных публичных IP-кандидатов в offline-плане.\nНикакие TLS-запросы не выполняются. Esc: назад",
             );
@@ -278,7 +280,7 @@ impl CandidateBatchPanel {
                 );
                 out.push_str(&format!(
                     "Доступно IP: {}. Выбрано: {}/{} (не подтверждено).\n",
-                    self.entries.len(),
+                    self.available_count(),
                     self.selected_count(),
                     MAX_DUAL_BATCH
                 ));
@@ -553,7 +555,7 @@ mod tests {
             5
         );
         panel.ask_confirmation();
-        assert!(panel.back_or_close() == false);
+        assert!(!panel.back_or_close());
         assert!(!panel.is_confirming());
         assert!(panel.back_or_close());
     }
