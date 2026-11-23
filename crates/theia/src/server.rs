@@ -767,7 +767,7 @@ async fn relay_tcp(
     state.finish().map_err(|_| ServerError::Protocol)
 }
 
-fn pem_data(reference: &str, private_key: bool) -> Result<Vec<u8>, ServerError> {
+pub(crate) fn pem_data(reference: &str, private_key: bool) -> Result<Vec<u8>, ServerError> {
     let path = reference.strip_prefix("file:").ok_or(ServerError::Config)?;
     let path = Path::new(path);
     let meta = std::fs::symlink_metadata(path).map_err(|_| ServerError::Config)?;
@@ -803,11 +803,13 @@ fn check_certificate_name(
 struct TlsMaterial {
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
+    identity: crate::reload_preflight::IdentityHash,
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     let cert_bytes = pem_data(&inbound.tls_cert, false)?;
     let key_bytes = pem_data(&inbound.tls_key, true)?;
+    let identity = crate::reload_preflight::IdentityHash::from_pem(&cert_bytes, &key_bytes);
     let mut cert_reader = BufReader::new(cert_bytes.as_slice());
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
@@ -817,7 +819,7 @@ fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes.as_slice()))
         .map_err(|_| ServerError::Config)?
         .ok_or(ServerError::Config)?;
-    Ok(TlsMaterial { certs, key })
+    Ok(TlsMaterial { certs, key, identity })
 }
 
 fn tls_acceptor(
@@ -843,13 +845,24 @@ pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
     let Config::Server(document) = parsed else {
         return Err(ServerError::Config);
     };
-    run_document(document).await
+    run_document_with_config(document, Some(config_path)).await
 }
 
 pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
+    run_document_with_config(document, None).await
+}
+
+async fn run_document_with_config(
+    document: ServerDocument,
+    config_path: Option<&Path>,
+) -> Result<(), ServerError> {
     if !document.server.enabled {
         return Err(ServerError::Config);
     }
+    #[cfg(target_os = "linux")]
+    let baseline = document.clone();
+    #[cfg(target_os = "linux")]
+    let mut loaded_identities = Vec::new();
     let policy = document.server.policy;
     let peer_budget = Arc::new(PeerBudget::default());
     let global = Arc::new(Semaphore::new(policy.max_connections_total as usize));
@@ -875,6 +888,8 @@ pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
             .parse()
             .map_err(|_| ServerError::Config)?;
         let material = tls_material(inbound)?;
+        #[cfg(target_os = "linux")]
+        loaded_identities.push(material.identity.clone());
         let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         let listener = TcpListener::bind(addr).await.map_err(|_| ServerError::Io)?;
         let endpoint =
@@ -899,7 +914,18 @@ pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
     // all TLS/TCP/QUIC binds have been prepared successfully.
     #[cfg(target_os = "linux")]
     let management = crate::management::StatusServer::from_environment(prepared.len())
-        .map_err(|_| ServerError::Io)?;
+        .map_err(|_| ServerError::Io)?
+        .map(|server| {
+            if let Some(path) = config_path {
+                server.with_preflight(Arc::new(crate::reload_preflight::ReloadPreflight::new(
+                    path.to_owned(),
+                    baseline,
+                    loaded_identities,
+                )))
+            } else {
+                server
+            }
+        });
 
     let mut tasks = JoinSet::new();
     for (listener, acceptor, endpoint, context) in prepared {
