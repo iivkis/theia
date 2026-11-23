@@ -1110,9 +1110,11 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
         for _ in 0..64 {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let remote = listener.local_addr().unwrap();
-            if let Ok(udp) =
-                theia::quic_transport::server_endpoint(remote, vec![der.clone()], key.clone_key().into())
-            {
+            if let Ok(udp) = theia::quic_transport::server_endpoint(
+                remote,
+                vec![der.clone()],
+                key.clone_key().into(),
+            ) {
                 pair = Some((listener, remote, udp));
                 break;
             }
