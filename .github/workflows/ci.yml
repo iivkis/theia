@@ -175,6 +175,14 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Build genuine Linux server for Windows cross-OS F-14 E2E
+        run: cargo build --workspace --locked --bin theia
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f14-linux-server
+          path: target/debug/theia
+          if-no-files-found: error
+          retention-days: 1
       - name: Release compilation only after main merge
         if: github.event_name != 'pull_request'
         run: cargo build --workspace --release --locked
@@ -211,6 +219,43 @@ jobs:
       - name: Native Windows release compilation only after main merge
         if: github.event_name != 'pull_request'
         run: cargo build --workspace --release --locked
+
+  f14-cross-host:
+    name: F-14 Linux VM server to native Windows client
+    needs: [specification, rust-tests]
+    if: needs.specification.outputs.rust_ready == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 50
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "f14-cross-os"
+      - uses: actions/download-artifact@v4
+        with:
+          name: f14-linux-server
+          path: ${{ runner.temp }}/theia-linux
+      # Pin the audited v7.2.0 tag commit, not a mutable branch.
+      - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 2
+          additional-packages: python3 openssl
+      - name: Prove separate Linux VM kernel before starting E2E
+        shell: pwsh
+        run: |
+          $kernel = wsl.exe --distribution Ubuntu-24.04 -- uname -s
+          if ($LASTEXITCODE -ne 0 -or $kernel.Trim() -ne 'Linux') { throw 'No real Linux WSL2 kernel' }
+      - name: Run native Windows import and real Linux H2/H3 end-to-end
+        shell: pwsh
+        run: |
+          cargo build --workspace --locked --bin theia
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows Theia compilation failed' }
+          python scripts/f14-cross-os-ci.py --linux-binary "$env:RUNNER_TEMP/theia-linux/theia"
+          if ($LASTEXITCODE -ne 0) { throw 'F-14 Linux/Windows cross-OS E2E failed' }
 
   browser-e2e:
     name: browser-e2e (${{ matrix.os }})
@@ -379,7 +424,7 @@ jobs:
 
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, browser-e2e, m3-3-bbr-comparison, m3-4-btls-spike, m3-4e-btls-production-feature]
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-3-bbr-comparison, m3-4-btls-spike, m3-4e-btls-production-feature]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -393,7 +438,7 @@ jobs:
           import os
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "browser-e2e", "m3-3-bbr-comparison", "m3-4-btls-spike", "m3-4e-btls-production-feature"}
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-3-bbr-comparison", "m3-4-btls-spike", "m3-4e-btls-production-feature"}
           failed = [name for name in sorted(expected) if results.get(name, {}).get("result") != "success"]
           if failed:
               raise SystemExit("Required CI jobs did not succeed: " + ", ".join(failed))
