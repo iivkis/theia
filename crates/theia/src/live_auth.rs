@@ -142,6 +142,15 @@ impl LiveAuthorization {
         })
     }
 
+    /// After an auth-only CAS, update the structural baseline without
+    /// replacing the shared AuthCell or invalidating existing sessions.
+    pub(crate) fn with_new_baseline(&self, baseline: ServerDocument) -> Self {
+        Self {
+            baseline,
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     /// Rebase a TLS-only rotation onto the SAME AuthCell shared by existing
     /// H2/H3 contexts. The caller must independently prove that ONLY TLS PEM
     /// identity may change, never routing, quotas or user inventory.
