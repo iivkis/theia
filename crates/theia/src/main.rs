@@ -24,10 +24,12 @@ async fn main() {
             .map_err(CliError::Client),
         Ok(Command::ServerStatus) => {
             match management::query_environment(management::StatusCommand::Status).await {
-                Ok(management::StatusReply::Running { inbounds }) => {
-                    Ok(format!("server running; {inbounds} inbounds; reload not available"))
-                }
-                Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Ok(management::StatusReply::Running { inbounds }) => Ok(format!(
+                    "server running; {inbounds} inbounds; reload not available"
+                )),
+                Ok(_) => Err(CliError::Management(
+                    management::ManagementError::InvalidReply,
+                )),
                 Err(error) => Err(CliError::Management(error)),
             }
         }
