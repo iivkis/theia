@@ -4,7 +4,10 @@
 //! runtime directory. No administrative TCP, reload, config mutation or secret
 //! data is exposed. Windows named pipes/ACL and transactional reload are open.
 //! The endpoint exists only while a server process is actually serving.
-use std::{fmt, path::Path};
+use std::fmt;
+
+#[cfg(target_os = "linux")]
+use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use std::{
