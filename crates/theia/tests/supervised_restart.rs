@@ -170,6 +170,47 @@ fn apply(
     );
 }
 
+fn rollback(env_key: &str, endpoint: &str, expected: u64, succeeds: bool) {
+    let output = cli(
+        env_key,
+        endpoint,
+        &[
+            "server",
+            "tls",
+            "rollback",
+            "--apply",
+            "--expected-revision",
+            &expected.to_string(),
+            "--confirm",
+        ],
+    );
+    assert_eq!(
+        output.status.success(),
+        succeeds,
+        "rollback CAS: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    if succeeds {
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("previous same-port H2/H3 TLS identity restored from memory"));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!("revision={}", expected + 1))
+        );
+    }
+}
+
+fn check_rollback(env_key: &str, endpoint: &str, revision: u64) -> bool {
+    let output = cli(env_key, endpoint, &["server", "tls", "rollback", "--check"]);
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.contains(&format!("revision={revision}"))
+        && text.contains("remaining_seconds=")
+        && text.contains("no change applied")
+}
+
 fn write_identity(cert: &Path, key: &Path, generated: &rcgen::CertifiedKey) {
     fs::write(
         cert,
@@ -322,6 +363,8 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         // Keep actual authenticated H2 and H3 tunnels alive through cutover.
         let h2_tunnel = old_h2.open(address.clone(), echo_port).await.unwrap();
         let h3_tunnel = old_h3.open(address.clone(), echo_port).await.unwrap();
+        assert!(!check_rollback(env_key, &endpoint, 1));
+        rollback(env_key, &endpoint, 1, false);
 
         let mut next = document.clone();
         let next_tcp = port(true);
@@ -384,6 +427,8 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         );
         apply(env_key, &endpoint, 1, &hash, false, &config_path);
         assert!(revision(env_key, &endpoint, 2));
+        assert!(!check_rollback(env_key, &endpoint, 2));
+        rollback(env_key, &endpoint, 2, false);
 
         let new_h2 = H2Client::new(
             &format!("127.0.0.1:{next_tcp}"),
@@ -588,6 +633,8 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
         .unwrap();
         let h2_tunnel = previous_h2.open(address.clone(), echo_port).await.unwrap();
         let h3_tunnel = previous_h3.open(address.clone(), echo_port).await.unwrap();
+        assert!(!check_rollback(env_key, &endpoint, 1));
+        rollback(env_key, &endpoint, 1, false);
 
         let mut candidate = document.clone();
         candidate.server.inbounds[0].tls_cert = format!("file:{}", next_cert.display());
@@ -632,6 +679,7 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
         assert_eq!(real_hash, hash);
         apply(env_key, &endpoint, 1, &real_hash, true, &config_path);
         assert!(revision(env_key, &endpoint, 2));
+        assert!(check_rollback(env_key, &endpoint, 2));
         assert!(server.0.try_wait().unwrap().is_none());
         apply(env_key, &endpoint, 1, &real_hash, false, &config_path);
         assert!(revision(env_key, &endpoint, 2));
@@ -703,6 +751,9 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             String::from_utf8_lossy(&reloaded.stderr)
         );
         assert!(revision(env_key, &endpoint, 3));
+        assert!(check_rollback(env_key, &endpoint, 3));
+        rollback(env_key, &endpoint, 2, false);
+        assert!(revision(env_key, &endpoint, 3));
 
         // Repeating the SAME-port rotation after an auth-only CAS must use
         // its newest user/token baseline. This protects against stale View
@@ -730,8 +781,63 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             restored_ca,
         )
         .unwrap();
-        assert!(restored_h2.open(address.clone(), echo_port).await.is_ok());
-        assert!(restored_h3.open(address, echo_port).await.is_ok());
+        // Keep open authenticated tunnels on the identity about to be
+        // retired by rollback. Neither H2 nor QUIC sessions are migrated
+        // or aborted just because new handshakes switch certificates.
+        let still_h2 = restored_h2.open(address.clone(), echo_port).await.unwrap();
+        let still_h3 = restored_h3.open(address.clone(), echo_port).await.unwrap();
+
+        // The second same-port TLS rotation supersedes the older undo.
+        // Corrupt the previous certificate on disk AFTER the CAS. Rollback
+        // must use retained production TLS configs and preserve the
+        // authorization token changed between those two rotations.
+        assert!(check_rollback(env_key, &endpoint, 4));
+        fs::write(&next_cert, "corrupted disk certificate").unwrap();
+        fs::write(&next_key, "corrupted disk private key").unwrap();
+        rollback(env_key, &endpoint, 3, false);
+        assert!(revision(env_key, &endpoint, 4));
+        rollback(env_key, &endpoint, 4, true);
+        assert!(revision(env_key, &endpoint, 5));
+        assert!(!check_rollback(env_key, &endpoint, 5));
+        rollback(env_key, &endpoint, 5, false);
+        assert!(revision(env_key, &endpoint, 5));
+
+        let mut previous_only = RootCertStore::empty();
+        previous_only.add(next_identity.cert.der().clone()).unwrap();
+        let recovered_h2 = H2Client::new(
+            &format!("127.0.0.1:{tcp_port}"),
+            "localhost",
+            &credential(0x43),
+            previous_only.clone(),
+        )
+        .unwrap();
+        let recovered_h3 = H3Client::new(
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            "localhost",
+            &credential(0x43),
+            previous_only,
+        )
+        .unwrap();
+        assert!(recovered_h2.open(address.clone(), echo_port).await.is_ok());
+        assert!(recovered_h3.open(address.clone(), echo_port).await.is_ok());
+        let (mut h2_app, h2_local) = tokio::io::duplex(128);
+        let h2_task = tokio::spawn(async move { still_h2.relay(h2_local).await });
+        h2_app.write_all(b"old-alive!").await.unwrap();
+        let mut from_h2 = [0u8; 10];
+        h2_app.read_exact(&mut from_h2).await.unwrap();
+        assert_eq!(&from_h2, b"old-alive!");
+        h2_app.shutdown().await.unwrap();
+        h2_task.await.unwrap().unwrap();
+
+        let (mut h3_app, h3_local) = tokio::io::duplex(128);
+        let h3_task = tokio::spawn(async move { still_h3.relay(h3_local).await });
+        h3_app.write_all(b"old-alive!").await.unwrap();
+        let mut from_h3 = [0u8; 10];
+        h3_app.read_exact(&mut from_h3).await.unwrap();
+        assert_eq!(&from_h3, b"old-alive!");
+        h3_app.shutdown().await.unwrap();
+        h3_task.await.unwrap().unwrap();
+        assert!(server.0.try_wait().unwrap().is_none());
         echo_task.abort();
     })
     .await

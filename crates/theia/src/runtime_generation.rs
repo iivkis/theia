@@ -9,7 +9,10 @@ use crate::{
     live_auth::{LiveAuthError, LiveAuthorization, StagedAuthorization},
     reload_preflight::ReloadPreflight,
 };
-use std::sync::{Arc, RwLock};
+use std::{
+    sync::{Arc, RwLock},
+    time::Instant,
+};
 use tokio::sync::oneshot;
 
 pub(crate) struct View {
@@ -21,12 +24,32 @@ pub(crate) struct View {
 
 pub(crate) struct State {
     current: RwLock<Arc<View>>,
+    // Only advisory metadata crosses IPC; the actual previous TLS private
+    // configs live exclusively in the single supervisor, never in replies.
+    rollback_until: RwLock<Option<Instant>>,
 }
 
 impl State {
     pub(crate) fn new(initial: View) -> Self {
         Self {
             current: RwLock::new(Arc::new(initial)),
+            rollback_until: RwLock::new(None),
+        }
+    }
+
+    /// Advisory rollback readiness. Never returns certificates, keys or
+    /// fingerprints; a fresh CAS recheck is mandatory on Apply.
+    pub(crate) fn rollback_status(&self) -> Option<(u64, u64)> {
+        let view = self.current.read().ok()?;
+        let until = (*self.rollback_until.read().ok()?)?;
+        let remaining = until.checked_duration_since(Instant::now())?;
+        let revision = view.live.revision().ok()?;
+        Some((revision, remaining.as_secs().saturating_add(1)))
+    }
+
+    pub(crate) fn set_rollback_until(&self, deadline: Option<Instant>) {
+        if let Ok(mut slot) = self.rollback_until.write() {
+            *slot = deadline;
         }
     }
 
@@ -176,6 +199,7 @@ impl State {
 pub(crate) enum ChangeKind {
     Restart,
     Quota,
+    Rollback,
 }
 
 pub(crate) struct RestartRequest {
@@ -192,6 +216,34 @@ pub(crate) struct RestartRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollback_readiness_is_bounded_and_never_exposes_secret_material() {
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
+        let crate::config::Config::Server(document) = crate::config::parse(&source).unwrap() else {
+            panic!("server fixture");
+        };
+        let state = State::new(View {
+            document: Arc::new(document.clone()),
+            inbounds: document.server.inbounds.len(),
+            preflight: Arc::new(ReloadPreflight::new(
+                std::path::PathBuf::from("/nonexistent"),
+                document.clone(),
+                Vec::new(),
+            )),
+            live: Arc::new(LiveAuthorization::new(document).unwrap()),
+        });
+        assert!(state.rollback_status().is_none());
+        state.set_rollback_until(Some(Instant::now() + std::time::Duration::from_secs(300)));
+        let (revision, remaining) = state.rollback_status().unwrap();
+        assert_eq!(revision, 1);
+        assert!((1..=301).contains(&remaining));
+        state.set_rollback_until(Some(Instant::now() - std::time::Duration::from_secs(1)));
+        assert!(state.rollback_status().is_none());
+        state.set_rollback_until(None);
+        assert!(state.rollback_status().is_none());
+    }
 
     #[test]
     fn auth_only_cas_updates_tls_rotation_baseline_and_rejects_old_generation() {

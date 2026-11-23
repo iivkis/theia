@@ -73,6 +73,15 @@ pub fn server_endpoint(
     key: PrivateKeyDer<'static>,
 ) -> Result<Endpoint, QuicError> {
     let config = server_config(certificates, key)?;
+    server_endpoint_with_config(bind, config)
+}
+
+/// Preserve exactly the configuration installed on the live QUIC endpoint.
+/// Rollback must not reopen a PEM path or synthesize a different identity.
+pub(crate) fn server_endpoint_with_config(
+    bind: SocketAddr,
+    config: quinn::ServerConfig,
+) -> Result<Endpoint, QuicError> {
     Endpoint::server(config, bind).map_err(|_| QuicError::Bind)
 }
 

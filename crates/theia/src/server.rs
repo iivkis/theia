@@ -1109,6 +1109,7 @@ type ReadyListener = (
     TlsAcceptor,
     quinn::Endpoint,
     Arc<ServerContext>,
+    quinn::ServerConfig,
 );
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1148,8 +1149,10 @@ async fn prepare_generation(
         let listener = TcpListener::bind(tcp_addr)
             .await
             .map_err(|_| ServerError::Io)?;
+        let h3_config = crate::quic_transport::server_config(material.certs, material.key)
+            .map_err(|_| ServerError::Tls)?;
         let endpoint =
-            crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
+            crate::quic_transport::server_endpoint_with_config(udp_addr, h3_config.clone())
                 .map_err(|_| ServerError::Io)?;
         let mut context = ServerContext::with_limits(
             inbound,
@@ -1161,7 +1164,7 @@ async fn prepare_generation(
             limits.peer_budget.clone(),
         );
         context.live_quota = Some(limits.ledger.clone());
-        listeners.push((listener, acceptor, endpoint, Arc::new(context)));
+        listeners.push((listener, acceptor, endpoint, Arc::new(context), h3_config));
     }
     Ok(PreparedGeneration {
         listeners,
@@ -1208,11 +1211,29 @@ fn prepare_same_port_tls(
     Ok(PreparedSamePortTls { h2, h3, identities })
 }
 
+/// The *previous* actual TLS identity, retained for at most five minutes
+/// after ONE same-port rotation. TLS ServerConfig owns private signing keys;
+/// this slot never holds raw PEM bytes and never touches disk on rollback.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct RollbackSlot {
+    expires: Instant,
+    h2: Vec<TlsAcceptor>,
+    h3: Vec<quinn::ServerConfig>,
+    identities: Vec<crate::reload_preflight::IdentityHash>,
+    refs: Vec<(String, String)>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const TLS_ROLLBACK_WINDOW: Duration = Duration::from_secs(300);
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct RunningGeneration {
     tasks: JoinSet<Result<(), ServerError>>,
     phase: watch::Sender<GenerationPhase>,
     identities: Vec<HotIdentity>,
+    // Exact QUIC configs installed on the endpoints. Saved previous configs
+    // support a one-shot TLS undo without reading external PEM files again.
+    active_h3: Vec<quinn::ServerConfig>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1221,7 +1242,9 @@ impl RunningGeneration {
         let (sender, receiver) = watch::channel(phase);
         let mut tasks = JoinSet::new();
         let mut identities = Vec::with_capacity(listeners.len());
-        for (tcp, acceptor, udp, context) in listeners {
+        let mut active_h3 = Vec::with_capacity(listeners.len());
+        for (tcp, acceptor, udp, context, h3_config) in listeners {
+            active_h3.push(h3_config);
             let h2 = Arc::new(RwLock::new(acceptor));
             identities.push(HotIdentity {
                 h2: h2.clone(),
@@ -1243,6 +1266,7 @@ impl RunningGeneration {
             tasks,
             phase: sender,
             identities,
+            active_h3,
         }
     }
 
@@ -1328,11 +1352,18 @@ async fn stage_fresh_generation(
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn commit_same_port_tls(
     runtime: &crate::runtime_generation::State,
-    running: &RunningGeneration,
+    running: &mut RunningGeneration,
     request: &crate::runtime_generation::RestartRequest,
     loaded_identities: &[crate::reload_preflight::IdentityHash],
     path: &Path,
-) -> Result<(Vec<crate::reload_preflight::IdentityHash>, u64), ()> {
+) -> Result<
+    (
+        Vec<crate::reload_preflight::IdentityHash>,
+        u64,
+        RollbackSlot,
+    ),
+    (),
+> {
     let candidate = &request.candidate;
     let original = request.previous.document.as_ref();
     let snapshot = request.material.as_ref().ok_or(())?;
@@ -1365,6 +1396,16 @@ fn commit_same_port_tls(
     for handle in &running.identities {
         held.push(handle.h2.write().map_err(|_| ())?);
     }
+    let previous_h2 = held.iter().map(|guard| (**guard).clone()).collect();
+    let previous_h3 = running.active_h3.clone();
+    let next_h3 = prepared.h3.clone();
+    let refs = original
+        .server
+        .inbounds
+        .iter()
+        .map(|inbound| (inbound.tls_cert.clone(), inbound.tls_key.clone()))
+        .collect();
+    let previous_identities = loaded_identities.to_vec();
     let PreparedSamePortTls { h2, h3, identities } = prepared;
     let revision = runtime
         .commit_tls_rotation(
@@ -1382,7 +1423,83 @@ fn commit_same_port_tls(
             },
         )
         .map_err(|_| ())?;
-    Ok((identities, revision))
+    running.active_h3 = next_h3;
+    let slot = RollbackSlot {
+        expires: Instant::now() + TLS_ROLLBACK_WINDOW,
+        h2: previous_h2,
+        h3: previous_h3,
+        identities: previous_identities,
+        refs,
+    };
+    Ok((identities, revision, slot))
+}
+
+/// Reinstall exactly the old *compiled* H2/H3 TLS configs after an explicit
+/// operator CAS. The current authorization baseline (including quota and
+/// token changes made after rotation) is preserved; only TLS identity refs
+/// and loaded TLS hashes are restored. One shot, no PEM filesystem I/O.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn commit_tls_rollback(
+    runtime: &crate::runtime_generation::State,
+    running: &mut RunningGeneration,
+    slot: &RollbackSlot,
+    expected_revision: u64,
+    path: &Path,
+) -> Result<(Vec<crate::reload_preflight::IdentityHash>, u64), ()> {
+    if Instant::now() >= slot.expires
+        || slot.h2.len() != running.identities.len()
+        || slot.h3.len() != running.identities.len()
+        || slot.refs.len() != running.identities.len()
+        || slot.identities.len() != running.identities.len()
+    {
+        return Err(());
+    }
+    let previous = runtime.snapshot().map_err(|_| ())?;
+    if previous.live.revision() != Ok(expected_revision) {
+        return Err(());
+    }
+    let mut target = previous.document.as_ref().clone();
+    for (inbound, (cert, key)) in target.server.inbounds.iter_mut().zip(&slot.refs) {
+        inbound.tls_cert.clone_from(cert);
+        inbound.tls_key.clone_from(key);
+    }
+    if !crate::restart_guard::same_port_tls_only(&previous.document, &target) {
+        return Err(());
+    }
+    let (rebased_live, staged_auth) = previous
+        .live
+        .prepare_tls_rebase(&target, expected_revision)
+        .map_err(|_| ())?;
+    let next = crate::runtime_generation::View {
+        document: Arc::new(target.clone()),
+        inbounds: target.server.inbounds.len(),
+        preflight: Arc::new(crate::reload_preflight::ReloadPreflight::new(
+            path.to_owned(),
+            target,
+            slot.identities.clone(),
+        )),
+        live: Arc::new(rebased_live),
+    };
+
+    // Fail BEFORE changing a single endpoint if any H2 lock is poisoned.
+    let mut locks = Vec::with_capacity(running.identities.len());
+    for handle in &running.identities {
+        locks.push(handle.h2.write().map_err(|_| ())?);
+    }
+    let h2 = slot.h2.clone();
+    let h3 = slot.h3.clone();
+    let revision = runtime
+        .commit_tls_rotation(&previous, expected_revision, next, staged_auth, || {
+            for (guard, acceptor) in locks.iter_mut().zip(h2) {
+                **guard = acceptor;
+            }
+            for (handle, config) in running.identities.iter().zip(h3) {
+                handle.h3.set_server_config(Some(config));
+            }
+        })
+        .map_err(|_| ())?;
+    running.active_h3.clone_from(&slot.h3);
+    Ok((slot.identities.clone(), revision))
 }
 
 /// Quota-only CAS: nothing is rebound or restarted, and all previously
@@ -1464,6 +1581,7 @@ async fn run_supervised_file(
     let mut running = RunningGeneration::launch(initial.listeners, GenerationPhase::Active);
     let mut identities = current_identities;
     let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
+    let mut rollback: Option<RollbackSlot> = None;
     loop {
         tokio::select! {
             request = queue.recv() => {
@@ -1489,6 +1607,31 @@ async fn run_supervised_file(
                 if request.complete.is_closed() {
                     continue;
                 }
+                if request.kind == crate::runtime_generation::ChangeKind::Rollback {
+                    let applied = rollback.as_ref().ok_or(()).and_then(|slot| {
+                        commit_tls_rollback(
+                            &runtime,
+                            &mut running,
+                            slot,
+                            request.expected_revision,
+                            config_path,
+                        )
+                    });
+                    match applied {
+                        Ok((old_identities, revision)) => {
+                            identities = old_identities;
+                            // A rollback is one-shot, never a toggle or an
+                            // unbounded cache of previous private identities.
+                            rollback = None;
+                            runtime.set_rollback_until(None);
+                            let _ = request.complete.send(Ok(revision));
+                        }
+                        Err(()) => {
+                            let _ = request.complete.send(Err(()));
+                        }
+                    }
+                    continue;
+                }
                 if request.kind == crate::runtime_generation::ChangeKind::Quota {
                     let result = commit_live_quota(&runtime, &request, &limits.ledger);
                     let _ = request.complete.send(result);
@@ -1500,14 +1643,16 @@ async fn run_supervised_file(
                 ) {
                     let applied = commit_same_port_tls(
                         &runtime,
-                        &running,
+                        &mut running,
                         &request,
                         &identities,
                         config_path,
                     );
                     match applied {
-                        Ok((new_identities, revision)) => {
+                        Ok((new_identities, revision, previous_tls)) => {
                             identities = new_identities;
+                            runtime.set_rollback_until(Some(previous_tls.expires));
+                            rollback = Some(previous_tls);
                             let _ = request.complete.send(Ok(revision));
                         }
                         Err(()) => {
@@ -1543,10 +1688,22 @@ async fn run_supervised_file(
                 next_running.start();
                 let previous = std::mem::replace(&mut running, next_running);
                 identities = next_identities;
+                rollback = None;
+                runtime.set_rollback_until(None);
                 retiring = Some(tokio::spawn(reap_previous(previous)));
                 // This ACK is AFTER commit. Lost ACK is indeterminate:
                 // operator must query status; never retry blindly.
                 let _ = request.complete.send(Ok(revision));
+            }
+            _ = async {
+                if let Some(slot) = &rollback {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(slot.expires)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                rollback = None;
+                runtime.set_rollback_until(None);
             }
             result = running.tasks.join_next() => {
                 // An unexpected H2/H3 accept-loop exit is fatal, not a

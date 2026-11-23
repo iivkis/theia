@@ -83,6 +83,29 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
+        Ok(Command::ServerTlsRollbackCheck) => {
+            match management::query_environment(management::StatusCommand::CheckTlsRollback).await {
+                Ok(management::StatusReply::TlsRollbackReady {
+                    revision,
+                    remaining_seconds,
+                }) => Ok(format!(
+                    "last same-port TLS identity rollback ready; revision={revision}; remaining_seconds={remaining_seconds}; no change applied"
+                )),
+                Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
+        Ok(Command::ServerTlsRollbackApply { expected_revision }) => {
+            match management::query_environment(management::StatusCommand::ApplyTlsRollback {
+                expected_revision,
+            }).await {
+                Ok(management::StatusReply::TlsRollbackApplied { revision }) => Ok(format!(
+                    "previous same-port H2/H3 TLS identity restored from memory; revision={revision}; current tunnels and auth retained; rollback slot consumed"
+                )),
+                Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
         Ok(Command::ServerTlsFingerprint { config }) => {
             match server::tls_fingerprint_file(Path::new(&config)) {
                 Ok(digest) => Ok(format!(
