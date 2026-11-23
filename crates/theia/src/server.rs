@@ -1050,10 +1050,19 @@ async fn prepare_generation(
     })
 }
 
+/// Exact currently bound TLS accept handles. No socket is closed or rebound
+/// when the supervisor rotates the certificate for new H2/H3 handshakes.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct HotIdentity {
+    h2: Arc<RwLock<TlsAcceptor>>,
+    h3: quinn::Endpoint,
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct RunningGeneration {
     tasks: JoinSet<Result<(), ServerError>>,
     phase: watch::Sender<GenerationPhase>,
+    identities: Vec<HotIdentity>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1061,10 +1070,16 @@ impl RunningGeneration {
     fn launch(listeners: Vec<ReadyListener>, phase: GenerationPhase) -> Self {
         let (sender, receiver) = watch::channel(phase);
         let mut tasks = JoinSet::new();
+        let mut identities = Vec::with_capacity(listeners.len());
         for (tcp, acceptor, udp, context) in listeners {
-            tasks.spawn(serve_generation(
+            let h2 = Arc::new(RwLock::new(acceptor));
+            identities.push(HotIdentity {
+                h2: h2.clone(),
+                h3: udp.clone(),
+            });
+            tasks.spawn(serve_generation_with_tls(
                 tcp,
-                acceptor,
+                h2,
                 context.clone(),
                 receiver.clone(),
             ));
@@ -1077,6 +1092,7 @@ impl RunningGeneration {
         Self {
             tasks,
             phase: sender,
+            identities,
         }
     }
 
