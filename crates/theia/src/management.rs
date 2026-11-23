@@ -36,7 +36,7 @@ const SOCKET_NAME: &str = "theia-server.sock";
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) const MAX_COMMAND_BYTES: usize = 128;
+pub(crate) const MAX_COMMAND_BYTES: usize = 256;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_RESPONSE_BYTES: u64 = 128;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -97,6 +97,8 @@ pub enum StatusCommand {
     ApplyRestartBound {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
+        /// Fingerprint of actual CERT + PRIVATE KEY PEM content, not TOML.
+        tls_sha256: [u8; 32],
     },
     /// Explicit opt-in CAS auth publication, supported only by Linux server.
     ApplyReload {
@@ -585,8 +587,15 @@ fn parse_bound_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
-    parse_bound_command(command, b"restart-apply rev=")
+fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
+    let raw = std::str::from_utf8(command.strip_prefix(b"restart-apply rev=")?).ok()?;
+    let (revision, hashes) = raw.split_once(" sha256=")?;
+    let (document, tls) = hashes.split_once(" tls-sha256=")?;
+    Some((
+        positive_decimal(revision)?,
+        decode_digest(document)?,
+        decode_digest(tls)?,
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -632,6 +641,7 @@ where
         StatusCommand::ApplyRestartBound {
             expected_revision,
             candidate_sha256,
+            tls_sha256,
         } => {
             if expected_revision == 0 {
                 return Err(ManagementError::InvalidReply);
@@ -640,7 +650,14 @@ where
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            format!("restart-apply rev={expected_revision} sha256={digest}\n").into_bytes()
+            let tls = tls_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!(
+                "restart-apply rev={expected_revision} sha256={digest} tls-sha256={tls}\n"
+            )
+            .into_bytes()
         }
         StatusCommand::ApplyReload { expected_revision } => {
             if expected_revision == 0 {
