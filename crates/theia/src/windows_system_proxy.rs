@@ -10,11 +10,21 @@
 
 use crate::windows_control::current_user_sid;
 use serde::{Deserialize, Serialize};
-use std::{ffi::c_void, mem::size_of, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, ptr::null_mut};
+use std::{
+    ffi::c_void,
+    mem::size_of,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    ptr::null_mut,
+};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0},
+    Foundation::{
+        CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+    },
     Security::{
-        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetSecurityInfo, SE_REGISTRY_KEY},
+        Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+            GetSecurityInfo, SE_REGISTRY_KEY,
+        },
         EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
     },
     System::{
@@ -45,8 +55,18 @@ const VALID_PROXY_FLAGS: u32 = 0x0f;
 
 #[link(name = "wininet")]
 unsafe extern "system" {
-    fn InternetQueryOptionW(handle: *mut c_void, option: u32, buffer: *mut c_void, length: *mut u32) -> i32;
-    fn InternetSetOptionW(handle: *mut c_void, option: u32, buffer: *mut c_void, length: u32) -> i32;
+    fn InternetQueryOptionW(
+        handle: *mut c_void,
+        option: u32,
+        buffer: *mut c_void,
+        length: *mut u32,
+    ) -> i32;
+    fn InternetSetOptionW(
+        handle: *mut c_void,
+        option: u32,
+        buffer: *mut c_void,
+        length: u32,
+    ) -> i32;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,10 +103,11 @@ struct Snapshot {
 }
 impl Snapshot {
     fn validate(&self) -> Result<(), ProxyError> {
-        if self.flags == 0 || self.flags & !VALID_PROXY_FLAGS != 0
-            || [&self.server, &self.bypass, &self.auto_url].iter().any(|s| {
-                s.len() > MAX_TEXT || s.contains('\0') || s.contains(['\r', '\n'])
-            })
+        if self.flags == 0
+            || self.flags & !VALID_PROXY_FLAGS != 0
+            || [&self.server, &self.bypass, &self.auto_url]
+                .iter()
+                .any(|s| s.len() > MAX_TEXT || s.contains('\0') || s.contains(['\r', '\n']))
         {
             return Err(ProxyError::InvalidSettings);
         }
@@ -94,8 +115,10 @@ impl Snapshot {
     }
 
     fn for_loopback(&self, bind: SocketAddr) -> Result<Self, ProxyError> {
-        if !matches!(bind.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST))
-            || bind.port() == 0
+        if !matches!(
+            bind.ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST)
+        ) || bind.port() == 0
         {
             return Err(ProxyError::InvalidSettings);
         }
@@ -122,7 +145,9 @@ struct Journal {
 }
 impl Journal {
     fn validate(&self) -> Result<(), ProxyError> {
-        if self.version != 1 || self.user_sid != current_user_sid().map_err(|_| ProxyError::Journal)? {
+        if self.version != 1
+            || self.user_sid != current_user_sid().map_err(|_| ProxyError::Journal)?
+        {
             return Err(ProxyError::Journal);
         }
         self.before.validate()?;
@@ -157,7 +182,10 @@ struct PerConnectionList {
     options: *mut PerConnectionOption,
 }
 fn option(id: u32) -> PerConnectionOption {
-    PerConnectionOption { id, value: OptionValue { number: 0 } }
+    PerConnectionOption {
+        id,
+        value: OptionValue { number: 0 },
+    }
 }
 fn list(options: &mut [PerConnectionOption; 4]) -> PerConnectionList {
     PerConnectionList {
@@ -172,15 +200,21 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 fn read_wide(ptr: *mut u16) -> Result<String, ProxyError> {
-    if ptr.is_null() { return Ok(String::new()); }
+    if ptr.is_null() {
+        return Ok(String::new());
+    }
     // SAFETY: on successful WinINet query, this is an API-owned terminated
     // GlobalAlloc UTF-16 string. A hard scan bound limits decoded content.
     let mut len = 0usize;
     while len <= MAX_TEXT {
-        if unsafe { *ptr.add(len) } == 0 { break; }
+        if unsafe { *ptr.add(len) } == 0 {
+            break;
+        }
         len += 1;
     }
-    if len > MAX_TEXT { return Err(ProxyError::InvalidSettings); }
+    if len > MAX_TEXT {
+        return Err(ProxyError::InvalidSettings);
+    }
     // SAFETY: non-null WinINet result remains live until GlobalFree.
     String::from_utf16(unsafe { std::slice::from_raw_parts(ptr, len) })
         .map_err(|_| ProxyError::InvalidSettings)
@@ -213,7 +247,12 @@ fn query_with_flags(flag_id: u32) -> Result<Snapshot, ProxyError> {
             let server = read_wide(unsafe { fields[1].value.text })?;
             let bypass = read_wide(unsafe { fields[2].value.text })?;
             let auto_url = read_wide(unsafe { fields[3].value.text })?;
-            let state = Snapshot { flags, server, bypass, auto_url };
+            let state = Snapshot {
+                flags,
+                server,
+                bypass,
+                auto_url,
+            };
             state.validate()?;
             Ok(state)
         })()
@@ -223,7 +262,9 @@ fn query_with_flags(flag_id: u32) -> Result<Snapshot, ProxyError> {
     for field in &fields[1..] {
         let ptr = unsafe { field.value.text };
         if !ptr.is_null() {
-            unsafe { windows_sys::Win32::System::Memory::GlobalFree(ptr.cast()); }
+            unsafe {
+                windows_sys::Win32::System::Memory::GlobalFree(ptr.cast());
+            }
         }
     }
     observed
@@ -234,12 +275,36 @@ fn query() -> Result<Snapshot, ProxyError> {
 }
 fn set(state: &Snapshot) -> Result<(), ProxyError> {
     state.validate()?;
-    let mut strings = [wide(&state.server), wide(&state.bypass), wide(&state.auto_url)];
+    let mut strings = [
+        wide(&state.server),
+        wide(&state.bypass),
+        wide(&state.auto_url),
+    ];
     let mut fields = [
-        PerConnectionOption { id: INTERNET_PER_CONN_FLAGS, value: OptionValue { number: state.flags } },
-        PerConnectionOption { id: INTERNET_PER_CONN_PROXY_SERVER, value: OptionValue { text: strings[0].as_mut_ptr() } },
-        PerConnectionOption { id: INTERNET_PER_CONN_PROXY_BYPASS, value: OptionValue { text: strings[1].as_mut_ptr() } },
-        PerConnectionOption { id: INTERNET_PER_CONN_AUTOCONFIG_URL, value: OptionValue { text: strings[2].as_mut_ptr() } },
+        PerConnectionOption {
+            id: INTERNET_PER_CONN_FLAGS,
+            value: OptionValue {
+                number: state.flags,
+            },
+        },
+        PerConnectionOption {
+            id: INTERNET_PER_CONN_PROXY_SERVER,
+            value: OptionValue {
+                text: strings[0].as_mut_ptr(),
+            },
+        },
+        PerConnectionOption {
+            id: INTERNET_PER_CONN_PROXY_BYPASS,
+            value: OptionValue {
+                text: strings[1].as_mut_ptr(),
+            },
+        },
+        PerConnectionOption {
+            id: INTERNET_PER_CONN_AUTOCONFIG_URL,
+            value: OptionValue {
+                text: strings[2].as_mut_ptr(),
+            },
+        },
     ];
     let mut args = list(&mut fields);
     // SAFETY: each pointer lives through synchronous InternetSetOptionW.
@@ -250,7 +315,9 @@ fn set(state: &Snapshot) -> Result<(), ProxyError> {
             (&mut args as *mut PerConnectionList).cast(),
             size_of::<PerConnectionList>() as u32,
         )
-    } == 0 || args.option_error != 0 {
+    } == 0
+        || args.option_error != 0
+    {
         return Err(ProxyError::Unavailable);
     }
     for id in [INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_OPTION_REFRESH] {
@@ -266,11 +333,15 @@ struct Mutex(HANDLE);
 impl Mutex {
     fn acquire() -> Result<Self, ProxyError> {
         let sid = current_user_sid().map_err(|_| ProxyError::Unavailable)?;
-        if sid == "S-1-5-18" { return Err(ProxyError::Unavailable); }
+        if sid == "S-1-5-18" {
+            return Err(ProxyError::Unavailable);
+        }
         let name = wide(&format!("Local\\Theia-WinInet-Proxy-{sid}"));
         // SAFETY: private per-user name, no initial ownership, explicit wait.
         let handle = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
-        if handle.is_null() { return Err(ProxyError::Unavailable); }
+        if handle.is_null() {
+            return Err(ProxyError::Unavailable);
+        }
         // SAFETY: valid mutex handle; no blocking beyond zero milliseconds.
         let wait = unsafe { WaitForSingleObject(handle, 0) };
         if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
@@ -283,7 +354,10 @@ impl Mutex {
 impl Drop for Mutex {
     fn drop(&mut self) {
         // SAFETY: owner acquired this mutex in the current process.
-        unsafe { ReleaseMutex(self.0); CloseHandle(self.0); }
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
     }
 }
 use std::ptr::null;
@@ -291,7 +365,9 @@ use std::ptr::null;
 struct Security(*mut c_void);
 impl Drop for Security {
     fn drop(&mut self) {
-        if !self.0.is_null() { unsafe { LocalFree(self.0) }; }
+        if !self.0.is_null() {
+            unsafe { LocalFree(self.0) };
+        }
     }
 }
 fn private_security() -> Result<Security, ProxyError> {
@@ -300,40 +376,69 @@ fn private_security() -> Result<Security, ProxyError> {
     let mut pointer = null_mut();
     // SAFETY: terminated SDDL with protected user and SYSTEM only.
     if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(descriptor.as_ptr(), 1, &mut pointer, null_mut())
-    } == 0 || pointer.is_null() { return Err(ProxyError::Journal); }
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor.as_ptr(),
+            1,
+            &mut pointer,
+            null_mut(),
+        )
+    } == 0
+        || pointer.is_null()
+    {
+        return Err(ProxyError::Journal);
+    }
     Ok(Security(pointer))
 }
 struct Sid(*mut c_void);
 impl Drop for Sid {
-    fn drop(&mut self) { if !self.0.is_null() { unsafe { LocalFree(self.0) }; } }
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { LocalFree(self.0) };
+        }
+    }
 }
 fn parsed_sid(raw: &str) -> Result<Sid, ProxyError> {
     let mut sid = null_mut();
-    if unsafe { ConvertStringSidToSidW(wide(raw).as_ptr(), &mut sid) } == 0
-        || sid.is_null()
-    { return Err(ProxyError::Journal); }
+    if unsafe { ConvertStringSidToSidW(wide(raw).as_ptr(), &mut sid) } == 0 || sid.is_null() {
+        return Err(ProxyError::Journal);
+    }
     Ok(Sid(sid))
 }
 struct Key(HKEY);
 impl Drop for Key {
-    fn drop(&mut self) { unsafe { RegCloseKey(self.0); } }
+    fn drop(&mut self) {
+        unsafe {
+            RegCloseKey(self.0);
+        }
+    }
 }
 fn check_acl(key: HKEY) -> Result<(), ProxyError> {
     let mut acl: *mut ACL = null_mut();
     let mut descriptor = null_mut();
     // SAFETY: live registry key handle and owned descriptor output.
     if unsafe {
-        GetSecurityInfo(key as _, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION,
-            null_mut(), null_mut(), &mut acl, null_mut(), &mut descriptor)
-    } != 0 || acl.is_null() {
+        GetSecurityInfo(
+            key as _,
+            SE_REGISTRY_KEY,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut acl,
+            null_mut(),
+            &mut descriptor,
+        )
+    } != 0
+        || acl.is_null()
+    {
         return Err(ProxyError::Journal);
     }
     let _descriptor = Security(descriptor);
     let user = parsed_sid(&current_user_sid().map_err(|_| ProxyError::Journal)?)?;
     let system = parsed_sid("S-1-5-18")?;
     let count = unsafe { (*acl).AceCount };
-    if count != 2 { return Err(ProxyError::Journal); }
+    if count != 2 {
+        return Err(ProxyError::Journal);
+    }
     let mut found_user = false;
     let mut found_system = false;
     for i in 0..u32::from(count) {
@@ -343,17 +448,27 @@ fn check_acl(key: HKEY) -> Result<(), ProxyError> {
         }
         let ace = raw.cast::<ACCESS_ALLOWED_ACE>();
         let header = unsafe { (*ace).Header };
-        if header.AceType != 0 || header.AceFlags != 0 { return Err(ProxyError::Journal); }
+        if header.AceType != 0 || header.AceFlags != 0 {
+            return Err(ProxyError::Journal);
+        }
         let found = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast::<c_void>() };
         if unsafe { EqualSid(found, user.0) } != 0 {
-            if found_user { return Err(ProxyError::Journal); }
+            if found_user {
+                return Err(ProxyError::Journal);
+            }
             found_user = true;
         } else if unsafe { EqualSid(found, system.0) } != 0 {
-            if found_system { return Err(ProxyError::Journal); }
+            if found_system {
+                return Err(ProxyError::Journal);
+            }
             found_system = true;
-        } else { return Err(ProxyError::Journal); }
+        } else {
+            return Err(ProxyError::Journal);
+        }
     }
-    if !found_user || !found_system { return Err(ProxyError::Journal); }
+    if !found_user || !found_system {
+        return Err(ProxyError::Journal);
+    }
     Ok(())
 }
 fn open_key(create: bool) -> Result<Option<Key>, ProxyError> {
@@ -370,30 +485,56 @@ fn open_key(create: bool) -> Result<Option<Key>, ProxyError> {
         // SAFETY: HKCU scope, protected DACL and live out handles.
         if unsafe {
             RegCreateKeyExW(
-                HKEY_CURRENT_USER, path.as_ptr(), 0, null_mut(), 0,
-                KEY_ALL_ACCESS, &mut attributes, &mut key, &mut disposition
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                0,
+                null_mut(),
+                0,
+                KEY_ALL_ACCESS,
+                &mut attributes,
+                &mut key,
+                &mut disposition,
             )
-        } != 0 { return Err(ProxyError::Journal); }
+        } != 0
+        {
+            return Err(ProxyError::Journal);
+        }
     } else {
         // SAFETY: open read-only private HKCU recovery journal, never create.
-        let result = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_READ, &mut key) };
-        if result == ERROR_FILE_NOT_FOUND { return Ok(None); }
-        if result != 0 { return Err(ProxyError::Journal); }
+        let result =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_READ, &mut key) };
+        if result == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if result != 0 {
+            return Err(ProxyError::Journal);
+        }
     }
     let guard = Key(key);
     check_acl(guard.0)?;
     Ok(Some(guard))
 }
 fn read_journal() -> Result<Option<Journal>, ProxyError> {
-    let Some(key) = open_key(false)? else { return Ok(None); };
+    let Some(key) = open_key(false)? else {
+        return Ok(None);
+    };
     let mut kind = 0;
     let mut length = 0u32;
     let name = wide(JOURNAL_NAME);
     // SAFETY: probe the owned HKCU registry value length with no output buffer.
     let result = unsafe {
-        RegQueryValueExW(key.0, name.as_ptr(), null(), &mut kind, null_mut(), &mut length)
+        RegQueryValueExW(
+            key.0,
+            name.as_ptr(),
+            null(),
+            &mut kind,
+            null_mut(),
+            &mut length,
+        )
     };
-    if result == ERROR_FILE_NOT_FOUND { return Ok(None); }
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
     if result != 0 || kind != REG_BINARY || length == 0 || length as usize > MAX_JOURNAL {
         return Err(ProxyError::Journal);
     }
@@ -401,10 +542,17 @@ fn read_journal() -> Result<Option<Journal>, ProxyError> {
     // SAFETY: bounded destination and live key; registry API writes length bytes.
     if unsafe {
         RegQueryValueExW(
-            key.0, name.as_ptr(), null(), &mut kind,
-            bytes.as_mut_ptr(), &mut length
+            key.0,
+            name.as_ptr(),
+            null(),
+            &mut kind,
+            bytes.as_mut_ptr(),
+            &mut length,
         )
-    } != 0 || kind != REG_BINARY || length as usize != bytes.len() {
+    } != 0
+        || kind != REG_BINARY
+        || length as usize != bytes.len()
+    {
         return Err(ProxyError::Journal);
     }
     let text = std::str::from_utf8(&bytes).map_err(|_| ProxyError::Journal)?;
@@ -415,16 +563,29 @@ fn read_journal() -> Result<Option<Journal>, ProxyError> {
 fn save_journal(value: &Journal) -> Result<(), ProxyError> {
     value.validate()?;
     let encoded = toml::to_string(value).map_err(|_| ProxyError::Journal)?;
-    if encoded.len() > MAX_JOURNAL { return Err(ProxyError::Journal); }
+    if encoded.len() > MAX_JOURNAL {
+        return Err(ProxyError::Journal);
+    }
     let key = open_key(true)?.ok_or(ProxyError::Journal)?;
     // Never silently replace a recovery record, even with an identical one.
-    if read_journal()?.is_some() { return Err(ProxyError::RecoveryRequired); }
+    if read_journal()?.is_some() {
+        return Err(ProxyError::RecoveryRequired);
+    }
     let bytes = encoded.as_bytes();
     let name = wide(JOURNAL_NAME);
     // SAFETY: bounded immutable serialized journal and live HKCU key.
     if unsafe {
-        RegSetValueExW(key.0, name.as_ptr(), 0, REG_BINARY, bytes.as_ptr(), bytes.len() as u32)
-    } != 0 || unsafe { RegFlushKey(key.0) } != 0 {
+        RegSetValueExW(
+            key.0,
+            name.as_ptr(),
+            0,
+            REG_BINARY,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        )
+    } != 0
+        || unsafe { RegFlushKey(key.0) } != 0
+    {
         return Err(ProxyError::Journal);
     }
     Ok(())
@@ -441,7 +602,9 @@ fn delete_journal() -> Result<(), ProxyError> {
 }
 
 fn recover_locked() -> Result<Recovery, ProxyError> {
-    let Some(journal) = read_journal()? else { return Ok(Recovery::NothingPending); };
+    let Some(journal) = read_journal()? else {
+        return Ok(Recovery::NothingPending);
+    };
     let current = query()?;
     if current == journal.before {
         // Process crashed before WinINet commit or another actor restored the
@@ -454,7 +617,9 @@ fn recover_locked() -> Result<Recovery, ProxyError> {
         return Err(ProxyError::Conflict);
     }
     set(&journal.before)?;
-    if query()? != journal.before { return Err(ProxyError::Conflict); }
+    if query()? != journal.before {
+        return Err(ProxyError::Conflict);
+    }
     delete_journal()?;
     Ok(Recovery::Restored)
 }
@@ -480,10 +645,14 @@ impl OwnedProxy {
     /// listeners have successfully bound, on explicit --system-proxy --confirm.
     pub fn apply(bind: SocketAddr) -> Result<Self, ProxyError> {
         let lock = Mutex::acquire()?;
-        if read_journal()?.is_some() { return Err(ProxyError::RecoveryRequired); }
+        if read_journal()?.is_some() {
+            return Err(ProxyError::RecoveryRequired);
+        }
         let before = query()?;
         let applied = before.for_loopback(bind)?;
-        if applied == before { return Err(ProxyError::InvalidSettings); }
+        if applied == before {
+            return Err(ProxyError::InvalidSettings);
+        }
         save_journal(&Journal {
             version: 1,
             user_sid: current_user_sid().map_err(|_| ProxyError::Journal)?,
@@ -493,16 +662,25 @@ impl OwnedProxy {
         // Strict CAS immediately before WinINet. External changes after this
         // check may still race the native WinINet set: the post-check and
         // recovery journal prevent silent forceful restoration.
-        if query()? != before { return Err(ProxyError::Conflict); }
+        if query()? != before {
+            return Err(ProxyError::Conflict);
+        }
         set(&applied)?;
-        if query()? != applied { return Err(ProxyError::Conflict); }
-        Ok(Self { _lock: lock, active: true })
+        if query()? != applied {
+            return Err(ProxyError::Conflict);
+        }
+        Ok(Self {
+            _lock: lock,
+            active: true,
+        })
     }
 
     /// Synchronous guarded restore. A failed CAS leaves the durable journal
     /// for explicit operator recovery, never a forced system change.
     pub fn restore(&mut self) -> Result<Recovery, ProxyError> {
-        if !self.active { return Ok(Recovery::NothingPending); }
+        if !self.active {
+            return Ok(Recovery::NothingPending);
+        }
         let status = recover_locked()?;
         self.active = false;
         Ok(status)
@@ -524,7 +702,9 @@ pub enum ProxyStatus {
     PendingAlreadyRestored,
 }
 pub fn status() -> Result<ProxyStatus, ProxyError> {
-    let Some(journal) = read_journal()? else { return Ok(ProxyStatus::NoJournal); };
+    let Some(journal) = read_journal()? else {
+        return Ok(ProxyStatus::NoJournal);
+    };
     let current = query()?;
     Ok(if current == journal.applied {
         ProxyStatus::PendingOwned
@@ -540,12 +720,21 @@ mod tests {
     use super::*;
     #[test]
     fn rejects_invalid_or_foreign_proxy_settings_and_public_binds() {
-        let base = Snapshot { flags: PROXY_TYPE_DIRECT, server: String::new(), bypass: String::new(), auto_url: String::new() };
+        let base = Snapshot {
+            flags: PROXY_TYPE_DIRECT,
+            server: String::new(),
+            bypass: String::new(),
+            auto_url: String::new(),
+        };
         assert!(base.for_loopback("0.0.0.0:7890".parse().unwrap()).is_err());
-        assert!(base.for_loopback("192.0.2.1:7890".parse().unwrap()).is_err());
+        assert!(base
+            .for_loopback("192.0.2.1:7890".parse().unwrap())
+            .is_err());
         assert!(base.for_loopback("127.0.0.1:0".parse().unwrap()).is_err());
         assert_eq!(
-            base.for_loopback("127.0.0.1:7890".parse().unwrap()).unwrap().server,
+            base.for_loopback("127.0.0.1:7890".parse().unwrap())
+                .unwrap()
+                .server,
             "http=127.0.0.1:7890;https=127.0.0.1:7890"
         );
         let mut invalid = base.clone();
@@ -557,9 +746,21 @@ mod tests {
     }
     #[test]
     fn journal_is_bound_to_version_and_user_and_never_allows_forced_recovery() {
-        let before = Snapshot { flags: PROXY_TYPE_DIRECT, server: "old.proxy:8888".into(), bypass: "example.invalid".into(), auto_url: String::new() };
-        let applied = before.for_loopback("127.0.0.1:7890".parse().unwrap()).unwrap();
-        let mut journal = Journal { version: 1, user_sid: current_user_sid().unwrap(), before, applied };
+        let before = Snapshot {
+            flags: PROXY_TYPE_DIRECT,
+            server: "old.proxy:8888".into(),
+            bypass: "example.invalid".into(),
+            auto_url: String::new(),
+        };
+        let applied = before
+            .for_loopback("127.0.0.1:7890".parse().unwrap())
+            .unwrap();
+        let mut journal = Journal {
+            version: 1,
+            user_sid: current_user_sid().unwrap(),
+            before,
+            applied,
+        };
         journal.validate().unwrap();
         journal.version = 2;
         assert_eq!(journal.validate(), Err(ProxyError::Journal));
@@ -591,7 +792,11 @@ mod tests {
         let applied = query().unwrap();
         assert_eq!(applied.server, "http=127.0.0.1:45991;https=127.0.0.1:45991");
         assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
-        assert_eq!(recover_explicit(), Err(ProxyError::Busy), "running owner is protected by mutex");
+        assert_eq!(
+            recover_explicit(),
+            Err(ProxyError::Busy),
+            "running owner is protected by mutex"
+        );
         // Make a foreign WinINet edit and verify CAS refuses to erase it.
         let mut foreign = applied.clone();
         foreign.bypass.push_str(";example.org");
@@ -614,7 +819,11 @@ mod tests {
             .env("THEIA_PROXY_CRASH_CHILD", "yes")
             .status()
             .unwrap();
-        assert_eq!(result.code(), Some(73), "child must simulate hard exit after apply");
+        assert_eq!(
+            result.code(),
+            Some(73),
+            "child must simulate hard exit after apply"
+        );
         assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
         assert_eq!(recover_explicit(), Ok(Recovery::Restored));
         assert_eq!(query().unwrap(), original);
