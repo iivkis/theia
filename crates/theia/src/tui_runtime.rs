@@ -328,6 +328,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn restart_preview_never_exposes_a_confirmable_apply_even_after_success() {
+        for (reply, expected_phase) in [
+            (Ok(StatusReply::RestartAuthorizationOnly), Phase::RestartAuthorizationOnly),
+            (Ok(StatusReply::RestartRequiresMaintenance), Phase::RestartRequiresMaintenance),
+            (Ok(StatusReply::RestartFreshPortsBindable), Phase::RestartFreshPortsBindable),
+            (Err(ManagementError::CandidateRejected), Phase::RestartRejected),
+            (Err(ManagementError::TimedOut), Phase::RestartUnavailable),
+        ] {
+            let mut panel = fake(None, false);
+            panel.phase = Phase::RestartChecking;
+            panel.complete(reply);
+            assert_eq!(panel.phase, expected_phase);
+            assert_eq!(panel.title(), "Проверка готовности к перезапуску");
+            panel.key(key(KeyCode::Char('y')));
+            panel.key(key(KeyCode::Char('a')));
+            assert_eq!(panel.phase, expected_phase, "no key can commit a restart");
+            assert!(!panel.body().contains("authorization revision="));
+            assert!(panel.key(key(KeyCode::Esc)), "Esc must close the review");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(target_os = "linux")]
     async fn real_private_ipc_status_then_explicit_y_sends_bound_digest_once() {
