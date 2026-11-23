@@ -592,6 +592,26 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             "same-port identity rotation must have an explicit ready classification: {}",
             String::from_utf8_lossy(&check.stdout),
         );
+        // TOML is unchanged, yet both PEM files have been replaced with
+        // ANOTHER valid TLS identity after the operator inspected them.
+        // A SHA of TOML alone would accept this unauthorized identity.
+        let operator_tls_pin = material_fingerprint(&config_path);
+        let substituted = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        write_identity(&next_cert, &next_key, &substituted);
+        assert_ne!(material_fingerprint(&config_path), operator_tls_pin);
+        apply_with_pin(
+            env_key,
+            &endpoint,
+            1,
+            &hash,
+            &operator_tls_pin,
+            false,
+        );
+        assert!(revision(env_key, &endpoint, 1));
+        assert!(server.0.try_wait().unwrap().is_none());
+        write_identity(&next_cert, &next_key, &next_identity);
+        assert_eq!(material_fingerprint(&config_path), operator_tls_pin);
+
         // Candidate content and expected revision must be exact.
         apply(env_key, &endpoint, 1, &"0".repeat(64), false, &config_path);
         assert!(revision(env_key, &endpoint, 1));
