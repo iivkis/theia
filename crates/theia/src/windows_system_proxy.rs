@@ -127,7 +127,7 @@ impl Journal {
         }
         self.before.validate()?;
         self.applied.validate()?;
-        if self.applied.flags != PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY
+        if self.applied.flags != (PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY)
             || !self.applied.server.starts_with("http=")
             || !self.applied.server.contains(";https=")
             || self.applied.auto_url != self.before.auto_url
@@ -596,15 +596,8 @@ mod tests {
         assert_eq!(query().unwrap(), original);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
         drop(proxy);
-        // An abrupt process death leaves the journal, not a permission to
-        // overwrite a newly configured proxy. Simulate an abandoned owner.
-        let orphan = OwnedProxy::apply("127.0.0.1:45992".parse().unwrap()).unwrap();
-        assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
-        std::mem::forget(orphan);
-        // An actual crash releases the OS mutex, unlike mem::forget. The
-        // disposable fixture cannot safely fake a process death in-process.
-        // Drop is the normal restoration path; separate subprocess E2E must
-        // exercise real crash recovery.
-        // TEST ENDS WITH OS SETTINGS CHANGED -- do not do this.
+        // No test leaves the operator's actual WinINet settings modified.
+        assert_eq!(query().unwrap(), original);
+        assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
     }
 }
