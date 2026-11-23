@@ -237,8 +237,7 @@ mod tests {
     fn quota_only_rejects_unchanged_tls_user_or_listener_mutations() {
         let source = include_str!("../../../examples/server.toml")
             .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
-        let crate::config::Config::Server(active) = crate::config::parse(&source).unwrap()
-        else {
+        let crate::config::Config::Server(active) = crate::config::parse(&source).unwrap() else {
             panic!("example config");
         };
         let mut candidate = active.clone();
@@ -250,8 +249,7 @@ mod tests {
         candidate.server.users[0].disabled = false;
         candidate.server.inbounds[0].tls_cert = "file:new.pem".to_owned();
         assert!(!quota_only(&active, &candidate));
-        candidate.server.inbounds[0].tls_cert =
-            active.server.inbounds[0].tls_cert.clone();
+        candidate.server.inbounds[0].tls_cert = active.server.inbounds[0].tls_cert.clone();
         candidate.server.policy.allow_private_ips = !active.server.policy.allow_private_ips;
         assert!(!quota_only(&active, &candidate));
     }
