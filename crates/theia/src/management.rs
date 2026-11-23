@@ -876,7 +876,7 @@ mod tls_restart_pin_tests {
             parse_restart_revision(valid.as_bytes()),
             Some((7, [0xab; 32], [0xcd; 32]))
         );
-        assert!(valid.len() + 1 <= MAX_COMMAND_BYTES);
+        assert!(valid.len() < MAX_COMMAND_BYTES);
         for invalid in [
             format!("restart-apply rev=7 sha256={doc}"),
             format!("restart-apply rev=0 sha256={doc} tls-sha256={material}"),
