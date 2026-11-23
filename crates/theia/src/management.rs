@@ -960,21 +960,42 @@ pub async fn query_in(
 }
 
 pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, ManagementError> {
-    #[cfg(target_os = "linux")]
-    {
-        let directory =
-            std::env::var_os("THEIA_CONTROL_DIR").ok_or(ManagementError::NotConfigured)?;
-        query_in(Path::new(&directory), command).await
-    }
-    #[cfg(target_os = "windows")]
-    {
-        crate::windows_control::query_environment(command).await
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
-        let _ = command;
-        Err(ManagementError::Unsupported)
-    }
+    let kind = match command {
+        StatusCommand::Health => "health",
+        StatusCommand::Status => "status",
+        StatusCommand::Reload => "reload_rejected",
+        StatusCommand::CheckReload => "check_reload",
+        StatusCommand::CheckRestart => "check_restart",
+        StatusCommand::CheckTlsRollback => "check_tls_rollback",
+        StatusCommand::ApplyTlsRollback { .. } => "apply_tls_rollback",
+        StatusCommand::CheckQuota => "check_quota",
+        StatusCommand::ApplyQuotaBound { .. } => "apply_quota",
+        StatusCommand::ApplyRestartBound { .. } => "apply_restart",
+        StatusCommand::ApplyReload { .. } => "apply_reload",
+        StatusCommand::ApplyReloadBound { .. } => "apply_reload_bound",
+    };
+    crate::diag!(Info, "management", "ipc_query_begin",
+        "command" = crate::diagnostics::Value::Label(kind));
+    let result = {
+        #[cfg(target_os = "linux")]
+        {
+            let directory = std::env::var_os("THEIA_CONTROL_DIR")
+                .ok_or(ManagementError::NotConfigured)?;
+            query_in(Path::new(&directory), command).await
+        }
+        #[cfg(target_os = "windows")]
+        {
+            crate::windows_control::query_environment(command).await
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Err(ManagementError::Unsupported)
+        }
+    };
+    crate::diag!(Info, "management", "ipc_query_result",
+        "command" = crate::diagnostics::Value::Label(kind),
+        "success" = crate::diagnostics::Value::Flag(result.is_ok()));
+    result
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
