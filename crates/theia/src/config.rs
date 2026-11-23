@@ -490,9 +490,12 @@ impl ClientDocument {
                 "expected absolute file: reference to PEM CA bundle",
             )?;
             ensure(
-                profile.tls_profile == "default",
+                profile.tls_profile == "default"
+                    || (cfg!(feature = "experimental-btls-h2")
+                        && profile.tls_profile == "browser-h2-btls-v1"
+                        && profile.transport == Transport::H2),
                 format!("{field}.tls_profile"),
-                "unsupported TLS profile (fail closed)",
+                "unsupported TLS/HTTP fingerprint profile for this transport/backend (fail closed)",
             )?;
             ensure(
                 (500..=15_000).contains(&profile.quic_connect_timeout_ms),
