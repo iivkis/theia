@@ -20,6 +20,7 @@ pub mod h3_client;
 pub mod h3_server;
 pub mod invite;
 pub mod local_proxy;
+pub mod management;
 pub mod protocol;
 pub mod quic_transport;
 pub mod server;
@@ -47,6 +48,7 @@ pub enum Command {
     Tui { role: Option<Role> },
     TuiEdit { role: Role, config: String },
     ServerRun { config: String },
+    ServerStatus,
     ClientRun { config: String },
     ConfigValidate { config: String },
 }
@@ -60,6 +62,7 @@ pub enum CliError {
     NotImplemented(&'static str),
     Config(config::ConfigError),
     Server(server::ServerError),
+    Management(management::ManagementError),
     Client(client::ClientError),
     Tui(&'static str),
 }
@@ -85,6 +88,7 @@ impl fmt::Display for CliError {
             Self::NonUtf8Argument => write!(f, "arguments must be UTF-8"),
             Self::Config(error) => write!(f, "configuration invalid: {error}"),
             Self::Server(error) => write!(f, "server failed: {error}"),
+            Self::Management(error) => write!(f, "management status unavailable: {error}"),
             Self::Client(error) => write!(f, "client failed: {error}"),
             Self::Tui(message) => write!(f, "TUI failed: {message}"),
             Self::NotImplemented(feature) => write!(
@@ -133,6 +137,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             role: role(selected)?,
             config: config_path(path)?,
         }),
+        ["server", "status"] => Ok(Command::ServerStatus),
         ["server", "run", "--config", path] => Ok(Command::ServerRun {
             config: config_path(path)?,
         }),
@@ -151,6 +156,7 @@ Usage:\n\
   theia --help | --version\n\
   theia tui [--role server|client] [--config <path>]\n\
   theia server run --config <path>\n\
+  theia server status                # read-only Linux opt-in IPC\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
@@ -164,7 +170,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
-            Ok("Usage: theia server run --config <path>\nTLS 1.3/H2 and QUIC/H3 server inbounds.")
+            Ok("Usage: theia server run --config <path> | theia server status\nTLS 1.3/H2 and QUIC/H3 server inbounds; Linux read-only status requires a private THEIA_CONTROL_DIR.")
         }
         Command::Help(Some("client")) => {
             Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")
@@ -176,6 +182,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
         Command::Version => Ok(concat!("theia ", env!("CARGO_PKG_VERSION"))),
         Command::Tui { .. } | Command::TuiEdit { .. } => Err(CliError::NotImplemented("TUI")),
         Command::ServerRun { .. } => Err(CliError::NotImplemented("server runtime")),
+        Command::ServerStatus => Err(CliError::NotImplemented("async management status")),
         Command::ClientRun { .. } => Err(CliError::NotImplemented("client runtime")),
         Command::ConfigValidate { config } => {
             config::read_file(Path::new(&config)).map_err(CliError::Config)?;
@@ -258,6 +265,7 @@ mod tests {
 
     #[test]
     fn recognizes_both_headless_roles_and_config_validation() {
+        assert_eq!(command(&["server", "status"]), Ok(Command::ServerStatus));
         assert_eq!(
             command(&["server", "run", "--config", "server.toml"]),
             Ok(Command::ServerRun {

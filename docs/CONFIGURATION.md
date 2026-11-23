@@ -55,7 +55,7 @@ language = "ru"
 - `Authorization: Bearer` содержит canonical base64url без padding от **сырых 32 байт** токена. Сервер вычисляет SHA-256 от декодированных исходных байт (не текста base64url), сравнивает digest constant-time и только затем проверяет назначение inbound. Digest никогда не принимается вместо bearer token.
 - `allow_private_ips=false` исключает loopback, RFC1918, link-local, unspecified, multicast и прочие недоступные назначения; перепроверять после DNS resolve.
 - Limiting values >0; server должен выполнять caps с bounded resources, ошибки параметров с номером строки/полем.
-- `management.ipc="auto"`: Linux Unix socket с ограниченными permissions, Windows Named Pipe с ACL. `log_level`: error/warn/info/debug/trace, trace с предупреждением о метаданных.
+- `management.ipc="auto"`: **M4.2a Linux read-only opt-in** при установленном `THEIA_CONTROL_DIR`: абсолютная существующая euid-owned директория `0700`, без symlink; socket `theia-server.sock` внутри с правами `0600`. При отсутствии env сервер работает без status IPC, `theia server status` возвращает ошибку; при недоверенной директории или занятом socket bind сервер отказывает до запуска обработчиков. `health/status` доступны только локально; `reload` всегда unsupported. Socket не удаляется при startup, старый path после аварии требует проверки оператором. Windows Named Pipe+ACL, reload/rollback и TUI status ещё не реализованы. [ADR-0038](adr/0038-m4-2a-linux-readonly-management-ipc.md). `log_level`: error/warn/info/debug/trace, trace с предупреждением о метаданных.
 
 ## 3. Client schema
 

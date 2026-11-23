@@ -894,10 +894,21 @@ pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
         ));
         prepared.push((listener, acceptor, endpoint, context));
     }
+    // Management IPC is Linux opt-in until Windows named-pipe ACL and
+    // transactional reload are implemented. Never advertise status before
+    // all TLS/TCP/QUIC binds have been prepared successfully.
+    #[cfg(target_os = "linux")]
+    let management = crate::management::StatusServer::from_environment(prepared.len())
+        .map_err(|_| ServerError::Io)?;
+
     let mut tasks = JoinSet::new();
     for (listener, acceptor, endpoint, context) in prepared {
         tasks.spawn(serve(listener, acceptor, context.clone()));
         tasks.spawn(crate::h3_server::serve(endpoint, context));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(management) = management {
+        tasks.spawn(async move { management.serve().await.map_err(|_| ServerError::Io) });
     }
     match tasks.join_next().await {
         Some(Ok(result)) => result,

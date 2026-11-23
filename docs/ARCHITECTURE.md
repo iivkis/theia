@@ -101,7 +101,7 @@ ACTIVE_H3/H2 → stream ends → CLOSED
 
 - Два независимых файла `server.toml` и `client.toml` по умолчанию, явно передаваемые через `--config`; пути ОС — в `docs/CONFIGURATION.md`.
 - TUI применяет изменения в два этапа: parse+validate → atomic temp write, fsync, rename → локальный `reload`. При неудачном reload живой runtime остаётся на предыдущем snapshot; UI показывает расхождение.
-- Локальный IPC: Unix-domain socket на Linux с правами доступа, Named Pipe под Windows с ACL. Минимальные команды `health`, `status`, `reload`; отсутствие TCP-админки. TUI может редактировать конфиг при выключенном сервисе.
+- Локальный IPC: **M4.2a частично реализован** как *read-only* Linux Unix socket `theia-server.sock` под euid-owned 0700 `THEIA_CONTROL_DIR`, socket 0600, `health/status` и явный отказ `reload`, без TCP-админки ([ADR-0038](adr/0038-m4-2a-linux-readonly-management-ipc.md)). Важный контракт будущего M4.2: Windows Named Pipe с ACL, корректные runtime revision/health counters, транзакционный reload и rollback, интеграция TUI. Не считать сохранённый TOML применённым только потому, что local status сообщает running.
 - Runtime snapshots конфигурации иммутабельны, заменяются атомарно после проверки; отказ применения не ломает старые потоки.
 - Не считать логи и безопасный файл резервного состояния Windows «базой данных».
 
