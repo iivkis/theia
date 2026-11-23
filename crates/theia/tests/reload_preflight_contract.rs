@@ -104,12 +104,17 @@ fn changing_policy_quota_log_level_or_user_registry_is_not_claimed_compatible() 
     changes.push(doc);
     let mut doc = before.clone();
     doc.server.users[0].id = "renamed".into();
+    doc.server.inbounds[0].allowed_user_ids = vec!["renamed".into()];
     changes.push(doc);
     let mut doc = before.clone();
     doc.ui.language = "en".into();
     changes.push(doc);
     let mut doc = before.clone();
-    doc.server.inbounds.push(doc.server.inbounds[0].clone());
+    let mut added = doc.server.inbounds[0].clone();
+    added.id = "second".into();
+    added.h2_listen = "0.0.0.0:8444".into();
+    added.quic_listen = "0.0.0.0:8444".into();
+    doc.server.inbounds.push(added);
     changes.push(doc);
     for candidate in changes {
         assert_eq!(
