@@ -923,12 +923,20 @@ mod tests {
         editor.input = "updated.example.org".into();
         assert!(editor.accept());
         assert!(editor.dirty());
-        assert_eq!(editor.saved_sha256(), initial, "draft is never considered saved");
+        assert_eq!(
+            editor.saved_sha256(),
+            initial,
+            "draft is never considered saved"
+        );
         assert!(editor.save());
         assert!(!editor.dirty());
         let on_disk: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
         assert_ne!(on_disk, initial);
-        assert_eq!(editor.saved_sha256(), on_disk, "only durably written bytes are approved");
+        assert_eq!(
+            editor.saved_sha256(),
+            on_disk,
+            "only durably written bytes are approved"
+        );
         std::fs::remove_file(path).unwrap();
     }
 
