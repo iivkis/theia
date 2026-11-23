@@ -3,14 +3,16 @@
 //! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
 //! No service reload, network or OS proxy effect.
 use crate::{
-    tui_candidate_batch::CandidateBatchPanel, tui_candidates::CandidateReview,
-    tui_discovery::DiscoveryPanel, tui_domain::DomainPanel, tui_editor::Editor,
-    client_import, invite::Invitation,
-    tui_probe::ProbePanel, tui_runtime::RuntimePanel, Role,
+    client_import, invite::Invitation, tui_candidate_batch::CandidateBatchPanel,
+    tui_candidates::CandidateReview, tui_discovery::DiscoveryPanel, tui_domain::DomainPanel,
+    tui_editor::Editor, tui_probe::ProbePanel, tui_runtime::RuntimePanel, Role,
 };
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -66,14 +68,24 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen, Hide, EnableBracketedPaste)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            Hide,
+            EnableBracketedPaste
+        )?;
         Ok(guard)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste, Show, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            Show,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -283,9 +295,7 @@ impl Interaction {
     fn paste_import_source(&mut self, text: &str) {
         if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
             let input = text.trim_end_matches(['\r', '\n']);
-            if source.len().saturating_add(input.len()) <= 4096
-                && !input.contains('\0')
-            {
+            if source.len().saturating_add(input.len()) <= 4096 && !input.contains('\0') {
                 source.push_str(input);
             }
         }
@@ -314,7 +324,11 @@ impl Interaction {
                     });
                 }
                 if matches!(self.importing, Some(ImportFlow::Saving)) {
-                    self.importing = Some(if saved { ImportFlow::Done } else { ImportFlow::Failed });
+                    self.importing = Some(if saved {
+                        ImportFlow::Done
+                    } else {
+                        ImportFlow::Failed
+                    });
                 }
                 if saved {
                     if let Some(original) = self.pending.take() {
@@ -618,7 +632,8 @@ impl Interaction {
                                 });
                             }
                             Err(_) => {
-                                editor.error = Some("Неверный URI или локальный файл приглашения.".into());
+                                editor.error =
+                                    Some("Неверный URI или локальный файл приглашения.".into());
                                 self.importing = Some(ImportFlow::Input(source));
                             }
                         }
@@ -637,35 +652,61 @@ impl Interaction {
                     }
                     _ => self.importing = Some(ImportFlow::Input(source)),
                 },
-                ImportFlow::Preview { invitation, ca, public_ref } => match key.code {
-                    KeyCode::Esc | KeyCode::Char('n') => {}
-                    KeyCode::Char('c') => self.importing = Some(ImportFlow::Trust {
-                        invitation,
-                        ca: ca.unwrap_or_default(),
-                        public_ref,
-                    }),
-                    KeyCode::Char('e') if !invitation.has_token() => {
-                        self.importing = Some(ImportFlow::Credential {
-                            invitation,
-                            ca,
-                            reference: public_ref.unwrap_or_default(),
-                        });
-                    }
-                    KeyCode::Char('y') => {
-                        if !invitation.has_token() && public_ref.is_none() {
-                            editor.error = Some("Публичное приглашение требует отдельную env: ссылку на секрет.".into());
-                            self.importing = Some(ImportFlow::Preview { invitation, ca, public_ref });
-                        } else {
-                            self.importing = Some(ImportFlow::Saving);
-                            self.start_import(invitation, ca, public_ref);
+                ImportFlow::Preview {
+                    invitation,
+                    ca,
+                    public_ref,
+                } => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n') => {}
+                        KeyCode::Char('c') => {
+                            self.importing = Some(ImportFlow::Trust {
+                                invitation,
+                                ca: ca.unwrap_or_default(),
+                                public_ref,
+                            })
+                        }
+                        KeyCode::Char('e') if !invitation.has_token() => {
+                            self.importing = Some(ImportFlow::Credential {
+                                invitation,
+                                ca,
+                                reference: public_ref.unwrap_or_default(),
+                            });
+                        }
+                        KeyCode::Char('y') => {
+                            if !invitation.has_token() && public_ref.is_none() {
+                                editor.error = Some("Публичное приглашение требует отдельную env: ссылку на секрет.".into());
+                                self.importing = Some(ImportFlow::Preview {
+                                    invitation,
+                                    ca,
+                                    public_ref,
+                                });
+                            } else {
+                                self.importing = Some(ImportFlow::Saving);
+                                self.start_import(invitation, ca, public_ref);
+                            }
+                        }
+                        _ => {
+                            self.importing = Some(ImportFlow::Preview {
+                                invitation,
+                                ca,
+                                public_ref,
+                            })
                         }
                     }
-                    _ => self.importing = Some(ImportFlow::Preview { invitation, ca, public_ref }),
-                },
-                ImportFlow::Trust { invitation, mut ca, public_ref } => match key.code {
-                    KeyCode::Esc => self.importing = Some(ImportFlow::Preview {
-                        invitation, ca: None, public_ref,
-                    }),
+                }
+                ImportFlow::Trust {
+                    invitation,
+                    mut ca,
+                    public_ref,
+                } => match key.code {
+                    KeyCode::Esc => {
+                        self.importing = Some(ImportFlow::Preview {
+                            invitation,
+                            ca: None,
+                            public_ref,
+                        })
+                    }
                     KeyCode::Enter => {
                         let verified = if ca.is_empty() {
                             Ok(None)
@@ -676,38 +717,100 @@ impl Interaction {
                             Ok(value) => {
                                 editor.error = None;
                                 self.importing = Some(ImportFlow::Preview {
-                                    invitation, ca: value, public_ref,
+                                    invitation,
+                                    ca: value,
+                                    public_ref,
                                 });
                             }
                             Err(_) => {
-                                editor.error = Some("CA-файл должен быть доверенным PEM по абсолютному file: пути.".into());
-                                self.importing = Some(ImportFlow::Trust { invitation, ca, public_ref });
+                                editor.error = Some(
+                                    "CA-файл должен быть доверенным PEM по абсолютному file: пути."
+                                        .into(),
+                                );
+                                self.importing = Some(ImportFlow::Trust {
+                                    invitation,
+                                    ca,
+                                    public_ref,
+                                });
                             }
                         }
                     }
-                    KeyCode::Backspace => { ca.pop(); self.importing = Some(ImportFlow::Trust { invitation, ca, public_ref }); }
+                    KeyCode::Backspace => {
+                        ca.pop();
+                        self.importing = Some(ImportFlow::Trust {
+                            invitation,
+                            ca,
+                            public_ref,
+                        });
+                    }
                     KeyCode::Char(ch) if !ch.is_control() && ca.len() + ch.len_utf8() <= 1024 => {
                         ca.push(ch);
-                        self.importing = Some(ImportFlow::Trust { invitation, ca, public_ref });
+                        self.importing = Some(ImportFlow::Trust {
+                            invitation,
+                            ca,
+                            public_ref,
+                        });
                     }
-                    _ => self.importing = Some(ImportFlow::Trust { invitation, ca, public_ref }),
+                    _ => {
+                        self.importing = Some(ImportFlow::Trust {
+                            invitation,
+                            ca,
+                            public_ref,
+                        })
+                    }
                 },
-                ImportFlow::Credential { invitation, ca, mut reference } => match key.code {
-                    KeyCode::Esc => self.importing = Some(ImportFlow::Preview { invitation, ca, public_ref: None }),
+                ImportFlow::Credential {
+                    invitation,
+                    ca,
+                    mut reference,
+                } => match key.code {
+                    KeyCode::Esc => {
+                        self.importing = Some(ImportFlow::Preview {
+                            invitation,
+                            ca,
+                            public_ref: None,
+                        })
+                    }
                     KeyCode::Enter if client_import::valid_explicit_reference(&reference) => {
                         editor.error = None;
-                        self.importing = Some(ImportFlow::Preview { invitation, ca, public_ref: Some(reference) });
+                        self.importing = Some(ImportFlow::Preview {
+                            invitation,
+                            ca,
+                            public_ref: Some(reference),
+                        });
                     }
                     KeyCode::Enter => {
-                        editor.error = Some("Нужна явная ссылка env:NAME, без значения токена.".into());
-                        self.importing = Some(ImportFlow::Credential { invitation, ca, reference });
+                        editor.error =
+                            Some("Нужна явная ссылка env:NAME, без значения токена.".into());
+                        self.importing = Some(ImportFlow::Credential {
+                            invitation,
+                            ca,
+                            reference,
+                        });
                     }
-                    KeyCode::Backspace => { reference.pop(); self.importing = Some(ImportFlow::Credential { invitation, ca, reference }); }
+                    KeyCode::Backspace => {
+                        reference.pop();
+                        self.importing = Some(ImportFlow::Credential {
+                            invitation,
+                            ca,
+                            reference,
+                        });
+                    }
                     KeyCode::Char(ch) if ch.is_ascii_graphic() && reference.len() < 128 => {
                         reference.push(ch);
-                        self.importing = Some(ImportFlow::Credential { invitation, ca, reference });
+                        self.importing = Some(ImportFlow::Credential {
+                            invitation,
+                            ca,
+                            reference,
+                        });
                     }
-                    _ => self.importing = Some(ImportFlow::Credential { invitation, ca, reference }),
+                    _ => {
+                        self.importing = Some(ImportFlow::Credential {
+                            invitation,
+                            ca,
+                            reference,
+                        })
+                    }
                 },
                 ImportFlow::Saving => self.importing = Some(ImportFlow::Saving),
                 state @ (ImportFlow::Done | ImportFlow::Failed) => {
@@ -1002,7 +1105,12 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             interaction.and_then(|ui| ui.editor.as_ref()),
         );
     } else if let Some(flow) = interaction.and_then(|ui| ui.importing.as_ref()) {
-        draw_import(frame, parts[1], flow, interaction.and_then(|ui| ui.editor.as_ref()));
+        draw_import(
+            frame,
+            parts[1],
+            flow,
+            interaction.and_then(|ui| ui.editor.as_ref()),
+        );
     } else if interaction.is_some_and(|ui| ui.pending.is_some()) {
         panel(
             frame,
@@ -1619,12 +1727,13 @@ mod tests {
 
     #[test]
     fn client_import_modal_masks_pasted_link_and_requires_explicit_confirmation() {
-        use crate::{config::{self, Config}, invite::Invitation};
+        use crate::{
+            config::{self, Config},
+            invite::Invitation,
+        };
         use std::{fs, thread, time::Instant};
-        let path = std::env::temp_dir().join(format!(
-            "theia-f14-client-ui-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("theia-f14-client-ui-{}.toml", std::process::id()));
         let Config::Client(original) =
             config::parse(include_str!("../../../examples/client.toml")).unwrap()
         else {
@@ -1655,7 +1764,10 @@ mod tests {
         assert!(preview.contains("НЕ"));
         assert!(!preview.contains("theia://v1/"));
         ui.update(&mut model, press(KeyCode::Char('y')));
-        assert!(ui.saving.is_none(), "public tokenless link needs explicit env reference");
+        assert!(
+            ui.saving.is_none(),
+            "public tokenless link needs explicit env reference"
+        );
         ui.update(&mut model, press(KeyCode::Char('e')));
         for ch in "env:REMOTE_TOKEN".chars() {
             ui.update(&mut model, press(KeyCode::Char(ch)));
@@ -1687,10 +1799,8 @@ mod tests {
     #[test]
     fn client_import_refuses_dirty_editor_and_cancellation_does_not_modify_disk() {
         use std::fs;
-        let path = std::env::temp_dir().join(format!(
-            "theia-f14-cancel-ui-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("theia-f14-cancel-ui-{}.toml", std::process::id()));
         let source = include_str!("../../../examples/client.toml");
         fs::write(&path, source).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
