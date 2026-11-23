@@ -52,16 +52,25 @@ impl State {
         candidate: &ServerDocument,
         expected: u64,
     ) -> Result<u64, LiveAuthError> {
-        let guard = self
+        let mut guard = self
             .current
-            .read()
+            .write()
             .map_err(|_| LiveAuthError::Unavailable)?;
         if !Arc::ptr_eq(&guard, view) {
             return Err(LiveAuthError::StaleRevision);
         }
-        view.live
-            .stage(candidate, expected)
-            .and_then(|staged| view.live.publish(staged))
+        let staged = view.live.stage(candidate, expected)?;
+        let revision = view.live.publish(staged)?;
+        // The running TLS sockets, quotas and AuthCell remain the same.
+        // Rebase the management snapshot so a later TLS-only rotation
+        // compares against the MOST RECENT auth state, not startup TOML.
+        *guard = Arc::new(View {
+            document: Arc::new(candidate.clone()),
+            inbounds: view.inbounds,
+            preflight: Arc::new(view.preflight.rebased(candidate.clone())),
+            live: Arc::new(view.live.with_new_baseline(candidate.clone())),
+        });
+        Ok(revision)
     }
 
     /// Same-port identity rotation: one short writer CAS for the persisted
