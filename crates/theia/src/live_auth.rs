@@ -142,6 +142,39 @@ impl LiveAuthorization {
         })
     }
 
+    /// Rebase a TLS-only rotation onto the SAME AuthCell shared by existing
+    /// H2/H3 contexts. The caller must independently prove that ONLY TLS PEM
+    /// identity may change, never routing, quotas or user inventory.
+    /// Staging is pure and cannot leak another revision to readers.
+    pub(crate) fn prepare_tls_rebase(
+        &self,
+        candidate: &ServerDocument,
+        expected_revision: u64,
+    ) -> Result<(Self, StagedAuthorization), LiveAuthError> {
+        if self.revision()? != expected_revision {
+            return Err(LiveAuthError::StaleRevision);
+        }
+        Config::Server(candidate.clone())
+            .validate()
+            .map_err(|_| LiveAuthError::InvalidCandidate)?;
+        if !candidate.server.enabled {
+            return Err(LiveAuthError::InvalidCandidate);
+        }
+        let next = expected_revision
+            .checked_add(1)
+            .ok_or(LiveAuthError::RevisionExhausted)?;
+        let rebased = Self {
+            baseline: candidate.clone(),
+            shared: Arc::clone(&self.shared),
+        };
+        let stage = StagedAuthorization {
+            owner: Arc::clone(&self.shared),
+            expected_revision,
+            snapshot: Arc::new(AuthSnapshot::for_document(candidate, next)),
+        };
+        Ok((rebased, stage))
+    }
+
     /// Stop NEW H2/H3 authorization requests on the retiring generation.
     /// Already authenticated stream permits remain held until natural drain
     /// or the bounded grace deadline. This is NOT hard tunnel revocation.
