@@ -187,7 +187,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
-            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server reload --expected-revision N\nLinux-only CAS auth Apply requires private THEIA_CONTROL_DIR and expected active revision; TLS/listener and policy cannot change.")
+            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server reload --expected-revision N\nCAS auth Apply requires private Linux THEIA_CONTROL_DIR or Windows THEIA_CONTROL_PIPE, plus expected running revision; TLS/listener and policy cannot change.")
         }
         Command::Help(Some("client")) => {
             Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")

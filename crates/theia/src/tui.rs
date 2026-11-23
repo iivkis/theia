@@ -819,7 +819,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельное подтверждение auth-only Apply (только сохранённого TOML, Linux).\nНовый пользователь и grant: клавиша u. Ctrl+S только сохраняет, runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельное подтверждение auth-only Apply (только сохранённого TOML, Linux/Windows).\nНовый пользователь и grant: клавиша u. Ctrl+S только сохраняет, runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
