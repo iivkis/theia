@@ -26,6 +26,8 @@
 
 **M4.5h domain DNS and pinned H2+H3 TUI CI:** unit tests of `camouflage_domain_dns` prove denied/unlisted domain before any DNS, bounded exact-case catalogue, public A/AAAA vetting, mixed private/public full-set rejection, non-443 and >64 answers rejection, cap 8 pinned IPs, and no Internet lookups in CI. `tui_domain` tests two independent confirmation states (DNS vs active TCP+UDP), DNS worker outcomes via synthetic local channels, 60s TTL stale refusal, owner-selected Space IPs, cancellation and previous-domain pin wipe, only true per-transport verified evidence scores vs Unknown, REALITY always not ready. TUI integration requires server `p→r→d`; client/Home/CIDR input cannot initiate request. Actual source-aware dual transport handshake/PKI and wrong-CA/SSRF approval are covered by existing native Linux+Windows **loopback** `tests/camouflage_dual_batch.rs` (cert SAN `google.com`), no public DNS/HTTP/TLS domain scanning in CI. Full locked Rust tests/fmt/Clippy -D warnings, BBR/BoringSSL, Windows smoke, Chromium E2E, exact-head ci-gate mandatory.
 
+**M4.2a Linux read-only management IPC CI:** Linux-only isolated filesystem socket integration covers real compiled `theia server status`, `health`/typed `status`, fixed no-reload response, 0700 owner-only parent/0600 socket, symlink and occupied-file refusal without unlink, missing socket fail-closed, 64-byte input bound, 2s deadline, task-cancel cleanup. Windows unit API explicitly denies unsupported, rather than inventing a Named Pipe; mandatory Linux/Windows native CI matrix and exact-head gate. [ADR-0038](adr/0038-m4-2a-linux-readonly-management-ipc.md).
+
 ## 1. Test pyramid
 
 ### A. Pure unit tests (самые быстрые, обязательны в каждом PR)
