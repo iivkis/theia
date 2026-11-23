@@ -209,6 +209,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -247,6 +248,14 @@ jobs:
       - name: Release compilation only after main merge
         if: github.ref == 'refs/heads/main'
         run: cargo build --workspace --release --locked
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-rust-tests-linux
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
 
   windows-smoke:
     name: windows-smoke
@@ -255,6 +264,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 35
     env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -351,6 +361,14 @@ jobs:
       - name: Native Windows release compilation only after main merge
         if: github.ref == 'refs/heads/main'
         run: cargo build --workspace --release --locked
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-windows-smoke-windows
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
 
   f14-cross-host:
     name: F-14 Linux VM server to native Windows client
@@ -359,6 +377,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 50
     env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -386,6 +405,14 @@ jobs:
         run: |
           python scripts/f14-cross-os-ci.py --linux-binary "$env:RUNNER_TEMP/theia-linux/theia" --windows-test "$env:RUNNER_TEMP/theia-windows/f14_cross_host.exe" --windows-client "$env:RUNNER_TEMP/theia-windows/theia.exe"
           if ($LASTEXITCODE -ne 0) { throw 'F-14 Linux/Windows cross-OS E2E failed' }
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-f14-cross-host-cross-host
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
 
   browser-e2e:
     name: browser-e2e (${{ matrix.os }})
@@ -398,6 +425,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -427,6 +455,14 @@ jobs:
         run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5 -- --ignored --exact --nocapture
       - name: Capture actual Chromium H2 SETTINGS and HPACK pseudo names on loopback
         run: cargo test --workspace --locked --test chromium_h2_reference actual_chromium_h2_settings_and_pseudo_order_reference -- --ignored --exact --nocapture
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-browser-e2e-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
 
   m3-3-bbr-comparison:
     name: m3-3-bbr-comparison (${{ matrix.os }})
@@ -438,6 +474,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
       THEIA_BBR_RESULTS_PATH: ${{ github.workspace }}/theia-bbr-${{ matrix.os }}.csv
     steps:
@@ -472,6 +509,14 @@ jobs:
           name: m3-3-quic-comparison-${{ runner.os }}
           path: ${{ github.workspace }}/theia-bbr-${{ matrix.os }}.csv
           if-no-files-found: error
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-m3-3-bbr-comparison-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
 
   m3-4-btls-spike:
     name: m3-4-btls-spike (${{ matrix.os }})
@@ -551,6 +596,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -587,6 +633,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'M3.4e rustfmt drift' }
           cargo clippy --workspace --all-targets --features experimental-btls-h2 -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw 'M3.4e feature Clippy failed' }
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-m3-4e-btls-production-feature-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
 
   ci-gate:
     name: ci-gate

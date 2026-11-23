@@ -1,8 +1,36 @@
 use std::path::Path;
-use theia::{execute, local_proxy, management, parse, server, tui, CliError, Command};
+use theia::{diagnostics, execute, local_proxy, management, parse, server, tui, CliError, Command};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    diagnostics::init();
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        if let Some(location) = panic.location() {
+            diagnostics::emit(
+                diagnostics::Level::Error,
+                "process",
+                "panic",
+                &[(
+                    "line",
+                    diagnostics::Value::Count(u64::from(location.line())),
+                )],
+                location.file(),
+                location.line(),
+            );
+        } else {
+            theia::diag!(Error, "process", "panic_without_location");
+        }
+        diagnostics::flush();
+        previous_hook(panic);
+    }));
+    theia::diag!(
+        Info,
+        "process",
+        "started",
+        "argv_count" =
+            diagnostics::Value::Count(std::env::args_os().len().saturating_sub(1) as u64)
+    );
     let args: Result<Vec<String>, CliError> = std::env::args_os()
         .skip(1)
         .map(|arg| arg.into_string().map_err(|_| CliError::NonUtf8Argument))
@@ -214,10 +242,35 @@ async fn main() {
         Err(error) => Err(error),
     };
     match result {
-        Ok(message) => println!("{message}"),
+        Ok(message) => {
+            theia::diag!(Info, "process", "completed");
+            println!("{message}");
+        }
         Err(error) => {
+            let class = match &error {
+                CliError::InvalidArguments => "invalid_arguments",
+                CliError::InvalidRole => "invalid_role",
+                CliError::InvalidConfigPath => "invalid_config_path",
+                CliError::NonUtf8Argument => "non_utf8_argument",
+                CliError::NotImplemented(_) => "not_implemented",
+                CliError::Config(_) => "config",
+                CliError::Server(_) => "server",
+                CliError::Management(_) => "management",
+                CliError::Client(_) => "client",
+                #[cfg(windows)]
+                CliError::SystemProxy(_) => "system_proxy",
+                CliError::Tui(_) => "tui",
+            };
+            theia::diag!(
+                Error,
+                "process",
+                "failed",
+                "error_class" = diagnostics::Value::Label(class)
+            );
             eprintln!("theia: {error}");
+            diagnostics::flush();
             std::process::exit(error.exit_code());
         }
     }
+    diagnostics::flush();
 }

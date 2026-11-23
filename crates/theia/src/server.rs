@@ -2,6 +2,7 @@
 //! A listener, not the untrusted HTTP Host/authority, determines authorization.
 use crate::{
     config::{self, Config, Inbound, ServerDocument, ServerPolicy, User},
+    diagnostics::{self, Value},
     live_auth::{AuthCell, LiveAuthorization},
     protocol::{self, Address, Decoder, Direction, ErrorCode, Frame, Role, Session},
 };
@@ -97,6 +98,17 @@ impl fmt::Display for ServerError {
     }
 }
 impl std::error::Error for ServerError {}
+
+pub(crate) const fn error_kind(error: ServerError) -> &'static str {
+    match error {
+        ServerError::Config => "configuration",
+        ServerError::Io => "io",
+        ServerError::Tls => "tls",
+        ServerError::Http2 => "h2",
+        ServerError::Protocol => "protocol",
+        ServerError::TimedOut => "timeout",
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthFailure {
@@ -518,8 +530,10 @@ pub(crate) async fn serve_generation_with_tls(
     mut phase: watch::Receiver<GenerationPhase>,
 ) -> Result<(), ServerError> {
     if !await_generation_activation(&mut phase).await {
+        crate::diag!(Info, "server.h2", "generation_aborted_before_activation");
         return Ok(());
     }
+    crate::diag!(Info, "server.h2", "listener_active");
     // JoinSet ownership makes cancellation of serve cancel all of its
     // connections, which in turn cancel all of their stream handlers.
     let mut connections = JoinSet::new();
@@ -533,7 +547,12 @@ pub(crate) async fn serve_generation_with_tls(
             _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 let (socket, peer) = accepted.map_err(|_| ServerError::Io)?;
+                let connection_id = diagnostics::next_id();
+                crate::diag!(Trace, "server.h2", "tcp_accepted",
+                    "connection" = Value::Count(connection_id));
                 let Some(slot) = context.connection_slot() else {
+                    crate::diag!(Warn, "server.h2", "connection_quota_rejected",
+                        "connection" = Value::Count(connection_id));
                     continue;
                 };
                 let tls_acceptor = {
@@ -543,18 +562,36 @@ pub(crate) async fn serve_generation_with_tls(
                 let context = context.clone();
                 connections.spawn(async move {
                     let _slot = slot;
-                    let Ok(Ok(tls)) = timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(socket)).await else {
-                        return;
+                    let tls = match timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(socket)).await {
+                        Ok(Ok(tls)) => tls,
+                        Ok(Err(_)) => {
+                            crate::diag!(Warn, "server.h2", "tls_handshake_failed",
+                                "connection" = Value::Count(connection_id));
+                            return;
+                        }
+                        Err(_) => {
+                            crate::diag!(Warn, "server.h2", "tls_handshake_timeout",
+                                "connection" = Value::Count(connection_id));
+                            return;
+                        }
                     };
                     if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+                        crate::diag!(Warn, "server.h2", "alpn_rejected",
+                            "connection" = Value::Count(connection_id));
                         return;
                     }
+                    crate::diag!(Trace, "server.h2", "tls_verified",
+                        "connection" = Value::Count(connection_id));
                     let mut builder = h2::server::Builder::new();
                     builder.max_concurrent_streams(MAX_H2_STREAMS);
                     builder.max_header_list_size(MAX_HEADER_BYTES);
                     let Ok(Ok(mut connection)) = timeout(HANDSHAKE_TIMEOUT, builder.handshake(tls)).await else {
+                        crate::diag!(Warn, "server.h2", "h2_handshake_failed_or_timeout",
+                            "connection" = Value::Count(connection_id));
                         return;
                     };
+                    crate::diag!(Debug, "server.h2", "connection_ready",
+                        "connection" = Value::Count(connection_id));
                     let mut handlers = JoinSet::new();
                     loop {
                         let accepted = if handlers.is_empty() {
@@ -573,7 +610,10 @@ pub(crate) async fn serve_generation_with_tls(
                         };
                         let context = context.clone();
                         handlers.spawn(async move {
-                            let _ = handle_request(request, respond, context, peer.ip()).await;
+                            if let Err(error) = handle_request(request, respond, context, peer.ip()).await {
+                                crate::diag!(Warn, "server.h2", "request_failed",
+                                    "reason" = Value::Label(error_kind(error)));
+                            }
                         });
                     }
                 });
@@ -583,6 +623,7 @@ pub(crate) async fn serve_generation_with_tls(
     // Stop new TCP accepts first, then give already-authenticated tunnels a
     // bounded chance to finish. Exceeding the grace aborts remaining tasks;
     // it is never advertised as hard revoke or lossless migration.
+    crate::diag!(Info, "server.h2", "generation_draining");
     drop(listener);
     let _ = timeout(GENERATION_DRAIN, async {
         while connections.join_next().await.is_some() {}
@@ -611,10 +652,32 @@ async fn handle_request(
     context: Arc<ServerContext>,
     peer: IpAddr,
 ) -> Result<(), ServerError> {
+    let session_id = diagnostics::next_id();
+    crate::diag!(
+        Trace,
+        "server.h2",
+        "request_received",
+        "session" = Value::Count(session_id)
+    );
     let permit = match context.authorize_request(&request, peer) {
         Ok(permit) => permit,
-        Err(status) => return reject(&mut respond, status).await,
+        Err(status) => {
+            crate::diag!(
+                Warn,
+                "server.h2",
+                "authorization_rejected",
+                "session" = Value::Count(session_id),
+                "http_status" = Value::Count(u64::from(status.as_u16()))
+            );
+            return reject(&mut respond, status).await;
+        }
     };
+    crate::diag!(
+        Debug,
+        "server.h2",
+        "authorized",
+        "session" = Value::Count(session_id)
+    );
     let mut inbound = request.into_body();
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -626,9 +689,30 @@ async fn handle_request(
         .map_err(|_| ServerError::Http2)?;
     let result = timeout(
         Duration::from_secs(300),
-        handle_frames(&mut inbound, &mut outgoing, &context),
+        handle_frames(&mut inbound, &mut outgoing, &context, session_id),
     )
     .await;
+    match &result {
+        Ok(Ok(())) => crate::diag!(
+            Info,
+            "server.h2",
+            "request_completed",
+            "session" = Value::Count(session_id)
+        ),
+        Ok(Err(error)) => crate::diag!(
+            Warn,
+            "server.h2",
+            "request_relay_failed",
+            "session" = Value::Count(session_id),
+            "reason" = Value::Label(error_kind(*error))
+        ),
+        Err(_) => crate::diag!(
+            Warn,
+            "server.h2",
+            "request_timeout",
+            "session" = Value::Count(session_id)
+        ),
+    }
     // A timeout or transport failure can interrupt an already partially
     // written frame. Reset rather than appending an ABORT to corrupt bytes.
     if matches!(
@@ -717,6 +801,7 @@ async fn handle_frames(
     incoming: &mut h2::RecvStream,
     outgoing: &mut h2::SendStream<Bytes>,
     context: &ServerContext,
+    session_id: u64,
 ) -> Result<(), ServerError> {
     let mut decoder = IncomingFrames::default();
     let mut state = Session::new(Role::Server);
@@ -754,6 +839,12 @@ async fn handle_frames(
     .await
     .map_err(|_| ServerError::TimedOut)??;
     let (address, port) = opened;
+    crate::diag!(
+        Trace,
+        "server.h2",
+        "hello_and_open_validated",
+        "session" = Value::Count(session_id)
+    );
     let dial = tokio::select! {
         result = context.dial_target(&address, port) => result,
         _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
@@ -763,6 +854,13 @@ async fn handle_frames(
     let tcp = match dial {
         Ok(tcp) => tcp,
         Err(code) => {
+            crate::diag!(
+                Warn,
+                "server.h2",
+                "target_dial_rejected",
+                "session" = Value::Count(session_id),
+                "code" = Value::Count(code as u64)
+            );
             let failure = Frame::OpenError(code);
             state
                 .apply(Direction::Send, &failure)
@@ -775,8 +873,13 @@ async fn handle_frames(
         .apply(Direction::Send, &Frame::OpenOk)
         .map_err(|_| ServerError::Protocol)?;
     send_frame(outgoing, &Frame::OpenOk).await?;
-
-    relay_tcp(tcp, incoming, outgoing, decoder, state).await
+    crate::diag!(
+        Info,
+        "server.h2",
+        "open_ok_sent",
+        "session" = Value::Count(session_id)
+    );
+    relay_tcp(tcp, incoming, outgoing, decoder, state, session_id).await
 }
 
 /// Drive the two TCP directions independently. In particular, lack of H2
@@ -789,6 +892,7 @@ async fn relay_tcp(
     outgoing: &mut h2::SendStream<Bytes>,
     mut decoder: IncomingFrames,
     mut state: Session,
+    session_id: u64,
 ) -> Result<(), ServerError> {
     let (mut read, mut write) = tcp.into_split();
     let mut rx_state = state.clone();
@@ -802,12 +906,25 @@ async fn relay_tcp(
                 .map_err(|_| ServerError::Protocol)?;
             match frame {
                 Frame::Data(data) => {
+                    crate::diag!(
+                        Trace,
+                        "server.h2",
+                        "upload_frame",
+                        "session" = Value::Count(session_id),
+                        "bytes" = Value::Count(data.len() as u64)
+                    );
                     timeout(FRAME_IDLE_TIMEOUT, write.write_all(&data))
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
                 }
                 Frame::Fin => {
+                    crate::diag!(
+                        Debug,
+                        "server.h2",
+                        "upload_fin",
+                        "session" = Value::Count(session_id)
+                    );
                     timeout(FRAME_IDLE_TIMEOUT, write.shutdown())
                         .await
                         .map_err(|_| ServerError::TimedOut)?
@@ -850,6 +967,14 @@ async fn relay_tcp(
             } else {
                 Frame::Data(buffer[..size].to_vec())
             };
+            crate::diag!(
+                Trace,
+                "server.h2",
+                "download_frame",
+                "session" = Value::Count(session_id),
+                "bytes" = Value::Count(size as u64),
+                "fin" = Value::Flag(size == 0)
+            );
             tx_state
                 .apply(Direction::Send, &frame)
                 .map_err(|_| ServerError::Protocol)?;
@@ -1053,10 +1178,18 @@ fn tls_acceptor(
 
 /// Prepare all TCP and UDP listeners and TLS identity before launching tasks.
 pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
+    crate::diag!(Info, "server", "config_read_begin");
     let parsed = config::read_file(config_path).map_err(|_| ServerError::Config)?;
     let Config::Server(document) = parsed else {
+        crate::diag!(Warn, "server", "config_role_mismatch");
         return Err(ServerError::Config);
     };
+    crate::diag!(
+        Info,
+        "server",
+        "config_valid",
+        "inbounds" = Value::Count(document.server.inbounds.len() as u64)
+    );
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         run_supervised_file(document, config_path).await
@@ -1542,8 +1675,20 @@ async fn run_supervised_file(
     document: ServerDocument,
     config_path: &Path,
 ) -> Result<(), ServerError> {
+    crate::diag!(
+        Info,
+        "server.supervisor",
+        "initial_generation_preflight_begin",
+        "inbounds" = Value::Count(document.server.inbounds.len() as u64)
+    );
     let limits = GenerationLimits::new(&document);
     let initial = prepare_generation(&document, 1, &limits, None).await?;
+    crate::diag!(
+        Info,
+        "server.supervisor",
+        "initial_generation_prepared",
+        "listeners" = Value::Count(initial.listeners.len() as u64)
+    );
     let current_identities = initial.identities.clone();
     let runtime = Arc::new(crate::runtime_generation::State::new(
         crate::runtime_generation::View {
@@ -1579,6 +1724,7 @@ async fn run_supervised_file(
         tokio::spawn(async move { service.serve().await.map_err(|_| ServerError::Io) })
     });
     let mut running = RunningGeneration::launch(initial.listeners, GenerationPhase::Active);
+    crate::diag!(Info, "server.supervisor", "generation_active");
     let mut identities = current_identities;
     let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
     let mut rollback: Option<RollbackSlot> = None;
@@ -1772,6 +1918,13 @@ async fn run_document_with_config(
             .parse()
             .map_err(|_| ServerError::Config)?;
         let material = tls_material(inbound)?;
+        crate::diag!(
+            Debug,
+            "server",
+            "listener_prepare",
+            "h2_port" = Value::Count(u64::from(addr.port())),
+            "h3_port" = Value::Count(u64::from(udp_addr.port()))
+        );
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         loaded_identities.push(material.identity.clone());
         let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;

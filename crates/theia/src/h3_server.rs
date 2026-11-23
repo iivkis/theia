@@ -1,6 +1,7 @@
 //! M3.1b: authenticated H3 request handling, not yet bound by server CLI.
 //! Reuses H2's inbound context, admission, authorization, quota and DNS ACL.
 use crate::{
+    diagnostics::{self, Value},
     protocol::{self, Decoder, Direction, Frame, Role, Session},
     quic_transport,
     server::{self, GenerationPhase, ServerContext, ServerError},
@@ -59,8 +60,10 @@ pub(crate) async fn serve_generation(
     mut phase: watch::Receiver<GenerationPhase>,
 ) -> Result<(), ServerError> {
     if !server::await_generation_activation(&mut phase).await {
+        crate::diag!(Info, "server.h3", "generation_aborted_before_activation");
         return Ok(());
     }
+    crate::diag!(Info, "server.h3", "listener_active");
     let endpoint = EndpointGuard(endpoint);
     let mut connections = JoinSet::new();
     loop {
@@ -75,7 +78,12 @@ pub(crate) async fn serve_generation(
                 let Some(incoming) = incoming else {
                     return Err(ServerError::Io);
                 };
+                let connection_id = diagnostics::next_id();
+                crate::diag!(Trace, "server.h3", "quic_incoming",
+                    "connection" = Value::Count(connection_id));
                 let Some(slot) = context.connection_slot() else {
+                    crate::diag!(Warn, "server.h3", "connection_quota_rejected",
+                        "connection" = Value::Count(connection_id));
                     incoming.refuse();
                     continue;
                 };
@@ -83,8 +91,12 @@ pub(crate) async fn serve_generation(
                 connections.spawn(async move {
                     let _slot = slot;
                     let Ok(connection) = quic_transport::accept(incoming).await else {
+                        crate::diag!(Warn, "server.h3", "quic_tls_handshake_rejected",
+                            "connection" = Value::Count(connection_id));
                         return;
                     };
+                    crate::diag!(Debug, "server.h3", "quic_verified",
+                        "connection" = Value::Count(connection_id));
                     run_connection(connection, context).await;
                 });
             }
@@ -93,6 +105,7 @@ pub(crate) async fn serve_generation(
     // Quinn does not expose a portable accept-only half-close on Endpoint:
     // while existing streams drain, refuse all NEW datagrams/connection
     // attempts. EndpointGuard closes everything after the bounded window.
+    crate::diag!(Info, "server.h3", "generation_draining");
     let _ = timeout(server::GENERATION_DRAIN, async {
         while !connections.is_empty() {
             tokio::select! {
@@ -122,8 +135,10 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
     )
     .await
     else {
+        crate::diag!(Warn, "server.h3", "h3_handshake_failed_or_timeout");
         return;
     };
+    crate::diag!(Trace, "server.h3", "h3_connection_ready");
     let mut handlers = JoinSet::new();
     loop {
         // Do not accumulate unresolved header readers indefinitely.
@@ -153,6 +168,7 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
             let Ok(Ok((request, stream))) =
                 timeout(HANDSHAKE_TIMEOUT, resolver.resolve_request()).await
             else {
+                crate::diag!(Warn, "server.h3", "request_headers_failed_or_timeout");
                 return;
             };
             handle_request(request, stream, &context, peer).await;
@@ -166,9 +182,23 @@ async fn handle_request(
     context: &ServerContext,
     peer: IpAddr,
 ) {
+    let session_id = diagnostics::next_id();
+    crate::diag!(
+        Trace,
+        "server.h3",
+        "request_received",
+        "session" = Value::Count(session_id)
+    );
     let permit = match context.authorize_request(&request, peer) {
         Ok(permit) => permit,
         Err(status) => {
+            crate::diag!(
+                Warn,
+                "server.h3",
+                "authorization_rejected",
+                "session" = Value::Count(session_id),
+                "http_status" = Value::Count(u64::from(status.as_u16()))
+            );
             let _ = timeout(CLOSE_TIMEOUT, respond(&mut stream, status)).await;
             let _ = timeout(CLOSE_TIMEOUT, stream.finish()).await;
             // Refuse further body bytes without accepting a tunnel.
@@ -176,6 +206,12 @@ async fn handle_request(
             return;
         }
     };
+    crate::diag!(
+        Debug,
+        "server.h3",
+        "authorized",
+        "session" = Value::Count(session_id)
+    );
     if !matches!(
         timeout(CLOSE_TIMEOUT, respond(&mut stream, StatusCode::OK)).await,
         Ok(Ok(()))
@@ -186,7 +222,32 @@ async fn handle_request(
     }
 
     let (mut tx, mut rx) = stream.split();
-    let result = timeout(SESSION_TIMEOUT, handle_frames(&mut tx, &mut rx, context)).await;
+    let result = timeout(
+        SESSION_TIMEOUT,
+        handle_frames(&mut tx, &mut rx, context, session_id),
+    )
+    .await;
+    match &result {
+        Ok(Ok(())) => crate::diag!(
+            Info,
+            "server.h3",
+            "request_completed",
+            "session" = Value::Count(session_id)
+        ),
+        Ok(Err(error)) => crate::diag!(
+            Warn,
+            "server.h3",
+            "request_relay_failed",
+            "session" = Value::Count(session_id),
+            "reason" = Value::Label(server::error_kind(*error))
+        ),
+        Err(_) => crate::diag!(
+            Warn,
+            "server.h3",
+            "request_timeout",
+            "session" = Value::Count(session_id)
+        ),
+    }
     if matches!(result, Ok(Ok(()))) {
         if !matches!(timeout(CLOSE_TIMEOUT, tx.finish()).await, Ok(Ok(()))) {
             tx.stop_stream(Code::H3_REQUEST_CANCELLED);
@@ -272,6 +333,7 @@ async fn handle_frames(
     tx: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
     rx: &mut RequestStream<h3_quinn::RecvStream, Bytes>,
     context: &ServerContext,
+    session_id: u64,
 ) -> Result<(), ServerError> {
     let mut incoming = Incoming::default();
     let mut state = Session::new(Role::Server);
@@ -300,6 +362,12 @@ async fn handle_frames(
     .await
     .map_err(|_| ServerError::TimedOut)??;
 
+    crate::diag!(
+        Trace,
+        "server.h3",
+        "hello_and_open_validated",
+        "session" = Value::Count(session_id)
+    );
     // Dial only a shared-policy vetted address. Detect early body/EOF/reset
     // while connecting; a client is not allowed to send DATA before OPEN_OK.
     let dial = tokio::select! {
@@ -313,6 +381,13 @@ async fn handle_frames(
     let tcp = match dial {
         Ok(tcp) => tcp,
         Err(code) => {
+            crate::diag!(
+                Warn,
+                "server.h3",
+                "target_dial_rejected",
+                "session" = Value::Count(session_id),
+                "code" = Value::Count(code as u64)
+            );
             let failure = Frame::OpenError(code);
             state
                 .apply(Direction::Send, &failure)
@@ -324,7 +399,13 @@ async fn handle_frames(
         .apply(Direction::Send, &Frame::OpenOk)
         .map_err(|_| ServerError::Protocol)?;
     send(tx, &Frame::OpenOk).await?;
-    relay(tcp, tx, rx, incoming, state).await
+    crate::diag!(
+        Info,
+        "server.h3",
+        "open_ok_sent",
+        "session" = Value::Count(session_id)
+    );
+    relay(tcp, tx, rx, incoming, state, session_id).await
 }
 
 async fn relay(
@@ -333,6 +414,7 @@ async fn relay(
     rx: &mut RequestStream<h3_quinn::RecvStream, Bytes>,
     mut incoming: Incoming,
     mut state: Session,
+    session_id: u64,
 ) -> Result<(), ServerError> {
     let (mut read, mut write) = tcp.into_split();
     let mut upload_state = state.clone();
@@ -345,12 +427,25 @@ async fn relay(
                 .map_err(|_| ServerError::Protocol)?;
             match frame {
                 Frame::Data(data) => {
+                    crate::diag!(
+                        Trace,
+                        "server.h3",
+                        "upload_frame",
+                        "session" = Value::Count(session_id),
+                        "bytes" = Value::Count(data.len() as u64)
+                    );
                     timeout(IDLE_TIMEOUT, write.write_all(&data))
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
                 }
                 Frame::Fin => {
+                    crate::diag!(
+                        Debug,
+                        "server.h3",
+                        "upload_fin",
+                        "session" = Value::Count(session_id)
+                    );
                     timeout(IDLE_TIMEOUT, write.shutdown())
                         .await
                         .map_err(|_| ServerError::TimedOut)?
@@ -381,6 +476,14 @@ async fn relay(
             } else {
                 Frame::Data(buffer[..n].to_vec())
             };
+            crate::diag!(
+                Trace,
+                "server.h3",
+                "download_frame",
+                "session" = Value::Count(session_id),
+                "bytes" = Value::Count(n as u64),
+                "fin" = Value::Flag(n == 0)
+            );
             download_state
                 .apply(Direction::Send, &frame)
                 .map_err(|_| ServerError::Protocol)?;

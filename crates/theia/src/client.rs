@@ -1,5 +1,6 @@
 //! Authenticated H2 client transport used by the local proxy listeners.
 //! Trust anchors are supplied by the caller; this API never disables PKI.
+use crate::diagnostics::{self, Value};
 use crate::protocol::{self, Address, Decoder, Direction, ErrorCode, Frame, Role, Session};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
@@ -54,6 +55,24 @@ impl fmt::Display for ClientError {
 }
 
 impl std::error::Error for ClientError {}
+
+/// Sanitized, stable error categories: never format a remote-controlled value.
+pub(crate) fn error_kind(error: &ClientError) -> &'static str {
+    match error {
+        ClientError::Configuration => "configuration",
+        ClientError::Io => "io",
+        ClientError::Tls => "tls",
+        ClientError::Http2 => "h2",
+        ClientError::Http3 => "h3",
+        ClientError::QuicUnreachable => "quic_unreachable",
+        ClientError::Unauthorized => "unauthorized",
+        ClientError::SystemProxy => "system_proxy",
+        ClientError::Rejected(_) => "http_rejected",
+        ClientError::Protocol => "protocol",
+        ClientError::Open(_) => "open_rejected",
+        ClientError::Timeout => "timeout",
+    }
+}
 
 pub(crate) fn bearer_header(token: &str) -> Result<HeaderValue, ClientError> {
     if token.len() != 43 || token.contains('=') {
@@ -211,14 +230,38 @@ impl H2Client {
     /// encoded verbatim as OPEN_TCP and are never resolved by this client.
     /// A successful return is possible only after a valid OPEN_OK.
     pub async fn open(&self, address: Address, port: u16) -> Result<Tunnel, ClientError> {
+        let operation = diagnostics::next_id();
+        crate::diag!(
+            Debug,
+            "client.h2",
+            "open_begin",
+            "op" = Value::Count(operation)
+        );
         let open = Frame::OpenTcp { address, port };
         protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        timeout(OPEN_TIMEOUT, self.open_inner(open))
+        let result = timeout(OPEN_TIMEOUT, self.open_inner(open, operation))
             .await
-            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::Timeout)
+            .and_then(|result| result);
+        match &result {
+            Ok(_) => crate::diag!(
+                Info,
+                "client.h2",
+                "open_confirmed",
+                "op" = Value::Count(operation)
+            ),
+            Err(error) => crate::diag!(
+                Warn,
+                "client.h2",
+                "open_failed",
+                "op" = Value::Count(operation),
+                "reason" = Value::Label(error_kind(error))
+            ),
+        }
+        result
     }
 
-    async fn open_inner(&self, open: Frame) -> Result<Tunnel, ClientError> {
+    async fn open_inner(&self, open: Frame, operation: u64) -> Result<Tunnel, ClientError> {
         let socket = TcpStream::connect(self.endpoint.as_str())
             .await
             .map_err(|_| ClientError::Io)?;
@@ -242,6 +285,12 @@ impl H2Client {
                 start_h2(tls, self.wire_shape).await?
             }
         };
+        crate::diag!(
+            Trace,
+            "client.h2",
+            "tls_and_h2_verified",
+            "op" = Value::Count(operation)
+        );
         // Build and send the credential-bearing POST ONLY after the selected
         // backend verified TLS identity and ALPN and established HTTP/2.
         let request = Request::post(self.uri.clone())
@@ -253,6 +302,13 @@ impl H2Client {
             .send_request(request, false)
             .map_err(|_| ClientError::Http2)?;
         let response = response.await.map_err(|_| ClientError::Http2)?;
+        crate::diag!(
+            Trace,
+            "client.h2",
+            "response_received",
+            "op" = Value::Count(operation),
+            "status" = Value::Count(u64::from(response.status().as_u16()))
+        );
         match response.status() {
             StatusCode::OK => {}
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -278,6 +334,12 @@ impl H2Client {
         state
             .apply(Direction::Receive, &ack)
             .map_err(|_| ClientError::Protocol)?;
+        crate::diag!(
+            Trace,
+            "client.h2",
+            "hello_ack_received",
+            "op" = Value::Count(operation)
+        );
         if !matches!(ack, Frame::HelloAck { .. }) {
             return Err(ClientError::Protocol);
         }
@@ -294,13 +356,23 @@ impl H2Client {
             .map_err(|_| ClientError::Protocol)?;
         match result {
             Frame::OpenOk if state.tunnel_open() => Ok(Tunnel {
+                operation,
                 incoming,
                 outgoing,
                 decoder,
                 state,
                 _driver: driver,
             }),
-            Frame::OpenError(code) => Err(ClientError::Open(code)),
+            Frame::OpenError(code) => {
+                crate::diag!(
+                    Warn,
+                    "client.h2",
+                    "remote_open_refused",
+                    "op" = Value::Count(operation),
+                    "code" = Value::Count(code as u64)
+                );
+                Err(ClientError::Open(code))
+            }
             _ => Err(ClientError::Protocol),
         }
     }
@@ -353,6 +425,7 @@ impl Drop for Driver {
 /// Construction is private: a Tunnel always represents a verified OPEN_OK.
 /// Dropping it also aborts the dedicated HTTP/2 connection driver.
 pub struct Tunnel {
+    operation: u64,
     incoming: h2::RecvStream,
     outgoing: h2::SendStream<Bytes>,
     decoder: IncomingFrames,
@@ -367,6 +440,13 @@ impl Tunnel {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let operation = self.operation;
+        crate::diag!(
+            Info,
+            "client.h2",
+            "relay_begin",
+            "op" = Value::Count(operation)
+        );
         let (mut read, mut write) = tokio::io::split(local);
         let incoming = &mut self.incoming;
         let outgoing = &mut self.outgoing;
@@ -385,6 +465,14 @@ impl Tunnel {
                 } else {
                     Frame::Data(buffer[..size].to_vec())
                 };
+                crate::diag!(
+                    Trace,
+                    "client.h2",
+                    "upload_frame",
+                    "op" = Value::Count(operation),
+                    "bytes" = Value::Count(size as u64),
+                    "fin" = Value::Flag(size == 0)
+                );
                 upload_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
@@ -404,12 +492,25 @@ impl Tunnel {
                     .map_err(|_| ClientError::Protocol)?;
                 match frame {
                     Frame::Data(data) => {
+                        crate::diag!(
+                            Trace,
+                            "client.h2",
+                            "download_frame",
+                            "op" = Value::Count(operation),
+                            "bytes" = Value::Count(data.len() as u64)
+                        );
                         timeout(IO_TIMEOUT, write.write_all(&data))
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
                     }
                     Frame::Fin => {
+                        crate::diag!(
+                            Debug,
+                            "client.h2",
+                            "download_fin",
+                            "op" = Value::Count(operation)
+                        );
                         timeout(IO_TIMEOUT, write.shutdown())
                             .await
                             .map_err(|_| ClientError::Timeout)?
@@ -425,7 +526,22 @@ impl Tunnel {
             }
             Ok::<(), ClientError>(())
         };
-        tokio::try_join!(upload, download)?;
+        if let Err(error) = tokio::try_join!(upload, download) {
+            crate::diag!(
+                Warn,
+                "client.h2",
+                "relay_failed",
+                "op" = Value::Count(operation),
+                "reason" = Value::Label(error_kind(&error))
+            );
+            return Err(error);
+        }
+        crate::diag!(
+            Info,
+            "client.h2",
+            "relay_completed",
+            "op" = Value::Count(operation)
+        );
         self.state
             .apply(Direction::Send, &Frame::Fin)
             .map_err(|_| ClientError::Protocol)?;

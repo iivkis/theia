@@ -15,6 +15,7 @@ pub mod camouflage_workflow;
 pub mod client;
 pub mod client_import;
 pub mod config;
+pub mod diagnostics;
 #[cfg(feature = "experimental-btls-h2")]
 mod h2_btls;
 pub mod h3_client;
