@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::oneshot;
 
 pub(crate) struct View {
+    pub(crate) document: Arc<ServerDocument>,
     pub(crate) inbounds: usize,
     pub(crate) preflight: Arc<ReloadPreflight>,
     pub(crate) live: Arc<LiveAuthorization>,
@@ -111,13 +112,13 @@ mod tests {
                 Vec::new(),
             ))
         };
-        let state = State::new(View { inbounds: 2, preflight: preflight(), live: a.clone() });
+        let state = State::new(View { document: Arc::new(active.clone()), inbounds: 1, preflight: preflight(), live: a.clone() });
         let before = state.snapshot().unwrap();
-        let invalid = View { inbounds: 2, preflight: preflight(), live: b.clone() };
+        let invalid = View { document: Arc::new(active.clone()), inbounds: 1, preflight: preflight(), live: b.clone() };
         assert!(state.commit_restart(&before, 2, invalid).is_err());
         assert_eq!(state.snapshot().unwrap().live.revision(), Ok(1));
-        let foreign = Arc::new(View { inbounds: 2, preflight: preflight(), live: a });
-        let invalid = View { inbounds: 2, preflight: preflight(), live: b };
+        let foreign = Arc::new(View { document: Arc::new(active.clone()), inbounds: 1, preflight: preflight(), live: a });
+        let invalid = View { document: Arc::new(active.clone()), inbounds: 1, preflight: preflight(), live: b };
         assert!(state.commit_restart(&foreign, 1, invalid).is_err());
         assert!(Arc::ptr_eq(&state.snapshot().unwrap(), &before));
     }
