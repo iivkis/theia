@@ -339,13 +339,19 @@ pub async fn query_in(
             .await
             .map_err(|_| ManagementError::SocketUnavailable)?;
         let request = match command {
-            StatusCommand::Health => b"health\n".as_slice(),
-            StatusCommand::Status => b"status\n".as_slice(),
-            StatusCommand::Reload => b"reload\n".as_slice(),
-            StatusCommand::CheckReload => b"check-reload\n".as_slice(),
+            StatusCommand::Health => b"health\n".to_vec(),
+            StatusCommand::Status => b"status\n".to_vec(),
+            StatusCommand::Reload => b"reload\n".to_vec(),
+            StatusCommand::CheckReload => b"check-reload\n".to_vec(),
+            StatusCommand::ApplyReload { expected_revision } => {
+                if expected_revision == 0 {
+                    return Err(ManagementError::InvalidReply);
+                }
+                format!("apply-reload rev={expected_revision}\n").into_bytes()
+            }
         };
         stream
-            .write_all(request)
+            .write_all(&request)
             .await
             .map_err(|_| ManagementError::Io)?;
         let mut reply = Vec::new();
@@ -370,8 +376,40 @@ pub async fn query_in(
                 _ => Err(ManagementError::InvalidReply),
             };
         }
+        if let StatusCommand::ApplyReload { expected_revision } = command {
+            let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+            if let Some(revision) = text
+                .strip_prefix("theia-apply-v1 applied revision=")
+                .and_then(|line| line.strip_suffix('\n'))
+                .and_then(positive_decimal)
+            {
+                if Some(revision) == expected_revision.checked_add(1) {
+                    return Ok(StatusReply::Applied { revision });
+                }
+            }
+            return if reply == b"theia-apply-v1 rejected\n" {
+                Err(ManagementError::CandidateRejected)
+            } else if reply == b"ERR unsupported\n" {
+                Err(ManagementError::Unsupported)
+            } else {
+                Err(ManagementError::InvalidReply)
+            };
+        }
         if command == StatusCommand::Status {
             let reply = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+            if let Some((count, revision)) = reply
+                .strip_prefix("theia-status-v2 running inbounds=")
+                .and_then(|line| line.strip_suffix('\n'))
+                .and_then(|line| line.split_once(" revision="))
+            {
+                let inbounds = positive_decimal(count).filter(|_| count.len() <= 7);
+                let revision = positive_decimal(revision);
+                if let (Some(inbounds), Some(revision)) = (inbounds, revision) {
+                    if let Ok(inbounds) = usize::try_from(inbounds) {
+                        return Ok(StatusReply::RunningRevision { inbounds, revision });
+                    }
+                }
+            }
             if let Some(number) = reply
                 .strip_prefix("theia-status-v1 running inbounds=")
                 .and_then(|line| line.strip_suffix('\n'))
