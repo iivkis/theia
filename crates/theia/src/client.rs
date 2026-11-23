@@ -71,6 +71,14 @@ pub(crate) fn bearer_header(token: &str) -> Result<HeaderValue, ClientError> {
     Ok(authorization)
 }
 
+#[derive(Clone, Copy)]
+enum H2WireShape {
+    Standard,
+    /// Measured partial Chromium-like HTTP/2 features. Strict bounded
+    /// credits and the library's pseudo-header order are intentionally kept.
+    BrowserH2V1,
+}
+
 enum H2Tls {
     Rustls(TlsConnector),
     #[cfg(feature = "experimental-btls-h2")]
@@ -89,6 +97,7 @@ pub struct H2Client {
     uri: http::Uri,
     authorization: HeaderValue,
     connector: H2Tls,
+    wire_shape: H2WireShape,
 }
 
 impl H2Client {
@@ -115,6 +124,7 @@ impl H2Client {
             name,
             token,
             H2Tls::Rustls(TlsConnector::from(Arc::new(tls))),
+            H2WireShape::Standard,
         )
     }
 
@@ -137,6 +147,32 @@ impl H2Client {
                 server_name: name.to_owned(),
                 trusted_ca_pem: Arc::from(trusted_ca_pem),
             },
+            H2WireShape::Standard,
+        )
+    }
+
+    /// F-13 opt-in production H2 profile: real BoringSSL TLS1.3, GREASE,
+    /// ALPS and strict CA/SNI/ALPN, plus a measured resource-bounded H2
+    /// wire shape. Chromium159 parity is NOT asserted: pseudo-header order,
+    /// connection window and full ClientHello cipher/extension vectors differ.
+    /// H3/QUIC and auto are refused by typed configuration before startup.
+    #[cfg(feature = "experimental-btls-h2")]
+    pub fn new_browser_h2_v1(
+        endpoint: &str,
+        name: &str,
+        token: &str,
+        trusted_ca_pem: &[u8],
+    ) -> Result<Self, ClientError> {
+        crate::h2_btls::validate_ca(trusted_ca_pem)?;
+        Self::with_connector(
+            endpoint,
+            name,
+            token,
+            H2Tls::Btls {
+                server_name: name.to_owned(),
+                trusted_ca_pem: Arc::from(trusted_ca_pem),
+            },
+            H2WireShape::BrowserH2V1,
         )
     }
 
@@ -145,6 +181,7 @@ impl H2Client {
         name: &str,
         token: &str,
         connector: H2Tls,
+        wire_shape: H2WireShape,
     ) -> Result<Self, ClientError> {
         let authorization = bearer_header(token)?;
         let authority: http::uri::Authority =
@@ -166,6 +203,7 @@ impl H2Client {
             uri,
             authorization,
             connector,
+            wire_shape,
         })
     }
 
@@ -193,7 +231,7 @@ impl H2Client {
                 if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
                     return Err(ClientError::Tls);
                 }
-                start_h2(tls).await?
+                start_h2(tls, self.wire_shape).await?
             }
             #[cfg(feature = "experimental-btls-h2")]
             H2Tls::Btls {
@@ -270,7 +308,10 @@ impl H2Client {
 
 /// Same HTTP/2 transport engine and ownership regardless of verified TLS
 /// backend. The SmartTheia HELLO/OPEN_OK state machine below is shared.
-async fn start_h2<S>(tls: S) -> Result<(h2::client::SendRequest<Bytes>, Driver), ClientError>
+async fn start_h2<S>(
+    tls: S,
+    wire_shape: H2WireShape,
+) -> Result<(h2::client::SendRequest<Bytes>, Driver), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -282,6 +323,15 @@ where
     // bounded default receive windows. No named browser profile is claimed.
     builder.enable_push(false);
     builder.max_header_list_size(8192);
+    if matches!(wire_shape, H2WireShape::BrowserH2V1) {
+        // Chromium159 advertises HPACK table 65536, 6MiB per-stream credit,
+        // 256KiB max header list and ~15MiB connection receive credit.
+        // Preserve the same HPACK table hint but bound receive credit to
+        // 256KiB per active stream and retain the strict 8KiB header limit.
+        // This is a measured *partial* HTTP fingerprint, not impersonation.
+        builder.header_table_size(65_536);
+        builder.initial_window_size(262_144);
+    }
     let (sender, connection) = builder
         .handshake(tls)
         .await
