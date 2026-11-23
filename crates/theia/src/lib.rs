@@ -264,7 +264,9 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             config: config_path(path)?,
         }),
         ["client", "run", "--config", path, "--system-proxy", "--confirm"] => {
-            Ok(Command::ClientRunSystemProxy { config: config_path(path)? })
+            Ok(Command::ClientRunSystemProxy {
+                config: config_path(path)?,
+            })
         }
         ["client", "proxy", "--status"] => Ok(Command::ClientProxyStatus),
         ["client", "proxy", "--recover", "--confirm"] => Ok(Command::ClientProxyRecover),
@@ -660,8 +662,17 @@ mod tests {
     #[test]
     fn wininet_system_proxy_requires_independent_confirmation_and_recovery_is_explicit() {
         assert_eq!(
-            command(&["client", "run", "--config", "client.toml", "--system-proxy", "--confirm"]),
-            Ok(Command::ClientRunSystemProxy { config: "client.toml".into() })
+            command(&[
+                "client",
+                "run",
+                "--config",
+                "client.toml",
+                "--system-proxy",
+                "--confirm"
+            ]),
+            Ok(Command::ClientRunSystemProxy {
+                config: "client.toml".into()
+            })
         );
         assert_eq!(
             command(&["client", "proxy", "--status"]),
@@ -677,7 +688,14 @@ mod tests {
             vec!["client", "run", "--config", "client.toml", "--confirm"],
             vec!["client", "proxy", "--recover"],
             vec!["client", "proxy", "--force"],
-            vec!["server", "run", "--config", "server.toml", "--system-proxy", "--confirm"],
+            vec![
+                "server",
+                "run",
+                "--config",
+                "server.toml",
+                "--system-proxy",
+                "--confirm",
+            ],
         ] {
             assert_eq!(command(&invalid), Err(CliError::InvalidArguments));
         }
