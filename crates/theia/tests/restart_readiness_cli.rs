@@ -11,7 +11,10 @@ fn restart_check_is_a_recognized_explicit_management_command() {
         .env_remove("THEIA_CONTROL_PIPE")
         .output()
         .expect("compiled binary");
-    assert!(!output.status.success(), "no manager must never be reported ready");
+    assert!(
+        !output.status.success(),
+        "no manager must never be reported ready"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("management status unavailable"),
