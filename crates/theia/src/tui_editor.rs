@@ -846,7 +846,9 @@ mod tests {
         assert!(editor.issued_ready());
         let invite = editor.take_issued().expect("one-time replacement token");
         assert!(editor.take_issued().is_none());
-        assert!(Invitation::decode(&invite.encode().unwrap()).unwrap().has_token());
+        assert!(Invitation::decode(&invite.encode().unwrap())
+            .unwrap()
+            .has_token());
         let token = invite.token_bytes().unwrap();
         assert_ne!(token, [0x42; 32]);
         let stored = fs::read_to_string(&temp.0).unwrap();
