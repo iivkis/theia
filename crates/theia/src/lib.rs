@@ -378,6 +378,43 @@ mod tests {
     }
 
     #[test]
+    fn restart_requires_pin_of_actual_tls_pem_bytes_and_canonical_digest() {
+        let hex = "ab".repeat(32);
+        assert_eq!(
+            command(&["server", "tls", "fingerprint", "--config", "/tmp/server.toml"]),
+            Ok(Command::ServerTlsFingerprint {
+                config: "/tmp/server.toml".into(),
+            })
+        );
+        assert_eq!(
+            command(&[
+                "server", "restart", "--apply", "--expected-revision",
+                "7", "--sha256", &hex, "--tls-sha256", &hex, "--confirm",
+            ]),
+            Ok(Command::ServerApplyRestart {
+                expected_revision: 7,
+                candidate_sha256: [0xab; 32],
+                tls_sha256: [0xab; 32],
+            })
+        );
+        assert_eq!(
+            command(&[
+                "server", "restart", "--apply", "--expected-revision",
+                "7", "--sha256", &hex, "--confirm",
+            ]),
+            Err(CliError::InvalidArguments),
+            "old TOML-only restart Apply must fail closed"
+        );
+        assert_eq!(
+            command(&[
+                "server", "restart", "--apply", "--expected-revision",
+                "7", "--sha256", &hex, "--tls-sha256", &"AB".repeat(32), "--confirm",
+            ]),
+            Err(CliError::InvalidArguments)
+        );
+    }
+
+    #[test]
     fn supervised_restart_requires_explicit_confirmation_and_exact_sha256() {
         let digest = "ab".repeat(32);
         assert_eq!(
