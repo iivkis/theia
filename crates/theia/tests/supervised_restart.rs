@@ -640,6 +640,36 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             String::from_utf8_lossy(&reloaded.stderr)
         );
         assert!(revision(env_key, &endpoint, 3));
+
+        // Repeating the SAME-port rotation after an auth-only CAS must use
+        // its newest user/token baseline. This protects against stale View
+        // documents that would falsely classify valid PEM-only candidates as
+        // an unauthorized user mutation.
+        let mut rotate_again = document.clone();
+        rotate_again.server.inbounds[0].tls_cert =
+            format!("file:{}", old_cert.display());
+        rotate_again.server.inbounds[0].tls_key = format!("file:{}", old_key.display());
+        let again_hash = save(&config_path, &rotate_again);
+        apply(env_key, &endpoint, 3, &again_hash, true);
+        assert!(revision(env_key, &endpoint, 4));
+        let mut restored_ca = RootCertStore::empty();
+        restored_ca.add(old_identity.cert.der().clone()).unwrap();
+        let restored_h2 = H2Client::new(
+            &format!("127.0.0.1:{tcp_port}"),
+            "localhost",
+            &credential(0x43),
+            restored_ca.clone(),
+        )
+        .unwrap();
+        let restored_h3 = H3Client::new(
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            "localhost",
+            &credential(0x43),
+            restored_ca,
+        )
+        .unwrap();
+        assert!(restored_h2.open(address.clone(), echo_port).await.is_ok());
+        assert!(restored_h3.open(address, echo_port).await.is_ok());
         echo_task.abort();
     })
     .await
