@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -37,6 +38,24 @@ class LinuxGuestAddressTests(TestCase):
             with self.subTest(address=candidate):
                 with self.assertRaisesRegex(RuntimeError, "guest IPv4"):
                     guest_server.require_guest_ipv4(candidate)
+
+
+class LinuxCertificateTests(TestCase):
+    def test_fixture_cert_must_be_tls_server_leaf_not_ca(self) -> None:
+        # Strict rustls trust checks rejected the old CA:TRUE/keyCertSign
+        # self-signed certificate as an end-entity during real cross-OS E2E.
+        with TemporaryDirectory() as directory:
+            cert, key = guest_server.certificate(Path(directory), "server")
+            self.assertTrue(key.is_file())
+            details = subprocess.run(
+                ["openssl", "x509", "-in", str(cert), "-noout", "-text"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=12,
+            ).stdout
+            self.assertIn("CA:FALSE", details)
+            self.assertIn("TLS Web Server Authentication", details)
 
 
 class GuestIpTests(TestCase):
