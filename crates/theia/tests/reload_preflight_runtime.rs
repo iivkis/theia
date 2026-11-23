@@ -7,7 +7,7 @@ use std::{
     fs,
     net::{TcpListener, UdpSocket},
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
