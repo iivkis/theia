@@ -177,11 +177,22 @@ enum IssueFlow {
     Showing(Zeroizing<String>),
 }
 
+/// A deliberate server-only global account disable. No bearer is displayed,
+/// and a confirmed change stays pending until guarded TOML save succeeds.
+enum DisableFlow {
+    Input(String),
+    Confirm(String),
+    Saving,
+    SaveFailed,
+    Done,
+}
+
 /// UI dispatch is separate from all configuration/OS effects. A queued
 /// transition never runs until the user saves, discards or cancels explicitly.
 struct Interaction {
     editor: Option<Editor>,
     issuance: Option<IssueFlow>,
+    revocation: Option<DisableFlow>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
     candidate_batch: Option<CandidateBatchPanel>,
@@ -197,6 +208,7 @@ impl Interaction {
         Self {
             editor,
             issuance: None,
+            revocation: None,
             discovery: None,
             candidates: None,
             candidate_batch: None,
@@ -234,6 +246,13 @@ impl Interaction {
                         IssueFlow::Offer
                     } else {
                         IssueFlow::SaveFailed
+                    });
+                }
+                if matches!(self.revocation, Some(DisableFlow::Saving)) {
+                    self.revocation = Some(if saved {
+                        DisableFlow::Done
+                    } else {
+                        DisableFlow::SaveFailed
                     });
                 }
                 if saved {
@@ -472,6 +491,57 @@ impl Interaction {
             return false;
         }
 
+        if let Some(flow) = self.revocation.take() {
+            match flow {
+                DisableFlow::Input(mut id) => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter if !id.is_empty() => {
+                        self.revocation = Some(DisableFlow::Confirm(id));
+                    }
+                    KeyCode::Backspace => {
+                        id.pop();
+                        self.revocation = Some(DisableFlow::Input(id));
+                    }
+                    KeyCode::Char(ch)
+                        if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                            && (ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                            && id.len() < 64 =>
+                    {
+                        id.push(ch);
+                        self.revocation = Some(DisableFlow::Input(id));
+                    }
+                    _ => self.revocation = Some(DisableFlow::Input(id)),
+                },
+                DisableFlow::Confirm(id) => match key.code {
+                    KeyCode::Char('y') => {
+                        if editor.disable_user(&id).is_ok() {
+                            self.revocation = Some(DisableFlow::Saving);
+                            self.start_save();
+                        } else {
+                            self.revocation = Some(DisableFlow::Input(id));
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {}
+                    _ => self.revocation = Some(DisableFlow::Confirm(id)),
+                },
+                DisableFlow::Saving => self.revocation = Some(DisableFlow::Saving),
+                DisableFlow::SaveFailed => match key.code {
+                    KeyCode::Char('r') => {
+                        self.revocation = Some(DisableFlow::Saving);
+                        self.start_save();
+                    }
+                    KeyCode::Char('d') => editor.discard(),
+                    _ => self.revocation = Some(DisableFlow::SaveFailed),
+                },
+                DisableFlow::Done => {
+                    if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                        self.revocation = Some(DisableFlow::Done);
+                    }
+                }
+            }
+            return false;
+        }
+
         if let Some(original) = self.pending {
             match key.code {
                 KeyCode::Char('s') => {
@@ -561,6 +631,16 @@ impl Interaction {
                 } else {
                     editor.error = None;
                     self.issuance = Some(IssueFlow::Input(String::new()));
+                }
+                return false;
+            }
+            if editor.role() == Role::Server && key.code == KeyCode::Char('x') {
+                if editor.dirty() {
+                    editor.error =
+                        Some("Сохраните или отмените черновик перед отзывом доступа.".into());
+                } else {
+                    editor.error = None;
+                    self.revocation = Some(DisableFlow::Input(String::new()));
                 }
                 return false;
             }
@@ -707,7 +787,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, x: подтверждённое глобальное отключение существующего пользователя (только TOML), p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
             true,
         ),
     }
@@ -723,6 +803,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     } else if let Some(flow) = interaction.and_then(|ui| ui.issuance.as_ref()) {
         draw_issuance(
+            frame,
+            parts[1],
+            flow,
+            interaction.and_then(|ui| ui.editor.as_ref()),
+        );
+    } else if let Some(flow) = interaction.and_then(|ui| ui.revocation.as_ref()) {
+        draw_revocation(
             frame,
             parts[1],
             flow,
@@ -779,7 +866,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  u: пользователь  v: статус  Ctrl+R: подтверждённый Apply  Ctrl+S: сохранить",
+            "j/k: запись  Tab: поле  Enter/e: ввод  u: новый  x: отключить  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
@@ -828,6 +915,46 @@ fn draw_issuance(frame: &mut Frame<'_>, area: Rect, flow: &IssueFlow, editor: Op
     panel(frame, area, title, &body, true);
 }
 
+fn draw_revocation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    flow: &DisableFlow,
+    editor: Option<&Editor>,
+) {
+    let (title, body) = match flow {
+        DisableFlow::Input(id) => (
+            "Отключить существующего пользователя",
+            format!(
+                "ID пользователя с доступом к выбранному inbound: {id}\\n\\nEnter: проверить имя  Esc: отменить\\n\\n{}",
+                editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        DisableFlow::Confirm(id) => (
+            "Подтверждение отзыва доступа",
+            format!(
+                "Пользователь: {id}\\nВыбранный inbound: {}\\n\\nВНИМАНИЕ: отключение глобальное для всех inbound этого пользователя.\\nТокен и grants остаются в TOML, но новые запросы будут отклоняться после отдельного auth-only Apply. Текущие туннели не отзываются принудительно.\\n\\ny: подтвердить и сохранить  n/Esc: отменить",
+                editor.map_or("", |e| e.selected_record_id())
+            ),
+        ),
+        DisableFlow::Saving => (
+            "Отзыв доступа: сохранение",
+            "Проверка и атомарная запись TOML. Runtime не изменяется.".into(),
+        ),
+        DisableFlow::SaveFailed => (
+            "Отзыв доступа: ошибка сохранения",
+            format!(
+                "TOML НЕ сохранён. Runtime не изменён.\\n\\n{}\\n\\nr: повторить сохранение  d: отменить черновик",
+                editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        DisableFlow::Done => (
+            "Пользователь отключён в TOML",
+            "Файл сохранён. Для отказа в новых подключениях требуется отдельно проверить revision и подтвердить auth-only Apply. Уже открытые туннели не разрываются.\\n\\nEnter/Esc: закрыть.".into(),
+        ),
+    };
+    panel(frame, area, title, &body, true);
+}
+
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     let dirty = if editor.dirty() {
         "* Не сохранено"
@@ -835,7 +962,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь и grant: клавиша u. Ctrl+S только сохраняет, runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Отключение существующего: x (глобально по всем inbound). Ctrl+S только сохраняет; runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
