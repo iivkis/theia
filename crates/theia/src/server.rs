@@ -1292,16 +1292,17 @@ async fn stage_fresh_generation(
 > {
     let active = request.previous.document.as_ref();
     let candidate = &request.candidate;
+    let snapshot = request.material.as_ref().ok_or(())?;
     if !crate::restart_guard::same_shared_limits(active, candidate) {
         return Err(());
     }
-    if crate::restart_guard::probe(active, identities, candidate)
+    if crate::restart_guard::probe_captured(active, identities, candidate, snapshot)
         != Ok(crate::restart_guard::RestartVerdict::FreshPortsBindable)
     {
         return Err(());
     }
     let next_revision = request.expected_revision.checked_add(1).ok_or(())?;
-    let prepared = prepare_generation(candidate, next_revision, limits)
+    let prepared = prepare_generation(candidate, next_revision, limits, Some(snapshot))
         .await
         .map_err(|_| ())?;
     let next = crate::runtime_generation::View {
@@ -1335,13 +1336,14 @@ fn commit_same_port_tls(
 ) -> Result<(Vec<crate::reload_preflight::IdentityHash>, u64), ()> {
     let candidate = &request.candidate;
     let original = request.previous.document.as_ref();
-    if crate::restart_guard::probe(original, loaded_identities, candidate)
+    let snapshot = request.material.as_ref().ok_or(())?;
+    if crate::restart_guard::probe_captured(original, loaded_identities, candidate, snapshot)
         != Ok(crate::restart_guard::RestartVerdict::SamePortTlsReady)
         || running.identities.len() != candidate.server.inbounds.len()
     {
         return Err(());
     }
-    let prepared = prepare_same_port_tls(candidate).map_err(|_| ())?;
+    let prepared = prepare_same_port_tls(candidate, snapshot).map_err(|_| ())?;
     let (rebased_live, staged_auth) = request
         .previous
         .live
