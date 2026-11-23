@@ -1,8 +1,8 @@
-//! M4.2a: bounded, read-only local management transport.
+//! M4.2b1b: bounded Linux local management IPC with explicit CAS auth Apply.
 //!
 //! Linux-only opt-in endpoint via THEIA_CONTROL_DIR, a private, operator-owned
-//! runtime directory. No administrative TCP, reload, config mutation or secret
-//! data is exposed. Windows named pipes/ACL and transactional reload are open.
+//! runtime directory. No administrative TCP, token disclosure or TLS/listener mutation.
+//! Windows Named Pipe/DACL and TUI Apply remain separate milestones.
 //! The endpoint exists only while a server process is actually serving.
 use std::fmt;
 
@@ -60,7 +60,7 @@ impl fmt::Display for ManagementError {
             Self::Io => "local management I/O failed",
             Self::TimedOut => "local management request timed out",
             Self::InvalidReply => "invalid local management response",
-            Self::CandidateRejected => "candidate reload preflight rejected; runtime unchanged",
+            Self::CandidateRejected => "candidate or expected revision rejected; query status if Apply outcome is uncertain",
         };
         f.write_str(message)
     }
@@ -76,6 +76,8 @@ pub enum StatusCommand {
     Reload,
     /// Read-only preflight; does not modify config or runtime.
     CheckReload,
+    /// Explicit opt-in CAS auth publication, supported only by Linux server.
+    ApplyReload { expected_revision: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +86,11 @@ pub enum StatusReply {
     Running {
         inbounds: usize,
     },
+    RunningRevision { inbounds: usize, revision: u64 },
     Unsupported,
     /// Candidate passes the deliberately narrow compatibility preflight.
     Compatible,
+    Applied { revision: u64 },
 }
 
 #[cfg(target_os = "linux")]
@@ -125,6 +129,7 @@ pub struct StatusServer {
     inode: u64,
     inbounds: usize,
     preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
+    live: Option<Arc<crate::live_auth::LiveAuthorization>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -152,6 +157,7 @@ impl StatusServer {
             inode: metadata.ino(),
             inbounds,
             preflight: None,
+            live: None,
         })
     }
 
@@ -160,6 +166,16 @@ impl StatusServer {
         preflight: Arc<crate::reload_preflight::ReloadPreflight>,
     ) -> Self {
         self.preflight = Some(preflight);
+        self
+    }
+
+    /// Without both the running authorization controller and exact config
+    /// preflight, Apply remains unavailable (including test-only sockets).
+    pub(crate) fn with_live_authorization(
+        mut self,
+        live: Arc<crate::live_auth::LiveAuthorization>,
+    ) -> Self {
+        self.live = Some(live);
         self
     }
 
@@ -188,9 +204,12 @@ impl StatusServer {
                     if let Ok(permit) = concurrency.clone().try_acquire_owned() {
                         let inbounds = self.inbounds;
                         let preflight = self.preflight.clone();
+                        let live = self.live.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
-                            let _ = timeout(IO_TIMEOUT, handle(stream, inbounds, preflight)).await;
+                            // Cancelled handlers cannot publish. Their
+                            // spawn_blocking workers only load candidates.
+                            let _ = timeout(IO_TIMEOUT, handle(stream, inbounds, preflight, live)).await;
                         });
                     }
                     // Over budget: close socket immediately, never build a
@@ -220,6 +239,7 @@ async fn handle(
     mut stream: UnixStream,
     inbounds: usize,
     preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
+    live: Option<Arc<crate::live_auth::LiveAuthorization>>,
 ) -> Result<(), ManagementError> {
     let mut command = Vec::with_capacity(16);
     let mut newline = false;
