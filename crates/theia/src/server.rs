@@ -986,7 +986,11 @@ impl CapturedTls {
                 hash.update(chunk);
             }
             let identity = crate::reload_preflight::IdentityHash::from_pem(&cert, &key);
-            pairs.push(CapturedPem { cert, key, identity });
+            pairs.push(CapturedPem {
+                cert,
+                key,
+                identity,
+            });
         }
         Ok(Self {
             pairs,
@@ -999,7 +1003,10 @@ impl CapturedTls {
     }
 
     pub(crate) fn identities(&self) -> Vec<crate::reload_preflight::IdentityHash> {
-        self.pairs.iter().map(|pair| pair.identity.clone()).collect()
+        self.pairs
+            .iter()
+            .map(|pair| pair.identity.clone())
+            .collect()
     }
 
     fn material(&self, inbound: &Inbound, index: usize) -> Result<TlsMaterial, ServerError> {
@@ -2010,8 +2017,7 @@ mod hardening_tests {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-                .unwrap();
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
         let mut doc = live_auth_fixture();
