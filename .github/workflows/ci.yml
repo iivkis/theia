@@ -208,6 +208,7 @@ jobs:
   browser-e2e:
     name: browser-e2e (${{ matrix.os }})
     needs: specification
+    if: needs.specification.outputs.rust_ready == 'true'
     strategy:
       fail-fast: false
       matrix:
