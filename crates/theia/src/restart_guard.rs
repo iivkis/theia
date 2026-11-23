@@ -192,6 +192,22 @@ pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocu
     &normalized == active
 }
 
+/// Quota-only live update. Every typed TOML field except the two
+/// occupancy limits must be byte-for-byte equivalent after parsing.
+pub(crate) fn quota_only(active: &ServerDocument, candidate: &ServerDocument) -> bool {
+    let previous = &active.server.policy;
+    let updated = &candidate.server.policy;
+    if previous.max_connections_total == updated.max_connections_total
+        && previous.max_connections_per_user == updated.max_connections_per_user
+    {
+        return false;
+    }
+    let mut normalized = candidate.clone();
+    normalized.server.policy.max_connections_total = previous.max_connections_total;
+    normalized.server.policy.max_connections_per_user = previous.max_connections_per_user;
+    &normalized == active
+}
+
 /// First supervised-cutover slice must reuse the SAME global/per-user
 /// semaphores for both generations until bounded drain finishes. Changing
 /// quota or user inventory would silently double admission and is forbidden.
@@ -216,6 +232,29 @@ pub(crate) fn same_shared_limits(active: &ServerDocument, candidate: &ServerDocu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_only_rejects_unchanged_tls_user_or_listener_mutations() {
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
+        let crate::config::Config::Server(active) = crate::config::parse(&source).unwrap()
+        else {
+            panic!("example config");
+        };
+        let mut candidate = active.clone();
+        assert!(!quota_only(&active, &candidate));
+        candidate.server.policy.max_connections_total += 1;
+        assert!(quota_only(&active, &candidate));
+        candidate.server.users[0].disabled = true;
+        assert!(!quota_only(&active, &candidate));
+        candidate.server.users[0].disabled = false;
+        candidate.server.inbounds[0].tls_cert = "file:new.pem".to_owned();
+        assert!(!quota_only(&active, &candidate));
+        candidate.server.inbounds[0].tls_cert =
+            active.server.inbounds[0].tls_cert.clone();
+        candidate.server.policy.allow_private_ips = !active.server.policy.allow_private_ips;
+        assert!(!quota_only(&active, &candidate));
+    }
 
     #[test]
     fn same_port_tls_classification_refuses_any_quota_or_binding_mutation() {
