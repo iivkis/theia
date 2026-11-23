@@ -30,8 +30,12 @@ def certificate(directory: Path, name: str) -> tuple[Path, Path]:
             "-keyout", str(key), "-out", str(cert),
             "-subj", "/CN=localhost", "-days", "1",
             "-addext", "subjectAltName=DNS:localhost",
-            "-addext", "basicConstraints=critical,CA:TRUE",
-            "-addext", "keyUsage=critical,digitalSignature,keyCertSign",
+            # The actual Linux server presents this certificate as a TLS
+            # end entity. CA:TRUE/keyCertSign was rejected by strict clients:
+            # trust anchor registration does not make a CA valid as the leaf.
+            "-addext", "basicConstraints=critical,CA:FALSE",
+            "-addext", "keyUsage=critical,digitalSignature",
+            "-addext", "extendedKeyUsage=serverAuth",
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
