@@ -46,9 +46,17 @@ impl Drop for Temp {
 
 fn port(tcp: bool) -> u16 {
     if tcp {
-        StdTcp::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        StdTcp::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     } else {
-        StdUdp::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        StdUdp::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 }
 
@@ -81,13 +89,7 @@ fn revision(env_key: &str, endpoint: &str, value: u64) -> bool {
             .contains(&format!("authorization revision={value}"))
 }
 
-fn apply(
-    env_key: &str,
-    endpoint: &str,
-    expected: u64,
-    hex: &str,
-    should_succeed: bool,
-) {
+fn apply(env_key: &str, endpoint: &str, expected: u64, hex: &str, should_succeed: bool) {
     let output = cli(
         env_key,
         endpoint,
@@ -110,21 +112,15 @@ fn apply(
         String::from_utf8_lossy(&output.stderr)
     );
     if should_succeed {
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("supervised fresh-port restart applied"));
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("supervised fresh-port restart applied")
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .contains(&format!("revision={}", expected + 1))
+            String::from_utf8_lossy(&output.stdout).contains(&format!("revision={}", expected + 1))
         );
     }
 }
 
-fn write_identity(
-    cert: &Path,
-    key: &Path,
-    generated: &rcgen::CertifiedKey,
-) {
+fn write_identity(cert: &Path, key: &Path, generated: &rcgen::CertifiedKey) {
     fs::write(
         cert,
         format!(
@@ -332,7 +328,10 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         let hash = save(&config_path, &next);
         apply(env_key, &endpoint, 1, &hash, true);
         assert!(revision(env_key, &endpoint, 2));
-        assert!(server.0.try_wait().unwrap().is_none(), "supervisor died after cutover");
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "supervisor died after cutover"
+        );
         apply(env_key, &endpoint, 1, &hash, false);
         assert!(revision(env_key, &endpoint, 2));
 
