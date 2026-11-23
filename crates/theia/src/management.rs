@@ -130,7 +130,9 @@ pub enum StatusReply {
     RestartSamePortTlsReady,
     /// Valid quota-only candidate, no active connection is revoked.
     QuotaReady,
-    QuotaApplied { revision: u64 },
+    QuotaApplied {
+        revision: u64,
+    },
     /// All NEW candidate ports were temporarily bound, then released.
     RestartFreshPortsBindable,
     RestartApplied {
@@ -358,19 +360,28 @@ where
                     format!("theia-status-v1 running inbounds={inbounds}\n")
                 }
             }
-            candidate if parse_restart_revision(candidate).is_some()
-                || parse_quota_revision(candidate).is_some() =>
+            candidate
+                if parse_restart_revision(candidate).is_some()
+                    || parse_quota_revision(candidate).is_some() =>
             {
                 if let (Some(preflight), Some(runtime), Some(previous), Some(restarts)) =
                     (&preflight, &runtime, &observed, &restarts)
                 {
                     let (expected, sha256, kind) =
                         if let Some((revision, digest)) = parse_quota_revision(candidate) {
-                            (revision, digest, crate::runtime_generation::ChangeKind::Quota)
+                            (
+                                revision,
+                                digest,
+                                crate::runtime_generation::ChangeKind::Quota,
+                            )
                         } else {
                             let (revision, digest) =
                                 parse_restart_revision(candidate).expect("already parsed");
-                            (revision, digest, crate::runtime_generation::ChangeKind::Restart)
+                            (
+                                revision,
+                                digest,
+                                crate::runtime_generation::ChangeKind::Restart,
+                            )
                         };
                     let verb = if kind == crate::runtime_generation::ChangeKind::Quota {
                         "theia-quota-v1"
@@ -678,7 +689,10 @@ where
             _ => Err(ManagementError::InvalidReply),
         };
     }
-    if let StatusCommand::ApplyQuotaBound { expected_revision, .. } = command {
+    if let StatusCommand::ApplyQuotaBound {
+        expected_revision, ..
+    } = command
+    {
         let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
         let applied = text
             .strip_prefix("theia-quota-v1 applied revision=")
@@ -688,9 +702,7 @@ where
             Some(revision) if Some(revision) == expected_revision.checked_add(1) => {
                 Ok(StatusReply::QuotaApplied { revision })
             }
-            _ if reply == b"theia-quota-v1 rejected\n" => {
-                Err(ManagementError::CandidateRejected)
-            }
+            _ if reply == b"theia-quota-v1 rejected\n" => Err(ManagementError::CandidateRejected),
             _ if reply == b"ERR unsupported\n" => Err(ManagementError::Unsupported),
             _ => Err(ManagementError::InvalidReply),
         };
