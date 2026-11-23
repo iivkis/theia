@@ -1109,6 +1109,7 @@ type ReadyListener = (
     TlsAcceptor,
     quinn::Endpoint,
     Arc<ServerContext>,
+    quinn::ServerConfig,
 );
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1148,8 +1149,10 @@ async fn prepare_generation(
         let listener = TcpListener::bind(tcp_addr)
             .await
             .map_err(|_| ServerError::Io)?;
+        let h3_config = crate::quic_transport::server_config(material.certs, material.key)
+            .map_err(|_| ServerError::Tls)?;
         let endpoint =
-            crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
+            crate::quic_transport::server_endpoint_with_config(udp_addr, h3_config.clone())
                 .map_err(|_| ServerError::Io)?;
         let mut context = ServerContext::with_limits(
             inbound,
@@ -1161,7 +1164,7 @@ async fn prepare_generation(
             limits.peer_budget.clone(),
         );
         context.live_quota = Some(limits.ledger.clone());
-        listeners.push((listener, acceptor, endpoint, Arc::new(context)));
+        listeners.push((listener, acceptor, endpoint, Arc::new(context), h3_config));
     }
     Ok(PreparedGeneration {
         listeners,
@@ -1213,6 +1216,9 @@ struct RunningGeneration {
     tasks: JoinSet<Result<(), ServerError>>,
     phase: watch::Sender<GenerationPhase>,
     identities: Vec<HotIdentity>,
+    // Exact QUIC configs installed on the endpoints. Saved previous configs
+    // support a one-shot TLS undo without reading external PEM files again.
+    active_h3: Vec<quinn::ServerConfig>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1221,7 +1227,9 @@ impl RunningGeneration {
         let (sender, receiver) = watch::channel(phase);
         let mut tasks = JoinSet::new();
         let mut identities = Vec::with_capacity(listeners.len());
-        for (tcp, acceptor, udp, context) in listeners {
+        let mut active_h3 = Vec::with_capacity(listeners.len());
+        for (tcp, acceptor, udp, context, h3_config) in listeners {
+            active_h3.push(h3_config);
             let h2 = Arc::new(RwLock::new(acceptor));
             identities.push(HotIdentity {
                 h2: h2.clone(),
@@ -1243,6 +1251,7 @@ impl RunningGeneration {
             tasks,
             phase: sender,
             identities,
+            active_h3,
         }
     }
 
