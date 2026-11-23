@@ -58,37 +58,28 @@ for name in ("windows-smoke", "browser-e2e"):
     )
 require(needs("ci-gate") == mandatory, "ci-gate must depend on EVERY required job")
 require(needs("f14-cross-host") == {"specification", "rust-tests", "windows-smoke"},
-        "cross-OS Windows job must consume both Linux and Windows CI-built executables")
+        "F-14 must consume verified Linux and Windows CI-built executable artifacts")
 cross_host = job("f14-cross-host")
-require("needs.specification.outputs.rust_ready == 'true'" in cross_host,
-        "cross-OS acceptance must not run on specification-only PRs")
-require("runs-on: windows-2025" in cross_host,
-        "cross-OS acceptance must use a real native Windows runner")
-require("name: f14-linux-server" in cross_host
-        and "name: f14-windows-compiled" in cross_host
-        and cross_host.count("actions/download-artifact@v4") == 2,
-        "cross-OS must retrieve both natively compiled Linux and Windows binaries")
-require("Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4" in cross_host
-        and "wsl-version: 2" in cross_host,
-        "Linux must run under a pinned, real WSL2 VM")
+require("runs-on: windows-2025" in cross_host and "wsl-version: 2" in cross_host,
+        "F-14 must connect native Windows client to real Linux WSL2 VM")
+require("name: f14-linux-server" in cross_host and "name: f14-windows-compiled" in cross_host,
+        "F-14 must consume both native OS binaries, never build on WSL runner")
 require("scripts/f14-cross-os-ci.py" in cross_host
-        and "--windows-test" in cross_host
-        and "--windows-client" in cross_host
-        and "cargo build" not in cross_host
-        and "rust-toolchain" not in cross_host,
-        "cross-OS must execute precompiled Windows test harness without rebuilding Rust")
-require("Stage Windows E2E binaries already compiled by all-targets" in job("windows-smoke")
-        and "f14-windows-compiled" in job("windows-smoke")
-        and "actions/upload-artifact@v4" in job("windows-smoke"),
-        "Windows E2E binaries must come from the mandatory native Windows smoke job")
-require("python3 -m compileall -q scripts tests" in job("specification")
-        and "python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'" in job("specification"),
-        "fast Python syntax and guest IPv4 regressions must execute before native tests")
-require("continue-on-error" not in cross_host and "|| true" not in cross_host,
-        "mandatory Linux/Windows integration cannot be optional")
+        and "--windows-client" in cross_host and "--windows-test" in cross_host
+        and "cargo build" not in cross_host,
+        "F-14 must execute prebuilt native Windows harness without duplicate compilation")
 require("Build genuine Linux server for Windows cross-OS F-14 E2E" in job("rust-tests")
         and "actions/upload-artifact@v4" in job("rust-tests"),
-        "Linux executable must be built natively on Ubuntu and uploaded")
+        "Linux Theia ELF must originate from mandatory Linux native build")
+require("Stage Windows E2E binaries from Cargo JSON artifact paths" in job("windows-smoke")
+        and "cargo build --workspace --locked --bin theia --message-format=json" in job("windows-smoke")
+        and "name: f14-windows-compiled" in job("windows-smoke"),
+        "Windows Theia and test harness must originate from mandatory Windows smoke")
+require("python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'" in job("specification"),
+        "cheap F-14 WSL guest IP regression must precede expensive Rust builds")
+require("continue-on-error" not in cross_host and "|| true" not in cross_host,
+        "F-14 cross-OS acceptance cannot be made optional")
+
 gate = job("ci-gate")
 require("always()" in gate, "ci-gate must execute even when mandatory jobs fail")
 require('results.get(name, {}).get("result") != "success"' in gate,
@@ -108,6 +99,18 @@ require("windows-cross-sid-ci.ps1" in windows,
         "the second-SID test must actually run in CI")
 require("pywinpty==3.0.5 pyte==0.8.2" in windows,
         "the ConPTY/VT test dependencies must be pinned")
+require("Real Windows live Theia H2 fingerprint vs pinned Go uTLS" in windows
+        and "cargo test --workspace --locked --test fingerprint_h2" in windows,
+        "Windows fingerprint must reuse the previously compiled root workspace")
+require(windows.index("Native Windows tests")
+        < windows.index("Real Windows live Theia H2 fingerprint vs pinned Go uTLS"),
+        "fingerprint must run after native Windows root build")
+require("cargo test --workspace --locked --test fingerprint_h2" not in job("m0-1-windows-spike"),
+        "isolated Windows M0.1 job must not repeat the whole root workspace build")
+require("go mod verify" in windows and "go run . $hello" in windows,
+        "native Windows fingerprint must generate its pinned uTLS reference")
+require("python3 -m compileall -q scripts tests" in job("specification"),
+        "cheap Python preflight must execute before Rust tests")
 linux = job("rust-tests")
 require("cargo test --workspace --all-targets --locked" in linux,
         "mandatory Linux all-target tests must run")
@@ -117,13 +120,64 @@ require("cargo clippy --workspace --all-targets --all-features -- -D warnings" i
         "mandatory Clippy warnings-as-errors must run")
 require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
 
+# Every OS/job variant runs against the *same* read-only formatting artifact.
+# Rustfmt and gofmt execute once before any expensive build/test starts.
+spec = job("specification")
+require("python3 tests/ci/test_format_artifact.py" in spec,
+        "format artifact source/path isolation tests must run before fan-out")
+require("cargo fmt --all" in spec
+        and "cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all" in spec
+        and "cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all" in spec,
+        "all Rust workspaces must be autoformatted first")
+require("gofmt -w" in spec and "scripts/ci-format.py" in spec,
+        "Go helpers must be formatted and the bounded artifact packaged")
+require("name: ci-formatted-source" in spec and "actions/upload-artifact@v4" in spec,
+        "specification must publish the canonical source artifact")
+for name in mandatory - {"specification", "f14-cross-host"}:
+    payload = job(name)
+    require("actions/download-artifact@v4" in payload
+            and "name: ci-formatted-source" in payload
+            and "Use canonical formatted sources for all tests" in payload,
+            f"{name} must apply the shared formatting artifact")
+    require(payload.index("Use canonical formatted sources for all tests")
+            < payload.index("cargo test") if "cargo test" in payload else True,
+            f"{name} must autoformat BEFORE compiling/running tests")
+require("persist-format" not in mandatory,
+        "autoformat persistence must never replace a required test job")
+persist = job("persist-format")
+require(needs("persist-format") == {"ci-gate"},
+        "source persistence must wait for the full green CI gate")
+require("needs.ci-gate.result == 'success'" in persist,
+        "failed tests must not permit autoformat commits")
+require("github.event_name == 'pull_request'" in persist
+        and "github.event.pull_request.head.repo.full_name == github.repository" in persist,
+        "no privileged writes for forks or untrusted events")
+require("ref: ${{ github.event.pull_request.head.sha }}" in persist
+        and 'test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"' in persist,
+        "never persist formatting against a stale or guessed PR head")
+require("actions/download-artifact@v4" in persist
+        and "name: ci-formatted-source" in persist,
+        "persistence must download the same artifact used by test jobs")
+require("python3 scripts/ci-format.py" in persist
+        and 'cmp "$RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar"' in persist,
+        "post-green commit must byte-verify against exactly the tested source archive")
+require('git push origin "HEAD:refs/heads/$HEAD_REF"' in persist,
+        "post-green formatting must use race-safe fast-forward push")
+require("gh workflow run" not in persist
+        and "actions: write" not in persist,
+        "autoformat must NOT request redundant full CI reruns or extra Actions permissions")
+require("contents: write" in persist,
+        "isolated post-green job needs scoped write permission to save formatting")
+require("contents: read" in workflow.split("jobs:", 1)[0],
+        "normal test jobs must remain read-only")
+
 require((ROOT / "spikes/m0_1/utls_reference/go.sum").is_file(),
         "pinned uTLS Go module dependency lock must exist")
 go_steps = re.findall(
-    r"(?m)^      - uses: actions/setup-go@v5\n        with:\n((?:          [^\n]+\n)+)",
+    r"(?m)^      - uses: actions/setup-go@v5\n(?:        if: [^\n]+\n)?        with:\n((?:          [^\n]+\n)+)",
     workflow,
 )
-require(len(go_steps) == 3, "all three test-only Go setup steps must be audited")
+require(len(go_steps) == 6, "all test-only and formatter Go toolchains must be audited")
 for step in go_steps:
     require("cache: true" in step,
             "Go module/build cache must be enabled for recurring CI")
