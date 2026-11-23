@@ -202,7 +202,7 @@ async fn client_scenario(
     drop(socks_socket);
 
     let mut process = Running(
-        Command::new(env!("CARGO_BIN_EXE_theia"))
+        Command::new(std::env::var_os("THEIA_F14_CLIENT_BIN").expect("CI must supply its compiled native Windows client"))
             .args(["client", "run", "--config"])
             .arg(&config_path)
             .env_remove("THEIA_AUTH_TOKEN")
