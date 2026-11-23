@@ -1020,6 +1020,210 @@ mod hardening_tests {
         assert_eq!(result, Ok(second));
     }
 
+    fn live_auth_fixture() -> ServerDocument {
+        use crate::config::{Management, ServerSettings, Ui};
+        let digest = |byte: u8| -> String {
+            Sha256::digest([byte; 32])
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        ServerDocument {
+            schema_version: 1,
+            server: ServerSettings {
+                enabled: true,
+                inbounds: vec![
+                    Inbound {
+                        id: "edge-a".into(),
+                        allowed_user_ids: vec!["alice".into()],
+                        h2_listen: "127.0.0.1:9443".into(),
+                        quic_listen: "127.0.0.1:9443".into(),
+                        server_name: "a.example.org".into(),
+                        tls_cert: "file:/tmp/theia-a.crt".into(),
+                        tls_key: "file:/tmp/theia-a.key".into(),
+                    },
+                    Inbound {
+                        id: "edge-b".into(),
+                        allowed_user_ids: vec!["bob".into()],
+                        h2_listen: "127.0.0.1:9444".into(),
+                        quic_listen: "127.0.0.1:9444".into(),
+                        server_name: "b.example.org".into(),
+                        tls_cert: "file:/tmp/theia-b.crt".into(),
+                        tls_key: "file:/tmp/theia-b.key".into(),
+                    },
+                ],
+                users: vec![
+                    User {
+                        id: "alice".into(),
+                        token_sha256: digest(7),
+                        disabled: false,
+                    },
+                    User {
+                        id: "bob".into(),
+                        token_sha256: digest(9),
+                        disabled: false,
+                    },
+                ],
+                policy: ServerPolicy {
+                    allow_private_ips: false,
+                    max_connections_per_user: 1,
+                    max_connections_total: 3,
+                    connect_timeout_ms: 1000,
+                },
+            },
+            management: Management {
+                ipc: "auto".into(),
+                log_level: "info".into(),
+            },
+            ui: Ui {
+                language: "ru".into(),
+            },
+        }
+    }
+
+    fn live_auth_contexts(
+        control: &crate::live_auth::LiveAuthorization,
+        document: &ServerDocument,
+    ) -> (ServerContext, ServerContext) {
+        let policy = &document.server.policy;
+        let total = Arc::new(Semaphore::new(policy.max_connections_total as usize));
+        let users: Arc<HashMap<_, _>> = Arc::new(
+            document
+                .server
+                .users
+                .iter()
+                .map(|u| {
+                    (
+                        u.id.clone(),
+                        Arc::new(Semaphore::new(policy.max_connections_per_user as usize)),
+                    )
+                })
+                .collect(),
+        );
+        let connections = Arc::new(Semaphore::new(policy.max_connections_total as usize));
+        let budget = Arc::new(PeerBudget::default());
+        let make = |inbound: &Inbound| {
+            ServerContext::with_limits(
+                inbound,
+                policy,
+                control.shared(),
+                total.clone(),
+                users.clone(),
+                connections.clone(),
+                budget.clone(),
+            )
+        };
+        (
+            make(&document.server.inbounds[0]),
+            make(&document.server.inbounds[1]),
+        )
+    }
+
+    fn live_bearer(byte: u8) -> String {
+        format!("Bearer {}", URL_SAFE_NO_PAD.encode([byte; 32]))
+    }
+
+    #[test]
+    fn m4_2b1a_staged_auth_is_invisible_until_atomic_publish_to_all_inbounds() {
+        use crate::live_auth::LiveAuthorization;
+        let document = live_auth_fixture();
+        let control = LiveAuthorization::new(document.clone()).unwrap();
+        let (a, b) = live_auth_contexts(&control, &document);
+        let old_alice = live_bearer(7);
+        let rotated_alice = live_bearer(8);
+        let bob = live_bearer(9);
+
+        // The session already granted on edge-a must survive a future
+        // credential revocation, without holding the auth snapshot lock.
+        let existing = a.authorize(Some(&old_alice)).unwrap();
+        let mut candidate = document.clone();
+        candidate.server.users[0].token_sha256 = Sha256::digest([8u8; 32])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        candidate.server.inbounds[0].allowed_user_ids = vec!["bob".into()];
+        candidate.server.inbounds[1].allowed_user_ids = vec!["alice".into()];
+        let staged = control.stage(&candidate, 1).unwrap();
+        assert_eq!(control.revision(), Ok(1));
+        assert_eq!(a.authorize(Some(&bob)).err(), Some(AuthFailure::Forbidden));
+        assert_eq!(b.authorize(Some(&rotated_alice)).err(), Some(AuthFailure::Unauthorized));
+
+        assert_eq!(control.publish(staged), Ok(2));
+        assert_eq!(control.revision(), Ok(2));
+        assert_eq!(a.authorize(Some(&old_alice)).err(), Some(AuthFailure::Unauthorized));
+        assert_eq!(b.authorize(Some(&bob)).err(), Some(AuthFailure::Forbidden));
+        // New requests on BOTH listener contexts see one published snapshot.
+        let bob_granted = a.authorize(Some(&bob)).unwrap();
+        let alice_granted = b.authorize(Some(&rotated_alice)).unwrap();
+        drop(existing);
+        drop(bob_granted);
+        drop(alice_granted);
+    }
+
+    #[test]
+    fn m4_2b1a_failed_candidate_stale_cas_and_foreign_stage_never_change_revision() {
+        use crate::live_auth::{LiveAuthError, LiveAuthorization};
+        let document = live_auth_fixture();
+        let control = LiveAuthorization::new(document.clone()).unwrap();
+        let foreign = LiveAuthorization::new(document.clone()).unwrap();
+        let (a, b) = live_auth_contexts(&control, &document);
+        let mut invalid = document.clone();
+        invalid.server.inbounds[0].allowed_user_ids = vec!["nonexistent".into()];
+        assert!(matches!(
+            control.stage(&invalid, 1),
+            Err(LiveAuthError::InvalidCandidate)
+        ));
+
+        let mut incompatible = document.clone();
+        incompatible.server.policy.max_connections_per_user = 2;
+        assert!(matches!(
+            control.stage(&incompatible, 1),
+            Err(LiveAuthError::RequiresRestart)
+        ));
+        assert_eq!(control.revision(), Ok(1));
+
+        let mut rotated = document.clone();
+        rotated.server.users[1].disabled = true;
+        let first = control.stage(&rotated, 1).unwrap();
+        let second = control.stage(&rotated, 1).unwrap();
+        let other = foreign.stage(&rotated, 1).unwrap();
+        assert_eq!(control.publish(other), Err(LiveAuthError::ForeignStage));
+        assert_eq!(control.revision(), Ok(1));
+        assert_eq!(control.publish(first), Ok(2));
+        assert_eq!(control.publish(second), Err(LiveAuthError::StaleRevision));
+        assert!(matches!(
+            control.stage(&document, 1),
+            Err(LiveAuthError::StaleRevision)
+        ));
+        assert_eq!(control.revision(), Ok(2));
+        assert_eq!(a.authorize(Some(&live_bearer(7))).is_ok(), true);
+        assert_eq!(b.authorize(Some(&live_bearer(9))).err(), Some(AuthFailure::Forbidden));
+    }
+
+    #[test]
+    fn m4_2b1a_rotating_token_does_not_reset_per_user_quota_or_existing_permit() {
+        use crate::live_auth::LiveAuthorization;
+        let document = live_auth_fixture();
+        let control = LiveAuthorization::new(document.clone()).unwrap();
+        let (a, _) = live_auth_contexts(&control, &document);
+        let existing = a.authorize(Some(&live_bearer(7))).unwrap();
+
+        let mut candidate = document.clone();
+        candidate.server.users[0].token_sha256 = Sha256::digest([8u8; 32])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let staged = control.stage(&candidate, 1).unwrap();
+        assert_eq!(control.publish(staged), Ok(2));
+        assert_eq!(
+            a.authorize(Some(&live_bearer(8))).err(),
+            Some(AuthFailure::Busy),
+            "rotated credential must share existing user's permit quota"
+        );
+        drop(existing);
+        assert!(a.authorize(Some(&live_bearer(8))).is_ok());
+    }
+
     #[test]
     fn configured_name_must_match_certificate_san() {
         let cert = rcgen::generate_simple_self_signed(vec!["theia.example".into()]).unwrap();
