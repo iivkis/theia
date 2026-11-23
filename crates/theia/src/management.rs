@@ -403,14 +403,12 @@ where
                             let document = preflight.load_restart_candidate_bound(sha256)?;
                             // Capture and validate each PEM exactly once.
                             // No subsequent supervisor disk reads are allowed.
-                            let material = crate::server::CapturedTls::capture(&document)
-                                .map_err(|_| {
+                            let material =
+                                crate::server::CapturedTls::capture(&document).map_err(|_| {
                                     crate::restart_guard::RestartError::InvalidTlsIdentity
                                 })?;
                             if !material.matches(&tls_pin.expect("restart must pin PEM")) {
-                                return Err(
-                                    crate::restart_guard::RestartError::InvalidTlsIdentity,
-                                );
+                                return Err(crate::restart_guard::RestartError::InvalidTlsIdentity);
                             }
                             Ok((document, Some(material)))
                         }
@@ -672,10 +670,8 @@ where
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            format!(
-                "restart-apply rev={expected_revision} sha256={digest} tls-sha256={tls}\n"
-            )
-            .into_bytes()
+            format!("restart-apply rev={expected_revision} sha256={digest} tls-sha256={tls}\n")
+                .into_bytes()
         }
         StatusCommand::ApplyReload { expected_revision } => {
             if expected_revision == 0 {
