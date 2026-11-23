@@ -24,9 +24,9 @@ pub mod local_proxy;
 pub mod management;
 pub mod protocol;
 pub mod quic_transport;
+pub(crate) mod quota;
 pub mod reload_preflight;
 pub mod restart_guard;
-pub(crate) mod quota;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
 pub mod server;
@@ -321,8 +321,14 @@ mod tests {
         );
         assert_eq!(
             command(&[
-                "server", "quota", "--apply", "--expected-revision",
-                "3", "--sha256", &digest, "--confirm"
+                "server",
+                "quota",
+                "--apply",
+                "--expected-revision",
+                "3",
+                "--sha256",
+                &digest,
+                "--confirm"
             ]),
             Ok(Command::ServerApplyQuota {
                 expected_revision: 3,
@@ -332,23 +338,40 @@ mod tests {
         for bad in ["0", "03", "+3", "-3", "3x"] {
             assert_eq!(
                 command(&[
-                    "server", "quota", "--apply", "--expected-revision",
-                    bad, "--sha256", &digest, "--confirm"
+                    "server",
+                    "quota",
+                    "--apply",
+                    "--expected-revision",
+                    bad,
+                    "--sha256",
+                    &digest,
+                    "--confirm"
                 ]),
                 Err(CliError::InvalidArguments)
             );
         }
         assert_eq!(
             command(&[
-                "server", "quota", "--apply", "--expected-revision",
-                "3", "--sha256", &digest
+                "server",
+                "quota",
+                "--apply",
+                "--expected-revision",
+                "3",
+                "--sha256",
+                &digest
             ]),
             Err(CliError::InvalidArguments)
         );
         assert_eq!(
             command(&[
-                "server", "quota", "--apply", "--expected-revision",
-                "3", "--sha256", &"AB".repeat(32), "--confirm"
+                "server",
+                "quota",
+                "--apply",
+                "--expected-revision",
+                "3",
+                "--sha256",
+                &"AB".repeat(32),
+                "--confirm"
             ]),
             Err(CliError::InvalidArguments)
         );
