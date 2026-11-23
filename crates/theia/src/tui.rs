@@ -672,7 +672,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                     frame,
                     parts[1],
                     "Для сервера",
-                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: состояние неизвестно (IPC ещё не реализован)\n\nЭтот экран только для чтения. Запуск сервера, редактирование и reload пока недоступны.",
+                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: v запрашивает настоящий статус через Linux IPC\n\nЭтот экран только для чтения. Нужен явный --role server --config FILE для редактирования и подтверждаемого Apply; без него здесь только статус.",
                     true,
                 );
             }
@@ -694,7 +694,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ни один шаг не применяет настройки. Runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
             true,
         ),
     }
@@ -772,7 +772,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  u: пользователь  p: сеть/IP  r/b/d: кандидаты  Ctrl+S: сохранить",
+            "j/k: запись  Tab: поле  Enter/e: ввод  u: пользователь  v: статус  Ctrl+R: подтверждённый Apply  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
@@ -828,7 +828,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: состояние неизвестно; reload не выполнялся.\nНовый пользователь и grant: клавиша u. Runtime и системный прокси не изменяются.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельное подтверждение auth-only Apply (только сохранённого TOML, Linux).\nНовый пользователь и grant: клавиша u. Ctrl+S только сохраняет, runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
@@ -851,7 +851,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
 }
 
 /// Edit only when both role and a config path are explicitly supplied.
-/// No service or OS-proxy changes; a separate IPC transaction is future work.
+/// Saving never changes a service. A separate, explicitly confirmed Linux\n/// IPC transaction is available only for saved server authorization deltas.
 pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(TuiError::NotInteractive);
