@@ -5,7 +5,7 @@
 use crate::{
     tui_candidate_batch::CandidateBatchPanel, tui_candidates::CandidateReview,
     tui_discovery::DiscoveryPanel, tui_domain::DomainPanel, tui_editor::Editor,
-    tui_probe::ProbePanel, Role,
+    tui_probe::ProbePanel, tui_runtime::RuntimePanel, Role,
 };
 use crossterm::{
     cursor::{Hide, Show},
@@ -187,6 +187,7 @@ struct Interaction {
     candidate_batch: Option<CandidateBatchPanel>,
     domain: Option<DomainPanel>,
     probe: Option<ProbePanel>,
+    runtime: Option<RuntimePanel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
 }
@@ -201,6 +202,7 @@ impl Interaction {
             candidate_batch: None,
             domain: None,
             probe: None,
+            runtime: None,
             pending: None,
             saving: None,
         }
@@ -252,6 +254,12 @@ impl Interaction {
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press || self.saving.is_some() {
+            return false;
+        }
+        if let Some(runtime) = self.runtime.as_mut() {
+            if runtime.key(key) {
+                self.runtime = None;
+            }
             return false;
         }
         if let Some(domain) = self.domain.as_mut() {
@@ -380,6 +388,10 @@ impl Interaction {
             return false;
         }
         let Some(editor) = self.editor.as_mut() else {
+            if model.screen == Screen::Server && key.code == KeyCode::Char('v') {
+                self.runtime = Some(RuntimePanel::open(None, false));
+                return false;
+            }
             if model.screen == Screen::Server && key.code == KeyCode::Char('p') {
                 self.discovery = Some(DiscoveryPanel::new());
                 return false;
@@ -497,6 +509,25 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            // An editable draft is never silently sent to the server.
+            // Ctrl+R requires an explicit saved source and then a second 'y'.
+            let apply_shortcut =
+                key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r');
+            if editor.role() == Role::Server && (key.code == KeyCode::Char('v') || apply_shortcut) {
+                if apply_shortcut && editor.dirty() {
+                    editor.error =
+                        Some("Сначала Ctrl+S: нельзя применять несохранённый черновик.".into());
+                } else {
+                    let saved = if editor.dirty() {
+                        None
+                    } else {
+                        Some(editor.saved_sha256())
+                    };
+                    self.runtime = Some(RuntimePanel::open(saved, apply_shortcut));
+                    editor.error = None;
+                }
+                return false;
+            }
             if editor.role() == Role::Server && key.code == KeyCode::Char('p') {
                 if editor.dirty() {
                     editor.error =
@@ -638,7 +669,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                     frame,
                     parts[1],
                     "Для сервера",
-                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: состояние неизвестно (IPC ещё не реализован)\n\nЭтот экран только для чтения. Запуск сервера, редактирование и reload пока недоступны.",
+                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: v запрашивает настоящий статус через Linux IPC\n\nЭтот экран только для чтения. Нужен явный --role server --config FILE для редактирования и подтверждаемого Apply; без него здесь только статус.",
                     true,
                 );
             }
@@ -660,11 +691,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ни один шаг не применяет настройки. Runtime и системный прокси не изменяются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
             true,
         ),
     }
-    if interaction.is_some_and(|ui| ui.saving.is_some()) {
+    if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
+        panel(frame, parts[1], runtime.title(), &runtime.body(), true);
+    } else if interaction.is_some_and(|ui| ui.saving.is_some()) {
         panel(
             frame,
             parts[1],
@@ -730,7 +763,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  u: пользователь  p: сеть/IP  r/b/d: кандидаты  Ctrl+S: сохранить",
+            "j/k: запись  Tab: поле  Enter/e: ввод  u: пользователь  v: статус  Ctrl+R: подтверждённый Apply  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
@@ -786,7 +819,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: состояние неизвестно; reload не выполнялся.\nНовый пользователь и grant: клавиша u. Runtime и системный прокси не изменяются.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельное подтверждение auth-only Apply (только сохранённого TOML, Linux).\nНовый пользователь и grant: клавиша u. Ctrl+S только сохраняет, runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
@@ -809,7 +842,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
 }
 
 /// Edit only when both role and a config path are explicitly supplied.
-/// No service or OS-proxy changes; a separate IPC transaction is future work.
+/// Saving never changes a service. A separate, explicitly confirmed Linux\n/// IPC transaction is available only for saved server authorization deltas.
 pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(TuiError::NotInteractive);
@@ -830,6 +863,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
     loop {
         if interaction.poll_save(&mut model)? {
             return Ok(());
+        }
+        if let Some(runtime) = interaction.runtime.as_mut() {
+            runtime.poll();
         }
         if let Some(discovery) = interaction.discovery.as_mut() {
             discovery.poll();
@@ -874,6 +910,62 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn m4_2c_server_status_and_apply_are_explicit_and_dirty_draft_cannot_commit() {
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "theia-tui-m42c-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
+        fs::write(&path, source).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+
+        assert!(!ui.update(&mut model, press(KeyCode::Char('v'))));
+        assert!(ui.runtime.is_some(), "v enters read-only IPC status panel");
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.runtime.is_none());
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(!ui.update(&mut model, ctrl_r));
+        assert!(ui.runtime.is_some(), "Ctrl+R never directly commits");
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.runtime.is_none());
+
+        let edit = ui.editor.as_mut().unwrap();
+        edit.begin();
+        edit.input = "edited.example.org".into();
+        assert!(edit.accept());
+        assert!(edit.dirty());
+        assert!(!ui.update(&mut model, ctrl_r));
+        assert!(ui.runtime.is_none(), "unsaved edits must block Apply");
+        assert!(ui
+            .editor
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Ctrl+S"));
+
+        // A client panel never gets a server Apply hotkey.
+        let client_path =
+            std::env::temp_dir().join(format!("theia-tui-m42c-client-{}.toml", std::process::id()));
+        fs::write(&client_path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut client = Interaction::new(Some(Editor::load(Role::Client, &client_path).unwrap()));
+        let mut client_model = Model::new(Some(Role::Client));
+        assert!(!client.update(&mut client_model, ctrl_r));
+        assert!(client.runtime.is_none());
+        fs::remove_file(path).unwrap();
+        fs::remove_file(client_path).unwrap();
     }
 
     #[test]

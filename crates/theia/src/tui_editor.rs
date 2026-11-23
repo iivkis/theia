@@ -360,6 +360,13 @@ impl Editor {
         self.draft != self.original
     }
 
+    /// An exact digest of the bytes last loaded or durably saved by this
+    /// editor. It is NOT the dirty draft or a bearer credential. The running
+    /// Linux server must verify the same bytes before accepting TUI Apply.
+    pub(crate) fn saved_sha256(&self) -> [u8; 32] {
+        Sha256::digest(&self.source).into()
+    }
+
     pub fn begin(&mut self) {
         if self.issued.is_some() {
             self.error = Some("Завершите одноразовую выдачу ссылки.".into());
@@ -892,6 +899,44 @@ mod tests {
         editor.backspace();
         assert_eq!(editor.input.len(), MAX_INPUT - 1);
         assert!(!editor.save());
+    }
+
+    #[test]
+    fn m4_2c_saved_digest_tracks_only_durable_bytes_not_unsaved_editor_draft() {
+        let path = std::env::temp_dir().join(format!(
+            "theia-m42c-editor-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"b".repeat(64));
+        std::fs::write(&path, source).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        let initial = editor.saved_sha256();
+        let observed: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
+        assert_eq!(initial, observed);
+        editor.begin();
+        editor.input = "updated.example.org".into();
+        assert!(editor.accept());
+        assert!(editor.dirty());
+        assert_eq!(
+            editor.saved_sha256(),
+            initial,
+            "draft is never considered saved"
+        );
+        assert!(editor.save());
+        assert!(!editor.dirty());
+        let on_disk: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
+        assert_ne!(on_disk, initial);
+        assert_eq!(
+            editor.saved_sha256(),
+            on_disk,
+            "only durably written bytes are approved"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[cfg(unix)]

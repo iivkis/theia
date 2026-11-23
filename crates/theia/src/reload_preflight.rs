@@ -137,6 +137,44 @@ impl ReloadPreflight {
             Ok(Config::Server(document)) => document,
             _ => return Err(ReloadCheckError::InvalidConfig),
         };
+        self.validate_candidate(candidate)
+    }
+
+    /// The TUI can only apply the *exact bytes* of its last saved document.
+    /// Read the live server's file ONCE and compare its digest before parsing.
+    /// This rejects a mismatched path, out-of-band edits and a stale preview;
+    /// the file worker is still purely read-only and cancellation-safe.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn load_candidate_bound(
+        &self,
+        expected_sha256: [u8; 32],
+    ) -> Result<ServerDocument, ReloadCheckError> {
+        use std::io::Read;
+        let file =
+            std::fs::File::open(&self.config_path).map_err(|_| ReloadCheckError::InvalidConfig)?;
+        let mut contents = zeroize::Zeroizing::new(Vec::new());
+        file.take(1024 * 1024 + 1)
+            .read_to_end(&mut contents)
+            .map_err(|_| ReloadCheckError::InvalidConfig)?;
+        if contents.len() > 1024 * 1024 {
+            return Err(ReloadCheckError::InvalidConfig);
+        }
+        let observed: [u8; 32] = Sha256::digest(contents.as_slice()).into();
+        if observed != expected_sha256 {
+            return Err(ReloadCheckError::InvalidConfig);
+        }
+        let source = std::str::from_utf8(&contents).map_err(|_| ReloadCheckError::InvalidConfig)?;
+        let candidate = match config::parse(source) {
+            Ok(Config::Server(document)) => document,
+            _ => return Err(ReloadCheckError::InvalidConfig),
+        };
+        self.validate_candidate(candidate)
+    }
+
+    fn validate_candidate(
+        &self,
+        candidate: ServerDocument,
+    ) -> Result<ServerDocument, ReloadCheckError> {
         assess_reload(&self.active, &candidate)?;
         if self.identities.len() != candidate.server.inbounds.len() {
             return Err(ReloadCheckError::IdentityDrift);
