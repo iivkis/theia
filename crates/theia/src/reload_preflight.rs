@@ -173,6 +173,42 @@ impl ReloadPreflight {
         self.validate_candidate(candidate)
     }
 
+    /// Content-bound restart candidate, read ONCE by a cancel-safe worker.
+    /// Unlike auth-only Apply this deliberately allows changed listeners/TLS,
+    /// but still never commits or opens a production socket on the worker.
+    pub(crate) fn load_restart_candidate_bound(
+        &self,
+        expected_sha256: [u8; 32],
+    ) -> Result<ServerDocument, crate::restart_guard::RestartError> {
+        use std::io::Read;
+        let file = std::fs::File::open(&self.config_path)
+            .map_err(|_| crate::restart_guard::RestartError::InvalidConfig)?;
+        let mut contents = zeroize::Zeroizing::new(Vec::new());
+        file.take(1024 * 1024 + 1)
+            .read_to_end(&mut contents)
+            .map_err(|_| crate::restart_guard::RestartError::InvalidConfig)?;
+        if contents.len() > 1024 * 1024 {
+            return Err(crate::restart_guard::RestartError::InvalidConfig);
+        }
+        let observed: [u8; 32] = Sha256::digest(contents.as_slice()).into();
+        if observed != expected_sha256 {
+            return Err(crate::restart_guard::RestartError::InvalidConfig);
+        }
+        let source = std::str::from_utf8(&contents)
+            .map_err(|_| crate::restart_guard::RestartError::InvalidConfig)?;
+        let candidate = match config::parse(source) {
+            Ok(Config::Server(document)) => document,
+            _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
+        };
+        Config::Server(candidate.clone())
+            .validate()
+            .map_err(|_| crate::restart_guard::RestartError::InvalidConfig)?;
+        if !candidate.server.enabled {
+            return Err(crate::restart_guard::RestartError::InvalidConfig);
+        }
+        Ok(candidate)
+    }
+
     fn validate_candidate(
         &self,
         candidate: ServerDocument,
