@@ -70,8 +70,8 @@ pub(crate) fn probe(
 ) -> Result<RestartVerdict, RestartError> {
     // Advisory readiness is NOT a reservation, pin, or Apply. However it
     // uses the same bounded validated PEM capture as the Apply path.
-    let captured = server::CapturedTls::capture(candidate)
-        .map_err(|_| RestartError::InvalidTlsIdentity)?;
+    let captured =
+        server::CapturedTls::capture(candidate).map_err(|_| RestartError::InvalidTlsIdentity)?;
     probe_captured(active, loaded_identities, candidate, &captured)
 }
 
