@@ -27,4 +27,4 @@ Client TLS trust remains strict and independent of the invitation; no automatic 
 
 ## Limitations
 
-No clipboard system access, QR, remote config admin, direct import without explicit client config, automatic CA provisioning, remote certificate verification during preview, direct Windows system proxy activation or H3/QUIC cross-host E2E. This PR introduces no new wire type, TOML schema, database, runtime dependency or new executable.
+No clipboard system access, QR, remote config admin, direct import without explicit client config, automatic CA provisioning, remote certificate verification during preview, direct Windows system proxy activation or cross-host H3/QUIC E2E. This PR introduces no new wire type, TOML schema, database, runtime dependency or new executable.
