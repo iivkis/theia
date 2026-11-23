@@ -113,6 +113,7 @@ impl Ledger {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn resize(&self, policy: &ServerPolicy) -> Result<(), QuotaError> {
         Self::validate_limits(policy)?;
         let mut usage = self.usage.lock().map_err(|_| QuotaError::Unavailable)?;
