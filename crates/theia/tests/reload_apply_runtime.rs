@@ -143,8 +143,8 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         let addr = Address::V4([127, 0, 0, 1]);
         let h2old = H2Client::new(&format!("127.0.0.1:{tcp}"), "localhost", &token(0x42), roots.clone()).unwrap();
         let h3old = H3Client::new(format!("127.0.0.1:{udp}").parse().unwrap(), "localhost", &token(0x42), roots.clone()).unwrap();
-        let h2_open = h2old.open(addr.clone(), target_port).await.unwrap();
-        let h3_open = h3old.open(addr.clone(), target_port).await.unwrap();
+        let mut h2_open = Some(h2old.open(addr.clone(), target_port).await.unwrap());
+        let mut h3_open = Some(h3old.open(addr.clone(), target_port).await.unwrap());
 
         // Stage is a safe read-only preview, not an implicit commit.
         doc.server.users[0].token_sha256 = hash(0x43);
@@ -172,9 +172,11 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         for old in [0u8, 1u8] {
             let (mut app, local) = tokio::io::duplex(256);
             let relay = if old == 0 {
-                tokio::spawn(async move { h2_open.relay(local).await.map_err(|e| format!("{e}")) })
+                let tunnel = h2_open.take().unwrap();
+                tokio::spawn(async move { tunnel.relay(local).await.map_err(|e| format!("{e}")) })
             } else {
-                tokio::spawn(async move { h3_open.relay(local).await.map_err(|e| format!("{e}")) })
+                let tunnel = h3_open.take().unwrap();
+                tokio::spawn(async move { tunnel.relay(local).await.map_err(|e| format!("{e}")) })
             };
             app.write_all(b"still-open").await.unwrap();
             let mut reply = [0; 10];
