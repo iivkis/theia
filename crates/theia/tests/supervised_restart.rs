@@ -354,6 +354,8 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         // Keep actual authenticated H2 and H3 tunnels alive through cutover.
         let h2_tunnel = old_h2.open(address.clone(), echo_port).await.unwrap();
         let h3_tunnel = old_h3.open(address.clone(), echo_port).await.unwrap();
+        assert!(!check_rollback(env_key, &endpoint, 1));
+        rollback(env_key, &endpoint, 1, false);
 
         let mut next = document.clone();
         let next_tcp = port(true);
@@ -416,6 +418,8 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         );
         apply(env_key, &endpoint, 1, &hash, false, &config_path);
         assert!(revision(env_key, &endpoint, 2));
+        assert!(!check_rollback(env_key, &endpoint, 2));
+        rollback(env_key, &endpoint, 2, false);
 
         let new_h2 = H2Client::new(
             &format!("127.0.0.1:{next_tcp}"),
