@@ -871,8 +871,7 @@ mod tls_restart_pin_tests {
     fn restart_native_ipc_fails_closed_without_two_exact_hex_digests() {
         let doc = "ab".repeat(32);
         let material = "cd".repeat(32);
-        let valid =
-            format!("restart-apply rev=7 sha256={doc} tls-sha256={material}");
+        let valid = format!("restart-apply rev=7 sha256={doc} tls-sha256={material}");
         assert_eq!(
             parse_restart_revision(valid.as_bytes()),
             Some((7, [0xab; 32], [0xcd; 32]))
@@ -882,11 +881,20 @@ mod tls_restart_pin_tests {
             format!("restart-apply rev=7 sha256={doc}"),
             format!("restart-apply rev=0 sha256={doc} tls-sha256={material}"),
             format!("restart-apply rev=07 sha256={doc} tls-sha256={material}"),
-            format!("restart-apply rev=7 sha256={doc} tls-sha256={}", "CD".repeat(32)),
-            format!("restart-apply rev=7 sha256={} tls-sha256={material}", "AB".repeat(32)),
+            format!(
+                "restart-apply rev=7 sha256={doc} tls-sha256={}",
+                "CD".repeat(32)
+            ),
+            format!(
+                "restart-apply rev=7 sha256={} tls-sha256={material}",
+                "AB".repeat(32)
+            ),
             format!("restart-apply rev=7 sha256={doc} tls-sha256={} ", material),
             format!("restart-apply rev=7 sha256={doc} tls-sha256={}0", material),
-            format!("restart-apply rev=7 sha256={doc} tls-sha256={}", "cd".repeat(31)),
+            format!(
+                "restart-apply rev=7 sha256={doc} tls-sha256={}",
+                "cd".repeat(31)
+            ),
             format!("restart-apply rev=7 sha256={doc} TLS-SHA256={material}"),
         ] {
             assert_eq!(parse_restart_revision(invalid.as_bytes()), None);
