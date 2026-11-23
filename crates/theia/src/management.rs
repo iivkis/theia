@@ -77,7 +77,9 @@ pub enum StatusCommand {
     /// Read-only preflight; does not modify config or runtime.
     CheckReload,
     /// Explicit opt-in CAS auth publication, supported only by Linux server.
-    ApplyReload { expected_revision: u64 },
+    ApplyReload {
+        expected_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,11 +88,16 @@ pub enum StatusReply {
     Running {
         inbounds: usize,
     },
-    RunningRevision { inbounds: usize, revision: u64 },
+    RunningRevision {
+        inbounds: usize,
+        revision: u64,
+    },
     Unsupported,
     /// Candidate passes the deliberately narrow compatibility preflight.
     Compatible,
-    Applied { revision: u64 },
+    Applied {
+        revision: u64,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -265,7 +272,9 @@ async fn handle(
                 if let Some(live) = &live {
                     match live.revision() {
                         Ok(revision) => {
-                            format!("theia-status-v2 running inbounds={inbounds} revision={revision}\n")
+                            format!(
+                                "theia-status-v2 running inbounds={inbounds} revision={revision}\n"
+                            )
                         }
                         Err(_) => "ERR unsupported\n".to_owned(),
                     }
@@ -293,8 +302,13 @@ async fn handle(
                     // publish the exact document that was just validated.
                     match tokio::task::spawn_blocking(move || preflight.load_candidate()).await {
                         Ok(Ok(candidate)) => {
-                            match live.stage(&candidate, expected).and_then(|stage| live.publish(stage)) {
-                                Ok(revision) => format!("theia-apply-v1 applied revision={revision}\n"),
+                            match live
+                                .stage(&candidate, expected)
+                                .and_then(|stage| live.publish(stage))
+                            {
+                                Ok(revision) => {
+                                    format!("theia-apply-v1 applied revision={revision}\n")
+                                }
                                 Err(_) => "theia-apply-v1 rejected\n".to_owned(),
                             }
                         }
@@ -316,7 +330,10 @@ async fn handle(
 
 #[cfg(target_os = "linux")]
 fn positive_decimal(value: &str) -> Option<u64> {
-    if value.is_empty() || value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     value.parse().ok()
