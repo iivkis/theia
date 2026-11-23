@@ -928,13 +928,13 @@ fn tls_material_from_bytes(
 ) -> Result<TlsMaterial, ServerError> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let identity = crate::reload_preflight::IdentityHash::from_pem(&cert_bytes, &key_bytes);
-    let mut cert_reader = BufReader::new(cert_bytes.as_slice());
+    let mut cert_reader = BufReader::new(cert_bytes);
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
         .map_err(|_| ServerError::Config)?;
     let leaf = certs.first().ok_or(ServerError::Config)?;
     check_certificate_name(leaf, &inbound.server_name)?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes.as_slice()))
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes))
         .map_err(|_| ServerError::Config)?
         .ok_or(ServerError::Config)?;
     Ok(TlsMaterial {
