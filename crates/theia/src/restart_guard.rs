@@ -68,22 +68,30 @@ pub(crate) fn probe(
     loaded_identities: &[IdentityHash],
     candidate: &ServerDocument,
 ) -> Result<RestartVerdict, RestartError> {
+    // Advisory readiness is NOT a reservation, pin, or Apply. However it
+    // uses the same bounded validated PEM capture as the Apply path.
+    let captured = server::CapturedTls::capture(candidate)
+        .map_err(|_| RestartError::InvalidTlsIdentity)?;
+    probe_captured(active, loaded_identities, candidate, &captured)
+}
+
+/// Restart decisions use the SAME captured bytes that will be given to the
+/// actual H2/H3 builders. No second file open is permitted after operator
+/// fingerprint comparison, including for same-port classification.
+pub(crate) fn probe_captured(
+    active: &ServerDocument,
+    loaded_identities: &[IdentityHash],
+    candidate: &ServerDocument,
+    captured: &server::CapturedTls,
+) -> Result<RestartVerdict, RestartError> {
     Config::Server(candidate.clone())
         .validate()
         .map_err(|_| RestartError::InvalidConfig)?;
     if !candidate.server.enabled {
         return Err(RestartError::InvalidConfig);
     }
-
-    // Verify every candidate's real name, PEM and key with the same strict
-    // TLS1.3/H2 config builder that startup uses. Refuse invalid candidates
-    // before touching any kernel listen address.
-    for inbound in &candidate.server.inbounds {
-        server::validate_listener_identity(inbound)
-            .map_err(|_| RestartError::InvalidTlsIdentity)?;
-    }
-
-    let identities_unchanged = loaded_identities.len() == candidate.server.inbounds.len()
+    let candidate_identities = captured.identities();
+    let identities_unchanged = loaded_identities.len() == candidate_identities.len()
         && active.server.inbounds.len() == candidate.server.inbounds.len()
         && active
             .server
@@ -91,17 +99,9 @@ pub(crate) fn probe(
             .iter()
             .zip(&candidate.server.inbounds)
             .zip(loaded_identities)
-            .all(|((before, after), original)| {
-                if before.id != after.id {
-                    return false;
-                }
-                let Ok(cert) = server::pem_data(&after.tls_cert, false) else {
-                    return false;
-                };
-                let Ok(key) = server::pem_data(&after.tls_key, true) else {
-                    return false;
-                };
-                original.matches(&cert, &key)
+            .zip(&candidate_identities)
+            .all(|(((before, after), original), candidate_identity)| {
+                before.id == after.id && original == candidate_identity
             });
     if assess_reload(active, candidate).is_ok() && identities_unchanged {
         return Ok(RestartVerdict::AuthorizationOnly);
