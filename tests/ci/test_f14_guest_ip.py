@@ -21,6 +21,23 @@ assert spec is not None and spec.loader is not None
 driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
 
+guest_server_path = ROOT / "scripts" / "f14-wsl-server.py"
+guest_spec = importlib.util.spec_from_file_location("theia_f14_wsl_server", guest_server_path)
+assert guest_spec is not None and guest_spec.loader is not None
+guest_server = importlib.util.module_from_spec(guest_spec)
+guest_spec.loader.exec_module(guest_server)
+
+
+class LinuxGuestAddressTests(TestCase):
+    def test_accepts_native_guest_ipv4(self) -> None:
+        self.assertIsNone(guest_server.require_guest_ipv4("172.25.17.8"))
+
+    def test_rejects_loopback_unspecified_ipv6_and_invalid(self) -> None:
+        for candidate in ("127.0.0.1", "0.0.0.0", "::1", "not-an-ip"):
+            with self.subTest(address=candidate):
+                with self.assertRaisesRegex(RuntimeError, "guest IPv4"):
+                    guest_server.require_guest_ipv4(candidate)
+
 
 class GuestIpTests(TestCase):
     def test_selects_non_loopback_virtual_nic(self) -> None:
