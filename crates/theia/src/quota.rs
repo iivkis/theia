@@ -3,6 +3,160 @@
 //! No async I/O or allocations on the successful admission critical section.
 use crate::config::{ServerPolicy, User};
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
+/// All active stream/user and transport occupancies are counted under ONE
+/// short lock. Resizing below occupancy creates admission debt, not a
+/// semaphore replacement that would forget already-open sessions.
+#[derive(Debug)]
+pub(crate) struct Ledger {
+    usage: Mutex<Usage>,
+}
+
+#[derive(Debug)]
+struct Usage {
+    per_user_limit: usize,
+    total_limit: usize,
+    sessions: usize,
+    connections: usize,
+    per_user: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuotaError {
+    InvalidLimit,
+    Unavailable,
+}
+
+pub(crate) struct Lease {
+    ledger: Arc<Ledger>,
+    kind: LeaseKind,
+}
+
+enum LeaseKind {
+    Session(String),
+    Connection,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A poisoned lock must never cause a panic from Drop; it must
+        // fail closed for future admissions instead of over-admitting.
+        if let Ok(mut usage) = self.ledger.usage.lock() {
+            match &self.kind {
+                LeaseKind::Session(user) => {
+                    usage.sessions -= 1;
+                    if let Some(count) = usage.per_user.get_mut(user) {
+                        *count -= 1;
+                    }
+                }
+                LeaseKind::Connection => usage.connections -= 1,
+            }
+        }
+    }
+}
+
+impl Ledger {
+    pub(crate) fn new(policy: &ServerPolicy, users: &[User]) -> Arc<Self> {
+        Arc::new(Self {
+            usage: Mutex::new(Usage {
+                per_user_limit: policy.max_connections_per_user as usize,
+                total_limit: policy.max_connections_total as usize,
+                sessions: 0,
+                connections: 0,
+                per_user: users.iter().map(|user| (user.id.clone(), 0)).collect(),
+            }),
+        })
+    }
+
+    /// Admission is a single non-async decision across both transports and
+    /// ALL inbounds. No new slot can sneak in while a quota cap is resized.
+    pub(crate) fn acquire_session(self: &Arc<Self>, user: &str) -> Option<Lease> {
+        let mut usage = self.usage.lock().ok()?;
+        if usage.sessions >= usage.total_limit
+            || *usage.per_user.get(user)? >= usage.per_user_limit
+        {
+            return None;
+        }
+        usage.sessions += 1;
+        *usage.per_user.get_mut(user)? += 1;
+        drop(usage);
+        Some(Lease {
+            ledger: Arc::clone(self),
+            kind: LeaseKind::Session(user.to_owned()),
+        })
+    }
+
+    pub(crate) fn acquire_connection(self: &Arc<Self>) -> Option<Lease> {
+        let mut usage = self.usage.lock().ok()?;
+        if usage.connections >= usage.total_limit {
+            return None;
+        }
+        usage.connections += 1;
+        drop(usage);
+        Some(Lease {
+            ledger: Arc::clone(self),
+            kind: LeaseKind::Connection,
+        })
+    }
+
+    fn validate_limits(policy: &ServerPolicy) -> Result<(), QuotaError> {
+        if policy.max_connections_per_user == 0
+            || policy.max_connections_total == 0
+            || policy.max_connections_per_user > policy.max_connections_total
+        {
+            return Err(QuotaError::InvalidLimit);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resize(&self, policy: &ServerPolicy) -> Result<(), QuotaError> {
+        Self::validate_limits(policy)?;
+        let mut usage = self.usage.lock().map_err(|_| QuotaError::Unavailable)?;
+        usage.per_user_limit = policy.max_connections_per_user as usize;
+        usage.total_limit = policy.max_connections_total as usize;
+        Ok(())
+    }
+
+    /// Acquire before CAS; only commit new caps AFTER authorization revision
+    /// successfully publishes. The guard is held across publication so
+    /// admission cannot race into the old free permits during a shrink.
+    pub(crate) fn prepare_resize(
+        &self,
+        policy: &ServerPolicy,
+    ) -> Result<PreparedResize<'_>, QuotaError> {
+        Self::validate_limits(policy)?;
+        let guard = self.usage.lock().map_err(|_| QuotaError::Unavailable)?;
+        Ok(PreparedResize {
+            guard,
+            per_user_limit: policy.max_connections_per_user as usize,
+            total_limit: policy.max_connections_total as usize,
+        })
+    }
+
+    #[cfg(test)]
+    fn occupancy(&self) -> Result<(usize, usize), QuotaError> {
+        let usage = self.usage.lock().map_err(|_| QuotaError::Unavailable)?;
+        Ok((usage.sessions, usage.connections))
+    }
+}
+
+pub(crate) struct PreparedResize<'a> {
+    guard: std::sync::MutexGuard<'a, Usage>,
+    per_user_limit: usize,
+    total_limit: usize,
+}
+
+impl PreparedResize<'_> {
+    pub(crate) fn commit(mut self) {
+        self.guard.per_user_limit = self.per_user_limit;
+        self.guard.total_limit = self.total_limit;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
