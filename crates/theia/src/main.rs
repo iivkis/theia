@@ -22,16 +22,15 @@ async fn main() {
             .await
             .map(|_| "client stopped".to_owned())
             .map_err(CliError::Client),
-        Ok(Command::ServerStatus) => management::query_environment(management::StatusCommand::Status)
-            .await
-            .map(|reply| match reply {
-                management::StatusReply::Running { inbounds } => {
-                    format!("server running; {inbounds} inbounds; reload not available")
+        Ok(Command::ServerStatus) => {
+            match management::query_environment(management::StatusCommand::Status).await {
+                Ok(management::StatusReply::Running { inbounds }) => {
+                    Ok(format!("server running; {inbounds} inbounds; reload not available"))
                 }
-                management::StatusReply::Unsupported => "server reload/status unsupported".to_owned(),
-                management::StatusReply::Healthy => "server healthy".to_owned(),
-            })
-            .map_err(CliError::Management),
+                Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
         Ok(command) => execute(command).map(str::to_owned),
         Err(error) => Err(error),
     };
