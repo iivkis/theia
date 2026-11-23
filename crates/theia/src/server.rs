@@ -1169,8 +1169,13 @@ mod hardening_tests {
         assert_eq!(b.authorize(Some(&bob)).err(), Some(AuthFailure::Forbidden));
         // New requests on BOTH listener contexts see one published snapshot.
         let bob_granted = a.authorize(Some(&bob)).unwrap();
-        let alice_granted = b.authorize(Some(&rotated_alice)).unwrap();
+        assert_eq!(
+            b.authorize(Some(&rotated_alice)).err(),
+            Some(AuthFailure::Busy),
+            "prior Alice session keeps the same per-user quota occupied"
+        );
         drop(existing);
+        let alice_granted = b.authorize(Some(&rotated_alice)).unwrap();
         drop(bob_granted);
         drop(alice_granted);
     }
