@@ -483,7 +483,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         assert_eq!(client.client.active_profile, "home");
         assert_eq!(client.client.profiles.len(), 2);
         let imported = &client.client.profiles[1];
-        assert_eq!(imported.auth_token.starts_with("file:"), true);
+        assert!(imported.auth_token.starts_with("file:"));
         assert!(!std::fs::read_to_string(&config_path)
             .unwrap()
             .contains(&token()));
