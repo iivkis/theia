@@ -299,11 +299,10 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 mod tests {
     use super::*;
 
-    #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn unsupported_platform_fails_closed_without_creating_a_listener() {
         assert_eq!(
