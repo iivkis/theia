@@ -785,7 +785,7 @@ mod tests {
         assert_eq!(imported.server, "edge.example.org:443");
         assert_eq!(imported.server_name, "edge.example.org");
         assert!(imported.tls_ca.is_none(), "trust is not granted by URI");
-        assert_eq!(imported.auth_token.starts_with("file:"), true);
+        assert!(imported.auth_token.starts_with("file:"));
         let secret_path = Path::new(imported.auth_token.strip_prefix("file:").unwrap());
         assert!(secret_path.is_absolute());
         assert_eq!(
