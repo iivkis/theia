@@ -70,6 +70,10 @@ pub enum Command {
     ServerTlsFingerprint {
         config: String,
     },
+    ServerTlsRollbackCheck,
+    ServerTlsRollbackApply {
+        expected_revision: u64,
+    },
     ServerCheckQuota,
     ServerApplyQuota {
         expected_revision: u64,
@@ -201,6 +205,12 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["server", "status"] => Ok(Command::ServerStatus),
         ["server", "reload", "--check"] => Ok(Command::ServerCheckReload),
         ["server", "restart", "--check"] => Ok(Command::ServerCheckRestart),
+        ["server", "tls", "rollback", "--check"] => Ok(Command::ServerTlsRollbackCheck),
+        ["server", "tls", "rollback", "--apply", "--expected-revision", revision, "--confirm"] => {
+            Ok(Command::ServerTlsRollbackApply {
+                expected_revision: expected_revision(revision)?,
+            })
+        }
         ["server", "tls", "fingerprint", "--config", path] => Ok(Command::ServerTlsFingerprint {
             config: config_path(path)?,
         }),
@@ -257,6 +267,8 @@ Usage:\n\
   theia server reload --check        # read-only compatibility check\n\
   theia server restart --check       # read-only restart readiness; never commits\n\
   theia server tls fingerprint --config <path>  # read-only PEM fingerprint\n\
+  theia server tls rollback --check   # in-memory rollback readiness, 300s window\n\
+  theia server tls rollback --apply --expected-revision N --confirm\n\
   theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm\n\
   theia server quota --check         # read-only occupancy-aware quota validation\n\
   theia server quota --apply --expected-revision N --sha256 HEX --confirm\n\
@@ -274,7 +286,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
-            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --expected-revision N\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
+            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server tls rollback --check | theia server tls rollback --apply --expected-revision N --confirm | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --expected-revision N\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
         }
         Command::Help(Some("client")) => {
             Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")
@@ -290,6 +302,8 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
         | Command::ServerCheckReload
         | Command::ServerCheckRestart
         | Command::ServerTlsFingerprint { .. }
+        | Command::ServerTlsRollbackCheck
+        | Command::ServerTlsRollbackApply { .. }
         | Command::ServerCheckQuota
         | Command::ServerApplyQuota { .. }
         | Command::ServerApplyRestart { .. }
