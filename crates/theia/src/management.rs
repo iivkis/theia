@@ -369,20 +369,22 @@ where
                 if let (Some(preflight), Some(runtime), Some(previous), Some(restarts)) =
                     (&preflight, &runtime, &observed, &restarts)
                 {
-                    let (expected, sha256, kind) =
+                    let (expected, sha256, kind, tls_pin) =
                         if let Some((revision, digest)) = parse_quota_revision(candidate) {
                             (
                                 revision,
                                 digest,
                                 crate::runtime_generation::ChangeKind::Quota,
+                                None,
                             )
                         } else {
-                            let (revision, digest) =
+                            let (revision, digest, tls_digest) =
                                 parse_restart_revision(candidate).expect("already parsed");
                             (
                                 revision,
                                 digest,
                                 crate::runtime_generation::ChangeKind::Restart,
+                                Some(tls_digest),
                             )
                         };
                     let verb = if kind == crate::runtime_generation::ChangeKind::Quota {
@@ -395,20 +397,36 @@ where
                     let preflight = Arc::clone(preflight);
                     let candidate = tokio::task::spawn_blocking(move || {
                         if kind == crate::runtime_generation::ChangeKind::Quota {
-                            preflight.load_quota_candidate_bound(sha256)
+                            let document = preflight.load_quota_candidate_bound(sha256)?;
+                            Ok((document, None))
                         } else {
-                            preflight.load_restart_candidate_bound(sha256)
+                            let document = preflight.load_restart_candidate_bound(sha256)?;
+                            // Capture and validate each PEM exactly once.
+                            // No subsequent supervisor disk reads are allowed.
+                            let material = crate::server::CapturedTls::capture(&document)
+                                .map_err(|_| {
+                                    crate::restart_guard::RestartError::InvalidTlsIdentity
+                                })?;
+                            if !material.matches(&tls_pin.expect("restart must pin PEM")) {
+                                return Err(
+                                    crate::restart_guard::RestartError::InvalidTlsIdentity,
+                                );
+                            }
+                            Ok((document, Some(material)))
                         }
                     })
                     .await;
                     match candidate {
-                        Ok(Ok(candidate)) if runtime.still_current(previous, expected) => {
+                        Ok(Ok((candidate, material)))
+                            if runtime.still_current(previous, expected) =>
+                        {
                             let (complete, result) = oneshot::channel();
                             let request = crate::runtime_generation::RestartRequest {
                                 kind,
                                 previous: Arc::clone(previous),
                                 expected_revision: expected,
                                 candidate,
+                                material,
                                 complete,
                             };
                             if restarts.try_send(request).is_err() {
