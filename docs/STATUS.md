@@ -21,7 +21,7 @@
 ## Открытые P0 и ограничения безопасности
 
 - **F-13:** именованный, измеренный browser-like TLS/HTTP профиль для реального Windows/Linux клиента и H2/H3 ещё не поставлен. Опциональный BoringSSL backend, Go uTLS эталон и Chromium измерения являются исследованием, а не профилем.
-- **F-14:** повторная выдача/ротация, безопасный файл/clipboard, проверенный клиентский импорт `theia://v1`, защищённое Windows хранилище, CA trust и автоматический Linux-server → Windows-client E2E остаются открытыми. `disabled=true` из редактора действует **только после** отдельного auth-only CAS Apply для новых запросов; активные туннели не отзываются.
+- **F-14:** повторная выдача/ротация, безопасный файл/clipboard, клиентский импорт `theia://v1` с защищённым файлом и CA (ADR-0055, PR/CI pending), полная Windows ACL/collision/recovery приёмка и автоматический Linux-server → Windows-client H2/H3 E2E остаются открытыми. `disabled=true` из редактора действует **только после** отдельного auth-only CAS Apply для новых запросов; активные туннели не отзываются.
 - **F-18:** криптографически проверенный REALITY-подобный security mode, anti-probing/replay, безопасный двухшаговый picker/Apply и cross-host security evidence не реализованы. `TlsEvidence`/score не доказывают DPI-невидимость и не авторизуют активные сетевые проверки.
 - **F-19:** flow-shaping, независимый TLS-in-TLS classifier, benchmark thresholds и измеренное улучшение не реализованы.
 - **M4.3:** Windows WinINet snapshot/confirm/apply/CAS restore и crash recovery не реализованы. Нельзя включать системный прокси автоматически.
