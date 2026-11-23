@@ -142,6 +142,59 @@ impl Editor {
         Ok(())
     }
 
+    /// M4.4b2a: disable an existing bearer without attempting to recover
+    /// or rotate its secret. The selected inbound must explicitly grant this
+    /// user; the confirmation UI warns that disable is global to all inbounds.
+    /// This changes only the local draft, never the running server.
+    pub fn disable_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+        let result = self.try_disable_user(user_id);
+        if let Err(message) = result {
+            self.error = Some(message.to_owned());
+        }
+        result
+    }
+
+    fn try_disable_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+        if self.role != Role::Server || self.editing || self.dirty() || self.issued.is_some() {
+            return Err("Finish or discard edits and pending issuance first");
+        }
+        let Config::Server(doc) = &self.draft else {
+            return Err("Server configuration required");
+        };
+        let Some(inbound) = doc.server.inbounds.get(self.selected_record) else {
+            return Err("Inbound missing");
+        };
+        if !inbound.allowed_user_ids.iter().any(|id| id == user_id) {
+            return Err("User is not granted on the selected inbound");
+        }
+        let Some(user) = doc.server.users.iter().find(|user| user.id == user_id) else {
+            return Err("User does not exist");
+        };
+        if user.disabled {
+            return Err("User is already disabled");
+        }
+        let mut candidate = self.draft.clone();
+        let Config::Server(candidate_doc) = &mut candidate else {
+            return Err("Server configuration required");
+        };
+        let Some(user) = candidate_doc
+            .server
+            .users
+            .iter_mut()
+            .find(|user| user.id == user_id)
+        else {
+            return Err("User does not exist");
+        };
+        user.disabled = true;
+        candidate
+            .validate()
+            .map_err(|_| "Disabled user did not pass configuration validation")?;
+        self.draft = candidate;
+        self.error = None;
+        self.notice = "Пользователь отключён в черновике. Сохранение не обновляет runtime.";
+        Ok(())
+    }
+
     pub fn issued_ready(&self) -> bool {
         self.issued.is_some() && self.issued_ready && !self.dirty()
     }
@@ -690,6 +743,96 @@ mod tests {
         assert_ne!(first, [0; 32]);
         assert_ne!(second, [0; 32]);
         assert!(editor.issue_user("device-a").is_err());
+    }
+
+    #[test]
+    fn user_disable_requires_clean_server_editor_and_explicit_selected_grant() {
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+
+        for user_id in ["", "missing", "bad id"] {
+            assert!(editor.disable_user(user_id).is_err());
+            assert!(!editor.dirty());
+        }
+        editor.begin();
+        assert!(editor.disable_user("device-a").is_err());
+        editor.cancel();
+        editor.begin();
+        editor.input = "other.example.org".into();
+        assert!(editor.accept());
+        assert!(editor.disable_user("device-a").is_err());
+        editor.discard();
+
+        let Config::Server(original) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        let previous_digest = original.server.users[0].token_sha256.clone();
+        assert!(editor.disable_user("device-a").is_ok());
+        assert!(editor.dirty());
+        assert!(editor.take_issued().is_none());
+        assert!(!config::read_file(&temp.0)
+            .unwrap()
+            .to_toml()
+            .unwrap()
+            .contains("disabled = true"));
+        assert!(editor.save());
+        let Config::Server(doc) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert!(doc.server.users[0].disabled);
+        assert_eq!(doc.server.users[0].token_sha256, previous_digest);
+        assert_eq!(doc.server.inbounds[0].allowed_user_ids, ["device-a"]);
+        assert_eq!(doc.server.inbounds[1].allowed_user_ids, ["device-a"]);
+        assert!(
+            editor.disable_user("device-a").is_err(),
+            "repeat disable must fail"
+        );
+    }
+
+    #[test]
+    fn user_disable_requires_exact_existing_inbound_grant_not_just_global_user() {
+        let Config::Server(mut doc) = config::parse(&two_inbounds()).unwrap() else {
+            panic!("server");
+        };
+        doc.server.users.push(User {
+            id: "device-b".into(),
+            token_sha256: format!("{:x}", Sha256::digest([0x43; 32])),
+            disabled: false,
+        });
+        doc.server.inbounds[1].allowed_user_ids = vec!["device-b".into()];
+        let temp = Temp::write(&Config::Server(doc).to_toml().unwrap());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.disable_user("device-b").is_err());
+        assert!(!editor.dirty());
+        editor.select_record(true);
+        assert_eq!(editor.selected_record_id(), "backup");
+        assert!(editor.disable_user("device-b").is_ok());
+        assert!(editor.save());
+        let Config::Server(after) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert!(!after.server.users[0].disabled);
+        assert!(after.server.users[1].disabled);
+        assert_eq!(after.server.inbounds[0].allowed_user_ids, ["device-a"]);
+        assert_eq!(after.server.inbounds[1].allowed_user_ids, ["device-b"]);
+    }
+
+    #[test]
+    fn user_disable_refuses_external_file_conflict_and_client_role() {
+        let temp = Temp::write(&server_source());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.disable_user("device-a").is_ok());
+        let changed = format!("# external edit\n{}", server_source());
+        fs::write(&temp.0, &changed).unwrap();
+        assert!(!editor.save());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), changed);
+        editor.discard();
+        assert!(!editor.dirty());
+
+        let client = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut client_editor = Editor::load(Role::Client, &client.0).unwrap();
+        assert!(client_editor.disable_user("device-a").is_err());
+        assert!(!client_editor.dirty());
     }
 
     #[test]
