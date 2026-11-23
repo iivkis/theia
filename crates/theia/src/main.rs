@@ -27,9 +27,9 @@ async fn main() {
                 Ok(management::StatusReply::Running { inbounds }) => Ok(format!(
                     "server running; {inbounds} inbounds; reload not available"
                 )),
-                Ok(management::StatusReply::RunningRevision { inbounds, revision }) => Ok(
-                    format!("server running; {inbounds} inbounds; authorization revision={revision}"),
-                ),
+                Ok(management::StatusReply::RunningRevision { inbounds, revision }) => Ok(format!(
+                    "server running; {inbounds} inbounds; authorization revision={revision}"
+                )),
                 Ok(_) => Err(CliError::Management(
                     management::ManagementError::InvalidReply,
                 )),
@@ -42,10 +42,12 @@ async fn main() {
             })
             .await
             {
-                Ok(management::StatusReply::Applied { revision }) => {
-                    Ok(format!("authorization applied; revision={revision}; existing tunnels retained"))
-                }
-                Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Ok(management::StatusReply::Applied { revision }) => Ok(format!(
+                    "authorization applied; revision={revision}; existing tunnels retained"
+                )),
+                Ok(_) => Err(CliError::Management(
+                    management::ManagementError::InvalidReply,
+                )),
                 Err(error) => Err(CliError::Management(error)),
             }
         }
