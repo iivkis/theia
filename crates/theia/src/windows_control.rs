@@ -259,7 +259,9 @@ impl WindowsServer {
                 let _permit = permit;
                 let _ = timeout(
                     management::IO_TIMEOUT,
-                    management::handle_internal(stream, inbounds, preflight, live, runtime, restarts),
+                    management::handle_internal(
+                        stream, inbounds, preflight, live, runtime, restarts,
+                    ),
                 )
                 .await;
             });
