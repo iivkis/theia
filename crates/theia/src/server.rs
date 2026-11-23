@@ -916,8 +916,16 @@ struct TlsMaterial {
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
-    let cert_bytes = pem_data(&inbound.tls_cert, false)?;
-    let key_bytes = pem_data(&inbound.tls_key, true)?;
+    let cert_bytes = zeroize::Zeroizing::new(pem_data(&inbound.tls_cert, false)?);
+    let key_bytes = zeroize::Zeroizing::new(pem_data(&inbound.tls_key, true)?);
+    tls_material_from_bytes(inbound, &cert_bytes, &key_bytes)
+}
+
+fn tls_material_from_bytes(
+    inbound: &Inbound,
+    cert_bytes: &[u8],
+    key_bytes: &[u8],
+) -> Result<TlsMaterial, ServerError> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let identity = crate::reload_preflight::IdentityHash::from_pem(&cert_bytes, &key_bytes);
     let mut cert_reader = BufReader::new(cert_bytes.as_slice());
@@ -935,6 +943,88 @@ fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         identity,
     })
+}
+
+/// One read of each external TLS PEM file, tied to the operator's
+/// independently supplied SHA-256. No private key bytes appear in IPC,
+/// stderr or logs; raw buffers are zeroized when the request/snapshot drops.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) struct CapturedTls {
+    pairs: Vec<CapturedPem>,
+    fingerprint: [u8; 32],
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct CapturedPem {
+    cert: zeroize::Zeroizing<Vec<u8>>,
+    key: zeroize::Zeroizing<Vec<u8>>,
+    identity: crate::reload_preflight::IdentityHash,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl CapturedTls {
+    /// Domain-separated and length-delimited digest, including stable inbound
+    /// IDs in document order. This prevents a reordered pair or ambiguous
+    /// PEM concatenation from sharing an operator approval fingerprint.
+    pub(crate) fn capture(document: &ServerDocument) -> Result<Self, ServerError> {
+        let mut hash = Sha256::new();
+        hash.update(b"theia-tls-pem-snapshot-v1\0");
+        hash.update((document.server.inbounds.len() as u64).to_be_bytes());
+        let mut pairs = Vec::with_capacity(document.server.inbounds.len());
+        for inbound in &document.server.inbounds {
+            let cert = zeroize::Zeroizing::new(pem_data(&inbound.tls_cert, false)?);
+            let key = zeroize::Zeroizing::new(pem_data(&inbound.tls_key, true)?);
+            // A successful fingerprint is proof of a usable TLS1.3 identity,
+            // not simply that two arbitrary private files could be hashed.
+            let material = tls_material_from_bytes(inbound, &cert, &key)?;
+            let _h2 = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
+            let _h3 = crate::quic_transport::server_config(material.certs, material.key)
+                .map_err(|_| ServerError::Tls)?;
+            let id = inbound.id.as_bytes();
+            for chunk in [id, cert.as_slice(), key.as_slice()] {
+                hash.update((chunk.len() as u64).to_be_bytes());
+                hash.update(chunk);
+            }
+            let identity = crate::reload_preflight::IdentityHash::from_pem(&cert, &key);
+            pairs.push(CapturedPem { cert, key, identity });
+        }
+        Ok(Self {
+            pairs,
+            fingerprint: hash.finalize().into(),
+        })
+    }
+
+    pub(crate) fn matches(&self, expected: &[u8; 32]) -> bool {
+        self.fingerprint.ct_eq(expected).unwrap_u8() == 1
+    }
+
+    pub(crate) fn identities(&self) -> Vec<crate::reload_preflight::IdentityHash> {
+        self.pairs.iter().map(|pair| pair.identity.clone()).collect()
+    }
+
+    fn material(&self, inbound: &Inbound, index: usize) -> Result<TlsMaterial, ServerError> {
+        let pair = self.pairs.get(index).ok_or(ServerError::Config)?;
+        tls_material_from_bytes(inbound, &pair.cert, &pair.key)
+    }
+}
+
+/// Read-only local CLI tool. It reads the same bounded private PEM files that
+/// the server will later capture; the resulting digest is public, NOT the key.
+/// Operators must compute this fingerprint from trusted/immutable PEM paths.
+pub fn tls_fingerprint_file(path: &Path) -> Result<[u8; 32], ServerError> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        let document = match config::read_file(path).map_err(|_| ServerError::Config)? {
+            Config::Server(document) => document,
+            _ => return Err(ServerError::Config),
+        };
+        Ok(CapturedTls::capture(&document)?.fingerprint)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = path;
+        Err(ServerError::Config)
+    }
 }
 
 fn tls_acceptor(
