@@ -23,7 +23,7 @@ import tempfile
 import time
 
 DISTRO = "Ubuntu-24.04"
-MAX_TRANSFER_BYTES = 64 * 1024 * 1024
+MAX_TRANSFER_BYTES = 256 * 1024 * 1024
 
 
 def wsl_command(*args: str) -> list[str]:
