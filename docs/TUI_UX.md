@@ -92,6 +92,10 @@ TLS-in-TLS в расширенных настройках: будущий пер
 
 После явного `THEIA_CONTROL_PIPE=id` действующий Windows-сервер предоставляет тот же status/revision и **подтверждаемый** auth-only CAS Apply, что Linux. TUI в роли server (`--role server --config FILE`) открывает `v` (read-only), `Ctrl+R` показывает ожидаемую running revision, и только отдельное `y` передаёт SHA-256 **сохранённого** TOML. Client TUI, dirty draft, неверная revision, отсутствующий Named Pipe/SID/DACL, incompatible или TLS-drift не должны применять. IPC не затрагивает Windows system proxy; потерянный ACK остаётся indeterminate, требуется status. Системное имя pipe формируется по TokenUser SID, из env принимается только короткий ASCII идентификатор. [ADR-0043](adr/0043-m4-2d-windows-sid-named-pipe.md).
 
+### M4.2k: TLS PEM snapshot pin, no TUI Apply
+
+При смене TLS/server restart оператор обязан сначала локально вычислить `server tls fingerprint --config FILE`, получить только SHA-256 фактических PEM сертификатов+ключей, затем передать оба дайджеста в `server restart --apply --expected-revision N --sha256 TOMLHEX --tls-sha256 PEMHEX --confirm` через защищённый native IPC. Старая TOML-only команда запрещена; `Shift+R` остаётся **read-only** и лишь предлагает провести эту операцию вручную. Смена PEM после расчёта отпечатка отклоняется до CAS, а H2/H3 строятся только из zeroized snapshot проверенных байтов. Старые auth-only и quota CAS не затронуты. Нет post-commit автоматического rollback, см. ADR-0051.
+
 ### M4.2j: live quota changes are explicit CLI-only
 
 Серверная TUI не выполняет и не предлагает quota Apply автоматически. Оператор сохраняет TOML (допускаются только два max_connections*), запускает read-only `theia server quota --check` через private IPC, затем отдельно даёт `theia server quota --apply --expected-revision N --sha256 HEX --confirm`. Уже открытые H2/H3 sessions продолжают работу; при снижении caps ниже occupancy новые admissions блокируются до освобождения permits, при увеличении новые slots сразу доступны. Status показывает монотонную revision, но текущие counts и отдельная графическая панель квот пока не реализованы. При timeout/потере ACK нельзя повторять Apply по предположению. ADR-0050.
@@ -102,7 +106,7 @@ TLS-in-TLS в расширенных настройках: будущий пер
 
 ### M4.2h: explicit CLI-only supervised fresh-port cutover
 
-Серверный CLI поддерживает отдельное подтверждённое `server restart --apply --expected-revision N --sha256 HEX --confirm`, которое действительно переключает H2/H3 listeners на **все новые порты** после prebind и CAS, с сохранением общего quota и ограниченным 20-секундным drain. Это не same-port TLS switch, не hot quota edit и не lossless migration. Server TUI Shift+R по-прежнему **только** проверяет готовность: y/a не выполняют restart, а оператор получает указание использовать CLI и точную SHA-256 сохранённого TOML. При timeout результата Apply повторять по предположению нельзя, необходим повторный status. ADR-0048.
+Серверный CLI поддерживает отдельное подтверждённое `server restart --apply --expected-revision N --sha256 TOMLHEX --tls-sha256 PEMHEX --confirm`, которое действительно переключает H2/H3 listeners на **все новые порты** после prebind и CAS, с сохранением общего quota и ограниченным 20-секундным drain. Это не same-port TLS switch, не hot quota edit и не lossless migration. Server TUI Shift+R по-прежнему **только** проверяет готовность: y/a не выполняют restart, а оператор получает указание использовать CLI и точную SHA-256 сохранённого TOML. При timeout результата Apply повторять по предположению нельзя, необходим повторный status. ADR-0048.
 
 ### M4.2g: внешний контролируемый restart readiness (без TUI cutover)
 
