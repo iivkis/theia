@@ -13,9 +13,7 @@ use std::{
     time::Duration,
 };
 use theia::{
-    config::{
-        Config, Inbound, Management, ServerDocument, ServerPolicy, ServerSettings, Ui, User,
-    },
+    config::{Config, Inbound, Management, ServerDocument, ServerPolicy, ServerSettings, Ui, User},
     management::{query_in, ManagementError, StatusCommand, StatusReply},
 };
 use tokio::time::{sleep, timeout};
@@ -53,7 +51,9 @@ fn fresh_port(tcp: bool) -> u16 {
 #[tokio::test]
 async fn live_binary_preflight_accepts_safe_delta_rejects_identity_drift_and_never_applies() {
     let directory = std::env::temp_dir().join(format!(
-        "theia-b0-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+        "theia-b0-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&directory).unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
