@@ -1620,13 +1620,19 @@ mod tests {
             panic!("server");
         };
         assert_ne!(after.server.users[0].token_sha256, old_hash);
-        assert_eq!(after.server.inbounds[0].allowed_user_ids, before.server.inbounds[0].allowed_user_ids);
+        assert_eq!(
+            after.server.inbounds[0].allowed_user_ids,
+            before.server.inbounds[0].allowed_user_ids
+        );
         ui.update(&mut model, press(KeyCode::Char('y')));
         let IssueFlow::Showing(link) = ui.issuance.as_ref().unwrap() else {
             panic!("one-time rotation reveal expected");
         };
         let token = Invitation::decode(link).unwrap().token_bytes().unwrap();
-        assert_eq!(after.server.users[0].token_sha256, format!("{:x}", Sha256::digest(token)));
+        assert_eq!(
+            after.server.users[0].token_sha256,
+            format!("{:x}", Sha256::digest(token))
+        );
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.issuance.is_none());
         assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
@@ -1637,10 +1643,8 @@ mod tests {
     #[test]
     fn rotation_shortcut_rejects_client_dirty_and_cancelled_confirmation() {
         use std::fs;
-        let path = std::env::temp_dir().join(format!(
-            "theia-m44b2b1-client-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("theia-m44b2b1-client-{}.toml", std::process::id()));
         fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
@@ -1648,10 +1652,8 @@ mod tests {
         assert!(ui.issuance.is_none());
         fs::remove_file(path).unwrap();
 
-        let path = std::env::temp_dir().join(format!(
-            "theia-m44b2b1-server-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("theia-m44b2b1-server-{}.toml", std::process::id()));
         fs::write(&path, server_issuance_fixture()).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
         let mut model = Model::new(Some(Role::Server));
