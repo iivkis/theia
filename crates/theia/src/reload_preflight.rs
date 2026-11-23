@@ -299,7 +299,9 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn on_disk_preflight_detects_pem_drift_without_writing_or_publishing() {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::fs;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
         let directory = std::env::temp_dir().join(format!(
             "theia-preflight-{}-{}",
             std::process::id(),
@@ -316,6 +318,7 @@ mod tests {
         let key_bytes = b"private key bytes captured when listener started";
         fs::write(&cert, cert_bytes).unwrap();
         fs::write(&key, key_bytes).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
         let mut active = document();
         active.server.inbounds[0].tls_cert = format!("file:{}", cert.display());
