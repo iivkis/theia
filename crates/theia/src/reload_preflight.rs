@@ -4,7 +4,9 @@
 //! existing users' token digests/disabled flags and existing inbound grants.
 //! Listener/TLS identity, quota policy and user inventory remain immutable.
 //! Real reload/rollback and Windows management IPC are separate milestones.
-use crate::config::{self, Config, ServerDocument};
+use crate::config::{Config, ServerDocument};
+#[cfg(any(target_os = "linux", test))]
+use crate::config;
 use std::fmt;
 
 #[cfg(any(target_os = "linux", test))]
