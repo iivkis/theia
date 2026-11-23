@@ -1,8 +1,8 @@
-//! M4.2c: bounded Linux management IPC with exact-content-bound TUI CAS Apply.
+//! M4.2d: shared bounded IPC protocol over private Linux socket or Windows SID Named Pipe.
 //!
 //! Linux-only opt-in endpoint via THEIA_CONTROL_DIR, a private, operator-owned
 //! runtime directory. No administrative TCP, token disclosure or TLS/listener mutation.
-//! Windows Named Pipe/DACL remains a separate milestone.
+//! Windows binds only explicit current-user SID DACL, never default pipe permissions.
 //! The endpoint exists only while a server process is actually serving.
 use std::fmt;
 
@@ -14,29 +14,28 @@ use std::{
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::PathBuf,
-    sync::Arc,
-    time::Duration,
 };
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::{sync::Arc, time::Duration};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
-    sync::Semaphore,
-    task::JoinSet,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
 };
+#[cfg(target_os = "linux")]
+use tokio::{net::{UnixListener, UnixStream}, sync::Semaphore, task::JoinSet};
 
 #[cfg(target_os = "linux")]
 const SOCKET_NAME: &str = "theia-server.sock";
-#[cfg(target_os = "linux")]
-const IO_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(target_os = "linux")]
-const MAX_COMMAND_BYTES: usize = 128;
-#[cfg(target_os = "linux")]
-const MAX_RESPONSE_BYTES: u64 = 128;
-#[cfg(target_os = "linux")]
-const MAX_CLIENTS: usize = 8;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const MAX_COMMAND_BYTES: usize = 128;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const MAX_RESPONSE_BYTES: u64 = 128;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const MAX_CLIENTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagementError {
@@ -246,13 +245,16 @@ impl Drop for StatusServer {
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn handle(
-    mut stream: UnixStream,
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) async fn handle<S>(
+    mut stream: S,
     inbounds: usize,
     preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
     live: Option<Arc<crate::live_auth::LiveAuthorization>>,
-) -> Result<(), ManagementError> {
+) -> Result<(), ManagementError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut command = Vec::with_capacity(16);
     let mut newline = false;
     for _ in 0..MAX_COMMAND_BYTES {
@@ -362,7 +364,7 @@ async fn handle(
     stream.shutdown().await.map_err(|_| ManagementError::Io)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn positive_decimal(value: &str) -> Option<u64> {
     if value.is_empty()
         || value.starts_with('0')
@@ -373,14 +375,14 @@ fn positive_decimal(value: &str) -> Option<u64> {
     value.parse().ok()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_apply_revision(command: &[u8]) -> Option<u64> {
     let raw = command.strip_prefix(b"apply-reload rev=")?;
     positive_decimal(std::str::from_utf8(raw).ok()?)
 }
 
 /// Canonical lowercase hex only; no ambiguity or relaxed delimiters.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn decode_digest(raw: &str) -> Option<[u8; 32]> {
     if raw.len() != 64
         || !raw
@@ -396,23 +398,21 @@ fn decode_digest(raw: &str) -> Option<[u8; 32]> {
     Some(digest)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_bound_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
     let rest = std::str::from_utf8(command.strip_prefix(b"apply-reload rev=")?).ok()?;
     let (revision, digest) = rest.split_once(" sha256=")?;
     Some((positive_decimal(revision)?, decode_digest(digest)?))
 }
 
-#[cfg(target_os = "linux")]
-pub async fn query_in(
-    directory: &Path,
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) async fn exchange<S>(
+    mut stream: S,
     command: StatusCommand,
-) -> Result<StatusReply, ManagementError> {
-    let path = endpoint_path(directory)?;
-    timeout(IO_TIMEOUT, async {
-        let mut stream = UnixStream::connect(&path)
-            .await
-            .map_err(|_| ManagementError::SocketUnavailable)?;
+) -> Result<StatusReply, ManagementError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
         let request = match command {
             StatusCommand::Health => b"health\n".to_vec(),
             StatusCommand::Status => b"status\n".to_vec(),
@@ -517,6 +517,19 @@ pub async fn query_in(
             }
         }
         Err(ManagementError::InvalidReply)
+}
+
+#[cfg(target_os = "linux")]
+pub async fn query_in(
+    directory: &Path,
+    command: StatusCommand,
+) -> Result<StatusReply, ManagementError> {
+    let path = endpoint_path(directory)?;
+    timeout(IO_TIMEOUT, async {
+        let stream = UnixStream::connect(&path)
+            .await
+            .map_err(|_| ManagementError::SocketUnavailable)?;
+        exchange(stream, command).await
     })
     .await
     .map_err(|_| ManagementError::TimedOut)?
@@ -529,7 +542,11 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
             std::env::var_os("THEIA_CONTROL_DIR").ok_or(ManagementError::NotConfigured)?;
         query_in(Path::new(&directory), command).await
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_control::query_environment(command).await
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = command;
         Err(ManagementError::Unsupported)
@@ -566,7 +583,7 @@ mod bound_command_tests {
     }
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "windows"))))]
 mod tests {
     use super::*;
 
