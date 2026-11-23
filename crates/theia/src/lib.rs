@@ -288,7 +288,9 @@ mod tests {
         );
         assert_eq!(
             command(&["server", "reload", "--expected-revision", "1"]),
-            Ok(Command::ServerApplyReload { expected_revision: 1 })
+            Ok(Command::ServerApplyReload {
+                expected_revision: 1
+            })
         );
         for invalid in ["0", "01", "-1", "+1", "1x", "18446744073709551616"] {
             assert_eq!(
