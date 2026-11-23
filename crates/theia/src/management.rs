@@ -129,8 +129,7 @@ impl StatusServer {
         let path = endpoint_path(directory)?;
         // bind() refuses a preexisting path instead of deleting it. It may
         // briefly create a world-accessible socket, but its parent is 0700.
-        let listener =
-            UnixListener::bind(&path).map_err(|_| ManagementError::SocketUnavailable)?;
+        let listener = UnixListener::bind(&path).map_err(|_| ManagementError::SocketUnavailable)?;
         let metadata = fs::symlink_metadata(&path).map_err(|_| ManagementError::Io)?;
         if !metadata.file_type().is_socket() {
             return Err(ManagementError::Io);
@@ -189,9 +188,7 @@ impl Drop for StatusServer {
     fn drop(&mut self) {
         // Never unlink another process's replacement socket or regular file.
         if let Ok(meta) = fs::symlink_metadata(&self.path) {
-            if meta.file_type().is_socket()
-                && meta.dev() == self.device
-                && meta.ino() == self.inode
+            if meta.file_type().is_socket() && meta.dev() == self.device && meta.ino() == self.inode
             {
                 let _ = fs::remove_file(&self.path);
             }
@@ -288,9 +285,7 @@ pub async fn query_in(
     .map_err(|_| ManagementError::TimedOut)?
 }
 
-pub async fn query_environment(
-    command: StatusCommand,
-) -> Result<StatusReply, ManagementError> {
+pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, ManagementError> {
     #[cfg(target_os = "linux")]
     {
         let directory =
