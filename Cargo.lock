@@ -1575,7 +1575,7 @@ dependencies = [
  "tokio-btls",
  "tokio-rustls",
  "toml",
- "windows-sys",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
