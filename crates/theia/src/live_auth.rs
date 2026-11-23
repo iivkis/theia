@@ -115,19 +115,53 @@ pub struct StagedAuthorization {
 
 impl LiveAuthorization {
     pub fn new(baseline: ServerDocument) -> Result<Self, LiveAuthError> {
+        Self::new_at_revision(baseline, 1)
+    }
+
+    /// A real listener generation restart increments the monotonic CAS
+    /// revision, so a pre-cutover management request cannot be replayed.
+    pub(crate) fn new_at_revision(
+        baseline: ServerDocument,
+        revision: u64,
+    ) -> Result<Self, LiveAuthError> {
+        if revision == 0 {
+            return Err(LiveAuthError::InvalidCandidate);
+        }
         Config::Server(baseline.clone())
             .validate()
             .map_err(|_| LiveAuthError::InvalidCandidate)?;
         if !baseline.server.enabled {
             return Err(LiveAuthError::InvalidCandidate);
         }
-        let initial = AuthSnapshot::for_document(&baseline, 1);
+        let initial = AuthSnapshot::for_document(&baseline, revision);
         Ok(Self {
             baseline,
             shared: Arc::new(AuthCell {
                 current: RwLock::new(Arc::new(initial)),
             }),
         })
+    }
+
+    /// Stop NEW H2/H3 authorization requests on the retiring generation.
+    /// Already authenticated stream permits remain held until natural drain
+    /// or the bounded grace deadline. This is NOT hard tunnel revocation.
+    pub(crate) fn close_new_admission(&self) -> Result<(), LiveAuthError> {
+        let mut guard = self
+            .shared
+            .current
+            .write()
+            .map_err(|_| LiveAuthError::Unavailable)?;
+        let previous = &**guard;
+        let mut users = previous.users.clone();
+        for user in &mut users {
+            user.disabled = true;
+        }
+        *guard = Arc::new(AuthSnapshot {
+            revision: previous.revision,
+            users,
+            grants: HashMap::new(),
+        });
+        Ok(())
     }
 
     pub(crate) fn shared(&self) -> Arc<AuthCell> {

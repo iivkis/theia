@@ -10,7 +10,7 @@ use crate::{
 use std::{ffi::c_void, mem::size_of, ptr::null_mut, sync::Arc, time::Duration};
 use tokio::{
     net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions},
-    sync::Semaphore,
+    sync::{mpsc, Semaphore},
     task::JoinSet,
     time::{sleep, timeout},
 };
@@ -182,6 +182,8 @@ pub struct WindowsServer {
     inbounds: usize,
     preflight: Option<Arc<ReloadPreflight>>,
     live: Option<Arc<LiveAuthorization>>,
+    runtime: Option<Arc<crate::runtime_generation::State>>,
+    restarts: Option<mpsc::Sender<crate::runtime_generation::RestartRequest>>,
 }
 
 impl WindowsServer {
@@ -197,6 +199,8 @@ impl WindowsServer {
             inbounds,
             preflight: None,
             live: None,
+            runtime: None,
+            restarts: None,
         })
     }
 
@@ -220,6 +224,16 @@ impl WindowsServer {
         self
     }
 
+    pub(crate) fn with_supervisor(
+        mut self,
+        state: Arc<crate::runtime_generation::State>,
+        requests: mpsc::Sender<crate::runtime_generation::RestartRequest>,
+    ) -> Self {
+        self.runtime = Some(state);
+        self.restarts = Some(requests);
+        self
+    }
+
     pub async fn serve(mut self) -> Result<(), ManagementError> {
         let permits = Arc::new(Semaphore::new(management::MAX_CLIENTS));
         let mut tasks = JoinSet::new();
@@ -239,11 +253,15 @@ impl WindowsServer {
             let inbounds = self.inbounds;
             let preflight = self.preflight.clone();
             let live = self.live.clone();
+            let runtime = self.runtime.clone();
+            let restarts = self.restarts.clone();
             tasks.spawn(async move {
                 let _permit = permit;
                 let _ = timeout(
                     management::IO_TIMEOUT,
-                    management::handle(stream, inbounds, preflight, live),
+                    management::handle_internal(
+                        stream, inbounds, preflight, live, runtime, restarts,
+                    ),
                 )
                 .await;
             });

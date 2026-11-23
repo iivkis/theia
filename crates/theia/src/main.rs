@@ -51,6 +51,27 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
+        Ok(Command::ServerApplyRestart {
+            expected_revision,
+            candidate_sha256,
+        }) => {
+            match management::query_environment(
+                management::StatusCommand::ApplyRestartBound {
+                    expected_revision,
+                    candidate_sha256,
+                },
+            )
+            .await
+            {
+                Ok(management::StatusReply::RestartApplied { revision }) => Ok(format!(
+                    "supervised fresh-port restart applied; revision={revision}; old connections draining (max 20s); no same-port rollback guarantee"
+                )),
+                Ok(_) => Err(CliError::Management(
+                    management::ManagementError::InvalidReply,
+                )),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
         Ok(Command::ServerCheckRestart) => {
             match management::query_environment(management::StatusCommand::CheckRestart).await {
                 Ok(management::StatusReply::RestartAuthorizationOnly) => Ok(

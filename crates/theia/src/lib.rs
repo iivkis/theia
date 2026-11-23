@@ -26,6 +26,8 @@ pub mod protocol;
 pub mod quic_transport;
 pub mod reload_preflight;
 pub mod restart_guard;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) mod runtime_generation;
 pub mod server;
 pub mod tui;
 pub(crate) mod tui_candidate_batch;
@@ -51,15 +53,32 @@ pub enum Role {
 pub enum Command {
     Help(Option<&'static str>),
     Version,
-    Tui { role: Option<Role> },
-    TuiEdit { role: Role, config: String },
-    ServerRun { config: String },
+    Tui {
+        role: Option<Role>,
+    },
+    TuiEdit {
+        role: Role,
+        config: String,
+    },
+    ServerRun {
+        config: String,
+    },
     ServerStatus,
     ServerCheckReload,
     ServerCheckRestart,
-    ServerApplyReload { expected_revision: u64 },
-    ClientRun { config: String },
-    ConfigValidate { config: String },
+    ServerApplyRestart {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
+    },
+    ServerApplyReload {
+        expected_revision: u64,
+    },
+    ClientRun {
+        config: String,
+    },
+    ConfigValidate {
+        config: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +145,22 @@ fn role(raw: &str) -> Result<Role, CliError> {
     }
 }
 
+/// Accept only exact 64-char lowercase hex for the saved TOML SHA256.
+fn parse_restart_digest(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
 /// Parse arguments excluding argv[0]; reject unknown and duplicate flags.
 /// A recognized runtime command is NOT evidence that a runtime exists.
 pub fn parse(args: &[String]) -> Result<Command, CliError> {
@@ -149,6 +184,22 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["server", "status"] => Ok(Command::ServerStatus),
         ["server", "reload", "--check"] => Ok(Command::ServerCheckReload),
         ["server", "restart", "--check"] => Ok(Command::ServerCheckRestart),
+        ["server", "restart", "--apply", "--expected-revision", revision, "--sha256", digest, "--confirm"] =>
+        {
+            let expected_revision = revision
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .filter(|_| !revision.starts_with('0'))
+                .filter(|_| revision.bytes().all(|byte| byte.is_ascii_digit()))
+                .ok_or(CliError::InvalidArguments)?;
+            let candidate_sha256 =
+                parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?;
+            Ok(Command::ServerApplyRestart {
+                expected_revision,
+                candidate_sha256,
+            })
+        }
         ["server", "reload", "--expected-revision", raw] => {
             if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(CliError::InvalidArguments);
@@ -177,6 +228,7 @@ Usage:\n\
   theia server status                # read-only Linux opt-in IPC\n\
   theia server reload --check        # read-only compatibility check\n\
   theia server restart --check       # read-only restart readiness; never commits\n\
+  theia server restart --apply --expected-revision N --sha256 HEX --confirm\n\
   theia server reload --expected-revision N  # Linux CAS auth Apply\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
@@ -191,7 +243,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
-            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server reload --expected-revision N\nRestart check only probes candidate TLS and TCP/UDP ports; it does not reserve, apply, restart or guarantee rollback. CAS auth Apply requires private Linux THEIA_CONTROL_DIR or Windows THEIA_CONTROL_PIPE, plus expected running revision.")
+            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server restart --apply --expected-revision N --sha256 HEX --confirm | theia server reload --expected-revision N\nSupervised restart cutover supports only fresh, nonoverlapping listeners with unchanged quota and user IDs; old connections drain 20s. SHA256 must match exact saved TOML bytes; changes to overlapping ports and quotas require separate maintenance. Existing sessions are not migrated. A lost ACK is indeterminate, query status. CAS auth Apply requires private Linux THEIA_CONTROL_DIR or Windows THEIA_CONTROL_PIPE, plus expected running revision.")
         }
         Command::Help(Some("client")) => {
             Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")
@@ -206,6 +258,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
         Command::ServerStatus
         | Command::ServerCheckReload
         | Command::ServerCheckRestart
+        | Command::ServerApplyRestart { .. }
         | Command::ServerApplyReload { .. } => {
             Err(CliError::NotImplemented("async management IPC"))
         },
@@ -239,6 +292,75 @@ mod tests {
         assert!(execute(Command::Help(None))
             .unwrap()
             .contains("H2 server inbound"));
+    }
+
+    #[test]
+    fn supervised_restart_requires_explicit_confirmation_and_exact_sha256() {
+        let digest = "ab".repeat(32);
+        assert_eq!(
+            command(&[
+                "server",
+                "restart",
+                "--apply",
+                "--expected-revision",
+                "7",
+                "--sha256",
+                &digest,
+                "--confirm"
+            ]),
+            Ok(Command::ServerApplyRestart {
+                expected_revision: 7,
+                candidate_sha256: [0xabu8; 32],
+            })
+        );
+        for wrong_revision in ["0", "07", "-1", "+1", "1x", "18446744073709551616"] {
+            assert_eq!(
+                command(&[
+                    "server",
+                    "restart",
+                    "--apply",
+                    "--expected-revision",
+                    wrong_revision,
+                    "--sha256",
+                    &digest,
+                    "--confirm"
+                ]),
+                Err(CliError::InvalidArguments)
+            );
+        }
+        for wrong_digest in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            format!("{}f", digest),
+            "xx".repeat(32),
+        ] {
+            assert_eq!(
+                command(&[
+                    "server",
+                    "restart",
+                    "--apply",
+                    "--expected-revision",
+                    "7",
+                    "--sha256",
+                    &wrong_digest,
+                    "--confirm"
+                ]),
+                Err(CliError::InvalidArguments)
+            );
+        }
+        assert_eq!(
+            command(&[
+                "server",
+                "restart",
+                "--apply",
+                "--expected-revision",
+                "7",
+                "--sha256",
+                &digest
+            ]),
+            Err(CliError::InvalidArguments),
+            "a restart without --confirm may never become executable"
+        );
     }
 
     #[test]
