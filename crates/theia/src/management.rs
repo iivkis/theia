@@ -532,6 +532,30 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod bound_command_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_sha256_binding_is_required_before_any_apply_side_effect() {
+        let valid = format!("apply-reload rev=7 sha256={}", "ab".repeat(32));
+        assert_eq!(parse_bound_revision(valid.as_bytes()), Some((7, [0xabu8; 32])));
+        for invalid in [
+            format!("apply-reload rev=0 sha256={}", "ab".repeat(32)),
+            format!("apply-reload rev=07 sha256={}", "ab".repeat(32)),
+            format!("apply-reload rev=7 sha256={}", "AB".repeat(32)),
+            format!("apply-reload rev=7 sha256={}", "ab".repeat(31)),
+            format!("apply-reload rev=7 sha256={}0", "ab".repeat(32)),
+            format!("apply-reload rev=7 sha256={} ", "ab".repeat(32)),
+            format!("apply-reload rev=7 sha256={}", "gg".repeat(32)),
+            format!("apply-reload rev=7 SHA256={}", "ab".repeat(32)),
+            format!("apply-reload rev=18446744073709551616 sha256={}", "ab".repeat(32)),
+        ] {
+            assert_eq!(parse_bound_revision(invalid.as_bytes()), None);
+        }
+    }
+}
+
 #[cfg(all(test, not(target_os = "linux")))]
 mod tests {
     use super::*;
