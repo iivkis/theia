@@ -634,16 +634,16 @@ pub fn recover_explicit() -> Result<Recovery, ProxyError> {
     recover_locked()
 }
 
-pub struct OwnedProxy {
-    // Holding the mutex for client lifetime prevents a second instance from
-    // forcibly restoring the proxy while the first proxy is still serving.
+/// The Windows mutex is **thread-owned**, not task-owned. A Tokio task can
+/// resume on another OS thread after any await; therefore the mutex, WinINet
+/// apply and every CAS restore are pinned to this dedicated native thread.
+struct NativeOwner {
     _lock: Mutex,
     active: bool,
 }
-impl OwnedProxy {
-    /// Called ONLY after config/credential/CA validation and both loopback
-    /// listeners have successfully bound, on explicit --system-proxy --confirm.
-    pub fn apply(bind: SocketAddr) -> Result<Self, ProxyError> {
+
+impl NativeOwner {
+    fn apply(bind: SocketAddr) -> Result<Self, ProxyError> {
         let lock = Mutex::acquire()?;
         if read_journal()?.is_some() {
             return Err(ProxyError::RecoveryRequired);
@@ -659,9 +659,8 @@ impl OwnedProxy {
             before: before.clone(),
             applied: applied.clone(),
         })?;
-        // Strict CAS immediately before WinINet. External changes after this
-        // check may still race the native WinINet set: the post-check and
-        // recovery journal prevent silent forceful restoration.
+        // Compare-before-write. Other applications do not honor this mutex:
+        // a subsequent foreign edit cannot be overwritten during restore.
         if query()? != before {
             return Err(ProxyError::Conflict);
         }
@@ -675,22 +674,112 @@ impl OwnedProxy {
         })
     }
 
-    /// Synchronous guarded restore. A failed CAS leaves the durable journal
-    /// for explicit operator recovery, never a forced system change.
+    fn restore(&mut self) -> Result<Recovery, ProxyError> {
+        if !self.active {
+            return Ok(Recovery::NothingPending);
+        }
+        let outcome = recover_locked()?;
+        self.active = false;
+        Ok(outcome)
+    }
+}
+
+impl Drop for NativeOwner {
+    fn drop(&mut self) {
+        // Only the same native thread that acquired the Windows mutex
+        // can release it. A failed CAS preserves a private recovery journal.
+        let _ = self.restore();
+    }
+}
+
+type RestoreReply = std::sync::mpsc::SyncSender<Result<Recovery, ProxyError>>;
+
+pub struct OwnedProxy {
+    commands: Option<std::sync::mpsc::Sender<RestoreReply>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    active: bool,
+}
+
+impl OwnedProxy {
+    /// Called ONLY after config/credential/CA validation and both loopback
+    /// listeners have successfully bound, on explicit --system-proxy --confirm.
+    pub fn apply(bind: SocketAddr) -> Result<Self, ProxyError> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (commands_tx, commands_rx) = std::sync::mpsc::channel::<RestoreReply>();
+        let thread = std::thread::Builder::new()
+            .name("theia-wininet-owner".into())
+            .spawn(move || {
+                let mut owner = match NativeOwner::apply(bind) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                while let Ok(reply) = commands_rx.recv() {
+                    let outcome = owner.restore();
+                    let done = outcome.is_ok();
+                    let _ = reply.send(outcome);
+                    if done {
+                        break;
+                    }
+                }
+                // NativeOwner and the kernel mutex are dropped on THIS
+                // worker OS thread, even when the caller exits unexpectedly.
+            })
+            .map_err(|_| ProxyError::Unavailable)?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                commands: Some(commands_tx),
+                thread: Some(thread),
+                active: true,
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err(ProxyError::Unavailable)
+            }
+        }
+    }
+
+    /// Synchronous conditional restore on the same OS thread that owns
+    /// WinINet mutex; safe across async task migration or Ctrl+C callbacks.
     pub fn restore(&mut self) -> Result<Recovery, ProxyError> {
         if !self.active {
             return Ok(Recovery::NothingPending);
         }
-        let status = recover_locked()?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .ok_or(ProxyError::Unavailable)?
+            .send(tx)
+            .map_err(|_| ProxyError::Unavailable)?;
+        let outcome = rx.recv().map_err(|_| ProxyError::Unavailable)??;
         self.active = false;
-        Ok(status)
+        self.commands.take();
+        if let Some(thread) = self.thread.take() {
+            thread.join().map_err(|_| ProxyError::Unavailable)?;
+        }
+        Ok(outcome)
     }
 }
+
 impl Drop for OwnedProxy {
     fn drop(&mut self) {
-        // Best-effort unwind for normal returns/panics. Abrupt process kill
-        // cannot run destructors; explicit next-start recovery journal remains.
+        // Graceful client shutdown always requests CAS, never forced restore.
         let _ = self.restore();
+        // Release channel even after a foreign-write conflict, allowing the
+        // native worker to finish and release its *own thread's* Win32 mutex.
+        self.commands.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
