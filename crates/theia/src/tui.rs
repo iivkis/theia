@@ -922,6 +922,51 @@ mod tests {
     }
 
     #[test]
+    fn m4_2c_server_status_and_apply_are_explicit_and_dirty_draft_cannot_commit() {
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "theia-tui-m42c-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        fs::write(&path, include_str!("../../../examples/server.toml")).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+
+        assert!(!ui.update(&mut model, press(KeyCode::Char('v'))));
+        assert!(ui.runtime.is_some(), "v enters read-only IPC status panel");
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.runtime.is_none());
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(!ui.update(&mut model, ctrl_r));
+        assert!(ui.runtime.is_some(), "Ctrl+R never directly commits");
+        assert!(!ui.update(&mut model, press(KeyCode::Esc)));
+        assert!(ui.runtime.is_none());
+
+        let edit = ui.editor.as_mut().unwrap();
+        edit.begin();
+        edit.input = "edited.example.org".into();
+        assert!(edit.accept());
+        assert!(edit.dirty());
+        assert!(!ui.update(&mut model, ctrl_r));
+        assert!(ui.runtime.is_none(), "unsaved edits must block Apply");
+        assert!(ui.editor.as_ref().unwrap().error.as_ref().unwrap().contains("Ctrl+S"));
+
+        // A client panel never gets a server Apply hotkey.
+        let client_path = std::env::temp_dir().join(format!(
+            "theia-tui-m42c-client-{}.toml", std::process::id()
+        ));
+        fs::write(&client_path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut client = Interaction::new(Some(Editor::load(Role::Client, &client_path).unwrap()));
+        let mut client_model = Model::new(Some(Role::Client));
+        assert!(!client.update(&mut client_model, ctrl_r));
+        assert!(client.runtime.is_none());
+        fs::remove_file(path).unwrap();
+        fs::remove_file(client_path).unwrap();
+    }
+
+    #[test]
     fn model_navigation_help_and_safe_exit() {
         let mut app = Model::new(None);
         assert_eq!(app.screen, Screen::Home);
