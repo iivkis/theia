@@ -119,6 +119,8 @@ pub enum StatusReply {
     RestartAuthorizationOnly,
     /// Some active listener bind must be reused: maintenance is required.
     RestartRequiresMaintenance,
+    /// Exact existing TCP/UDP ports can rotate fully prevalidated TLS identities.
+    RestartSamePortTlsReady,
     /// All NEW candidate ports were temporarily bound, then released.
     RestartFreshPortsBindable,
     RestartApplied {
@@ -397,6 +399,9 @@ where
                         Ok(Ok(crate::restart_guard::RestartVerdict::AuthorizationOnly)) => {
                             "theia-restart-v1 auth-only\n".to_owned()
                         }
+                        Ok(Ok(crate::restart_guard::RestartVerdict::SamePortTlsReady)) => {
+                            "theia-restart-v1 same-port-tls\n".to_owned()
+                        }
                         Ok(Ok(crate::restart_guard::RestartVerdict::RequiresMaintenance)) => {
                             "theia-restart-v1 maintenance\n".to_owned()
                         }
@@ -631,6 +636,7 @@ where
         return match reply.as_slice() {
             b"theia-restart-v1 auth-only\n" => Ok(StatusReply::RestartAuthorizationOnly),
             b"theia-restart-v1 maintenance\n" => Ok(StatusReply::RestartRequiresMaintenance),
+            b"theia-restart-v1 same-port-tls\n" => Ok(StatusReply::RestartSamePortTlsReady),
             b"theia-restart-v1 ports-bindable\n" => Ok(StatusReply::RestartFreshPortsBindable),
             b"theia-restart-v1 rejected\n" => Err(ManagementError::CandidateRejected),
             b"ERR unsupported\n" => Err(ManagementError::Unsupported),
