@@ -153,8 +153,7 @@ mod tests {
     fn auth_only_cas_updates_tls_rotation_baseline_and_rejects_old_generation() {
         let source = include_str!("../../../examples/server.toml")
             .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
-        let crate::config::Config::Server(active) = crate::config::parse(&source).unwrap()
-        else {
+        let crate::config::Config::Server(active) = crate::config::parse(&source).unwrap() else {
             panic!("server config fixture must parse");
         };
         let live = Arc::new(LiveAuthorization::new(active.clone()).unwrap());
@@ -182,8 +181,7 @@ mod tests {
             Err(LiveAuthError::StaleRevision)
         ));
         let mut next_identity = updated.clone();
-        next_identity.server.inbounds[0].tls_cert =
-            "file:rotated-cert.pem".to_owned();
+        next_identity.server.inbounds[0].tls_cert = "file:rotated-cert.pem".to_owned();
         assert!(
             crate::restart_guard::same_port_tls_only(&current.document, &next_identity),
             "TLS rotation after auth CAS must compare the newest auth user state"
