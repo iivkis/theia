@@ -276,3 +276,108 @@ fn new_private_directory(_: &Path) -> io::Result<()> { Err(io::Error::other("uns
 #[cfg(not(any(unix, windows)))]
 fn new_private_file(_: &Path) -> io::Result<File> { Err(io::Error::other("unsupported platform")) }
 
+
+#[cfg(all(test, windows))]
+mod windows_acl_tests {
+    use super::*;
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr::null_mut};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION,
+        },
+    };
+
+    struct Local(*mut c_void);
+    impl Drop for Local {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: Win32 LocalAlloc allocation owned by this wrapper.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
+    fn sid(raw: &str) -> Local {
+        let wide = raw.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let mut sid: *mut c_void = null_mut();
+        // SAFETY: NUL-terminated Windows SID string and out pointer.
+        assert_ne!(unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) }, 0);
+        assert!(!sid.is_null());
+        Local(sid)
+    }
+
+    fn assert_exact_private_dacl(path: &Path) {
+        let mut wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut acl: *mut ACL = null_mut();
+        let mut descriptor: *mut c_void = null_mut();
+        // SAFETY: path points to a live owned object; output pointers valid.
+        assert_eq!(
+            unsafe {
+                GetNamedSecurityInfoW(
+                    wide.as_mut_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    &mut acl,
+                    null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        assert!(!acl.is_null(), "NULL DACL would allow everyone access");
+        let _descriptor = Local(descriptor);
+        let user = sid(&crate::windows_control::current_user_sid().unwrap());
+        let system = sid("S-1-5-18");
+        // SAFETY: ACL comes from a live kernel security descriptor.
+        let count = unsafe { (*acl).AceCount };
+        assert_eq!(count, 2, "only owner and LocalSystem may access token");
+        let mut seen_user = false;
+        let mut seen_system = false;
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = null_mut();
+            // SAFETY: index below the exact ACE count.
+            assert_ne!(unsafe { GetAce(acl, index, &mut ace) }, 0);
+            assert!(!ace.is_null());
+            let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: GetAce returned an ACCESS_ALLOWED_ACE pointer.
+            let header = unsafe { (*ace).Header };
+            assert_eq!(header.AceType, 0u8);
+            assert_eq!(header.AceFlags, 0u8, "must not inherit broad ACEs");
+            let actual = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast::<c_void>() };
+            // SAFETY: both SID allocations and security descriptor are live.
+            if unsafe { EqualSid(actual, user.0) } != 0 {
+                assert!(!seen_user);
+                seen_user = true;
+            } else if unsafe { EqualSid(actual, system.0) } != 0 {
+                assert!(!seen_system);
+                seen_system = true;
+            } else {
+                panic!("unexpected Windows principal in bearer ACL");
+            }
+        }
+        assert!(seen_user && seen_system);
+    }
+
+    #[test]
+    fn imported_bearer_file_and_directory_have_only_user_and_system_acl() {
+        let parent = std::env::temp_dir().join(format!(
+            "theia-import-acl-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&parent).unwrap();
+        let credential = PrivateBearer::create(&parent.join("client.toml"), &[0x42; 32])
+            .expect("must create protected directory and token file");
+        assert_exact_private_dacl(&credential.directory);
+        assert_exact_private_dacl(&credential.file);
+        drop(credential);
+        fs::remove_dir(&parent).unwrap();
+    }
+}
