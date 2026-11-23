@@ -14,7 +14,7 @@ Keep the privacy invariant and introduce a distinct, **default-enabled, safely s
 - Bounded `sync_channel(4096)` with `try_send` avoids blocking Tokio reactors on disk I/O. A dedicated thread writes/flushed lines and rotates atomically within its file set; overloads increment a counter and emit a `queue_overflow` marker when the writer catches up. Events may be lost if the queue stays full or the process/power dies abruptly. Successful normal CLI exit drains through an explicit flush barrier (up to 3 seconds).
 - Linux: log directory must be a non-symlink private `0700` directory; created log files are `0600`. Windows: default `%LOCALAPPDATA%\\Theia\\logs` inherits the account ACL; an override must be a directory accessible only to the intended operator. No elevated rights or fallback to an unprotected file.
 - Defaults: Linux `${XDG_STATE_HOME:-$HOME/.local/state}/theia/logs`; Windows `%LOCALAPPDATA%\\Theia\\logs`. Set `THEIA_TRACE_DIR` to an explicitly trusted private directory for CI/operations, or `THEIA_TRACE_OFF=1` to disable. If the file cannot be initialized, the application remains available and prints a path-free warning to stderr; diagnostics are incomplete rather than silently claiming success.
-- Native CI uses isolated `${{ runner.temp }}/theia-traces` directories and uploads trace artifacts **on failure**, with short retention. Test output is not copied into the logs.
+- Native CI uses isolated `${{ github.workspace }}/theia-traces` directories and uploads trace artifacts **on failure**, with short retention. Test output is not copied into the logs.
 
 ## Alternatives rejected
 
