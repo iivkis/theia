@@ -201,18 +201,17 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["server", "status"] => Ok(Command::ServerStatus),
         ["server", "reload", "--check"] => Ok(Command::ServerCheckReload),
         ["server", "restart", "--check"] => Ok(Command::ServerCheckRestart),
-        ["server", "tls", "fingerprint", "--config", path] => {
-            Ok(Command::ServerTlsFingerprint { config: config_path(path)? })
-        }
-        ["server", "quota", "--check"] => Ok(Command::ServerCheckQuota),
-        [
-            "server", "restart", "--apply", "--expected-revision", revision,
-            "--sha256", digest, "--tls-sha256", tls_digest, "--confirm",
-        ] => Ok(Command::ServerApplyRestart {
-            expected_revision: expected_revision(revision)?,
-            candidate_sha256: parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
-            tls_sha256: parse_restart_digest(tls_digest).ok_or(CliError::InvalidArguments)?,
+        ["server", "tls", "fingerprint", "--config", path] => Ok(Command::ServerTlsFingerprint {
+            config: config_path(path)?,
         }),
+        ["server", "quota", "--check"] => Ok(Command::ServerCheckQuota),
+        ["server", "restart", "--apply", "--expected-revision", revision, "--sha256", digest, "--tls-sha256", tls_digest, "--confirm"] => {
+            Ok(Command::ServerApplyRestart {
+                expected_revision: expected_revision(revision)?,
+                candidate_sha256: parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
+                tls_sha256: parse_restart_digest(tls_digest).ok_or(CliError::InvalidArguments)?,
+            })
+        }
         ["server", "quota", "--apply", "--expected-revision", revision, "--sha256", digest, "--confirm"] =>
         {
             let expected_revision = revision
@@ -398,15 +397,29 @@ mod tests {
     fn restart_requires_pin_of_actual_tls_pem_bytes_and_canonical_digest() {
         let hex = "ab".repeat(32);
         assert_eq!(
-            command(&["server", "tls", "fingerprint", "--config", "/tmp/server.toml"]),
+            command(&[
+                "server",
+                "tls",
+                "fingerprint",
+                "--config",
+                "/tmp/server.toml"
+            ]),
             Ok(Command::ServerTlsFingerprint {
                 config: "/tmp/server.toml".into(),
             })
         );
         assert_eq!(
             command(&[
-                "server", "restart", "--apply", "--expected-revision",
-                "7", "--sha256", &hex, "--tls-sha256", &hex, "--confirm",
+                "server",
+                "restart",
+                "--apply",
+                "--expected-revision",
+                "7",
+                "--sha256",
+                &hex,
+                "--tls-sha256",
+                &hex,
+                "--confirm",
             ]),
             Ok(Command::ServerApplyRestart {
                 expected_revision: 7,
@@ -416,16 +429,30 @@ mod tests {
         );
         assert_eq!(
             command(&[
-                "server", "restart", "--apply", "--expected-revision",
-                "7", "--sha256", &hex, "--confirm",
+                "server",
+                "restart",
+                "--apply",
+                "--expected-revision",
+                "7",
+                "--sha256",
+                &hex,
+                "--confirm",
             ]),
             Err(CliError::InvalidArguments),
             "old TOML-only restart Apply must fail closed"
         );
         assert_eq!(
             command(&[
-                "server", "restart", "--apply", "--expected-revision",
-                "7", "--sha256", &hex, "--tls-sha256", &"AB".repeat(32), "--confirm",
+                "server",
+                "restart",
+                "--apply",
+                "--expected-revision",
+                "7",
+                "--sha256",
+                &hex,
+                "--tls-sha256",
+                &"AB".repeat(32),
+                "--confirm",
             ]),
             Err(CliError::InvalidArguments)
         );
@@ -436,10 +463,19 @@ mod tests {
         let digest = "ab".repeat(32);
         let run = |rev: &str, document: &str, tls: &str, confirm: bool| {
             let mut args = vec![
-                "server", "restart", "--apply", "--expected-revision",
-                rev, "--sha256", document, "--tls-sha256", tls,
+                "server",
+                "restart",
+                "--apply",
+                "--expected-revision",
+                rev,
+                "--sha256",
+                document,
+                "--tls-sha256",
+                tls,
             ];
-            if confirm { args.push("--confirm"); }
+            if confirm {
+                args.push("--confirm");
+            }
             command(&args)
         };
         assert_eq!(
@@ -451,13 +487,30 @@ mod tests {
             })
         );
         for wrong in ["0", "07", "-1", "+1", "1x", "18446744073709551616"] {
-            assert_eq!(run(wrong, &digest, &digest, true), Err(CliError::InvalidArguments));
+            assert_eq!(
+                run(wrong, &digest, &digest, true),
+                Err(CliError::InvalidArguments)
+            );
         }
-        for wrong in ["AB".repeat(32), "ab".repeat(31), format!("{}f", digest), "xx".repeat(32)] {
-            assert_eq!(run("7", &wrong, &digest, true), Err(CliError::InvalidArguments));
-            assert_eq!(run("7", &digest, &wrong, true), Err(CliError::InvalidArguments));
+        for wrong in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            format!("{}f", digest),
+            "xx".repeat(32),
+        ] {
+            assert_eq!(
+                run("7", &wrong, &digest, true),
+                Err(CliError::InvalidArguments)
+            );
+            assert_eq!(
+                run("7", &digest, &wrong, true),
+                Err(CliError::InvalidArguments)
+            );
         }
-        assert_eq!(run("7", &digest, &digest, false), Err(CliError::InvalidArguments));
+        assert_eq!(
+            run("7", &digest, &digest, false),
+            Err(CliError::InvalidArguments)
+        );
     }
 
     #[test]
