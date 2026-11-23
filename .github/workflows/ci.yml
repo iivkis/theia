@@ -160,6 +160,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned CI-only VT screen driver for real Linux PTY
+        run: python -m pip install pyte==0.8.2
       - name: Tests first
         run: cargo test --workspace --all-targets --locked
       - name: Formatting
@@ -182,6 +187,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned CI-only Windows ConPTY and VT screen drivers
+        run: python -m pip install pywinpty==3.0.5 pyte==0.8.2
       - name: Native Windows tests
         run: cargo test --workspace --all-targets --locked
       - name: Cross-logon Windows pipe kernel-denial E2E (mandatory)
