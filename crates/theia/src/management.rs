@@ -263,7 +263,7 @@ pub async fn query_in(
         if reply == b"theia-health-v1 ok\n" && command == StatusCommand::Health {
             return Ok(StatusReply::Healthy);
         }
-        if reply == b"ERR unsupported\n" {
+        if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
             return Ok(StatusReply::Unsupported);
         }
         if command == StatusCommand::Status {
