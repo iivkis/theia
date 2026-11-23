@@ -359,6 +359,46 @@ where
                     format!("theia-status-v1 running inbounds={inbounds}\n")
                 }
             }
+            candidate if parse_restart_revision(candidate).is_some() => {
+                if let (Some(preflight), Some(runtime), Some(previous), Some(restarts)) =
+                    (&preflight, &runtime, &observed, &restarts)
+                {
+                    let (expected, sha256) =
+                        parse_restart_revision(candidate).expect("already parsed");
+                    // A worker may finish after client timeout, but cannot
+                    // publish or even request a new generation after the
+                    // calling IPC handler has been cancelled.
+                    let preflight = Arc::clone(preflight);
+                    let candidate = tokio::task::spawn_blocking(move || {
+                        preflight.load_restart_candidate_bound(sha256)
+                    })
+                    .await;
+                    match candidate {
+                        Ok(Ok(candidate)) if runtime.still_current(previous, expected) => {
+                            let (complete, result) = oneshot::channel();
+                            let request = crate::runtime_generation::RestartRequest {
+                                previous: Arc::clone(previous),
+                                expected_revision: expected,
+                                candidate,
+                                complete,
+                            };
+                            if restarts.try_send(request).is_err() {
+                                "theia-restart-v1 rejected\n".to_owned()
+                            } else {
+                                match result.await {
+                                    Ok(Ok(revision)) => {
+                                        format!("theia-restart-v1 applied revision={revision}\n")
+                                    }
+                                    _ => "theia-restart-v1 rejected\n".to_owned(),
+                                }
+                            }
+                        }
+                        _ => "theia-restart-v1 rejected\n".to_owned(),
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
+            }
             b"check-restart" => {
                 if let Some(preflight) = preflight {
                     // Blocking disk/PEM verification and transient native
@@ -407,10 +447,15 @@ where
                     .await
                     {
                         Ok(Ok(candidate)) => {
-                            match live
-                                .stage(&candidate, expected)
-                                .and_then(|stage| live.publish(stage))
+                            let result = if let (Some(runtime), Some(previous)) =
+                                (&runtime, &observed)
                             {
+                                runtime.apply_auth(previous, &candidate, expected)
+                            } else {
+                                live.stage(&candidate, expected)
+                                    .and_then(|stage| live.publish(stage))
+                            };
+                            match result {
                                 Ok(revision) => {
                                     format!("theia-apply-v1 applied revision={revision}\n")
                                 }
@@ -431,10 +476,15 @@ where
                     // publish the exact document that was just validated.
                     match tokio::task::spawn_blocking(move || preflight.load_candidate()).await {
                         Ok(Ok(candidate)) => {
-                            match live
-                                .stage(&candidate, expected)
-                                .and_then(|stage| live.publish(stage))
+                            let result = if let (Some(runtime), Some(previous)) =
+                                (&runtime, &observed)
                             {
+                                runtime.apply_auth(previous, &candidate, expected)
+                            } else {
+                                live.stage(&candidate, expected)
+                                    .and_then(|stage| live.publish(stage))
+                            };
+                            match result {
                                 Ok(revision) => {
                                     format!("theia-apply-v1 applied revision={revision}\n")
                                 }
