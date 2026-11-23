@@ -5,8 +5,12 @@
 //! Listener/TLS identity, quota policy and user inventory remain immutable.
 //! Real reload/rollback and Windows management IPC are separate milestones.
 use crate::config::{self, Config, ServerDocument};
+use std::fmt;
+
+#[cfg(any(target_os = "linux", test))]
 use sha2::{Digest, Sha256};
-use std::{fmt, path::{Path, PathBuf}};
+#[cfg(any(target_os = "linux", test))]
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadCheckError {
@@ -76,12 +80,14 @@ pub fn assess_reload(
 
 /// Digest of *loaded* PEM bytes, not the paths in TOML. Never log these
 /// digests: the private key itself is not captured in this snapshot.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone)]
 pub(crate) struct IdentityHash {
     cert: [u8; 32],
     key: [u8; 32],
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl IdentityHash {
     pub(crate) fn from_pem(cert: &[u8], key: &[u8]) -> Self {
         Self {
@@ -99,12 +105,14 @@ impl IdentityHash {
 /// Safe, bounded validation against the exact active server document and the
 /// PEM bytes used when constructing the actual TLS acceptors. A successful
 /// check never authorizes reloading or changes an existing connection.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) struct ReloadPreflight {
     config_path: PathBuf,
     active: ServerDocument,
     identities: Vec<IdentityHash>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl ReloadPreflight {
     pub(crate) fn new(
         config_path: PathBuf,
@@ -209,7 +217,7 @@ mod tests {
     fn tls_content_change_is_rejected_even_if_reference_paths_match() {
         let doc = document();
         let snapshot = ReloadPreflight::new(
-            Path::new("/tmp/nonexistent").to_owned(),
+            std::path::Path::new("/tmp/nonexistent").to_owned(),
             doc.clone(),
             vec![IdentityHash::from_pem(b"original cert", b"original key")],
         );
@@ -235,7 +243,7 @@ mod tests {
     fn missing_candidate_file_is_invalid_not_applied() {
         let doc = document();
         let snapshot = ReloadPreflight::new(
-            Path::new("/definitely-not-a-theia-config-file").to_owned(),
+            std::path::Path::new("/definitely-not-a-theia-config-file").to_owned(),
             doc,
             vec![IdentityHash::from_pem(b"original", b"key")],
         );
