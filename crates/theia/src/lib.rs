@@ -53,9 +53,16 @@ pub enum Role {
 pub enum Command {
     Help(Option<&'static str>),
     Version,
-    Tui { role: Option<Role> },
-    TuiEdit { role: Role, config: String },
-    ServerRun { config: String },
+    Tui {
+        role: Option<Role>,
+    },
+    TuiEdit {
+        role: Role,
+        config: String,
+    },
+    ServerRun {
+        config: String,
+    },
     ServerStatus,
     ServerCheckReload,
     ServerCheckRestart,
@@ -63,9 +70,15 @@ pub enum Command {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
     },
-    ServerApplyReload { expected_revision: u64 },
-    ClientRun { config: String },
-    ConfigValidate { config: String },
+    ServerApplyReload {
+        expected_revision: u64,
+    },
+    ClientRun {
+        config: String,
+    },
+    ConfigValidate {
+        config: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,16 +184,8 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["server", "status"] => Ok(Command::ServerStatus),
         ["server", "reload", "--check"] => Ok(Command::ServerCheckReload),
         ["server", "restart", "--check"] => Ok(Command::ServerCheckRestart),
-        [
-            "server",
-            "restart",
-            "--apply",
-            "--expected-revision",
-            revision,
-            "--sha256",
-            digest,
-            "--confirm",
-        ] => {
+        ["server", "restart", "--apply", "--expected-revision", revision, "--sha256", digest, "--confirm"] =>
+        {
             let expected_revision = revision
                 .parse::<u64>()
                 .ok()
@@ -294,8 +299,14 @@ mod tests {
         let digest = "ab".repeat(32);
         assert_eq!(
             command(&[
-                "server", "restart", "--apply", "--expected-revision",
-                "7", "--sha256", &digest, "--confirm"
+                "server",
+                "restart",
+                "--apply",
+                "--expected-revision",
+                "7",
+                "--sha256",
+                &digest,
+                "--confirm"
             ]),
             Ok(Command::ServerApplyRestart {
                 expected_revision: 7,
@@ -305,28 +316,47 @@ mod tests {
         for wrong_revision in ["0", "07", "-1", "+1", "1x", "18446744073709551616"] {
             assert_eq!(
                 command(&[
-                    "server", "restart", "--apply", "--expected-revision",
-                    wrong_revision, "--sha256", &digest, "--confirm"
+                    "server",
+                    "restart",
+                    "--apply",
+                    "--expected-revision",
+                    wrong_revision,
+                    "--sha256",
+                    &digest,
+                    "--confirm"
                 ]),
                 Err(CliError::InvalidArguments)
             );
         }
         for wrong_digest in [
-            "AB".repeat(32), "ab".repeat(31), format!("{}f", digest),
-            "xx".repeat(32)
+            "AB".repeat(32),
+            "ab".repeat(31),
+            format!("{}f", digest),
+            "xx".repeat(32),
         ] {
             assert_eq!(
                 command(&[
-                    "server", "restart", "--apply", "--expected-revision",
-                    "7", "--sha256", &wrong_digest, "--confirm"
+                    "server",
+                    "restart",
+                    "--apply",
+                    "--expected-revision",
+                    "7",
+                    "--sha256",
+                    &wrong_digest,
+                    "--confirm"
                 ]),
                 Err(CliError::InvalidArguments)
             );
         }
         assert_eq!(
             command(&[
-                "server", "restart", "--apply", "--expected-revision",
-                "7", "--sha256", &digest
+                "server",
+                "restart",
+                "--apply",
+                "--expected-revision",
+                "7",
+                "--sha256",
+                &digest
             ]),
             Err(CliError::InvalidArguments),
             "a restart without --confirm may never become executable"
