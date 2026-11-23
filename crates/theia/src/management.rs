@@ -471,5 +471,13 @@ mod tests {
             query_environment(StatusCommand::Status).await,
             Err(ManagementError::Unsupported)
         );
+        assert_eq!(
+            query_environment(StatusCommand::ApplyReload {
+                expected_revision: 1,
+            })
+            .await,
+            Err(ManagementError::Unsupported),
+            "Windows cannot silently emulate Unix IPC Apply without Named Pipe DACL"
+        );
     }
 }
