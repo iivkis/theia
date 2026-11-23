@@ -34,6 +34,8 @@ pub(crate) mod tui_domain;
 pub mod tui_editor;
 pub(crate) mod tui_probe;
 pub(crate) mod tui_runtime;
+#[cfg(target_os = "windows")]
+pub mod windows_control;
 
 use std::fmt;
 use std::path::Path;
