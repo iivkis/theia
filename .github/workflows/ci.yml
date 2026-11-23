@@ -28,6 +28,8 @@ jobs:
         run: bash scripts/check-spec.sh
       - name: Test required CI DAG, native E2E and Go cache contract
         run: python3 tests/ci/check_workflow_parallel.py
+      - name: Verify CI format artifact isolation
+        run: python3 tests/ci/test_format_artifact.py
       - name: Detect Rust workspace
         id: detect
         shell: bash
@@ -41,6 +43,34 @@ jobs:
             echo "::notice::Specification-only stage: Rust tests skipped until Cargo workspace exists"
             echo "rust_ready=false" >> "$GITHUB_OUTPUT"
           fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.detect.outputs.rust_ready == 'true'
+        with:
+          components: rustfmt
+      - uses: actions/setup-go@v5
+        if: steps.detect.outputs.rust_ready == 'true'
+        with:
+          go-version: '1.24.x'
+          cache: true
+          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
+      - name: Format root Rust, independent spikes, and pinned Go test helpers
+        if: steps.detect.outputs.rust_ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
+          cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all
+          mapfile -d '' -t go_files < <(git ls-files -z -- '*.go')
+          if (( ${#go_files[@]} )); then gofmt -w "${go_files[@]}"; fi
+          python3 scripts/ci-format.py "$RUNNER_TEMP/ci-formatted-source.tar"
+      - uses: actions/upload-artifact@v4
+        if: steps.detect.outputs.rust_ready == 'true'
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source.tar
+          if-no-files-found: error
+          retention-days: 2
 
   m0-1-api-spike:
     name: m0-1-api-spike (Linux)
@@ -51,6 +81,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -112,6 +151,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -160,6 +208,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -176,7 +233,7 @@ jobs:
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Release compilation only after main merge
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         run: cargo build --workspace --release --locked
 
   windows-smoke:
@@ -189,6 +246,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -239,7 +305,7 @@ jobs:
         shell: pwsh
         run: ./scripts/windows-cross-sid-ci.ps1
       - name: Native Windows release compilation only after main merge
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         run: cargo build --workspace --release --locked
 
   browser-e2e:
@@ -256,6 +322,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -288,6 +363,15 @@ jobs:
       THEIA_BBR_RESULTS_PATH: ${{ github.workspace }}/theia-bbr-${{ matrix.os }}.csv
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -323,6 +407,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -382,6 +475,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -429,3 +531,63 @@ jobs:
               raise SystemExit("Required CI jobs did not succeed: " + ", ".join(failed))
           print("All required CI jobs succeeded.")
           PY
+
+  persist-format:
+    name: Persist canonical formatting after green gate
+    needs: ci-gate
+    if: ${{ github.event_name == 'pull_request' && needs.ci-gate.result == 'success' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == 'main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Persist only source bytes proven by the green CI jobs
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          cargo fmt --all
+          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
+          cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all
+          mapfile -d '' -t go_files < <(git ls-files -z -- '*.go')
+          if (( ${#go_files[@]} )); then gofmt -w "${go_files[@]}"; fi
+          python3 scripts/ci-format.py "$RUNNER_TEMP/rebuilt-formatted-source.tar"
+          # Byte-for-byte identity: persist exactly the source files already
+          # overlaid and tested by every mandatory job, never fresh edits.
+          cmp "$RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" \
+              "$RUNNER_TEMP/rebuilt-formatted-source.tar"
+          git diff --exit-code -- . ':!*.rs' ':!*.go'
+          if git diff --quiet; then
+            echo "Formatter made no changes: tested PR head is already canonical."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- '*.rs' '*.go'
+          git diff --cached --quiet && { echo "Nothing to persist"; exit 0; }
+          git commit -m "style(ci): persist rustfmt and gofmt after passing tests"
+          # A fast-forward push rejects PR branches changed since tests began.
+          git push origin "HEAD:refs/heads/$HEAD_REF"
+          # GITHUB_TOKEN pushes do not retrigger PR/push workflows.
+          # No second full test run: git tree differs only by formatting
+          # bytes that were already tested by the green ci-gate.
+          echo "Saved exactly the CI-tested formatted files; no redundant rerun."
