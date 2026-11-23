@@ -308,6 +308,25 @@ mod tests {
     }
 
     #[test]
+    fn restart_readiness_probe_is_single_flight_even_if_original_ipc_times_out() {
+        let snapshot = ReloadPreflight::new(
+            std::path::PathBuf::from("nonexistent-theia-restart-preflight.toml"),
+            document(),
+            Vec::new(),
+        );
+        let held = snapshot.restart_probe_lock.lock().unwrap();
+        assert!(matches!(
+            snapshot.check_restart_file(),
+            Err(crate::restart_guard::RestartError::ProbeBusy)
+        ));
+        drop(held);
+        assert!(matches!(
+            snapshot.check_restart_file(),
+            Err(crate::restart_guard::RestartError::InvalidConfig)
+        ));
+    }
+
+    #[test]
     fn missing_candidate_file_is_invalid_not_applied() {
         let doc = document();
         let snapshot = ReloadPreflight::new(
