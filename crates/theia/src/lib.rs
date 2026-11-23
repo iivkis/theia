@@ -25,6 +25,7 @@ pub mod management;
 pub mod protocol;
 pub mod quic_transport;
 pub mod reload_preflight;
+pub mod restart_guard;
 pub mod server;
 pub mod tui;
 pub(crate) mod tui_candidate_batch;
