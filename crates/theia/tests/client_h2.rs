@@ -617,15 +617,14 @@ async fn check_native_binary_connect_and_socks5(tls_profile: &str, label: &str) 
                 socket.shutdown().await.unwrap();
             }
         });
-        let (_dir, mut child, http, socks) =
-            launch_client_with_profile(
-                endpoint,
-                pem,
-                label,
-                theia::config::Transport::H2,
-                tls_profile,
-            )
-            .await;
+        let (_dir, mut child, http, socks) = launch_client_with_profile(
+            endpoint,
+            pem,
+            label,
+            theia::config::Transport::H2,
+            tls_profile,
+        )
+        .await;
 
         // --disable ignores any user curlrc. --noproxy "" prevents the
         // standard localhost bypass. HTTP mode must actually use CONNECT.
