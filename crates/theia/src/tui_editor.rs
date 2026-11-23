@@ -903,6 +903,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn m4_2c_saved_digest_tracks_only_durable_bytes_not_unsaved_editor_draft() {
+        let path = std::env::temp_dir().join(format!(
+            "theia-m42c-editor-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"b".repeat(64));
+        std::fs::write(&path, source).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        let initial = editor.saved_sha256();
+        let observed: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
+        assert_eq!(initial, observed);
+        editor.begin();
+        editor.input = "updated.example.org".into();
+        assert!(editor.accept());
+        assert!(editor.dirty());
+        assert_eq!(editor.saved_sha256(), initial, "draft is never considered saved");
+        assert!(editor.save());
+        assert!(!editor.dirty());
+        let on_disk: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
+        assert_ne!(on_disk, initial);
+        assert_eq!(editor.saved_sha256(), on_disk, "only durably written bytes are approved");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn symlinked_config_is_rejected() {
         use std::os::unix::fs::symlink;
         let temp = Temp::write(include_str!("../../../examples/client.toml"));
