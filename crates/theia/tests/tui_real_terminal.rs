@@ -247,9 +247,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     // M4.2g: native CLI checks run via the SAME protected IPC of this real
     // server, not a separate parser/unit mock. All verdicts MUST keep the
     // original H2+H3 listeners and live authorization revision 1 untouched.
-    assert_restart_check(
-        binary, env_key, &endpoint, "restart not needed", true
-    );
+    assert_restart_check(binary, env_key, &endpoint, "restart not needed", true);
 
     let old_doc = doc.clone();
     let mut moved = doc.clone();
@@ -257,17 +255,24 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     moved.server.inbounds[0].quic_listen = format!("127.0.0.1:{}", free_port(false));
     save(&server_file, &moved);
     assert_restart_check(
-        binary, env_key, &endpoint, "temporarily bound then released", true
+        binary,
+        env_key,
+        &endpoint,
+        "temporarily bound then released",
+        true,
     );
     assert!(cli_status(binary, env_key, &endpoint, 1));
 
     let occupied_tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut busy = moved.clone();
-    busy.server.inbounds[0].h2_listen =
-        occupied_tcp.local_addr().unwrap().to_string();
+    busy.server.inbounds[0].h2_listen = occupied_tcp.local_addr().unwrap().to_string();
     save(&server_file, &busy);
     assert_restart_check(
-        binary, env_key, &endpoint, "candidate or expected revision rejected", false
+        binary,
+        env_key,
+        &endpoint,
+        "candidate or expected revision rejected",
+        false,
     );
     drop(occupied_tcp);
     assert!(cli_status(binary, env_key, &endpoint, 1));
@@ -277,7 +282,11 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     busy.server.inbounds[0].quic_listen = occupied_udp.local_addr().unwrap().to_string();
     save(&server_file, &busy);
     assert_restart_check(
-        binary, env_key, &endpoint, "candidate or expected revision rejected", false
+        binary,
+        env_key,
+        &endpoint,
+        "candidate or expected revision rejected",
+        false,
     );
     drop(occupied_udp);
     assert!(cli_status(binary, env_key, &endpoint, 1));
@@ -288,7 +297,11 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     maintenance.server.policy.max_connections_total += 1;
     save(&server_file, &maintenance);
     assert_restart_check(
-        binary, env_key, &endpoint, "requires controlled maintenance", true
+        binary,
+        env_key,
+        &endpoint,
+        "requires controlled maintenance",
+        true,
     );
     assert!(cli_status(binary, env_key, &endpoint, 1));
 
@@ -300,7 +313,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     fs::write(
         &other_cert,
         format!(
-            "-----BEGIN CERTIFICATE-----\\n{}\\n-----END CERTIFICATE-----\\n",
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
             STANDARD.encode(alien.cert.der())
         ),
     )
@@ -308,7 +321,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     fs::write(
         &other_key,
         format!(
-            "-----BEGIN PRIVATE KEY-----\\n{}\\n-----END PRIVATE KEY-----\\n",
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
             STANDARD.encode(alien.key_pair.serialize_der())
         ),
     )
@@ -323,7 +336,11 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     bad_identity.server.inbounds[0].tls_key = format!("file:{}", other_key.display());
     save(&server_file, &bad_identity);
     assert_restart_check(
-        binary, env_key, &endpoint, "candidate or expected revision rejected", false
+        binary,
+        env_key,
+        &endpoint,
+        "candidate or expected revision rejected",
+        false,
     );
     assert!(cli_status(binary, env_key, &endpoint, 1));
 
