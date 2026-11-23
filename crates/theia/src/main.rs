@@ -51,6 +51,23 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
+        Ok(Command::ServerCheckRestart) => {
+            match management::query_environment(management::StatusCommand::CheckRestart).await {
+                Ok(management::StatusReply::RestartAuthorizationOnly) => Ok(
+                    "restart not needed for compatible authorization changes; use CAS auth Apply; runtime UNCHANGED".to_owned(),
+                ),
+                Ok(management::StatusReply::RestartRequiresMaintenance) => Ok(
+                    "restart requires controlled maintenance: active listener addresses overlap; runtime UNCHANGED".to_owned(),
+                ),
+                Ok(management::StatusReply::RestartFreshPortsBindable) => Ok(
+                    "restart readiness probe passed: new TCP/UDP ports temporarily bound then released; runtime UNCHANGED; NOT reserved or applied".to_owned(),
+                ),
+                Ok(_) => Err(CliError::Management(
+                    management::ManagementError::InvalidReply,
+                )),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
         Ok(Command::ServerCheckReload) => {
             match management::query_environment(management::StatusCommand::CheckReload).await {
                 Ok(management::StatusReply::Compatible) => {
