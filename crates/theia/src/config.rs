@@ -717,6 +717,7 @@ mod tests {
             );
         }
     }
+    #[cfg(feature = "experimental-btls-h2")]
     #[test]
     fn f13_named_browser_h2_backend_is_explicit_and_never_downgrades_to_h3_or_auto() {
         let named = client()
@@ -740,6 +741,18 @@ mod tests {
                 "client.profiles[0].tls_profile",
             );
         }
+    }
+
+    #[cfg(not(feature = "experimental-btls-h2"))]
+    #[test]
+    fn f13_named_browser_profile_refuses_binary_without_compiled_boring_ssl() {
+        let named = client()
+            .replace("tls_profile = \"default\"", "tls_profile = \"browser-h2-btls-v1\"")
+            .replace("transport = \"auto\"", "transport = \"h2\"");
+        assert_eq!(
+            parse(&named).unwrap_err().field,
+            "client.profiles[0].tls_profile",
+        );
     }
 
     #[test]
