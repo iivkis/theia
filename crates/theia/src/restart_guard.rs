@@ -68,6 +68,13 @@ pub(crate) fn probe(
     loaded_identities: &[IdentityHash],
     candidate: &ServerDocument,
 ) -> Result<RestartVerdict, RestartError> {
+    // Fail closed on unvalidated TLS file references before any disk read.
+    Config::Server(candidate.clone())
+        .validate()
+        .map_err(|_| RestartError::InvalidConfig)?;
+    if !candidate.server.enabled {
+        return Err(RestartError::InvalidConfig);
+    }
     // Advisory readiness is NOT a reservation, pin, or Apply. However it
     // uses the same bounded validated PEM capture as the Apply path.
     let captured =
