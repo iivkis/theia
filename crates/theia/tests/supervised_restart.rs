@@ -143,7 +143,7 @@ fn apply_with_pin(
     );
     if should_succeed {
         assert!(String::from_utf8_lossy(&output.stdout)
-            .contains("supervised fresh-port restart applied"));
+            .contains("supervised H2/H3 restart applied"));
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(&format!("revision={}", expected + 1))
         );
