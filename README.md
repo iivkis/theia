@@ -80,6 +80,10 @@ applications → local HTTP/SOCKS → SmartTheia over HTTP/3 (QUIC + BBR)
 
 По отдельному решению оператора перед `theia server run --config server.toml` задаётся `THEIA_CONTROL_DIR` с **существующей абсолютной приватной директорией 0700 под текущим euid**. Сервер после успешного TLS/TCP/QUIC preflight создаёт в ней `theia-server.sock` (0600); команда `theia server status` при том же `THEIA_CONTROL_DIR` проверяет реально работающий процесс. Без переменной сервер работает как раньше, но status недоступен. Неверные права/занятый socket вызывают отказ запуска, а `reload`, Apply, Windows Named Pipe/ACL и транзакционный rollback **не реализованы**. Нельзя считать обычный status подтверждением обновлённой конфигурации. [ADR-0038](docs/adr/0038-m4-2a-linux-readonly-management-ipc.md).
 
+## M4.2b0: проверка конфигурации без перезагрузки
+
+В Linux **при запущенном через `server run --config FILE` сервере и явном `THEIA_CONTROL_DIR`** команда `theia server reload --check` попросит тот же локальный Unix IPC сравнить сохранённый TOML с реальным первоначальным документом runtime. Допустимы лишь возможные будущие изменения токенов/disabled/grants у прежних пользователей, при этом IP/ports, SNI, сертификаты/ключи, политики/квоты и состав пользователей не меняются; PEM bytes проверяются на подмену даже при прежнем имени файла. Вывод `candidate compatible with running listener; runtime UNCHANGED` **не означает, что конфигурация применена**, ничего не модифицируется. При несовместимости возврат nonzero. `theia server reload` без `--check` по-прежнему недоступен. Windows IPC/TUI Apply и транзакционный restart/rollback ещё открыты. [ADR-0039](docs/adr/0039-m4-2b0-readonly-reload-preflight.md).
+
 ## CLI (H2/H3 runtime и ограниченный TUI editor)
 
 ```sh
@@ -89,6 +93,8 @@ theia tui --role client                # обзор клиентской пан�
 theia tui --role server --config /path/to/server.toml  # поля DNS имени/H2 TCP/H3 UDP у выбранного inbound
 theia tui --role client --config /path/to/client.toml  # endpoint/TLS SNI/transport выбранного профиля
 theia server run --config server.toml  # headless сервер
+theia server status                     # opt-in Linux management status
+theia server reload --check             # only preflight; runtime UNCHANGED
 theia client run --config client.toml  # headless клиент
 theia config validate --config client.toml
 theia --version
