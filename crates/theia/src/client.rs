@@ -239,7 +239,7 @@ impl H2Client {
                 trusted_ca_pem,
             } => {
                 let tls = crate::h2_btls::connect(socket, server_name, trusted_ca_pem).await?;
-                start_h2(tls).await?
+                start_h2(tls, self.wire_shape).await?
             }
         };
         // Build and send the credential-bearing POST ONLY after the selected
