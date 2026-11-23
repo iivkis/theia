@@ -19,10 +19,9 @@ use std::{
 use std::{sync::Arc, time::Duration};
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    time::timeout,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use tokio::time::timeout;
 #[cfg(target_os = "linux")]
 use tokio::{
     net::{UnixListener, UnixStream},
