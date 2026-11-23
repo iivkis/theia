@@ -20,6 +20,9 @@ use std::{
 pub enum RestartVerdict {
     /// Only authorization-compatible changes; use the existing CAS Apply.
     AuthorizationOnly,
+    /// All current TCP/H3 port mappings, users and quotas remain unchanged;
+    /// only strict TLS PEM identity may rotate in-place on the same sockets.
+    SamePortTlsReady,
     /// A currently running listener address must be reused. A zero-downtime
     /// bind-before-close transition cannot be guaranteed with this runtime.
     RequiresMaintenance,
@@ -103,6 +106,9 @@ pub(crate) fn probe(
     if assess_reload(active, candidate).is_ok() && identities_unchanged {
         return Ok(RestartVerdict::AuthorizationOnly);
     }
+    if same_port_tls_only(active, candidate) && !identities_unchanged {
+        return Ok(RestartVerdict::SamePortTlsReady);
+    }
 
     // When ANY candidate listener overlaps ANY old listener on the same
     // transport, don't infer SO_REUSEPORT, SCM_RIGHTS or a release/rebind
@@ -165,6 +171,30 @@ pub(crate) fn probe(
     Ok(RestartVerdict::FreshPortsBindable)
 }
 
+/// A TLS-only in-place rotation never rebinds a TCP/UDP port, changes
+/// SNI/hostname expectations, routes users differently or touches quota.
+/// Compare *every* typed field and blank only the two PEM references.
+/// A PEM file changed in place also qualifies when identity digests drift.
+pub(crate) fn same_port_tls_only(
+    active: &ServerDocument,
+    candidate: &ServerDocument,
+) -> bool {
+    if active.server.inbounds.len() != candidate.server.inbounds.len() {
+        return false;
+    }
+    let mut normalized = candidate.clone();
+    for (original, normalized_inbound) in active
+        .server
+        .inbounds
+        .iter()
+        .zip(&mut normalized.server.inbounds)
+    {
+        normalized_inbound.tls_cert.clone_from(&original.tls_cert);
+        normalized_inbound.tls_key.clone_from(&original.tls_key);
+    }
+    &normalized == active
+}
+
 /// First supervised-cutover slice must reuse the SAME global/per-user
 /// semaphores for both generations until bounded drain finishes. Changing
 /// quota or user inventory would silently double admission and is forbidden.
@@ -189,6 +219,28 @@ pub(crate) fn same_shared_limits(active: &ServerDocument, candidate: &ServerDocu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_port_tls_classification_refuses_any_quota_or_binding_mutation() {
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
+        let crate::config::Config::Server(base) = crate::config::parse(&source).unwrap() else {
+            panic!("example server fixture must parse");
+        };
+        let mut candidate = base.clone();
+        candidate.server.inbounds[0].tls_cert = "file:new-cert.pem".into();
+        candidate.server.inbounds[0].tls_key = "file:new-key.pem".into();
+        assert!(same_port_tls_only(&base, &candidate));
+        candidate.server.policy.max_connections_total += 1;
+        assert!(!same_port_tls_only(&base, &candidate));
+        candidate.server.policy = base.server.policy.clone();
+        candidate.server.inbounds[0].quic_listen = "127.0.0.1:34567".into();
+        assert!(!same_port_tls_only(&base, &candidate));
+        candidate.server.inbounds[0].quic_listen =
+            base.server.inbounds[0].quic_listen.clone();
+        candidate.server.users[0].disabled = true;
+        assert!(!same_port_tls_only(&base, &candidate));
+    }
 
     #[test]
     fn wildcard_and_dual_stack_bind_aliases_force_maintenance_instead_of_blind_rebind() {
