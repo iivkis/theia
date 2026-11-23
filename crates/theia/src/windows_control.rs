@@ -310,7 +310,7 @@ mod tests {
                 ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW,
                 GetSecurityInfo, SE_KERNEL_OBJECT,
             },
-            EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACL,
+            EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACL,
             DACL_SECURITY_INFORMATION,
         };
         let pipe = WindowsServer::bind(&id(), 1).unwrap();
@@ -392,8 +392,8 @@ mod tests {
             // SAFETY: successful GetAce points at a valid ACE_HEADER.
             let header = unsafe { (*ace).Header };
             assert_eq!(
-                header.AceType, ACCESS_ALLOWED_ACE_TYPE as u8,
-                "only explicit access-allowed ACEs permitted"
+                header.AceType, 0u8,
+                "only explicit ACCESS_ALLOWED_ACE (WinNT ACE type 0) permitted"
             );
             assert_eq!(header.AceFlags, 0, "no inherited or unusual ACE flags");
             // SAFETY: access-allowed ACE layout stores the variable-length
