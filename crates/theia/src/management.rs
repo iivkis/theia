@@ -47,6 +47,7 @@ pub enum ManagementError {
     Io,
     TimedOut,
     InvalidReply,
+    CandidateRejected,
 }
 
 impl fmt::Display for ManagementError {
@@ -59,6 +60,7 @@ impl fmt::Display for ManagementError {
             Self::Io => "local management I/O failed",
             Self::TimedOut => "local management request timed out",
             Self::InvalidReply => "invalid local management response",
+            Self::CandidateRejected => "candidate reload preflight rejected; runtime unchanged",
         };
         f.write_str(message)
     }
@@ -72,6 +74,8 @@ pub enum StatusCommand {
     Status,
     /// Explicitly rejected in this read-only slice. Never reload implicitly.
     Reload,
+    /// Read-only preflight; does not modify config or runtime.
+    CheckReload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +83,8 @@ pub enum StatusReply {
     Healthy,
     Running { inbounds: usize },
     Unsupported,
+    /// Candidate passes the deliberately narrow compatibility preflight.
+    Compatible,
 }
 
 #[cfg(target_os = "linux")]
@@ -116,6 +122,7 @@ pub struct StatusServer {
     device: u64,
     inode: u64,
     inbounds: usize,
+    preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -142,7 +149,16 @@ impl StatusServer {
             device: metadata.dev(),
             inode: metadata.ino(),
             inbounds,
+            preflight: None,
         })
+    }
+
+    pub(crate) fn with_preflight(
+        mut self,
+        preflight: Arc<crate::reload_preflight::ReloadPreflight>,
+    ) -> Self {
+        self.preflight = Some(preflight);
+        self
     }
 
     /// If the operator did not explicitly provision THEIA_CONTROL_DIR, the
@@ -169,9 +185,10 @@ impl StatusServer {
                     let (stream, _) = accepted.map_err(|_| ManagementError::Io)?;
                     if let Ok(permit) = concurrency.clone().try_acquire_owned() {
                         let inbounds = self.inbounds;
+                        let preflight = self.preflight.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
-                            let _ = timeout(IO_TIMEOUT, handle(stream, inbounds)).await;
+                            let _ = timeout(IO_TIMEOUT, handle(stream, inbounds, preflight)).await;
                         });
                     }
                     // Over budget: close socket immediately, never build a
@@ -197,7 +214,11 @@ impl Drop for StatusServer {
 }
 
 #[cfg(target_os = "linux")]
-async fn handle(mut stream: UnixStream, inbounds: usize) -> Result<(), ManagementError> {
+async fn handle(
+    mut stream: UnixStream,
+    inbounds: usize,
+    preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
+) -> Result<(), ManagementError> {
     let mut command = Vec::with_capacity(16);
     let mut newline = false;
     for _ in 0..MAX_COMMAND_BYTES {
@@ -219,6 +240,18 @@ async fn handle(mut stream: UnixStream, inbounds: usize) -> Result<(), Managemen
         match command.as_slice() {
             b"health" => "theia-health-v1 ok\n".to_owned(),
             b"status" => format!("theia-status-v1 running inbounds={inbounds}\n"),
+            b"check-reload" => {
+                if let Some(preflight) = preflight {
+                    // 1 MiB bounded config + PEM reads belong on a worker.
+                    // A timed-out worker can NEVER apply, only return a verdict.
+                    match tokio::task::spawn_blocking(move || preflight.check_file()).await {
+                        Ok(Ok(())) => "theia-check-v1 compatible\n".to_owned(),
+                        _ => "theia-check-v1 rejected\n".to_owned(),
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
+            }
             _ => "ERR unsupported\n".to_owned(),
         }
     };
@@ -243,6 +276,7 @@ pub async fn query_in(
             StatusCommand::Health => b"health\n".as_slice(),
             StatusCommand::Status => b"status\n".as_slice(),
             StatusCommand::Reload => b"reload\n".as_slice(),
+            StatusCommand::CheckReload => b"check-reload\n".as_slice(),
         };
         stream
             .write_all(request)
@@ -262,6 +296,13 @@ pub async fn query_in(
         }
         if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
             return Ok(StatusReply::Unsupported);
+        }
+        if command == StatusCommand::CheckReload {
+            return match reply.as_slice() {
+                b"theia-check-v1 compatible\n" => Ok(StatusReply::Compatible),
+                b"theia-check-v1 rejected\n" => Err(ManagementError::CandidateRejected),
+                _ => Err(ManagementError::InvalidReply),
+            };
         }
         if command == StatusCommand::Status {
             let reply = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
