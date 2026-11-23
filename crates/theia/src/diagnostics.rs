@@ -213,7 +213,9 @@ fn open_logger() -> io::Result<Logger> {
                         }
                     }
                     Message::Flush(reply) => {
-                        let _ = sink.file.flush();
+                        if let Some(file) = sink.file.as_mut() {
+                            let _ = file.flush();
+                        }
                         let _ = reply.send(());
                     }
                 }
@@ -225,7 +227,7 @@ fn open_logger() -> io::Result<Logger> {
 struct RotatingFile {
     active: PathBuf,
     previous: PathBuf,
-    file: fs::File,
+    file: Option<fs::File>,
     size: u64,
     segment_bytes: u64,
 }
@@ -237,7 +239,7 @@ impl RotatingFile {
         }
         let previous = active.with_extension("log.1");
         let file = new_file(&active)?;
-        Ok(Self { active, previous, file, size: 0, segment_bytes })
+        Ok(Self { active, previous, file: Some(file), size: 0, segment_bytes })
     }
 
     fn write(&mut self, record: &str) -> io::Result<()> {
@@ -248,22 +250,22 @@ impl RotatingFile {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "record exceeds segment"));
         }
         if self.size + length > self.segment_bytes {
-            self.file.flush()?;
-            // On Windows, renaming a still-open file is unreliable. Replace
-            // the handle before rotating, and never follow a prior symlink.
-            let pending = self.active.with_extension("log.next");
-            let next = new_file(&pending)?;
-            let old = std::mem::replace(&mut self.file, next);
-            drop(old);
+            // Drop the old handle before rename, including on Windows.
+            if let Some(file) = self.file.as_mut() {
+                file.flush()?;
+            }
+            drop(self.file.take());
             if fs::symlink_metadata(&self.previous).is_ok() {
                 fs::remove_file(&self.previous)?;
             }
             fs::rename(&self.active, &self.previous)?;
-            fs::rename(&pending, &self.active)?;
+            self.file = Some(new_file(&self.active)?);
             self.size = 0;
         }
-        self.file.write_all(bytes)?;
-        self.file.flush()?;
+        let file = self.file.as_mut()
+            .ok_or_else(|| io::Error::other("trace writer is closed"))?;
+        file.write_all(bytes)?;
+        file.flush()?;
         self.size += length;
         Ok(())
     }
@@ -338,7 +340,7 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         private_directory(&dir).unwrap();
         let writer = RotatingFile::new(dir.join("trace.log"), 100).unwrap();
-        assert_eq!(writer.file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(writer.file.as_ref().unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o600);
         drop(writer);
         fs::remove_dir_all(dir).unwrap();
     }
