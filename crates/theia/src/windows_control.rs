@@ -307,13 +307,15 @@ mod tests {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Security::{
             Authorization::{
-                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
-                SE_KERNEL_OBJECT,
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW,
+                GetSecurityInfo, SE_KERNEL_OBJECT,
             },
+            EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACL,
             DACL_SECURITY_INFORMATION,
         };
         let pipe = WindowsServer::bind(&id(), 1).unwrap();
         let mut security: *mut c_void = null_mut();
+        let mut acl: *mut ACL = null_mut();
         // SAFETY: owned live server kernel handle and valid output pointer.
         let result = unsafe {
             GetSecurityInfo(
@@ -322,12 +324,13 @@ mod tests {
                 DACL_SECURITY_INFORMATION,
                 null_mut(),
                 null_mut(),
-                null_mut(),
+                &mut acl,
                 null_mut(),
                 &mut security,
             )
         };
         assert_eq!(result, 0, "must inspect the actual NT object ACL");
+        assert!(!acl.is_null(), "null DACL would grant unrestricted access");
         let _security = Descriptor(security);
         let mut text: *mut u16 = null_mut();
         // SAFETY: descriptor is live and obtained directly from the pipe.
@@ -354,17 +357,59 @@ mod tests {
             String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) }).unwrap();
         // SAFETY: free exactly the text allocated by the NT converter.
         unsafe { LocalFree(text.cast()) };
-        let sid = current_user_sid().unwrap();
         assert!(observed.starts_with("D:P"), "DACL must block inheritance");
-        assert!(observed.contains(&format!(";;;{sid})")));
-        assert!(observed.contains(";;;SY)"));
-        assert_eq!(observed.matches("(A;").count(), 2, "exactly two allow ACEs");
-        for banned in [";;;WD)", ";;;AN)", ";;;AU)", ";;;BU)", ";;;BA)"] {
-            assert!(
-                !observed.contains(banned),
-                "default Everyone/anonymous/broad ACL leaked"
-            );
+
+        // Canonical SDDL may render well-known SIDs using aliases (e.g. SY)
+        // and even the process SID via a friendly alias. Check actual ACE
+        // binary identities in the NT security descriptor, not display text.
+        fn sid_from_text(value: &str) -> Descriptor {
+            let wide = value
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let mut sid: *mut c_void = null_mut();
+            // SAFETY: NUL-terminated string and writable result, LocalAlloc.
+            assert_ne!(unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) }, 0);
+            assert!(!sid.is_null());
+            Descriptor(sid)
         }
+        let user_sid = sid_from_text(&current_user_sid().unwrap());
+        let system_sid = sid_from_text("SY");
+        // SAFETY: acl points into the still-owned GetSecurityInfo allocation.
+        let count = unsafe { (*acl).AceCount };
+        assert_eq!(count, 2, "exactly two ACEs, no inherited/broad grants");
+        let mut user_found = false;
+        let mut system_found = false;
+        for index in 0..u32::from(count) {
+            let mut raw_ace: *mut c_void = null_mut();
+            // SAFETY: the ACL belongs to the still-live security descriptor.
+            assert_ne!(unsafe { GetAce(acl, index, &mut raw_ace) }, 0);
+            assert!(!raw_ace.is_null());
+            let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: successful GetAce points at a valid ACE_HEADER.
+            let header = unsafe { (*ace).Header };
+            assert_eq!(
+                header.AceType,
+                ACCESS_ALLOWED_ACE_TYPE as u8,
+                "only explicit access-allowed ACEs permitted"
+            );
+            assert_eq!(header.AceFlags, 0, "no inherited or unusual ACE flags");
+            // SAFETY: access-allowed ACE layout stores the variable-length
+            // SID immediately after SidStart at an aligned address.
+            let sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast::<c_void>() };
+            // SAFETY: SID pointers are valid for the security descriptor and
+            // both comparison SIDs are held in LocalAlloc RAII wrappers.
+            if unsafe { EqualSid(sid, user_sid.0) } != 0 {
+                assert!(!user_found, "duplicate user SID ACE");
+                user_found = true;
+            } else if unsafe { EqualSid(sid, system_sid.0) } != 0 {
+                assert!(!system_found, "duplicate SYSTEM SID ACE");
+                system_found = true;
+            } else {
+                panic!("unexpected principal granted access to management Named Pipe");
+            }
+        }
+        assert!(user_found && system_found, "DACL must grant exactly user and SYSTEM");
     }
 
     #[tokio::test]
