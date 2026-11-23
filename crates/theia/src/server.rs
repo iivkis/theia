@@ -475,13 +475,7 @@ pub(crate) async fn serve_generation(
     context: Arc<ServerContext>,
     phase: watch::Receiver<GenerationPhase>,
 ) -> Result<(), ServerError> {
-    serve_generation_with_tls(
-        listener,
-        Arc::new(RwLock::new(acceptor)),
-        context,
-        phase,
-    )
-    .await
+    serve_generation_with_tls(listener, Arc::new(RwLock::new(acceptor)), context, phase).await
 }
 
 /// A short, per-new-TCP-socket acceptor load; active TLS sessions retain the
