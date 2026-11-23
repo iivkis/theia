@@ -4,6 +4,7 @@
 
 pub mod camouflage_batch;
 pub mod camouflage_discovery;
+pub mod camouflage_domain_dns;
 pub mod camouflage_dual;
 pub mod camouflage_dual_batch;
 pub mod camouflage_egress;
@@ -26,6 +27,7 @@ pub mod tui;
 pub(crate) mod tui_candidate_batch;
 pub(crate) mod tui_candidates;
 pub(crate) mod tui_discovery;
+pub(crate) mod tui_domain;
 pub mod tui_editor;
 pub(crate) mod tui_probe;
 
