@@ -968,7 +968,12 @@ impl GenerationLimits {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-type ReadyListener = (TcpListener, TlsAcceptor, quinn::Endpoint, Arc<ServerContext>);
+type ReadyListener = (
+    TcpListener,
+    TlsAcceptor,
+    quinn::Endpoint,
+    Arc<ServerContext>,
+);
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct PreparedGeneration {
@@ -991,19 +996,21 @@ async fn prepare_generation(
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
     for inbound in &document.server.inbounds {
         let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
-        let udp_addr: SocketAddr = inbound.quic_listen.parse().map_err(|_| ServerError::Config)?;
+        let udp_addr: SocketAddr = inbound
+            .quic_listen
+            .parse()
+            .map_err(|_| ServerError::Config)?;
         let material = tls_material(inbound)?;
         identities.push(material.identity);
         let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         // Prebind BOTH transports before publishing or shutting down ANY
         // old listener. A failure drops all prepared sockets by RAII.
-        let listener = TcpListener::bind(tcp_addr).await.map_err(|_| ServerError::Io)?;
-        let endpoint = crate::quic_transport::server_endpoint(
-            udp_addr,
-            material.certs,
-            material.key,
-        )
-        .map_err(|_| ServerError::Io)?;
+        let listener = TcpListener::bind(tcp_addr)
+            .await
+            .map_err(|_| ServerError::Io)?;
+        let endpoint =
+            crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
+                .map_err(|_| ServerError::Io)?;
         let context = Arc::new(ServerContext::with_limits(
             inbound,
             &document.server.policy,
@@ -1034,8 +1041,17 @@ impl RunningGeneration {
         let (sender, receiver) = watch::channel(phase);
         let mut tasks = JoinSet::new();
         for (tcp, acceptor, udp, context) in listeners {
-            tasks.spawn(serve_generation(tcp, acceptor, context.clone(), receiver.clone()));
-            tasks.spawn(crate::h3_server::serve_generation(udp, context, receiver.clone()));
+            tasks.spawn(serve_generation(
+                tcp,
+                acceptor,
+                context.clone(),
+                receiver.clone(),
+            ));
+            tasks.spawn(crate::h3_server::serve_generation(
+                udp,
+                context,
+                receiver.clone(),
+            ));
         }
         Self {
             tasks,
@@ -1110,10 +1126,7 @@ async fn stage_fresh_generation(
         )),
         live: prepared.live,
     };
-    let mut running = RunningGeneration::launch(
-        prepared.listeners,
-        GenerationPhase::Prepared,
-    );
+    let mut running = RunningGeneration::launch(prepared.listeners, GenerationPhase::Prepared);
     tokio::task::yield_now().await;
     if !running.is_healthy_before_activation() {
         return Err(());
