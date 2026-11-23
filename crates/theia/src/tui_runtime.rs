@@ -83,7 +83,9 @@ impl RuntimePanel {
                         .enable_all()
                         .build()
                         .map_err(|_| ManagementError::Io)
-                        .and_then(|runtime| runtime.block_on(crate::management::query_in(&directory, command)))
+                        .and_then(|runtime| {
+                            runtime.block_on(crate::management::query_in(&directory, command))
+                        })
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -242,7 +244,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(target_os = "linux")]
     async fn real_private_ipc_status_then_explicit_y_sends_bound_digest_once() {
-        use std::{fs, os::unix::fs::PermissionsExt, sync::atomic::{AtomicUsize, Ordering}};
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
             net::UnixListener,
@@ -291,18 +297,32 @@ mod tests {
         let mut panel = RuntimePanel::open_at(Some(dir.clone()), Some([0xabu8; 32]), true);
         for _ in 0..100 {
             panel.poll();
-            if matches!(panel.phase, Phase::Confirming { .. }) { break; }
+            if matches!(panel.phase, Phase::Confirming { .. }) {
+                break;
+            }
             sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(panel.phase, Phase::Confirming { inbounds: 2, revision: 8 });
-        assert_eq!(seen.load(Ordering::SeqCst), 1, "status never implicitly commits");
+        assert_eq!(
+            panel.phase,
+            Phase::Confirming {
+                inbounds: 2,
+                revision: 8
+            }
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "status never implicitly commits"
+        );
         panel.key(key(KeyCode::Char('n')));
         assert_eq!(seen.load(Ordering::SeqCst), 1);
         panel.key(key(KeyCode::Char('a')));
         panel.key(key(KeyCode::Char('y')));
         for _ in 0..100 {
             panel.poll();
-            if matches!(panel.phase, Phase::Applied { .. }) { break; }
+            if matches!(panel.phase, Phase::Applied { .. }) {
+                break;
+            }
             sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(panel.phase, Phase::Applied { revision: 9 });
@@ -319,10 +339,22 @@ mod tests {
             inbounds: 1,
             revision: 8,
         }));
-        assert_eq!(panel.phase, Phase::Viewing { inbounds: 1, revision: 8 });
+        assert_eq!(
+            panel.phase,
+            Phase::Viewing {
+                inbounds: 1,
+                revision: 8
+            }
+        );
         panel.key(key(KeyCode::Char('y')));
         panel.key(key(KeyCode::Char('a')));
-        assert_eq!(panel.phase, Phase::Viewing { inbounds: 1, revision: 8 });
+        assert_eq!(
+            panel.phase,
+            Phase::Viewing {
+                inbounds: 1,
+                revision: 8
+            }
+        );
         assert!(panel.body().contains("недоступно"));
         let mut legacy = fake(Some([1u8; 32]), true);
         legacy.complete(Ok(StatusReply::Running { inbounds: 1 }));
@@ -338,12 +370,30 @@ mod tests {
             inbounds: 2,
             revision: 4,
         }));
-        assert_eq!(panel.phase, Phase::Confirming { inbounds: 2, revision: 4 });
+        assert_eq!(
+            panel.phase,
+            Phase::Confirming {
+                inbounds: 2,
+                revision: 4
+            }
+        );
         assert!(panel.body().contains("revision=4"));
         panel.key(key(KeyCode::Char('n')));
-        assert_eq!(panel.phase, Phase::Viewing { inbounds: 2, revision: 4 });
+        assert_eq!(
+            panel.phase,
+            Phase::Viewing {
+                inbounds: 2,
+                revision: 4
+            }
+        );
         panel.key(key(KeyCode::Char('a')));
-        assert_eq!(panel.phase, Phase::Confirming { inbounds: 2, revision: 4 });
+        assert_eq!(
+            panel.phase,
+            Phase::Confirming {
+                inbounds: 2,
+                revision: 4
+            }
+        );
         // Even a lost ACK cannot be reported as definitely rolled back.
         panel.phase = Phase::Applying;
         assert!(!panel.key(key(KeyCode::Esc)));

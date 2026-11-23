@@ -511,15 +511,12 @@ impl Interaction {
         if active {
             // An editable draft is never silently sent to the server.
             // Ctrl+R requires an explicit saved source and then a second 'y'.
-            let apply_shortcut = key.modifiers.contains(KeyModifiers::CONTROL)
-                && key.code == KeyCode::Char('r');
-            if editor.role() == Role::Server
-                && (key.code == KeyCode::Char('v') || apply_shortcut)
-            {
+            let apply_shortcut =
+                key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r');
+            if editor.role() == Role::Server && (key.code == KeyCode::Char('v') || apply_shortcut) {
                 if apply_shortcut && editor.dirty() {
-                    editor.error = Some(
-                        "Сначала Ctrl+S: нельзя применять несохранённый черновик.".into(),
-                    );
+                    editor.error =
+                        Some("Сначала Ctrl+S: нельзя применять несохранённый черновик.".into());
                 } else {
                     let saved = if editor.dirty() {
                         None
@@ -699,13 +696,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         ),
     }
     if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
-        panel(
-            frame,
-            parts[1],
-            runtime.title(),
-            &runtime.body(),
-            true,
-        );
+        panel(frame, parts[1], runtime.title(), &runtime.body(), true);
     } else if interaction.is_some_and(|ui| ui.saving.is_some()) {
         panel(
             frame,
@@ -956,12 +947,18 @@ mod tests {
         assert!(edit.dirty());
         assert!(!ui.update(&mut model, ctrl_r));
         assert!(ui.runtime.is_none(), "unsaved edits must block Apply");
-        assert!(ui.editor.as_ref().unwrap().error.as_ref().unwrap().contains("Ctrl+S"));
+        assert!(ui
+            .editor
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Ctrl+S"));
 
         // A client panel never gets a server Apply hotkey.
-        let client_path = std::env::temp_dir().join(format!(
-            "theia-tui-m42c-client-{}.toml", std::process::id()
-        ));
+        let client_path =
+            std::env::temp_dir().join(format!("theia-tui-m42c-client-{}.toml", std::process::id()));
         fs::write(&client_path, include_str!("../../../examples/client.toml")).unwrap();
         let mut client = Interaction::new(Some(Editor::load(Role::Client, &client_path).unwrap()));
         let mut client_model = Model::new(Some(Role::Client));

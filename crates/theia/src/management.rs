@@ -382,7 +382,10 @@ fn parse_apply_revision(command: &[u8]) -> Option<u64> {
 /// Canonical lowercase hex only; no ambiguity or relaxed delimiters.
 #[cfg(target_os = "linux")]
 fn decode_digest(raw: &str) -> Option<[u8; 32]> {
-    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    if raw.len() != 64
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
         return None;
     }
@@ -464,7 +467,8 @@ pub async fn query_in(
         if let StatusCommand::ApplyReload { expected_revision }
         | StatusCommand::ApplyReloadBound {
             expected_revision, ..
-        } = command {
+        } = command
+        {
             let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
             if let Some(revision) = text
                 .strip_prefix("theia-apply-v1 applied revision=")
@@ -539,7 +543,10 @@ mod bound_command_tests {
     #[test]
     fn canonical_sha256_binding_is_required_before_any_apply_side_effect() {
         let valid = format!("apply-reload rev=7 sha256={}", "ab".repeat(32));
-        assert_eq!(parse_bound_revision(valid.as_bytes()), Some((7, [0xabu8; 32])));
+        assert_eq!(
+            parse_bound_revision(valid.as_bytes()),
+            Some((7, [0xabu8; 32]))
+        );
         for invalid in [
             format!("apply-reload rev=0 sha256={}", "ab".repeat(32)),
             format!("apply-reload rev=07 sha256={}", "ab".repeat(32)),
@@ -549,7 +556,10 @@ mod bound_command_tests {
             format!("apply-reload rev=7 sha256={} ", "ab".repeat(32)),
             format!("apply-reload rev=7 sha256={}", "gg".repeat(32)),
             format!("apply-reload rev=7 SHA256={}", "ab".repeat(32)),
-            format!("apply-reload rev=18446744073709551616 sha256={}", "ab".repeat(32)),
+            format!(
+                "apply-reload rev=18446744073709551616 sha256={}",
+                "ab".repeat(32)
+            ),
         ] {
             assert_eq!(parse_bound_revision(invalid.as_bytes()), None);
         }

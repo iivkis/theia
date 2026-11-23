@@ -149,8 +149,8 @@ impl ReloadPreflight {
         expected_sha256: [u8; 32],
     ) -> Result<ServerDocument, ReloadCheckError> {
         use std::io::Read;
-        let file = std::fs::File::open(&self.config_path)
-            .map_err(|_| ReloadCheckError::InvalidConfig)?;
+        let file =
+            std::fs::File::open(&self.config_path).map_err(|_| ReloadCheckError::InvalidConfig)?;
         let mut contents = zeroize::Zeroizing::new(Vec::new());
         file.take(1024 * 1024 + 1)
             .read_to_end(&mut contents)
