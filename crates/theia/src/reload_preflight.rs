@@ -112,6 +112,7 @@ pub(crate) struct ReloadPreflight {
     config_path: PathBuf,
     active: ServerDocument,
     identities: Vec<IdentityHash>,
+    restart_probe_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
@@ -125,6 +126,7 @@ impl ReloadPreflight {
             config_path,
             active,
             identities,
+            restart_probe_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -197,6 +199,12 @@ impl ReloadPreflight {
     pub(crate) fn check_restart_file(
         &self,
     ) -> Result<crate::restart_guard::RestartVerdict, crate::restart_guard::RestartError> {
+        // Failed/cancelled IPC handlers cannot launch a growing backlog of
+        // slow filesystem operations or hold candidate ports indefinitely.
+        // The guard stays owned by the worker even after its client times out.
+        let _single_flight = self.restart_probe_lock.try_lock().map_err(|_| {
+            crate::restart_guard::RestartError::ProbeBusy
+        })?;
         let candidate = match config::read_file(&self.config_path) {
             Ok(Config::Server(document)) => document,
             _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
