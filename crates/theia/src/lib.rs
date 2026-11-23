@@ -26,6 +26,7 @@ pub mod protocol;
 pub mod quic_transport;
 pub mod reload_preflight;
 pub mod restart_guard;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
 pub mod server;
 pub mod tui;
