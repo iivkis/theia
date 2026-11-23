@@ -310,8 +310,7 @@ mod tests {
                 ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW,
                 GetSecurityInfo, SE_KERNEL_OBJECT,
             },
-            EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACL,
-            DACL_SECURITY_INFORMATION,
+            EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION,
         };
         let pipe = WindowsServer::bind(&id(), 1).unwrap();
         let mut security: *mut c_void = null_mut();
