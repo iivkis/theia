@@ -86,6 +86,12 @@ API `probe_dual_batch` обрабатывает максимум 8 вручну�
 
 TLS-in-TLS в расширенных настройках: будущий переключатель off/optional/required, измеренный эффект на статистику внешних потоков, p95/CPU/RSS/overhead и показ рисков. Unsupported required запрещает соединение, не выключается скрыто. Не отображать содержание TLS приложений, bearer/private keys или пользовательские URL.
 
+### M4.2c: реальный серверный статус и защищённое подтверждение Apply (Linux)
+
+Только серверная TUI с явными `--role server --config FILE` и чистым сохранённым документом: `v` = запрос текущего `authorization revision` у действующего Linux-сервера, `Ctrl+R` = показать текущую revision/ограничения и запросить отдельное `y`. После подтверждения IPC проверяет SHA-256 **ровно сохранённых байтов TOML**, совпадение ожидаемой CAS revision, полный typed schema, неизменные loaded TLS PEM и restart-only поля. Несовпавший файл, внешний edit или stale revision дают отказ без Apply. Пока окно ревизии загружается, ничего не применяется. Два разных TOML с идентичными байтами допускаются, поскольку применяемый кандидат совпадает по содержимому, а не по имени.
+
+Во время уже подтверждённой отправки Apply закрытие/отмена не должны ложно сигнализировать rollback; при timeout/разрыве показывать «результат неизвестен; проверьте статус», а не «не применено». Панель отдельная, с возвратом в редактор; `Ctrl+S` только сохраняет файл. Существующие H2/H3 туннели не отзываются. Нет Windows Named Pipe/DACL, Windows/TUI system proxy effect, TLS/listener Apply или автозапуска сервера. [ADR-0042](adr/0042-m4-2c-content-bound-tui-apply.md).
+
 ## 2. Навигация и клавиатура
 
 | Клавиши | Действие |
@@ -96,7 +102,8 @@ TLS-in-TLS в расширенных настройках: будущий пер
 | `Enter` | открыть/выбрать/подтвердить |
 | `Esc` | назад или отменить диалог (без потери изменений) |
 | `Ctrl+S` | проверить и сохранить |
-| `Ctrl+R` | запросить reload (когда доступен, с подтверждением) |
+| `v` (server) | read-only статус и revision действующего Linux-сервера |
+| `Ctrl+R` (saved server config) | запросить auth-only CAS Apply, требуется отдельное `y` |
 | `?` / `F1` | контекстная помощь |
 | `q` | выход (не срабатывать при вводе текста) |
 
@@ -105,7 +112,7 @@ TLS-in-TLS в расширенных настройках: будущий пер
 ## 3. Формы, состояния, обратная связь
 
 - В каждой форме есть `*`/«Не сохранено»; при Esc/q диалог «Сохранить / Отменить изменения / Остаться».
-- Save != Apply: после сохранения показывать «Сохранено в TOML; runtime ещё не обновлён», если reload не сделан. M4.2a предоставляет лишь **Linux CLI read-only** `theia server status` при явном приватном `THEIA_CONTROL_DIR`, без интеграции TUI, ревизии или разрешения Apply; в TUI runtime остаётся «состояние неизвестно» ([ADR-0038](adr/0038-m4-2a-linux-readonly-management-ipc.md)). M4.2b0 добавляет отдельный CLI `theia server reload --check` **без применения и без статуса Applied**: strict candidate TOML / loaded TLS PEM fingerprint comparison, live H2/H3 listeners остаются неизменными, TUI Apply по-прежнему запрещён ([ADR-0039](adr/0039-m4-2b0-readonly-reload-preflight.md)). При успешном reload показывать время и snapshot revision.
+- Save != Apply: после сохранения показывать «Сохранено в TOML; runtime ещё не обновлён», если reload не сделан. Исторически M4.2a предоставлял только **Linux CLI read-only** `theia server status` при явном приватном `THEIA_CONTROL_DIR`, без интеграции TUI, ревизии или разрешения Apply; в TUI runtime остаётся «состояние неизвестно» ([ADR-0038](adr/0038-m4-2a-linux-readonly-management-ipc.md)). M4.2b0 добавляет отдельный CLI `theia server reload --check` **без применения и без статуса Applied**: strict candidate TOML / loaded TLS PEM fingerprint comparison, live H2/H3 listeners остаются неизменными, TUI Apply по-прежнему запрещён ([ADR-0039](adr/0039-m4-2b0-readonly-reload-preflight.md)). При успешном reload показывать время и snapshot revision.
 - Валидация с именем поля и способом исправления: «server.inbounds[0].h2_listen: порт 443 занят», а не «ошибка 0x3».
 - Долгая операция — индикатор прогресса, возможность отмены; UI event loop никогда не блокируется на DNS, TLS или file IO.
 - Важные статусы показывать и **цветом, и текстом**. High-contrast варианты, не полагаться на Unicode-иконки, совместимость 16-color терминалов.
