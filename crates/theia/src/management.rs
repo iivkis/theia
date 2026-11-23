@@ -17,6 +17,8 @@ use std::{
 };
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::{sync::Arc, time::Duration};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use tokio::sync::{mpsc, oneshot};
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -83,6 +85,12 @@ pub enum StatusCommand {
     /// Read-only restart readiness: validates TLS and tests fresh TCP/UDP ports.
     /// Never reserves a port, stops listeners or commits new runtime state.
     CheckRestart,
+    /// Explicit restart cutover, requires saved TOML SHA-256 and revision CAS.
+    /// Only distinct new ports with unchanged quotas/roster are supported.
+    ApplyRestartBound {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
+    },
     /// Explicit opt-in CAS auth publication, supported only by Linux server.
     ApplyReload {
         expected_revision: u64,
@@ -113,6 +121,9 @@ pub enum StatusReply {
     RestartRequiresMaintenance,
     /// All NEW candidate ports were temporarily bound, then released.
     RestartFreshPortsBindable,
+    RestartApplied {
+        revision: u64,
+    },
     Applied {
         revision: u64,
     },
@@ -155,6 +166,8 @@ pub struct StatusServer {
     inbounds: usize,
     preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
     live: Option<Arc<crate::live_auth::LiveAuthorization>>,
+    runtime: Option<Arc<crate::runtime_generation::State>>,
+    restarts: Option<mpsc::Sender<crate::runtime_generation::RestartRequest>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -183,6 +196,8 @@ impl StatusServer {
             inbounds,
             preflight: None,
             live: None,
+            runtime: None,
+            restarts: None,
         })
     }
 
@@ -201,6 +216,16 @@ impl StatusServer {
         live: Arc<crate::live_auth::LiveAuthorization>,
     ) -> Self {
         self.live = Some(live);
+        self
+    }
+
+    pub(crate) fn with_supervisor(
+        mut self,
+        state: Arc<crate::runtime_generation::State>,
+        requests: mpsc::Sender<crate::runtime_generation::RestartRequest>,
+    ) -> Self {
+        self.runtime = Some(state);
+        self.restarts = Some(requests);
         self
     }
 
@@ -230,11 +255,16 @@ impl StatusServer {
                         let inbounds = self.inbounds;
                         let preflight = self.preflight.clone();
                         let live = self.live.clone();
+                        let runtime = self.runtime.clone();
+                        let restarts = self.restarts.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
-                            // Cancelled handlers cannot publish. Their
-                            // spawn_blocking workers only load candidates.
-                            let _ = timeout(IO_TIMEOUT, handle(stream, inbounds, preflight, live)).await;
+                            // Only the live supervisor owns generation commits.
+                            let _ = timeout(
+                                IO_TIMEOUT,
+                                handle_internal(stream, inbounds, preflight, live, runtime, restarts),
+                            )
+                            .await;
                         });
                     }
                     // Over budget: close socket immediately, never build a
@@ -261,10 +291,25 @@ impl Drop for StatusServer {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) async fn handle<S>(
-    mut stream: S,
+    stream: S,
     inbounds: usize,
     preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
     live: Option<Arc<crate::live_auth::LiveAuthorization>>,
+) -> Result<(), ManagementError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    handle_internal(stream, inbounds, preflight, live, None, None).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) async fn handle_internal<S>(
+    mut stream: S,
+    mut inbounds: usize,
+    mut preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
+    mut live: Option<Arc<crate::live_auth::LiveAuthorization>>,
+    runtime: Option<Arc<crate::runtime_generation::State>>,
+    restarts: Option<mpsc::Sender<crate::runtime_generation::RestartRequest>>,
 ) -> Result<(), ManagementError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -284,6 +329,17 @@ where
             Err(_) => break,
         }
     }
+    // Resolve exactly one generation snapshot for this request. The CAS
+    // publication is separately guarded against a concurrent restart commit.
+    let observed = if let Some(runtime) = &runtime {
+        let view = runtime.snapshot().map_err(|_| ManagementError::Io)?;
+        inbounds = view.inbounds;
+        preflight = Some(view.preflight.clone());
+        live = Some(view.live.clone());
+        Some(view)
+    } else {
+        None
+    };
     let response = if !newline {
         "ERR unsupported\n".to_owned()
     } else {
@@ -437,7 +493,17 @@ fn decode_digest(raw: &str) -> Option<[u8; 32]> {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_bound_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
-    let rest = std::str::from_utf8(command.strip_prefix(b"apply-reload rev=")?).ok()?;
+    parse_bound_command(command, b"apply-reload rev=")
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
+    parse_bound_command(command, b"restart-apply rev=")
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_bound_command(command: &[u8], prefix: &[u8]) -> Option<(u64, [u8; 32])> {
+    let rest = std::str::from_utf8(command.strip_prefix(prefix)?).ok()?;
     let (revision, digest) = rest.split_once(" sha256=")?;
     Some((positive_decimal(revision)?, decode_digest(digest)?))
 }
@@ -456,6 +522,19 @@ where
         StatusCommand::Reload => b"reload\n".to_vec(),
         StatusCommand::CheckReload => b"check-reload\n".to_vec(),
         StatusCommand::CheckRestart => b"check-restart\n".to_vec(),
+        StatusCommand::ApplyRestartBound {
+            expected_revision,
+            candidate_sha256,
+        } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
+            let digest = candidate_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("restart-apply rev={expected_revision} sha256={digest}\n").into_bytes()
+        }
         StatusCommand::ApplyReload { expected_revision } => {
             if expected_revision == 0 {
                 return Err(ManagementError::InvalidReply);
@@ -494,6 +573,26 @@ where
     }
     if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
         return Ok(StatusReply::Unsupported);
+    }
+    if let StatusCommand::ApplyRestartBound {
+        expected_revision, ..
+    } = command
+    {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        let applied = text
+            .strip_prefix("theia-restart-v1 applied revision=")
+            .and_then(|line| line.strip_suffix('\n'))
+            .and_then(positive_decimal);
+        return match applied {
+            Some(revision) if Some(revision) == expected_revision.checked_add(1) => {
+                Ok(StatusReply::RestartApplied { revision })
+            }
+            _ if reply == b"theia-restart-v1 rejected\n" => {
+                Err(ManagementError::CandidateRejected)
+            }
+            _ if reply == b"ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
+        };
     }
     if command == StatusCommand::CheckRestart {
         return match reply.as_slice() {
