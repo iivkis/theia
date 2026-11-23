@@ -145,7 +145,7 @@ fn stale_future_and_backwards_clock_fail_closed() {
     let mut seen = ReplayWindow::new(8).unwrap();
 
     assert_eq!(
-        seen.accept(&pin, &proof, signature.as_ref(), 12_001),
+        seen.accept(&pin, &proof, signature.as_ref(), 7_999),
         Err(Failure::Future)
     );
     assert_eq!(
