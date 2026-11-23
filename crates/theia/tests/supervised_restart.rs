@@ -89,7 +89,35 @@ fn revision(env_key: &str, endpoint: &str, value: u64) -> bool {
             .contains(&format!("authorization revision={value}"))
 }
 
-fn apply(env_key: &str, endpoint: &str, expected: u64, hex: &str, should_succeed: bool) {
+/// Read-only operator fingerprint. Returns only the domain-separated digest,
+/// never a certificate, private key, or bearer in stdout.
+fn material_fingerprint(config: &Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_theia"))
+        .args(["server", "tls", "fingerprint", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        // Invalid TLS candidates must still be sent to the native manager
+        // for explicit fail-closed validation, with no valid key exposure.
+        return "0".repeat(64);
+    }
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    stdout
+        .strip_prefix("theia-tls-pem-v1 sha256=")
+        .and_then(|value| value.strip_suffix('\n'))
+        .expect("read-only fingerprint output format")
+        .to_owned()
+}
+
+fn apply_with_pin(
+    env_key: &str,
+    endpoint: &str,
+    expected: u64,
+    hex: &str,
+    material_sha: &str,
+    should_succeed: bool,
+) {
     let output = cli(
         env_key,
         endpoint,
@@ -101,6 +129,8 @@ fn apply(env_key: &str, endpoint: &str, expected: u64, hex: &str, should_succeed
             &expected.to_string(),
             "--sha256",
             hex,
+            "--tls-sha256",
+            material_sha,
             "--confirm",
         ],
     );
@@ -118,6 +148,18 @@ fn apply(env_key: &str, endpoint: &str, expected: u64, hex: &str, should_succeed
             String::from_utf8_lossy(&output.stdout).contains(&format!("revision={}", expected + 1))
         );
     }
+}
+
+fn apply(
+    env_key: &str,
+    endpoint: &str,
+    expected: u64,
+    hex: &str,
+    should_succeed: bool,
+    config: &Path,
+) {
+    let material_sha = material_fingerprint(config);
+    apply_with_pin(env_key, endpoint, expected, hex, &material_sha, should_succeed);
 }
 
 fn write_identity(cert: &Path, key: &Path, generated: &rcgen::CertifiedKey) {
@@ -282,14 +324,14 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         next.server.inbounds[0].tls_key = format!("file:{}", new_key.display());
         let next_sha = save(&config_path, &next);
 
-        apply(env_key, &endpoint, 1, &"0".repeat(64), false);
+        apply(env_key, &endpoint, 1, &"0".repeat(64), false, &config_path);
         assert!(revision(env_key, &endpoint, 1));
 
         let occupied_tcp = StdTcp::bind("127.0.0.1:0").unwrap();
         let mut busy = next.clone();
         busy.server.inbounds[0].h2_listen = occupied_tcp.local_addr().unwrap().to_string();
         let hash = save(&config_path, &busy);
-        apply(env_key, &endpoint, 1, &hash, false);
+        apply(env_key, &endpoint, 1, &hash, false, &config_path);
         drop(occupied_tcp);
         assert!(revision(env_key, &endpoint, 1));
 
@@ -297,20 +339,20 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         busy = next.clone();
         busy.server.inbounds[0].quic_listen = occupied_udp.local_addr().unwrap().to_string();
         let hash = save(&config_path, &busy);
-        apply(env_key, &endpoint, 1, &hash, false);
+        apply(env_key, &endpoint, 1, &hash, false, &config_path);
         drop(occupied_udp);
         assert!(revision(env_key, &endpoint, 1));
 
         let mut quota_changed = next.clone();
         quota_changed.server.policy.max_connections_total += 1;
         let hash = save(&config_path, &quota_changed);
-        apply(env_key, &endpoint, 1, &hash, false);
+        apply(env_key, &endpoint, 1, &hash, false, &config_path);
         assert!(revision(env_key, &endpoint, 1));
 
         let mut same_port = next.clone();
         same_port.server.inbounds[0].h2_listen = document.server.inbounds[0].h2_listen.clone();
         let hash = save(&config_path, &same_port);
-        apply(env_key, &endpoint, 1, &hash, false);
+        apply(env_key, &endpoint, 1, &hash, false, &config_path);
         assert!(revision(env_key, &endpoint, 1));
 
         // Hash computed BEFORE an external writer modifies the file must
@@ -322,17 +364,17 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
             .unwrap()
             .write_all(b"\n# concurrent operator edit\n")
             .unwrap();
-        apply(env_key, &endpoint, 1, &next_sha, false);
+        apply(env_key, &endpoint, 1, &next_sha, false, &config_path);
         assert!(revision(env_key, &endpoint, 1));
 
         let hash = save(&config_path, &next);
-        apply(env_key, &endpoint, 1, &hash, true);
+        apply(env_key, &endpoint, 1, &hash, true, &config_path);
         assert!(revision(env_key, &endpoint, 2));
         assert!(
             server.0.try_wait().unwrap().is_none(),
             "supervisor died after cutover"
         );
-        apply(env_key, &endpoint, 1, &hash, false);
+        apply(env_key, &endpoint, 1, &hash, false, &config_path);
         assert!(revision(env_key, &endpoint, 2));
 
         let new_h2 = H2Client::new(
@@ -551,26 +593,26 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             String::from_utf8_lossy(&check.stdout),
         );
         // Candidate content and expected revision must be exact.
-        apply(env_key, &endpoint, 1, &"0".repeat(64), false);
+        apply(env_key, &endpoint, 1, &"0".repeat(64), false, &config_path);
         assert!(revision(env_key, &endpoint, 1));
         let mut invalid = candidate.clone();
         invalid.server.inbounds[0].tls_cert = format!("file:{}", malformed_cert.display());
         let bad_hash = save(&config_path, &invalid);
-        apply(env_key, &endpoint, 1, &bad_hash, false);
+        apply(env_key, &endpoint, 1, &bad_hash, false, &config_path);
         assert!(revision(env_key, &endpoint, 1));
         let mut quota = candidate.clone();
         quota.server.policy.max_connections_per_user += 1;
         let quota_hash = save(&config_path, &quota);
-        apply(env_key, &endpoint, 1, &quota_hash, false);
+        apply(env_key, &endpoint, 1, &quota_hash, false, &config_path);
         assert!(revision(env_key, &endpoint, 1));
         // Fresh-port path is NOT invoked: both existing TCP and UDP bind
         // addresses remain the same throughout this confirmed rotation.
         let real_hash = save(&config_path, &candidate);
         assert_eq!(real_hash, hash);
-        apply(env_key, &endpoint, 1, &real_hash, true);
+        apply(env_key, &endpoint, 1, &real_hash, true, &config_path);
         assert!(revision(env_key, &endpoint, 2));
         assert!(server.0.try_wait().unwrap().is_none());
-        apply(env_key, &endpoint, 1, &real_hash, false);
+        apply(env_key, &endpoint, 1, &real_hash, false, &config_path);
         assert!(revision(env_key, &endpoint, 2));
 
         // A client trusting ONLY the new CA must see the NEW certificate on
@@ -649,7 +691,7 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
         rotate_again.server.inbounds[0].tls_cert = format!("file:{}", old_cert.display());
         rotate_again.server.inbounds[0].tls_key = format!("file:{}", old_key.display());
         let again_hash = save(&config_path, &rotate_again);
-        apply(env_key, &endpoint, 3, &again_hash, true);
+        apply(env_key, &endpoint, 3, &again_hash, true, &config_path);
         assert!(revision(env_key, &endpoint, 4));
         let mut restored_ca = RootCertStore::empty();
         restored_ca.add(old_identity.cert.der().clone()).unwrap();
