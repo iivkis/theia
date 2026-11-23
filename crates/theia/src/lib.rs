@@ -33,6 +33,7 @@ pub(crate) mod tui_discovery;
 pub(crate) mod tui_domain;
 pub mod tui_editor;
 pub(crate) mod tui_probe;
+pub(crate) mod tui_runtime;
 
 use std::fmt;
 use std::path::Path;
