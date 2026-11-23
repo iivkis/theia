@@ -55,6 +55,22 @@ async fn health_and_status_reflect_real_running_socket_without_reloading() {
         query_in(&dir, StatusCommand::Reload).await,
         Ok(StatusReply::Unsupported)
     );
+    // Verify the compiled executable, not just the library protocol.
+    let cli_dir = dir.clone();
+    let cli = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_theia"))
+            .args(["server", "status"])
+            .env("THEIA_CONTROL_DIR", cli_dir)
+            .output()
+            .expect("compiled CLI")
+    })
+    .await
+    .unwrap();
+    assert!(cli.status.success(), "{:?}", cli.stderr);
+    assert_eq!(
+        std::str::from_utf8(&cli.stdout).unwrap(),
+        "server running; 2 inbounds; reload not available\n"
+    );
     task.abort();
     let _ = task.await;
     assert!(!socket.exists(), "owned socket removed on cancellation");
