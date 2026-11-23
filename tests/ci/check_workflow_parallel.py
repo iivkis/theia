@@ -119,11 +119,19 @@ require("github.event_name == 'pull_request'" in persist
 require("ref: ${{ github.event.pull_request.head.sha }}" in persist
         and 'test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"' in persist,
         "never persist formatting against a stale or guessed PR head")
-require('git push origin "HEAD:refs/heads/$HEAD_REF"' in persist
-        and 'gh workflow run ci.yml --ref "$HEAD_REF"' in persist,
-        "each autoformat commit must explicitly trigger exact-new-head CI")
-require("contents: write" in persist and "actions: write" in persist,
-        "isolated post-green job needs scoped permissions to push and dispatch")
+require("actions/download-artifact@v4" in persist
+        and "name: ci-formatted-source" in persist,
+        "persistence must download the same artifact used by test jobs")
+require("python3 scripts/ci-format.py" in persist
+        and 'cmp "$RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar"' in persist,
+        "post-green commit must byte-verify against exactly the tested source archive")
+require('git push origin "HEAD:refs/heads/$HEAD_REF"' in persist,
+        "post-green formatting must use race-safe fast-forward push")
+require("gh workflow run" not in persist
+        and "actions: write" not in persist,
+        "autoformat must NOT request redundant full CI reruns or extra Actions permissions")
+require("contents: write" in persist,
+        "isolated post-green job needs scoped write permission to save formatting")
 require("contents: read" in workflow.split("jobs:", 1)[0],
         "normal test jobs must remain read-only")
 
