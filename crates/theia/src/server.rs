@@ -15,7 +15,7 @@ use std::{
     io::BufReader,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -473,6 +473,24 @@ pub(crate) async fn serve_generation(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     context: Arc<ServerContext>,
+    phase: watch::Receiver<GenerationPhase>,
+) -> Result<(), ServerError> {
+    serve_generation_with_tls(
+        listener,
+        Arc::new(RwLock::new(acceptor)),
+        context,
+        phase,
+    )
+    .await
+}
+
+/// A short, per-new-TCP-socket acceptor load; active TLS sessions retain the
+/// ServerConfig selected for their own handshake. The running supervisor
+/// replaces only the acceptor pointer after validating the full H2+H3 set.
+pub(crate) async fn serve_generation_with_tls(
+    listener: TcpListener,
+    acceptor: Arc<RwLock<TlsAcceptor>>,
+    context: Arc<ServerContext>,
     mut phase: watch::Receiver<GenerationPhase>,
 ) -> Result<(), ServerError> {
     if !await_generation_activation(&mut phase).await {
@@ -494,7 +512,10 @@ pub(crate) async fn serve_generation(
                 let Some(slot) = context.connection_slot() else {
                     continue;
                 };
-                let tls_acceptor = acceptor.clone();
+                let tls_acceptor = {
+                    let current = acceptor.read().map_err(|_| ServerError::Io)?;
+                    current.clone()
+                };
                 let context = context.clone();
                 connections.spawn(async move {
                     let _slot = slot;
