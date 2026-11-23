@@ -293,6 +293,18 @@ impl ProxyTunnel {
 }
 
 pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
+    run_file_inner(config_path, false).await
+}
+
+/// Windows-only, explicitly confirmed user WinINet proxy operation. The
+/// settings are touched ONLY after strict client/TLS preflight and BOTH local
+/// loopback TCP listeners are bound, never on plain client run or server run.
+#[cfg(windows)]
+pub async fn run_file_with_system_proxy(config_path: &Path) -> Result<(), ClientError> {
+    run_file_inner(config_path, true).await
+}
+
+async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result<(), ClientError> {
     let Config::Client(document) =
         config::read_file(config_path).map_err(|_| ClientError::Configuration)?
     else {
@@ -312,6 +324,32 @@ pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
     let socks = TcpListener::bind(&document.client.proxy.socks5_listen)
         .await
         .map_err(|_| ClientError::Io)?;
+    #[cfg(windows)]
+    if enable_system_proxy {
+        // A config declaration is insufficient by itself: this branch
+        // requires the *additional CLI* --system-proxy --confirm.
+        if document.client.proxy.system_proxy != config::SystemProxy::Manual {
+            return Err(ClientError::SystemProxy);
+        }
+        let bound = http.local_addr().map_err(|_| ClientError::Io)?;
+        let mut lease = crate::windows_system_proxy::OwnedProxy::apply(bound)
+            .map_err(|_| ClientError::SystemProxy)?;
+        // Ctrl+C is the normal scoped exit. A killed process cannot execute
+        // destructors; persistent registry journal permits explicit recovery
+        // on the next invocation, without overwriting a foreign proxy change.
+        let result = tokio::select! {
+            result = serve_proxy(http, socks, client) => result,
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(|_| ClientError::SystemProxy)
+            }
+        };
+        lease.restore().map_err(|_| ClientError::SystemProxy)?;
+        return result;
+    }
+    #[cfg(not(windows))]
+    if enable_system_proxy {
+        return Err(ClientError::SystemProxy);
+    }
     serve_proxy(http, socks, client).await
 }
 
