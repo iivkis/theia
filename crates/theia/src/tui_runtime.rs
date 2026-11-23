@@ -38,7 +38,18 @@ pub(crate) struct RuntimePanel {
 
 impl RuntimePanel {
     pub(crate) fn open(saved_sha256: Option<[u8; 32]>, start_with_review: bool) -> Self {
-        let directory = std::env::var_os("THEIA_CONTROL_DIR").map(PathBuf::from);
+        Self::open_at(
+            std::env::var_os("THEIA_CONTROL_DIR").map(PathBuf::from),
+            saved_sha256,
+            start_with_review,
+        )
+    }
+
+    fn open_at(
+        directory: Option<PathBuf>,
+        saved_sha256: Option<[u8; 32]>,
+        start_with_review: bool,
+    ) -> Self {
         let mut panel = Self {
             phase: Phase::Checking,
             directory,
@@ -226,6 +237,79 @@ mod tests {
             start_with_review: review,
             receiver: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(target_os = "linux")]
+    async fn real_private_ipc_status_then_explicit_y_sends_bound_digest_once() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::atomic::{AtomicUsize, Ordering}};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+            time::{sleep, Duration},
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "theia-tui-ipc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("theia-server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        let responder = tokio::spawn(async move {
+            let (mut status, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 7];
+            status.read_exact(&mut req).await.unwrap();
+            assert_eq!(&req, b"status\n");
+            counter.fetch_add(1, Ordering::SeqCst);
+            status
+                .write_all(b"theia-status-v2 running inbounds=2 revision=8\n")
+                .await
+                .unwrap();
+            status.shutdown().await.unwrap();
+            drop(status);
+
+            let (mut apply, _) = listener.accept().await.unwrap();
+            let expected = format!("apply-reload rev=8 sha256={}\n", "ab".repeat(32));
+            let mut req = vec![0u8; expected.len()];
+            apply.read_exact(&mut req).await.unwrap();
+            assert_eq!(req, expected.as_bytes());
+            counter.fetch_add(1, Ordering::SeqCst);
+            apply
+                .write_all(b"theia-apply-v1 applied revision=9\n")
+                .await
+                .unwrap();
+            apply.shutdown().await.unwrap();
+        });
+        let mut panel = RuntimePanel::open_at(Some(dir.clone()), Some([0xabu8; 32]), true);
+        for _ in 0..100 {
+            panel.poll();
+            if matches!(panel.phase, Phase::Confirming { .. }) { break; }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(panel.phase, Phase::Confirming { inbounds: 2, revision: 8 });
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "status never implicitly commits");
+        panel.key(key(KeyCode::Char('n')));
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        panel.key(key(KeyCode::Char('a')));
+        panel.key(key(KeyCode::Char('y')));
+        for _ in 0..100 {
+            panel.poll();
+            if matches!(panel.phase, Phase::Applied { .. }) { break; }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(panel.phase, Phase::Applied { revision: 9 });
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        responder.await.unwrap();
+        fs::remove_file(socket).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 
     #[test]
