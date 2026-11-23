@@ -169,10 +169,7 @@ pub(crate) fn probe(
 /// semaphores for both generations until bounded drain finishes. Changing
 /// quota or user inventory would silently double admission and is forbidden.
 /// This check does not publish, bind listeners or stop any old session.
-pub(crate) fn same_shared_limits(
-    active: &ServerDocument,
-    candidate: &ServerDocument,
-) -> bool {
+pub(crate) fn same_shared_limits(active: &ServerDocument, candidate: &ServerDocument) -> bool {
     if active.server.policy != candidate.server.policy
         || active.management != candidate.management
         || active.schema_version != candidate.schema_version
@@ -180,7 +177,12 @@ pub(crate) fn same_shared_limits(
         return false;
     }
     let before: HashSet<_> = active.server.users.iter().map(|u| u.id.as_str()).collect();
-    let after: HashSet<_> = candidate.server.users.iter().map(|u| u.id.as_str()).collect();
+    let after: HashSet<_> = candidate
+        .server
+        .users
+        .iter()
+        .map(|u| u.id.as_str())
+        .collect();
     before == after
 }
 
