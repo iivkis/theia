@@ -26,6 +26,8 @@ jobs:
         run: bash scripts/check-spec.sh
       - name: Test required CI DAG, native E2E and Go cache contract
         run: python3 tests/ci/check_workflow_parallel.py
+      - name: Verify CI format artifact isolation
+        run: python3 tests/ci/test_format_artifact.py
       - name: Detect Rust workspace
         id: detect
         shell: bash
@@ -39,6 +41,34 @@ jobs:
             echo "::notice::Specification-only stage: Rust tests skipped until Cargo workspace exists"
             echo "rust_ready=false" >> "$GITHUB_OUTPUT"
           fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.detect.outputs.rust_ready == 'true'
+        with:
+          components: rustfmt
+      - uses: actions/setup-go@v5
+        if: steps.detect.outputs.rust_ready == 'true'
+        with:
+          go-version: '1.24.x'
+          cache: true
+          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
+      - name: Format root Rust, independent spikes, and pinned Go test helpers
+        if: steps.detect.outputs.rust_ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all
+          cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all
+          mapfile -d '' -t go_files < <(git ls-files -z -- '*.go')
+          if (( ${#go_files[@]} )); then gofmt -w "${go_files[@]}"; fi
+          python3 scripts/ci-format.py "$RUNNER_TEMP/ci-formatted-source.tar"
+      - uses: actions/upload-artifact@v4
+        if: steps.detect.outputs.rust_ready == 'true'
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source.tar
+          if-no-files-found: error
+          retention-days: 2
 
   m0-1-api-spike:
     name: m0-1-api-spike (Linux)
@@ -49,6 +79,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -110,6 +149,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -160,6 +208,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -176,7 +233,7 @@ jobs:
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Release compilation only after main merge
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         run: cargo build --workspace --release --locked
 
   windows-smoke:
@@ -189,6 +246,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -209,7 +275,7 @@ jobs:
         shell: pwsh
         run: ./scripts/windows-cross-sid-ci.ps1
       - name: Native Windows release compilation only after main merge
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         run: cargo build --workspace --release --locked
 
   browser-e2e:
@@ -226,6 +292,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -258,6 +333,15 @@ jobs:
       THEIA_BBR_RESULTS_PATH: ${{ github.workspace }}/theia-bbr-${{ matrix.os }}.csv
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -293,6 +377,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -352,6 +445,15 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Use canonical formatted sources for all tests
+        shell: pwsh
+        run: |
+          tar -xf "$env:RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply CI canonical formatting' }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
