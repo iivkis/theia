@@ -1,0 +1,30 @@
+# Rust build artifacts (workspace and isolated CI-only research crates)
+/target/
+**/target/
+*.rs.bk
+
+# Local development state and editor caches
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Temporary outputs
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Never accidentally stage local runtime secrets or generated private keys.
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+*.pem
+
+# Preserve Cargo.lock files and committed TOML templates.
