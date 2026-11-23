@@ -927,9 +927,14 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "theia-tui-m42c-{}-{}.toml",
             std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
-        fs::write(&path, include_str!("../../../examples/server.toml")).unwrap();
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
+        fs::write(&path, source).unwrap();
         let editor = Editor::load(Role::Server, &path).unwrap();
         let mut ui = Interaction::new(Some(editor));
         let mut model = Model::new(Some(Role::Server));
