@@ -534,8 +534,10 @@ impl Interaction {
             }
             if editor.role() == Role::Server && key.code == KeyCode::Char('R') {
                 if editor.dirty() {
-                    editor.error =
-                        Some("Сначала Ctrl+S: проверьте сохранённый TOML перед restart preflight.".into());
+                    editor.error = Some(
+                        "Сначала Ctrl+S: проверьте сохранённый TOML перед restart preflight."
+                            .into(),
+                    );
                 } else {
                     self.runtime = Some(RuntimePanel::open_restart());
                     editor.error = None;
