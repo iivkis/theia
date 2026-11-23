@@ -1616,8 +1616,12 @@ async fn run_supervised_file(
     document: ServerDocument,
     config_path: &Path,
 ) -> Result<(), ServerError> {
+    crate::diag!(Info, "server.supervisor", "initial_generation_preflight_begin",
+        "inbounds" = Value::Count(document.server.inbounds.len() as u64));
     let limits = GenerationLimits::new(&document);
     let initial = prepare_generation(&document, 1, &limits, None).await?;
+    crate::diag!(Info, "server.supervisor", "initial_generation_prepared",
+        "listeners" = Value::Count(initial.listeners.len() as u64));
     let current_identities = initial.identities.clone();
     let runtime = Arc::new(crate::runtime_generation::State::new(
         crate::runtime_generation::View {
@@ -1653,6 +1657,7 @@ async fn run_supervised_file(
         tokio::spawn(async move { service.serve().await.map_err(|_| ServerError::Io) })
     });
     let mut running = RunningGeneration::launch(initial.listeners, GenerationPhase::Active);
+    crate::diag!(Info, "server.supervisor", "generation_active");
     let mut identities = current_identities;
     let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
     let mut rollback: Option<RollbackSlot> = None;
