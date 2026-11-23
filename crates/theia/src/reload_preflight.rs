@@ -252,4 +252,67 @@ mod tests {
             Err(ReloadCheckError::InvalidConfig)
         );
     }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn on_disk_preflight_detects_pem_drift_without_writing_or_publishing() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let directory = std::env::temp_dir().join(format!(
+            "theia-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let cert = directory.join("cert.pem");
+        let key = directory.join("key.pem");
+        let config_file = directory.join("server.toml");
+        let cert_bytes = b"certificate bytes captured when listener started";
+        let key_bytes = b"private key bytes captured when listener started";
+        fs::write(&cert, cert_bytes).unwrap();
+        fs::write(&key, key_bytes).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut active = document();
+        active.server.inbounds[0].tls_cert = format!("file:{}", cert.display());
+        active.server.inbounds[0].tls_key = format!("file:{}", key.display());
+        fs::write(
+            &config_file,
+            Config::Server(active.clone()).to_toml().unwrap(),
+        )
+        .unwrap();
+        let snapshot = ReloadPreflight::new(
+            config_file.clone(),
+            active.clone(),
+            vec![IdentityHash::from_pem(cert_bytes, key_bytes)],
+        );
+        assert_eq!(snapshot.check_file(), Ok(()));
+        let mut candidate = active;
+        candidate.server.users[0].token_sha256 = "c".repeat(64);
+        fs::write(
+            &config_file,
+            Config::Server(candidate.clone()).to_toml().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.check_file(), Ok(()), "candidate is not committed");
+
+        fs::write(&cert, b"swapped certificate").unwrap();
+        assert_eq!(snapshot.check_file(), Err(ReloadCheckError::IdentityDrift));
+        fs::write(&cert, cert_bytes).unwrap();
+        fs::write(&key, b"swapped key").unwrap();
+        assert_eq!(snapshot.check_file(), Err(ReloadCheckError::IdentityDrift));
+        fs::write(&key, key_bytes).unwrap();
+        candidate.server.inbounds[0].h2_listen = "127.0.0.1:9555".into();
+        fs::write(
+            &config_file,
+            Config::Server(candidate).to_toml().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.check_file(),
+            Err(ReloadCheckError::RequiresRestart)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
 }
