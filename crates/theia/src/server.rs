@@ -1161,11 +1161,17 @@ mod hardening_tests {
         let staged = control.stage(&candidate, 1).unwrap();
         assert_eq!(control.revision(), Ok(1));
         assert_eq!(a.authorize(Some(&bob)).err(), Some(AuthFailure::Forbidden));
-        assert_eq!(b.authorize(Some(&rotated_alice)).err(), Some(AuthFailure::Unauthorized));
+        assert_eq!(
+            b.authorize(Some(&rotated_alice)).err(),
+            Some(AuthFailure::Unauthorized)
+        );
 
         assert_eq!(control.publish(staged), Ok(2));
         assert_eq!(control.revision(), Ok(2));
-        assert_eq!(a.authorize(Some(&old_alice)).err(), Some(AuthFailure::Unauthorized));
+        assert_eq!(
+            a.authorize(Some(&old_alice)).err(),
+            Some(AuthFailure::Unauthorized)
+        );
         assert_eq!(b.authorize(Some(&bob)).err(), Some(AuthFailure::Forbidden));
         // New requests on BOTH listener contexts see one published snapshot.
         let bob_granted = a.authorize(Some(&bob)).unwrap();
@@ -1217,7 +1223,10 @@ mod hardening_tests {
         ));
         assert_eq!(control.revision(), Ok(2));
         assert!(a.authorize(Some(&live_bearer(7))).is_ok());
-        assert_eq!(b.authorize(Some(&live_bearer(9))).err(), Some(AuthFailure::Forbidden));
+        assert_eq!(
+            b.authorize(Some(&live_bearer(9))).err(),
+            Some(AuthFailure::Forbidden)
+        );
     }
 
     #[test]
