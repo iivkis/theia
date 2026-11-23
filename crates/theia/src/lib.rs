@@ -271,6 +271,14 @@ mod tests {
     fn recognizes_both_headless_roles_and_config_validation() {
         assert_eq!(command(&["server", "status"]), Ok(Command::ServerStatus));
         assert_eq!(
+            command(&["server", "reload", "--check"]),
+            Ok(Command::ServerCheckReload)
+        );
+        assert_eq!(
+            command(&["server", "reload"]),
+            Err(CliError::InvalidArguments)
+        );
+        assert_eq!(
             command(&["server", "run", "--config", "server.toml"]),
             Ok(Command::ServerRun {
                 config: "server.toml".into()
