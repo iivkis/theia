@@ -20,6 +20,7 @@ pub mod h3_client;
 pub mod h3_server;
 pub mod invite;
 pub mod local_proxy;
+pub mod live_auth;
 pub mod management;
 pub mod protocol;
 pub mod quic_transport;
