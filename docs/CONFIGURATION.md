@@ -96,7 +96,7 @@ language = "ru"
 - `active_profile` указывает на существующий уникальный `profiles[].id`.
 - `server` — hostname:port или [IPv6]:port. `server_name` — hostname для TLS/SNI, без insecure override.
 - `auth_token` — `env:NAME` или `file:path`, содержимое должно быть canonical base64url **без padding**, декодироваться строго в **32 байта**; зафиксировать test vector и отклонять двусмысленные формы.
-- `tls_profile`: `default` (не имитирует браузер) или конкретный **реализованный и проверенный** именованный browser-like профиль (F-13, P0). Неизвестное имя = ошибка; запрещён тихий fallback на default. Для профиля необходимы воспроизводимые TLS/HTTP2/HTTP3 сравнения и документированные расхождения.
+- `tls_profile`: `default` (строгий rustls, без имитации браузера) либо **явно выбранный** `browser-h2-btls-v1` только с `transport = "h2"` (ADR-0057, PR #83, CI pending). В обычном бинарнике BoringSSL собирается, но не выбирается автоматически. Новый профиль действительно меняет TLS backend и измеряемые H2 SETTINGS при сохранении TLS1.3/CA/SNI/ALPN и 8KiB header guard. H3/auto с данным именем, неизвестные строки и сборки без включённого BoringSSL отказывают без downgrade. Внешний Chromium159 несовпадающий reference, поэтому полная F-13 release acceptance остаётся открытой.
 - `transport`: `auto`, `h3`, `h2`. В `h3` не разрешён fallback; `h2` не инициирует UDP. В `auto` fallback только при network-level QUIC failure.
 - `quic_connect_timeout_ms`: рекомендуемый 1600, допустимо 500..15000. `quic_negative_cache_ttl_s`: по умолчанию 900, допускается 0 (без кеша) .. 86400.
 - Proxy listeners строго loopback по умолчанию; возможность внешнего bind НЕ включать до явной аутентификации локального proxy и отдельной политики безопасности.
@@ -130,7 +130,7 @@ language = "ru"
 
 ## 4.2. Будущие F-18/F-19 поля (не изменять TOML v1 до реализации)
 
-REALITY-подобный security mode, криптографическая идентичность сервера и pin **публичного** ключа, выбранный TLS образец target/SNI, версия протокола, fingerprint и anti-TLS-in-TLS policy off/optional/required требуют отдельного ADR с точными типами, схемой миграции и versioned invitation. В существующем строгом schema_version=1 клиентский tls_profile=default и экспорт theia://v1 остаются единственными разрешёнными; нельзя пропускать новые поля или выдавать стандартный TLS за REALITY. Server private key должен храниться через защищённый env/file; не помещать его в приглашение, логи, результаты сканера. Клиент должен проверять server identity без снятия верификации TLS; при неподдерживаемом required — отказ. См. docs/STEALTH_REALITY.md.
+REALITY-подобный security mode, криптографическая идентичность сервера и pin **публичного** ключа, выбранный TLS образец target/SNI, версия протокола, fingerprint и anti-TLS-in-TLS policy off/optional/required требуют отдельного ADR с точными типами, схемой миграции и versioned invitation. В строгом schema_version=1 клиентский `tls_profile` допускает только `default` либо явно выбранный отдельный H2 `browser-h2-btls-v1` (ADR-0057), а экспорт theia://v1 остаётся неизменным; нельзя пропускать новые поля или выдавать стандартный TLS за REALITY. Server private key должен храниться через защищённый env/file; не помещать его в приглашение, логи, результаты сканера. Клиент должен проверять server identity без снятия верификации TLS; при неподдерживаемом required — отказ. См. docs/STEALTH_REALITY.md.
 
 ## 5. Windows system proxy
 
