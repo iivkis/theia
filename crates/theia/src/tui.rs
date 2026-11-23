@@ -1618,6 +1618,99 @@ mod tests {
     }
 
     #[test]
+    fn client_import_modal_masks_pasted_link_and_requires_explicit_confirmation() {
+        use crate::{config::{self, Config}, invite::Invitation};
+        use std::{fs, thread, time::Instant};
+        let path = std::env::temp_dir().join(format!(
+            "theia-f14-client-ui-{}.toml",
+            std::process::id()
+        ));
+        let Config::Client(original) =
+            config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
+            panic!("client");
+        };
+        let mut new_profile = original.client.profiles[0].clone();
+        new_profile.id = "remote".into();
+        new_profile.server = "remote.example.org:443".into();
+        new_profile.server_name = "remote.example.org".into();
+        let link = Invitation::public_from_profile(&new_profile)
+            .unwrap()
+            .encode()
+            .unwrap();
+        fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Char('i')));
+        assert!(matches!(ui.importing, Some(ImportFlow::Input(_))));
+        ui.paste_import_source(&link);
+        let hidden = rendered_interaction(120, 40, &model, &ui);
+        assert!(hidden.contains("скрыто"));
+        assert!(!hidden.contains(&link));
+        assert!(!hidden.contains("remote.example.org"));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.importing, Some(ImportFlow::Preview { .. })));
+        let preview = rendered_interaction(120, 40, &model, &ui);
+        assert!(preview.contains("remote.example.org"));
+        assert!(preview.contains("НЕ"));
+        assert!(!preview.contains("theia://v1/"));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        assert!(ui.saving.is_none(), "public tokenless link needs explicit env reference");
+        ui.update(&mut model, press(KeyCode::Char('e')));
+        for ch in "env:REMOTE_TOKEN".chars() {
+            ui.update(&mut model, press(KeyCode::Char(ch)));
+        }
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.importing, Some(ImportFlow::Preview { .. })));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        assert!(ui.saving.is_some());
+        let start = Instant::now();
+        while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ui.saving.is_none());
+        assert!(matches!(ui.importing, Some(ImportFlow::Done)));
+        let Config::Client(after) = config::read_file(&path).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(after.client.active_profile, "home");
+        assert_eq!(after.client.profiles.len(), 2);
+        assert_eq!(after.client.profiles[1].id, "remote");
+        assert_eq!(after.client.profiles[1].auth_token, "env:REMOTE_TOKEN");
+        assert!(!fs::read_to_string(&path).unwrap().contains(&link));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.importing.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn client_import_refuses_dirty_editor_and_cancellation_does_not_modify_disk() {
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "theia-f14-cancel-ui-{}.toml",
+            std::process::id()
+        ));
+        let source = include_str!("../../../examples/client.toml");
+        fs::write(&path, source).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Char('i')));
+        assert!(matches!(ui.importing, Some(ImportFlow::Input(_))));
+        ui.paste_import_source("invalid://fake");
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.importing.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        ui.editor.as_mut().unwrap().begin();
+        ui.editor.as_mut().unwrap().input = "different.example.org:443".into();
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.editor.as_ref().unwrap().dirty());
+        ui.update(&mut model, press(KeyCode::Char('i')));
+        assert!(ui.importing.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn server_issuance_modal_hides_secret_until_durable_save_and_explicit_reveal() {
         use crate::config::{self, Config};
         use crate::invite::Invitation;
