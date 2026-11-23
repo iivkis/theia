@@ -45,7 +45,8 @@ class StreamedGuestArtifactTests(TestCase):
             ):
                 driver.copy_into_guest(source, "/tmp/theia")
             self.assertEqual(run.call_args.kwargs["input"], data)
-            self.assertIn("sh", run.call_args.args[0])
+            self.assertIn("dd", run.call_args.args[0])
+            self.assertNotIn("sh", run.call_args.args[0])
             self.assertNotIn("wslpath", run.call_args.args[0])
 
     def test_rejects_changed_guest_artifact_and_empty_source(self) -> None:
