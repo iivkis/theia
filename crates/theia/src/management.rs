@@ -81,7 +81,9 @@ pub enum StatusCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusReply {
     Healthy,
-    Running { inbounds: usize },
+    Running {
+        inbounds: usize,
+    },
     Unsupported,
     /// Candidate passes the deliberately narrow compatibility preflight.
     Compatible,
