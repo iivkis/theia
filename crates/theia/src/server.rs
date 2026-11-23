@@ -814,14 +814,14 @@ fn check_certificate_name(
 struct TlsMaterial {
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     identity: crate::reload_preflight::IdentityHash,
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     let cert_bytes = pem_data(&inbound.tls_cert, false)?;
     let key_bytes = pem_data(&inbound.tls_key, true)?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let identity = crate::reload_preflight::IdentityHash::from_pem(&cert_bytes, &key_bytes);
     let mut cert_reader = BufReader::new(cert_bytes.as_slice());
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
@@ -835,7 +835,7 @@ fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     Ok(TlsMaterial {
         certs,
         key,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         identity,
     })
 }
@@ -874,18 +874,18 @@ async fn run_document_with_config(
     document: ServerDocument,
     config_path: Option<&Path>,
 ) -> Result<(), ServerError> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = config_path;
     if !document.server.enabled {
         return Err(ServerError::Config);
     }
-    // One shared authorization snapshot for every H2/H3 inbound. The
-    // controller's stage/commit API is NOT exposed by management IPC yet.
+    // One shared authorization snapshot for every H2/H3 inbound.
+    // Explicit CAS Apply is accessible only via secured local IPC.
     let live_authorization =
         Arc::new(LiveAuthorization::new(document.clone()).map_err(|_| ServerError::Config)?);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let baseline = document.clone();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let mut loaded_identities = Vec::new();
     let policy = document.server.policy;
     let peer_budget = Arc::new(PeerBudget::default());
@@ -912,7 +912,7 @@ async fn run_document_with_config(
             .parse()
             .map_err(|_| ServerError::Config)?;
         let material = tls_material(inbound)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         loaded_identities.push(material.identity.clone());
         let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         let listener = TcpListener::bind(addr).await.map_err(|_| ServerError::Io)?;
@@ -933,9 +933,8 @@ async fn run_document_with_config(
         ));
         prepared.push((listener, acceptor, endpoint, context));
     }
-    // Management IPC and CAS Apply are Linux opt-in until Windows named-pipe
-    // ACL and TUI Apply are implemented. Never advertise status before
-    // all TLS/TCP/QUIC binds have been prepared successfully.
+    // Both platforms require explicit private local IPC opt-in. Advertise
+    // status only AFTER all TCP/UDP listeners and TLS have been prepared.
     #[cfg(target_os = "linux")]
     let management = crate::management::StatusServer::from_environment(prepared.len())
         .map_err(|_| ServerError::Io)?
@@ -953,6 +952,24 @@ async fn run_document_with_config(
             }
         });
 
+    #[cfg(target_os = "windows")]
+    let windows_management =
+        crate::windows_control::WindowsServer::from_environment(prepared.len())
+            .map_err(|_| ServerError::Io)?
+            .map(|server| {
+                if let Some(path) = config_path {
+                    server
+                        .with_preflight(Arc::new(crate::reload_preflight::ReloadPreflight::new(
+                            path.to_owned(),
+                            baseline,
+                            loaded_identities,
+                        )))
+                        .with_live_authorization(live_authorization.clone())
+                } else {
+                    server
+                }
+            });
+
     let mut tasks = JoinSet::new();
     for (listener, acceptor, endpoint, context) in prepared {
         tasks.spawn(serve(listener, acceptor, context.clone()));
@@ -960,6 +977,10 @@ async fn run_document_with_config(
     }
     #[cfg(target_os = "linux")]
     if let Some(management) = management {
+        tasks.spawn(async move { management.serve().await.map_err(|_| ServerError::Io) });
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(management) = windows_management {
         tasks.spawn(async move { management.serve().await.map_err(|_| ServerError::Io) });
     }
     match tasks.join_next().await {
