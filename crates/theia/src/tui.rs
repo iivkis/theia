@@ -915,12 +915,7 @@ fn draw_issuance(frame: &mut Frame<'_>, area: Rect, flow: &IssueFlow, editor: Op
     panel(frame, area, title, &body, true);
 }
 
-fn draw_revocation(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    flow: &DisableFlow,
-    editor: Option<&Editor>,
-) {
+fn draw_revocation(frame: &mut Frame<'_>, area: Rect, flow: &DisableFlow, editor: Option<&Editor>) {
     let (title, body) = match flow {
         DisableFlow::Input(id) => (
             "Отключить существующего пользователя",
@@ -1570,10 +1565,8 @@ mod tests {
     #[test]
     fn disable_shortcut_rejects_client_and_dirty_server_draft() {
         use std::fs;
-        let client_path = std::env::temp_dir().join(format!(
-            "theia-m44b2a-client-{}.toml",
-            std::process::id()
-        ));
+        let client_path =
+            std::env::temp_dir().join(format!("theia-m44b2a-client-{}.toml", std::process::id()));
         fs::write(&client_path, include_str!("../../../examples/client.toml")).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Client, &client_path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
@@ -1581,10 +1574,8 @@ mod tests {
         assert!(ui.revocation.is_none());
         fs::remove_file(client_path).unwrap();
 
-        let server_path = std::env::temp_dir().join(format!(
-            "theia-m44b2a-dirty-{}.toml",
-            std::process::id()
-        ));
+        let server_path =
+            std::env::temp_dir().join(format!("theia-m44b2a-dirty-{}.toml", std::process::id()));
         fs::write(&server_path, server_issuance_fixture()).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Server, &server_path).unwrap()));
         let mut model = Model::new(Some(Role::Server));
