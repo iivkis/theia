@@ -92,6 +92,12 @@ pub enum Command {
     ClientRun {
         config: String,
     },
+    /// Explicit opt-in. Native Windows only; server role cannot use this.
+    ClientRunSystemProxy {
+        config: String,
+    },
+    ClientProxyStatus,
+    ClientProxyRecover,
     ConfigValidate {
         config: String,
     },
@@ -108,6 +114,8 @@ pub enum CliError {
     Server(server::ServerError),
     Management(management::ManagementError),
     Client(client::ClientError),
+    #[cfg(target_os = "windows")]
+    SystemProxy(windows_system_proxy::ProxyError),
     Tui(&'static str),
 }
 
@@ -134,6 +142,8 @@ impl fmt::Display for CliError {
             Self::Server(error) => write!(f, "server failed: {error}"),
             Self::Management(error) => write!(f, "management status unavailable: {error}"),
             Self::Client(error) => write!(f, "client failed: {error}"),
+            #[cfg(target_os = "windows")]
+            Self::SystemProxy(error) => write!(f, "Windows system proxy: {error}"),
             Self::Tui(message) => write!(f, "TUI failed: {message}"),
             Self::NotImplemented(feature) => write!(
                 f,
@@ -253,6 +263,11 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["client", "run", "--config", path] => Ok(Command::ClientRun {
             config: config_path(path)?,
         }),
+        ["client", "run", "--config", path, "--system-proxy", "--confirm"] => {
+            Ok(Command::ClientRunSystemProxy { config: config_path(path)? })
+        }
+        ["client", "proxy", "--status"] => Ok(Command::ClientProxyStatus),
+        ["client", "proxy", "--recover", "--confirm"] => Ok(Command::ClientProxyRecover),
         ["config", "validate", "--config", path] => Ok(Command::ConfigValidate {
             config: config_path(path)?,
         }),
@@ -276,9 +291,12 @@ Usage:\n\
   theia server quota --apply --expected-revision N --sha256 HEX --confirm\n\
   theia server reload --expected-revision N  # Linux CAS auth Apply\n\
   theia client run --config <path>\n\
+  theia client run --config <path> --system-proxy --confirm  # Windows only: scoped WinINet CAS\n\
+  theia client proxy --status             # Windows read-only proxy ownership status\n\
+  theia client proxy --recover --confirm  # Windows crash recovery, CAS only\n\
   theia config validate --config <path>\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
-Client requires tls_ca PEM bundle. TUI edits 3 safe fields; server role+config supports u for new user and one-time token link after save; system proxy never changed.";
+Client requires tls_ca PEM bundle. Windows system proxy requires explicit --system-proxy --confirm, a manual config flag and live bound listeners; normal client run and TUI never alter OS proxy.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn execute(command: Command) -> Result<&'static str, CliError> {
@@ -291,7 +309,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server tls rollback --check | theia server tls rollback --apply --expected-revision N --confirm | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --expected-revision N\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
         }
         Command::Help(Some("client")) => {
-            Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")
+            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
         Command::Help(Some("config")) => {
             Ok("Usage: theia config validate --config <path>\nValidate TOML v1 without reading secret values.")
@@ -312,7 +330,8 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
         | Command::ServerApplyReload { .. } => {
             Err(CliError::NotImplemented("async management IPC"))
         },
-        Command::ClientRun { .. } => Err(CliError::NotImplemented("client runtime")),
+        Command::ClientRun { .. } | Command::ClientRunSystemProxy { .. } => Err(CliError::NotImplemented("client runtime")),
+        Command::ClientProxyStatus | Command::ClientProxyRecover => Err(CliError::NotImplemented("Windows system proxy management")),
         Command::ConfigValidate { config } => {
             config::read_file(Path::new(&config)).map_err(CliError::Config)?;
             Ok("configuration structurally valid (secret/file existence not checked)")
@@ -636,6 +655,32 @@ mod tests {
             command(&["tui", "--role", "server", "--role", "client"]),
             Err(CliError::InvalidArguments)
         );
+    }
+
+    #[test]
+    fn wininet_system_proxy_requires_independent_confirmation_and_recovery_is_explicit() {
+        assert_eq!(
+            command(&["client", "run", "--config", "client.toml", "--system-proxy", "--confirm"]),
+            Ok(Command::ClientRunSystemProxy { config: "client.toml".into() })
+        );
+        assert_eq!(
+            command(&["client", "proxy", "--status"]),
+            Ok(Command::ClientProxyStatus)
+        );
+        assert_eq!(
+            command(&["client", "proxy", "--recover", "--confirm"]),
+            Ok(Command::ClientProxyRecover)
+        );
+        for invalid in [
+            vec!["client", "run", "--config", "client.toml", "--system-proxy"],
+            vec!["client", "run", "--system-proxy", "--config", "client.toml"],
+            vec!["client", "run", "--config", "client.toml", "--confirm"],
+            vec!["client", "proxy", "--recover"],
+            vec!["client", "proxy", "--force"],
+            vec!["server", "run", "--config", "server.toml", "--system-proxy", "--confirm"],
+        ] {
+            assert_eq!(command(&invalid), Err(CliError::InvalidArguments));
+        }
     }
 
     #[test]
