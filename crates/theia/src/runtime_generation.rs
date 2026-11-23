@@ -9,7 +9,10 @@ use crate::{
     live_auth::{LiveAuthError, LiveAuthorization, StagedAuthorization},
     reload_preflight::ReloadPreflight,
 };
-use std::{sync::{Arc, RwLock}, time::Instant};
+use std::{
+    sync::{Arc, RwLock},
+    time::Instant,
+};
 use tokio::sync::oneshot;
 
 pub(crate) struct View {
@@ -218,8 +221,9 @@ mod tests {
     fn rollback_readiness_is_bounded_and_never_exposes_secret_material() {
         let source = include_str!("../../../examples/server.toml")
             .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
-        let crate::config::Config::Server(document) = crate::config::parse(&source).unwrap()
-        else { panic!("server fixture"); };
+        let crate::config::Config::Server(document) = crate::config::parse(&source).unwrap() else {
+            panic!("server fixture");
+        };
         let state = State::new(View {
             document: Arc::new(document.clone()),
             inbounds: document.server.inbounds.len(),
