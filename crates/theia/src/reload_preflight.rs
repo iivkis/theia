@@ -235,6 +235,70 @@ impl ReloadPreflight {
         Ok(candidate)
     }
 
+    /// The quota transaction MUST NOT smuggle a TLS file update via an
+    /// unchanged file: reference; actual loaded PEM bytes remain authoritative.
+    pub(crate) fn loaded_tls_unchanged(&self, candidate: &ServerDocument) -> bool {
+        if candidate.server.inbounds.len() != self.identities.len() {
+            return false;
+        }
+        candidate
+            .server
+            .inbounds
+            .iter()
+            .zip(&self.identities)
+            .all(|(inbound, identity)| {
+                let Ok(cert) = crate::server::pem_data(&inbound.tls_cert, false) else {
+                    return false;
+                };
+                let Ok(key) = crate::server::pem_data(&inbound.tls_key, true) else {
+                    return false;
+                };
+                identity.matches(&cert, &key)
+            })
+    }
+
+    /// Bound and typed TOML is the ONE candidate the native supervisor sees.
+    /// This operation can never publish a quota update from a timed-out IPC
+    /// worker, and never exposes cert paths or tokens in its response.
+    pub(crate) fn load_quota_candidate_bound(
+        &self,
+        expected_sha256: [u8; 32],
+    ) -> Result<ServerDocument, crate::restart_guard::RestartError> {
+        let candidate = self.load_restart_candidate_bound(expected_sha256)?;
+        if !crate::restart_guard::quota_only(&self.active, &candidate) {
+            return Err(crate::restart_guard::RestartError::InvalidConfig);
+        }
+        if !self.loaded_tls_unchanged(&candidate) {
+            return Err(crate::restart_guard::RestartError::InvalidTlsIdentity);
+        }
+        Ok(candidate)
+    }
+
+    /// Advisory only. Actual admission accounting must be checked under
+    /// the single quota mutex at CAS, not here during filesystem I/O.
+    pub(crate) fn check_quota_file(
+        &self,
+    ) -> Result<(), crate::restart_guard::RestartError> {
+        let _single_flight = self
+            .restart_probe_lock
+            .try_lock()
+            .map_err(|_| crate::restart_guard::RestartError::ProbeBusy)?;
+        let candidate = match config::read_file(&self.config_path) {
+            Ok(Config::Server(document)) => document,
+            _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
+        };
+        Config::Server(candidate.clone())
+            .validate()
+            .map_err(|_| crate::restart_guard::RestartError::InvalidConfig)?;
+        if !crate::restart_guard::quota_only(&self.active, &candidate) {
+            return Err(crate::restart_guard::RestartError::InvalidConfig);
+        }
+        if !self.loaded_tls_unchanged(&candidate) {
+            return Err(crate::restart_guard::RestartError::InvalidTlsIdentity);
+        }
+        Ok(())
+    }
+
     /// Restart-only planning: read one bounded candidate, verify real TLS
     /// identities and temporarily probe all fresh OS listener addresses.
     /// Never publishes auth, stops old listeners or reserves ports for later.
