@@ -77,6 +77,9 @@ async fn main() {
                 Ok(management::StatusReply::RestartAuthorizationOnly) => Ok(
                     "restart not needed for compatible authorization changes; use CAS auth Apply; runtime UNCHANGED".to_owned(),
                 ),
+                Ok(management::StatusReply::RestartSamePortTlsReady) => Ok(
+                    "same-port TLS rotation ready: original H2/H3 bind addresses retained; explicit --apply --expected-revision N --sha256 HEX --confirm required; runtime UNCHANGED".to_owned(),
+                ),
                 Ok(management::StatusReply::RestartRequiresMaintenance) => Ok(
                     "restart requires controlled maintenance: active listener addresses overlap; runtime UNCHANGED".to_owned(),
                 ),
