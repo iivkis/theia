@@ -476,7 +476,7 @@ fn open_key(create: bool) -> Result<Option<Key>, ProxyError> {
     let path = wide(JOURNAL_KEY);
     if create {
         let security = private_security()?;
-        let mut attributes = SECURITY_ATTRIBUTES {
+        let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: security.0,
             bInheritHandle: 0,
@@ -491,7 +491,7 @@ fn open_key(create: bool) -> Result<Option<Key>, ProxyError> {
                 null_mut(),
                 0,
                 KEY_ALL_ACCESS,
-                &mut attributes,
+                &attributes,
                 &mut key,
                 &mut disposition,
             )
