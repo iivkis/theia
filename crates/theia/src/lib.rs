@@ -169,7 +169,7 @@ Usage:\n\
   theia tui [--role server|client] [--config <path>]\n\
   theia server run --config <path>\n\
   theia server status                # read-only Linux opt-in IPC\n\
-  theia server reload --check        # read-only compatibility check\n\\
+  theia server reload --check        # read-only compatibility check\n\
   theia server reload --expected-revision N  # Linux CAS auth Apply\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
