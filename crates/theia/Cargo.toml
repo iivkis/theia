@@ -5,7 +5,10 @@ edition = "2021"
 publish = false
 
 [features]
-# CI-only, API-level opt-in. Never enabled by runtime TOML or default binary.
+# F-13: ship a BoringSSL backend on Linux and Windows so the explicit
+# browser-h2-btls-v1 profile is available in ordinary client binaries.
+# The default profile remains strict rustls; no automatic fingerprint change.
+default = ["experimental-btls-h2"]
 experimental-btls-h2 = ["dep:btls", "dep:tokio-btls"]
 
 [dependencies]
