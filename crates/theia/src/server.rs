@@ -863,6 +863,8 @@ async fn run_document_with_config(
     document: ServerDocument,
     config_path: Option<&Path>,
 ) -> Result<(), ServerError> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = config_path;
     if !document.server.enabled {
         return Err(ServerError::Config);
     }
