@@ -713,6 +713,68 @@ mod tests {
     }
 
     #[test]
+    fn delayed_dns_worker_result_is_not_rejuvenated_by_late_ui_poll() {
+        let mut panel = panel();
+        let (tx, rx) = mpsc::channel();
+        let (cancel, _) = oneshot::channel();
+        panel.state = DomainState::DnsRunning {
+            result: rx,
+            cancel: Some(cancel),
+        };
+        tx.send(Ok(DnsObservation {
+            addresses: vec!["93.184.216.10".parse().unwrap()],
+            completed_at: Instant::now() - DNS_PIN_TTL - Duration::from_secs(1),
+        }))
+        .unwrap();
+        panel.poll();
+        assert!(!panel.is_resolved());
+        assert!(panel.addresses.is_empty());
+        assert!(panel.dns_received.is_none());
+        assert!(panel.body().contains("устар"));
+        panel.ask_probe_confirmation();
+        assert!(!panel.is_probe_confirming());
+    }
+
+    #[test]
+    fn recent_dns_worker_result_retains_original_observation_timestamp() {
+        let mut panel = panel();
+        let (tx, rx) = mpsc::channel();
+        let (cancel, _) = oneshot::channel();
+        panel.state = DomainState::DnsRunning {
+            result: rx,
+            cancel: Some(cancel),
+        };
+        let completed_at = Instant::now() - Duration::from_secs(2);
+        tx.send(Ok(DnsObservation {
+            addresses: vec!["93.184.216.10".parse().unwrap()],
+            completed_at,
+        }))
+        .unwrap();
+        panel.poll();
+        assert!(panel.is_resolved());
+        assert_eq!(panel.dns_received, Some(completed_at));
+        assert_eq!(panel.selected_count(), 0);
+    }
+
+    #[test]
+    fn a_future_or_expired_dns_timestamp_never_grants_probe_permission() {
+        let mut panel = panel();
+        panel.state = DomainState::Resolved;
+        panel.addresses = vec!["93.184.216.10".parse().unwrap()];
+        for timestamp in [
+            Instant::now() + Duration::from_secs(3),
+            Instant::now() - DNS_PIN_TTL - Duration::from_millis(1),
+        ] {
+            panel.dns_received = Some(timestamp);
+            panel.selected = vec!["93.184.216.10".parse().unwrap()];
+            panel.ask_probe_confirmation();
+            assert!(!panel.is_probe_confirming());
+            panel.confirm_probes_and_start();
+            assert!(!panel.is_running());
+        }
+    }
+
+    #[test]
     fn dropping_running_dns_cancels_without_waiting() {
         let mut panel = panel();
         let (_tx, rx) = mpsc::channel();
