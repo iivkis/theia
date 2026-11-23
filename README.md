@@ -1,139 +1,62 @@
 # Theia / Тея
 
-**Specification-first · Rust · one binary · TOML · ratatui · SmartTheia**
+**Experimental / unreleased.** Theia — один Rust-бинарник с двумя ролями: сервер (в том числе Linux-сервер через SSH) и клиент (Windows/Linux). Транспорт SmartTheia v1 поверх стандартных HTTP/3 (QUIC/TLS 1.3, ALPN `h3`) и HTTP/2 (TLS 1.3, ALPN `h2`); локальные HTTP CONNECT/SOCKS5, TOML v1 и терминальная панель ratatui. Это не реализация протоколов Xray/VLESS/REALITY и не обещание обхода DPI.
 
-**Состояние M4.4b1 (после M4.4a):** единый Rust-бинарник поддерживает H2/TLS и H3/QUIC server/client, локальные HTTP CONNECT/SOCKS5 и строгий QUIC-first fallback. BBR включён на обоих QUIC endpoints, но полноценный release benchmark ещё открыт. Добавлен стартовый TUI и ограниченный редактор явно выбранного TOML: по три безопасных поля выбранного inbound/профиля, валидация, несохранённые изменения и атомарная запись. F-14 P0: добавляется чистый версионированный codec переносимого приглашения и строгая проверка его соответствия grants/token digest; **создание нового пользователя с CSPRNG-токеном, grant и однократным показом ссылки после сохранения добавлено в серверную TUI; безопасный файл экспорта, ротация и импорт в client.toml ещё не реализованы**. Полное CRUD пользователей и inbound, ротация/полный отзыв, защищённый экспорт/импорт, IPC, Windows system proxy и browser-like fingerprint остаются не реализованными.
+**Текущее состояние на 2026-11-24:** [матрица готовности и релизных блокеров](docs/STATUS.md). Исторические состояния отдельных этапов находятся в [плане реализации](docs/IMPLEMENTATION_PLAN.md) и [ADR](docs/adr/), а не в этом README.
 
-**F-18/F-19 (спецификация 0.3, ещё не реализовано):** новый REALITY-подобный защищённый SmartTheia режим и мастер подбора IP/domain в два основных действия, а также самостоятельная измеряемая защита от TLS-in-TLS. Поиск автоматически охватывает подтверждённый диапазон сервера и встроенный каталог популярных HTTPS-доменов (google.com, samsung.com, amd.com и др.); активные проверки чужих/неподтверждённых диапазонов без разрешения запрещены, score не является гарантией обхода DPI. Старые TOML v1/theia://v1 не поддерживают новые режимы. [Нормативные требования](docs/STEALTH_REALITY.md).
+## Что реально работает
 
-**M3.5b2b0 (ограничение offline CIDR-плана, PR #49):** даже при явно переданном approval соседние IPv4 не попадают в очередь, если CIDR шире наблюдаемого префикса интерфейса; неизвестная `/0` и некорректная маска также не разрешают расширение. Это дополнительная защита, **не** подтверждение владения диапазоном; отдельно маршрутизируемые блоки при интерфейсе `/32` потребуют будущей проверки внешнего права/источника. Нет новых сетевых вызовов и сканера. [ADR-0024](docs/adr/0024-m3-5b2b-assigned-cidr-guard.md).
+- **H2/H3 сервер и клиент:** TLS-проверка сертификата/SNI/ALPN, авторизация по 256-битному bearer и SHA-256 digest, отдельные grants на inbound, лимиты соединений, DNS и ACL на сервере, TCP relay с `OPEN_OK`. Режим `auto` начинает с QUIC и использует H2 fallback **только при доказанной сетевой недоступности UDP до авторизации**, не при ошибке TLS, токена или протокола.
+- **BBR в QUIC:** выбран на обоих концах и проверяется в обязательной CI-матрице; полноценные release-измерения bandwidth/RTT/fairness/CPU/RSS **не завершены**.
+- **TUI и конфигурация:** выбор существующих inbound/profiles, ограниченное редактирование трёх полей, атомарная запись TOML с защитой от внешних изменений. Серверная TUI умеет создавать пользователя (`u`), однократно показывать секретное приглашение после сохранения и **глобально отключать существующего пользователя** (`x` с отдельным подтверждением). Сохранение **не применяет** конфигурацию к работающему серверу.
+- **Защищённое локальное управление:** Linux Unix socket и Windows SID-защищённый Named Pipe по opt-in. Подтверждаемый auth-only CAS Apply, CLI-переключение fresh-port listener, same-port TLS rotation, живые квоты, одноразовый откат последнего TLS-identity на том же порту в течение 300 секунд. TLS restart требует отдельного PEM-фингерпринта. Все операции подчиняются revision/confirmation и ограничениям [документации конфигурации](docs/CONFIGURATION.md).
+- **Исследовательские проверки кандидатов:** M3.5b1 даёт только offline-план и неизвестные оценки по умолчанию; M3.5b2a даёт строго проверяемый, явно разрешённый TLS/H2 probe. Последующие M4.5 добавляют отдельное согласие на точечные H2/H3 пробы и DNS pin. **Это не автоматический интернет-сканер и не готовый REALITY-подобный режим.**
 
-**M4.5i (hardening свежести DNS):** 60с для domain IP pin отсчитываются от **завершения DNS lookup**, а не от задержанной обработки сообщения TUI. Старые/будущие наблюдения отбрасываются без адресов и без TLS, а probe worker повторно проверяет TTL непосредственно перед началом сети. Требуются прежние два независимых согласия; нет автоматической проверки внешних доменов. [ADR-0037](docs/adr/0037-m4-5i-dns-pin-observation-freshness.md).
+## Что ещё блокирует релиз
 
-**M4.5h (TUI: доменный поиск с двумя раздельными согласиями):** `p → r → d` открывает 14 **непроверенных** HTTPS-доменов без сетевой активности. j/k выбирает **один** домен, Enter раскрывает внешнюю DNS-проверку, только отдельное `y` выполняет один ограниченный A/AAAA lookup (≤5с); все DNS-адреса проверяются на опасные/private/localhost/некорректный порт, и при хотя бы одном таком ответе **отклоняется вся выборка**. Показывается не больше **8** публичных IP, которые Theia закрепляет в памяти на **60с** (срок истёк → новый DNS). j/k и Space вручную отмечают точные IP, новый Enter показывает **каждый `IP:443 + SNI=домен`** и требование проверенных прав, только **второе** `y` запускает bounded TCP/TLS1.3/H2 и UDP/QUIC/TLS1.3/H3 через существующий `probe_dual_batch` с native CA. Повторного DNS между подтверждением и подключением **нет**; n/Esc отменяют, никакого сканирования всего каталога, auto Apply, REALITY identity или обещания обхода DPI. Только двойной проверенный TLS/ALPN даёт `dual` статус, **REALITY: НЕ готов**. [ADR-0036](docs/adr/0036-m4-5h-consented-domain-dns-pinned-dual-tui.md).
+| Требование | Текущее ограничение |
+| --- | --- |
+| **F-13 browser-like fingerprint** | Нет поставляемого измеренного именованного H2/H3 browser-like профиля. BoringSSL/Chromium/uTLS эталоны и экспериментальные адаптеры не заменяют релизную реализацию. |
+| **F-14 приглашения** | Серверная выдача и disable-only существуют; защищённый экспорт файла/clipboard, ротация, клиентский импорт с доверенным хранением секрета и Linux→Windows E2E не завершены. |
+| **F-18 REALITY-подобная защита** | Нет согласованного криптографического identity/security mode, антипробинга и законченного двухшагового мастера с безопасным Apply. Текущие H2/H3 TLS probes — только evidence. |
+| **F-19 TLS-in-TLS** | Нет измеренной flow-shaping защиты с независимым classifier и release thresholds. |
+| **Windows system proxy / M4.3** | Автоматический WinINet snapshot/apply/CAS restore с проверенной аварийной recovery ещё не поставляется. |
+| **M5 release** | Нужны дополнительные сравнительные BBR/fingerprint/performance/security gates и end-to-end приёмка всех P0. |
 
-**M4.5g (TUI: ручной выбор IP из разрешённого offline CIDR → проверка обоих транспортов):** `p → r → b` показывает все публичные IP из **пассивного** локального плана; при необходимости сначала `a → CIDR → Enter → y` включает **только** временное дополнение кандидатами из /24..=/32 в пределах наблюдаемой маски сервера. В списке **j/k**, **Space** отмечает каждый разрешённый конкретный IP отдельно (максимум **8**); **Enter** раскрывает все выбранные `IP:443`, SNI, TCP/TLS1.3/h2 и UDP/QUIC/TLS1.3/h3, лимиты **2 параллельно, 5с/цель, 20с/пакет**. Только отдельная **y** начинает фоновую `probe_dual_batch` с native CA и обязательным preflight **всех** целей до первого сокета; **n/Esc** отменяет. Результаты каждого H2/H3 и суммарное dual-совпадение видны отдельно, **REALITY не готов**, fingerprint и HTTP/3 semantics неизвестны. CIDR/маска интерфейса **не доказывает право владения**: нужны права на каждый IP, никакого автоматического обхода /24 или сторонних доменов. Результаты/согласие не сохраняются, TOML/IPC/прокси не меняются. [ADR-0035](docs/adr/0035-m4-5g-consented-cidr-dual-batch-tui.md).
+**Важно:** отключение пользователя в TUI ставит `users[].disabled = true` в **сохранённом TOML**, но не завершает активные туннели и не обновляет runtime само по себе. Для отказа в *новых* подключениях нужно отдельно подтвердить auth-only Apply в защищённом локальном IPC. Нельзя считать это hard revocation. Подробности: [инвайты](docs/INVITATIONS.md) и [ADR-0053](docs/adr/0053-m4-4b2a-explicit-existing-user-disable.md).
 
-**M4.5f (bounded batch H2+H3 для вручную разрешённых IP/доменов):** новый API `probe_dual_batch` проверяет до **8** явно выбранных exact `IP:443+SNI` (не более **2 кандидатов одновременно**), заранее проверяет **все** права/план/доверенные CA до первого TCP/UDP, общий срок до **20 секунд**. Для IP адрес должен быть указан в offline-плане и отдельно одобрен; для домена `CandidateConsent::PinnedDomain` требует отдельную точную пару каталожного домена и закреплённого IP, проверку SNI и явный exact-IP approval. Два независимых TLS/ALPN результата сохраняются без подмены H3 успехом H2; кандидат признаётся dual TLS только при обеих верификациях и **всё ещё не является готовым REALITY**. **Пока это API**, без автоматического обхода CIDR, DNS-поиска и TUI запуска проверки чужих доменов. [ADR-0034](docs/adr/0034-m4-5f-source-aware-dual-batch.md).
+## Как запустить уже реализованные части
 
-**M4.5e (отбор только для одновременно H2 и H3):** в серверной TUI `p → t → Enter → y` теперь после отдельного согласия проверяет **один и тот же назначенный публичный IP:443 и SNI** сразу двумя независимыми соединениями: TCP/TLS1.3 + ALPN=`h2`, UDP/QUIC/TLS1.3 + ALPN=`h3`. Нужны обе подтверждённые CA/SNI/SAN/ALPN и валидность сертификатов; ошибка или timeout одного протокола оставляет кандидата **не совместимым с обоими**. Видны H2/H3 по отдельности: H3 получает баллы **только** после настоящего QUIC handshake, иначе Unknown. **Это не REALITY**: проверка серверного криптографического identity, HTTP/3 semantics, fingerprint Theia, anti-TLS-in-TLS и Apply всё ещё не реализованы. Автоматического сканирования CIDR и доменов нет: offline seed-домены не дают прав на внешний пробинг. [ADR-0033](docs/adr/0033-m4-5e-dual-h2-h3-candidate-gate.md).
-
-**M4.5d (серверная TUI: объяснимое измерение TLS/H2):** после отдельно разрешённого `p→t→Enter→y` строгого TLS/H2 handshake результат показывает **только измеренные факты**, score и confidence из `TlsEvidence::suitability`, причины неизвестных критериев и возраст результата с момента получения. Нормальный TLS1.3/CA/SAN/ALPN=h2 даёт **H2 80/100, confidence 85%, eligible НЕТ**, а **H3 score Unknown, confidence 0%, eligible НЕТ**: QUIC/H3 вообще не проверялся, и результаты TCP/TLS/H2 нельзя переносить на H3. Несовпадение фактического peer IP, timeout, отклонённый сертификат или ALPN дают **score Unknown** без позитивных доказательств. **Эти баллы не вероятность обхода DPI**, REALITY и TLS-in-TLS не готовы, сканирование CIDR/Apply не добавлены. [ADR-0032](docs/adr/0032-m4-5d-evidence-score-tui.md).
-
-**M4.5c (серверная TUI: группы кандидатов и ручной CIDR, полностью офлайн):** `p → r` показывает **Подсеть сервера** (действительно назначенные публичные IP), **Популярные домены** (14 не проверенных по TLS имён) и **Добавленные вручную** (сначала пусто); score TLS/H2 = 0/100, confidence = 0%, eligibility = NO до реальных измерений. `a` вводит только IPv4 CIDR /24..=/32, Enter проверяет, что диапазон содержит собственный публичный IP, не выходит за маску интерфейса и не превышает лимиты; **отдельное y** добавляет выбранные дополнительные IP **только в одноразовый offline-план**. `n/Esc` отменяют, закрытие стирает этот scope. Никаких автоматических DNS, TLS, сканов, сохранения разрешений, конфигурационного Apply или права probing; даже подтверждение оператора **не доказывает владение CIDR**. [ADR-0031](docs/adr/0031-m4-5c-candidate-groups-offline-cidr.md).
-
-**M4.5b (серверная TUI: один явно разрешённый TLS/H2 probe):** внутри пассивной панели **p → t** открывает просмотр **только действительно назначенных локальных публичных IP** (максимум 8, без перебора CIDR, ipify-адресов или популярных доменов). Должен быть загружен и проверен `server.toml` для выбранного inbound с TLS SNI. **j/k** выбирают один IP, **Enter/t** показывает IP:443/SNI и отдельное согласие, только **y** запускает строго проверяемый TLS1.3/CA/SAN/ALPN=h2 handshake (5s, background с Esc cancel). Отказ, неверная CA/ALPN или timeout НЕ означают успеха; настоящий fingerprint, H3, REALITY и обход DPI остаются unknown. Это НЕ автоматический scanner и НЕ Apply. [ADR-0030](docs/adr/0030-m4-5b-explicit-single-ip-h2-tui.md).
-
-**M4.5a (серверная TUI: пассивный просмотр IP и подтверждение ipify):** в разделе «Для сервера» клавиша **p** показывает локальные Linux IP/префиксы и офлайн-план 14 доменов без DNS, сети, изменения TOML или proxy. Клавиша **i** показывает отдельное предупреждение о раскрытии исходящего IP оператору **`https://api64.ipify.org/`**, **y** запускает один проверяемый DNS/TLS1.3 запрос в отменяемом фоне, **n/Esc** отказывает/закрывает без побочных эффектов. На Windows локальный OS collector ещё Unsupported, но ipify может быть доступен после согласия и загрузки системных CA. UI честно различает неизвестное/совпадающее/отличающееся исходящее IP; **не** доказывает NAT/ownership и не активирует сетевой scanner, REALITY или конфигурационный apply. [ADR-0029](docs/adr/0029-m4-5a-consented-ip-discovery-panel.md).
-
-**M3.5b2b4 (стандартный сервис публичного IP, opt-in):** по умолчанию выбран официальный двухстековый HTTPS API **[api64.ipify.org](https://api64.ipify.org/)** (именно `.org`, не `.com`); обычный `GET /` возвращает текстовый IPv4 **или** IPv6, в зависимости от маршрута. `camouflage_egress::observe_default_ipify(roots, IpifyConsent::Approved)` сначала требует явного разрешения, только затем разрешает DNS для фиксированного домена, выбирает один публичный IP:443, закрепляет TCP-адрес и проверяет TLS1.3/SAN/CA/ALPN + ограниченный ответ в общем deadline 5s. `Denied` по умолчанию не отправляет даже DNS. Это пока **библиотечная опция**, не автообращение из TUI/CLI; подключение раскрывает внешний IP сервису и не доказывает владение CIDR или NAT. [ADR-0028](docs/adr/0028-m3-5b2b4-default-ipify.md).
-
-**M3.5b2b3 (exact-consent TLS/H2 batch, library-only):** добавлен ограниченный одновременный запуск проверок **до 8 вручную выбранных IP** с отдельным точным approval на каждый публичный IP:443, привязкой к offline-плану, запретом duplicate/неразрешённых целей до сетевого подключения и сохранением отдельных ошибок/фактов TLS1.3/h2. Один провал не выдаёт всю группу за успешную. Внутренний лимит 20s, у каждого probe собственный ≤5s и общий concurrency=4. **Нет** автоматического сканирования CIDR, популярных доменов, DNS, внешних CI endpoint, TUI/CLI команды, доказательства ownership, REALITY, H3 scan или fingerprint readiness. [ADR-0027](docs/adr/0027-m3-5b2b3-explicit-batch.md).
-
-**M3.5b2b2 (opt-in HTTPS egress witness + offline preview, library-only):** добавлен реальный строго проверяемый TLS1.3/HTTP1.1 запрос к **одному явно разрешённому, закреплённому публичному IP:443** с переданными оператором CA/SNI, ограничениями времени/памяти/параллелизма и отказом от redirect/непубличного ответа. Публичный egress-IP является **утверждением удалённого наблюдателя**, а не доказательством владения CIDR или NAT. Linux-интерфейсы, этот результат и явный approved CIDR объединяются только в offline preview с default `PassiveOnly`; Windows native collector ещё Unsupported, но безопасный egress API и preview-тесты работают на обеих ОС. **Нет** автоматического внешнего IP-сервиса, TUI consent, active scanner, REALITY или TLS-in-TLS. [ADR-0026](docs/adr/0026-m3-5b2b2-consented-egress-preview.md).
-
-**M3.5b2b1 (Linux native collector, library-only):** через getifaddrs читаются реальные UP интерфейсы и непрерывные IPv4/IPv6 маски без отправки сетевых пакетов, проверки external egress и предположений о CIDR ownership; нет автоматического approval или сканирования. На Windows вызов явно возвращает Unsupported (общие типы и mask tests доступны на обеих платформах). [ADR-0025](docs/adr/0025-m3-5b2b1-linux-interface-collector.md).
-
-**M3.5b2a (experimental library API, не полноценный scanner):** добавлена реальная проверка TLS1.3/h2 к явно разрешённому закреплённому IP с обычной strict CA/SNI/SAN проверкой, лимитом 4 handshakes и временем ≤5s. Проверка локального route source IP не отправляет UDP-пакетов и не предполагает ownership CIDR. Тесты используют только loopback. Публичный доменный каталог ещё не сканируется, нет автоматического OS/CIDR collector или TUI, нет поддержки REALITY/H3/TLS-in-TLS. [ADR-0023](docs/adr/0023-m3-5b2a-explicit-tls-probe.md).
-
-**M3.5b1 (offline planner, готово как изолированный модуль, но не scanner):** в коде есть 14 встроенных популярных доменов, контролируемое планирование явно разрешённых IPv4-подсетей и отдельная H2/H3 эвристика оценки *предоставленных* наблюдений. Ни реальных TLS-probe, ни OS collector, ни двухшагового TUI пока нет. Этот срез не означает выполнение F-18. [ADR-0022](docs/adr/0022-m3-5b1-offline-discovery-and-evidence.md).
-
-**M3.5a0 (исследовательский CI-срез):** добавлены тесты безопасного TLS exporter channel binding на реальных H2/TCP и H3/QUIC локальных соединениях с неверной CA и явным отказом нереализованным security flags в TOML/invite v1. Это НЕ REALITY-подобная реализация, не анти-DPI защита и не TLS-in-TLS mitigation. [ADR-0021](docs/adr/0021-m3-5a-rustls-quic-auth-feasibility.md).
-
-**M3.4a–M3.4j:** на Linux/Windows проверены реальные TLS/H2 first-flight, Chromium159 SETTINGS/WINDOW_UPDATE/pseudo порядок и опциональный BoringSSL H2. Default rustls и порядок заголовков стандартного h2 пока не соответствуют Chrome. Это измерения и исследовательский feature, **не** готовый именованный browser-like профиль.
-
-Theia — проект компактной клиент-серверной прокси-платформы. Серверная панель рассчитана на запуск на удалённом Linux-сервере (например, через SSH), а клиентская — на локальный Windows/Linux-клиент, подобно роли управления inbound в 3x-ui и импорта профилей в v2rayN/NekoBox; **это не wire-совместимость**. Оба режима входят в бинарник, собранный под нужную ОС. Один исполняемый файл работает в режиме **сервера** (inbound, пользователи, политика подключения) или **клиента** (подключение к inbound, локальный прокси, системный прокси Windows). При запуске TUI показывает два раздела: **«Для сервера»** и **«Для клиента»**.
-
-> **Статус: experimental / unreleased.** H2/H3, локальные прокси и базовый TUI с ограниченным редактированием TOML реализованы; P0 browser-like fingerprint, конфигурационные формы TUI, Windows system proxy, BBR/performance release gates и полная проверка безопасности ещё не завершены. Это не готовый публичный MVP.
-
-## Архитектура одним взглядом
-
-```text
-Windows/Linux client                 Linux server
-applications → local HTTP/SOCKS → SmartTheia over HTTP/3 (QUIC + BBR)
-                          └────→ SmartTheia over HTTP/2 (TLS fallback)
-                                → authenticated inbound → target
-                  theia (one Rust executable, two roles)
-                  TOML ←→ ratatui TUI, no database
+```sh
+theia --help
+theia config validate --config client.toml
+theia server run --config server.toml
+theia client run --config client.toml
+theia tui --role server --config server.toml
+theia tui --role client --config client.toml
 ```
 
-На обоих транспортных каналах применяется **один прикладной протокол SmartTheia**. HTTP/3 использует стандартный QUIC+TLS и ALPN `h3`, запасной транспорт HTTP/2 использует TLS и ALPN `h2`. Нестандартный QUIC ALPN или открытый уникальный маркер ухудшает заявленную устойчивость к сигнатурному DPI. Невидимость для DPI **не гарантируется**: это измеряемое свойство, а не маркетинговый пункт.
+Для opt-in управления действующим сервером: на Linux заранее создайте частный каталог `0700` и передайте `THEIA_CONTROL_DIR`; на Windows задайте `THEIA_CONTROL_PIPE` для текущего SID. Команды `theia server status`, `theia server reload --check`, подтверждаемое Apply и отдельные TLS/restart/quota CLI-операции описаны в [CONFIGURATION](docs/CONFIGURATION.md) и [TUI UX](docs/TUI_UX.md). Не включайте `Windows system proxy` автоматически; включение и восстановление ещё не реализованы.
 
-## Документы для ИИ-агента
+Шаблоны [server.toml](examples/server.toml) и [client.toml](examples/client.toml) содержат **негодные заглушки**; для реального запуска нужны корректные сертификаты, секреты, маршруты и доверенные CA. Ссылку `theia://v1/...` с bearer нельзя помещать в shell history, Git или логи.
+
+## Документы и порядок доверия
 
 | Документ | Назначение |
 | --- | --- |
-| [AGENTS.md](AGENTS.md) | обязательные правила работы агента и Definition of Done |
-| [docs/IMPLEMENTATION_SPEC.md](docs/IMPLEMENTATION_SPEC.md) | продуктовые требования, сценарии, ограничения, критерии приемки |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | границы доменов, процессы, транспортный выбор, компоненты |
-| [docs/SMARTTHEIA_PROTOCOL.md](docs/SMARTTHEIA_PROTOCOL.md) | версия 1, сообщения, состояния, авторизация, ошибки |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | схема и безопасное применение TOML |
-| [docs/TUI_UX.md](docs/TUI_UX.md) | структура панелей, навигация, UX-инварианты |
-| [docs/STEALTH_REALITY.md](docs/STEALTH_REALITY.md) | F-18/F-19: REALITY-подобный mode, ограниченный подбор IP/domain, anti-TLS-in-TLS и измеряемые релизные критерии |
-| [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) | небольшие вертикальные итерации и критерии завершения |
-| [docs/TESTING_CI.md](docs/TESTING_CI.md) | TDD, тестовая матрица, CI, кэш сборок |
-| [docs/adr/0004-m0-1-feasibility.md](docs/adr/0004-m0-1-feasibility.md) | результаты M0.1: Rust API spike, подтверждения и открытые блокеры |
-| [docs/adr/0005-tls-fingerprint-baseline.md](docs/adr/0005-tls-fingerprint-baseline.md) | измерение default rustls H2/H3, воспроизводимый Go uTLS Chrome133 эталон H2 без browser capture, открытый P0 блокер рабочего H2/H3 backend |
-| [docs/SPEC_REVIEW.md](docs/SPEC_REVIEW.md) | критические находки ревью и ограничения патча |
-| [examples/server.toml](examples/server.toml) | серверный шаблон |
-| [examples/client.toml](examples/client.toml) | клиентский шаблон |
+| [AGENTS.md](AGENTS.md) | Обязательный контракт разработки, CI-only и Definition of Done |
+| [STATUS.md](docs/STATUS.md) | Текущий статус и доказательства, отдельно от исторических PR |
+| [IMPLEMENTATION_SPEC.md](docs/IMPLEMENTATION_SPEC.md) | Продуктовые F-ID, сценарии и release acceptance |
+| [SMARTTHEIA_PROTOCOL.md](docs/SMARTTHEIA_PROTOCOL.md) | Wire-протокол, state machine, auth/fallback |
+| [CONFIGURATION.md](docs/CONFIGURATION.md) | TOML v1, секреты, управление и ограничения |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Границы подсистем, роли и транспорт |
+| [TUI_UX.md](docs/TUI_UX.md) | Контракт терминальной панели |
+| [STEALTH_REALITY.md](docs/STEALTH_REALITY.md) | F-18/F-19, модель угроз и экспериментальные пробы |
+| [INVITATIONS.md](docs/INVITATIONS.md) | F-14, выдача, отзыв и будущий клиентский импорт |
+| [IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) | Хронология вертикальных срезов, не live-статус |
+| [TESTING_CI.md](docs/TESTING_CI.md) | Linux/Windows CI-only приёмка |
+| [docs/adr/](docs/adr/) | Неизменяемая история архитектурных решений |
 
-## M4.2a: локальный статус запущенного сервера (Linux, только чтение)
+Все автоматические тесты, включая реальные Linux/Windows loopback/E2E, запускаются в GitHub Actions. Финальный `ci-gate` обязан быть зелёным для точного SHA; пропущенный/отменённый job не считается успехом. Исследовательские `spikes/` **используются обязательным CI**, поэтому не удаляются как «старые файлы».
 
-По отдельному решению оператора перед `theia server run --config server.toml` задаётся `THEIA_CONTROL_DIR` с **существующей абсолютной приватной директорией 0700 под текущим euid**. Сервер после успешного TLS/TCP/QUIC preflight создаёт в ней `theia-server.sock` (0600); команда `theia server status` при том же `THEIA_CONTROL_DIR` проверяет реально работающий процесс. Без переменной сервер работает как раньше, но status недоступен. Неверные права/занятый socket вызывают отказ запуска, а `reload`, Apply, Windows Named Pipe/ACL и транзакционный rollback **не реализованы**. Нельзя считать обычный status подтверждением обновлённой конфигурации. [ADR-0038](docs/adr/0038-m4-2a-linux-readonly-management-ipc.md).
-
-## M4.2d: приватный Windows Named Pipe и CAS Apply для H2/H3
-
-**Windows opt-in:** перед запуском реального сервера задайте `THEIA_CONTROL_PIPE=instance1`, затем `theia server run --config server.toml`. `instance1` это **только идентификатор** 1–48 ASCII букв/цифр/`_`/`-`, а не произвольный путь. Сервер создаёт локальный `\\.\pipe\theia-control-<OS user SID>-instance1` с explicit protected DACL только для текущего SID + LocalSystem, отклоняет remote clients и вторую первую инстанцию. Клиент CLI/TUI должен работать под тем же Windows SID и с тем же `THEIA_CONTROL_PIPE`. Доступны `server status`, read-only `server reload --check`, явный `server reload --expected-revision N` и подтверждаемый в server TUI `v`, `Ctrl+R` + `y` с SHA-256 точно сохранённого TOML. Без переменной управление не поднимается; некорректная переменная/ошибка DACL/занятый pipe отказывают fail-closed. Поддерживается **только auth-only** hot Apply прежних пользователей; TLS/listeners/quotas требуют restart. Уже открытые туннели сохраняются; Windows system proxy не изменяется. [ADR-0043](docs/adr/0043-m4-2d-windows-sid-named-pipe.md).
-
-## M4.2c: серверная TUI с реальным статусом и подтверждаемым Apply
-
-В интерактивной TUI с `theia tui --role server --config server.toml` клавиша `v` открывает **реальный статус/revision** Linux-сервера из приватного `THEIA_CONTROL_DIR`. Только сохранённый TOML без грязного черновика допускает `Ctrl+R`: экран показывает running revision, требует отдельное `y`, затем передаёт SHA-256 **точных сохранённых байтов TOML**. Сервер сверяет хэш со своим реально прочитанным кандидатом, PEM/TLS-идентичность и CAS ревизию до публикации auth-only changes на H2/H3. `n/Esc` до подтверждения ничего не меняют; потерянный ответ НЕ означает откат, требуется `r` повторный статус. Windows пока только Unsupported, нет Windows Named Pipe и расширенного runtime restart. Сохранение файла само по себе не является Apply. [ADR-0042](docs/adr/0042-m4-2c-content-bound-tui-apply.md).
-
-## M4.2b1b: явный Linux Apply с CAS ревизией для H2/H3
-
-В запущенном Linux-сервере с приватным `THEIA_CONTROL_DIR` команда `theia server status` теперь показывает **authorization revision** (начинается с 1). Сохранённые изменения токена, `disabled` или inbound grants прежних пользователей применяются **только по явному** `theia server reload --expected-revision N`. Сервер заново читает один ограниченный TOML-кандидат, сравнивает реальные PEM bytes с загруженной TLS-идентичностью, отклоняет restart-only изменения и публикует один общий H2/H3 auth snapshot при совпадении revision. Успешный ответ `authorization applied; revision=N+1` выдаётся **после** публикации; неверная/устаревшая revision или файл оставляют runtime прежним. При потерянном ответе нужен `server status`, нельзя предполагать откат. Уже открытые туннели не обрываются, внешняя TUI Apply и Windows IPC отсутствуют. `reload --check` остаётся read-only. [ADR-0041](docs/adr/0041-m4-2b1b-linux-revisioned-auth-apply.md).
-
-## M4.2b1a: общий снимок авторизации H2/H3 (без применения)
-
-Все работающие H2/H3 server inbounds теперь читают пользователей и inbound grants из **одного immutable revisioned snapshot**. Внутренняя двухфазная подготовка/CAS-публикация допускает только совместимые изменения token digests/disabled/grants у тех же пользователей и проверяет ревизию; stale, foreign, некорректные и требующие рестарта изменения отклоняются. Ранее принятые сессии сохраняют свои разрешения/лимиты, обновление не пересоздаёт semaphore quotas. **В исходном M4.2b1a это был только фундамент**: внешний Apply ещё отсутствовал. В M4.2b1b добавлен явный Linux auth-only CAS Apply и revision в CLI; `reload --check` остаётся read-only, Windows IPC и TUI Apply ещё отсутствуют. [ADR-0040](docs/adr/0040-m4-2b1a-shared-cas-auth-snapshot.md).
-
-## M4.2b0: проверка конфигурации без перезагрузки
-
-В Linux **при запущенном через `server run --config FILE` сервере и явном `THEIA_CONTROL_DIR`** команда `theia server reload --check` попросит тот же локальный Unix IPC сравнить сохранённый TOML с реальным первоначальным документом runtime. Допустимы лишь возможные будущие изменения токенов/disabled/grants у прежних пользователей, при этом IP/ports, SNI, сертификаты/ключи, политики/квоты и состав пользователей не меняются; PEM bytes проверяются на подмену даже при прежнем имени файла. Вывод `candidate compatible with running listener; runtime UNCHANGED` **не означает, что конфигурация применена**, ничего не модифицируется. При несовместимости возврат nonzero. `theia server reload` без `--check` по-прежнему недоступен. Windows IPC/TUI Apply и транзакционный restart/rollback ещё открыты. [ADR-0039](docs/adr/0039-m4-2b0-readonly-reload-preflight.md).
-
-## CLI (H2/H3 runtime и ограниченный TUI editor)
-
-```sh
-theia tui                              # стартовое меню, только чтение
-theia tui --role server                # обзор серверной панели, только чтение
-theia tui --role client                # обзор клиентской панели, только чтение
-theia tui --role server --config /path/to/server.toml  # поля DNS имени/H2 TCP/H3 UDP у выбранного inbound
-theia tui --role client --config /path/to/client.toml  # endpoint/TLS SNI/transport выбранного профиля
-theia server run --config server.toml  # headless сервер
-theia server status                     # opt-in Linux management status
-theia server reload --check             # only preflight; runtime UNCHANGED
-theia client run --config client.toml  # headless клиент
-theia config validate --config client.toml
-theia --version
-```
-
-`theia config validate --config FILE` структурно проверяет TOML v1 (exit 0/2) без чтения содержимого секретов. `tui` работает в интерактивном терминале, а без TTY отказывает с exit 2, не меняя окружение. Без `--config` это только навигация. С `--role` и `--config` можно выбирать существующий inbound/профиль (↑/↓, j/k), переключать три поля (Tab/Shift+Tab), проверить черновик и сохранить TOML (без reload и запуска службы); при внешнем изменении файла запись блокируется. `server run` и `client run` поддерживают H2/H3 с аутентификацией, TLS-проверками и TCP relay; `auto` использует QUIC-first с ограниченным H2 fallback исключительно при сетевой UDP-недоступности до аутентификации. Локальные CONNECT/SOCKS5 работают только на loopback, для H2 требуется явно доверенная CA. Автоматические тесты выполняются GitHub Actions на Linux и Windows; ручных smoke нет. Исходный код CLI расположен в `crates/theia/`, исследовательский `spikes/m0_1/` не входит в production workspace.
-
-## Приоритеты
-
-1. **Безопасность и корректность**, затем совместимость.
-2. **Тесты до реализации**, сквозные сценарии до настройки «маскировки».
-3. **KISS и pragmatic engineering**: не писать собственные реализации TLS/QUIC/HTTP, не вводить БД и веб-панель.
-4. **P0-гейты до релиза**: F-18 REALITY-подобный mode/подбор IP, F-19 measured TLS-in-TLS mitigation, работающий BBR на обоих направлениях QUIC и как минимум один реально настраиваемый, проверенный TLS/HTTP browser-like fingerprint профиль; не выдавать шаблонный User-Agent за uTLS.
-5. **Измерять**, а не обещать скорость или невозможность DPI-классификации.
-
-Пример конфигураций содержит заменяемые значения и не предназначен для реального деплоя без создания сертификата и секретов. Лицензия ещё не выбрана; перед распространением добавить `LICENSE`.
-
-**M3.4j (merged):** реальные Chromium159 H2 SETTINGS, WINDOW_UPDATE и HPACK pseudo order измерены и сравнены со стандартным h2 0.4.19 на Linux/Windows. Обычная перестановка заголовков и параметров окна не обеспечивает Chrome-порядок; релизный F-13 остаётся заблокированным. **M4.1a (merged):** read-only TUI. **M4.1b (merged):** typed TOML editor с dirty, validation, save/discard/stay. **M4.1c (merged):** выбор существующих inbound/profiles и редактирование трёх безопасных полей на запись; без создания/удаления, применения к runtime и управления системным прокси.
-
-**P0 F-14 / M4.4a (in review):** переносимое подключение theia://v1/... теперь является обязательным релизным требованием. Библиотечный codec проверяет версию, каноничность, 32-byte token, user grants и digest без раскрытия secrets по умолчанию; экспорт/импорт через UI, ротация и secure persistence пока НЕ реализованы. См. [docs/INVITATIONS.md](docs/INVITATIONS.md). Нельзя вставлять URI с токеном в командную строку или публичные логи.
-
-**M4.4b1 (PR #43):** в явной серверной TUI после выбора inbound клавиша `u` вводит ID нового пользователя, подтверждение `y` создаёт случайный 256-битный bearer, SHA-256 digest и доступ только к выбранному inbound. После успешной атомарной записи server.toml второе `y` однократно показывает конфиденциальную ссылку, `Esc` стирает её из TUI. Сохранение не перезагружает службу. Безопасный файл экспорта, буфер обмена, QR, ротация, клиентский импорт и проверка соединения ещё не реализованы.
-
-**F-14 / M4.4b2a (в review):** серверная TUI поддерживает клавишу `x` для подтверждённого отключения существующего активного пользователя с grant на выбранный inbound. `users[].disabled=true` сохраняется через проверку внешних изменений и атомарную запись; это глобальное отключение во всех inbound, но **без автоматического IPC Apply и без разрыва старых туннелей**. Для отказа в новых подключения нужен отдельный auth-only CAS Apply. Ротация bearer, экспорт защищённого файла, клиентский импорт и F-14 E2E остаются открытыми. [ADR-0053](docs/adr/0053-m4-4b2a-explicit-existing-user-disable.md).
+Проект пока без выбранной лицензии и не предназначен для публичной production-поставки.
