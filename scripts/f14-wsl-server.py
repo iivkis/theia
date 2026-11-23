@@ -72,8 +72,9 @@ def origin_listener(port: int, stop: threading.Event) -> None:
 
 def serve(args: argparse.Namespace) -> None:
     assert os.name == "posix" and os.uname().sysname == "Linux"
-    assert ipaddress.ip_address(args.ip).version == 4
-    assert not ipaddress.ip_address(args.ip).is_loopback()
+    guest_ip = ipaddress.ip_address(args.ip)
+    if guest_ip.version != 4 or guest_ip.is_loopback or guest_ip.is_unspecified:
+        raise RuntimeError("Linux server must bind to a valid non-loopback guest IPv4")
     digest = input().strip()
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
         raise RuntimeError("invalid 32-byte bearer SHA-256 digest")
