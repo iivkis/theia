@@ -360,6 +360,13 @@ impl Editor {
         self.draft != self.original
     }
 
+    /// An exact digest of the bytes last loaded or durably saved by this
+    /// editor. It is NOT the dirty draft or a bearer credential. The running
+    /// Linux server must verify the same bytes before accepting TUI Apply.
+    pub(crate) fn saved_sha256(&self) -> [u8; 32] {
+        Sha256::digest(&self.source).into()
+    }
+
     pub fn begin(&mut self) {
         if self.issued.is_some() {
             self.error = Some("Завершите одноразовую выдачу ссылки.".into());
