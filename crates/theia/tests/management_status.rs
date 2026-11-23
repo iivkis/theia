@@ -53,6 +53,17 @@ async fn health_and_status_reflect_real_running_socket_without_reloading() {
         query_in(&dir, StatusCommand::Reload).await,
         Ok(StatusReply::Unsupported)
     );
+    assert_eq!(
+        query_in(
+            &dir,
+            StatusCommand::ApplyReload {
+                expected_revision: 1
+            }
+        )
+        .await,
+        Err(ManagementError::Unsupported),
+        "a read-only standalone StatusServer must never pretend to Apply"
+    );
     // Verify the compiled executable, not just the library protocol.
     let cli_dir = dir.clone();
     let cli = tokio::task::spawn_blocking(move || {
@@ -168,4 +179,37 @@ async fn failed_connect_never_claims_running_or_applied() {
         Err(ManagementError::SocketUnavailable)
     );
     fs::remove_dir(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn fake_apply_receipt_with_wrong_revision_or_unsupported_is_never_success() {
+    for reply in [
+        b"theia-apply-v1 applied revision=99\n".as_slice(),
+        b"theia-apply-v1 applied revision=02\n",
+        b"theia-check-v1 compatible\n",
+    ] {
+        let dir = private_dir();
+        let listener = tokio::net::UnixListener::bind(dir.join("theia-server.sock")).unwrap();
+        let response = reply.to_vec();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 19];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"apply-reload rev=1\n");
+            stream.write_all(&response).await.unwrap();
+        });
+        assert_eq!(
+            query_in(
+                &dir,
+                StatusCommand::ApplyReload {
+                    expected_revision: 1
+                }
+            )
+            .await,
+            Err(ManagementError::InvalidReply)
+        );
+        responder.await.unwrap();
+        fs::remove_file(dir.join("theia-server.sock")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
 }

@@ -1,8 +1,8 @@
-//! M4.2a: bounded, read-only local management transport.
+//! M4.2b1b: bounded Linux local management IPC with explicit CAS auth Apply.
 //!
 //! Linux-only opt-in endpoint via THEIA_CONTROL_DIR, a private, operator-owned
-//! runtime directory. No administrative TCP, reload, config mutation or secret
-//! data is exposed. Windows named pipes/ACL and transactional reload are open.
+//! runtime directory. No administrative TCP, token disclosure or TLS/listener mutation.
+//! Windows Named Pipe/DACL and TUI Apply remain separate milestones.
 //! The endpoint exists only while a server process is actually serving.
 use std::fmt;
 
@@ -60,7 +60,7 @@ impl fmt::Display for ManagementError {
             Self::Io => "local management I/O failed",
             Self::TimedOut => "local management request timed out",
             Self::InvalidReply => "invalid local management response",
-            Self::CandidateRejected => "candidate reload preflight rejected; runtime unchanged",
+            Self::CandidateRejected => "candidate or expected revision rejected; query status if Apply outcome is uncertain",
         };
         f.write_str(message)
     }
@@ -76,6 +76,10 @@ pub enum StatusCommand {
     Reload,
     /// Read-only preflight; does not modify config or runtime.
     CheckReload,
+    /// Explicit opt-in CAS auth publication, supported only by Linux server.
+    ApplyReload {
+        expected_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +88,16 @@ pub enum StatusReply {
     Running {
         inbounds: usize,
     },
+    RunningRevision {
+        inbounds: usize,
+        revision: u64,
+    },
     Unsupported,
     /// Candidate passes the deliberately narrow compatibility preflight.
     Compatible,
+    Applied {
+        revision: u64,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -125,6 +136,7 @@ pub struct StatusServer {
     inode: u64,
     inbounds: usize,
     preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
+    live: Option<Arc<crate::live_auth::LiveAuthorization>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -152,6 +164,7 @@ impl StatusServer {
             inode: metadata.ino(),
             inbounds,
             preflight: None,
+            live: None,
         })
     }
 
@@ -160,6 +173,16 @@ impl StatusServer {
         preflight: Arc<crate::reload_preflight::ReloadPreflight>,
     ) -> Self {
         self.preflight = Some(preflight);
+        self
+    }
+
+    /// Without both the running authorization controller and exact config
+    /// preflight, Apply remains unavailable (including test-only sockets).
+    pub(crate) fn with_live_authorization(
+        mut self,
+        live: Arc<crate::live_auth::LiveAuthorization>,
+    ) -> Self {
+        self.live = Some(live);
         self
     }
 
@@ -188,9 +211,12 @@ impl StatusServer {
                     if let Ok(permit) = concurrency.clone().try_acquire_owned() {
                         let inbounds = self.inbounds;
                         let preflight = self.preflight.clone();
+                        let live = self.live.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
-                            let _ = timeout(IO_TIMEOUT, handle(stream, inbounds, preflight)).await;
+                            // Cancelled handlers cannot publish. Their
+                            // spawn_blocking workers only load candidates.
+                            let _ = timeout(IO_TIMEOUT, handle(stream, inbounds, preflight, live)).await;
                         });
                     }
                     // Over budget: close socket immediately, never build a
@@ -220,6 +246,7 @@ async fn handle(
     mut stream: UnixStream,
     inbounds: usize,
     preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
+    live: Option<Arc<crate::live_auth::LiveAuthorization>>,
 ) -> Result<(), ManagementError> {
     let mut command = Vec::with_capacity(16);
     let mut newline = false;
@@ -241,7 +268,20 @@ async fn handle(
     } else {
         match command.as_slice() {
             b"health" => "theia-health-v1 ok\n".to_owned(),
-            b"status" => format!("theia-status-v1 running inbounds={inbounds}\n"),
+            b"status" => {
+                if let Some(live) = &live {
+                    match live.revision() {
+                        Ok(revision) => {
+                            format!(
+                                "theia-status-v2 running inbounds={inbounds} revision={revision}\n"
+                            )
+                        }
+                        Err(_) => "ERR unsupported\n".to_owned(),
+                    }
+                } else {
+                    format!("theia-status-v1 running inbounds={inbounds}\n")
+                }
+            }
             b"check-reload" => {
                 if let Some(preflight) = preflight {
                     // 1 MiB bounded config + PEM reads belong on a worker.
@@ -249,6 +289,30 @@ async fn handle(
                     match tokio::task::spawn_blocking(move || preflight.check_file()).await {
                         Ok(Ok(())) => "theia-check-v1 compatible\n".to_owned(),
                         _ => "theia-check-v1 rejected\n".to_owned(),
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
+            }
+            candidate if parse_apply_revision(candidate).is_some() => {
+                if let (Some(preflight), Some(live)) = (preflight, live) {
+                    let expected = parse_apply_revision(candidate).expect("already parsed");
+                    // The blocking worker can finish after a timeout, but it
+                    // NEVER commits. Only this still-live task may stage/CAS
+                    // publish the exact document that was just validated.
+                    match tokio::task::spawn_blocking(move || preflight.load_candidate()).await {
+                        Ok(Ok(candidate)) => {
+                            match live
+                                .stage(&candidate, expected)
+                                .and_then(|stage| live.publish(stage))
+                            {
+                                Ok(revision) => {
+                                    format!("theia-apply-v1 applied revision={revision}\n")
+                                }
+                                Err(_) => "theia-apply-v1 rejected\n".to_owned(),
+                            }
+                        }
+                        _ => "theia-apply-v1 rejected\n".to_owned(),
                     }
                 } else {
                     "ERR unsupported\n".to_owned()
@@ -265,6 +329,23 @@ async fn handle(
 }
 
 #[cfg(target_os = "linux")]
+fn positive_decimal(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_apply_revision(command: &[u8]) -> Option<u64> {
+    let raw = command.strip_prefix(b"apply-reload rev=")?;
+    positive_decimal(std::str::from_utf8(raw).ok()?)
+}
+
+#[cfg(target_os = "linux")]
 pub async fn query_in(
     directory: &Path,
     command: StatusCommand,
@@ -275,13 +356,19 @@ pub async fn query_in(
             .await
             .map_err(|_| ManagementError::SocketUnavailable)?;
         let request = match command {
-            StatusCommand::Health => b"health\n".as_slice(),
-            StatusCommand::Status => b"status\n".as_slice(),
-            StatusCommand::Reload => b"reload\n".as_slice(),
-            StatusCommand::CheckReload => b"check-reload\n".as_slice(),
+            StatusCommand::Health => b"health\n".to_vec(),
+            StatusCommand::Status => b"status\n".to_vec(),
+            StatusCommand::Reload => b"reload\n".to_vec(),
+            StatusCommand::CheckReload => b"check-reload\n".to_vec(),
+            StatusCommand::ApplyReload { expected_revision } => {
+                if expected_revision == 0 {
+                    return Err(ManagementError::InvalidReply);
+                }
+                format!("apply-reload rev={expected_revision}\n").into_bytes()
+            }
         };
         stream
-            .write_all(request)
+            .write_all(&request)
             .await
             .map_err(|_| ManagementError::Io)?;
         let mut reply = Vec::new();
@@ -306,8 +393,40 @@ pub async fn query_in(
                 _ => Err(ManagementError::InvalidReply),
             };
         }
+        if let StatusCommand::ApplyReload { expected_revision } = command {
+            let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+            if let Some(revision) = text
+                .strip_prefix("theia-apply-v1 applied revision=")
+                .and_then(|line| line.strip_suffix('\n'))
+                .and_then(positive_decimal)
+            {
+                if Some(revision) == expected_revision.checked_add(1) {
+                    return Ok(StatusReply::Applied { revision });
+                }
+            }
+            return if reply == b"theia-apply-v1 rejected\n" {
+                Err(ManagementError::CandidateRejected)
+            } else if reply == b"ERR unsupported\n" {
+                Err(ManagementError::Unsupported)
+            } else {
+                Err(ManagementError::InvalidReply)
+            };
+        }
         if command == StatusCommand::Status {
             let reply = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+            if let Some((count, revision)) = reply
+                .strip_prefix("theia-status-v2 running inbounds=")
+                .and_then(|line| line.strip_suffix('\n'))
+                .and_then(|line| line.split_once(" revision="))
+            {
+                let inbounds = positive_decimal(count).filter(|_| count.len() <= 7);
+                let revision = positive_decimal(revision);
+                if let (Some(inbounds), Some(revision)) = (inbounds, revision) {
+                    if let Ok(inbounds) = usize::try_from(inbounds) {
+                        return Ok(StatusReply::RunningRevision { inbounds, revision });
+                    }
+                }
+            }
             if let Some(number) = reply
                 .strip_prefix("theia-status-v1 running inbounds=")
                 .and_then(|line| line.strip_suffix('\n'))
@@ -351,6 +470,14 @@ mod tests {
         assert_eq!(
             query_environment(StatusCommand::Status).await,
             Err(ManagementError::Unsupported)
+        );
+        assert_eq!(
+            query_environment(StatusCommand::ApplyReload {
+                expected_revision: 1,
+            })
+            .await,
+            Err(ManagementError::Unsupported),
+            "Windows cannot silently emulate Unix IPC Apply without Named Pipe DACL"
         );
     }
 }

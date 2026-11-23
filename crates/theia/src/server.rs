@@ -882,7 +882,7 @@ async fn run_document_with_config(
     // One shared authorization snapshot for every H2/H3 inbound. The
     // controller's stage/commit API is NOT exposed by management IPC yet.
     let live_authorization =
-        LiveAuthorization::new(document.clone()).map_err(|_| ServerError::Config)?;
+        Arc::new(LiveAuthorization::new(document.clone()).map_err(|_| ServerError::Config)?);
     #[cfg(target_os = "linux")]
     let baseline = document.clone();
     #[cfg(target_os = "linux")]
@@ -933,19 +933,21 @@ async fn run_document_with_config(
         ));
         prepared.push((listener, acceptor, endpoint, context));
     }
-    // Management IPC is Linux opt-in until Windows named-pipe ACL and
-    // transactional reload are implemented. Never advertise status before
+    // Management IPC and CAS Apply are Linux opt-in until Windows named-pipe
+    // ACL and TUI Apply are implemented. Never advertise status before
     // all TLS/TCP/QUIC binds have been prepared successfully.
     #[cfg(target_os = "linux")]
     let management = crate::management::StatusServer::from_environment(prepared.len())
         .map_err(|_| ServerError::Io)?
         .map(|server| {
             if let Some(path) = config_path {
-                server.with_preflight(Arc::new(crate::reload_preflight::ReloadPreflight::new(
-                    path.to_owned(),
-                    baseline,
-                    loaded_identities,
-                )))
+                server
+                    .with_preflight(Arc::new(crate::reload_preflight::ReloadPreflight::new(
+                        path.to_owned(),
+                        baseline,
+                        loaded_identities,
+                    )))
+                    .with_live_authorization(live_authorization.clone())
             } else {
                 server
             }
