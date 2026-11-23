@@ -14,6 +14,7 @@ import hashlib
 import ipaddress
 import os
 from pathlib import Path
+import shutil
 import secrets
 import socket
 import subprocess
@@ -81,14 +82,32 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
     if port == origin:
         origin += 1
 
-    with tempfile.TemporaryDirectory(prefix="theia-f14-xhost-") as dirname:
+    # GitHub-hosted Windows checks out onto D:\\a, which is NOT guaranteed
+    # to be mounted in Ubuntu's WSL2 VM. Stage only CI test inputs on C:
+    # (the normal DrvFs /mnt/c mount), never a secret or bearer token.
+    user_home = Path(os.environ["USERPROFILE"])
+    c_temp = user_home / "AppData" / "Local" / "Temp"
+    c_temp.mkdir(parents=True, exist_ok=True)
+    if user_home.drive.lower() != "c:":
+        raise RuntimeError("Windows profile must reside on WSL-mounted system drive C:")
+    with tempfile.TemporaryDirectory(prefix="theia-f14-xhost-", dir=c_temp) as dirname:
         shared = Path(dirname)
         server_script = Path(__file__).resolve().with_name("f14-wsl-server.py")
+        guest_script = shared / "f14-wsl-server.py"
+        guest_binary = shared / "theia-linux"
+        shutil.copy2(server_script, guest_script)
+        shutil.copy2(binary, guest_binary)
+        guest_shared_path = wsl_path(shared)
+        guest_script_path = wsl_path(guest_script)
+        guest_binary_path = wsl_path(guest_binary)
+        linux("test", "-r", guest_script_path)
+        linux("test", "-r", guest_binary_path)
+        print("F-14: verified Windows C: staged artifact visibility inside the Linux VM")
         command = [
             "wsl.exe", "--distribution", DISTRO, "--",
-            "python3", wsl_path(server_script),
-            "--shared", wsl_path(shared),
-            "--binary", wsl_path(binary),
+            "python3", guest_script_path,
+            "--shared", guest_shared_path,
+            "--binary", guest_binary_path,
             "--ip", ip, "--port", str(port), "--origin-port", str(origin),
         ]
         server = subprocess.Popen(
