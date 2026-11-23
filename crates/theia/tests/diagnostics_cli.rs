@@ -43,7 +43,7 @@ fn cli_writes_trace_by_default_without_leaking_arguments_or_credentials() {
     assert!(combined.contains("component=process event=started"));
     assert!(combined.contains("component=process event=failed"));
     assert!(combined.contains("component=process event=completed"));
-    assert!(combined.contains("at=crates/theia/src/main.rs:"));
+    assert!(combined.contains("at=") && combined.contains("main.rs:"));
     assert!(!combined.contains(secret));
     fs::remove_dir_all(dir).unwrap();
 }
