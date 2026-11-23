@@ -56,6 +56,7 @@ pub enum Command {
     ServerRun { config: String },
     ServerStatus,
     ServerCheckReload,
+    ServerCheckRestart,
     ServerApplyReload { expected_revision: u64 },
     ClientRun { config: String },
     ConfigValidate { config: String },
@@ -147,6 +148,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         }),
         ["server", "status"] => Ok(Command::ServerStatus),
         ["server", "reload", "--check"] => Ok(Command::ServerCheckReload),
+        ["server", "restart", "--check"] => Ok(Command::ServerCheckRestart),
         ["server", "reload", "--expected-revision", raw] => {
             if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(CliError::InvalidArguments);
@@ -174,6 +176,7 @@ Usage:\n\
   theia server run --config <path>\n\
   theia server status                # read-only Linux opt-in IPC\n\
   theia server reload --check        # read-only compatibility check\n\
+  theia server restart --check       # read-only restart readiness; never commits\n\
   theia server reload --expected-revision N  # Linux CAS auth Apply\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
@@ -188,7 +191,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
-            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server reload --expected-revision N\nCAS auth Apply requires private Linux THEIA_CONTROL_DIR or Windows THEIA_CONTROL_PIPE, plus expected running revision; TLS/listener and policy cannot change.")
+            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server reload --expected-revision N\nRestart check only probes candidate TLS and TCP/UDP ports; it does not reserve, apply, restart or guarantee rollback. CAS auth Apply requires private Linux THEIA_CONTROL_DIR or Windows THEIA_CONTROL_PIPE, plus expected running revision.")
         }
         Command::Help(Some("client")) => {
             Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")
@@ -200,7 +203,10 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
         Command::Version => Ok(concat!("theia ", env!("CARGO_PKG_VERSION"))),
         Command::Tui { .. } | Command::TuiEdit { .. } => Err(CliError::NotImplemented("TUI")),
         Command::ServerRun { .. } => Err(CliError::NotImplemented("server runtime")),
-        Command::ServerStatus | Command::ServerCheckReload | Command::ServerApplyReload { .. } => {
+        Command::ServerStatus
+        | Command::ServerCheckReload
+        | Command::ServerCheckRestart
+        | Command::ServerApplyReload { .. } => {
             Err(CliError::NotImplemented("async management IPC"))
         },
         Command::ClientRun { .. } => Err(CliError::NotImplemented("client runtime")),
