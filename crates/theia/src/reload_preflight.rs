@@ -202,9 +202,10 @@ impl ReloadPreflight {
         // Failed/cancelled IPC handlers cannot launch a growing backlog of
         // slow filesystem operations or hold candidate ports indefinitely.
         // The guard stays owned by the worker even after its client times out.
-        let _single_flight = self.restart_probe_lock.try_lock().map_err(|_| {
-            crate::restart_guard::RestartError::ProbeBusy
-        })?;
+        let _single_flight = self
+            .restart_probe_lock
+            .try_lock()
+            .map_err(|_| crate::restart_guard::RestartError::ProbeBusy)?;
         let candidate = match config::read_file(&self.config_path) {
             Ok(Config::Server(document)) => document,
             _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
