@@ -54,7 +54,13 @@ async fn health_and_status_reflect_real_running_socket_without_reloading() {
         Ok(StatusReply::Unsupported)
     );
     assert_eq!(
-        query_in(&dir, StatusCommand::ApplyReload { expected_revision: 1 }).await,
+        query_in(
+            &dir,
+            StatusCommand::ApplyReload {
+                expected_revision: 1
+            }
+        )
+        .await,
         Err(ManagementError::Unsupported),
         "a read-only standalone StatusServer must never pretend to Apply"
     );
@@ -193,7 +199,13 @@ async fn fake_apply_receipt_with_wrong_revision_or_unsupported_is_never_success(
             stream.write_all(&response).await.unwrap();
         });
         assert_eq!(
-            query_in(&dir, StatusCommand::ApplyReload { expected_revision: 1 }).await,
+            query_in(
+                &dir,
+                StatusCommand::ApplyReload {
+                    expected_revision: 1
+                }
+            )
+            .await,
             Err(ManagementError::InvalidReply)
         );
         responder.await.unwrap();
