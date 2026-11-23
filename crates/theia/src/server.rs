@@ -1980,6 +1980,68 @@ mod hardening_tests {
         assert!(a.authorize(Some(&live_bearer(8))).is_ok());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn captured_pem_snapshot_survives_disk_replacement_without_tls_builder_reread() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let path = std::env::temp_dir().join(format!(
+            "theia-tls-pin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let cert_path = path.join("cert.pem");
+        let key_path = path.join("key.pem");
+        let generated = rcgen::generate_simple_self_signed(vec![
+            "a.example.org".into(),
+            "b.example.org".into(),
+        ])
+        .unwrap();
+        let cert_pem = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            STANDARD.encode(generated.cert.der())
+        );
+        let key_pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            STANDARD.encode(generated.key_pair.serialize_der())
+        );
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        let mut doc = live_auth_fixture();
+        for inbound in &mut doc.server.inbounds {
+            inbound.tls_cert = format!("file:{}", cert_path.display());
+            inbound.tls_key = format!("file:{}", key_path.display());
+        }
+        let captured = CapturedTls::capture(&doc).unwrap();
+        let fingerprint = captured.fingerprint;
+        assert!(captured.matches(&fingerprint));
+        std::fs::write(&cert_path, "corrupted cert after snapshot").unwrap();
+        std::fs::write(&key_path, "corrupted key after snapshot").unwrap();
+        assert!(CapturedTls::capture(&doc).is_err());
+        // Both real H2 and QUIC/BBR builders must still work exclusively
+        // from the previously authorized private in-memory PEM snapshot.
+        let prepared = prepare_same_port_tls(&doc, &captured).unwrap();
+        assert_eq!(prepared.h2.len(), doc.server.inbounds.len());
+        assert_eq!(prepared.h3.len(), doc.server.inbounds.len());
+        assert_eq!(prepared.identities, captured.identities());
+        // Order of inbound identities is part of the cryptographic pin.
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        let mut reordered = doc.clone();
+        reordered.server.inbounds.reverse();
+        assert!(!CapturedTls::capture(&reordered)
+            .unwrap()
+            .matches(&fingerprint));
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+
     #[test]
     fn configured_name_must_match_certificate_san() {
         let cert = rcgen::generate_simple_self_signed(vec!["theia.example".into()]).unwrap();
