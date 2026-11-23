@@ -1287,6 +1287,41 @@ fn commit_same_port_tls(
     Ok((identities, revision))
 }
 
+/// Quota-only CAS: nothing is rebound or restarted, and all previously
+/// acquired permits remain counted by the SAME ledger across both transports.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn commit_live_quota(
+    runtime: &crate::runtime_generation::State,
+    request: &crate::runtime_generation::RestartRequest,
+    ledger: &crate::quota::Ledger,
+) -> Result<u64, ()> {
+    let active = request.previous.document.as_ref();
+    let candidate = &request.candidate;
+    if !crate::restart_guard::quota_only(active, candidate) {
+        return Err(());
+    }
+    let (rebased_live, staged_auth) = request
+        .previous
+        .live
+        .prepare_tls_rebase(candidate, request.expected_revision)
+        .map_err(|_| ())?;
+    let next = crate::runtime_generation::View {
+        document: Arc::new(candidate.clone()),
+        inbounds: request.previous.inbounds,
+        preflight: Arc::new(request.previous.preflight.rebased(candidate.clone())),
+        live: Arc::new(rebased_live),
+    };
+    runtime
+        .commit_quota(
+            &request.previous,
+            request.expected_revision,
+            next,
+            staged_auth,
+            ledger,
+        )
+        .map_err(|_| ())
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn run_supervised_file(
     document: ServerDocument,
@@ -1354,6 +1389,11 @@ async fn run_supervised_file(
                 // Never start or commit a speculative restart whose operator
                 // is no longer listening for its result.
                 if request.complete.is_closed() {
+                    continue;
+                }
+                if request.kind == crate::runtime_generation::ChangeKind::Quota {
+                    let result = commit_live_quota(&runtime, &request, &limits.ledger);
+                    let _ = request.complete.send(result);
                     continue;
                 }
                 if crate::restart_guard::same_port_tls_only(
