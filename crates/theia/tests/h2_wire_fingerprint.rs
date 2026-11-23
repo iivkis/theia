@@ -135,6 +135,8 @@ enum Backend {
     Rustls,
     #[cfg(feature = "experimental-btls-h2")]
     BoringSsl,
+    #[cfg(feature = "experimental-btls-h2")]
+    BrowserH2V1,
 }
 
 async fn measure(backend: Backend) -> Observation {
@@ -203,6 +205,14 @@ async fn measure(backend: Backend) -> Observation {
                 ca_pem.as_bytes(),
             )
             .expect("explicitly trusted BoringSSL client"),
+            #[cfg(feature = "experimental-btls-h2")]
+            Backend::BrowserH2V1 => H2Client::new_browser_h2_v1(
+                &endpoint.to_string(),
+                "localhost",
+                &token,
+                ca_pem.as_bytes(),
+            )
+            .expect("explicitly trusted named browser-like H2 client"),
         };
         let result = client.open(Address::Dns("localhost".into()), 443).await;
         assert!(
@@ -217,6 +227,8 @@ async fn measure(backend: Backend) -> Observation {
                 Backend::Rustls => "rustls",
                 #[cfg(feature = "experimental-btls-h2")]
                 Backend::BoringSsl => "experimental-btls",
+                #[cfg(feature = "experimental-btls-h2")]
+                Backend::BrowserH2V1 => "browser-h2-btls-v1",
             },
             observation.settings,
             observation.frames_before_headers,
@@ -232,6 +244,36 @@ async fn measure(backend: Backend) -> Observation {
     })
     .await
     .expect("bounded H2 wire fingerprint loopback")
+}
+
+/// F-13: measure the *actual* production H2Client selected by the named
+/// profile, after independently verified TLS1.3/CA/SNI/ALPN. Both default and
+/// named profiles use the real HTTP/2 request and never return OPEN_OK on 403.
+#[cfg(feature = "experimental-btls-h2")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_browser_h2_profile_has_measured_distinct_bounded_first_flight() {
+    let regular = measure(Backend::Rustls).await;
+    let observed = measure(Backend::BrowserH2V1).await;
+    assert_eq!(regular.settings, [(2, 0), (6, 8192)]);
+    assert_eq!(
+        observed.settings,
+        [(1, 65_536), (2, 0), (4, 262_144), (6, 8192)],
+        "this is actual produced HTTP/2 SETTINGS, not a renamed config"
+    );
+    assert_eq!(
+        observed.pseudo_headers,
+        [":method", ":scheme", ":authority", ":path"],
+        "the existing h2 encoder order is not Chrome159 parity"
+    );
+    let chrome159 = [(1, 65_536), (2, 0), (4, 6_291_456), (6, 262_144)];
+    assert_ne!(
+        observed.settings.as_slice(),
+        chrome159.as_slice(),
+        "never claim full Chromium settings under the strict 8KiB header bound"
+    );
+    assert!(observed.connection_window_updates.is_empty());
+    assert!(!observed.request_end_stream);
+    assert_eq!(observed.ordinary_fields, 2);
 }
 
 /// Compare exactly the same shipping HTTP/2 engine as the default browser

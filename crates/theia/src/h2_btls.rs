@@ -1,6 +1,8 @@
-//! Explicit, feature-gated BoringSSL H2 transport for M3.4e CI verification.
-//! Never used by the shipping default client or selected by TOML. This is
-//! not a Chrome/JA3/JA4 profile and cannot serve QUIC/H3.
+//! BoringSSL H2 TLS1.3 backend for opt-in native Windows/Linux profile.
+//! The ordinary default profile still uses rustls. Explicit named
+//! `browser-h2-btls-v1` selects this strict CA/SNI/ALPN backend with GREASE
+//! and ALPS, plus a bounded H2 SETTINGS shape; it is not byte-exact Chrome,
+//! JA3/JA4 impersonation or QUIC/H3 (ADR-0057).
 use crate::client::ClientError;
 use btls::{
     ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion},

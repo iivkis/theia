@@ -18,7 +18,7 @@
 
 | Требование | Текущее ограничение |
 | --- | --- |
-| **F-13 browser-like fingerprint** | Нет поставляемого измеренного именованного H2/H3 browser-like профиля. BoringSSL/Chromium/uTLS эталоны и экспериментальные адаптеры не заменяют релизную реализацию. |
+| **F-13 browser-like fingerprint** | PR #83: реальный opt-in `browser-h2-btls-v1` на BoringSSL, отдельные измеряемые H2 SETTINGS и нативный клиентский E2E (CI pending). Это частичный H2-профиль, **не** полное соответствие Chromium; H3/QUIC fingerprint и релизный F-13 всё ещё открыты. |
 | **F-14 приглашения** | Серверная выдача и disable-only существуют; импорт в клиентскую TUI с защищённым файлом/CA и native H2 E2E находится в PR/CI. Защищённый экспорт, ротация (отдельный PR #80), H3 и Linux→Windows cross-host E2E пока не завершены. |
 | **F-18 REALITY-подобная защита** | Нет согласованного криптографического identity/security mode, антипробинга и законченного двухшагового мастера с безопасным Apply. Текущие H2/H3 TLS probes — только evidence. |
 | **F-19 TLS-in-TLS** | Нет измеренной flow-shaping защиты с независимым classifier и release thresholds. |

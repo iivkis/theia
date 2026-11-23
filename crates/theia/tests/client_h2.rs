@@ -366,11 +366,12 @@ async fn wait_for_proxy(address: std::net::SocketAddr, child: &mut ChildProcess)
     .expect("client listener startup deadline");
 }
 
-async fn launch_client(
+async fn launch_client_with_profile(
     endpoint: String,
     pem: String,
     label: &str,
     transport: theia::config::Transport,
+    tls_profile: &str,
 ) -> (
     TestDirectory,
     ChildProcess,
@@ -399,6 +400,7 @@ async fn launch_client(
     profile.server = endpoint;
     profile.server_name = "localhost".into();
     profile.transport = transport;
+    profile.tls_profile = tls_profile.to_owned();
     profile.tls_ca = Some(format!("file:{}", ca_path.display()));
     profile.auth_token = "env:THEIA_CI_TEST_TOKEN".into();
     doc.client.proxy.http_listen = http.to_string();
@@ -423,6 +425,20 @@ async fn launch_client(
     wait_for_proxy(http, &mut child).await;
     wait_for_proxy(socks, &mut child).await;
     (dir, child, http, socks)
+}
+
+async fn launch_client(
+    endpoint: String,
+    pem: String,
+    label: &str,
+    transport: theia::config::Transport,
+) -> (
+    TestDirectory,
+    ChildProcess,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+) {
+    launch_client_with_profile(endpoint, pem, label, transport, "default").await
 }
 
 /// Black-box curl tests run on both native CI runners. No external service,
@@ -565,6 +581,19 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_binary_curl_connect_and_socks5h() {
+    check_native_binary_connect_and_socks5("default", "curl").await;
+}
+
+#[cfg(feature = "experimental-btls-h2")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn named_browser_h2_profile_binary_connect_and_socks5_real_open_ok() {
+    // Uses ordinary client.toml selection (not an experimental-only API)
+    // in the actual compiled Windows/Linux client. Both local proxy
+    // protocols must reach the real SmartTheia OPEN_OK gate.
+    check_native_binary_connect_and_socks5("browser-h2-btls-v1", "browser-h2").await;
+}
+
+async fn check_native_binary_connect_and_socks5(tls_profile: &str, label: &str) {
     timeout(Duration::from_secs(40), async {
         let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -588,8 +617,14 @@ async fn client_binary_curl_connect_and_socks5h() {
                 socket.shutdown().await.unwrap();
             }
         });
-        let (_dir, mut child, http, socks) =
-            launch_client(endpoint, pem, "curl", theia::config::Transport::H2).await;
+        let (_dir, mut child, http, socks) = launch_client_with_profile(
+            endpoint,
+            pem,
+            label,
+            theia::config::Transport::H2,
+            tls_profile,
+        )
+        .await;
 
         // --disable ignores any user curlrc. --noproxy "" prevents the
         // standard localhost bypass. HTTP mode must actually use CONNECT.

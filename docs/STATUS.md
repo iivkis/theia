@@ -20,7 +20,7 @@
 
 ## Открытые P0 и ограничения безопасности
 
-- **F-13:** именованный, измеренный browser-like TLS/HTTP профиль для реального Windows/Linux клиента и H2/H3 ещё не поставлен. Опциональный BoringSSL backend, Go uTLS эталон и Chromium измерения являются исследованием, а не профилем.
+- **F-13:** PR #83 / ADR-0057 (CI pending) подключает реальный opt-in `browser-h2-btls-v1` через штатный клиент Windows/Linux: BoringSSL GREASE/ALPS с подтверждённым TLS1.3/PKI, отличающийся от `default` HTTP/2 SETTINGS и нативный CONNECT/SOCKS5 E2E. Это только частичная H2 browser-style реализация, не воспроизведение Chromium; H3 QUIC Initial, полные TLS vectors/HPACK pseudo порядок, benchmark/релизный F-13 остаются открытыми.
 - **F-14:** повторная выдача/ротация, безопасный файл/clipboard, клиентский импорт `theia://v1` с защищённым файлом и CA (ADR-0055, PR/CI pending), полная Windows ACL/collision/recovery приёмка и автоматический Linux-server → Windows-client H2/H3 E2E остаются открытыми. `disabled=true` из редактора действует **только после** отдельного auth-only CAS Apply для новых запросов; активные туннели не отзываются.
 - **F-18:** криптографически проверенный REALITY-подобный security mode, anti-probing/replay, безопасный двухшаговый picker/Apply и cross-host security evidence не реализованы. `TlsEvidence`/score не доказывают DPI-невидимость и не авторизуют активные сетевые проверки.
 - **F-19:** flow-shaping, независимый TLS-in-TLS classifier, benchmark thresholds и измеренное улучшение не реализованы.
