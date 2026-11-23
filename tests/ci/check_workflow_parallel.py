@@ -37,6 +37,7 @@ mandatory = {
     "specification",
     "rust-tests",
     "windows-smoke",
+    "f14-cross-host",
     "browser-e2e",
     "m0-1-api-spike",
     "m0-1-windows-spike",
@@ -56,6 +57,27 @@ for name in ("windows-smoke", "browser-e2e"):
         f"{name} must retain the Rust readiness precondition",
     )
 require(needs("ci-gate") == mandatory, "ci-gate must depend on EVERY required job")
+require(needs("f14-cross-host") == {"specification", "rust-tests"},
+        "cross-OS Windows job must consume the exact Linux server binary from CI")
+cross_host = job("f14-cross-host")
+require("needs.specification.outputs.rust_ready == 'true'" in cross_host,
+        "cross-OS acceptance must not run on specification-only PRs")
+require("runs-on: windows-2025" in cross_host,
+        "cross-OS acceptance must use a real native Windows runner")
+require("name: f14-linux-server" in cross_host
+        and "actions/download-artifact@v4" in cross_host,
+        "Windows must retrieve the built Linux binary artifact")
+require("Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4" in cross_host
+        and "wsl-version: 2" in cross_host,
+        "Linux must run under a pinned, real WSL2 VM")
+require("scripts/f14-cross-os-ci.py" in cross_host
+        and "cargo build --workspace --locked --bin theia" in cross_host,
+        "cross-OS job must run a real Windows client executable, not a mock")
+require("continue-on-error" not in cross_host and "|| true" not in cross_host,
+        "mandatory Linux/Windows integration cannot be optional")
+require("Build genuine Linux server for Windows cross-OS F-14 E2E" in job("rust-tests")
+        and "actions/upload-artifact@v4" in job("rust-tests"),
+        "Linux executable must be built natively on Ubuntu and uploaded")
 gate = job("ci-gate")
 require("always()" in gate, "ci-gate must execute even when mandatory jobs fail")
 require('results.get(name, {}).get("result") != "success"' in gate,
