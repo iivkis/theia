@@ -715,6 +715,31 @@ mod tests {
         }
     }
     #[test]
+    fn f13_named_browser_h2_backend_is_explicit_and_never_downgrades_to_h3_or_auto() {
+        let named = client()
+            .replace("tls_profile = \"default\"", "tls_profile = \"browser-h2-btls-v1\"")
+            .replace("transport = \"auto\"", "transport = \"h2\"");
+        let accepted = parse(&named).expect("real named browser-like H2 TLS/HTTP profile");
+        assert_eq!(parse(&accepted.to_toml().unwrap()).unwrap(), accepted);
+        // The production profile does not yet have a compatible QUIC TLS
+        // first flight, so neither h3 nor auto can silently use rustls.
+        for transport in ["h3", "auto"] {
+            let forbidden = named.replace("transport = \"h2\"", &format!("transport = \"{transport}\""));
+            assert_eq!(
+                parse(&forbidden).unwrap_err().field,
+                "client.profiles[0].tls_profile",
+            );
+        }
+        for unsupported in ["chrome133", "chrome159", "browser-h2-btls-v2", "default;unsafe"] {
+            let candidate = named.replace("browser-h2-btls-v1", unsupported);
+            assert_eq!(
+                parse(&candidate).unwrap_err().field,
+                "client.profiles[0].tls_profile",
+            );
+        }
+    }
+
+    #[test]
     fn unknown_keys_versions_and_malformed_input_fail() {
         for src in [
             client().replace("schema_version = 1", "schema_version = 2"),
