@@ -746,6 +746,122 @@ mod tests {
     }
 
     #[test]
+    fn rotation_changes_only_existing_users_digest_and_reveals_after_durable_save() {
+        use crate::invite::Invitation;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.select_record(true);
+        let Config::Server(original) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        let before = original.server.users[0].token_sha256.clone();
+        let grants = original
+            .server
+            .inbounds
+            .iter()
+            .map(|inbound| inbound.allowed_user_ids.clone())
+            .collect::<Vec<_>>();
+        assert!(editor.rotate_user("device-a").is_ok());
+        assert!(editor.dirty());
+        assert!(!editor.issued_ready());
+        assert!(editor.take_issued().is_none());
+        assert_eq!(
+            config::read_file(&temp.0).unwrap(),
+            Config::Server(original.clone())
+        );
+        assert!(editor.save());
+        assert!(editor.issued_ready());
+        let invite = editor.take_issued().expect("one-time replacement token");
+        assert!(editor.take_issued().is_none());
+        assert!(Invitation::decode(&invite.encode().unwrap()).unwrap().has_token());
+        let token = invite.token_bytes().unwrap();
+        assert_ne!(token, [0x42; 32]);
+        let stored = fs::read_to_string(&temp.0).unwrap();
+        assert!(!stored.contains(&URL_SAFE_NO_PAD.encode(token)));
+        let Config::Server(updated) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert_eq!(updated.server.users.len(), original.server.users.len());
+        assert_eq!(updated.server.users[0].id, "device-a");
+        assert!(!updated.server.users[0].disabled);
+        assert_ne!(updated.server.users[0].token_sha256, before);
+        assert_eq!(
+            updated.server.users[0].token_sha256,
+            format!("{:x}", Sha256::digest(token))
+        );
+        assert_eq!(
+            updated
+                .server
+                .inbounds
+                .iter()
+                .map(|inbound| inbound.allowed_user_ids.clone())
+                .collect::<Vec<_>>(),
+            grants
+        );
+    }
+
+    #[test]
+    fn rotation_rejects_unsafe_states_ungranted_user_and_external_conflict() {
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        for id in ["", "no-such-user", "invalid name"] {
+            assert!(editor.rotate_user(id).is_err(), "{id:?}");
+            assert!(!editor.dirty());
+        }
+        editor.begin();
+        assert!(editor.rotate_user("device-a").is_err());
+        editor.cancel();
+        editor.begin();
+        editor.input = "new.example.org".into();
+        assert!(editor.accept());
+        assert!(editor.rotate_user("device-a").is_err());
+        editor.discard();
+
+        let Config::Server(mut record) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        record.server.users.push(User {
+            id: "device-b".into(),
+            token_sha256: format!("{:x}", Sha256::digest([0x77; 32])),
+            disabled: false,
+        });
+        record.server.inbounds[1].allowed_user_ids = vec!["device-b".into()];
+        let temp2 = Temp::write(&Config::Server(record).to_toml().unwrap());
+        let mut ungranted = Editor::load(Role::Server, &temp2.0).unwrap();
+        assert!(ungranted.rotate_user("device-b").is_err());
+        ungranted.select_record(true);
+        assert!(ungranted.rotate_user("device-b").is_ok());
+        ungranted.discard();
+
+        let Config::Server(mut disabled) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        disabled.server.users[0].disabled = true;
+        let temp3 = Temp::write(&Config::Server(disabled).to_toml().unwrap());
+        let mut editor_disabled = Editor::load(Role::Server, &temp3.0).unwrap();
+        assert!(editor_disabled.rotate_user("device-a").is_err());
+        assert!(!editor_disabled.dirty());
+
+        assert!(editor.issue_user("new-device").is_ok());
+        assert!(editor.rotate_user("device-a").is_err());
+        editor.discard();
+        assert!(editor.rotate_user("device-a").is_ok());
+        let external = format!("# external edit\n{}", two_inbounds());
+        fs::write(&temp.0, &external).unwrap();
+        assert!(!editor.save());
+        assert!(!editor.issued_ready());
+        assert!(editor.take_issued().is_none());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), external);
+
+        let client = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut client_editor = Editor::load(Role::Client, &client.0).unwrap();
+        assert!(client_editor.rotate_user("device-a").is_err());
+        assert!(!client_editor.dirty());
+    }
+
+    #[test]
     fn user_disable_requires_clean_server_editor_and_explicit_selected_grant() {
         let temp = Temp::write(&two_inbounds());
         let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
