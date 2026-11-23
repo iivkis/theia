@@ -134,6 +134,26 @@ async fn invalid_or_oversized_messages_cannot_trigger_reload_or_hang() {
 }
 
 #[tokio::test]
+async fn fake_unsupported_reply_cannot_masquerade_as_running_status() {
+    let dir = private_dir();
+    let listener = tokio::net::UnixListener::bind(dir.join("theia-server.sock")).unwrap();
+    let responder = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 7];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"status\\n");
+        stream.write_all(b"ERR unsupported\\n").await.unwrap();
+    });
+    assert_eq!(
+        query_in(&dir, StatusCommand::Status).await,
+        Err(ManagementError::InvalidReply)
+    );
+    responder.await.unwrap();
+    fs::remove_file(dir.join("theia-server.sock")).unwrap();
+    fs::remove_dir(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn failed_connect_never_claims_running_or_applied() {
     let dir = private_dir();
     assert_eq!(
