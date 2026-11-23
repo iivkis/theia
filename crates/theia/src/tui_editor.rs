@@ -6,6 +6,7 @@
 use crate::{
     config::{self, Config, Transport, User},
     invite::Invitation,
+    client_import::{self, PrivateBearer},
     Role,
 };
 use sha2::{Digest, Sha256};
@@ -72,6 +73,114 @@ impl Editor {
             error: None,
             notice: "Загружено. Изменения не применяются к runtime.",
         })
+    }
+
+    /// F-14: commit a completely new client profile from a reviewed invitation.
+    /// The source's bearer is never written to TOML; the file is protected by
+    /// a fresh owner-only directory and private ACL/mode on both platforms.
+    /// Caller must explicitly review ID/endpoint/SNI/transport and CA trust.
+    pub fn import_invitation(
+        &mut self,
+        invite: &Invitation,
+        ca_ref: Option<&str>,
+        public_ref: Option<&str>,
+    ) -> Result<(), &'static str> {
+        let result = self.try_import_invitation(invite, ca_ref, public_ref);
+        if let Err(message) = result {
+            self.error = Some(message.to_owned());
+        }
+        result
+    }
+
+    fn try_import_invitation(
+        &mut self,
+        invite: &Invitation,
+        ca_ref: Option<&str>,
+        public_ref: Option<&str>,
+    ) -> Result<(), &'static str> {
+        if self.role != Role::Client || self.editing || self.dirty() || self.issued.is_some() {
+            return Err("Finish or discard all changes before importing");
+        }
+        let Config::Client(document) = &self.draft else {
+            return Err("Client config required");
+        };
+        if document.client.profiles.iter().any(|p| p.id == invite.id) {
+            return Err("An existing profile ID cannot be overwritten");
+        }
+        let ca = client_import::checked_ca_ref(ca_ref)
+            .map_err(|_| "Explicit TLS CA reference is invalid or unreadable")?;
+        // Only a NEW secret is ever written. A secretless public invitation
+        // demands a separately supplied env: reference, never a default.
+        let mut secret = if let Some(bytes) = invite.token_bytes() {
+            let token = Zeroizing::new(bytes);
+            Some(
+                PrivateBearer::create(&self.path, &token)
+                    .map_err(|_| "Cannot create protected bearer credential")?,
+            )
+        } else {
+            None
+        };
+        let credential = match secret.as_ref() {
+            Some(saved) => saved
+                .reference()
+                .map_err(|_| "Cannot build protected bearer reference")?,
+            None => {
+                let supplied = public_ref.ok_or("Public invite requires explicit env: credential")?;
+                if !client_import::valid_explicit_reference(supplied) {
+                    return Err("Public invite requires a valid explicit env: reference");
+                }
+                supplied.to_owned()
+            }
+        };
+        let profile = invite
+            .to_profile(&credential, ca)
+            .map_err(|_| "Invalid imported client profile")?;
+        let has_trust = profile.tls_ca.is_some();
+        let mut candidate = self.draft.clone();
+        let Config::Client(candidate_doc) = &mut candidate else {
+            return Err("Client config required");
+        };
+        candidate_doc.client.profiles.push(profile);
+        candidate
+            .validate()
+            .map_err(|_| "Imported profile did not pass full document validation")?;
+        let bytes = candidate
+            .to_toml()
+            .map_err(|_| "Imported profile could not be serialized")?
+            .into_bytes();
+        self.draft = candidate;
+        if !self.save() {
+            // fsync(parent) can fail *after* atomic rename. Inspect the exact
+            // serialized bytes; if the new document is present, KEEP the
+            // credential instead of creating a broken TOML file reference.
+            if read_bounded(&self.path)
+                .is_ok_and(|on_disk| on_disk == bytes)
+            {
+                if let Some(saved) = secret.as_mut() {
+                    saved.commit();
+                }
+                self.source = bytes;
+                self.original = self.draft.clone();
+                self.notice = "Точное состояние записи неизвестно: проверьте файл, не подключайтесь.";
+                return Err("TOML replacement may have completed; verify before using");
+            }
+            self.discard();
+            return Err("Imported profile was not saved; guarded rollback completed");
+        }
+        if let Some(saved) = secret.as_mut() {
+            saved.commit();
+        }
+        let Config::Client(updated) = &self.draft else {
+            return Err("Client config required");
+        };
+        self.selected_record = updated.client.profiles.len() - 1;
+        self.error = None;
+        self.notice = if has_trust {
+            "Профиль импортирован. TLS trust выбран, но соединение НЕ проверено и НЕ запущено."
+        } else {
+            "Профиль импортирован БЕЗ CA; запуск заблокирован до отдельного TLS trust."
+        };
+        Ok(())
     }
 
     /// Issue a new user with a cryptographically random 32-byte bearer.
