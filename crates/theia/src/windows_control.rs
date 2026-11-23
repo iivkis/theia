@@ -303,6 +303,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_pipe_kernel_dacl_contains_only_current_sid_and_system() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Security::{
+                Authorization::{
+                    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
+                    SE_KERNEL_OBJECT,
+                },
+                DACL_SECURITY_INFORMATION,
+            },
+        };
+        let pipe = WindowsServer::bind(&id(), 1).unwrap();
+        let mut security: *mut c_void = null_mut();
+        // SAFETY: owned live server kernel handle and valid output pointer.
+        let result = unsafe {
+            GetSecurityInfo(
+                pipe.current.as_raw_handle() as _,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut security,
+            )
+        };
+        assert_eq!(result, 0, "must inspect the actual NT object ACL");
+        let _security = Descriptor(security);
+        let mut text: *mut u16 = null_mut();
+        // SAFETY: descriptor is live and obtained directly from the pipe.
+        assert_ne!(
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    security,
+                    1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        let mut length = 0usize;
+        // SAFETY: ConvertSecurityDescriptor... returns NUL-terminated LocalAlloc UTF16.
+        while length < 1024 && unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        assert!(length < 1024);
+        // SAFETY: allocation remains valid until LocalFree below.
+        let observed = String::from_utf16(unsafe {
+            std::slice::from_raw_parts(text, length)
+        }).unwrap();
+        // SAFETY: free exactly the text allocated by the NT converter.
+        unsafe { LocalFree(text.cast()) };
+        let sid = current_user_sid().unwrap();
+        assert!(observed.starts_with("D:P"), "DACL must block inheritance");
+        assert!(observed.contains(&format!(";;;{sid})")));
+        assert!(observed.contains(";;;SY)"));
+        assert_eq!(observed.matches("(A;").count(), 2, "exactly two allow ACEs");
+        for banned in [";;;WD)", ";;;AN)", ";;;AU)", ";;;BU)", ";;;BA)"] {
+            assert!(!observed.contains(banned), "default Everyone/anonymous/broad ACL leaked");
+        }
+    }
+
+    #[tokio::test]
     async fn private_named_pipe_is_first_instance_and_standalone_has_no_apply() {
         let id = id();
         let server = WindowsServer::bind(&id, 2).unwrap();
