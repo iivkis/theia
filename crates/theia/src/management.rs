@@ -290,19 +290,6 @@ impl Drop for StatusServer {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) async fn handle<S>(
-    stream: S,
-    inbounds: usize,
-    preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
-    live: Option<Arc<crate::live_auth::LiveAuthorization>>,
-) -> Result<(), ManagementError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    handle_internal(stream, inbounds, preflight, live, None, None).await
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) async fn handle_internal<S>(
     mut stream: S,
     mut inbounds: usize,
