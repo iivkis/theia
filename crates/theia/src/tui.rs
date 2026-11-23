@@ -1514,6 +1514,102 @@ mod tests {
     }
 
     #[test]
+    fn rotation_modal_confirms_global_change_and_hides_new_secret_until_saved() {
+        use crate::config::{self, Config};
+        use crate::invite::Invitation;
+        use sha2::{Digest, Sha256};
+        use std::{fs, thread, time::Instant};
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b2b1-rotate-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.update(&mut model, press(KeyCode::Char('t')));
+        assert!(matches!(ui.issuance, Some(IssueFlow::Input(_))));
+        for ch in "device-a".chars() {
+            ui.update(&mut model, press(KeyCode::Char(ch)));
+        }
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.issuance, Some(IssueFlow::Confirm(_))));
+        let review = rendered_interaction(120, 40, &model, &ui);
+        assert!(review.contains("всех inbound"));
+        assert!(review.contains("CAS Apply"));
+        assert!(!review.contains("theia://v1/"));
+        let Config::Server(before) = config::read_file(&path).unwrap() else {
+            panic!("server");
+        };
+        let old_hash = before.server.users[0].token_sha256.clone();
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        assert!(ui.saving.is_some());
+        let start = Instant::now();
+        while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ui.saving.is_none());
+        assert!(matches!(ui.issuance, Some(IssueFlow::Offer)));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        let Config::Server(after) = config::read_file(&path).unwrap() else {
+            panic!("server");
+        };
+        assert_ne!(after.server.users[0].token_sha256, old_hash);
+        assert_eq!(after.server.inbounds[0].allowed_user_ids, before.server.inbounds[0].allowed_user_ids);
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        let IssueFlow::Showing(link) = ui.issuance.as_ref().unwrap() else {
+            panic!("one-time rotation reveal expected");
+        };
+        let token = Invitation::decode(link).unwrap().token_bytes().unwrap();
+        assert_eq!(after.server.users[0].token_sha256, format!("{:x}", Sha256::digest(token)));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.issuance.is_none());
+        assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rotation_shortcut_rejects_client_dirty_and_cancelled_confirmation() {
+        use std::fs;
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b2b1-client-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Char('t')));
+        assert!(ui.issuance.is_none());
+        fs::remove_file(path).unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b2b1-server-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.update(&mut model, press(KeyCode::Char('t')));
+        for ch in "device-a".chars() {
+            ui.update(&mut model, press(KeyCode::Char(ch)));
+        }
+        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Char('n')));
+        assert!(ui.issuance.is_none());
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        ui.editor.as_mut().unwrap().begin();
+        ui.editor.as_mut().unwrap().input = "changed.example.org".into();
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.editor.as_ref().unwrap().dirty());
+        ui.update(&mut model, press(KeyCode::Char('t')));
+        assert!(ui.issuance.is_none());
+        assert!(!ui.editor.as_ref().unwrap().issued_ready());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn explicit_disable_user_is_confirmed_saved_and_never_reveals_credentials() {
         use crate::config::{self, Config};
         use std::{fs, thread, time::Instant};
