@@ -33,6 +33,7 @@ pub enum RestartError {
     InvalidConfig,
     InvalidTlsIdentity,
     PortUnavailable,
+    ProbeBusy,
 }
 
 impl fmt::Display for RestartError {
@@ -41,6 +42,7 @@ impl fmt::Display for RestartError {
             Self::InvalidConfig => f.write_str("restart candidate config invalid"),
             Self::InvalidTlsIdentity => f.write_str("restart candidate TLS identity invalid"),
             Self::PortUnavailable => f.write_str("candidate TCP or UDP listener cannot be bound"),
+            Self::ProbeBusy => f.write_str("another restart readiness probe is still running"),
         }
     }
 }
