@@ -88,7 +88,7 @@ applications → local HTTP/SOCKS → SmartTheia over HTTP/3 (QUIC + BBR)
 
 ## M4.2b1a: общий снимок авторизации H2/H3 (без применения)
 
-Все работающие H2/H3 server inbounds теперь читают пользователей и inbound grants из **одного immutable revisioned snapshot**. Внутренняя двухфазная подготовка/CAS-публикация допускает только совместимые изменения token digests/disabled/grants у тех же пользователей и проверяет ревизию; stale, foreign, некорректные и требующие рестарта изменения отклоняются. Ранее принятые сессии сохраняют свои разрешения/лимиты, обновление не пересоздаёт semaphore quotas. **Это только фундамент**: `reload --check` остаётся read-only; отсутствует внешний безопасный Apply, revision в CLI, TLS/file revalidation при commit, rollback с receipt и Windows IPC. [ADR-0040](docs/adr/0040-m4-2b1a-shared-cas-auth-snapshot.md).
+Все работающие H2/H3 server inbounds теперь читают пользователей и inbound grants из **одного immutable revisioned snapshot**. Внутренняя двухфазная подготовка/CAS-публикация допускает только совместимые изменения token digests/disabled/grants у тех же пользователей и проверяет ревизию; stale, foreign, некорректные и требующие рестарта изменения отклоняются. Ранее принятые сессии сохраняют свои разрешения/лимиты, обновление не пересоздаёт semaphore quotas. **В исходном M4.2b1a это был только фундамент**: внешний Apply ещё отсутствовал. В M4.2b1b добавлен явный Linux auth-only CAS Apply и revision в CLI; `reload --check` остаётся read-only, Windows IPC и TUI Apply ещё отсутствуют. [ADR-0040](docs/adr/0040-m4-2b1a-shared-cas-auth-snapshot.md).
 
 ## M4.2b0: проверка конфигурации без перезагрузки
 
