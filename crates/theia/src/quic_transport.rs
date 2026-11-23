@@ -72,6 +72,18 @@ pub fn server_endpoint(
     certificates: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<Endpoint, QuicError> {
+    let config = server_config(certificates, key)?;
+    Endpoint::server(config, bind).map_err(|_| QuicError::Bind)
+}
+
+/// Build a complete QUIC TLS1.3/h3/BBR server configuration *without* owning
+/// a UDP socket. A running Endpoint may replace its server config for NEW
+/// connections while existing QUIC transport connections remain attached to
+/// their already-negotiated identity.
+pub(crate) fn server_config(
+    certificates: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<quinn::ServerConfig, QuicError> {
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -86,7 +98,7 @@ pub fn server_endpoint(
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(transport_config());
     config.migration(false);
-    Endpoint::server(config, bind).map_err(|_| QuicError::Bind)
+    Ok(config)
 }
 
 pub fn client_endpoint(bind: SocketAddr, roots: RootCertStore) -> Result<Endpoint, QuicError> {
