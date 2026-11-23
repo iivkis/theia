@@ -1,3 +1,7 @@
+### M4.3 F-07: Windows system proxy safety boundary (CLI opt-in; TUI apply not yet wired)
+
+The current client TUI does **not** enable WinINet. Editing TOML \`system_proxy = "manual"\` is not an action. A separate Windows client process \`theia client run --config FILE --system-proxy --confirm\` explicitly opts into applying the current-user WinINet default LAN HTTP(S) proxy, **only after** both loopback listener binds and independent TLS/credential checks. A durable protected HKCU recovery journal and user-SID mutex guard ownership. Normal Ctrl+C conditionally restores; hard-kill requires another explicit \`client proxy --recover --confirm\` and refuses if Windows settings differ from the owned snapshot. No user-friendly TUI Apply/Restore yet; full M4.3 acceptance remains open. See ADR-0056.
+
 # TUI / UX specification (ratatui)
 
 **M4.2f terminal acceptance:** Отображаемые TUI modal title/status, два шага Ctrl+R → явно отдельное y, n/Esc отказ, revision после Apply, реакция на изменённый извне сохранённый файл и dirty/client/no-config границы теперь проверяются обязательным CI через реальный Linux PTY и Windows ConPTY, а не только unit KeyEvent/TestBackend. Проверка появления надписи успеха сама по себе недостаточна: реальный compiled server status должен показать CAS 1→2. TerminalGuard восстанавливает alternate screen после выхода. Удалённый SSH E2E остаётся отдельным этапом (ADR-0045).

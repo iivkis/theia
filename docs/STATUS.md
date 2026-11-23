@@ -24,7 +24,7 @@
 - **F-14:** повторная выдача/ротация, безопасный файл/clipboard, клиентский импорт `theia://v1` с защищённым файлом и CA (ADR-0055, PR/CI pending), полная Windows ACL/collision/recovery приёмка и автоматический Linux-server → Windows-client H2/H3 E2E остаются открытыми. `disabled=true` из редактора действует **только после** отдельного auth-only CAS Apply для новых запросов; активные туннели не отзываются.
 - **F-18:** криптографически проверенный REALITY-подобный security mode, anti-probing/replay, безопасный двухшаговый picker/Apply и cross-host security evidence не реализованы. `TlsEvidence`/score не доказывают DPI-невидимость и не авторизуют активные сетевые проверки.
 - **F-19:** flow-shaping, независимый TLS-in-TLS classifier, benchmark thresholds и измеренное улучшение не реализованы.
-- **M4.3:** Windows WinINet snapshot/confirm/apply/CAS restore и crash recovery не реализованы. Нельзя включать системный прокси автоматически.
+- **M4.3:** Windows F-07 native WinINet per-user snapshot, explicitly confirmed client process opt-in, SID mutex, guarded CAS restore and durable HKCU recovery journal реализуются в PR #82 / ADR-0056 (CI pending). Это **не** автоматический system proxy: обычный client run остаётся off. Нативный Windows тест теперь включает отдельный процесс с аварийным завершением без Drop, отказ после чужого WinINet edit и восстановление исходного snapshot (финальный exact-head CI ещё проверяется). Policy/VPN compatibility, TUI-интеграция и тесты на выделенном долговременном Windows профиле остаются релизными блокерами.
 - **M5:** стабильная release CI/benchmark/security acceptance, full BBR throughput/RTT/fairness/CPU/RSS и P0 end-to-end ещё открыты.
 
 ## Что нельзя удалять при уборке
