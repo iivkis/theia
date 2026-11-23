@@ -414,7 +414,6 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
     .expect("native supervised H2/H3 cutover must finish without hanging");
 }
 
-
 /// M4.2i: rotate strict TLS1.3 identity on the SAME H2/TCP and H3/QUIC
 /// ports without rebinding either listener or aborting authenticated tunnels.
 /// The revision must advance only after both fresh TLS configs are staged.
@@ -512,7 +511,9 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
                 assert!(server.0.try_wait().unwrap().is_none(), "server exited");
                 sleep(Duration::from_millis(35)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo.local_addr().unwrap().port();
         let echo_task = tokio::spawn(async move {
@@ -525,14 +526,16 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             &format!("127.0.0.1:{tcp_port}"),
             "localhost",
             &credential(0x42),
-            roots.clone()
-        ).unwrap();
+            roots.clone(),
+        )
+        .unwrap();
         let previous_h3 = H3Client::new(
             format!("127.0.0.1:{udp_port}").parse().unwrap(),
             "localhost",
             &credential(0x42),
             roots.clone(),
-        ).unwrap();
+        )
+        .unwrap();
         let h2_tunnel = previous_h2.open(address.clone(), echo_port).await.unwrap();
         let h3_tunnel = previous_h3.open(address.clone(), echo_port).await.unwrap();
 
@@ -579,13 +582,15 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             "localhost",
             &credential(0x42),
             new_roots.clone(),
-        ).unwrap();
+        )
+        .unwrap();
         let new_h3 = H3Client::new(
             format!("127.0.0.1:{udp_port}").parse().unwrap(),
             "localhost",
             &credential(0x42),
             new_roots,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(new_h2.open(address.clone(), echo_port).await.is_ok());
         assert!(new_h3.open(address.clone(), echo_port).await.is_ok());
 
@@ -597,10 +602,20 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             let (mut app, local) = tokio::io::duplex(256);
             let relay = if old == 0 {
                 let tunnel = h2_open.take().unwrap();
-                tokio::spawn(async move { tunnel.relay(local).await.map_err(|error| format!("{error}")) })
+                tokio::spawn(async move {
+                    tunnel
+                        .relay(local)
+                        .await
+                        .map_err(|error| format!("{error}"))
+                })
             } else {
                 let tunnel = h3_open.take().unwrap();
-                tokio::spawn(async move { tunnel.relay(local).await.map_err(|error| format!("{error}")) })
+                tokio::spawn(async move {
+                    tunnel
+                        .relay(local)
+                        .await
+                        .map_err(|error| format!("{error}"))
+                })
             };
             app.write_all(b"still-live").await.unwrap();
             let mut response = [0u8; 10];
@@ -626,5 +641,7 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
         );
         assert!(revision(env_key, &endpoint, 3));
         echo_task.abort();
-    }).await.expect("native H2+H3 same-port TLS identity rotation must complete");
+    })
+    .await
+    .expect("native H2+H3 same-port TLS identity rotation must complete");
 }
