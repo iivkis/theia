@@ -37,6 +37,7 @@ mandatory = {
     "specification",
     "rust-tests",
     "windows-smoke",
+    "f14-cross-host",
     "browser-e2e",
     "m0-1-api-spike",
     "m0-1-windows-spike",
@@ -56,6 +57,29 @@ for name in ("windows-smoke", "browser-e2e"):
         f"{name} must retain the Rust readiness precondition",
     )
 require(needs("ci-gate") == mandatory, "ci-gate must depend on EVERY required job")
+require(needs("f14-cross-host") == {"specification", "rust-tests", "windows-smoke"},
+        "F-14 must consume verified Linux and Windows CI-built executable artifacts")
+cross_host = job("f14-cross-host")
+require("runs-on: windows-2025" in cross_host and "wsl-version: 2" in cross_host,
+        "F-14 must connect native Windows client to real Linux WSL2 VM")
+require("name: f14-linux-server" in cross_host and "name: f14-windows-compiled" in cross_host,
+        "F-14 must consume both native OS binaries, never build on WSL runner")
+require("scripts/f14-cross-os-ci.py" in cross_host
+        and "--windows-client" in cross_host and "--windows-test" in cross_host
+        and "cargo build" not in cross_host,
+        "F-14 must execute prebuilt native Windows harness without duplicate compilation")
+require("Build genuine Linux server for Windows cross-OS F-14 E2E" in job("rust-tests")
+        and "actions/upload-artifact@v4" in job("rust-tests"),
+        "Linux Theia ELF must originate from mandatory Linux native build")
+require("Stage Windows E2E binaries from Cargo JSON artifact paths" in job("windows-smoke")
+        and "cargo build --workspace --locked --bin theia --message-format=json" in job("windows-smoke")
+        and "name: f14-windows-compiled" in job("windows-smoke"),
+        "Windows Theia and test harness must originate from mandatory Windows smoke")
+require("python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'" in job("specification"),
+        "cheap F-14 WSL guest IP regression must precede expensive Rust builds")
+require("continue-on-error" not in cross_host and "|| true" not in cross_host,
+        "F-14 cross-OS acceptance cannot be made optional")
+
 gate = job("ci-gate")
 require("always()" in gate, "ci-gate must execute even when mandatory jobs fail")
 require('results.get(name, {}).get("result") != "success"' in gate,
@@ -109,7 +133,7 @@ require("gofmt -w" in spec and "scripts/ci-format.py" in spec,
         "Go helpers must be formatted and the bounded artifact packaged")
 require("name: ci-formatted-source" in spec and "actions/upload-artifact@v4" in spec,
         "specification must publish the canonical source artifact")
-for name in mandatory - {"specification"}:
+for name in mandatory - {"specification", "f14-cross-host"}:
     payload = job(name)
     require("actions/download-artifact@v4" in payload
             and "name: ci-formatted-source" in payload
