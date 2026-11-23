@@ -52,6 +52,7 @@ pub enum Command {
     ServerRun { config: String },
     ServerStatus,
     ServerCheckReload,
+    ServerApplyReload { expected_revision: u64 },
     ClientRun { config: String },
     ConfigValidate { config: String },
 }
@@ -142,6 +143,13 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         }),
         ["server", "status"] => Ok(Command::ServerStatus),
         ["server", "reload", "--check"] => Ok(Command::ServerCheckReload),
+        ["server", "reload", "--expected-revision", raw] => {
+            if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(CliError::InvalidArguments);
+            }
+            let expected_revision = raw.parse::<u64>().map_err(|_| CliError::InvalidArguments)?;
+            Ok(Command::ServerApplyReload { expected_revision })
+        }
         ["server", "run", "--config", path] => Ok(Command::ServerRun {
             config: config_path(path)?,
         }),
@@ -187,7 +195,9 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
         Command::Version => Ok(concat!("theia ", env!("CARGO_PKG_VERSION"))),
         Command::Tui { .. } | Command::TuiEdit { .. } => Err(CliError::NotImplemented("TUI")),
         Command::ServerRun { .. } => Err(CliError::NotImplemented("server runtime")),
-        Command::ServerStatus | Command::ServerCheckReload => Err(CliError::NotImplemented("async management preflight")),
+        Command::ServerStatus | Command::ServerCheckReload | Command::ServerApplyReload { .. } => {
+            Err(CliError::NotImplemented("async management IPC"))
+        },
         Command::ClientRun { .. } => Err(CliError::NotImplemented("client runtime")),
         Command::ConfigValidate { config } => {
             config::read_file(Path::new(&config)).map_err(CliError::Config)?;
@@ -275,6 +285,16 @@ mod tests {
             command(&["server", "reload", "--check"]),
             Ok(Command::ServerCheckReload)
         );
+        assert_eq!(
+            command(&["server", "reload", "--expected-revision", "1"]),
+            Ok(Command::ServerApplyReload { expected_revision: 1 })
+        );
+        for invalid in ["0", "01", "-1", "+1", "1x", "18446744073709551616"] {
+            assert_eq!(
+                command(&["server", "reload", "--expected-revision", invalid]),
+                Err(CliError::InvalidArguments)
+            );
+        }
         assert_eq!(
             command(&["server", "reload"]),
             Err(CliError::InvalidArguments)
