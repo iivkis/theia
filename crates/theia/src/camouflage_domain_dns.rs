@@ -27,6 +27,8 @@ pub enum DnsError {
     NotApproved,
     NotCatalogued,
     TimedOut,
+    /// DNS reply reached the UI after its 60-second freshness window.
+    StaleObservation,
     LookupFailed,
     NoPublicAddresses,
     UnsafeAddress,
