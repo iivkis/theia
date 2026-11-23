@@ -141,8 +141,8 @@ async fn fake_unsupported_reply_cannot_masquerade_as_running_status() {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0u8; 7];
         stream.read_exact(&mut request).await.unwrap();
-        assert_eq!(&request, b"status\\n");
-        stream.write_all(b"ERR unsupported\\n").await.unwrap();
+        assert_eq!(&request, b"status\n");
+        stream.write_all(b"ERR unsupported\n").await.unwrap();
     });
     assert_eq!(
         query_in(&dir, StatusCommand::Status).await,
