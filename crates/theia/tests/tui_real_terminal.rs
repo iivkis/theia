@@ -12,7 +12,9 @@ use std::{
     process::{Child, Command, Stdio},
     time::Duration,
 };
-use theia::config::{Config, Inbound, Management, ServerDocument, ServerPolicy, ServerSettings, Ui, User};
+use theia::config::{
+    Config, Inbound, Management, ServerDocument, ServerPolicy, ServerSettings, Ui, User,
+};
 use tokio::time::{sleep, timeout};
 
 struct Running(Child);
@@ -25,9 +27,17 @@ impl Drop for Running {
 
 fn free_port(tcp: bool) -> u16 {
     if tcp {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     } else {
-        UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 }
 
@@ -58,9 +68,13 @@ async fn drive_terminal(
     scenario: &str,
     revision: u64,
 ) {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../scripts/tui-real-terminal-e2e.py");
-    let interpreter = if cfg!(target_os = "windows") { "python" } else { "python3" };
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tui-real-terminal-e2e.py");
+    let interpreter = if cfg!(target_os = "windows") {
+        "python"
+    } else {
+        "python3"
+    };
     let binary = binary.to_owned();
     let env_key = env_key.to_owned();
     let endpoint = endpoint.to_owned();
@@ -71,10 +85,14 @@ async fn drive_terminal(
         tokio::task::spawn_blocking(move || {
             Command::new(interpreter)
                 .arg(script)
-                .arg("--binary").arg(binary)
-                .arg("--config").arg(config)
-                .arg("--scenario").arg(&scenario)
-                .arg("--revision").arg(revision.to_string())
+                .arg("--binary")
+                .arg(binary)
+                .arg("--config")
+                .arg(config)
+                .arg("--scenario")
+                .arg(&scenario)
+                .arg("--revision")
+                .arg(revision.to_string())
                 .env(&env_key, endpoint)
                 .output()
         }),
@@ -89,10 +107,8 @@ async fn drive_terminal(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains(&format!("REAL_TUI_PTY_E2E_OK: {scenario}"))
-    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains(&format!("REAL_TUI_PTY_E2E_OK: {scenario}")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -118,12 +134,20 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     fs::write(
         &cert_path,
-        format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", STANDARD.encode(generated.cert.der())),
-    ).unwrap();
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            STANDARD.encode(generated.cert.der())
+        ),
+    )
+    .unwrap();
     fs::write(
         &key_path,
-        format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", STANDARD.encode(generated.key_pair.serialize_der())),
-    ).unwrap();
+        format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            STANDARD.encode(generated.key_pair.serialize_der())
+        ),
+    )
+    .unwrap();
     let tcp = free_port(true);
     let udp = free_port(false);
     let mut doc = ServerDocument {
@@ -151,8 +175,13 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
                 connect_timeout_ms: 1500,
             },
         },
-        management: Management { ipc: "auto".into(), log_level: "info".into() },
-        ui: Ui { language: "ru".into() },
+        management: Management {
+            ipc: "auto".into(),
+            log_level: "info".into(),
+        },
+        ui: Ui {
+            language: "ru".into(),
+        },
     };
     save(&server_file, &doc);
     let binary = env!("CARGO_BIN_EXE_theia");
@@ -179,28 +208,52 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
             if cli_status(binary, env_key, &endpoint, 1) {
                 break;
             }
-            assert!(running.0.try_wait().unwrap().is_none(), "server exited before IPC");
+            assert!(
+                running.0.try_wait().unwrap().is_none(),
+                "server exited before IPC"
+            );
             sleep(Duration::from_millis(40)).await;
         }
-    }).await.expect("real server revision 1 must become available");
+    })
+    .await
+    .expect("real server revision 1 must become available");
     // The TUI loads an auth-only updated TOML. Ctrl+R is only a preview until y.
     doc.server.users[0].token_sha256 = digest(0x43);
     save(&server_file, &doc);
     drive_terminal(binary, env_key, &endpoint, &server_file, "apply", 1).await;
-    assert!(cli_status(binary, env_key, &endpoint, 2), "TUI y must really CAS publish");
+    assert!(
+        cli_status(binary, env_key, &endpoint, 2),
+        "TUI y must really CAS publish"
+    );
     // Modify TOML on disk AFTER TUI read, to fail exact saved-content digest.
     drive_terminal(binary, env_key, &endpoint, &server_file, "reject", 2).await;
-    assert!(cli_status(binary, env_key, &endpoint, 2), "external TOML edit must fail closed");
+    assert!(
+        cli_status(binary, env_key, &endpoint, 2),
+        "external TOML edit must fail closed"
+    );
     drive_terminal(binary, env_key, &endpoint, &server_file, "dirty", 2).await;
-    assert!(cli_status(binary, env_key, &endpoint, 2), "dirty draft must never apply");
+    assert!(
+        cli_status(binary, env_key, &endpoint, 2),
+        "dirty draft must never apply"
+    );
     drive_terminal(binary, env_key, &endpoint, &server_file, "readonly", 2).await;
-    assert!(cli_status(binary, env_key, &endpoint, 2), "status-only must never apply");
+    assert!(
+        cli_status(binary, env_key, &endpoint, 2),
+        "status-only must never apply"
+    );
     drive_terminal(
-        binary, env_key, &endpoint,
+        binary,
+        env_key,
+        &endpoint,
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/client.toml"),
-        "client", 2
-    ).await;
-    assert!(cli_status(binary, env_key, &endpoint, 2), "client TUI must never apply");
+        "client",
+        2,
+    )
+    .await;
+    assert!(
+        cli_status(binary, env_key, &endpoint, 2),
+        "client TUI must never apply"
+    );
     drop(running);
 }
 
