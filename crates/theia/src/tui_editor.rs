@@ -142,6 +142,59 @@ impl Editor {
         Ok(())
     }
 
+    /// M4.4b2a: disable an existing bearer without attempting to recover
+    /// or rotate its secret. The selected inbound must explicitly grant this
+    /// user; the confirmation UI warns that disable is global to all inbounds.
+    /// This changes only the local draft, never the running server.
+    pub fn disable_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+        let result = self.try_disable_user(user_id);
+        if let Err(message) = result {
+            self.error = Some(message.to_owned());
+        }
+        result
+    }
+
+    fn try_disable_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+        if self.role != Role::Server || self.editing || self.dirty() || self.issued.is_some() {
+            return Err("Finish or discard edits and pending issuance first");
+        }
+        let Config::Server(doc) = &self.draft else {
+            return Err("Server configuration required");
+        };
+        let Some(inbound) = doc.server.inbounds.get(self.selected_record) else {
+            return Err("Inbound missing");
+        };
+        if !inbound.allowed_user_ids.iter().any(|id| id == user_id) {
+            return Err("User is not granted on the selected inbound");
+        }
+        let Some(user) = doc.server.users.iter().find(|user| user.id == user_id) else {
+            return Err("User does not exist");
+        };
+        if user.disabled {
+            return Err("User is already disabled");
+        }
+        let mut candidate = self.draft.clone();
+        let Config::Server(candidate_doc) = &mut candidate else {
+            return Err("Server configuration required");
+        };
+        let Some(user) = candidate_doc
+            .server
+            .users
+            .iter_mut()
+            .find(|user| user.id == user_id)
+        else {
+            return Err("User does not exist");
+        };
+        user.disabled = true;
+        candidate
+            .validate()
+            .map_err(|_| "Disabled user did not pass configuration validation")?;
+        self.draft = candidate;
+        self.error = None;
+        self.notice = "Пользователь отключён в черновике. Сохранение не обновляет runtime.";
+        Ok(())
+    }
+
     pub fn issued_ready(&self) -> bool {
         self.issued.is_some() && self.issued_ready && !self.dirty()
     }
