@@ -440,9 +440,9 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
     };
     timeout(Duration::from_secs(40), async {
         let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
-        let directory = TestDirectory(std::env::temp_dir().join(format!(
-            "theia-f14-import-ci-{}", std::process::id()
-        )));
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("theia-f14-import-ci-{}", std::process::id())),
+        );
         std::fs::create_dir(&directory.0).unwrap();
         let ca_path = directory.0.join("ca.pem");
         std::fs::write(&ca_path, pem).unwrap();
@@ -450,13 +450,13 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         let config_path = directory.0.join("client.toml");
         std::fs::write(&config_path, include_str!("../../../examples/client.toml")).unwrap();
 
-        let Config::Server(mut source) = config::parse(
-            &include_str!("../../../examples/server.toml").replace(
+        let Config::Server(mut source) =
+            config::parse(&include_str!("../../../examples/server.toml").replace(
                 "REPLACE_WITH_64_LOWERCASE_HEX",
                 &format!("{:x}", Sha256::digest(TOKEN)),
-            ),
-        )
-        .unwrap() else {
+            ))
+            .unwrap()
+        else {
             panic!("server");
         };
         let endpoint_port = endpoint.rsplit(':').next().unwrap().parse::<u16>().unwrap();
@@ -484,7 +484,9 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         assert_eq!(client.client.profiles.len(), 2);
         let imported = &client.client.profiles[1];
         assert_eq!(imported.auth_token.starts_with("file:"), true);
-        assert!(!std::fs::read_to_string(&config_path).unwrap().contains(&token()));
+        assert!(!std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(&token()));
         assert_eq!(imported.server, endpoint);
         assert_eq!(imported.tls_ca.as_deref(), Some(ca_ref.as_str()));
 
@@ -510,7 +512,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .unwrap()
+                .unwrap(),
         );
         wait_for_proxy(http_addr, &mut binary).await;
         wait_for_proxy(socks_addr, &mut binary).await;
@@ -527,10 +529,13 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         });
 
         let mut http_proxy = TcpStream::connect(http_addr).await.unwrap();
-        http_proxy.write_all(
-            format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
-                .as_bytes()
-        ).await.unwrap();
+        http_proxy
+            .write_all(
+                format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             response_head(&mut http_proxy).await,
             "HTTP/1.1 200 Connection Established\r\n\r\n"
