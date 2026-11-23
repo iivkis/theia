@@ -26,6 +26,10 @@ Linux Unix domain socket из ADR-0038/0041/0042 защищён filesystem owner
 - Native Windows cargo test full workspace/Clippy and actual compiled server with private named pipe + TLS/H2 and QUIC/H3 loopback. `status` показывает revision=1, check read-only; wrong bound SHA fails без revision change; exact SHA+CAS -> revision 2 на обоих transport, old auth denied/new accepted while already established relays work; stale revision, modified policy or PEM drift rejected; second CLI CAS Apply -> disabled user and revision=3.
 - Native Windows unit: SID from process token, endpoint rejects path injection/invalid ID, duplicate first-instance fails, **kernel** GetSecurityInfo reports only current SID+SYSTEM DACL. Standalone server without live config does not Apply. Linux regression unchanged. Full Windows/Linux browser E2E, BoringSSL, BBR, uTLS and exact-head ci-gate must pass before review-ready.
 
+## Последующая проверка M4.2e
+
+Отдельный обязательный CI-only cross-logon E2E по ADR-0044 проверяет открытие реального именованного канала под другим непривилегированным SID, вместе с test-only положительным контролем. Статус результата устанавливается только после CI на точном SHA; это не меняет production API и не доказывает защиту от администратора или SYSTEM.
+
 ## Дальше
 
 Windows cross-logon deny E2E via a second restricted OS identity, Windows PTY/SSH TUI automation and controlled restart wizard for TLS/listeners/quota. Стадии не подменяют невыполненные P0 F18/F19 или production security audit.
