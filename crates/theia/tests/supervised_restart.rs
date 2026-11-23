@@ -675,7 +675,6 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
     .expect("native H2+H3 same-port TLS identity rotation must complete");
 }
 
-
 fn quota_apply(env_key: &str, endpoint: &str, expected: u64, sha: &str, succeeds: bool) {
     let output = cli(
         env_key,
@@ -871,7 +870,10 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
                 .map_or(true, |attempt| attempt.is_err()),
             "H3 admission must fail while existing occupancy exceeds cap"
         );
-        assert!(server.0.try_wait().unwrap().is_none(), "quota shrink stopped server");
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "quota shrink stopped server"
+        );
         assert!(revision(env_key, &endpoint, 2));
 
         // Growth beyond the ORIGINAL cap of 2 must use the same ledger,
