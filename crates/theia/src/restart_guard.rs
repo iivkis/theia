@@ -51,7 +51,7 @@ impl std::error::Error for RestartError {}
 /// Conservative overlap policy. A wildcard listener may occupy both the
 /// explicit address and, on some platforms, a dual-stack IPv4/IPv6 bind.
 /// False positives only request maintenance, never an unsafe cutover.
-fn conflicts_with_active(old: SocketAddr, candidate: SocketAddr) -> bool {
+pub(crate) fn conflicts_with_active(old: SocketAddr, candidate: SocketAddr) -> bool {
     old.port() == candidate.port()
         && (old.ip() == candidate.ip()
             || old.ip().is_unspecified()
@@ -163,6 +163,25 @@ pub(crate) fn probe(
     drop(udp_probes);
     drop(tcp_probes);
     Ok(RestartVerdict::FreshPortsBindable)
+}
+
+/// First supervised-cutover slice must reuse the SAME global/per-user
+/// semaphores for both generations until bounded drain finishes. Changing
+/// quota or user inventory would silently double admission and is forbidden.
+/// This check does not publish, bind listeners or stop any old session.
+pub(crate) fn same_shared_limits(
+    active: &ServerDocument,
+    candidate: &ServerDocument,
+) -> bool {
+    if active.server.policy != candidate.server.policy
+        || active.management != candidate.management
+        || active.schema_version != candidate.schema_version
+    {
+        return false;
+    }
+    let before: HashSet<_> = active.server.users.iter().map(|u| u.id.as_str()).collect();
+    let after: HashSet<_> = candidate.server.users.iter().map(|u| u.id.as_str()).collect();
+    before == after
 }
 
 #[cfg(test)]
