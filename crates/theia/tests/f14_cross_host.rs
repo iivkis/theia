@@ -123,16 +123,25 @@ async fn socks5_connect(proxy: SocketAddr, origin: u16, successful: bool) {
     assert_eq!(echoed, payload, "cross-OS SOCKS5 relay corrupted data");
 }
 
-async fn client_scenario(
-    source: &Config,
-    endpoint: &str,
-    token: &[u8; 32],
-    ca: &Path,
+struct CrossOsFixture<'a> {
+    source: &'a Config,
+    endpoint: &'a str,
+    token: &'a [u8; 32],
+    ca: &'a Path,
     origin: u16,
+}
+
+async fn client_scenario(
+    fixture: &CrossOsFixture<'_>,
     transport: Transport,
     invalid_token: bool,
     invalid_ca: bool,
 ) {
+    let source = fixture.source;
+    let endpoint = fixture.endpoint;
+    let token = fixture.token;
+    let ca = fixture.ca;
+    let origin = fixture.origin;
     let label = format!(
         "{}-{}-{}",
         match transport {
@@ -242,40 +251,17 @@ async fn linux_server_windows_client_f14_h2_h3_open_ok() {
             .try_into()
             .unwrap();
         let config = config::read_file(Path::new(&server_config)).unwrap();
+        let fixture = CrossOsFixture {
+            source: &config,
+            endpoint: &endpoint,
+            token: &token,
+            ca: &trusted_ca,
+            origin,
+        };
         for transport in [Transport::H2, Transport::H3] {
-            client_scenario(
-                &config,
-                &endpoint,
-                &token,
-                &trusted_ca,
-                origin,
-                transport,
-                false,
-                false,
-            )
-            .await;
-            client_scenario(
-                &config,
-                &endpoint,
-                &token,
-                &trusted_ca,
-                origin,
-                transport,
-                true,
-                false,
-            )
-            .await;
-            client_scenario(
-                &config,
-                &endpoint,
-                &token,
-                &trusted_ca,
-                origin,
-                transport,
-                false,
-                true,
-            )
-            .await;
+            client_scenario(&fixture, transport, false, false).await;
+            client_scenario(&fixture, transport, true, false).await;
+            client_scenario(&fixture, transport, false, true).await;
         }
     })
     .await
