@@ -92,6 +92,10 @@ TLS-in-TLS в расширенных настройках: будущий пер
 
 После явного `THEIA_CONTROL_PIPE=id` действующий Windows-сервер предоставляет тот же status/revision и **подтверждаемый** auth-only CAS Apply, что Linux. TUI в роли server (`--role server --config FILE`) открывает `v` (read-only), `Ctrl+R` показывает ожидаемую running revision, и только отдельное `y` передаёт SHA-256 **сохранённого** TOML. Client TUI, dirty draft, неверная revision, отсутствующий Named Pipe/SID/DACL, incompatible или TLS-drift не должны применять. IPC не затрагивает Windows system proxy; потерянный ACK остаётся indeterminate, требуется status. Системное имя pipe формируется по TokenUser SID, из env принимается только короткий ASCII идентификатор. [ADR-0043](adr/0043-m4-2d-windows-sid-named-pipe.md).
 
+### M4.2i: same-port TLS identity readiness, no TUI Apply
+
+Серверная TUI `Shift+R` теперь показывает отдельное состояние готовности `same-port TLS rotation ready`, если меняется только TLS PEM (не адреса, grants, policy или user roster), и подчёркивает, что это только проверка. Ни `y`, ни `a` не публикуют TLS identity и не перезапускают службу. Подтверждение same-port H2/H3 TLS rotation делается отдельной native CLI командой с expected revision, SHA-256 сохранённого TOML и `--confirm` (ADR-0049). Старые туннели не обрываются. Следует заранее распространить новое доверие CA; TLS handshakes, начатые до CAS, могут сохранить прежний сертификат.
+
 ### M4.2h: explicit CLI-only supervised fresh-port cutover
 
 Серверный CLI поддерживает отдельное подтверждённое `server restart --apply --expected-revision N --sha256 HEX --confirm`, которое действительно переключает H2/H3 listeners на **все новые порты** после prebind и CAS, с сохранением общего quota и ограниченным 20-секундным drain. Это не same-port TLS switch, не hot quota edit и не lossless migration. Server TUI Shift+R по-прежнему **только** проверяет готовность: y/a не выполняют restart, а оператор получает указание использовать CLI и точную SHA-256 сохранённого TOML. При timeout результата Apply повторять по предположению нельзя, необходим повторный status. ADR-0048.

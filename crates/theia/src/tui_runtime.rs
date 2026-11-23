@@ -24,6 +24,7 @@ enum Phase {
     Unavailable,
     RestartChecking,
     RestartAuthorizationOnly,
+    RestartSamePortTlsReady,
     RestartRequiresMaintenance,
     RestartFreshPortsBindable,
     RestartRejected,
@@ -168,6 +169,7 @@ impl RuntimePanel {
             Phase::RestartChecking => {
                 self.phase = match result {
                     Ok(StatusReply::RestartAuthorizationOnly) => Phase::RestartAuthorizationOnly,
+                    Ok(StatusReply::RestartSamePortTlsReady) => Phase::RestartSamePortTlsReady,
                     Ok(StatusReply::RestartRequiresMaintenance) => {
                         Phase::RestartRequiresMaintenance
                     }
@@ -217,6 +219,7 @@ impl RuntimePanel {
             (Phase::RestartChecking, _) => false,
             (
                 Phase::RestartAuthorizationOnly
+                | Phase::RestartSamePortTlsReady
                 | Phase::RestartRequiresMaintenance
                 | Phase::RestartFreshPortsBindable
                 | Phase::RestartRejected
@@ -267,6 +270,7 @@ impl RuntimePanel {
         match self.phase {
             Phase::RestartChecking
             | Phase::RestartAuthorizationOnly
+            | Phase::RestartSamePortTlsReady
             | Phase::RestartRequiresMaintenance
             | Phase::RestartFreshPortsBindable
             | Phase::RestartRejected
@@ -284,6 +288,7 @@ impl RuntimePanel {
         match self.phase {
             Phase::RestartChecking => "Проверка сохранённого TOML, TLS identity и TCP/UDP в защищённом IPC...\nЭто ТОЛЬКО проверка. Никаких изменений runtime.\nEsc: закрыть".into(),
             Phase::RestartAuthorizationOnly => "Достаточно существующего auth-only CAS Apply; restart не требуется.\nЭтот экран ничего не применяет.\nr: перепроверить | Esc: закрыть".into(),
+            Phase::RestartSamePortTlsReady => "Смена TLS identity на тех же TCP/H3 портах подготовима без закрытия слушателей.\nЭта проверка ничего НЕ применяет, действующие туннели не разрываются.\nТолько операторская CLI: restart --apply --expected-revision N --sha256 HEX --confirm.\nr: перепроверить | Esc: закрыть".into(),
             Phase::RestartRequiresMaintenance => "Для смены listener/TLS/квот нужен контролируемый перерыв: текущий порт не может быть независимо подготовлен.\nСервер работает БЕЗ ИЗМЕНЕНИЙ. НЕ останавливать его на основании этой проверки.\nr: перепроверить | Esc: закрыть".into(),
             Phase::RestartFreshPortsBindable => "Все НОВЫЕ TCP и UDP порты удалось одновременно пробно открыть.\nОни уже освобождены: НЕТ гарантии будущего bind, НЕТ restart, НЕТ rollback.\nСервер работает БЕЗ ИЗМЕНЕНИЙ.\nr: перепроверить | Esc: закрыть".into(),
             Phase::RestartRejected => "Отказ: кандидат TOML, TLS identity или TCP/UDP bind не прошёл проверку.\nСтарые listeners, авторизация и туннели не изменены этой операцией.\nr: перепроверить | Esc: закрыть".into(),
@@ -340,6 +345,10 @@ mod tests {
             (
                 Ok(StatusReply::RestartRequiresMaintenance),
                 Phase::RestartRequiresMaintenance,
+            ),
+            (
+                Ok(StatusReply::RestartSamePortTlsReady),
+                Phase::RestartSamePortTlsReady,
             ),
             (
                 Ok(StatusReply::RestartFreshPortsBindable),

@@ -413,3 +413,264 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
     .await
     .expect("native supervised H2/H3 cutover must finish without hanging");
 }
+
+/// M4.2i: rotate strict TLS1.3 identity on the SAME H2/TCP and H3/QUIC
+/// ports without rebinding either listener or aborting authenticated tunnels.
+/// The revision must advance only after both fresh TLS configs are staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_candidate() {
+    timeout(Duration::from_secs(50), async {
+        let base = std::env::temp_dir().join(format!(
+            "theia-tls-rotate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&base).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _temp = Temp(base.clone());
+        let old_cert = base.join("old-cert.pem");
+        let old_key = base.join("old-key.pem");
+        let next_cert = base.join("new-cert.pem");
+        let next_key = base.join("new-key.pem");
+        let malformed_cert = base.join("broken-cert.pem");
+        let config_path = base.join("server.toml");
+        let old_identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let next_identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        write_identity(&old_cert, &old_key, &old_identity);
+        write_identity(&next_cert, &next_key, &next_identity);
+        fs::write(&malformed_cert, "not a certificate").unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(old_identity.cert.der().clone()).unwrap();
+        roots.add(next_identity.cert.der().clone()).unwrap();
+        let tcp_port = port(true);
+        let udp_port = port(false);
+        let mut document = ServerDocument {
+            schema_version: 1,
+            server: ServerSettings {
+                enabled: true,
+                inbounds: vec![Inbound {
+                    id: "edge".into(),
+                    allowed_user_ids: vec!["device-a".into()],
+                    h2_listen: format!("127.0.0.1:{tcp_port}"),
+                    quic_listen: format!("127.0.0.1:{udp_port}"),
+                    server_name: "localhost".into(),
+                    tls_cert: format!("file:{}", old_cert.display()),
+                    tls_key: format!("file:{}", old_key.display()),
+                }],
+                users: vec![User {
+                    id: "device-a".into(),
+                    token_sha256: digest(0x42),
+                    disabled: false,
+                }],
+                policy: ServerPolicy {
+                    allow_private_ips: true,
+                    max_connections_per_user: 6,
+                    max_connections_total: 16,
+                    connect_timeout_ms: 2000,
+                },
+            },
+            management: Management {
+                ipc: "auto".into(),
+                log_level: "info".into(),
+            },
+            ui: Ui {
+                language: "ru".into(),
+            },
+        };
+        save(&config_path, &document);
+        #[cfg(target_os = "linux")]
+        let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
+        #[cfg(target_os = "windows")]
+        let (env_key, endpoint) = (
+            "THEIA_CONTROL_PIPE",
+            format!("m42i{}{}", std::process::id(), tcp_port),
+        );
+        let mut server = Running(
+            Command::new(env!("CARGO_BIN_EXE_theia"))
+                .args(["server", "run", "--config"])
+                .arg(&config_path)
+                .env(env_key, &endpoint)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        timeout(Duration::from_secs(12), async {
+            loop {
+                if revision(env_key, &endpoint, 1) {
+                    break;
+                }
+                assert!(server.0.try_wait().unwrap().is_none(), "server exited");
+                sleep(Duration::from_millis(35)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = echo.accept().await {
+                tokio::spawn(echo_one(socket));
+            }
+        });
+        let address = Address::V4([127, 0, 0, 1]);
+        let previous_h2 = H2Client::new(
+            &format!("127.0.0.1:{tcp_port}"),
+            "localhost",
+            &credential(0x42),
+            roots.clone(),
+        )
+        .unwrap();
+        let previous_h3 = H3Client::new(
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            "localhost",
+            &credential(0x42),
+            roots.clone(),
+        )
+        .unwrap();
+        let h2_tunnel = previous_h2.open(address.clone(), echo_port).await.unwrap();
+        let h3_tunnel = previous_h3.open(address.clone(), echo_port).await.unwrap();
+
+        let mut candidate = document.clone();
+        candidate.server.inbounds[0].tls_cert = format!("file:{}", next_cert.display());
+        candidate.server.inbounds[0].tls_key = format!("file:{}", next_key.display());
+        let hash = save(&config_path, &candidate);
+        let check = cli(env_key, &endpoint, &["server", "restart", "--check"]);
+        assert!(
+            check.status.success()
+                && String::from_utf8_lossy(&check.stdout).contains("same-port TLS"),
+            "same-port identity rotation must have an explicit ready classification: {}",
+            String::from_utf8_lossy(&check.stdout),
+        );
+        // Candidate content and expected revision must be exact.
+        apply(env_key, &endpoint, 1, &"0".repeat(64), false);
+        assert!(revision(env_key, &endpoint, 1));
+        let mut invalid = candidate.clone();
+        invalid.server.inbounds[0].tls_cert = format!("file:{}", malformed_cert.display());
+        let bad_hash = save(&config_path, &invalid);
+        apply(env_key, &endpoint, 1, &bad_hash, false);
+        assert!(revision(env_key, &endpoint, 1));
+        let mut quota = candidate.clone();
+        quota.server.policy.max_connections_per_user += 1;
+        let quota_hash = save(&config_path, &quota);
+        apply(env_key, &endpoint, 1, &quota_hash, false);
+        assert!(revision(env_key, &endpoint, 1));
+        // Fresh-port path is NOT invoked: both existing TCP and UDP bind
+        // addresses remain the same throughout this confirmed rotation.
+        let real_hash = save(&config_path, &candidate);
+        assert_eq!(real_hash, hash);
+        apply(env_key, &endpoint, 1, &real_hash, true);
+        assert!(revision(env_key, &endpoint, 2));
+        assert!(server.0.try_wait().unwrap().is_none());
+        apply(env_key, &endpoint, 1, &real_hash, false);
+        assert!(revision(env_key, &endpoint, 2));
+
+        // A client trusting ONLY the new CA must see the NEW certificate on
+        // BOTH original TCP and UDP addresses, not a newly bound port.
+        let mut new_roots = RootCertStore::empty();
+        new_roots.add(next_identity.cert.der().clone()).unwrap();
+        let new_h2 = H2Client::new(
+            &format!("127.0.0.1:{tcp_port}"),
+            "localhost",
+            &credential(0x42),
+            new_roots.clone(),
+        )
+        .unwrap();
+        let new_h3 = H3Client::new(
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            "localhost",
+            &credential(0x42),
+            new_roots,
+        )
+        .unwrap();
+        assert!(new_h2.open(address.clone(), echo_port).await.is_ok());
+        assert!(new_h3.open(address.clone(), echo_port).await.is_ok());
+
+        // Previously authenticated streams remain alive across the same-port
+        // TLS swap. This is NEW handshakes-only, not hard revoke/migration.
+        let mut h2_open = Some(h2_tunnel);
+        let mut h3_open = Some(h3_tunnel);
+        for old in [0u8, 1u8] {
+            let (mut app, local) = tokio::io::duplex(256);
+            let relay = if old == 0 {
+                let tunnel = h2_open.take().unwrap();
+                tokio::spawn(async move {
+                    tunnel
+                        .relay(local)
+                        .await
+                        .map_err(|error| format!("{error}"))
+                })
+            } else {
+                let tunnel = h3_open.take().unwrap();
+                tokio::spawn(async move {
+                    tunnel
+                        .relay(local)
+                        .await
+                        .map_err(|error| format!("{error}"))
+                })
+            };
+            app.write_all(b"still-live").await.unwrap();
+            let mut response = [0u8; 10];
+            app.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"still-live");
+            app.shutdown().await.unwrap();
+            relay.await.unwrap().unwrap();
+        }
+
+        // Existing auth-only CAS is immediately usable after the rotation.
+        document = candidate;
+        document.server.users[0].token_sha256 = digest(0x43);
+        save(&config_path, &document);
+        let reloaded = cli(
+            env_key,
+            &endpoint,
+            &["server", "reload", "--expected-revision", "2"],
+        );
+        assert!(
+            reloaded.status.success(),
+            "post-rotation CAS must use the current TLS baseline: {}",
+            String::from_utf8_lossy(&reloaded.stderr)
+        );
+        assert!(revision(env_key, &endpoint, 3));
+
+        // Repeating the SAME-port rotation after an auth-only CAS must use
+        // its newest user/token baseline. This protects against stale View
+        // documents that would falsely classify valid PEM-only candidates as
+        // an unauthorized user mutation.
+        let mut rotate_again = document.clone();
+        rotate_again.server.inbounds[0].tls_cert = format!("file:{}", old_cert.display());
+        rotate_again.server.inbounds[0].tls_key = format!("file:{}", old_key.display());
+        let again_hash = save(&config_path, &rotate_again);
+        apply(env_key, &endpoint, 3, &again_hash, true);
+        assert!(revision(env_key, &endpoint, 4));
+        let mut restored_ca = RootCertStore::empty();
+        restored_ca.add(old_identity.cert.der().clone()).unwrap();
+        let restored_h2 = H2Client::new(
+            &format!("127.0.0.1:{tcp_port}"),
+            "localhost",
+            &credential(0x43),
+            restored_ca.clone(),
+        )
+        .unwrap();
+        let restored_h3 = H3Client::new(
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            "localhost",
+            &credential(0x43),
+            restored_ca,
+        )
+        .unwrap();
+        assert!(restored_h2.open(address.clone(), echo_port).await.is_ok());
+        assert!(restored_h3.open(address, echo_port).await.is_ok());
+        echo_task.abort();
+    })
+    .await
+    .expect("native H2+H3 same-port TLS identity rotation must complete");
+}

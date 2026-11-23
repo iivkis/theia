@@ -6,7 +6,7 @@
 //! disk, PEM, network and the async supervisor are never run under this lock.
 use crate::{
     config::ServerDocument,
-    live_auth::{LiveAuthError, LiveAuthorization},
+    live_auth::{LiveAuthError, LiveAuthorization, StagedAuthorization},
     reload_preflight::ReloadPreflight,
 };
 use std::sync::{Arc, RwLock};
@@ -52,16 +52,59 @@ impl State {
         candidate: &ServerDocument,
         expected: u64,
     ) -> Result<u64, LiveAuthError> {
-        let guard = self
+        let mut guard = self
             .current
-            .read()
+            .write()
             .map_err(|_| LiveAuthError::Unavailable)?;
         if !Arc::ptr_eq(&guard, view) {
             return Err(LiveAuthError::StaleRevision);
         }
-        view.live
-            .stage(candidate, expected)
-            .and_then(|staged| view.live.publish(staged))
+        let staged = view.live.stage(candidate, expected)?;
+        let revision = view.live.publish(staged)?;
+        // The running TLS sockets, quotas and AuthCell remain the same.
+        // Rebase the management snapshot so a later TLS-only rotation
+        // compares against the MOST RECENT auth state, not startup TOML.
+        *guard = Arc::new(View {
+            document: Arc::new(candidate.clone()),
+            inbounds: view.inbounds,
+            preflight: Arc::new(view.preflight.rebased(candidate.clone())),
+            live: Arc::new(view.live.with_new_baseline(candidate.clone())),
+        });
+        Ok(revision)
+    }
+
+    /// Same-port identity rotation: one short writer CAS for the persisted
+    /// management snapshot and a staged authorization revision. The caller
+    /// has pre-built BOTH H2+H3 configs and already acquired all H2 locks,
+    /// so the final transport swap itself is infallible and synchronous.
+    ///
+    /// Old tunnels keep their negotiated TLS and shared authorization cell.
+    /// Rejected stale/foreign snapshots do not invoke the swap closure.
+    pub(crate) fn commit_tls_rotation(
+        &self,
+        previous: &Arc<View>,
+        expected: u64,
+        next: View,
+        authorization: StagedAuthorization,
+        swap_new_tls: impl FnOnce(),
+    ) -> Result<u64, LiveAuthError> {
+        let mut guard = self
+            .current
+            .write()
+            .map_err(|_| LiveAuthError::Unavailable)?;
+        if !Arc::ptr_eq(&guard, previous) || previous.live.revision()? != expected {
+            return Err(LiveAuthError::StaleRevision);
+        }
+        let next_revision = expected
+            .checked_add(1)
+            .ok_or(LiveAuthError::RevisionExhausted)?;
+        let actual = previous.live.publish(authorization)?;
+        if actual != next_revision {
+            return Err(LiveAuthError::StaleRevision);
+        }
+        swap_new_tls();
+        *guard = Arc::new(next);
+        Ok(actual)
     }
 
     /// Linearization point for a prepared fresh-port listener generation.
@@ -105,6 +148,45 @@ pub(crate) struct RestartRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_only_cas_updates_tls_rotation_baseline_and_rejects_old_generation() {
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
+        let crate::config::Config::Server(active) = crate::config::parse(&source).unwrap() else {
+            panic!("server config fixture must parse");
+        };
+        let live = Arc::new(LiveAuthorization::new(active.clone()).unwrap());
+        let preflight = Arc::new(ReloadPreflight::new(
+            std::path::PathBuf::from("/nonexistent"),
+            active.clone(),
+            Vec::new(),
+        ));
+        let state = State::new(View {
+            document: Arc::new(active.clone()),
+            inbounds: active.server.inbounds.len(),
+            preflight,
+            live,
+        });
+        let old = state.snapshot().unwrap();
+        let mut updated = active.clone();
+        updated.server.users[0].token_sha256 = "b".repeat(64);
+        assert_eq!(state.apply_auth(&old, &updated, 1), Ok(2));
+        let current = state.snapshot().unwrap();
+        assert_eq!(current.live.revision(), Ok(2));
+        assert_eq!(current.document.as_ref(), &updated);
+        assert!(!Arc::ptr_eq(&old, &current));
+        assert!(matches!(
+            state.apply_auth(&old, &updated, 2),
+            Err(LiveAuthError::StaleRevision)
+        ));
+        let mut next_identity = updated.clone();
+        next_identity.server.inbounds[0].tls_cert = "file:rotated-cert.pem".to_owned();
+        assert!(
+            crate::restart_guard::same_port_tls_only(&current.document, &next_identity),
+            "TLS rotation after auth CAS must compare the newest auth user state"
+        );
+    }
 
     #[test]
     fn restart_rejects_foreign_and_stale_snapshots_without_any_publication() {

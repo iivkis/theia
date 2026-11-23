@@ -15,7 +15,7 @@ use std::{
     io::BufReader,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -473,6 +473,18 @@ pub(crate) async fn serve_generation(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     context: Arc<ServerContext>,
+    phase: watch::Receiver<GenerationPhase>,
+) -> Result<(), ServerError> {
+    serve_generation_with_tls(listener, Arc::new(RwLock::new(acceptor)), context, phase).await
+}
+
+/// A short, per-new-TCP-socket acceptor load; active TLS sessions retain the
+/// ServerConfig selected for their own handshake. The running supervisor
+/// replaces only the acceptor pointer after validating the full H2+H3 set.
+pub(crate) async fn serve_generation_with_tls(
+    listener: TcpListener,
+    acceptor: Arc<RwLock<TlsAcceptor>>,
+    context: Arc<ServerContext>,
     mut phase: watch::Receiver<GenerationPhase>,
 ) -> Result<(), ServerError> {
     if !await_generation_activation(&mut phase).await {
@@ -494,7 +506,10 @@ pub(crate) async fn serve_generation(
                 let Some(slot) = context.connection_slot() else {
                     continue;
                 };
-                let tls_acceptor = acceptor.clone();
+                let tls_acceptor = {
+                    let current = acceptor.read().map_err(|_| ServerError::Io)?;
+                    current.clone()
+                };
                 let context = context.clone();
                 connections.spawn(async move {
                     let _slot = slot;
@@ -1029,10 +1044,46 @@ async fn prepare_generation(
     })
 }
 
+/// Exact currently bound TLS accept handles. No socket is closed or rebound
+/// when the supervisor rotates the certificate for new H2/H3 handshakes.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct HotIdentity {
+    h2: Arc<RwLock<TlsAcceptor>>,
+    h3: quinn::Endpoint,
+}
+
+/// TLS-only candidate fully staged *before* touching either bound socket.
+/// Both transport identities and BBR/ALPN parameters are validated using
+/// exactly the startup configuration builders.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct PreparedSamePortTls {
+    h2: Vec<TlsAcceptor>,
+    h3: Vec<quinn::ServerConfig>,
+    identities: Vec<crate::reload_preflight::IdentityHash>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn prepare_same_port_tls(document: &ServerDocument) -> Result<PreparedSamePortTls, ServerError> {
+    let mut h2 = Vec::with_capacity(document.server.inbounds.len());
+    let mut h3 = Vec::with_capacity(document.server.inbounds.len());
+    let mut identities = Vec::with_capacity(document.server.inbounds.len());
+    for inbound in &document.server.inbounds {
+        let material = tls_material(inbound)?;
+        identities.push(material.identity);
+        let h2_acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
+        let h3_config = crate::quic_transport::server_config(material.certs, material.key)
+            .map_err(|_| ServerError::Tls)?;
+        h2.push(h2_acceptor);
+        h3.push(h3_config);
+    }
+    Ok(PreparedSamePortTls { h2, h3, identities })
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct RunningGeneration {
     tasks: JoinSet<Result<(), ServerError>>,
     phase: watch::Sender<GenerationPhase>,
+    identities: Vec<HotIdentity>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1040,10 +1091,16 @@ impl RunningGeneration {
     fn launch(listeners: Vec<ReadyListener>, phase: GenerationPhase) -> Self {
         let (sender, receiver) = watch::channel(phase);
         let mut tasks = JoinSet::new();
+        let mut identities = Vec::with_capacity(listeners.len());
         for (tcp, acceptor, udp, context) in listeners {
-            tasks.spawn(serve_generation(
+            let h2 = Arc::new(RwLock::new(acceptor));
+            identities.push(HotIdentity {
+                h2: h2.clone(),
+                h3: udp.clone(),
+            });
+            tasks.spawn(serve_generation_with_tls(
                 tcp,
-                acceptor,
+                h2,
                 context.clone(),
                 receiver.clone(),
             ));
@@ -1056,6 +1113,7 @@ impl RunningGeneration {
         Self {
             tasks,
             phase: sender,
+            identities,
         }
     }
 
@@ -1134,6 +1192,68 @@ async fn stage_fresh_generation(
     Ok((running, next, prepared.identities, next_revision))
 }
 
+/// Only identity material may change. All PEM/cert/key/QUIC/H2 builders
+/// finish before acquiring the short CAS lock or swapping any live handles.
+/// The old listener socket and both active tunnel populations remain intact.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn commit_same_port_tls(
+    runtime: &crate::runtime_generation::State,
+    running: &RunningGeneration,
+    request: &crate::runtime_generation::RestartRequest,
+    loaded_identities: &[crate::reload_preflight::IdentityHash],
+    path: &Path,
+) -> Result<(Vec<crate::reload_preflight::IdentityHash>, u64), ()> {
+    let candidate = &request.candidate;
+    let original = request.previous.document.as_ref();
+    if crate::restart_guard::probe(original, loaded_identities, candidate)
+        != Ok(crate::restart_guard::RestartVerdict::SamePortTlsReady)
+        || running.identities.len() != candidate.server.inbounds.len()
+    {
+        return Err(());
+    }
+    let prepared = prepare_same_port_tls(candidate).map_err(|_| ())?;
+    let (rebased_live, staged_auth) = request
+        .previous
+        .live
+        .prepare_tls_rebase(candidate, request.expected_revision)
+        .map_err(|_| ())?;
+    let next_view = crate::runtime_generation::View {
+        document: Arc::new(candidate.clone()),
+        inbounds: candidate.server.inbounds.len(),
+        preflight: Arc::new(crate::reload_preflight::ReloadPreflight::new(
+            path.to_owned(),
+            candidate.clone(),
+            prepared.identities.clone(),
+        )),
+        live: Arc::new(rebased_live),
+    };
+
+    // Before publishing ANY TLS identity, acquire all H2 acceptor locks.
+    // Lock poisoning or a stale CAS aborts without touching the sockets.
+    let mut held = Vec::with_capacity(running.identities.len());
+    for handle in &running.identities {
+        held.push(handle.h2.write().map_err(|_| ())?);
+    }
+    let PreparedSamePortTls { h2, h3, identities } = prepared;
+    let revision = runtime
+        .commit_tls_rotation(
+            &request.previous,
+            request.expected_revision,
+            next_view,
+            staged_auth,
+            || {
+                for (guard, acceptor) in held.iter_mut().zip(h2) {
+                    **guard = acceptor;
+                }
+                for (handle, config) in running.identities.iter().zip(h3) {
+                    handle.h3.set_server_config(Some(config));
+                }
+            },
+        )
+        .map_err(|_| ())?;
+    Ok((identities, revision))
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn run_supervised_file(
     document: ServerDocument,
@@ -1197,6 +1317,34 @@ async fn run_supervised_file(
                     let _ = request.complete.send(Err(()));
                     continue;
                 }
+                // The sender can disappear if the IPC deadline has elapsed.
+                // Never start or commit a speculative restart whose operator
+                // is no longer listening for its result.
+                if request.complete.is_closed() {
+                    continue;
+                }
+                if crate::restart_guard::same_port_tls_only(
+                    request.previous.document.as_ref(),
+                    &request.candidate,
+                ) {
+                    let applied = commit_same_port_tls(
+                        &runtime,
+                        &running,
+                        &request,
+                        &identities,
+                        config_path,
+                    );
+                    match applied {
+                        Ok((new_identities, revision)) => {
+                            identities = new_identities;
+                            let _ = request.complete.send(Ok(revision));
+                        }
+                        Err(()) => {
+                            let _ = request.complete.send(Err(()));
+                        }
+                    }
+                    continue;
+                }
                 let staged = stage_fresh_generation(
                     &request,
                     &identities,
@@ -1210,6 +1358,9 @@ async fn run_supervised_file(
                 };
                 // Under the same short CAS barrier used for auth-only Apply:
                 // stale revisions cannot overwrite either generation.
+                if request.complete.is_closed() {
+                    continue;
+                }
                 if runtime.commit_restart(
                     &request.previous,
                     request.expected_revision,
