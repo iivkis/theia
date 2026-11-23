@@ -11,6 +11,7 @@ use rustls::RootCertStore;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Write as _,
     net::{TcpListener as StdTcp, UdpSocket as StdUdp},
     path::Path,
     process::{Child, Command, Output, Stdio},
@@ -352,11 +353,6 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         assert!(new_h2.open(address.clone(), echo_port).await.is_ok());
         assert!(new_h3.open(address.clone(), echo_port).await.is_ok());
 
-        // Neither accepting NEW old connections nor approving NEW requests
-        // over existing old connections is allowed after commit.
-        assert!(old_h2.open(address.clone(), echo_port).await.is_err());
-        assert!(old_h3.open(address.clone(), echo_port).await.is_err());
-
         // Previous authenticated tunnels can finish within bounded drain.
         let (mut h2_app, h2_local) = tokio::io::duplex(256);
         let h2_relay = tokio::spawn(async move { h2_tunnel.relay(h2_local).await });
@@ -374,6 +370,11 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         assert_eq!(&h3_reply, b"old-alive!");
         h3_app.shutdown().await.unwrap();
         h3_relay.await.unwrap().unwrap();
+
+        // Neither accepting NEW old connections nor approving NEW requests
+        // over existing old connections is allowed after commit.
+        assert!(old_h2.open(address.clone(), echo_port).await.is_err());
+        assert!(old_h3.open(address.clone(), echo_port).await.is_err());
 
         // The protected IPC preflight and CAS controller must now belong to
         // generation 2, so ordinary auth-only Apply continues working.
