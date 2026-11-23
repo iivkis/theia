@@ -144,6 +144,7 @@ impl ReloadPreflight {
     /// Read the live server's file ONCE and compare its digest before parsing.
     /// This rejects a mismatched path, out-of-band edits and a stale preview;
     /// the file worker is still purely read-only and cancellation-safe.
+    #[cfg(target_os = "linux")]
     pub(crate) fn load_candidate_bound(
         &self,
         expected_sha256: [u8; 32],
