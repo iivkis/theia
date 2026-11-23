@@ -781,8 +781,11 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             restored_ca,
         )
         .unwrap();
-        assert!(restored_h2.open(address.clone(), echo_port).await.is_ok());
-        assert!(restored_h3.open(address.clone(), echo_port).await.is_ok());
+        // Keep open authenticated tunnels on the identity about to be
+        // retired by rollback. Neither H2 nor QUIC sessions are migrated
+        // or aborted just because new handshakes switch certificates.
+        let still_h2 = restored_h2.open(address.clone(), echo_port).await.unwrap();
+        let still_h3 = restored_h3.open(address.clone(), echo_port).await.unwrap();
 
         // The second same-port TLS rotation supersedes the older undo.
         // Corrupt the previous certificate on disk AFTER the CAS. Rollback
@@ -816,7 +819,24 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
         )
         .unwrap();
         assert!(recovered_h2.open(address.clone(), echo_port).await.is_ok());
-        assert!(recovered_h3.open(address, echo_port).await.is_ok());
+        assert!(recovered_h3.open(address.clone(), echo_port).await.is_ok());
+        let (mut h2_app, h2_local) = tokio::io::duplex(128);
+        let h2_task = tokio::spawn(async move { still_h2.relay(h2_local).await });
+        h2_app.write_all(b"old-alive!").await.unwrap();
+        let mut from_h2 = [0u8; 10];
+        h2_app.read_exact(&mut from_h2).await.unwrap();
+        assert_eq!(&from_h2, b"old-alive!");
+        h2_app.shutdown().await.unwrap();
+        h2_task.await.unwrap().unwrap();
+
+        let (mut h3_app, h3_local) = tokio::io::duplex(128);
+        let h3_task = tokio::spawn(async move { still_h3.relay(h3_local).await });
+        h3_app.write_all(b"old-alive!").await.unwrap();
+        let mut from_h3 = [0u8; 10];
+        h3_app.read_exact(&mut from_h3).await.unwrap();
+        assert_eq!(&from_h3, b"old-alive!");
+        h3_app.shutdown().await.unwrap();
+        h3_task.await.unwrap().unwrap();
         assert!(server.0.try_wait().unwrap().is_none());
         echo_task.abort();
     })
