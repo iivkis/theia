@@ -211,11 +211,28 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         );
         has_revision(&dir, 1).await;
 
+        // The TUI's saved TOML is an exact-content candidate, not just
+        // an unscoped request to apply whatever some other file contains.
+        let digest: [u8; 32] = Sha256::digest(fs::read(&toml).unwrap()).into();
         assert_eq!(
             query_in(
                 &dir,
-                StatusCommand::ApplyReload {
-                    expected_revision: 1
+                StatusCommand::ApplyReloadBound {
+                    expected_revision: 1,
+                    candidate_sha256: [0u8; 32],
+                }
+            )
+            .await,
+            Err(ManagementError::CandidateRejected),
+            "another TOML file must never silently apply the active server file"
+        );
+        has_revision(&dir, 1).await;
+        assert_eq!(
+            query_in(
+                &dir,
+                StatusCommand::ApplyReloadBound {
+                    expected_revision: 1,
+                    candidate_sha256: digest,
                 }
             )
             .await,
