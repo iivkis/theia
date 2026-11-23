@@ -4,9 +4,9 @@
 //! secret references, token hashes or path in diagnostics. All writes go
 //! through the existing strict validator and atomic store.
 use crate::{
+    client_import::{self, PrivateBearer},
     config::{self, Config, Transport, User},
     invite::Invitation,
-    client_import::{self, PrivateBearer},
     Role,
 };
 use sha2::{Digest, Sha256};
@@ -125,7 +125,8 @@ impl Editor {
                 .reference()
                 .map_err(|_| "Cannot build protected bearer reference")?,
             None => {
-                let supplied = public_ref.ok_or("Public invite requires explicit env: credential")?;
+                let supplied =
+                    public_ref.ok_or("Public invite requires explicit env: credential")?;
                 if !client_import::valid_explicit_reference(supplied) {
                     return Err("Public invite requires a valid explicit env: reference");
                 }
@@ -153,15 +154,14 @@ impl Editor {
             // fsync(parent) can fail *after* atomic rename. Inspect the exact
             // serialized bytes; if the new document is present, KEEP the
             // credential instead of creating a broken TOML file reference.
-            if read_bounded(&self.path)
-                .is_ok_and(|on_disk| on_disk == bytes)
-            {
+            if read_bounded(&self.path).is_ok_and(|on_disk| on_disk == bytes) {
                 if let Some(saved) = secret.as_mut() {
                     saved.commit();
                 }
                 self.source = bytes;
                 self.original = self.draft.clone();
-                self.notice = "Точное состояние записи неизвестно: проверьте файл, не подключайтесь.";
+                self.notice =
+                    "Точное состояние записи неизвестно: проверьте файл, не подключайтесь.";
                 return Err("TOML replacement may have completed; verify before using");
             }
             self.discard();
@@ -763,8 +763,8 @@ mod tests {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
         let server = config::parse(&server_source()).unwrap();
-        let invite = Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32])
-            .unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
         let raw = invite.encode().unwrap();
         assert!(read_source(&raw).unwrap().has_token());
         let temp = Temp::write(include_str!("../../../examples/client.toml"));
@@ -788,16 +788,23 @@ mod tests {
         assert_eq!(imported.auth_token.starts_with("file:"), true);
         let secret_path = Path::new(imported.auth_token.strip_prefix("file:").unwrap());
         assert!(secret_path.is_absolute());
-        assert_eq!(fs::read_to_string(secret_path).unwrap(), URL_SAFE_NO_PAD.encode([0x42; 32]));
+        assert_eq!(
+            fs::read_to_string(secret_path).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x42; 32])
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(secret_path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(secret_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
             assert_eq!(
                 fs::metadata(secret_path.parent().unwrap())
                     .unwrap()
                     .permissions()
-                    .mode() & 0o777,
+                    .mode()
+                    & 0o777,
                 0o700
             );
         }
@@ -814,19 +821,27 @@ mod tests {
             panic!("client");
         };
         let duplicate = Invitation::public_from_profile(&original.client.profiles[0]).unwrap();
-        assert!(editor.import_invitation(&duplicate, None, Some("env:THEIA_OTHER")).is_err());
+        assert!(editor
+            .import_invitation(&duplicate, None, Some("env:THEIA_OTHER"))
+            .is_err());
 
         let mut second = original.client.profiles[0].clone();
         second.id = "remote".into();
         second.server = "remote.example.org:443".into();
         let public = Invitation::public_from_profile(&second).unwrap();
         assert!(editor.import_invitation(&public, None, None).is_err());
-        assert!(editor.import_invitation(&public, None, Some("file:unsafe")).is_err());
+        assert!(editor
+            .import_invitation(&public, None, Some("file:unsafe"))
+            .is_err());
         assert!(!editor.dirty());
         editor.begin();
-        assert!(editor.import_invitation(&public, None, Some("env:REMOTE_AUTH")).is_err());
+        assert!(editor
+            .import_invitation(&public, None, Some("env:REMOTE_AUTH"))
+            .is_err());
         editor.cancel();
-        assert!(editor.import_invitation(&public, None, Some("env:REMOTE_AUTH")).is_ok());
+        assert!(editor
+            .import_invitation(&public, None, Some("env:REMOTE_AUTH"))
+            .is_ok());
         let Config::Client(saved) = config::read_file(&temp.0).unwrap() else {
             panic!("client");
         };
@@ -840,11 +855,14 @@ mod tests {
     fn import_refuses_external_edit_and_rolls_back_new_bearer() {
         use crate::invite::Invitation;
         let server = config::parse(&server_source()).unwrap();
-        let invite = Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32])
-            .unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
         let temp = Temp::write(include_str!("../../../examples/client.toml"));
         let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
-        let changed = format!("# external writer\n{}", include_str!("../../../examples/client.toml"));
+        let changed = format!(
+            "# external writer\n{}",
+            include_str!("../../../examples/client.toml")
+        );
         fs::write(&temp.0, &changed).unwrap();
         assert!(editor.import_invitation(&invite, None, None).is_err());
         assert_eq!(fs::read_to_string(&temp.0).unwrap(), changed);
@@ -852,7 +870,9 @@ mod tests {
 
         let other = Temp::write(&server_source());
         let mut server_editor = Editor::load(Role::Server, &other.0).unwrap();
-        assert!(server_editor.import_invitation(&invite, None, None).is_err());
+        assert!(server_editor
+            .import_invitation(&invite, None, None)
+            .is_err());
     }
 
     #[test]
@@ -862,17 +882,29 @@ mod tests {
         let ca = Temp::write(&cert.cert.pem());
         let ca_ref = format!("file:{}", ca.0.display());
         let server = config::parse(&server_source()).unwrap();
-        let invite = Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32])
-            .unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
         let temp = Temp::write(include_str!("../../../examples/client.toml"));
         let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
-        assert!(editor.import_invitation(&invite, Some("file:relative"), None).is_err());
-        assert!(editor.import_invitation(&invite, Some(&ca_ref), None).is_ok());
+        assert!(editor
+            .import_invitation(&invite, Some("file:relative"), None)
+            .is_err());
+        assert!(editor
+            .import_invitation(&invite, Some(&ca_ref), None)
+            .is_ok());
         let Config::Client(doc) = config::read_file(&temp.0).unwrap() else {
             panic!("client");
         };
-        assert_eq!(doc.client.profiles[1].tls_ca.as_deref(), Some(ca_ref.as_str()));
-        let secret_file = Path::new(doc.client.profiles[1].auth_token.strip_prefix("file:").unwrap());
+        assert_eq!(
+            doc.client.profiles[1].tls_ca.as_deref(),
+            Some(ca_ref.as_str())
+        );
+        let secret_file = Path::new(
+            doc.client.profiles[1]
+                .auth_token
+                .strip_prefix("file:")
+                .unwrap(),
+        );
         fs::remove_file(secret_file).unwrap();
         fs::remove_dir(secret_file.parent().unwrap()).unwrap();
     }
