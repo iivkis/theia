@@ -1124,6 +1124,7 @@ async fn prepare_generation(
     document: &ServerDocument,
     revision: u64,
     limits: &GenerationLimits,
+    captured: Option<&CapturedTls>,
 ) -> Result<PreparedGeneration, ServerError> {
     let live = Arc::new(
         LiveAuthorization::new_at_revision(document.clone(), revision)
@@ -1131,13 +1132,16 @@ async fn prepare_generation(
     );
     let mut listeners = Vec::with_capacity(document.server.inbounds.len());
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
-    for inbound in &document.server.inbounds {
+    for (index, inbound) in document.server.inbounds.iter().enumerate() {
         let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
         let udp_addr: SocketAddr = inbound
             .quic_listen
             .parse()
             .map_err(|_| ServerError::Config)?;
-        let material = tls_material(inbound)?;
+        let material = match captured {
+            Some(snapshot) => snapshot.material(inbound, index)?,
+            None => tls_material(inbound)?,
+        };
         identities.push(material.identity);
         let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         // Prebind BOTH transports before publishing or shutting down ANY
@@ -1186,12 +1190,15 @@ struct PreparedSamePortTls {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn prepare_same_port_tls(document: &ServerDocument) -> Result<PreparedSamePortTls, ServerError> {
+fn prepare_same_port_tls(
+    document: &ServerDocument,
+    captured: &CapturedTls,
+) -> Result<PreparedSamePortTls, ServerError> {
     let mut h2 = Vec::with_capacity(document.server.inbounds.len());
     let mut h3 = Vec::with_capacity(document.server.inbounds.len());
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
-    for inbound in &document.server.inbounds {
-        let material = tls_material(inbound)?;
+    for (index, inbound) in document.server.inbounds.iter().enumerate() {
+        let material = captured.material(inbound, index)?;
         identities.push(material.identity);
         let h2_acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         let h3_config = crate::quic_transport::server_config(material.certs, material.key)
@@ -1418,7 +1425,7 @@ async fn run_supervised_file(
     config_path: &Path,
 ) -> Result<(), ServerError> {
     let limits = GenerationLimits::new(&document);
-    let initial = prepare_generation(&document, 1, &limits).await?;
+    let initial = prepare_generation(&document, 1, &limits, None).await?;
     let current_identities = initial.identities.clone();
     let runtime = Arc::new(crate::runtime_generation::State::new(
         crate::runtime_generation::View {
