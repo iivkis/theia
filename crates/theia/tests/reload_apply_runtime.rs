@@ -205,9 +205,26 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         has_revision(&dir, 2).await;
         fs::write(&cert_path, &cert).unwrap();
 
+        // Verify compiled CLI performs a REAL second CAS publication, not
+        // merely printing a fake success before IPC has answered.
+        doc.server.users[0].disabled = true;
+        save(&toml, &doc);
+        let accepted = tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            move || cli(&dir, &["server", "reload", "--expected-revision", "2"])
+        }).await.unwrap();
+        assert!(accepted.status.success(), "{:?}", accepted.stderr);
+        assert_eq!(
+            accepted.stdout,
+            b"authorization applied; revision=3; existing tunnels retained\n"
+        );
+        has_revision(&dir, 3).await;
+        assert_eq!(h2new.open(addr.clone(), target_port).await.err(), Some(ClientError::Unauthorized));
+        assert_eq!(h3new.open(addr, target_port).await.err(), Some(ClientError::Unauthorized));
+
         let rejected = tokio::task::spawn_blocking({
             let dir = dir.clone();
-            move || cli(&dir, &["server", "reload", "--expected-revision", "1"])
+            move || cli(&dir, &["server", "reload", "--expected-revision", "2"])
         }).await.unwrap();
         assert!(!rejected.status.success());
         assert!(!String::from_utf8_lossy(&rejected.stderr).contains(&token(0x43)));
@@ -216,7 +233,7 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
             move || cli(&dir, &["server", "status"])
         }).await.unwrap();
         assert!(status.status.success());
-        assert!(String::from_utf8_lossy(&status.stdout).contains("revision=2"));
+        assert!(String::from_utf8_lossy(&status.stdout).contains("revision=3"));
 
         echo_task.abort();
         drop(server);
