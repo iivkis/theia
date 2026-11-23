@@ -76,6 +76,10 @@ applications → local HTTP/SOCKS → SmartTheia over HTTP/3 (QUIC + BBR)
 | [examples/server.toml](examples/server.toml) | серверный шаблон |
 | [examples/client.toml](examples/client.toml) | клиентский шаблон |
 
+## M4.2a: локальный статус запущенного сервера (Linux, только чтение)
+
+По отдельному решению оператора перед `theia server run --config server.toml` задаётся `THEIA_CONTROL_DIR` с **существующей абсолютной приватной директорией 0700 под текущим euid**. Сервер после успешного TLS/TCP/QUIC preflight создаёт в ней `theia-server.sock` (0600); команда `theia server status` при том же `THEIA_CONTROL_DIR` проверяет реально работающий процесс. Без переменной сервер работает как раньше, но status недоступен. Неверные права/занятый socket вызывают отказ запуска, а `reload`, Apply, Windows Named Pipe/ACL и транзакционный rollback **не реализованы**. Нельзя считать обычный status подтверждением обновлённой конфигурации. [ADR-0038](docs/adr/0038-m4-2a-linux-readonly-management-ipc.md).
+
 ## CLI (H2/H3 runtime и ограниченный TUI editor)
 
 ```sh
