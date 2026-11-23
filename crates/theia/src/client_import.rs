@@ -3,14 +3,14 @@
 //! A caller must perform strict typed TOML validation and guarded commit.
 use crate::invite::Invitation;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
-#[cfg(unix)]
-use std::fs::OpenOptions;
 
 const MAX_URI: u64 = 4096;
 const RANDOM_BYTES: usize = 16;
@@ -58,22 +58,19 @@ pub fn read_source(raw: &str) -> Result<Invitation, ImportError> {
         return Err(ImportError::InvalidSource);
     }
     let value = std::str::from_utf8(&contents).map_err(|_| ImportError::InvalidSource)?;
-    Invitation::decode(value.trim_end_matches(['\r', '\n']))
-        .map_err(|_| ImportError::InvalidSource)
+    Invitation::decode(value.trim_end_matches(['\r', '\n'])).map_err(|_| ImportError::InvalidSource)
 }
 
 pub fn valid_explicit_reference(raw: &str) -> bool {
     raw.starts_with("env:")
-        && raw
-            .strip_prefix("env:")
-            .is_some_and(|name| {
-                let bytes = name.as_bytes();
-                !bytes.is_empty()
-                    && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
-                    && bytes[1..]
-                        .iter()
-                        .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-            })
+        && raw.strip_prefix("env:").is_some_and(|name| {
+            let bytes = name.as_bytes();
+            !bytes.is_empty()
+                && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+                && bytes[1..]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        })
 }
 
 /// Untrusted URI cannot add, bypass, replace or select CA anchors. The CA
@@ -83,9 +80,15 @@ pub fn checked_ca_ref(raw: Option<&str>) -> Result<Option<String>, ImportError> 
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let path = raw.strip_prefix("file:").ok_or(ImportError::InvalidSource)?;
+    let path = raw
+        .strip_prefix("file:")
+        .ok_or(ImportError::InvalidSource)?;
     let path = Path::new(path);
-    if !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
         return Err(ImportError::InvalidSource);
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| ImportError::InvalidSource)?;
@@ -196,13 +199,22 @@ fn new_private_directory(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn new_private_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
 }
 
 #[cfg(windows)]
 mod private_windows {
     use super::*;
-    use std::{ffi::c_void, mem::size_of, os::windows::{ffi::OsStrExt, io::FromRawHandle}, ptr::null_mut};
+    use std::{
+        ffi::c_void,
+        mem::size_of,
+        os::windows::{ffi::OsStrExt, io::FromRawHandle},
+        ptr::null_mut,
+    };
     use windows_sys::Win32::{
         Foundation::{LocalFree, INVALID_HANDLE_VALUE},
         Security::{
@@ -223,10 +235,22 @@ mod private_windows {
         let sid = crate::windows_control::current_user_sid()
             .map_err(|_| io::Error::other("private user SID unavailable"))?;
         let sddl = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
-        let wide = sddl.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let wide = sddl
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
         let mut ptr = null_mut();
         // SAFETY: NUL-terminated SDDL, out-pointer valid and LocalAlloc owned.
-        if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide.as_ptr(), 1, &mut ptr, null_mut()) } == 0 || ptr.is_null() {
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                1,
+                &mut ptr,
+                null_mut(),
+            )
+        } == 0
+            || ptr.is_null()
+        {
             return Err(io::Error::other("cannot create protected DACL"));
         }
         Ok(Descriptor(ptr))
@@ -239,7 +263,10 @@ mod private_windows {
         }
     }
     fn path_wide(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
     pub(super) fn directory(path: &Path) -> io::Result<()> {
         let descriptor = security_descriptor()?;
@@ -256,7 +283,15 @@ mod private_windows {
         // SAFETY: CREATE_NEW refuses existing targets, including symlink/reparse
         // objects. Security attributes are explicit and protected, not inherited.
         let handle = unsafe {
-            CreateFileW(path_wide(path).as_ptr(), 0x4000_0000, 0, &attrs, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, null_mut())
+            CreateFileW(
+                path_wide(path).as_ptr(),
+                0x4000_0000,
+                0,
+                &attrs,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
         };
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
@@ -267,15 +302,22 @@ mod private_windows {
 }
 
 #[cfg(windows)]
-fn new_private_directory(path: &Path) -> io::Result<()> { private_windows::directory(path) }
+fn new_private_directory(path: &Path) -> io::Result<()> {
+    private_windows::directory(path)
+}
 #[cfg(windows)]
-fn new_private_file(path: &Path) -> io::Result<File> { private_windows::file(path) }
+fn new_private_file(path: &Path) -> io::Result<File> {
+    private_windows::file(path)
+}
 
 #[cfg(not(any(unix, windows)))]
-fn new_private_directory(_: &Path) -> io::Result<()> { Err(io::Error::other("unsupported platform")) }
+fn new_private_directory(_: &Path) -> io::Result<()> {
+    Err(io::Error::other("unsupported platform"))
+}
 #[cfg(not(any(unix, windows)))]
-fn new_private_file(_: &Path) -> io::Result<File> { Err(io::Error::other("unsupported platform")) }
-
+fn new_private_file(_: &Path) -> io::Result<File> {
+    Err(io::Error::other("unsupported platform"))
+}
 
 #[cfg(all(test, windows))]
 mod windows_acl_tests {
@@ -300,10 +342,16 @@ mod windows_acl_tests {
     }
 
     fn sid(raw: &str) -> Local {
-        let wide = raw.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let wide = raw
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
         let mut sid: *mut c_void = null_mut();
         // SAFETY: NUL-terminated Windows SID string and out pointer.
-        assert_ne!(unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) }, 0);
+        assert_ne!(
+            unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) },
+            0
+        );
         assert!(!sid.is_null());
         Local(sid)
     }
@@ -368,10 +416,7 @@ mod windows_acl_tests {
 
     #[test]
     fn imported_bearer_file_and_directory_have_only_user_and_system_acl() {
-        let parent = std::env::temp_dir().join(format!(
-            "theia-import-acl-{}",
-            std::process::id()
-        ));
+        let parent = std::env::temp_dir().join(format!("theia-import-acl-{}", std::process::id()));
         fs::create_dir(&parent).unwrap();
         let credential = PrivateBearer::create(&parent.join("client.toml"), &[0x42; 32])
             .expect("must create protected directory and token file");
