@@ -86,6 +86,10 @@ API `probe_dual_batch` обрабатывает максимум 8 вручну�
 
 TLS-in-TLS в расширенных настройках: будущий переключатель off/optional/required, измеренный эффект на статистику внешних потоков, p95/CPU/RSS/overhead и показ рисков. Unsupported required запрещает соединение, не выключается скрыто. Не отображать содержание TLS приложений, bearer/private keys или пользовательские URL.
 
+### M4.2d: Windows server TUI через SID-защищённый Named Pipe
+
+После явного `THEIA_CONTROL_PIPE=id` действующий Windows-сервер предоставляет тот же status/revision и **подтверждаемый** auth-only CAS Apply, что Linux. TUI в роли server (`--role server --config FILE`) открывает `v` (read-only), `Ctrl+R` показывает ожидаемую running revision, и только отдельное `y` передаёт SHA-256 **сохранённого** TOML. Client TUI, dirty draft, неверная revision, отсутствующий Named Pipe/SID/DACL, incompatible или TLS-drift не должны применять. IPC не затрагивает Windows system proxy; потерянный ACK остаётся indeterminate, требуется status. Системное имя pipe формируется по TokenUser SID, из env принимается только короткий ASCII идентификатор. [ADR-0043](adr/0043-m4-2d-windows-sid-named-pipe.md).
+
 ### M4.2c: реальный серверный статус и защищённое подтверждение Apply (Linux)
 
 Только серверная TUI с явными `--role server --config FILE` и чистым сохранённым документом: `v` = запрос текущего `authorization revision` у действующего Linux-сервера, `Ctrl+R` = показать текущую revision/ограничения и запросить отдельное `y`. После подтверждения IPC проверяет SHA-256 **ровно сохранённых байтов TOML**, совпадение ожидаемой CAS revision, полный typed schema, неизменные loaded TLS PEM и restart-only поля. Несовпавший файл, внешний edit или stale revision дают отказ без Apply. Пока окно ревизии загружается, ничего не применяется. Два разных TOML с идентичными байтами допускаются, поскольку применяемый кандидат совпадает по содержимому, а не по имени.

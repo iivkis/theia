@@ -1,4 +1,4 @@
-//! M4.2c: explicit, cancellation-aware server TUI status and auth-only Apply.
+//! M4.2d: cancellation-aware Linux Unix IPC / Windows SID Named Pipe TUI Apply.
 //!
 //! This panel never reads token digests or private keys. A confirmed request
 //! carries the SHA-256 of the exact TOML bytes last loaded or saved by the
@@ -38,11 +38,13 @@ pub(crate) struct RuntimePanel {
 
 impl RuntimePanel {
     pub(crate) fn open(saved_sha256: Option<[u8; 32]>, start_with_review: bool) -> Self {
-        Self::open_at(
-            std::env::var_os("THEIA_CONTROL_DIR").map(PathBuf::from),
-            saved_sha256,
-            start_with_review,
-        )
+        #[cfg(target_os = "linux")]
+        let endpoint = std::env::var_os("THEIA_CONTROL_DIR").map(PathBuf::from);
+        #[cfg(target_os = "windows")]
+        let endpoint = std::env::var_os("THEIA_CONTROL_PIPE").map(PathBuf::from);
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let endpoint: Option<PathBuf> = None;
+        Self::open_at(endpoint, saved_sha256, start_with_review)
     }
 
     fn open_at(
@@ -57,9 +59,9 @@ impl RuntimePanel {
             start_with_review: start_with_review && saved_sha256.is_some(),
             receiver: None,
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         panel.start(StatusCommand::Status);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             panel.phase = Phase::Unavailable;
         }
@@ -87,7 +89,18 @@ impl RuntimePanel {
                             runtime.block_on(crate::management::query_in(&directory, command))
                         })
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = directory;
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| ManagementError::Io)
+                        .and_then(|runtime| {
+                            runtime.block_on(crate::management::query_environment(command))
+                        })
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
                     let _ = (directory, command);
                     Err(ManagementError::Unsupported)
@@ -218,7 +231,7 @@ impl RuntimePanel {
             ),
             Phase::Rejected => "Сервер отклонил кандидат или ревизию. Авторизация не применена.\nПроверьте, что TOML не менялся с момента сохранения, сервер использует тот же файл, а TLS PEM/политика неизменны.\nr: запросить фактический статус | Esc: закрыть".into(),
             Phase::Indeterminate => "Ответ IPC потерян или повреждён. Применение МОГЛО произойти.\nПовторять Apply наугад нельзя. Сначала проверьте текущую revision по r: статус, затем перепроверьте TOML.\nEsc: закрыть".into(),
-            Phase::Unavailable => "Нет проверенного Linux IPC с revision или приватного THEIA_CONTROL_DIR.\nНичего не применено через эту панель.\nr: повторить проверку | Esc: закрыть".into(),
+            Phase::Unavailable => "Нет проверенного локального IPC с revision (Linux: THEIA_CONTROL_DIR; Windows: THEIA_CONTROL_PIPE).\nНичего не применено через эту панель.\nr: повторить проверку | Esc: закрыть".into(),
         }
     }
 }

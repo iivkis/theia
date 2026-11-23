@@ -1,8 +1,8 @@
-//! M4.2c: bounded Linux management IPC with exact-content-bound TUI CAS Apply.
+//! M4.2d: shared bounded IPC protocol over private Linux socket or Windows SID Named Pipe.
 //!
 //! Linux-only opt-in endpoint via THEIA_CONTROL_DIR, a private, operator-owned
 //! runtime directory. No administrative TCP, token disclosure or TLS/listener mutation.
-//! Windows Named Pipe/DACL remains a separate milestone.
+//! Windows binds only explicit current-user SID DACL, never default pipe permissions.
 //! The endpoint exists only while a server process is actually serving.
 use std::fmt;
 
@@ -14,35 +14,38 @@ use std::{
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::PathBuf,
-    sync::Arc,
-    time::Duration,
 };
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::{sync::Arc, time::Duration};
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use tokio::time::timeout;
 #[cfg(target_os = "linux")]
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     sync::Semaphore,
     task::JoinSet,
-    time::timeout,
 };
 
 #[cfg(target_os = "linux")]
 const SOCKET_NAME: &str = "theia-server.sock";
-#[cfg(target_os = "linux")]
-const IO_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(target_os = "linux")]
-const MAX_COMMAND_BYTES: usize = 128;
-#[cfg(target_os = "linux")]
-const MAX_RESPONSE_BYTES: u64 = 128;
-#[cfg(target_os = "linux")]
-const MAX_CLIENTS: usize = 8;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const MAX_COMMAND_BYTES: usize = 128;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const MAX_RESPONSE_BYTES: u64 = 128;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const MAX_CLIENTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagementError {
     Unsupported,
     NotConfigured,
     UnsafeDirectory,
+    UnsafeEndpoint,
     SocketUnavailable,
     Io,
     TimedOut,
@@ -56,6 +59,7 @@ impl fmt::Display for ManagementError {
             Self::Unsupported => "local management IPC unsupported on this platform",
             Self::NotConfigured => "THEIA_CONTROL_DIR is not configured",
             Self::UnsafeDirectory => "management runtime directory is unsafe",
+            Self::UnsafeEndpoint => "management pipe name or Windows security identity is unsafe",
             Self::SocketUnavailable => "local management socket unavailable",
             Self::Io => "local management I/O failed",
             Self::TimedOut => "local management request timed out",
@@ -246,13 +250,16 @@ impl Drop for StatusServer {
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn handle(
-    mut stream: UnixStream,
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) async fn handle<S>(
+    mut stream: S,
     inbounds: usize,
     preflight: Option<Arc<crate::reload_preflight::ReloadPreflight>>,
     live: Option<Arc<crate::live_auth::LiveAuthorization>>,
-) -> Result<(), ManagementError> {
+) -> Result<(), ManagementError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut command = Vec::with_capacity(16);
     let mut newline = false;
     for _ in 0..MAX_COMMAND_BYTES {
@@ -362,7 +369,7 @@ async fn handle(
     stream.shutdown().await.map_err(|_| ManagementError::Io)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn positive_decimal(value: &str) -> Option<u64> {
     if value.is_empty()
         || value.starts_with('0')
@@ -373,14 +380,14 @@ fn positive_decimal(value: &str) -> Option<u64> {
     value.parse().ok()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_apply_revision(command: &[u8]) -> Option<u64> {
     let raw = command.strip_prefix(b"apply-reload rev=")?;
     positive_decimal(std::str::from_utf8(raw).ok()?)
 }
 
 /// Canonical lowercase hex only; no ambiguity or relaxed delimiters.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn decode_digest(raw: &str) -> Option<[u8; 32]> {
     if raw.len() != 64
         || !raw
@@ -396,11 +403,125 @@ fn decode_digest(raw: &str) -> Option<[u8; 32]> {
     Some(digest)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_bound_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
     let rest = std::str::from_utf8(command.strip_prefix(b"apply-reload rev=")?).ok()?;
     let (revision, digest) = rest.split_once(" sha256=")?;
     Some((positive_decimal(revision)?, decode_digest(digest)?))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) async fn exchange<S>(
+    mut stream: S,
+    command: StatusCommand,
+) -> Result<StatusReply, ManagementError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = match command {
+        StatusCommand::Health => b"health\n".to_vec(),
+        StatusCommand::Status => b"status\n".to_vec(),
+        StatusCommand::Reload => b"reload\n".to_vec(),
+        StatusCommand::CheckReload => b"check-reload\n".to_vec(),
+        StatusCommand::ApplyReload { expected_revision } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
+            format!("apply-reload rev={expected_revision}\n").into_bytes()
+        }
+        StatusCommand::ApplyReloadBound {
+            expected_revision,
+            candidate_sha256,
+        } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
+            let digest = candidate_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("apply-reload rev={expected_revision} sha256={digest}\n").into_bytes()
+        }
+    };
+    stream
+        .write_all(&request)
+        .await
+        .map_err(|_| ManagementError::Io)?;
+    let mut reply = Vec::new();
+    stream
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut reply)
+        .await
+        .map_err(|_| ManagementError::Io)?;
+    if reply.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(ManagementError::InvalidReply);
+    }
+    if reply == b"theia-health-v1 ok\n" && command == StatusCommand::Health {
+        return Ok(StatusReply::Healthy);
+    }
+    if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
+        return Ok(StatusReply::Unsupported);
+    }
+    if command == StatusCommand::CheckReload {
+        return match reply.as_slice() {
+            b"theia-check-v1 compatible\n" => Ok(StatusReply::Compatible),
+            b"theia-check-v1 rejected\n" => Err(ManagementError::CandidateRejected),
+            _ => Err(ManagementError::InvalidReply),
+        };
+    }
+    if let StatusCommand::ApplyReload { expected_revision }
+    | StatusCommand::ApplyReloadBound {
+        expected_revision, ..
+    } = command
+    {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        if let Some(revision) = text
+            .strip_prefix("theia-apply-v1 applied revision=")
+            .and_then(|line| line.strip_suffix('\n'))
+            .and_then(positive_decimal)
+        {
+            if Some(revision) == expected_revision.checked_add(1) {
+                return Ok(StatusReply::Applied { revision });
+            }
+        }
+        return if reply == b"theia-apply-v1 rejected\n" {
+            Err(ManagementError::CandidateRejected)
+        } else if reply == b"ERR unsupported\n" {
+            Err(ManagementError::Unsupported)
+        } else {
+            Err(ManagementError::InvalidReply)
+        };
+    }
+    if command == StatusCommand::Status {
+        let reply = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        if let Some((count, revision)) = reply
+            .strip_prefix("theia-status-v2 running inbounds=")
+            .and_then(|line| line.strip_suffix('\n'))
+            .and_then(|line| line.split_once(" revision="))
+        {
+            let inbounds = positive_decimal(count).filter(|_| count.len() <= 7);
+            let revision = positive_decimal(revision);
+            if let (Some(inbounds), Some(revision)) = (inbounds, revision) {
+                if let Ok(inbounds) = usize::try_from(inbounds) {
+                    return Ok(StatusReply::RunningRevision { inbounds, revision });
+                }
+            }
+        }
+        if let Some(number) = reply
+            .strip_prefix("theia-status-v1 running inbounds=")
+            .and_then(|line| line.strip_suffix('\n'))
+        {
+            if !number.starts_with('0')
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+                && number.len() <= 7
+            {
+                if let Ok(inbounds) = number.parse::<usize>() {
+                    return Ok(StatusReply::Running { inbounds });
+                }
+            }
+        }
+    }
+    Err(ManagementError::InvalidReply)
 }
 
 #[cfg(target_os = "linux")]
@@ -410,113 +531,10 @@ pub async fn query_in(
 ) -> Result<StatusReply, ManagementError> {
     let path = endpoint_path(directory)?;
     timeout(IO_TIMEOUT, async {
-        let mut stream = UnixStream::connect(&path)
+        let stream = UnixStream::connect(&path)
             .await
             .map_err(|_| ManagementError::SocketUnavailable)?;
-        let request = match command {
-            StatusCommand::Health => b"health\n".to_vec(),
-            StatusCommand::Status => b"status\n".to_vec(),
-            StatusCommand::Reload => b"reload\n".to_vec(),
-            StatusCommand::CheckReload => b"check-reload\n".to_vec(),
-            StatusCommand::ApplyReload { expected_revision } => {
-                if expected_revision == 0 {
-                    return Err(ManagementError::InvalidReply);
-                }
-                format!("apply-reload rev={expected_revision}\n").into_bytes()
-            }
-            StatusCommand::ApplyReloadBound {
-                expected_revision,
-                candidate_sha256,
-            } => {
-                if expected_revision == 0 {
-                    return Err(ManagementError::InvalidReply);
-                }
-                let digest = candidate_sha256
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                format!("apply-reload rev={expected_revision} sha256={digest}\n").into_bytes()
-            }
-        };
-        stream
-            .write_all(&request)
-            .await
-            .map_err(|_| ManagementError::Io)?;
-        let mut reply = Vec::new();
-        stream
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_end(&mut reply)
-            .await
-            .map_err(|_| ManagementError::Io)?;
-        if reply.len() as u64 > MAX_RESPONSE_BYTES {
-            return Err(ManagementError::InvalidReply);
-        }
-        if reply == b"theia-health-v1 ok\n" && command == StatusCommand::Health {
-            return Ok(StatusReply::Healthy);
-        }
-        if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
-            return Ok(StatusReply::Unsupported);
-        }
-        if command == StatusCommand::CheckReload {
-            return match reply.as_slice() {
-                b"theia-check-v1 compatible\n" => Ok(StatusReply::Compatible),
-                b"theia-check-v1 rejected\n" => Err(ManagementError::CandidateRejected),
-                _ => Err(ManagementError::InvalidReply),
-            };
-        }
-        if let StatusCommand::ApplyReload { expected_revision }
-        | StatusCommand::ApplyReloadBound {
-            expected_revision, ..
-        } = command
-        {
-            let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
-            if let Some(revision) = text
-                .strip_prefix("theia-apply-v1 applied revision=")
-                .and_then(|line| line.strip_suffix('\n'))
-                .and_then(positive_decimal)
-            {
-                if Some(revision) == expected_revision.checked_add(1) {
-                    return Ok(StatusReply::Applied { revision });
-                }
-            }
-            return if reply == b"theia-apply-v1 rejected\n" {
-                Err(ManagementError::CandidateRejected)
-            } else if reply == b"ERR unsupported\n" {
-                Err(ManagementError::Unsupported)
-            } else {
-                Err(ManagementError::InvalidReply)
-            };
-        }
-        if command == StatusCommand::Status {
-            let reply = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
-            if let Some((count, revision)) = reply
-                .strip_prefix("theia-status-v2 running inbounds=")
-                .and_then(|line| line.strip_suffix('\n'))
-                .and_then(|line| line.split_once(" revision="))
-            {
-                let inbounds = positive_decimal(count).filter(|_| count.len() <= 7);
-                let revision = positive_decimal(revision);
-                if let (Some(inbounds), Some(revision)) = (inbounds, revision) {
-                    if let Ok(inbounds) = usize::try_from(inbounds) {
-                        return Ok(StatusReply::RunningRevision { inbounds, revision });
-                    }
-                }
-            }
-            if let Some(number) = reply
-                .strip_prefix("theia-status-v1 running inbounds=")
-                .and_then(|line| line.strip_suffix('\n'))
-            {
-                if !number.starts_with('0')
-                    && number.bytes().all(|byte| byte.is_ascii_digit())
-                    && number.len() <= 7
-                {
-                    if let Ok(inbounds) = number.parse::<usize>() {
-                        return Ok(StatusReply::Running { inbounds });
-                    }
-                }
-            }
-        }
-        Err(ManagementError::InvalidReply)
+        exchange(stream, command).await
     })
     .await
     .map_err(|_| ManagementError::TimedOut)?
@@ -529,7 +547,11 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
             std::env::var_os("THEIA_CONTROL_DIR").ok_or(ManagementError::NotConfigured)?;
         query_in(Path::new(&directory), command).await
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_control::query_environment(command).await
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = command;
         Err(ManagementError::Unsupported)
@@ -566,7 +588,7 @@ mod bound_command_tests {
     }
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "windows"))))]
 mod tests {
     use super::*;
 

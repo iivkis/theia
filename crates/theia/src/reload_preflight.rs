@@ -4,14 +4,14 @@
 //! existing users' token digests/disabled flags and existing inbound grants.
 //! Listener/TLS identity, quota policy and user inventory remain immutable.
 //! Real reload/rollback and Windows management IPC are separate milestones.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 use crate::config;
 use crate::config::{Config, ServerDocument};
 use std::fmt;
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 use sha2::{Digest, Sha256};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,14 +82,14 @@ pub fn assess_reload(
 
 /// Digest of *loaded* PEM bytes, not the paths in TOML. Never log these
 /// digests: the private key itself is not captured in this snapshot.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 #[derive(Clone)]
 pub(crate) struct IdentityHash {
     cert: [u8; 32],
     key: [u8; 32],
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 impl IdentityHash {
     pub(crate) fn from_pem(cert: &[u8], key: &[u8]) -> Self {
         Self {
@@ -107,14 +107,14 @@ impl IdentityHash {
 /// Safe, bounded validation against the exact active server document and the
 /// PEM bytes used when constructing the actual TLS acceptors. A successful
 /// check never authorizes reloading or changes an existing connection.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub(crate) struct ReloadPreflight {
     config_path: PathBuf,
     active: ServerDocument,
     identities: Vec<IdentityHash>,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 impl ReloadPreflight {
     pub(crate) fn new(
         config_path: PathBuf,
@@ -144,7 +144,7 @@ impl ReloadPreflight {
     /// Read the live server's file ONCE and compare its digest before parsing.
     /// This rejects a mismatched path, out-of-band edits and a stale preview;
     /// the file worker is still purely read-only and cancellation-safe.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub(crate) fn load_candidate_bound(
         &self,
         expected_sha256: [u8; 32],
@@ -297,9 +297,11 @@ mod tests {
         assert_eq!(snapshot.check_file(), Err(ReloadCheckError::InvalidConfig));
     }
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn on_disk_preflight_detects_pem_drift_without_writing_or_publishing() {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::fs;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
         let directory = std::env::temp_dir().join(format!(
             "theia-preflight-{}-{}",
             std::process::id(),
@@ -316,6 +318,7 @@ mod tests {
         let key_bytes = b"private key bytes captured when listener started";
         fs::write(&cert, cert_bytes).unwrap();
         fs::write(&key, key_bytes).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
         let mut active = document();
         active.server.inbounds[0].tls_cert = format!("file:{}", cert.display());
