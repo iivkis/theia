@@ -121,8 +121,10 @@ async fn live_binary_preflight_accepts_safe_delta_rejects_identity_drift_and_nev
     let mut server = ServerChild(child);
     timeout(Duration::from_secs(8), async {
         loop {
-            if let Ok(StatusReply::RunningRevision { inbounds: 1, revision: 1 }) =
-                query_in(&directory, StatusCommand::Status).await
+            if let Ok(StatusReply::RunningRevision {
+                inbounds: 1,
+                revision: 1,
+            }) = query_in(&directory, StatusCommand::Status).await
             {
                 break;
             }
@@ -196,7 +198,10 @@ async fn live_binary_preflight_accepts_safe_delta_rejects_identity_drift_and_nev
     assert!(!String::from_utf8_lossy(&rejected.stderr).contains("private key"));
     assert_eq!(
         query_in(&directory, StatusCommand::Status).await,
-        Ok(StatusReply::RunningRevision { inbounds: 1, revision: 1 })
+        Ok(StatusReply::RunningRevision {
+            inbounds: 1,
+            revision: 1
+        })
     );
     drop(server);
     fs::remove_dir_all(&directory).unwrap();
