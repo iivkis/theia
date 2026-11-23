@@ -177,6 +177,15 @@ def drive(binary, config, scenario, expected):
             revision(binary, expected)
             tty.send("y")  # no saved digest: must never apply
             revision(binary, expected)
+            # M4.2g: real PTY/ConPTY uppercase R opens a distinct read-only
+            # restart readiness modal, not the authorization Apply modal.
+            tty.send("\x1b")
+            time.sleep(0.1)
+            tty.send("R")
+            tty.wait("Проверка готовности к перезапуску")
+            tty.wait("auth-only CAS Apply")
+            tty.send("y")  # never mutates even when the candidate is feasible
+            revision(binary, expected)
         else:
             tty.wait("Редактор TOML")
             if scenario == "dirty":
