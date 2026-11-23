@@ -916,17 +916,25 @@ struct TlsMaterial {
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
-    let cert_bytes = pem_data(&inbound.tls_cert, false)?;
-    let key_bytes = pem_data(&inbound.tls_key, true)?;
+    let cert_bytes = zeroize::Zeroizing::new(pem_data(&inbound.tls_cert, false)?);
+    let key_bytes = zeroize::Zeroizing::new(pem_data(&inbound.tls_key, true)?);
+    tls_material_from_bytes(inbound, &cert_bytes, &key_bytes)
+}
+
+fn tls_material_from_bytes(
+    inbound: &Inbound,
+    cert_bytes: &[u8],
+    key_bytes: &[u8],
+) -> Result<TlsMaterial, ServerError> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let identity = crate::reload_preflight::IdentityHash::from_pem(&cert_bytes, &key_bytes);
-    let mut cert_reader = BufReader::new(cert_bytes.as_slice());
+    let identity = crate::reload_preflight::IdentityHash::from_pem(cert_bytes, key_bytes);
+    let mut cert_reader = BufReader::new(cert_bytes);
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
         .map_err(|_| ServerError::Config)?;
     let leaf = certs.first().ok_or(ServerError::Config)?;
     check_certificate_name(leaf, &inbound.server_name)?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes.as_slice()))
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes))
         .map_err(|_| ServerError::Config)?
         .ok_or(ServerError::Config)?;
     Ok(TlsMaterial {
@@ -935,6 +943,95 @@ fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         identity,
     })
+}
+
+/// One read of each external TLS PEM file, tied to the operator's
+/// independently supplied SHA-256. No private key bytes appear in IPC,
+/// stderr or logs; raw buffers are zeroized when the request/snapshot drops.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) struct CapturedTls {
+    pairs: Vec<CapturedPem>,
+    fingerprint: [u8; 32],
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct CapturedPem {
+    cert: zeroize::Zeroizing<Vec<u8>>,
+    key: zeroize::Zeroizing<Vec<u8>>,
+    identity: crate::reload_preflight::IdentityHash,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl CapturedTls {
+    /// Domain-separated and length-delimited digest, including stable inbound
+    /// IDs in document order. This prevents a reordered pair or ambiguous
+    /// PEM concatenation from sharing an operator approval fingerprint.
+    pub(crate) fn capture(document: &ServerDocument) -> Result<Self, ServerError> {
+        let mut hash = Sha256::new();
+        hash.update(b"theia-tls-pem-snapshot-v1\0");
+        hash.update((document.server.inbounds.len() as u64).to_be_bytes());
+        let mut pairs = Vec::with_capacity(document.server.inbounds.len());
+        for inbound in &document.server.inbounds {
+            let cert = zeroize::Zeroizing::new(pem_data(&inbound.tls_cert, false)?);
+            let key = zeroize::Zeroizing::new(pem_data(&inbound.tls_key, true)?);
+            // A successful fingerprint is proof of a usable TLS1.3 identity,
+            // not simply that two arbitrary private files could be hashed.
+            let material = tls_material_from_bytes(inbound, &cert, &key)?;
+            let _h2 = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
+            let _h3 = crate::quic_transport::server_config(material.certs, material.key)
+                .map_err(|_| ServerError::Tls)?;
+            let id = inbound.id.as_bytes();
+            for chunk in [id, cert.as_slice(), key.as_slice()] {
+                hash.update((chunk.len() as u64).to_be_bytes());
+                hash.update(chunk);
+            }
+            let identity = crate::reload_preflight::IdentityHash::from_pem(&cert, &key);
+            pairs.push(CapturedPem {
+                cert,
+                key,
+                identity,
+            });
+        }
+        Ok(Self {
+            pairs,
+            fingerprint: hash.finalize().into(),
+        })
+    }
+
+    pub(crate) fn matches(&self, expected: &[u8; 32]) -> bool {
+        self.fingerprint.ct_eq(expected).unwrap_u8() == 1
+    }
+
+    pub(crate) fn identities(&self) -> Vec<crate::reload_preflight::IdentityHash> {
+        self.pairs
+            .iter()
+            .map(|pair| pair.identity.clone())
+            .collect()
+    }
+
+    fn material(&self, inbound: &Inbound, index: usize) -> Result<TlsMaterial, ServerError> {
+        let pair = self.pairs.get(index).ok_or(ServerError::Config)?;
+        tls_material_from_bytes(inbound, &pair.cert, &pair.key)
+    }
+}
+
+/// Read-only local CLI tool. It reads the same bounded private PEM files that
+/// the server will later capture; the resulting digest is public, NOT the key.
+/// Operators must compute this fingerprint from trusted/immutable PEM paths.
+pub fn tls_fingerprint_file(path: &Path) -> Result<[u8; 32], ServerError> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        let document = match config::read_file(path).map_err(|_| ServerError::Config)? {
+            Config::Server(document) => document,
+            _ => return Err(ServerError::Config),
+        };
+        Ok(CapturedTls::capture(&document)?.fingerprint)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = path;
+        Err(ServerError::Config)
+    }
 }
 
 fn tls_acceptor(
@@ -952,14 +1049,6 @@ fn tls_acceptor(
     tls.alpn_protocols = vec![b"h2".to_vec()];
     tls.max_early_data_size = 0;
     Ok(TlsAcceptor::from(Arc::new(tls)))
-}
-
-/// Validate a restart candidate using the exact production TLS identity parser
-/// and TLS1.3/H2 acceptor builder, without starting a server or binding ports.
-pub(crate) fn validate_listener_identity(inbound: &Inbound) -> Result<(), ServerError> {
-    let material = tls_material(inbound)?;
-    let _ = tls_acceptor(material.certs, material.key)?;
-    Ok(())
 }
 
 /// Prepare all TCP and UDP listeners and TLS identity before launching tasks.
@@ -1034,6 +1123,7 @@ async fn prepare_generation(
     document: &ServerDocument,
     revision: u64,
     limits: &GenerationLimits,
+    captured: Option<&CapturedTls>,
 ) -> Result<PreparedGeneration, ServerError> {
     let live = Arc::new(
         LiveAuthorization::new_at_revision(document.clone(), revision)
@@ -1041,13 +1131,16 @@ async fn prepare_generation(
     );
     let mut listeners = Vec::with_capacity(document.server.inbounds.len());
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
-    for inbound in &document.server.inbounds {
+    for (index, inbound) in document.server.inbounds.iter().enumerate() {
         let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
         let udp_addr: SocketAddr = inbound
             .quic_listen
             .parse()
             .map_err(|_| ServerError::Config)?;
-        let material = tls_material(inbound)?;
+        let material = match captured {
+            Some(snapshot) => snapshot.material(inbound, index)?,
+            None => tls_material(inbound)?,
+        };
         identities.push(material.identity);
         let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         // Prebind BOTH transports before publishing or shutting down ANY
@@ -1096,12 +1189,15 @@ struct PreparedSamePortTls {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn prepare_same_port_tls(document: &ServerDocument) -> Result<PreparedSamePortTls, ServerError> {
+fn prepare_same_port_tls(
+    document: &ServerDocument,
+    captured: &CapturedTls,
+) -> Result<PreparedSamePortTls, ServerError> {
     let mut h2 = Vec::with_capacity(document.server.inbounds.len());
     let mut h3 = Vec::with_capacity(document.server.inbounds.len());
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
-    for inbound in &document.server.inbounds {
-        let material = tls_material(inbound)?;
+    for (index, inbound) in document.server.inbounds.iter().enumerate() {
+        let material = captured.material(inbound, index)?;
         identities.push(material.identity);
         let h2_acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         let h3_config = crate::quic_transport::server_config(material.certs, material.key)
@@ -1195,16 +1291,17 @@ async fn stage_fresh_generation(
 > {
     let active = request.previous.document.as_ref();
     let candidate = &request.candidate;
+    let snapshot = request.material.as_ref().ok_or(())?;
     if !crate::restart_guard::same_shared_limits(active, candidate) {
         return Err(());
     }
-    if crate::restart_guard::probe(active, identities, candidate)
+    if crate::restart_guard::probe_captured(active, identities, candidate, snapshot)
         != Ok(crate::restart_guard::RestartVerdict::FreshPortsBindable)
     {
         return Err(());
     }
     let next_revision = request.expected_revision.checked_add(1).ok_or(())?;
-    let prepared = prepare_generation(candidate, next_revision, limits)
+    let prepared = prepare_generation(candidate, next_revision, limits, Some(snapshot))
         .await
         .map_err(|_| ())?;
     let next = crate::runtime_generation::View {
@@ -1238,13 +1335,14 @@ fn commit_same_port_tls(
 ) -> Result<(Vec<crate::reload_preflight::IdentityHash>, u64), ()> {
     let candidate = &request.candidate;
     let original = request.previous.document.as_ref();
-    if crate::restart_guard::probe(original, loaded_identities, candidate)
+    let snapshot = request.material.as_ref().ok_or(())?;
+    if crate::restart_guard::probe_captured(original, loaded_identities, candidate, snapshot)
         != Ok(crate::restart_guard::RestartVerdict::SamePortTlsReady)
         || running.identities.len() != candidate.server.inbounds.len()
     {
         return Err(());
     }
-    let prepared = prepare_same_port_tls(candidate).map_err(|_| ())?;
+    let prepared = prepare_same_port_tls(candidate, snapshot).map_err(|_| ())?;
     let (rebased_live, staged_auth) = request
         .previous
         .live
@@ -1328,7 +1426,7 @@ async fn run_supervised_file(
     config_path: &Path,
 ) -> Result<(), ServerError> {
     let limits = GenerationLimits::new(&document);
-    let initial = prepare_generation(&document, 1, &limits).await?;
+    let initial = prepare_generation(&document, 1, &limits, None).await?;
     let current_identities = initial.identities.clone();
     let runtime = Arc::new(crate::runtime_generation::State::new(
         crate::runtime_generation::View {
@@ -1879,6 +1977,67 @@ mod hardening_tests {
         );
         drop(existing);
         assert!(a.authorize(Some(&live_bearer(8))).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn captured_pem_snapshot_survives_disk_replacement_without_tls_builder_reread() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let path = std::env::temp_dir().join(format!(
+            "theia-tls-pin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let cert_path = path.join("cert.pem");
+        let key_path = path.join("key.pem");
+        let generated = rcgen::generate_simple_self_signed(vec![
+            "a.example.org".into(),
+            "b.example.org".into(),
+        ])
+        .unwrap();
+        let cert_pem = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            STANDARD.encode(generated.cert.der())
+        );
+        let key_pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            STANDARD.encode(generated.key_pair.serialize_der())
+        );
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut doc = live_auth_fixture();
+        for inbound in &mut doc.server.inbounds {
+            inbound.tls_cert = format!("file:{}", cert_path.display());
+            inbound.tls_key = format!("file:{}", key_path.display());
+        }
+        let captured = CapturedTls::capture(&doc).unwrap();
+        let fingerprint = captured.fingerprint;
+        assert!(captured.matches(&fingerprint));
+        std::fs::write(&cert_path, "corrupted cert after snapshot").unwrap();
+        std::fs::write(&key_path, "corrupted key after snapshot").unwrap();
+        assert!(CapturedTls::capture(&doc).is_err());
+        // Both real H2 and QUIC/BBR builders must still work exclusively
+        // from the previously authorized private in-memory PEM snapshot.
+        let prepared = prepare_same_port_tls(&doc, &captured).unwrap();
+        assert_eq!(prepared.h2.len(), doc.server.inbounds.len());
+        assert_eq!(prepared.h3.len(), doc.server.inbounds.len());
+        assert!(prepared.identities == captured.identities());
+        // Order of inbound identities is part of the cryptographic pin.
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        let mut reordered = doc.clone();
+        reordered.server.inbounds.reverse();
+        assert!(!CapturedTls::capture(&reordered)
+            .unwrap()
+            .matches(&fingerprint));
+        std::fs::remove_dir_all(&path).unwrap();
     }
 
     #[test]

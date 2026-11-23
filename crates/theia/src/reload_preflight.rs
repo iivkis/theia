@@ -83,7 +83,7 @@ pub fn assess_reload(
 /// Digest of *loaded* PEM bytes, not the paths in TOML. Never log these
 /// digests: the private key itself is not captured in this snapshot.
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct IdentityHash {
     cert: [u8; 32],
     key: [u8; 32],

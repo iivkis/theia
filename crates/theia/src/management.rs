@@ -36,7 +36,7 @@ const SOCKET_NAME: &str = "theia-server.sock";
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) const MAX_COMMAND_BYTES: usize = 128;
+pub(crate) const MAX_COMMAND_BYTES: usize = 256;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_RESPONSE_BYTES: u64 = 128;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -97,6 +97,8 @@ pub enum StatusCommand {
     ApplyRestartBound {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
+        /// Fingerprint of actual CERT + PRIVATE KEY PEM content, not TOML.
+        tls_sha256: [u8; 32],
     },
     /// Explicit opt-in CAS auth publication, supported only by Linux server.
     ApplyReload {
@@ -367,20 +369,22 @@ where
                 if let (Some(preflight), Some(runtime), Some(previous), Some(restarts)) =
                     (&preflight, &runtime, &observed, &restarts)
                 {
-                    let (expected, sha256, kind) =
+                    let (expected, sha256, kind, tls_pin) =
                         if let Some((revision, digest)) = parse_quota_revision(candidate) {
                             (
                                 revision,
                                 digest,
                                 crate::runtime_generation::ChangeKind::Quota,
+                                None,
                             )
                         } else {
-                            let (revision, digest) =
+                            let (revision, digest, tls_digest) =
                                 parse_restart_revision(candidate).expect("already parsed");
                             (
                                 revision,
                                 digest,
                                 crate::runtime_generation::ChangeKind::Restart,
+                                Some(tls_digest),
                             )
                         };
                     let verb = if kind == crate::runtime_generation::ChangeKind::Quota {
@@ -393,20 +397,34 @@ where
                     let preflight = Arc::clone(preflight);
                     let candidate = tokio::task::spawn_blocking(move || {
                         if kind == crate::runtime_generation::ChangeKind::Quota {
-                            preflight.load_quota_candidate_bound(sha256)
+                            let document = preflight.load_quota_candidate_bound(sha256)?;
+                            Ok((document, None))
                         } else {
-                            preflight.load_restart_candidate_bound(sha256)
+                            let document = preflight.load_restart_candidate_bound(sha256)?;
+                            // Capture and validate each PEM exactly once.
+                            // No subsequent supervisor disk reads are allowed.
+                            let material =
+                                crate::server::CapturedTls::capture(&document).map_err(|_| {
+                                    crate::restart_guard::RestartError::InvalidTlsIdentity
+                                })?;
+                            if !material.matches(&tls_pin.expect("restart must pin PEM")) {
+                                return Err(crate::restart_guard::RestartError::InvalidTlsIdentity);
+                            }
+                            Ok((document, Some(material)))
                         }
                     })
                     .await;
                     match candidate {
-                        Ok(Ok(candidate)) if runtime.still_current(previous, expected) => {
+                        Ok(Ok((candidate, material)))
+                            if runtime.still_current(previous, expected) =>
+                        {
                             let (complete, result) = oneshot::channel();
                             let request = crate::runtime_generation::RestartRequest {
                                 kind,
                                 previous: Arc::clone(previous),
                                 expected_revision: expected,
                                 candidate,
+                                material,
                                 complete,
                             };
                             if restarts.try_send(request).is_err() {
@@ -585,8 +603,15 @@ fn parse_bound_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
-    parse_bound_command(command, b"restart-apply rev=")
+fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
+    let raw = std::str::from_utf8(command.strip_prefix(b"restart-apply rev=")?).ok()?;
+    let (revision, hashes) = raw.split_once(" sha256=")?;
+    let (document, tls) = hashes.split_once(" tls-sha256=")?;
+    Some((
+        positive_decimal(revision)?,
+        decode_digest(document)?,
+        decode_digest(tls)?,
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -632,6 +657,7 @@ where
         StatusCommand::ApplyRestartBound {
             expected_revision,
             candidate_sha256,
+            tls_sha256,
         } => {
             if expected_revision == 0 {
                 return Err(ManagementError::InvalidReply);
@@ -640,7 +666,12 @@ where
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            format!("restart-apply rev={expected_revision} sha256={digest}\n").into_bytes()
+            let tls = tls_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("restart-apply rev={expected_revision} sha256={digest} tls-sha256={tls}\n")
+                .into_bytes()
         }
         StatusCommand::ApplyReload { expected_revision } => {
             if expected_revision == 0 {
@@ -829,6 +860,45 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
     {
         let _ = command;
         Err(ManagementError::Unsupported)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod tls_restart_pin_tests {
+    use super::*;
+
+    #[test]
+    fn restart_native_ipc_fails_closed_without_two_exact_hex_digests() {
+        let doc = "ab".repeat(32);
+        let material = "cd".repeat(32);
+        let valid = format!("restart-apply rev=7 sha256={doc} tls-sha256={material}");
+        assert_eq!(
+            parse_restart_revision(valid.as_bytes()),
+            Some((7, [0xab; 32], [0xcd; 32]))
+        );
+        assert!(valid.len() < MAX_COMMAND_BYTES);
+        for invalid in [
+            format!("restart-apply rev=7 sha256={doc}"),
+            format!("restart-apply rev=0 sha256={doc} tls-sha256={material}"),
+            format!("restart-apply rev=07 sha256={doc} tls-sha256={material}"),
+            format!(
+                "restart-apply rev=7 sha256={doc} tls-sha256={}",
+                "CD".repeat(32)
+            ),
+            format!(
+                "restart-apply rev=7 sha256={} tls-sha256={material}",
+                "AB".repeat(32)
+            ),
+            format!("restart-apply rev=7 sha256={doc} tls-sha256={} ", material),
+            format!("restart-apply rev=7 sha256={doc} tls-sha256={}0", material),
+            format!(
+                "restart-apply rev=7 sha256={doc} tls-sha256={}",
+                "cd".repeat(31)
+            ),
+            format!("restart-apply rev=7 sha256={doc} TLS-SHA256={material}"),
+        ] {
+            assert_eq!(parse_restart_revision(invalid.as_bytes()), None);
+        }
     }
 }
 

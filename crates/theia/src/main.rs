@@ -83,20 +83,34 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
+        Ok(Command::ServerTlsFingerprint { config }) => {
+            match server::tls_fingerprint_file(Path::new(&config)) {
+                Ok(digest) => Ok(format!(
+                    "theia-tls-pem-v1 sha256={}",
+                    digest
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                )),
+                Err(error) => Err(CliError::Server(error)),
+            }
+        }
         Ok(Command::ServerApplyRestart {
             expected_revision,
             candidate_sha256,
+            tls_sha256,
         }) => {
             match management::query_environment(
                 management::StatusCommand::ApplyRestartBound {
                     expected_revision,
                     candidate_sha256,
+                    tls_sha256,
                 },
             )
             .await
             {
                 Ok(management::StatusReply::RestartApplied { revision }) => Ok(format!(
-                    "supervised fresh-port restart applied; revision={revision}; old connections draining (max 20s); no same-port rollback guarantee"
+                    "supervised H2/H3 restart applied; revision={revision}; same-port TLS keeps old tunnels, fresh-port cutover drains old up to 20s; no automatic rollback"
                 )),
                 Ok(_) => Err(CliError::Management(
                     management::ManagementError::InvalidReply,

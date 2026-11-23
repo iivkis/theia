@@ -183,6 +183,9 @@ pub(crate) struct RestartRequest {
     pub(crate) previous: Arc<View>,
     pub(crate) expected_revision: u64,
     pub(crate) candidate: ServerDocument,
+    /// The one verified candidate PEM snapshot, required for any restart.
+    /// Quota-only requests carry None and never touch TLS identities.
+    pub(crate) material: Option<crate::server::CapturedTls>,
     pub(crate) complete: oneshot::Sender<Result<u64, ()>>,
 }
 
