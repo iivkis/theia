@@ -968,6 +968,41 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod tls_rollback_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_wire_requires_exact_positive_revision() {
+        assert_eq!(parse_tls_rollback_revision(b"tls-rollback-apply rev=7"), Some(7));
+        for invalid in [
+            "tls-rollback-apply rev=0",
+            "tls-rollback-apply rev=07",
+            "tls-rollback-apply rev=-1",
+            "tls-rollback-apply rev=+1",
+            "tls-rollback-apply rev=7x",
+            "tls-rollback-apply rev=7 --force",
+            "tls-rollback-apply rev=18446744073709551616",
+            "tls-rollback-apply rev=7\n",
+        ] {
+            assert_eq!(parse_tls_rollback_revision(invalid.as_bytes()), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_native_ipc_never_exposes_rollback_or_acknowledges_apply() {
+        for command in [
+            StatusCommand::CheckTlsRollback,
+            StatusCommand::ApplyTlsRollback { expected_revision: 1 },
+        ] {
+            let (client, server) = tokio::io::duplex(512);
+            let handler = tokio::spawn(handle_internal(server, 1, None, None, None, None));
+            assert_eq!(exchange(client, command).await, Err(ManagementError::Unsupported));
+            handler.await.unwrap().unwrap();
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
 mod tls_restart_pin_tests {
     use super::*;
 
