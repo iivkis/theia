@@ -132,8 +132,12 @@ pub(crate) fn probe(
             .quic_listen
             .parse()
             .map_err(|_| RestartError::InvalidConfig)?;
-        if current_tcp.iter().any(|old| conflicts_with_active(*old, tcp))
-            || current_udp.iter().any(|old| conflicts_with_active(*old, udp))
+        if current_tcp
+            .iter()
+            .any(|old| conflicts_with_active(*old, tcp))
+            || current_udp
+                .iter()
+                .any(|old| conflicts_with_active(*old, udp))
         {
             return Ok(RestartVerdict::RequiresMaintenance);
         }
