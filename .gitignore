@@ -28,3 +28,22 @@ Thumbs.db
 *.pem
 
 # Preserve Cargo.lock files and committed TOML templates.
+
+# Generated Python test / tooling state (never source)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.venv/
+venv/
+
+# Local Rust instrumentation profiles
+*.profraw
+*.profdata

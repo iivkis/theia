@@ -1,6 +1,6 @@
 # Theia connection invitations: portable v1 (F-14, P0)
 
-**Нормативный контракт F-14; актуальный статус на 2026-11-24 см. [STATUS.md](STATUS.md).** M4.4a delivers the codec; M4.4b1 adds server TUI new-user issuance and one-time confidential link display after durable TOML save. M4.4b2a adds explicit existing-user disable with confirmation and safe TOML save; token rotation and secure export files/clipboard remain separately under review; client import is now proposed in ADR-0055 with CI pending. Do not call F-14 P0 complete until M4.4b2/M4.4c/d pass Linux/Windows CI.
+**Нормативный контракт F-14; актуальный статус на 2026-11-24 см. [STATUS.md](STATUS.md).** M4.4a реализует codec, M4.4b1 серверную выдачу, M4.4b2a отключение, M4.4b2b1 подтверждённую ротацию bearer, а M4.4c локальный клиентский импорт с защищённым хранением (PR #80/#81, native Linux/Windows CI успешен). F-14 P0 ещё не завершён: защищённый экспорт, расширенная ACL/crash матрица и cross-host H2/H3 E2E остаются открытыми.
 
 ## User model
 
@@ -31,7 +31,7 @@ Fields: `version` must be 1, `id` a v1-compatible profile ID, `endpoint` a valid
 - v1 shared endpoint uses `inbound.server_name` and the common numeric port of TCP/H2 and UDP/H3. If the port numbers differ, **reject auto invitation**, do not silently generate an unusable profile or disable fallback. This also assumes the publicly reachable address/port matches configured DNS and listener; proxies, NAT port mapping, split DNS and port overrides need an explicit future profile flow.
 - Public/secretless export is default. Confidential export requires a separate explicit operator confirmation, can be viewed/copied/exported only once, and must be hidden/cleared when the view closes. QR of the same URI can be added as P1 opt-in. URI with a token is a credential; do not print in ordinary logs, crash dumps, shell history or default stdout. Protect exported files and clipboard.
 - **M4.4b1 server issuance (merged):** on a valid clean server TOML, select inbound, press `u`, enter a unique ASCII ID, Enter and confirm `y`. Use the pinned rustls/ring SecureRandom provider to create a fresh 32-byte bearer, append SHA-256 digest user with `disabled=false` and an explicit grant on this inbound only. Strict document validation and existing background guarded atomic write must finish successfully before a separate `y` reveals the full `theia://v1/...` link exactly once. `n`/Esc abandons the unseen secret; Esc closes the shown secret. On conflict: `r` retries or `d` discards, with no link disclosure. This neither reloads runtime nor auto-enables a proxy.
-- **Limitations:** new-user creation and existing-user **disable-only** (M4.4b2a); no token rotation, re-enable or immediate tunnel revocation. Protected file export, QR and clipboard, Windows client import, cert/CA provisioning, service reload and cross-host E2E are still P0 blockers. If operator closes/declines the one-time link before recording it, token cannot be reconstructed from the SHA-256 digest. Best-effort `zeroize` of freshly generated token, invitation bearer on drop and displayed URI string does not guarantee scrubbing serde/base64/TOML buffers or terminal/SSH scrollback.
+- **Limitations:** серверные выдача, disable-only и ротация (M4.4b2b1) реализованы, а локальный клиентский импорт (M4.4c) проходит native Linux/Windows H2 E2E. Нет автоматического live Apply, hard revocation, re-enable, защищённого file/clipboard export, QR и cross-host H2/H3 E2E. Если оператор закрыл однократную ссылку до её сохранения, bearer нельзя восстановить из SHA-256 digest. Best-effort `zeroize` не гарантирует очистку всех serde/base64/TOML буферов или terminal/SSH scrollback.
 
 ## M4.4b2a: explicit existing-user disable (server TUI only)
 
@@ -45,7 +45,7 @@ In `theia tui --role server --config FILE`, select the inbound that already gran
 
 The new `theia://v1` link is offered only **after** strict document validation and successful guarded atomic TOML save; external file conflict blocks reveal. `y` separately shows the confidential URI once, `n/Esc` discards unseen bearer, Esc hides a shown bearer. No file, log, CLI argv, system proxy change or automatic runtime Apply. **Until separate native IPC auth-only CAS Apply, the running server still accepts the OLD bearer for new sessions**; after Apply it accepts the new bearer and refuses the old for new sessions across all inbounds, while **already-open tunnels continue**. No immediate hard revoke or implicit re-enable. See [ADR-0054](adr/0054-m4-4b2b1-confirmed-bearer-rotation.md).
 
-**This is a bounded partial F-14 slice** (Linux/Windows native CI pending). Protected file export, clipboard, disabled-user re-enable, Windows client import/persistence and end-to-end E2E remain open.
+**This is a bounded partial F-14 slice** (PR #80 merged after native CI). Protected file export, clipboard, disabled-user re-enable and cross-host H2/H3 E2E remain open; local client import with native H2 E2E has since been merged in PR #81.
 
 ## Client: import and TLS trust
 
@@ -55,7 +55,7 @@ The new `theia://v1` link is offered only **after** strict document validation a
 - Durable profile and credential-file writes need a tested transaction/rollback strategy; Windows ACL checks, crash and collision tests must pass before declaring P0. Safe preview must work with token masked.
 - Client file import and TUI profile creation are **M4.4c**; real server-issue → file/link → Windows-client import → validated H3/H2 OPEN_OK E2E (and negative cases) is **M4.4d**.
 
-## M4.4c client-side local import (implementation under native CI)
+## M4.4c client-side local import (merged; native Linux/Windows CI passed)
 
 With explicit \`theia tui --role client --config FILE\`, \`i\` accepts a pasted \`theia://v1\` URI or absolute local text-file path. Input is **never echoed**, including in error paths; preview shows only ID, endpoint, TLS SNI, transport and whether a token is included. Bracketed paste is enabled in the terminal. No remote URL, file from invitation, or automatic connect/system proxy.
 
@@ -63,7 +63,7 @@ An optional separate \`c\` step selects a **pre-trusted** \`file:/absolute/ca.pe
 
 After final \`y\` the importer reuses guarded typed TOML validation/atomic save in a background worker. External edits/failed saves roll back the new private token when safe. A post-rename fsync ambiguity preserves the file referenced by the observed committed TOML rather than deleting it and silently breaking configuration. Link input is dropped/zeroized best-effort; caller retains responsibility for source file, terminal/SSH scrollback and private folder. Import success is **not** a claim of TLS connection or token acceptance until a separately selected profile reaches real \`OPEN_OK\`.
 
-Native Linux/Windows integration verifies the actual \`theia client run\` binary with imported private bearer, separately trusted CA, SOCKS5 and HTTP CONNECT over real authenticated H2 (including distinct user action to change active profile). This PR **does not** complete F-14: cross-host Linux→Windows/H3, full ACL/adversarial and crash/recovery matrix, more protected export options and M4.3 Windows proxy remain release blockers. [ADR-0055](adr/0055-f14-secure-client-import.md).
+Native Linux/Windows integration verifies the actual \`theia client run\` binary with imported private bearer, separately trusted CA, SOCKS5 and HTTP CONNECT over real authenticated H2 (including distinct user action to change active profile). M4.4c **does not** complete F-14: cross-host Linux→Windows/H3, full ACL/adversarial and crash/recovery matrix, and more protected export options remain release blockers. M4.3 WinINet is independently delivered in PR #82 with additional policy/VPN acceptance still open. [ADR-0055](adr/0055-f14-secure-client-import.md).
 
 ## Security tests and limitations of M4.4a
 

@@ -82,6 +82,13 @@ class SpecContractTests(unittest.TestCase):
         self.assertNotIn("Windows пока только Unsupported", readme)
         self.assertNotIn("реализация ядра по-прежнему **отсутствует**", readme)
         self.assertIn("docs/STATUS.md", readme)
+        self.assertIn("PR #83", readme)
+        self.assertIn("PR #83", status)
+        for live_path in ("README.md", "docs/STATUS.md", "docs/CONFIGURATION.md", "docs/INVITATIONS.md"):
+            with self.subTest(live_path=live_path):
+                live = read(live_path)
+                self.assertNotIn("CI pending", live)
+                self.assertNotIn("PR/CI", live)
         self.assertIn("14/14 SUCCESS", status)
         self.assertIn("только после", status)
         for item in ("F-13", "F-14", "F-18", "F-19", "M4.3"):
