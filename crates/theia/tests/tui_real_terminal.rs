@@ -3,7 +3,7 @@
 //! status confirms real shared H2/H3 auth publication (not fake TUI receipts).
 #![cfg(any(target_os = "linux", target_os = "windows"))]
 
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine as _};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
