@@ -87,7 +87,10 @@ async fn main() {
             match server::tls_fingerprint_file(Path::new(&config)) {
                 Ok(digest) => Ok(format!(
                     "theia-tls-pem-v1 sha256={}",
-                    digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                    digest
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
                 )),
                 Err(error) => Err(CliError::Server(error)),
             }
