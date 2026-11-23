@@ -276,9 +276,7 @@ impl ReloadPreflight {
 
     /// Advisory only. Actual admission accounting must be checked under
     /// the single quota mutex at CAS, not here during filesystem I/O.
-    pub(crate) fn check_quota_file(
-        &self,
-    ) -> Result<(), crate::restart_guard::RestartError> {
+    pub(crate) fn check_quota_file(&self) -> Result<(), crate::restart_guard::RestartError> {
         let _single_flight = self
             .restart_probe_lock
             .try_lock()
