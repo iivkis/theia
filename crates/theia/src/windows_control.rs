@@ -369,7 +369,10 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut sid: *mut c_void = null_mut();
             // SAFETY: NUL-terminated string and writable result, LocalAlloc.
-            assert_ne!(unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) }, 0);
+            assert_ne!(
+                unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) },
+                0
+            );
             assert!(!sid.is_null());
             Descriptor(sid)
         }
@@ -389,8 +392,7 @@ mod tests {
             // SAFETY: successful GetAce points at a valid ACE_HEADER.
             let header = unsafe { (*ace).Header };
             assert_eq!(
-                header.AceType,
-                ACCESS_ALLOWED_ACE_TYPE as u8,
+                header.AceType, ACCESS_ALLOWED_ACE_TYPE as u8,
                 "only explicit access-allowed ACEs permitted"
             );
             assert_eq!(header.AceFlags, 0, "no inherited or unusual ACE flags");
@@ -409,7 +411,10 @@ mod tests {
                 panic!("unexpected principal granted access to management Named Pipe");
             }
         }
-        assert!(user_found && system_found, "DACL must grant exactly user and SYSTEM");
+        assert!(
+            user_found && system_found,
+            "DACL must grant exactly user and SYSTEM"
+        );
     }
 
     #[tokio::test]
