@@ -305,14 +305,12 @@ mod tests {
     #[tokio::test]
     async fn named_pipe_kernel_dacl_contains_only_current_sid_and_system() {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::{
-            Security::{
-                Authorization::{
-                    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
-                    SE_KERNEL_OBJECT,
-                },
-                DACL_SECURITY_INFORMATION,
+        use windows_sys::Win32::Security::{
+            Authorization::{
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
+                SE_KERNEL_OBJECT,
             },
+            DACL_SECURITY_INFORMATION,
         };
         let pipe = WindowsServer::bind(&id(), 1).unwrap();
         let mut security: *mut c_void = null_mut();
@@ -352,9 +350,8 @@ mod tests {
         }
         assert!(length < 1024);
         // SAFETY: allocation remains valid until LocalFree below.
-        let observed = String::from_utf16(unsafe {
-            std::slice::from_raw_parts(text, length)
-        }).unwrap();
+        let observed =
+            String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) }).unwrap();
         // SAFETY: free exactly the text allocated by the NT converter.
         unsafe { LocalFree(text.cast()) };
         let sid = current_user_sid().unwrap();
@@ -363,7 +360,10 @@ mod tests {
         assert!(observed.contains(";;;SY)"));
         assert_eq!(observed.matches("(A;").count(), 2, "exactly two allow ACEs");
         for banned in [";;;WD)", ";;;AN)", ";;;AU)", ";;;BU)", ";;;BA)"] {
-            assert!(!observed.contains(banned), "default Everyone/anonymous/broad ACL leaked");
+            assert!(
+                !observed.contains(banned),
+                "default Everyone/anonymous/broad ACL leaked"
+            );
         }
     }
 
