@@ -85,6 +85,10 @@ pub enum StatusCommand {
     /// Read-only restart readiness: validates TLS and tests fresh TCP/UDP ports.
     /// Never reserves a port, stops listeners or commits new runtime state.
     CheckRestart,
+    /// Advisory last-same-port-identity recovery readiness (no PEM values).
+    CheckTlsRollback,
+    /// Explicit one-shot CAS on the protected native management endpoint.
+    ApplyTlsRollback { expected_revision: u64 },
     /// Read-only validation of a quota-only saved candidate.
     CheckQuota,
     /// Native occupancy-aware quota resize, mandatory revision/SHA CAS.
@@ -140,6 +144,8 @@ pub enum StatusReply {
     RestartApplied {
         revision: u64,
     },
+    TlsRollbackReady { revision: u64, remaining_seconds: u64 },
+    TlsRollbackApplied { revision: u64 },
     Applied {
         revision: u64,
     },
@@ -444,6 +450,52 @@ where
                     "ERR unsupported\n".to_owned()
                 }
             }
+            b"tls-rollback-check" => {
+                if let Some(runtime) = &runtime {
+                    match runtime.rollback_status() {
+                        Some((revision, seconds)) => format!(
+                            "theia-tls-rollback-v1 ready revision={revision} seconds={seconds}\n"
+                        ),
+                        None => "theia-tls-rollback-v1 unavailable\n".to_owned(),
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
+            }
+            candidate if parse_tls_rollback_revision(candidate).is_some() => {
+                if let (Some(runtime), Some(previous), Some(restarts)) =
+                    (&runtime, &observed, &restarts)
+                {
+                    let expected = parse_tls_rollback_revision(candidate)
+                        .expect("validated rollback revision");
+                    if runtime.still_current(previous, expected)
+                        && runtime.rollback_status().map(|(revision, _)| revision) == Some(expected)
+                    {
+                        let (complete, response) = oneshot::channel();
+                        let request = crate::runtime_generation::RestartRequest {
+                            kind: crate::runtime_generation::ChangeKind::Rollback,
+                            previous: Arc::clone(previous),
+                            expected_revision: expected,
+                            candidate: previous.document.as_ref().clone(),
+                            material: None,
+                            complete,
+                        };
+                        if restarts.try_send(request).is_err() {
+                            "theia-tls-rollback-v1 rejected\n".to_owned()
+                        } else {
+                            match response.await {
+                                Ok(Ok(revision)) =>
+                                    format!("theia-tls-rollback-v1 applied revision={revision}\n"),
+                                _ => "theia-tls-rollback-v1 rejected\n".to_owned(),
+                            }
+                        }
+                    } else {
+                        "theia-tls-rollback-v1 rejected\n".to_owned()
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
+            }
             b"check-quota" => {
                 if let Some(preflight) = preflight {
                     match tokio::task::spawn_blocking(move || preflight.check_quota_file()).await {
@@ -615,6 +667,14 @@ fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_tls_rollback_revision(command: &[u8]) -> Option<u64> {
+    let raw = std::str::from_utf8(
+        command.strip_prefix(b"tls-rollback-apply rev=")?
+    ).ok()?;
+    positive_decimal(raw)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_quota_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
     parse_bound_command(command, b"quota-apply rev=")
 }
@@ -640,6 +700,13 @@ where
         StatusCommand::Reload => b"reload\n".to_vec(),
         StatusCommand::CheckReload => b"check-reload\n".to_vec(),
         StatusCommand::CheckRestart => b"check-restart\n".to_vec(),
+        StatusCommand::CheckTlsRollback => b"tls-rollback-check\n".to_vec(),
+        StatusCommand::ApplyTlsRollback { expected_revision } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
+            format!("tls-rollback-apply rev={expected_revision}\n").into_bytes()
+        }
         StatusCommand::CheckQuota => b"check-quota\n".to_vec(),
         StatusCommand::ApplyQuotaBound {
             expected_revision,
@@ -711,6 +778,43 @@ where
     }
     if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
         return Ok(StatusReply::Unsupported);
+    }
+    if command == StatusCommand::CheckTlsRollback {
+        let reply = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        let info = reply
+            .strip_prefix("theia-tls-rollback-v1 ready revision=")
+            .and_then(|value| value.strip_suffix('\n'))
+            .and_then(|value| value.split_once(" seconds="));
+        if let Some((revision, seconds)) = info {
+            let revision = positive_decimal(revision);
+            let remaining_seconds = positive_decimal(seconds);
+            if let (Some(revision), Some(remaining_seconds)) = (revision, remaining_seconds) {
+                if remaining_seconds <= 300 {
+                    return Ok(StatusReply::TlsRollbackReady { revision, remaining_seconds });
+                }
+            }
+        }
+        return match reply {
+            "theia-tls-rollback-v1 unavailable\n" => Err(ManagementError::CandidateRejected),
+            "ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
+        };
+    }
+    if let StatusCommand::ApplyTlsRollback { expected_revision } = command {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        let applied = text
+            .strip_prefix("theia-tls-rollback-v1 applied revision=")
+            .and_then(|line| line.strip_suffix('\n'))
+            .and_then(positive_decimal);
+        return match applied {
+            Some(revision) if Some(revision) == expected_revision.checked_add(1) => {
+                Ok(StatusReply::TlsRollbackApplied { revision })
+            }
+            _ if reply == b"theia-tls-rollback-v1 rejected\n" =>
+                Err(ManagementError::CandidateRejected),
+            _ if reply == b"ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
+        };
     }
     if command == StatusCommand::CheckQuota {
         return match reply.as_slice() {
