@@ -8,6 +8,12 @@
 
 **Вывод:** H2 и H3 обладают примитивом channel binding, но он **не** заменяет REALITY-модифицированное TLS-рукопожатие, pinned server identity, replay/active-probing defense или согласованный внешний QUIC/HTTP fingerprint. Из-за этого **F-18/F-19 остаются открытыми P0**. Следующий M3.5a1 — проектирование/audit протокола идентичности и real first-flight modified handshake feasibility; M3.5a2 — отдельная возможность QUIC/H3. Нельзя выставлять новый tls_profile или разрешать insecure verifier на основании exporter tests.
 
+## M3.5a1 — test-only независимый server identity proof (проект на crypto review)
+
+Исследовательский срез [ADR-0059](adr/0059-f18-m3-5a1-identity-research-lab.md) отделяет cryptographic server identity от обычного CA-проверенного TLS. Через `ring` Ed25519 проверяется строго подписанный typed transcript: transport H2/H3, DNS/SNI/port, fresh 32-byte CSPRNG challenge/nonce, миллисекундный freshness и **экспортёр конкретного уже проверенного TLS-канала**. Отрицательные тесты не принимают неправильный pin, изменённый transport/name/nonce/exporter, повтор, истёкший proof или переполненный bounded replay cache. Отдельный loopback TLS1.3/H2 test действительно передаёт challenge/proof поверх защищённой сессии. Существующий H3/QUIC exporter test остаётся отдельным, и H3 identity flight **ещё не реализован**.
+
+Этот код существует **только в CI integration tests**, не доступен из production server/client, не меняет TOML/invite v1 и **не является** REALITY-подобным режимом, реальным on-wire contract, anti-probing или TLS camouflage. Подпись после обычного TLS не скрывает первый TLS/QUIC handshake. M3.5a2 QUIC first-flight и независимый security review остаются блокирующими перед любым user-facing mode. Нельзя считать F-18 выполненным по этим тестам.
+
 ## M3.5b1 — чистый offline planner кандидатов (реализован частично)
 
 Файл `crates/theia/src/camouflage_discovery.rs`, integration tests `crates/theia/tests/camouflage_discovery.rs`, ADR-0022. Код в текущем *едином* Rust binary (library module) без новых зависимостей, не имеет ни socket/DNS/HTTP/TLS вызовов, ни CLI/TUI команды:
