@@ -6,7 +6,7 @@
 //! disk, PEM, network and the async supervisor are never run under this lock.
 use crate::{
     config::ServerDocument,
-    live_auth::{LiveAuthError, LiveAuthorization},
+    live_auth::{LiveAuthError, LiveAuthorization, StagedAuthorization},
     reload_preflight::ReloadPreflight,
 };
 use std::sync::{Arc, RwLock};
@@ -62,6 +62,40 @@ impl State {
         view.live
             .stage(candidate, expected)
             .and_then(|staged| view.live.publish(staged))
+    }
+
+    /// Same-port identity rotation: one short writer CAS for the persisted
+    /// management snapshot and a staged authorization revision. The caller
+    /// has pre-built BOTH H2+H3 configs and already acquired all H2 locks,
+    /// so the final transport swap itself is infallible and synchronous.
+    ///
+    /// Old tunnels keep their negotiated TLS and shared authorization cell.
+    /// Rejected stale/foreign snapshots do not invoke the swap closure.
+    pub(crate) fn commit_tls_rotation(
+        &self,
+        previous: &Arc<View>,
+        expected: u64,
+        next: View,
+        authorization: StagedAuthorization,
+        swap_new_tls: impl FnOnce(),
+    ) -> Result<u64, LiveAuthError> {
+        let mut guard = self
+            .current
+            .write()
+            .map_err(|_| LiveAuthError::Unavailable)?;
+        if !Arc::ptr_eq(&guard, previous) || previous.live.revision()? != expected {
+            return Err(LiveAuthError::StaleRevision);
+        }
+        let next_revision = expected
+            .checked_add(1)
+            .ok_or(LiveAuthError::RevisionExhausted)?;
+        let actual = previous.live.publish(authorization)?;
+        if actual != next_revision {
+            return Err(LiveAuthError::StaleRevision);
+        }
+        swap_new_tls();
+        *guard = Arc::new(next);
+        Ok(actual)
     }
 
     /// Linearization point for a prepared fresh-port listener generation.
