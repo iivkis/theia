@@ -175,12 +175,18 @@ fn rollback(env_key: &str, endpoint: &str, expected: u64, succeeds: bool) {
         env_key,
         endpoint,
         &[
-            "server", "tls", "rollback", "--apply",
-            "--expected-revision", &expected.to_string(), "--confirm",
+            "server",
+            "tls",
+            "rollback",
+            "--apply",
+            "--expected-revision",
+            &expected.to_string(),
+            "--confirm",
         ],
     );
     assert_eq!(
-        output.status.success(), succeeds,
+        output.status.success(),
+        succeeds,
         "rollback CAS: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -188,14 +194,17 @@ fn rollback(env_key: &str, endpoint: &str, expected: u64, succeeds: bool) {
     if succeeds {
         assert!(String::from_utf8_lossy(&output.stdout)
             .contains("previous same-port H2/H3 TLS identity restored from memory"));
-        assert!(String::from_utf8_lossy(&output.stdout)
-            .contains(&format!("revision={}", expected + 1)));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!("revision={}", expected + 1))
+        );
     }
 }
 
 fn check_rollback(env_key: &str, endpoint: &str, revision: u64) -> bool {
     let output = cli(env_key, endpoint, &["server", "tls", "rollback", "--check"]);
-    if !output.status.success() { return false; }
+    if !output.status.success() {
+        return false;
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     text.contains(&format!("revision={revision}"))
         && text.contains("remaining_seconds=")
@@ -793,13 +802,19 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
         let mut previous_only = RootCertStore::empty();
         previous_only.add(next_identity.cert.der().clone()).unwrap();
         let recovered_h2 = H2Client::new(
-            &format!("127.0.0.1:{tcp_port}"), "localhost",
-            &credential(0x43), previous_only.clone(),
-        ).unwrap();
+            &format!("127.0.0.1:{tcp_port}"),
+            "localhost",
+            &credential(0x43),
+            previous_only.clone(),
+        )
+        .unwrap();
         let recovered_h3 = H3Client::new(
             format!("127.0.0.1:{udp_port}").parse().unwrap(),
-            "localhost", &credential(0x43), previous_only,
-        ).unwrap();
+            "localhost",
+            &credential(0x43),
+            previous_only,
+        )
+        .unwrap();
         assert!(recovered_h2.open(address.clone(), echo_port).await.is_ok());
         assert!(recovered_h3.open(address, echo_port).await.is_ok());
         assert!(server.0.try_wait().unwrap().is_none());
