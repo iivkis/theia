@@ -169,7 +169,8 @@ Usage:\n\
   theia tui [--role server|client] [--config <path>]\n\
   theia server run --config <path>\n\
   theia server status                # read-only Linux opt-in IPC\n\
-  theia server reload --check        # check only, no Apply/reload\n\
+  theia server reload --check        # read-only compatibility check\n\\
+  theia server reload --expected-revision N  # Linux CAS auth Apply\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
@@ -183,7 +184,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
-            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check\nTLS 1.3/H2 and QUIC/H3 server inbounds; Linux read-only status requires a private THEIA_CONTROL_DIR.")
+            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server reload --expected-revision N\nLinux-only CAS auth Apply requires private THEIA_CONTROL_DIR and expected active revision; TLS/listener and policy cannot change.")
         }
         Command::Help(Some("client")) => {
             Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")
