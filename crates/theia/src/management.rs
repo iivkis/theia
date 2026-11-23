@@ -1,8 +1,8 @@
-//! M4.2b1b: bounded Linux local management IPC with explicit CAS auth Apply.
+//! M4.2c: bounded Linux management IPC with exact-content-bound TUI CAS Apply.
 //!
 //! Linux-only opt-in endpoint via THEIA_CONTROL_DIR, a private, operator-owned
 //! runtime directory. No administrative TCP, token disclosure or TLS/listener mutation.
-//! Windows Named Pipe/DACL and TUI Apply remain separate milestones.
+//! Windows Named Pipe/DACL remains a separate milestone.
 //! The endpoint exists only while a server process is actually serving.
 use std::fmt;
 
@@ -32,7 +32,7 @@ const SOCKET_NAME: &str = "theia-server.sock";
 #[cfg(target_os = "linux")]
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
-const MAX_COMMAND_BYTES: usize = 64;
+const MAX_COMMAND_BYTES: usize = 128;
 #[cfg(target_os = "linux")]
 const MAX_RESPONSE_BYTES: u64 = 128;
 #[cfg(target_os = "linux")]
@@ -79,6 +79,11 @@ pub enum StatusCommand {
     /// Explicit opt-in CAS auth publication, supported only by Linux server.
     ApplyReload {
         expected_revision: u64,
+    },
+    /// Confirm exact saved TOML bytes, not an unrelated file on this server.
+    ApplyReloadBound {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
     },
 }
 
@@ -294,6 +299,35 @@ async fn handle(
                     "ERR unsupported\n".to_owned()
                 }
             }
+            candidate if parse_bound_revision(candidate).is_some() => {
+                if let (Some(preflight), Some(live)) = (preflight, live) {
+                    let (expected, sha256) =
+                        parse_bound_revision(candidate).expect("already parsed");
+                    // Worker is read-only even after IPC cancellation.
+                    // The exact same validated bytes are committed only from
+                    // the live async task under CAS, never by the worker.
+                    match tokio::task::spawn_blocking(move || {
+                        preflight.load_candidate_bound(sha256)
+                    })
+                    .await
+                    {
+                        Ok(Ok(candidate)) => {
+                            match live
+                                .stage(&candidate, expected)
+                                .and_then(|stage| live.publish(stage))
+                            {
+                                Ok(revision) => {
+                                    format!("theia-apply-v1 applied revision={revision}\n")
+                                }
+                                Err(_) => "theia-apply-v1 rejected\n".to_owned(),
+                            }
+                        }
+                        _ => "theia-apply-v1 rejected\n".to_owned(),
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
+            }
             candidate if parse_apply_revision(candidate).is_some() => {
                 if let (Some(preflight), Some(live)) = (preflight, live) {
                     let expected = parse_apply_revision(candidate).expect("already parsed");
@@ -345,6 +379,27 @@ fn parse_apply_revision(command: &[u8]) -> Option<u64> {
     positive_decimal(std::str::from_utf8(raw).ok()?)
 }
 
+/// Canonical lowercase hex only; no ambiguity or relaxed delimiters.
+#[cfg(target_os = "linux")]
+fn decode_digest(raw: &str) -> Option<[u8; 32]> {
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let mut digest = [0u8; 32];
+    for (i, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&raw[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_bound_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
+    let rest = std::str::from_utf8(command.strip_prefix(b"apply-reload rev=")?).ok()?;
+    let (revision, digest) = rest.split_once(" sha256=")?;
+    Some((positive_decimal(revision)?, decode_digest(digest)?))
+}
+
 #[cfg(target_os = "linux")]
 pub async fn query_in(
     directory: &Path,
@@ -365,6 +420,19 @@ pub async fn query_in(
                     return Err(ManagementError::InvalidReply);
                 }
                 format!("apply-reload rev={expected_revision}\n").into_bytes()
+            }
+            StatusCommand::ApplyReloadBound {
+                expected_revision,
+                candidate_sha256,
+            } => {
+                if expected_revision == 0 {
+                    return Err(ManagementError::InvalidReply);
+                }
+                let digest = candidate_sha256
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                format!("apply-reload rev={expected_revision} sha256={digest}\n").into_bytes()
             }
         };
         stream
@@ -393,7 +461,10 @@ pub async fn query_in(
                 _ => Err(ManagementError::InvalidReply),
             };
         }
-        if let StatusCommand::ApplyReload { expected_revision } = command {
+        if let StatusCommand::ApplyReload { expected_revision }
+        | StatusCommand::ApplyReloadBound {
+            expected_revision, ..
+        } = command {
             let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
             if let Some(revision) = text
                 .strip_prefix("theia-apply-v1 applied revision=")
