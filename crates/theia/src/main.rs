@@ -22,6 +22,44 @@ async fn main() {
             .await
             .map(|_| "client stopped".to_owned())
             .map_err(CliError::Client),
+        Ok(Command::ClientRunSystemProxy { config }) => {
+            #[cfg(windows)]
+            {
+                local_proxy::run_file_with_system_proxy(Path::new(&config))
+                    .await
+                    .map(|_| "client stopped; conditional WinINet proxy restore completed".to_owned())
+                    .map_err(CliError::Client)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = config;
+                Err(CliError::NotImplemented("Windows user proxy"))
+            }
+        }
+        Ok(Command::ClientProxyStatus) => {
+            #[cfg(windows)]
+            {
+                let state = theia::windows_system_proxy::status()
+                    .map_err(CliError::SystemProxy)?;
+                Ok(format!("Windows user proxy recovery status: {state:?}; no changes"))
+            }
+            #[cfg(not(windows))]
+            {
+                Err(CliError::NotImplemented("Windows user proxy"))
+            }
+        }
+        Ok(Command::ClientProxyRecover) => {
+            #[cfg(windows)]
+            {
+                let state = theia::windows_system_proxy::recover_explicit()
+                    .map_err(CliError::SystemProxy)?;
+                Ok(format!("Windows user proxy recovery: {state:?}; no foreign edits overwritten"))
+            }
+            #[cfg(not(windows))]
+            {
+                Err(CliError::NotImplemented("Windows user proxy"))
+            }
+        }
         Ok(Command::ServerStatus) => {
             match management::query_environment(management::StatusCommand::Status).await {
                 Ok(management::StatusReply::Running { inbounds }) => Ok(format!(
