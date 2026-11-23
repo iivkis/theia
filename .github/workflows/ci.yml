@@ -194,6 +194,9 @@ jobs:
         run: python -m pip install pywinpty==3.0.5 pyte==0.8.2
       - name: Native Windows tests
         run: cargo test --workspace --all-targets --locked
+      - name: Cross-logon Windows pipe kernel-denial E2E (mandatory)
+        shell: pwsh
+        run: ./scripts/windows-cross-sid-ci.ps1
       - name: Native Windows release compilation only after main merge
         if: github.event_name != 'pull_request'
         run: cargo build --workspace --release --locked
