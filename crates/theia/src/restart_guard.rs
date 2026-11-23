@@ -46,6 +46,16 @@ impl fmt::Display for RestartError {
 }
 impl std::error::Error for RestartError {}
 
+/// Conservative overlap policy. A wildcard listener may occupy both the
+/// explicit address and, on some platforms, a dual-stack IPv4/IPv6 bind.
+/// False positives only request maintenance, never an unsafe cutover.
+fn conflicts_with_active(old: SocketAddr, candidate: SocketAddr) -> bool {
+    old.port() == candidate.port()
+        && (old.ip() == candidate.ip()
+            || old.ip().is_unspecified()
+            || candidate.ip().is_unspecified())
+}
+
 /// Call only on a blocking worker with a bounded TOML document. Never return
 /// the candidate's filesystem paths, tokens or PEM data over IPC.
 pub(crate) fn probe(
@@ -122,7 +132,9 @@ pub(crate) fn probe(
             .quic_listen
             .parse()
             .map_err(|_| RestartError::InvalidConfig)?;
-        if current_tcp.contains(&tcp) || current_udp.contains(&udp) {
+        if current_tcp.iter().any(|old| conflicts_with_active(*old, tcp))
+            || current_udp.iter().any(|old| conflicts_with_active(*old, udp))
+        {
             return Ok(RestartVerdict::RequiresMaintenance);
         }
         next_tcp.push(tcp);
@@ -145,4 +157,25 @@ pub(crate) fn probe(
     drop(udp_probes);
     drop(tcp_probes);
     Ok(RestartVerdict::FreshPortsBindable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_and_dual_stack_bind_aliases_force_maintenance_instead_of_blind_rebind() {
+        let local: SocketAddr = "127.0.0.1:9443".parse().unwrap();
+        let v4_wildcard: SocketAddr = "0.0.0.0:9443".parse().unwrap();
+        let v6_wildcard: SocketAddr = "[::]:9443".parse().unwrap();
+        let different_port: SocketAddr = "127.0.0.1:9444".parse().unwrap();
+        assert!(conflicts_with_active(local, v4_wildcard));
+        assert!(conflicts_with_active(v4_wildcard, local));
+        assert!(conflicts_with_active(v6_wildcard, local));
+        assert!(!conflicts_with_active(local, different_port));
+        assert!(!conflicts_with_active(
+            "127.0.0.1:9443".parse().unwrap(),
+            "127.0.0.2:9443".parse().unwrap()
+        ));
+    }
 }
