@@ -5,13 +5,14 @@
 use crate::{
     tui_candidate_batch::CandidateBatchPanel, tui_candidates::CandidateReview,
     tui_discovery::DiscoveryPanel, tui_domain::DomainPanel, tui_editor::Editor,
+    client_import, invite::Invitation,
     tui_probe::ProbePanel, tui_runtime::RuntimePanel, Role,
 };
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, DisableBracketedPaste, EnableBracketedPaste, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -65,14 +66,14 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        execute!(io::stdout(), EnterAlternateScreen, Hide, EnableBracketedPaste)?;
         Ok(guard)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -177,6 +178,30 @@ enum IssueFlow {
     Showing(Zeroizing<String>),
 }
 
+/// Client-only F-14 local file/pasted URI import. Only safe fields may render.
+/// A decoded invitation can hold a live bearer; no Debug and no cloning.
+enum ImportFlow {
+    Input(Zeroizing<String>),
+    Preview {
+        invitation: Invitation,
+        ca: Option<String>,
+        public_ref: Option<String>,
+    },
+    Trust {
+        invitation: Invitation,
+        ca: String,
+        public_ref: Option<String>,
+    },
+    Credential {
+        invitation: Invitation,
+        ca: Option<String>,
+        reference: String,
+    },
+    Saving,
+    Done,
+    Failed,
+}
+
 /// A deliberate server-only global account disable. No bearer is displayed,
 /// and a confirmed change stays pending until guarded TOML save succeeds.
 enum DisableFlow {
@@ -193,6 +218,7 @@ struct Interaction {
     editor: Option<Editor>,
     issuance: Option<IssueFlow>,
     revocation: Option<DisableFlow>,
+    importing: Option<ImportFlow>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
     candidate_batch: Option<CandidateBatchPanel>,
@@ -209,6 +235,7 @@ impl Interaction {
             editor,
             issuance: None,
             revocation: None,
+            importing: None,
             discovery: None,
             candidates: None,
             candidate_batch: None,
@@ -233,6 +260,37 @@ impl Interaction {
         });
     }
 
+    fn start_import(
+        &mut self,
+        invitation: Invitation,
+        ca: Option<String>,
+        public_ref: Option<String>,
+    ) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.saving = Some(rx);
+        let _worker = std::thread::spawn(move || {
+            let saved = editor
+                .import_invitation(&invitation, ca.as_deref(), public_ref.as_deref())
+                .is_ok();
+            let _ = tx.send((editor, saved));
+        });
+    }
+
+    /// Bracketed-paste source text stays in memory and is never rendered.
+    fn paste_import_source(&mut self, text: &str) {
+        if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
+            let input = text.trim_end_matches(['\r', '\n']);
+            if source.len().saturating_add(input.len()) <= 4096
+                && !input.contains('\0')
+            {
+                source.push_str(input);
+            }
+        }
+    }
+
     fn poll_save(&mut self, model: &mut Model) -> Result<bool, TuiError> {
         let Some(receiver) = self.saving.as_ref() else {
             return Ok(false);
@@ -254,6 +312,9 @@ impl Interaction {
                     } else {
                         DisableFlow::SaveFailed
                     });
+                }
+                if matches!(self.importing, Some(ImportFlow::Saving)) {
+                    self.importing = Some(if saved { ImportFlow::Done } else { ImportFlow::Failed });
                 }
                 if saved {
                     if let Some(original) = self.pending.take() {
@@ -542,6 +603,122 @@ impl Interaction {
             return false;
         }
 
+        if let Some(flow) = self.importing.take() {
+            match flow {
+                ImportFlow::Input(mut source) => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter if !source.is_empty() => {
+                        match client_import::read_source(source.trim()) {
+                            Ok(invitation) => {
+                                editor.error = None;
+                                self.importing = Some(ImportFlow::Preview {
+                                    invitation,
+                                    ca: None,
+                                    public_ref: None,
+                                });
+                            }
+                            Err(_) => {
+                                editor.error = Some("Неверный URI или локальный файл приглашения.".into());
+                                self.importing = Some(ImportFlow::Input(source));
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        source.pop();
+                        self.importing = Some(ImportFlow::Input(source));
+                    }
+                    KeyCode::Char(ch)
+                        if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                            && !ch.is_control()
+                            && source.len() + ch.len_utf8() <= 4096 =>
+                    {
+                        source.push(ch);
+                        self.importing = Some(ImportFlow::Input(source));
+                    }
+                    _ => self.importing = Some(ImportFlow::Input(source)),
+                },
+                ImportFlow::Preview { invitation, ca, public_ref } => match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => {}
+                    KeyCode::Char('c') => self.importing = Some(ImportFlow::Trust {
+                        invitation,
+                        ca: ca.unwrap_or_default(),
+                        public_ref,
+                    }),
+                    KeyCode::Char('e') if !invitation.has_token() => {
+                        self.importing = Some(ImportFlow::Credential {
+                            invitation,
+                            ca,
+                            reference: public_ref.unwrap_or_default(),
+                        });
+                    }
+                    KeyCode::Char('y') => {
+                        if !invitation.has_token() && public_ref.is_none() {
+                            editor.error = Some("Публичное приглашение требует отдельную env: ссылку на секрет.".into());
+                            self.importing = Some(ImportFlow::Preview { invitation, ca, public_ref });
+                        } else {
+                            self.importing = Some(ImportFlow::Saving);
+                            self.start_import(invitation, ca, public_ref);
+                        }
+                    }
+                    _ => self.importing = Some(ImportFlow::Preview { invitation, ca, public_ref }),
+                },
+                ImportFlow::Trust { invitation, mut ca, public_ref } => match key.code {
+                    KeyCode::Esc => self.importing = Some(ImportFlow::Preview {
+                        invitation, ca: None, public_ref,
+                    }),
+                    KeyCode::Enter => {
+                        let verified = if ca.is_empty() {
+                            Ok(None)
+                        } else {
+                            client_import::checked_ca_ref(Some(&ca))
+                        };
+                        match verified {
+                            Ok(value) => {
+                                editor.error = None;
+                                self.importing = Some(ImportFlow::Preview {
+                                    invitation, ca: value, public_ref,
+                                });
+                            }
+                            Err(_) => {
+                                editor.error = Some("CA-файл должен быть доверенным PEM по абсолютному file: пути.".into());
+                                self.importing = Some(ImportFlow::Trust { invitation, ca, public_ref });
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => { ca.pop(); self.importing = Some(ImportFlow::Trust { invitation, ca, public_ref }); }
+                    KeyCode::Char(ch) if !ch.is_control() && ca.len() + ch.len_utf8() <= 1024 => {
+                        ca.push(ch);
+                        self.importing = Some(ImportFlow::Trust { invitation, ca, public_ref });
+                    }
+                    _ => self.importing = Some(ImportFlow::Trust { invitation, ca, public_ref }),
+                },
+                ImportFlow::Credential { invitation, ca, mut reference } => match key.code {
+                    KeyCode::Esc => self.importing = Some(ImportFlow::Preview { invitation, ca, public_ref: None }),
+                    KeyCode::Enter if client_import::valid_explicit_reference(&reference) => {
+                        editor.error = None;
+                        self.importing = Some(ImportFlow::Preview { invitation, ca, public_ref: Some(reference) });
+                    }
+                    KeyCode::Enter => {
+                        editor.error = Some("Нужна явная ссылка env:NAME, без значения токена.".into());
+                        self.importing = Some(ImportFlow::Credential { invitation, ca, reference });
+                    }
+                    KeyCode::Backspace => { reference.pop(); self.importing = Some(ImportFlow::Credential { invitation, ca, reference }); }
+                    KeyCode::Char(ch) if ch.is_ascii_graphic() && reference.len() < 128 => {
+                        reference.push(ch);
+                        self.importing = Some(ImportFlow::Credential { invitation, ca, reference });
+                    }
+                    _ => self.importing = Some(ImportFlow::Credential { invitation, ca, reference }),
+                },
+                ImportFlow::Saving => self.importing = Some(ImportFlow::Saving),
+                ImportFlow::Done | ImportFlow::Failed => {
+                    if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                        self.importing = Some(flow);
+                    }
+                }
+            }
+            return false;
+        }
+
         if let Some(original) = self.pending {
             match key.code {
                 KeyCode::Char('s') => {
@@ -641,6 +818,15 @@ impl Interaction {
                 } else {
                     editor.error = None;
                     self.revocation = Some(DisableFlow::Input(String::new()));
+                }
+                return false;
+            }
+            if editor.role() == Role::Client && key.code == KeyCode::Char('i') {
+                if editor.dirty() {
+                    editor.error = Some("Сохраните или отмените черновик перед импортом.".into());
+                } else {
+                    editor.error = None;
+                    self.importing = Some(ImportFlow::Input(Zeroizing::new(String::new())));
                 }
                 return false;
             }
@@ -778,7 +964,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                     frame,
                     parts[1],
                     "Для клиента",
-                    "Профиль: не выбран\nЛокальный прокси: состояние неизвестно\nТранспорт: не проверялся\nСистемный прокси Windows: не изменён\n\nЭтот экран только для чтения. Подключение, редактирование и управление системным прокси пока недоступны.",
+                    "Профиль: не выбран\nЛокальный прокси: состояние неизвестно\nТранспорт: не проверялся\nСистемный прокси Windows: не изменён\n\nЭтот экран только для чтения. С --role client --config FILE можно импортировать приглашение клавишей i. Подключение и системный прокси не запускаются автоматически.",
                     true,
                 );
             }
@@ -787,7 +973,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, x: подтверждённое глобальное отключение существующего пользователя (только TOML), p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer. В серверной панели u создаёт пользователя, x: подтверждённое глобальное отключение существующего пользователя (только TOML), p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
             true,
         ),
     }
@@ -815,6 +1001,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             flow,
             interaction.and_then(|ui| ui.editor.as_ref()),
         );
+    } else if let Some(flow) = interaction.and_then(|ui| ui.importing.as_ref()) {
+        draw_import(frame, parts[1], flow, interaction.and_then(|ui| ui.editor.as_ref()));
     } else if interaction.is_some_and(|ui| ui.pending.is_some()) {
         panel(
             frame,
@@ -866,7 +1054,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  u: новый  x: отключить  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить",
+            "j/k: запись  Tab: поле  Enter/e: ввод  i: импорт  u: новый  x: отключить  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
@@ -950,6 +1138,55 @@ fn draw_revocation(frame: &mut Frame<'_>, area: Rect, flow: &DisableFlow, editor
     panel(frame, area, title, &body, true);
 }
 
+fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Option<&Editor>) {
+    let (title, body) = match flow {
+        ImportFlow::Input(source) => (
+            "F-14: импорт подключения",
+            format!(
+                "Введите или вставьте theia://v1/... либо абсолютный путь локального файла.\nИсточник и bearer НИКОГДА не показываются в TUI.\nВведено {} байт (скрыто).\n\nEnter: проверить  Esc: отменить\n\n{}",
+                source.len(),
+                editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        ImportFlow::Preview { invitation, ca, public_ref } => (
+            "F-14: безопасный предпросмотр подключения",
+            format!(
+                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nTransport: {:?}\nBearer: {}\nCA trust: {}\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\nНикакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
+                invitation.id, invitation.endpoint, invitation.server_name,
+                invitation.transport,
+                if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },
+                if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
+                if invitation.has_token() { "".into() } else { format!("e: указать env:NAME ({})\n", if public_ref.is_some() { "задано" } else { "обязательно" }) },
+                editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        ImportFlow::Trust { ca, .. } => (
+            "F-14: отдельный TLS trust",
+            format!(
+                "Укажите ПРЕДВАРИТЕЛЬНО доверенный file:/абсолютный/ca.pem.\nПуть введён: {} символов.\nПустое значение оставляет профиль неготовым.\n\nEnter: проверить CA  Esc: назад\n\n{}",
+                ca.len(), editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        ImportFlow::Credential { reference, .. } => (
+            "F-14: отдельная учётная запись для публичного приглашения",
+            format!(
+                "Укажите заранее созданную env:NAME ссылку (НЕ значение bearer).\nВведено {} символов, скрыто.\n\nEnter: принять  Esc: назад\n\n{}",
+                reference.len(), editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+        ImportFlow::Saving => ("F-14: безопасное сохранение", "Создание нового приватного bearer и guarded TOML commit. Секрет не отображается.\nНикакого подключения или системного прокси.".into()),
+        ImportFlow::Done => ("Импорт сохранён", "Новый профиль добавлен, исходный active_profile не изменён.\nTLS trust должен быть независимо проверен при подключении.\nНикаких сетевых соединений или OS proxy изменений.\n\nEnter/Esc: закрыть".into()),
+        ImportFlow::Failed => (
+            "Импорт НЕ подтверждён",
+            format!(
+                "Проверьте состояние TOML перед повторной попыткой. При отказе до commit новый секрет удалён.\nНикакого connect/OS proxy.\n\n{}\n\nEnter/Esc: закрыть",
+                editor.and_then(|e| e.error.as_deref()).unwrap_or("")
+            ),
+        ),
+    };
+    panel(frame, area, title, &body, true);
+}
+
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     let dirty = if editor.dirty() {
         "* Не сохранено"
@@ -957,7 +1194,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Отключение существующего: x (глобально по всем inbound). Ctrl+S только сохраняет; runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Отключение существующего: x (глобально по всем inbound). Клиентский импорт: i (URI/локальный файл, скрытый ввод). Ctrl+S только сохраняет; runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
@@ -1019,10 +1256,14 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if interaction.update(&mut model, key) {
-                    return Ok(());
+            match event::read()? {
+                Event::Key(key) => {
+                    if interaction.update(&mut model, key) {
+                        return Ok(());
+                    }
                 }
+                Event::Paste(text) => interaction.paste_import_source(&text),
+                _ => {}
             }
         }
     }
