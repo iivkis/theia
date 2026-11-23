@@ -52,7 +52,10 @@ impl State {
         candidate: &ServerDocument,
         expected: u64,
     ) -> Result<u64, LiveAuthError> {
-        let guard = self.current.read().map_err(|_| LiveAuthError::Unavailable)?;
+        let guard = self
+            .current
+            .read()
+            .map_err(|_| LiveAuthError::Unavailable)?;
         if !Arc::ptr_eq(&guard, view) {
             return Err(LiveAuthError::StaleRevision);
         }
@@ -70,11 +73,18 @@ impl State {
         expected: u64,
         next: View,
     ) -> Result<(), LiveAuthError> {
-        let mut guard = self.current.write().map_err(|_| LiveAuthError::Unavailable)?;
+        let mut guard = self
+            .current
+            .write()
+            .map_err(|_| LiveAuthError::Unavailable)?;
         if !Arc::ptr_eq(&guard, previous) || previous.live.revision()? != expected {
             return Err(LiveAuthError::StaleRevision);
         }
-        if next.live.revision()? != expected.checked_add(1).ok_or(LiveAuthError::RevisionExhausted)? {
+        if next.live.revision()?
+            != expected
+                .checked_add(1)
+                .ok_or(LiveAuthError::RevisionExhausted)?
+        {
             return Err(LiveAuthError::StaleRevision);
         }
         previous.live.close_new_admission()?;
@@ -112,13 +122,33 @@ mod tests {
                 Vec::new(),
             ))
         };
-        let state = State::new(View { document: Arc::new(active.clone()), inbounds: 1, preflight: preflight(), live: a.clone() });
+        let state = State::new(View {
+            document: Arc::new(active.clone()),
+            inbounds: 1,
+            preflight: preflight(),
+            live: a.clone(),
+        });
         let before = state.snapshot().unwrap();
-        let invalid = View { document: Arc::new(active.clone()), inbounds: 1, preflight: preflight(), live: b.clone() };
+        let invalid = View {
+            document: Arc::new(active.clone()),
+            inbounds: 1,
+            preflight: preflight(),
+            live: b.clone(),
+        };
         assert!(state.commit_restart(&before, 2, invalid).is_err());
         assert_eq!(state.snapshot().unwrap().live.revision(), Ok(1));
-        let foreign = Arc::new(View { document: Arc::new(active.clone()), inbounds: 1, preflight: preflight(), live: a });
-        let invalid = View { document: Arc::new(active.clone()), inbounds: 1, preflight: preflight(), live: b };
+        let foreign = Arc::new(View {
+            document: Arc::new(active.clone()),
+            inbounds: 1,
+            preflight: preflight(),
+            live: a,
+        });
+        let invalid = View {
+            document: Arc::new(active.clone()),
+            inbounds: 1,
+            preflight: preflight(),
+            live: b,
+        };
         assert!(state.commit_restart(&foreign, 1, invalid).is_err());
         assert!(Arc::ptr_eq(&state.snapshot().unwrap(), &before));
     }
