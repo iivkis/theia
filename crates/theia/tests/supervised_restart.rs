@@ -591,12 +591,16 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
 
         // Previously authenticated streams remain alive across the same-port
         // TLS swap. This is NEW handshakes-only, not hard revoke/migration.
+        let mut h2_open = Some(h2_tunnel);
+        let mut h3_open = Some(h3_tunnel);
         for old in [0u8, 1u8] {
             let (mut app, local) = tokio::io::duplex(256);
             let relay = if old == 0 {
-                tokio::spawn(h2_tunnel.relay(local))
+                let tunnel = h2_open.take().unwrap();
+                tokio::spawn(async move { tunnel.relay(local).await.map_err(|error| format!("{error}")) })
             } else {
-                tokio::spawn(h3_tunnel.relay(local))
+                let tunnel = h3_open.take().unwrap();
+                tokio::spawn(async move { tunnel.relay(local).await.map_err(|error| format!("{error}")) })
             };
             app.write_all(b"still-live").await.unwrap();
             let mut response = [0u8; 10];
