@@ -9,9 +9,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use theia::management::{
-    query_in, ManagementError, StatusCommand, StatusReply, StatusServer,
-};
+use theia::management::{query_in, ManagementError, StatusCommand, StatusReply, StatusServer};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
@@ -122,11 +120,20 @@ async fn invalid_or_oversized_messages_cannot_trigger_reload_or_hang() {
             .unwrap();
         stream.write_all(message).await.unwrap();
         let mut response = Vec::new();
-        timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        let result = timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(response, b"ERR unsupported\n");
+            .expect("bounded server must close invalid input");
+        if message.len() > 64 {
+            // Linux can reset the connection when a bounded server closes
+            // with unread bytes; both RST and ERR are safe refusals.
+            match result {
+                Ok(_) => assert_eq!(response, b"ERR unsupported\n"),
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+            }
+        } else {
+            result.unwrap();
+            assert_eq!(response, b"ERR unsupported\n");
+        }
     }
     task.abort();
     let _ = task.await;
