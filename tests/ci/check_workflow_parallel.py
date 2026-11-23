@@ -57,22 +57,33 @@ for name in ("windows-smoke", "browser-e2e"):
         f"{name} must retain the Rust readiness precondition",
     )
 require(needs("ci-gate") == mandatory, "ci-gate must depend on EVERY required job")
-require(needs("f14-cross-host") == {"specification", "rust-tests"},
-        "cross-OS Windows job must consume the exact Linux server binary from CI")
+require(needs("f14-cross-host") == {"specification", "rust-tests", "windows-smoke"},
+        "cross-OS Windows job must consume both Linux and Windows CI-built executables")
 cross_host = job("f14-cross-host")
 require("needs.specification.outputs.rust_ready == 'true'" in cross_host,
         "cross-OS acceptance must not run on specification-only PRs")
 require("runs-on: windows-2025" in cross_host,
         "cross-OS acceptance must use a real native Windows runner")
 require("name: f14-linux-server" in cross_host
-        and "actions/download-artifact@v4" in cross_host,
-        "Windows must retrieve the built Linux binary artifact")
+        and "name: f14-windows-compiled" in cross_host
+        and cross_host.count("actions/download-artifact@v4") == 2,
+        "cross-OS must retrieve both natively compiled Linux and Windows binaries")
 require("Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4" in cross_host
         and "wsl-version: 2" in cross_host,
         "Linux must run under a pinned, real WSL2 VM")
 require("scripts/f14-cross-os-ci.py" in cross_host
-        and "cargo build --workspace --locked --bin theia" in cross_host,
-        "cross-OS job must run a real Windows client executable, not a mock")
+        and "--windows-test" in cross_host
+        and "--windows-client" in cross_host
+        and "cargo build" not in cross_host
+        and "rust-toolchain" not in cross_host,
+        "cross-OS must execute precompiled Windows test harness without rebuilding Rust")
+require("Stage Windows E2E binaries already compiled by all-targets" in job("windows-smoke")
+        and "f14-windows-compiled" in job("windows-smoke")
+        and "actions/upload-artifact@v4" in job("windows-smoke"),
+        "Windows E2E binaries must come from the mandatory native Windows smoke job")
+require("python3 -m compileall -q scripts tests" in job("specification")
+        and "python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'" in job("specification"),
+        "fast Python syntax and guest IPv4 regressions must execute before native tests")
 require("continue-on-error" not in cross_host and "|| true" not in cross_host,
         "mandatory Linux/Windows integration cannot be optional")
 require("Build genuine Linux server for Windows cross-OS F-14 E2E" in job("rust-tests")
