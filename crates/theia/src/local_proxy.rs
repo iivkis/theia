@@ -92,6 +92,32 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
         let token = load_file(&profile.auth_token, 43, true)?;
         String::from_utf8(token).map_err(|_| ClientError::Configuration)?
     };
+    // F-13: runtime selection must match strict typed TOML validation even
+    // if a direct library caller bypasses document parsing. Never downgrade
+    // a named browser-style profile to rustls or apply it to QUIC/H3/auto.
+    if profile.tls_profile == "browser-h2-btls-v1" {
+        if profile.transport != Transport::H2 {
+            return Err(ClientError::Configuration);
+        }
+        #[cfg(feature = "experimental-btls-h2")]
+        {
+            return H2Client::new_browser_h2_v1(
+                &profile.server,
+                &profile.server_name,
+                &token,
+                &cert,
+            )
+            .map(Arc::new)
+            .map(ProxyClient::H2);
+        }
+        #[cfg(not(feature = "experimental-btls-h2"))]
+        {
+            return Err(ClientError::Configuration);
+        }
+    }
+    if profile.tls_profile != "default" {
+        return Err(ClientError::Configuration);
+    }
     match profile.transport {
         Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)
             .map(Arc::new)
