@@ -394,6 +394,45 @@ mod tests {
     }
 
     #[test]
+    fn tls_rollback_needs_explicit_confirmation_and_canonical_cas_revision() {
+        assert_eq!(
+            command(&["server", "tls", "rollback", "--check"]),
+            Ok(Command::ServerTlsRollbackCheck),
+        );
+        assert_eq!(
+            command(&[
+                "server", "tls", "rollback", "--apply",
+                "--expected-revision", "3", "--confirm",
+            ]),
+            Ok(Command::ServerTlsRollbackApply { expected_revision: 3 }),
+        );
+        for bad in ["0", "03", "+3", "-3", "3x", "18446744073709551616"] {
+            assert_eq!(
+                command(&[
+                    "server", "tls", "rollback", "--apply",
+                    "--expected-revision", bad, "--confirm",
+                ]),
+                Err(CliError::InvalidArguments),
+            );
+        }
+        assert_eq!(
+            command(&[
+                "server", "tls", "rollback", "--apply",
+                "--expected-revision", "3",
+            ]),
+            Err(CliError::InvalidArguments),
+            "an unconfirmed TLS rollback must never be executable",
+        );
+        assert_eq!(
+            command(&[
+                "server", "tls", "rollback", "--apply",
+                "--expected-revision", "3", "--confirm", "--force",
+            ]),
+            Err(CliError::InvalidArguments),
+        );
+    }
+
+    #[test]
     fn restart_requires_pin_of_actual_tls_pem_bytes_and_canonical_digest() {
         let hex = "ab".repeat(32);
         assert_eq!(
