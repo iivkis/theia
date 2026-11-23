@@ -39,6 +39,14 @@ On an explicitly loaded, clean server TOML, select an inbound and press `x`. Ent
 
 **Important:** this only updates `users[].disabled = true` in the saved TOML. It never calls IPC or reloads the server. A separate authorized, revisioned auth-only CAS Apply is needed to reject **new** admissions; already-authenticated H2/H3 tunnels continue. This is *not* hard revocation or token rotation. See [ADR-0053](adr/0053-m4-4b2a-explicit-existing-user-disable.md).
 
+## M4.4b2b1: explicit existing enabled-user rotation (server TUI only)
+
+In `theia tui --role server --config FILE`, select the inbound that already grants the active user, press `t`, enter that existing user ID, Enter and then `y` to explicitly confirm **global** bearer rotation. The old SHA-256 digest cannot recover the old secret; a fresh **32-byte ring CSPRNG token** replaces only `users[].token_sha256`. User ID, disabled state, all inbound grants and policy are preserved. Unknown/ungranted/disabled users, dirty editor, wrong client role, invalid auto H2/H3 ports and pending issuance are refused.
+
+The new `theia://v1` link is offered only **after** strict document validation and successful guarded atomic TOML save; external file conflict blocks reveal. `y` separately shows the confidential URI once, `n/Esc` discards unseen bearer, Esc hides a shown bearer. No file, log, CLI argv, system proxy change or automatic runtime Apply. **Until separate native IPC auth-only CAS Apply, the running server still accepts the OLD bearer for new sessions**; after Apply it accepts the new bearer and refuses the old for new sessions across all inbounds, while **already-open tunnels continue**. No immediate hard revoke or implicit re-enable. See [ADR-0054](adr/0054-m4-4b2b1-confirmed-bearer-rotation.md).
+
+**This is a bounded partial F-14 slice** (Linux/Windows native CI pending). Protected file export, clipboard, disabled-user re-enable, Windows client import/persistence and end-to-end E2E remain open.
+
 ## Client: import and TLS trust
 
 - Import from the paste buffer or a **local file**, with no automatic network fetch, shell args or web-admin API. Preview only id/endpoint/SNI/transport and whether a credential is present, **never token bytes**. Do not activate imported profiles, connect, reload, or enable system proxy without separate confirmation.
