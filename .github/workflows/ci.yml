@@ -22,6 +22,8 @@ jobs:
       rust_ready: ${{ steps.detect.outputs.rust_ready }}
     steps:
       - uses: actions/checkout@v4
+      - name: Preflight syntax of Python CI drivers (no dependencies)
+        run: python3 -m compileall -q scripts tests
       - name: Test documentation and TOML contracts
         run: bash scripts/check-spec.sh
       - name: Test required CI DAG, native E2E and Go cache contract
@@ -183,8 +185,6 @@ jobs:
           $env:THEIA_UTLS_HELLO_PATH = $hello
           cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_reference -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Rust comparison to Go uTLS failed' }
-          cargo test --workspace --locked --test fingerprint_h2 -- --ignored --nocapture
-          if ($LASTEXITCODE -ne 0) { throw 'Live Theia H2 fingerprint comparison failed' }
           Remove-Item $hello -Force
       - name: Real Windows Go uTLS H2 handshake and PKI negative tests
         shell: pwsh
@@ -264,6 +264,36 @@ jobs:
         run: python -m pip install pywinpty==3.0.5 pyte==0.8.2
       - name: Native Windows tests
         run: cargo test --workspace --all-targets --locked
+      # The root fingerprint test executable has already been built by the
+      # --all-targets command above. Running it in the M0.1 spike job instead
+      # rebuilt the entire root workspace for 5+ minutes on Windows.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
+      - name: Real Windows live Theia H2 fingerprint vs pinned Go uTLS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hello = Join-Path $env:RUNNER_TEMP "theia-utls-root-h2-hello.bin"
+          try {
+            Push-Location spikes/m0_1/utls_reference
+            try {
+              go mod verify
+              if ($LASTEXITCODE -ne 0) { throw 'Go pinned dependency verification failed' }
+              go run . $hello
+              if ($LASTEXITCODE -ne 0) { throw 'Generate pinned Chrome133 uTLS reference failed' }
+            } finally {
+              Pop-Location
+            }
+            $env:THEIA_UTLS_HELLO_PATH = $hello
+            cargo test --workspace --locked --test fingerprint_h2 -- --ignored --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'Real Windows H2 fingerprint comparison failed' }
+          } finally {
+            Remove-Item Env:THEIA_UTLS_HELLO_PATH -ErrorAction SilentlyContinue
+            Remove-Item $hello -Force -ErrorAction SilentlyContinue
+          }
       - name: Disposable Windows user WinINet proxy CAS and restore (F-07)
         shell: pwsh
         env:
