@@ -159,7 +159,14 @@ fn apply(
     config: &Path,
 ) {
     let material_sha = material_fingerprint(config);
-    apply_with_pin(env_key, endpoint, expected, hex, &material_sha, should_succeed);
+    apply_with_pin(
+        env_key,
+        endpoint,
+        expected,
+        hex,
+        &material_sha,
+        should_succeed,
+    );
 }
 
 fn write_identity(cert: &Path, key: &Path, generated: &rcgen::CertifiedKey) {
@@ -599,14 +606,7 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
         let substituted = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         write_identity(&next_cert, &next_key, &substituted);
         assert_ne!(material_fingerprint(&config_path), operator_tls_pin);
-        apply_with_pin(
-            env_key,
-            &endpoint,
-            1,
-            &hash,
-            &operator_tls_pin,
-            false,
-        );
+        apply_with_pin(env_key, &endpoint, 1, &hash, &operator_tls_pin, false);
         assert!(revision(env_key, &endpoint, 1));
         assert!(server.0.try_wait().unwrap().is_none());
         write_identity(&next_cert, &next_key, &next_identity);
