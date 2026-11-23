@@ -4,9 +4,9 @@
 //! existing users' token digests/disabled flags and existing inbound grants.
 //! Listener/TLS identity, quota policy and user inventory remain immutable.
 //! Real reload/rollback and Windows management IPC are separate milestones.
-use crate::config::{Config, ServerDocument};
 #[cfg(any(target_os = "linux", test))]
 use crate::config;
+use crate::config::{Config, ServerDocument};
 use std::fmt;
 
 #[cfg(any(target_os = "linux", test))]
@@ -175,9 +175,7 @@ impl ReloadPreflight {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        Inbound, Management, ServerPolicy, ServerSettings, Ui, User,
-    };
+    use crate::config::{Inbound, Management, ServerPolicy, ServerSettings, Ui, User};
 
     fn document() -> ServerDocument {
         ServerDocument {
@@ -249,10 +247,7 @@ mod tests {
             doc,
             vec![IdentityHash::from_pem(b"original", b"key")],
         );
-        assert_eq!(
-            snapshot.check_file(),
-            Err(ReloadCheckError::InvalidConfig)
-        );
+        assert_eq!(snapshot.check_file(), Err(ReloadCheckError::InvalidConfig));
     }
     #[test]
     #[cfg(target_os = "linux")]
@@ -305,16 +300,11 @@ mod tests {
         assert_eq!(snapshot.check_file(), Err(ReloadCheckError::IdentityDrift));
         fs::write(&key, key_bytes).unwrap();
         candidate.server.inbounds[0].h2_listen = "127.0.0.1:9555".into();
-        fs::write(
-            &config_file,
-            Config::Server(candidate).to_toml().unwrap(),
-        )
-        .unwrap();
+        fs::write(&config_file, Config::Server(candidate).to_toml().unwrap()).unwrap();
         assert_eq!(
             snapshot.check_file(),
             Err(ReloadCheckError::RequiresRestart)
         );
         fs::remove_dir_all(directory).unwrap();
     }
-
 }
