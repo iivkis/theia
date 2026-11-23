@@ -577,6 +577,14 @@ mod tests {
         if std::env::var("THEIA_WINDOWS_PROXY_E2E_ALLOWED").as_deref() != Ok("yes") {
             panic!("explicit disposable Windows runner consent required");
         }
+        if std::env::var("THEIA_PROXY_CRASH_CHILD").as_deref() == Ok("yes") {
+            // An actual second process uses a real WinINet mutation and a
+            // real OS process exit that bypasses Drop. Its mutex is released
+            // by the Windows kernel while the durable journal remains.
+            let _lease = OwnedProxy::apply("127.0.0.1:45992".parse().unwrap()).unwrap();
+            assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
+            std::process::exit(73);
+        }
         let original = query().unwrap();
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
         let mut proxy = OwnedProxy::apply("127.0.0.1:45991".parse().unwrap()).unwrap();
@@ -596,7 +604,23 @@ mod tests {
         assert_eq!(query().unwrap(), original);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
         drop(proxy);
-        // No test leaves the operator's actual WinINet settings modified.
+        // Real crash subprocess regression: a fresh process recovers a
+        // previous instance that exited *without* Rust destructors.
+        let self_executable = std::env::current_exe().unwrap();
+        let result = std::process::Command::new(self_executable)
+            .arg("windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override")
+            .arg("--exact")
+            .arg("--ignored")
+            .env("THEIA_PROXY_CRASH_CHILD", "yes")
+            .status()
+            .unwrap();
+        assert_eq!(result.code(), Some(73), "child must simulate hard exit after apply");
+        assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
+        assert_eq!(recover_explicit(), Ok(Recovery::Restored));
+        assert_eq!(query().unwrap(), original);
+        assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
+
+        // No test leaves the disposable CI user's WinINet settings modified.
         assert_eq!(query().unwrap(), original);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
     }
