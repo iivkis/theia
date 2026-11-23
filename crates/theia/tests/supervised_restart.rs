@@ -842,9 +842,20 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
         let mut mixed = shrink.clone();
         mixed.server.policy.allow_private_ips = false;
         quota_apply(env_key, &endpoint, 1, &save(&config, &mixed), false);
-        let mut invalid = shrink.clone();
-        invalid.server.policy.max_connections_per_user = 3;
-        quota_apply(env_key, &endpoint, 1, &save(&config, &invalid), false);
+        // The typed serializer correctly refuses invalid caps; create an
+        // intentionally malformed-on-disk candidate to exercise the native
+        // manager's own structural validator, not the test helper.
+        let invalid_toml = Config::Server(shrink.clone())
+            .to_toml()
+            .unwrap()
+            .replace(
+                "max_connections_per_user = 1",
+                "max_connections_per_user = 3",
+            );
+        assert!(invalid_toml.contains("max_connections_per_user = 3"));
+        fs::write(&config, &invalid_toml).unwrap();
+        let invalid_hash = format!("{:x}", Sha256::digest(invalid_toml.as_bytes()));
+        quota_apply(env_key, &endpoint, 1, &invalid_hash, false);
         assert!(revision(env_key, &endpoint, 1));
 
         let actual_sha = save(&config, &shrink);
