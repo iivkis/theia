@@ -48,7 +48,7 @@ def guest_ip() -> str:
             ip = ipaddress.ip_address(address)
         except ValueError:
             continue
-        if ip.version == 4 and not ip.is_loopback() and not ip.is_unspecified:
+        if ip.version == 4 and not ip.is_loopback and not ip.is_unspecified:
             return str(ip)
     raise RuntimeError("WSL2 has no routable non-loopback IPv4 NIC")
 
@@ -61,13 +61,15 @@ def is_listening(ip: str, port: int) -> bool:
         return False
 
 
-def main(binary: Path) -> None:
+def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
     if os.name != "nt":
         raise RuntimeError("native Windows runner is mandatory")
     if linux("uname", "-s") != "Linux":
         raise RuntimeError("WSL guest did not report a real Linux kernel")
     if not binary.is_file():
         raise RuntimeError("Linux-built server artifact was not downloaded")
+    if not windows_test.is_file() or not windows_client.is_file():
+        raise RuntimeError("Precompiled native Windows test/client artifacts are missing")
     ip = guest_ip()
     print("F-14: native Windows client + WSL2 Linux VM; separate virtual NIC validated")
     token = secrets.token_bytes(32)
@@ -120,11 +122,11 @@ def main(binary: Path) -> None:
                 THEIA_F14_XHOST_CA=str(shared / "trusted-ca.pem"),
                 THEIA_F14_XHOST_WRONG_CA=str(shared / "wrong-ca.pem"),
                 THEIA_F14_XHOST_TOKEN=token_b64,
+                THEIA_F14_CLIENT_BIN=str(windows_client.resolve()),
             )
             subprocess.run(
                 [
-                    "cargo", "test", "--workspace", "--locked", "--test",
-                    "f14_cross_host", "--", "--ignored", "--exact",
+                    str(windows_test.resolve()), "--ignored", "--exact",
                     "linux_server_windows_client_f14_h2_h3_open_ok", "--nocapture",
                 ],
                 env=env,
@@ -144,9 +146,11 @@ def main(binary: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--linux-binary", type=Path, required=True)
+    parser.add_argument("--windows-test", type=Path, required=True)
+    parser.add_argument("--windows-client", type=Path, required=True)
     args = parser.parse_args()
     try:
-        main(args.linux_binary)
+        main(args.linux_binary, args.windows_test, args.windows_client)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as error:
         print(f"F-14 cross-OS acceptance failed: {error}", file=sys.stderr)
         raise SystemExit(1) from error
