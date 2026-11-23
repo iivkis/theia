@@ -130,6 +130,12 @@ impl ReloadPreflight {
         }
     }
 
+    /// Preserve the cert/key digests actually loaded by listeners while
+    /// rebasing the candidate snapshot after an authorization-only CAS.
+    pub(crate) fn rebased(&self, candidate: ServerDocument) -> Self {
+        Self::new(self.config_path.clone(), candidate, self.identities.clone())
+    }
+
     /// Read the candidate exactly once and verify every restart-only
     /// field and the actual PEM bytes loaded by the live listeners. The owned
     /// returned document is the only one later staged/published: no second
