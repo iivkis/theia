@@ -710,9 +710,9 @@ impl Interaction {
                     _ => self.importing = Some(ImportFlow::Credential { invitation, ca, reference }),
                 },
                 ImportFlow::Saving => self.importing = Some(ImportFlow::Saving),
-                ImportFlow::Done | ImportFlow::Failed => {
+                state @ (ImportFlow::Done | ImportFlow::Failed) => {
                     if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                        self.importing = Some(flow);
+                        self.importing = Some(state);
                     }
                 }
             }
