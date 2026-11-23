@@ -142,8 +142,9 @@ fn apply_with_pin(
         String::from_utf8_lossy(&output.stderr)
     );
     if should_succeed {
-        assert!(String::from_utf8_lossy(&output.stdout)
-            .contains("supervised H2/H3 restart applied"));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("supervised H2/H3 restart applied")
+        );
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(&format!("revision={}", expected + 1))
         );
