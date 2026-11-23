@@ -69,12 +69,12 @@ fn token_rotation_disabling_user_and_inbound_grant_change_are_only_allowed_delta
 #[test]
 fn listener_cert_and_identity_changes_require_restart_even_if_structurally_valid() {
     let before = baseline();
-    let changes: Vec<Box<dyn Fn(&mut ServerDocument)>> = vec![
-        Box::new(|doc| doc.server.inbounds[0].h2_listen = "0.0.0.0:8444".into()),
-        Box::new(|doc| doc.server.inbounds[0].quic_listen = "0.0.0.0:8444".into()),
-        Box::new(|doc| doc.server.inbounds[0].server_name = "new.example.org".into()),
-        Box::new(|doc| doc.server.inbounds[0].tls_cert = "file:/etc/theia/other.pem".into()),
-        Box::new(|doc| doc.server.inbounds[0].tls_key = "file:/etc/theia/other.key".into()),
+    let changes: [fn(&mut ServerDocument); 5] = [
+        |doc| doc.server.inbounds[0].h2_listen = "0.0.0.0:8444".into(),
+        |doc| doc.server.inbounds[0].quic_listen = "0.0.0.0:8444".into(),
+        |doc| doc.server.inbounds[0].server_name = "new.example.org".into(),
+        |doc| doc.server.inbounds[0].tls_cert = "file:/etc/theia/other.pem".into(),
+        |doc| doc.server.inbounds[0].tls_key = "file:/etc/theia/other.key".into(),
     ];
     for change in changes {
         let mut candidate = before.clone();
