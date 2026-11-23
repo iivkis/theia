@@ -29,14 +29,29 @@ const VISIBLE_DOMAINS: usize = 7;
 enum DomainUiError {
     NoTrustAnchors,
     WorkerUnavailable,
+    StaleDnsPin,
     Batch(DualBatchError),
+}
+
+#[derive(Debug)]
+struct DnsObservation {
+    addresses: Vec<IpAddr>,
+    completed_at: Instant,
+}
+
+/// DNS freshness is based on the resolver completion time, never on when
+/// an event loop happens to inspect the worker's channel. Reject timestamps
+/// in the future as well as observations beyond the 60-second TTL.
+fn dns_pin_fresh_at(completed_at: Instant, now: Instant) -> bool {
+    now.checked_duration_since(completed_at)
+        .is_some_and(|age| age <= DNS_PIN_TTL)
 }
 
 enum DomainState {
     Catalog,
     DnsConfirm,
     DnsRunning {
-        result: Receiver<Result<Vec<IpAddr>, DnsError>>,
+        result: Receiver<Result<DnsObservation, DnsError>>,
         cancel: Option<oneshot::Sender<()>>,
     },
     Resolved,
@@ -115,7 +130,7 @@ impl DomainPanel {
 
     fn fresh(&self) -> bool {
         self.dns_received
-            .is_some_and(|received| received.elapsed() <= DNS_PIN_TTL)
+            .is_some_and(|received| dns_pin_fresh_at(received, Instant::now()))
     }
 
     fn reset_pins(&mut self) {
@@ -218,7 +233,10 @@ impl DomainPanel {
                             biased;
                             _ = cancel_rx => None,
                             reply = resolve_catalogued_domain(domain, DnsConsent::Approved) => {
-                                Some(reply)
+                                Some(reply.map(|addresses| DnsObservation {
+                                    addresses,
+                                    completed_at: Instant::now(),
+                                }))
                             }
                         }
                     })
@@ -253,6 +271,7 @@ impl DomainPanel {
         };
         let addresses = self.selected.clone();
         let preview = self.preview.clone();
+        let observed_at = self.dns_received;
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
         self.probed_at = None;
@@ -273,6 +292,12 @@ impl DomainPanel {
                         Ok(runtime) => runtime,
                         Err(_) => return Some(Err(DomainUiError::WorkerUnavailable)),
                     };
+                    // Recheck immediately before any socket can open. The
+                    // background thread may have spent time loading native
+                    // trust anchors or waiting to be scheduled.
+                    if !observed_at.is_some_and(|at| dns_pin_fresh_at(at, Instant::now())) {
+                        return Some(Err(DomainUiError::StaleDnsPin));
+                    }
                     let batch = addresses
                         .into_iter()
                         .map(|ip| DualBatchTarget {
@@ -319,7 +344,7 @@ impl DomainPanel {
     /// error string, raw cert, proxy token, response or secret is displayed.
     pub(crate) fn poll(&mut self) {
         enum Finished {
-            Dns(Result<Vec<IpAddr>, DnsError>),
+            Dns(Result<DnsObservation, DnsError>),
             Probe(Result<DualBatchReport, DomainUiError>),
         }
         let completed = match &self.state {
@@ -338,20 +363,24 @@ impl DomainPanel {
             _ => None,
         };
         match completed {
-            Some(Finished::Dns(Ok(ips))) if !ips.is_empty() => {
-                self.addresses = ips;
-                self.selected.clear();
-                self.address_index = 0;
-                self.dns_received = Some(Instant::now());
-                self.state = DomainState::Resolved;
+            Some(Finished::Dns(Ok(observation))) => {
+                if observation.addresses.is_empty() {
+                    self.reset_pins();
+                    self.state = DomainState::DnsFailed(DnsError::NoPublicAddresses);
+                } else if !dns_pin_fresh_at(observation.completed_at, Instant::now()) {
+                    self.reset_pins();
+                    self.state = DomainState::DnsFailed(DnsError::StaleObservation);
+                } else {
+                    self.addresses = observation.addresses;
+                    self.selected.clear();
+                    self.address_index = 0;
+                    self.dns_received = Some(observation.completed_at);
+                    self.state = DomainState::Resolved;
+                }
             }
             Some(Finished::Dns(Err(error))) => {
                 self.reset_pins();
                 self.state = DomainState::DnsFailed(error);
-            }
-            Some(Finished::Dns(Ok(_))) => {
-                self.reset_pins();
-                self.state = DomainState::DnsFailed(DnsError::NoPublicAddresses);
             }
             Some(Finished::Probe(report)) => {
                 self.probed_at = Some(Instant::now());
@@ -432,6 +461,7 @@ impl DomainPanel {
                     DnsError::NotApproved => "не получено разрешение",
                     DnsError::NotCatalogued => "имя отсутствует в каталоге",
                     DnsError::TimedOut => "таймаут DNS",
+                    DnsError::StaleObservation => "устаревший DNS-ответ, требуется новое согласие",
                     DnsError::LookupFailed => "DNS-запрос не выполнен",
                     DnsError::NoPublicAddresses => "нет публичных адресов",
                     DnsError::UnsafeAddress => "опасный/приватный IP в DNS, все ответы отклонены",
@@ -486,6 +516,7 @@ impl DomainPanel {
                 let explanation = match error {
                     DomainUiError::NoTrustAnchors => "нет системных доверенных CA",
                     DomainUiError::WorkerUnavailable => "недоступен worker",
+                    DomainUiError::StaleDnsPin => "DNS-пины устарели до старта TLS; повторите DNS с согласием",
                     DomainUiError::Batch(DualBatchError::Empty) => "пустой список",
                     DomainUiError::Batch(DualBatchError::TooManyTargets) => "слишком много IP",
                     DomainUiError::Batch(DualBatchError::DuplicateTarget) => "дублирующаяся цель",
@@ -704,12 +735,91 @@ mod tests {
             result: rx,
             cancel: Some(cancel),
         };
-        tx.send(Ok(vec!["93.184.216.10".parse().unwrap()])).unwrap();
+        tx.send(Ok(DnsObservation {
+            addresses: vec!["93.184.216.10".parse().unwrap()],
+            completed_at: Instant::now(),
+        }))
+        .unwrap();
         panel.poll();
         assert!(panel.is_resolved());
         assert_eq!(panel.addresses.len(), 1);
         assert_eq!(panel.selected_count(), 0);
         assert!(panel.body().contains("DNS: закреплено 1"));
+    }
+
+    #[test]
+    fn dns_timestamp_ttl_boundary_inclusive_and_future_rejected() {
+        let at = Instant::now();
+        assert!(dns_pin_fresh_at(at, at));
+        assert!(dns_pin_fresh_at(at, at + DNS_PIN_TTL));
+        assert!(!dns_pin_fresh_at(
+            at,
+            at + DNS_PIN_TTL + Duration::from_millis(1)
+        ));
+        // Windows Instant has coarser clock granularity than 1 nanosecond.
+        assert!(!dns_pin_fresh_at(at, at - Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn delayed_dns_worker_result_is_not_rejuvenated_by_late_ui_poll() {
+        let mut panel = panel();
+        let (tx, rx) = mpsc::channel();
+        let (cancel, _) = oneshot::channel();
+        panel.state = DomainState::DnsRunning {
+            result: rx,
+            cancel: Some(cancel),
+        };
+        tx.send(Ok(DnsObservation {
+            addresses: vec!["93.184.216.10".parse().unwrap()],
+            completed_at: Instant::now() - DNS_PIN_TTL - Duration::from_secs(1),
+        }))
+        .unwrap();
+        panel.poll();
+        assert!(!panel.is_resolved());
+        assert!(panel.addresses.is_empty());
+        assert!(panel.dns_received.is_none());
+        assert!(panel.body().contains("устар"));
+        panel.ask_probe_confirmation();
+        assert!(!panel.is_probe_confirming());
+    }
+
+    #[test]
+    fn recent_dns_worker_result_retains_original_observation_timestamp() {
+        let mut panel = panel();
+        let (tx, rx) = mpsc::channel();
+        let (cancel, _) = oneshot::channel();
+        panel.state = DomainState::DnsRunning {
+            result: rx,
+            cancel: Some(cancel),
+        };
+        let completed_at = Instant::now() - Duration::from_secs(2);
+        tx.send(Ok(DnsObservation {
+            addresses: vec!["93.184.216.10".parse().unwrap()],
+            completed_at,
+        }))
+        .unwrap();
+        panel.poll();
+        assert!(panel.is_resolved());
+        assert_eq!(panel.dns_received, Some(completed_at));
+        assert_eq!(panel.selected_count(), 0);
+    }
+
+    #[test]
+    fn a_future_or_expired_dns_timestamp_never_grants_probe_permission() {
+        let mut panel = panel();
+        panel.state = DomainState::Resolved;
+        panel.addresses = vec!["93.184.216.10".parse().unwrap()];
+        for timestamp in [
+            Instant::now() + Duration::from_secs(3),
+            Instant::now() - DNS_PIN_TTL - Duration::from_millis(1),
+        ] {
+            panel.dns_received = Some(timestamp);
+            panel.selected = vec!["93.184.216.10".parse().unwrap()];
+            panel.ask_probe_confirmation();
+            assert!(!panel.is_probe_confirming());
+            panel.confirm_probes_and_start();
+            assert!(!panel.is_running());
+        }
     }
 
     #[test]
