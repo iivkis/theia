@@ -261,7 +261,18 @@ async fn handle(
     } else {
         match command.as_slice() {
             b"health" => "theia-health-v1 ok\n".to_owned(),
-            b"status" => format!("theia-status-v1 running inbounds={inbounds}\n"),
+            b"status" => {
+                if let Some(live) = &live {
+                    match live.revision() {
+                        Ok(revision) => {
+                            format!("theia-status-v2 running inbounds={inbounds} revision={revision}\n")
+                        }
+                        Err(_) => "ERR unsupported\n".to_owned(),
+                    }
+                } else {
+                    format!("theia-status-v1 running inbounds={inbounds}\n")
+                }
+            }
             b"check-reload" => {
                 if let Some(preflight) = preflight {
                     // 1 MiB bounded config + PEM reads belong on a worker.
@@ -269,6 +280,25 @@ async fn handle(
                     match tokio::task::spawn_blocking(move || preflight.check_file()).await {
                         Ok(Ok(())) => "theia-check-v1 compatible\n".to_owned(),
                         _ => "theia-check-v1 rejected\n".to_owned(),
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
+            }
+            candidate if parse_apply_revision(candidate).is_some() => {
+                if let (Some(preflight), Some(live)) = (preflight, live) {
+                    let expected = parse_apply_revision(candidate).expect("already parsed");
+                    // The blocking worker can finish after a timeout, but it
+                    // NEVER commits. Only this still-live task may stage/CAS
+                    // publish the exact document that was just validated.
+                    match tokio::task::spawn_blocking(move || preflight.load_candidate()).await {
+                        Ok(Ok(candidate)) => {
+                            match live.stage(&candidate, expected).and_then(|stage| live.publish(stage)) {
+                                Ok(revision) => format!("theia-apply-v1 applied revision={revision}\n"),
+                                Err(_) => "theia-apply-v1 rejected\n".to_owned(),
+                            }
+                        }
+                        _ => "theia-apply-v1 rejected\n".to_owned(),
                     }
                 } else {
                     "ERR unsupported\n".to_owned()
@@ -282,6 +312,20 @@ async fn handle(
         .await
         .map_err(|_| ManagementError::Io)?;
     stream.shutdown().await.map_err(|_| ManagementError::Io)
+}
+
+#[cfg(target_os = "linux")]
+fn positive_decimal(value: &str) -> Option<u64> {
+    if value.is_empty() || value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_apply_revision(command: &[u8]) -> Option<u64> {
+    let raw = command.strip_prefix(b"apply-reload rev=")?;
+    positive_decimal(std::str::from_utf8(raw).ok()?)
 }
 
 #[cfg(target_os = "linux")]
