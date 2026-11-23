@@ -98,7 +98,7 @@ impl IdentityHash {
         }
     }
 
-    fn matches(&self, cert: &[u8], key: &[u8]) -> bool {
+    pub(crate) fn matches(&self, cert: &[u8], key: &[u8]) -> bool {
         let expected = Self::from_pem(cert, key);
         self.cert == expected.cert && self.key == expected.key
     }
@@ -189,6 +189,19 @@ impl ReloadPreflight {
             }
         }
         Ok(candidate)
+    }
+
+    /// Restart-only planning: read one bounded candidate, verify real TLS
+    /// identities and temporarily probe all fresh OS listener addresses.
+    /// Never publishes auth, stops old listeners or reserves ports for later.
+    pub(crate) fn check_restart_file(
+        &self,
+    ) -> Result<crate::restart_guard::RestartVerdict, crate::restart_guard::RestartError> {
+        let candidate = match config::read_file(&self.config_path) {
+            Ok(Config::Server(document)) => document,
+            _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
+        };
+        crate::restart_guard::probe(&self.active, &self.identities, &candidate)
     }
 
     /// Still a read-only check, never an implicit Apply.
