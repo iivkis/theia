@@ -24,6 +24,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test documentation and TOML contracts
         run: bash scripts/check-spec.sh
+      - name: Test required CI DAG, native E2E and Go cache contract
+        run: python3 tests/ci/check_workflow_parallel.py
       - name: Detect Rust workspace
         id: detect
         shell: bash
