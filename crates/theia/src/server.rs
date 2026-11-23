@@ -803,12 +803,14 @@ fn check_certificate_name(
 struct TlsMaterial {
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
+    #[cfg(target_os = "linux")]
     identity: crate::reload_preflight::IdentityHash,
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     let cert_bytes = pem_data(&inbound.tls_cert, false)?;
     let key_bytes = pem_data(&inbound.tls_key, true)?;
+    #[cfg(target_os = "linux")]
     let identity = crate::reload_preflight::IdentityHash::from_pem(&cert_bytes, &key_bytes);
     let mut cert_reader = BufReader::new(cert_bytes.as_slice());
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
@@ -819,7 +821,12 @@ fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes.as_slice()))
         .map_err(|_| ServerError::Config)?
         .ok_or(ServerError::Config)?;
-    Ok(TlsMaterial { certs, key, identity })
+    Ok(TlsMaterial {
+        certs,
+        key,
+        #[cfg(target_os = "linux")]
+        identity,
+    })
 }
 
 fn tls_acceptor(
