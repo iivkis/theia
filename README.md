@@ -18,11 +18,11 @@
 
 | Требование | Текущее ограничение |
 | --- | --- |
-| **F-13 browser-like fingerprint** | PR #83: реальный opt-in `browser-h2-btls-v1` на BoringSSL, отдельные измеряемые H2 SETTINGS и нативный клиентский E2E (CI pending). Это частичный H2-профиль, **не** полное соответствие Chromium; H3/QUIC fingerprint и релизный F-13 всё ещё открыты. |
-| **F-14 приглашения** | Серверная выдача и disable-only существуют; импорт в клиентскую TUI с защищённым файлом/CA и native H2 E2E находится в PR/CI. Защищённый экспорт, ротация (отдельный PR #80), H3 и Linux→Windows cross-host E2E пока не завершены. |
+| **F-13 browser-like fingerprint** | PR #83 слит после успешного CI: opt-in `browser-h2-btls-v1` на BoringSSL, отдельные измеряемые H2 SETTINGS и нативный клиентский E2E на Linux/Windows. Это частичный H2-профиль, **не** полное соответствие Chromium; H3/QUIC fingerprint и релизный F-13 всё ещё открыты. |
+| **F-14 приглашения** | Серверная выдача, отключение и подтверждённая ротация bearer, защищённый локальный импорт `theia://v1` в клиентскую TUI с отдельным доверенным CA и нативный H2 E2E реализованы (PR #80/#81, CI пройден). Защищённый экспорт файла/clipboard, H3 и Linux→Windows cross-host E2E, полная crash/ACL-матрица остаются открытыми. |
 | **F-18 REALITY-подобная защита** | Нет согласованного криптографического identity/security mode, антипробинга и законченного двухшагового мастера с безопасным Apply. Текущие H2/H3 TLS probes — только evidence. |
 | **F-19 TLS-in-TLS** | Нет измеренной flow-shaping защиты с независимым classifier и release thresholds. |
-| **Windows system proxy / M4.3** | Автоматический WinINet snapshot/apply/CAS restore с проверенной аварийной recovery ещё не поставляется. |
+| **Windows system proxy / M4.3** | PR #82 слит после Windows CI: только явная команда с `--system-proxy --confirm` выполняет WinINet apply/owned CAS restore, есть подтверждаемое восстановление после аварии. Автоматического включения нет; TUI-интеграция, policy/VPN-совместимость и расширенная приёмка остаются открытыми. |
 | **M5 release** | Нужны дополнительные сравнительные BBR/fingerprint/performance/security gates и end-to-end приёмка всех P0. |
 
 **Важно:** отключение пользователя в TUI ставит `users[].disabled = true` в **сохранённом TOML**, но не завершает активные туннели и не обновляет runtime само по себе. Для отказа в *новых* подключениях нужно отдельно подтвердить auth-only Apply в защищённом локальном IPC. Нельзя считать это hard revocation. Подробности: [инвайты](docs/INVITATIONS.md) и [ADR-0053](docs/adr/0053-m4-4b2a-explicit-existing-user-disable.md).
@@ -38,7 +38,7 @@ theia tui --role server --config server.toml
 theia tui --role client --config client.toml
 ```
 
-Для opt-in управления действующим сервером: на Linux заранее создайте частный каталог `0700` и передайте `THEIA_CONTROL_DIR`; на Windows задайте `THEIA_CONTROL_PIPE` для текущего SID. Команды `theia server status`, `theia server reload --check`, подтверждаемое Apply и отдельные TLS/restart/quota CLI-операции описаны в [CONFIGURATION](docs/CONFIGURATION.md) и [TUI UX](docs/TUI_UX.md). Не включайте `Windows system proxy` автоматически; включение и восстановление ещё не реализованы.
+Для opt-in управления действующим сервером: на Linux заранее создайте частный каталог `0700` и передайте `THEIA_CONTROL_DIR`; на Windows задайте `THEIA_CONTROL_PIPE` для текущего SID. Команды `theia server status`, `theia server reload --check`, подтверждаемое Apply и отдельные TLS/restart/quota CLI-операции описаны в [CONFIGURATION](docs/CONFIGURATION.md) и [TUI UX](docs/TUI_UX.md). Windows system proxy не включается автоматически: на Windows доступно только явное `theia client run --config FILE --system-proxy --confirm`; для аварийного восстановления есть `theia client proxy --status` и `--recover --confirm` (см. CONFIGURATION).
 
 Шаблоны [server.toml](examples/server.toml) и [client.toml](examples/client.toml) содержат **негодные заглушки**; для реального запуска нужны корректные сертификаты, секреты, маршруты и доверенные CA. Ссылку `theia://v1/...` с bearer нельзя помещать в shell history, Git или логи.
 
@@ -54,7 +54,7 @@ theia tui --role client --config client.toml
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Границы подсистем, роли и транспорт |
 | [TUI_UX.md](docs/TUI_UX.md) | Контракт терминальной панели |
 | [STEALTH_REALITY.md](docs/STEALTH_REALITY.md) | F-18/F-19, модель угроз и экспериментальные пробы |
-| [INVITATIONS.md](docs/INVITATIONS.md) | F-14, выдача, отзыв и будущий клиентский импорт |
+| [INVITATIONS.md](docs/INVITATIONS.md) | F-14, выдача, ротация, локальный импорт и оставшиеся ограничения |
 | [IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) | Хронология вертикальных срезов, не live-статус |
 | [TESTING_CI.md](docs/TESTING_CI.md) | Linux/Windows CI-only приёмка |
 | [docs/adr/](docs/adr/) | Неизменяемая история архитектурных решений |
