@@ -1,5 +1,7 @@
 # TUI / UX specification (ratatui)
 
+**M4.2f terminal acceptance:** Отображаемые TUI modal title/status, два шага Ctrl+R → явно отдельное y, n/Esc отказ, revision после Apply, реакция на изменённый извне сохранённый файл и dirty/client/no-config границы теперь проверяются обязательным CI через реальный Linux PTY и Windows ConPTY, а не только unit KeyEvent/TestBackend. Проверка появления надписи успеха сама по себе недостаточна: реальный compiled server status должен показать CAS 1→2. TerminalGuard восстанавливает alternate screen после выхода. Удалённый SSH E2E остаётся отдельным этапом (ADR-0045).
+
 **Задача:** понятная локальная консоль управления без веб-панели. И сервер, и клиент доступны из одного `theia tui`. Полноценный keyboard-first workflow, минимальное число модалок, ошибки по делу. Тексты основного интерфейса — русский, с перспективой en.
 
 ## 1. Информационная архитектура
