@@ -388,6 +388,10 @@ impl Interaction {
             return false;
         }
         let Some(editor) = self.editor.as_mut() else {
+            if model.screen == Screen::Server && key.code == KeyCode::Char('R') {
+                self.runtime = Some(RuntimePanel::open_restart());
+                return false;
+            }
             if model.screen == Screen::Server && key.code == KeyCode::Char('v') {
                 self.runtime = Some(RuntimePanel::open(None, false));
                 return false;
@@ -524,6 +528,18 @@ impl Interaction {
                         Some(editor.saved_sha256())
                     };
                     self.runtime = Some(RuntimePanel::open(saved, apply_shortcut));
+                    editor.error = None;
+                }
+                return false;
+            }
+            if editor.role() == Role::Server && key.code == KeyCode::Char('R') {
+                if editor.dirty() {
+                    editor.error = Some(
+                        "Сначала Ctrl+S: проверьте сохранённый TOML перед restart preflight."
+                            .into(),
+                    );
+                } else {
+                    self.runtime = Some(RuntimePanel::open_restart());
                     editor.error = None;
                 }
                 return false;
@@ -669,7 +685,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                     frame,
                     parts[1],
                     "Для сервера",
-                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: v запрашивает настоящий статус через Linux IPC\n\nЭтот экран только для чтения. Нужен явный --role server --config FILE для редактирования и подтверждаемого Apply; без него здесь только статус.",
+                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: v запрашивает настоящий статус через native IPC; R проверяет готовность restart без применения\n\nЭтот экран только для чтения. Нужен явный --role server --config FILE для редактирования и подтверждаемого Apply; без него здесь только статус.",
                     true,
                 );
             }
@@ -819,7 +835,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельное подтверждение auth-only Apply (только сохранённого TOML, Linux/Windows).\nНовый пользователь и grant: клавиша u. Ctrl+S только сохраняет, runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь и grant: клавиша u. Ctrl+S только сохраняет, runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),

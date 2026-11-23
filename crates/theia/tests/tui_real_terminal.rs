@@ -60,6 +60,27 @@ fn cli_status(binary: &str, env_key: &str, endpoint: &str, revision: u64) -> boo
             .contains(&format!("authorization revision={revision}"))
 }
 
+fn assert_restart_check(binary: &str, env_key: &str, endpoint: &str, expected: &str, ok: bool) {
+    let result = Command::new(binary)
+        .args(["server", "restart", "--check"])
+        .env(env_key, endpoint)
+        .output()
+        .expect("compiled restart checker must start");
+    assert_eq!(
+        result.status.success(),
+        ok,
+        "restart check exit mismatch; stdout={}; stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let observed = if ok { &result.stdout } else { &result.stderr };
+    assert!(
+        String::from_utf8_lossy(observed).contains(expected),
+        "restart check did not classify read-only preflight: {}",
+        String::from_utf8_lossy(observed)
+    );
+}
+
 async fn drive_terminal(
     binary: &str,
     env_key: &str,
@@ -223,6 +244,107 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     })
     .await
     .expect("real server revision 1 must become available");
+    // M4.2g: native CLI checks run via the SAME protected IPC of this real
+    // server, not a separate parser/unit mock. All verdicts MUST keep the
+    // original H2+H3 listeners and live authorization revision 1 untouched.
+    assert_restart_check(binary, env_key, &endpoint, "restart not needed", true);
+
+    let old_doc = doc.clone();
+    let mut moved = doc.clone();
+    moved.server.inbounds[0].h2_listen = format!("127.0.0.1:{}", free_port(true));
+    moved.server.inbounds[0].quic_listen = format!("127.0.0.1:{}", free_port(false));
+    save(&server_file, &moved);
+    assert_restart_check(
+        binary,
+        env_key,
+        &endpoint,
+        "temporarily bound then released",
+        true,
+    );
+    assert!(cli_status(binary, env_key, &endpoint, 1));
+
+    let occupied_tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut busy = moved.clone();
+    busy.server.inbounds[0].h2_listen = occupied_tcp.local_addr().unwrap().to_string();
+    save(&server_file, &busy);
+    assert_restart_check(
+        binary,
+        env_key,
+        &endpoint,
+        "candidate or expected revision rejected",
+        false,
+    );
+    drop(occupied_tcp);
+    assert!(cli_status(binary, env_key, &endpoint, 1));
+
+    let occupied_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    busy = moved.clone();
+    busy.server.inbounds[0].quic_listen = occupied_udp.local_addr().unwrap().to_string();
+    save(&server_file, &busy);
+    assert_restart_check(
+        binary,
+        env_key,
+        &endpoint,
+        "candidate or expected revision rejected",
+        false,
+    );
+    drop(occupied_udp);
+    assert!(cli_status(binary, env_key, &endpoint, 1));
+
+    // Same-port TLS/policy changes cannot honestly be prebound with this
+    // runtime; report maintenance, not a fake zero-downtime restart.
+    let mut maintenance = old_doc.clone();
+    maintenance.server.policy.max_connections_total += 1;
+    save(&server_file, &maintenance);
+    assert_restart_check(
+        binary,
+        env_key,
+        &endpoint,
+        "requires controlled maintenance",
+        true,
+    );
+    assert!(cli_status(binary, env_key, &endpoint, 1));
+
+    // A wrong SAN must be rejected by the REAL rustls TLS1.3 identity
+    // builder, even when the proposed next-generation ports are free.
+    let alien = rcgen::generate_simple_self_signed(vec!["other.example.org".into()]).unwrap();
+    let other_cert = base.join("other-cert.pem");
+    let other_key = base.join("other-key.pem");
+    fs::write(
+        &other_cert,
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            STANDARD.encode(alien.cert.der())
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &other_key,
+        format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            STANDARD.encode(alien.key_pair.serialize_der())
+        ),
+    )
+    .unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&other_key, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut bad_identity = moved;
+    bad_identity.server.inbounds[0].tls_cert = format!("file:{}", other_cert.display());
+    bad_identity.server.inbounds[0].tls_key = format!("file:{}", other_key.display());
+    save(&server_file, &bad_identity);
+    assert_restart_check(
+        binary,
+        env_key,
+        &endpoint,
+        "candidate or expected revision rejected",
+        false,
+    );
+    assert!(cli_status(binary, env_key, &endpoint, 1));
+
+    doc = old_doc;
     // The TUI loads an auth-only updated TOML. Ctrl+R is only a preview until y.
     doc.server.users[0].token_sha256 = digest(0x43);
     save(&server_file, &doc);

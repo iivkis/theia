@@ -80,6 +80,9 @@ pub enum StatusCommand {
     Reload,
     /// Read-only preflight; does not modify config or runtime.
     CheckReload,
+    /// Read-only restart readiness: validates TLS and tests fresh TCP/UDP ports.
+    /// Never reserves a port, stops listeners or commits new runtime state.
+    CheckRestart,
     /// Explicit opt-in CAS auth publication, supported only by Linux server.
     ApplyReload {
         expected_revision: u64,
@@ -104,6 +107,12 @@ pub enum StatusReply {
     Unsupported,
     /// Candidate passes the deliberately narrow compatibility preflight.
     Compatible,
+    /// Existing authorization CAS path is sufficient; no restart is needed.
+    RestartAuthorizationOnly,
+    /// Some active listener bind must be reused: maintenance is required.
+    RestartRequiresMaintenance,
+    /// All NEW candidate ports were temporarily bound, then released.
+    RestartFreshPortsBindable,
     Applied {
         revision: u64,
     },
@@ -294,6 +303,29 @@ where
                     format!("theia-status-v1 running inbounds={inbounds}\n")
                 }
             }
+            b"check-restart" => {
+                if let Some(preflight) = preflight {
+                    // Blocking disk/PEM verification and transient native
+                    // binds are read-only with respect to the running server.
+                    // A worker completing AFTER IPC timeout still cannot
+                    // swap the runtime, publish authorization or terminate it.
+                    match tokio::task::spawn_blocking(move || preflight.check_restart_file()).await
+                    {
+                        Ok(Ok(crate::restart_guard::RestartVerdict::AuthorizationOnly)) => {
+                            "theia-restart-v1 auth-only\n".to_owned()
+                        }
+                        Ok(Ok(crate::restart_guard::RestartVerdict::RequiresMaintenance)) => {
+                            "theia-restart-v1 maintenance\n".to_owned()
+                        }
+                        Ok(Ok(crate::restart_guard::RestartVerdict::FreshPortsBindable)) => {
+                            "theia-restart-v1 ports-bindable\n".to_owned()
+                        }
+                        _ => "theia-restart-v1 rejected\n".to_owned(),
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
+            }
             b"check-reload" => {
                 if let Some(preflight) = preflight {
                     // 1 MiB bounded config + PEM reads belong on a worker.
@@ -423,6 +455,7 @@ where
         StatusCommand::Status => b"status\n".to_vec(),
         StatusCommand::Reload => b"reload\n".to_vec(),
         StatusCommand::CheckReload => b"check-reload\n".to_vec(),
+        StatusCommand::CheckRestart => b"check-restart\n".to_vec(),
         StatusCommand::ApplyReload { expected_revision } => {
             if expected_revision == 0 {
                 return Err(ManagementError::InvalidReply);
@@ -461,6 +494,16 @@ where
     }
     if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
         return Ok(StatusReply::Unsupported);
+    }
+    if command == StatusCommand::CheckRestart {
+        return match reply.as_slice() {
+            b"theia-restart-v1 auth-only\n" => Ok(StatusReply::RestartAuthorizationOnly),
+            b"theia-restart-v1 maintenance\n" => Ok(StatusReply::RestartRequiresMaintenance),
+            b"theia-restart-v1 ports-bindable\n" => Ok(StatusReply::RestartFreshPortsBindable),
+            b"theia-restart-v1 rejected\n" => Err(ManagementError::CandidateRejected),
+            b"ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
+        };
     }
     if command == StatusCommand::CheckReload {
         return match reply.as_slice() {

@@ -98,7 +98,7 @@ impl IdentityHash {
         }
     }
 
-    fn matches(&self, cert: &[u8], key: &[u8]) -> bool {
+    pub(crate) fn matches(&self, cert: &[u8], key: &[u8]) -> bool {
         let expected = Self::from_pem(cert, key);
         self.cert == expected.cert && self.key == expected.key
     }
@@ -112,6 +112,7 @@ pub(crate) struct ReloadPreflight {
     config_path: PathBuf,
     active: ServerDocument,
     identities: Vec<IdentityHash>,
+    restart_probe_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
@@ -125,6 +126,7 @@ impl ReloadPreflight {
             config_path,
             active,
             identities,
+            restart_probe_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -189,6 +191,26 @@ impl ReloadPreflight {
             }
         }
         Ok(candidate)
+    }
+
+    /// Restart-only planning: read one bounded candidate, verify real TLS
+    /// identities and temporarily probe all fresh OS listener addresses.
+    /// Never publishes auth, stops old listeners or reserves ports for later.
+    pub(crate) fn check_restart_file(
+        &self,
+    ) -> Result<crate::restart_guard::RestartVerdict, crate::restart_guard::RestartError> {
+        // Failed/cancelled IPC handlers cannot launch a growing backlog of
+        // slow filesystem operations or hold candidate ports indefinitely.
+        // The guard stays owned by the worker even after its client times out.
+        let _single_flight = self
+            .restart_probe_lock
+            .try_lock()
+            .map_err(|_| crate::restart_guard::RestartError::ProbeBusy)?;
+        let candidate = match config::read_file(&self.config_path) {
+            Ok(Config::Server(document)) => document,
+            _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
+        };
+        crate::restart_guard::probe(&self.active, &self.identities, &candidate)
     }
 
     /// Still a read-only check, never an implicit Apply.
@@ -284,6 +306,25 @@ mod tests {
             snapshot.check_document_identity(&doc, &[]),
             Err(ReloadCheckError::IdentityDrift)
         );
+    }
+
+    #[test]
+    fn restart_readiness_probe_is_single_flight_even_if_original_ipc_times_out() {
+        let snapshot = ReloadPreflight::new(
+            std::path::PathBuf::from("nonexistent-theia-restart-preflight.toml"),
+            document(),
+            Vec::new(),
+        );
+        let held = snapshot.restart_probe_lock.lock().unwrap();
+        assert!(matches!(
+            snapshot.check_restart_file(),
+            Err(crate::restart_guard::RestartError::ProbeBusy)
+        ));
+        drop(held);
+        assert!(matches!(
+            snapshot.check_restart_file(),
+            Err(crate::restart_guard::RestartError::InvalidConfig)
+        ));
     }
 
     #[test]
