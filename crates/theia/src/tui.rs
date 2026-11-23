@@ -167,6 +167,14 @@ impl Model {
     }
 }
 
+/// Creation and rotation both reveal a newly generated bearer only after
+/// the guarded save succeeds. Existing user rotation never re-enables a user.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IssueKind {
+    NewUser,
+    Rotation,
+}
+
 /// Confidential bearer issuance is isolated from ordinary editor commands.
 enum IssueFlow {
     Input(String),
@@ -192,6 +200,7 @@ enum DisableFlow {
 struct Interaction {
     editor: Option<Editor>,
     issuance: Option<IssueFlow>,
+    issue_kind: IssueKind,
     revocation: Option<DisableFlow>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
@@ -208,6 +217,7 @@ impl Interaction {
         Self {
             editor,
             issuance: None,
+            issue_kind: IssueKind::NewUser,
             revocation: None,
             discovery: None,
             candidates: None,
@@ -444,7 +454,11 @@ impl Interaction {
                 },
                 IssueFlow::Confirm(id) => match key.code {
                     KeyCode::Char('y') => {
-                        if editor.issue_user(&id).is_ok() {
+                        let result = match self.issue_kind {
+                            IssueKind::NewUser => editor.issue_user(&id),
+                            IssueKind::Rotation => editor.rotate_user(&id),
+                        };
+                        if result.is_ok() {
                             self.issuance = Some(IssueFlow::Saving);
                             self.start_save();
                         } else {
@@ -630,6 +644,18 @@ impl Interaction {
                         Some("Сохраните или отмените черновик перед выдачей токена.".into());
                 } else {
                     editor.error = None;
+                    self.issue_kind = IssueKind::NewUser;
+                    self.issuance = Some(IssueFlow::Input(String::new()));
+                }
+                return false;
+            }
+            if editor.role() == Role::Server && key.code == KeyCode::Char('t') {
+                if editor.dirty() {
+                    editor.error =
+                        Some("Сохраните или отмените черновик перед ротацией токена.".into());
+                } else {
+                    editor.error = None;
+                    self.issue_kind = IssueKind::Rotation;
                     self.issuance = Some(IssueFlow::Input(String::new()));
                 }
                 return false;
@@ -787,7 +813,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, x: подтверждённое глобальное отключение существующего пользователя (только TOML), p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
             true,
         ),
     }
@@ -807,6 +833,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             parts[1],
             flow,
             interaction.and_then(|ui| ui.editor.as_ref()),
+            interaction.map_or(IssueKind::NewUser, |ui| ui.issue_kind),
         );
     } else if let Some(flow) = interaction.and_then(|ui| ui.revocation.as_ref()) {
         draw_revocation(
@@ -866,43 +893,80 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  u: новый  x: отключить  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить",
+            "j/k: запись  Tab: поле  Enter/e: ввод  u: новый  t: ротация  x: отключить  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
     );
 }
 
-fn draw_issuance(frame: &mut Frame<'_>, area: Rect, flow: &IssueFlow, editor: Option<&Editor>) {
+fn draw_issuance(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    flow: &IssueFlow,
+    editor: Option<&Editor>,
+    kind: IssueKind,
+) {
+    let rotating = kind == IssueKind::Rotation;
     let (title, body) = match flow {
         IssueFlow::Input(id) => (
-            "Новый пользователь для выбранного inbound",
+            if rotating {
+                "Ротация токена существующего пользователя"
+            } else {
+                "Новый пользователь для выбранного inbound"
+            },
             format!(
-                "ID пользователя: {id}\n\nСгенерировать 256-битный токен и назначить доступ только к выбранному inbound.\n\nEnter: продолжить  Backspace: удалить  Esc: отменить\n\n{}",
+                "ID пользователя: {id}\n\n{}\n\nEnter: продолжить  Backspace: удалить  Esc: отменить\n\n{}",
+                if rotating {
+                    "Только активный пользователь с grant на выбранном inbound. Новый bearer будет выдан однократно."
+                } else {
+                    "Сгенерировать 256-битный токен и назначить доступ только к выбранному inbound."
+                },
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
         ),
         IssueFlow::Confirm(id) => (
-            "Подтверждение нового пользователя",
+            if rotating {
+                "Подтверждение глобальной ротации токена"
+            } else {
+                "Подтверждение нового пользователя"
+            },
             format!(
-                "Пользователь: {id}\nInbound: {}\n\nСоздать токен CSPRNG и сохранить новую запись в server.toml?\nЭто НЕ перезагружает сервер.\n\n y: подтвердить  n/Esc: отменить",
-                editor.map_or("", |e| e.selected_record_id())
+                "Пользователь: {id}\nInbound: {}\n\n{}\n\ny: подтвердить и сохранить  n/Esc: отменить",
+                editor.map_or("", |e| e.selected_record_id()),
+                if rotating {
+                    "ВНИМАНИЕ: замена bearer глобальна для всех inbound данного пользователя. Старый токен станет недействительным для НОВЫХ подключений только после отдельного auth-only CAS Apply. Уже открытые туннели не разрываются. Grants и disabled не меняются. Runtime НЕ обновляется автоматически."
+                } else {
+                    "Создать токен CSPRNG и сохранить новую запись в server.toml? Это НЕ перезагружает сервер."
+                }
             ),
         ),
         IssueFlow::Saving => (
-            "Сохранение",
-            "Сохранение выполняется; конфиденциальная ссылка скрыта.".into(),
+            "Сохранение токена",
+            "Проверка и атомарная запись TOML. Конфиденциальная ссылка скрыта; runtime не меняется."
+                .into(),
         ),
         IssueFlow::SaveFailed => (
             "Сохранение НЕ удалось: ссылка заблокирована",
             format!(
-                "Новый пользователь НЕ записан. Токен не показывался.\n\n{}\n\nr: повторить запись  d: удалить черновик и токен",
+                "{}\n\n{}\n\nr: повторить запись  d: удалить черновик и токен",
+                if rotating {
+                    "Новый digest НЕ сохранён. Старый токен остаётся в файле; runtime не меняется."
+                } else {
+                    "Новый пользователь НЕ записан. Токен не показывался."
+                },
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
         ),
         IssueFlow::Offer => (
             "Одноразовая выдача конфиденциальной ссылки",
-            "server.toml сохранён. Runtime ещё не обновлён.\nСсылка содержит действующий bearer-токен. Не публиковать.\nПовторного показа после закрытия не будет.\n\n y: показать ссылку один раз\n n/Esc: отказаться и уничтожить токен в памяти".into(),
+            if rotating {
+                "Новый digest сохранён в server.toml, runtime НЕ обновлён. Старый bearer ещё принимается runtime до отдельного auth-only CAS Apply. Ссылка содержит НОВЫЙ bearer, повторное восстановление невозможно.\n\ny: показать один раз  n/Esc: отказаться и стереть токен"
+                    .into()
+            } else {
+                "server.toml сохранён. Runtime ещё не обновлён.\nСсылка содержит действующий bearer-токен. Не публиковать.\nПовторного показа после закрытия не будет.\n\ny: показать ссылку один раз\nn/Esc: отказаться и уничтожить токен в памяти"
+                    .into()
+            },
         ),
         IssueFlow::Showing(link) => (
             "СЕКРЕТ: ссылка подключения (однократный просмотр)",
@@ -957,7 +1021,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Отключение существующего: x (глобально по всем inbound). Ctrl+S только сохраняет; runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Ctrl+S только сохраняет; runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
