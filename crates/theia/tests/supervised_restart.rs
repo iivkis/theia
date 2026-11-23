@@ -845,13 +845,10 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
         // The typed serializer correctly refuses invalid caps; create an
         // intentionally malformed-on-disk candidate to exercise the native
         // manager's own structural validator, not the test helper.
-        let invalid_toml = Config::Server(shrink.clone())
-            .to_toml()
-            .unwrap()
-            .replace(
-                "max_connections_per_user = 1",
-                "max_connections_per_user = 3",
-            );
+        let invalid_toml = Config::Server(shrink.clone()).to_toml().unwrap().replace(
+            "max_connections_per_user = 1",
+            "max_connections_per_user = 3",
+        );
         assert!(invalid_toml.contains("max_connections_per_user = 3"));
         fs::write(&config, &invalid_toml).unwrap();
         let invalid_hash = format!("{:x}", Sha256::digest(invalid_toml.as_bytes()));
