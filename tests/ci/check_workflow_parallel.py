@@ -75,6 +75,21 @@ require("windows-cross-sid-ci.ps1" in windows,
         "the second-SID test must actually run in CI")
 require("pywinpty==3.0.5 pyte==0.8.2" in windows,
         "the ConPTY/VT test dependencies must be pinned")
+# The Windows root workspace is already compiled by all-targets: never rebuild
+# it from the isolated M0.1 Go/uTLS spike job.
+require("Real Windows live Theia H2 fingerprint vs pinned Go uTLS" in windows
+        and "cargo test --workspace --locked --test fingerprint_h2" in windows,
+        "native Windows fingerprint must execute alongside the cached root workspace")
+require(windows.index("Native Windows tests")
+        < windows.index("Real Windows live Theia H2 fingerprint vs pinned Go uTLS"),
+        "fingerprint must reuse already built Windows all-targets test executable")
+require("cargo test --workspace --locked --test fingerprint_h2" not in job("m0-1-windows-spike"),
+        "isolated Windows M0.1 spike must never rebuild the root Rust workspace")
+require("go mod verify" in windows and "go run . $hello" in windows
+        and "THEIA_UTLS_HELLO_PATH" in windows,
+        "Windows native fingerprint must use the pinned generated Go uTLS reference")
+require("python3 -m compileall -q scripts tests" in job("specification"),
+        "cheap Python CI driver syntax must fail before expensive Rust builds")
 linux = job("rust-tests")
 require("cargo test --workspace --all-targets --locked" in linux,
         "mandatory Linux all-target tests must run")
@@ -90,7 +105,7 @@ go_steps = re.findall(
     r"(?m)^      - uses: actions/setup-go@v5\n        with:\n((?:          [^\n]+\n)+)",
     workflow,
 )
-require(len(go_steps) == 3, "all three test-only Go setup steps must be audited")
+require(len(go_steps) == 4, "all four test-only Go setup steps must be audited")
 for step in go_steps:
     require("cache: true" in step,
             "Go module/build cache must be enabled for recurring CI")
