@@ -13,7 +13,7 @@
 | QUIC BBR | Выбран на обоих endpoint; Linux/Windows синтетические BBR/CUBIC сравнительные CI experiments выполняются. Это **не** полномасштабный релизный benchmark. |
 | TUI M4.1 | Роли server/client, три безопасных поля существующей записи, проверка/атомарное сохранение TOML; без общего CRUD и без автоматического runtime Apply. |
 | Local management M4.2 | Opt-in Linux Unix IPC / Windows SID-DACL Named Pipe, revisioned auth CAS, свежие порты, same-port TLS rotation, quota resize, pin TLS PEM bytes и one-shot 300s same-port rollback **только по явно подтверждаемым CLI-командам**. |
-| F-14 частично | Canonical `theia://v1` codec, серверная `u` CSPRNG new-user issuance и однократный показ после durable save, `x` global disable-only существующего пользователя в TOML (PR #78). |
+| F-14 частично | Canonical `theia://v1` codec, серверная `u` CSPRNG new-user issuance и однократный показ после durable save, `x` global disable-only (PR #78); M4.4b2b1 server-only `t` подтверждаемая ротация токена активного пользователя без live Apply (PR/CI на проверке). |
 | F-18 исследования | M3.5b1 offline candidate planning; M3.5b2a exact-consent strict H2 TLS; M4.5a–i passive discovery, DNS pin и согласованные отдельные H2/H3 кандидаты. Нет автоматического сканирования сторонних IP и нет REALITY режима. |
 
 Последний завершённый вертикальный срез: **M4.4b2a**. [CI для точного head SHA `b9d46c91...`](https://github.com/iivkis/theia/actions/runs/45238684069): **14/14 SUCCESS**, включая `ci-gate`. PR был слит **после** этого результата.
