@@ -33,6 +33,17 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
+        Ok(Command::ServerCheckReload) => {
+            match management::query_environment(management::StatusCommand::CheckReload).await {
+                Ok(management::StatusReply::Compatible) => {
+                    Ok("candidate compatible with running listener; runtime UNCHANGED".to_owned())
+                }
+                Ok(_) => Err(CliError::Management(
+                    management::ManagementError::InvalidReply,
+                )),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
         Ok(command) => execute(command).map(str::to_owned),
         Err(error) => Err(error),
     };
