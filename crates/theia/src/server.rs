@@ -22,7 +22,7 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{lookup_host, TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::timeout,
 };
@@ -435,16 +435,59 @@ fn permitted_candidates(
     Ok(permitted)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenerationPhase {
+    Prepared,
+    Active,
+    Drain,
+}
+
+pub(crate) const GENERATION_DRAIN: Duration = Duration::from_secs(20);
+
+pub(crate) async fn await_generation_activation(
+    phase: &mut watch::Receiver<GenerationPhase>,
+) -> bool {
+    loop {
+        let current = *phase.borrow_and_update();
+        match current {
+            GenerationPhase::Active => return true,
+            GenerationPhase::Drain => return false,
+            GenerationPhase::Prepared => {}
+        }
+        if phase.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
 pub async fn serve(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     context: Arc<ServerContext>,
 ) -> Result<(), ServerError> {
+    let (_owner, phase) = watch::channel(GenerationPhase::Active);
+    serve_generation(listener, acceptor, context, phase).await
+}
+
+pub(crate) async fn serve_generation(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    context: Arc<ServerContext>,
+    mut phase: watch::Receiver<GenerationPhase>,
+) -> Result<(), ServerError> {
+    if !await_generation_activation(&mut phase).await {
+        return Ok(());
+    }
     // JoinSet ownership makes cancellation of serve cancel all of its
     // connections, which in turn cancel all of their stream handlers.
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
+            change = phase.changed() => {
+                if change.is_err() || *phase.borrow() == GenerationPhase::Drain {
+                    break;
+                }
+            }
             _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 let (socket, peer) = accepted.map_err(|_| ServerError::Io)?;
@@ -492,6 +535,15 @@ pub async fn serve(
             }
         }
     }
+    // Stop new TCP accepts first, then give already-authenticated tunnels a
+    // bounded chance to finish. Exceeding the grace aborts remaining tasks;
+    // it is never advertised as hard revoke or lossless migration.
+    drop(listener);
+    let _ = timeout(GENERATION_DRAIN, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    Ok(())
 }
 
 async fn reject(
