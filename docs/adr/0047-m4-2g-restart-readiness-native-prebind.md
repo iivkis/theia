@@ -22,6 +22,10 @@ server_name, bind addresses и набор inbound остаются restart-only.
   модальную read-only проверку и умеет показать результат или отказ;
   клавиши y/a в этой модалке НИКОГДА не выполняют Apply.
   Несохранённый TUI draft требует Ctrl+S или discard до проверки.
+- Один restart probe за раз на running service: fail-closed
+  single-flight mutex не позволяет накопить бесконечную очередь
+  spawn_blocking workers при отказе/timeout, а guard живёт до
+  завершения worker даже после потери IPC клиента.
 - Запрос check-restart ограничен существующими 128/128-байтными
   IPC лимитами, 8 активными клиентами и 2-секундным deadline.
   Без конфигурационного file snapshot или защищённого IPC
