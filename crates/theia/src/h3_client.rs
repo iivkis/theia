@@ -76,7 +76,12 @@ impl H3Client {
 
     pub async fn open(&self, address: Address, port: u16) -> Result<H3Tunnel, ClientError> {
         let operation = diagnostics::next_id();
-        crate::diag!(Debug, "client.h3", "open_begin", "op" = Value::Count(operation));
+        crate::diag!(
+            Debug,
+            "client.h3",
+            "open_begin",
+            "op" = Value::Count(operation)
+        );
         let open = Frame::OpenTcp { address, port };
         protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
         let result = timeout(OPEN_TIMEOUT, self.open_inner(open, operation))
@@ -84,9 +89,19 @@ impl H3Client {
             .map_err(|_| ClientError::Timeout)
             .and_then(|result| result);
         match &result {
-            Ok(_) => crate::diag!(Info, "client.h3", "open_confirmed", "op" = Value::Count(operation)),
-            Err(error) => crate::diag!(Warn, "client.h3", "open_failed",
-                "op" = Value::Count(operation), "reason" = Value::Label(error_kind(error))),
+            Ok(_) => crate::diag!(
+                Info,
+                "client.h3",
+                "open_confirmed",
+                "op" = Value::Count(operation)
+            ),
+            Err(error) => crate::diag!(
+                Warn,
+                "client.h3",
+                "open_failed",
+                "op" = Value::Count(operation),
+                "reason" = Value::Label(error_kind(error))
+            ),
         }
         result
     }
@@ -103,7 +118,12 @@ impl H3Client {
             .connect(self.remote, &self.name, self.connect_timeout)
             .await
             .map_err(quic_error)?;
-        crate::diag!(Trace, "client.h3", "quic_tls_bbr_verified", "op" = Value::Count(operation));
+        crate::diag!(
+            Trace,
+            "client.h3",
+            "quic_tls_bbr_verified",
+            "op" = Value::Count(operation)
+        );
         let mut builder = h3::client::builder();
         builder.max_field_section_size(MAX_HEADERS);
         let (mut driver, mut sender) = builder
@@ -130,8 +150,13 @@ impl H3Client {
             .recv_response()
             .await
             .map_err(|_| ClientError::Http3)?;
-        crate::diag!(Trace, "client.h3", "response_received",
-            "op" = Value::Count(operation), "status" = Value::Count(u64::from(response.status().as_u16())));
+        crate::diag!(
+            Trace,
+            "client.h3",
+            "response_received",
+            "op" = Value::Count(operation),
+            "status" = Value::Count(u64::from(response.status().as_u16()))
+        );
         match response.status() {
             StatusCode::OK => {}
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -155,7 +180,12 @@ impl H3Client {
         state
             .apply(Direction::Receive, &ack)
             .map_err(|_| ClientError::Protocol)?;
-        crate::diag!(Trace, "client.h3", "hello_ack_received", "op" = Value::Count(operation));
+        crate::diag!(
+            Trace,
+            "client.h3",
+            "hello_ack_received",
+            "op" = Value::Count(operation)
+        );
         if !matches!(ack, Frame::HelloAck { .. }) {
             return Err(ClientError::Protocol);
         }
@@ -178,10 +208,15 @@ impl H3Client {
                 _endpoint: endpoint,
             }),
             Frame::OpenError(code) => {
-                crate::diag!(Warn, "client.h3", "remote_open_refused",
-                    "op" = Value::Count(operation), "code" = Value::Count(code as u64));
+                crate::diag!(
+                    Warn,
+                    "client.h3",
+                    "remote_open_refused",
+                    "op" = Value::Count(operation),
+                    "code" = Value::Count(code as u64)
+                );
                 Err(ClientError::Open(code))
-            },
+            }
             _ => Err(ClientError::Protocol),
         }
     }
@@ -224,7 +259,12 @@ impl H3Tunnel {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let operation = self.operation;
-        crate::diag!(Info, "client.h3", "relay_begin", "op" = Value::Count(operation));
+        crate::diag!(
+            Info,
+            "client.h3",
+            "relay_begin",
+            "op" = Value::Count(operation)
+        );
         let (mut read, mut write) = tokio::io::split(local);
         let tx = &mut self.tx;
         let rx = &mut self.rx;
@@ -243,9 +283,14 @@ impl H3Tunnel {
                 } else {
                     Frame::Data(buffer[..n].to_vec())
                 };
-                crate::diag!(Trace, "client.h3", "upload_frame",
-                    "op" = Value::Count(operation), "bytes" = Value::Count(n as u64),
-                    "fin" = Value::Flag(n == 0));
+                crate::diag!(
+                    Trace,
+                    "client.h3",
+                    "upload_frame",
+                    "op" = Value::Count(operation),
+                    "bytes" = Value::Count(n as u64),
+                    "fin" = Value::Flag(n == 0)
+                );
                 upload_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
@@ -267,15 +312,25 @@ impl H3Tunnel {
                     .map_err(|_| ClientError::Protocol)?;
                 match frame {
                     Frame::Data(data) => {
-                        crate::diag!(Trace, "client.h3", "download_frame",
-                            "op" = Value::Count(operation), "bytes" = Value::Count(data.len() as u64));
+                        crate::diag!(
+                            Trace,
+                            "client.h3",
+                            "download_frame",
+                            "op" = Value::Count(operation),
+                            "bytes" = Value::Count(data.len() as u64)
+                        );
                         timeout(IO_TIMEOUT, write.write_all(&data))
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
                     }
                     Frame::Fin => {
-                        crate::diag!(Debug, "client.h3", "download_fin", "op" = Value::Count(operation));
+                        crate::diag!(
+                            Debug,
+                            "client.h3",
+                            "download_fin",
+                            "op" = Value::Count(operation)
+                        );
                         timeout(IO_TIMEOUT, write.shutdown())
                             .await
                             .map_err(|_| ClientError::Timeout)?
@@ -292,11 +347,21 @@ impl H3Tunnel {
             Ok::<(), ClientError>(())
         };
         if let Err(error) = tokio::try_join!(upload, download) {
-            crate::diag!(Warn, "client.h3", "relay_failed",
-                "op" = Value::Count(operation), "reason" = Value::Label(error_kind(&error)));
+            crate::diag!(
+                Warn,
+                "client.h3",
+                "relay_failed",
+                "op" = Value::Count(operation),
+                "reason" = Value::Label(error_kind(&error))
+            );
             return Err(error);
         }
-        crate::diag!(Info, "client.h3", "relay_completed", "op" = Value::Count(operation));
+        crate::diag!(
+            Info,
+            "client.h3",
+            "relay_completed",
+            "op" = Value::Count(operation)
+        );
         self.state
             .apply(Direction::Send, &Frame::Fin)
             .map_err(|_| ClientError::Protocol)?;

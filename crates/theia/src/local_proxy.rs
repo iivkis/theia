@@ -2,8 +2,8 @@
 //! No system proxy changes, destination DNS lookups or live tunnel migration.
 use crate::{
     client::{error_kind, ClientError, H2Client, Tunnel},
-    diagnostics::{self, Value},
     config::{self, Config, Profile, Transport},
+    diagnostics::{self, Value},
     h3_client::{H3Client, H3Tunnel},
     protocol::{self, Address, ErrorCode, Frame},
 };
@@ -257,39 +257,64 @@ impl AutoClient {
 
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let (generation, cached) = self.observe()?;
-        crate::diag!(Debug, "client.auto", "transport_select",
-            "generation" = Value::Count(generation), "negative_cache_hit" = Value::Flag(cached));
+        crate::diag!(
+            Debug,
+            "client.auto",
+            "transport_select",
+            "generation" = Value::Count(generation),
+            "negative_cache_hit" = Value::Flag(cached)
+        );
         if !cached {
             match self.h3.open(address.clone(), port).await {
                 Ok(tunnel) => {
                     self.complete(generation, false)?;
-                    crate::diag!(Info, "client.auto", "selected_h3",
-                        "generation" = Value::Count(generation));
+                    crate::diag!(
+                        Info,
+                        "client.auto",
+                        "selected_h3",
+                        "generation" = Value::Count(generation)
+                    );
                     eprintln!("transport=h3");
                     return Ok(ProxyTunnel::H3(Box::new(tunnel)));
                 }
                 Err(ClientError::QuicUnreachable) => {
                     if !self.complete(generation, true)? {
-                        crate::diag!(Warn, "client.auto", "stale_quic_probe_rejected",
-                            "generation" = Value::Count(generation));
+                        crate::diag!(
+                            Warn,
+                            "client.auto",
+                            "stale_quic_probe_rejected",
+                            "generation" = Value::Count(generation)
+                        );
                         return Err(ClientError::QuicUnreachable);
                     }
-                    crate::diag!(Warn, "client.auto", "h3_udp_silent_fallback_h2",
-                        "generation" = Value::Count(generation));
+                    crate::diag!(
+                        Warn,
+                        "client.auto",
+                        "h3_udp_silent_fallback_h2",
+                        "generation" = Value::Count(generation)
+                    );
                     eprintln!("transport=h2 reason=quic_unreachable");
                 }
                 Err(error) => {
                     // All errors except observed UDP silence remain terminal.
                     self.complete(generation, false)?;
-                    crate::diag!(Warn, "client.auto", "terminal_h3_failure_no_fallback",
+                    crate::diag!(
+                        Warn,
+                        "client.auto",
+                        "terminal_h3_failure_no_fallback",
                         "generation" = Value::Count(generation),
-                        "reason" = Value::Label(error_kind(&error)));
+                        "reason" = Value::Label(error_kind(&error))
+                    );
                     return Err(error);
                 }
             }
         } else {
-            crate::diag!(Debug, "client.auto", "negative_cache_fallback_h2",
-                "generation" = Value::Count(generation));
+            crate::diag!(
+                Debug,
+                "client.auto",
+                "negative_cache_fallback_h2",
+                "generation" = Value::Count(generation)
+            );
             eprintln!("transport=h2 reason=quic_negative_cache");
         }
         self.h2
@@ -345,8 +370,12 @@ pub async fn run_file_with_system_proxy(config_path: &Path) -> Result<(), Client
 }
 
 async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result<(), ClientError> {
-    crate::diag!(Info, "client.proxy", "config_read_begin",
-        "system_proxy_requested" = Value::Flag(enable_system_proxy));
+    crate::diag!(
+        Info,
+        "client.proxy",
+        "config_read_begin",
+        "system_proxy_requested" = Value::Flag(enable_system_proxy)
+    );
     let Config::Client(document) =
         config::read_file(config_path).map_err(|_| ClientError::Configuration)?
     else {
@@ -358,8 +387,12 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
         .iter()
         .find(|p| p.id == document.client.active_profile)
         .ok_or(ClientError::Configuration)?;
-    crate::diag!(Debug, "client.proxy", "config_valid",
-        "profiles" = Value::Count(document.client.profiles.len() as u64));
+    crate::diag!(
+        Debug,
+        "client.proxy",
+        "config_valid",
+        "profiles" = Value::Count(document.client.profiles.len() as u64)
+    );
     let client = load_client(profile).await?;
     crate::diag!(Info, "client.proxy", "transport_preflight_passed");
     // All startup validation and both binds must succeed before accepting.
@@ -369,7 +402,12 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     let socks = TcpListener::bind(&document.client.proxy.socks5_listen)
         .await
         .map_err(|_| ClientError::Io)?;
-    crate::diag!(Info, "client.proxy", "listeners_bound", "count" = Value::Count(2));
+    crate::diag!(
+        Info,
+        "client.proxy",
+        "listeners_bound",
+        "count" = Value::Count(2)
+    );
     #[cfg(windows)]
     if enable_system_proxy {
         // A config declaration is insufficient by itself: this branch
@@ -422,8 +460,12 @@ async fn serve_proxy(
             return Err(ClientError::Configuration);
         }
     }
-    crate::diag!(Info, "client.proxy", "accept_loop_started",
-        "max_sessions" = Value::Count(LOCAL_LIMIT as u64));
+    crate::diag!(
+        Info,
+        "client.proxy",
+        "accept_loop_started",
+        "max_sessions" = Value::Count(LOCAL_LIMIT as u64)
+    );
     let slots = Arc::new(Semaphore::new(LOCAL_LIMIT));
     let mut tasks = JoinSet::new();
     loop {
@@ -433,12 +475,20 @@ async fn serve_proxy(
             accepted = socks.accept() => (accepted.map_err(|_| ClientError::Io)?.0, false),
         };
         let session_id = diagnostics::next_id();
-        crate::diag!(Trace, "client.proxy", "local_accepted",
+        crate::diag!(
+            Trace,
+            "client.proxy",
+            "local_accepted",
             "session" = Value::Count(session_id),
-            "http_connect" = Value::Flag(is_http));
+            "http_connect" = Value::Flag(is_http)
+        );
         let Ok(slot) = slots.clone().try_acquire_owned() else {
-            crate::diag!(Warn, "client.proxy", "session_quota_rejected",
-                "session" = Value::Count(session_id));
+            crate::diag!(
+                Warn,
+                "client.proxy",
+                "session_quota_rejected",
+                "session" = Value::Count(session_id)
+            );
             continue;
         };
         let client = client.clone();
@@ -446,11 +496,19 @@ async fn serve_proxy(
             let _slot = slot;
             let result = handle(socket, is_http, &client, session_id).await;
             match result {
-                Ok(()) => crate::diag!(Info, "client.proxy", "session_completed",
-                    "session" = Value::Count(session_id)),
-                Err(error) => crate::diag!(Warn, "client.proxy", "session_failed",
+                Ok(()) => crate::diag!(
+                    Info,
+                    "client.proxy",
+                    "session_completed",
+                    "session" = Value::Count(session_id)
+                ),
+                Err(error) => crate::diag!(
+                    Warn,
+                    "client.proxy",
+                    "session_failed",
                     "session" = Value::Count(session_id),
-                    "reason" = Value::Label(error_kind(&error))),
+                    "reason" = Value::Label(error_kind(&error))
+                ),
             }
         });
     }
@@ -631,15 +689,23 @@ async fn handle(
     client: &ProxyClient,
     session_id: u64,
 ) -> Result<(), ClientError> {
-    crate::diag!(Trace, "client.proxy", "negotiation_started",
-        "session" = Value::Count(session_id));
+    crate::diag!(
+        Trace,
+        "client.proxy",
+        "negotiation_started",
+        "session" = Value::Count(session_id)
+    );
     let (address, port) = if is_http {
         match timeout(NEGOTIATE_TIMEOUT, http_target(&mut socket)).await {
             Ok(Ok(target)) => target,
             Ok(Err(reply)) => {
                 let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
-                crate::diag!(Warn, "client.proxy", "http_connect_parse_failed",
-                    "session" = Value::Count(session_id));
+                crate::diag!(
+                    Warn,
+                    "client.proxy",
+                    "http_connect_parse_failed",
+                    "session" = Value::Count(session_id)
+                );
                 return Err(ClientError::Protocol);
             }
             Err(_) => return Err(ClientError::Timeout),
@@ -649,12 +715,20 @@ async fn handle(
             .await
             .map_err(|_| ClientError::Timeout)??
     };
-    crate::diag!(Debug, "client.proxy", "negotiation_validated",
-        "session" = Value::Count(session_id));
+    crate::diag!(
+        Debug,
+        "client.proxy",
+        "negotiation_validated",
+        "session" = Value::Count(session_id)
+    );
     match client.open(address, port).await {
         Ok(tunnel) => {
-            crate::diag!(Info, "client.proxy", "remote_open_ok",
-                "session" = Value::Count(session_id));
+            crate::diag!(
+                Info,
+                "client.proxy",
+                "remote_open_ok",
+                "session" = Value::Count(session_id)
+            );
             // This is the only success path; open() already verified OPEN_OK.
             if is_http {
                 timeout(REPLY_TIMEOUT, socket.write_all(HTTP_OK))
@@ -669,9 +743,13 @@ async fn handle(
             tunnel.relay(socket).await
         }
         Err(error) => {
-            crate::diag!(Warn, "client.proxy", "remote_open_failed",
+            crate::diag!(
+                Warn,
+                "client.proxy",
+                "remote_open_failed",
                 "session" = Value::Count(session_id),
-                "reason" = Value::Label(error_kind(&error)));
+                "reason" = Value::Label(error_kind(&error))
+            );
             if is_http {
                 let reply = match error {
                     ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => {

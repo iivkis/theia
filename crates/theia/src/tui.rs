@@ -1391,9 +1391,13 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
 /// Edit only when both role and a config path are explicitly supplied.
 /// Saving never changes a service. A separate, explicitly confirmed Linux\n/// IPC transaction is available only for saved server authorization deltas.
 pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiError> {
-    crate::diag!(Info, "tui", "start",
+    crate::diag!(
+        Info,
+        "tui",
+        "start",
         "server_role" = crate::diagnostics::Value::Flag(matches!(role, Some(Role::Server))),
-        "editor_requested" = crate::diagnostics::Value::Flag(config_path.is_some()));
+        "editor_requested" = crate::diagnostics::Value::Flag(config_path.is_some())
+    );
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         crate::diag!(Warn, "tui", "not_interactive");
         return Err(TuiError::NotInteractive);

@@ -8,9 +8,15 @@ async fn main() {
     std::panic::set_hook(Box::new(move |panic| {
         if let Some(location) = panic.location() {
             diagnostics::emit(
-                diagnostics::Level::Error, "process", "panic",
-                &[("line", diagnostics::Value::Count(u64::from(location.line())))],
-                location.file(), location.line(),
+                diagnostics::Level::Error,
+                "process",
+                "panic",
+                &[(
+                    "line",
+                    diagnostics::Value::Count(u64::from(location.line())),
+                )],
+                location.file(),
+                location.line(),
             );
         } else {
             theia::diag!(Error, "process", "panic_without_location");
@@ -18,9 +24,13 @@ async fn main() {
         diagnostics::flush();
         previous_hook(panic);
     }));
-    theia::diag!(Info, "process", "started", "argv_count" = diagnostics::Value::Count(
-        std::env::args_os().len().saturating_sub(1) as u64
-    ));
+    theia::diag!(
+        Info,
+        "process",
+        "started",
+        "argv_count" =
+            diagnostics::Value::Count(std::env::args_os().len().saturating_sub(1) as u64)
+    );
     let args: Result<Vec<String>, CliError> = std::env::args_os()
         .skip(1)
         .map(|arg| arg.into_string().map_err(|_| CliError::NonUtf8Argument))
@@ -251,7 +261,12 @@ async fn main() {
                 CliError::SystemProxy(_) => "system_proxy",
                 CliError::Tui(_) => "tui",
             };
-            theia::diag!(Error, "process", "failed", "error_class" = diagnostics::Value::Label(class));
+            theia::diag!(
+                Error,
+                "process",
+                "failed",
+                "error_class" = diagnostics::Value::Label(class)
+            );
             eprintln!("theia: {error}");
             diagnostics::flush();
             std::process::exit(error.exit_code());

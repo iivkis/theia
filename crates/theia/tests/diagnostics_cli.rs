@@ -7,7 +7,10 @@ use std::{
 };
 
 fn isolated_dir() -> PathBuf {
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     std::env::temp_dir().join(format!("theia-trace-cli-{}-{stamp}", std::process::id()))
 }
 
@@ -30,8 +33,15 @@ fn cli_writes_trace_by_default_without_leaking_arguments_or_credentials() {
     assert_eq!(failed.status.code(), Some(2));
     assert!(!String::from_utf8_lossy(&failed.stderr).contains(secret));
     let ok = invoke(&dir, &["--help"], false);
-    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
-    let files: Vec<_> = fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let files: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
     assert_eq!(files.len(), 2, "each process owns an isolated trace");
     let mut combined = String::new();
     for file in files {
@@ -63,9 +73,19 @@ fn trace_files_are_readable_only_by_the_owner() {
 
     let dir = isolated_dir();
     let result = invoke(&dir, &["--version"], false);
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let log = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
-    assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
-    assert_eq!(fs::metadata(log).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     fs::remove_dir_all(dir).unwrap();
 }

@@ -653,16 +653,31 @@ async fn handle_request(
     peer: IpAddr,
 ) -> Result<(), ServerError> {
     let session_id = diagnostics::next_id();
-    crate::diag!(Trace, "server.h2", "request_received", "session" = Value::Count(session_id));
+    crate::diag!(
+        Trace,
+        "server.h2",
+        "request_received",
+        "session" = Value::Count(session_id)
+    );
     let permit = match context.authorize_request(&request, peer) {
         Ok(permit) => permit,
         Err(status) => {
-            crate::diag!(Warn, "server.h2", "authorization_rejected",
-                "session" = Value::Count(session_id), "http_status" = Value::Count(u64::from(status.as_u16())));
+            crate::diag!(
+                Warn,
+                "server.h2",
+                "authorization_rejected",
+                "session" = Value::Count(session_id),
+                "http_status" = Value::Count(u64::from(status.as_u16()))
+            );
             return reject(&mut respond, status).await;
         }
     };
-    crate::diag!(Debug, "server.h2", "authorized", "session" = Value::Count(session_id));
+    crate::diag!(
+        Debug,
+        "server.h2",
+        "authorized",
+        "session" = Value::Count(session_id)
+    );
     let mut inbound = request.into_body();
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -678,12 +693,25 @@ async fn handle_request(
     )
     .await;
     match &result {
-        Ok(Ok(())) => crate::diag!(Info, "server.h2", "request_completed",
-            "session" = Value::Count(session_id)),
-        Ok(Err(error)) => crate::diag!(Warn, "server.h2", "request_relay_failed",
-            "session" = Value::Count(session_id), "reason" = Value::Label(error_kind(*error))),
-        Err(_) => crate::diag!(Warn, "server.h2", "request_timeout",
-            "session" = Value::Count(session_id)),
+        Ok(Ok(())) => crate::diag!(
+            Info,
+            "server.h2",
+            "request_completed",
+            "session" = Value::Count(session_id)
+        ),
+        Ok(Err(error)) => crate::diag!(
+            Warn,
+            "server.h2",
+            "request_relay_failed",
+            "session" = Value::Count(session_id),
+            "reason" = Value::Label(error_kind(*error))
+        ),
+        Err(_) => crate::diag!(
+            Warn,
+            "server.h2",
+            "request_timeout",
+            "session" = Value::Count(session_id)
+        ),
     }
     // A timeout or transport failure can interrupt an already partially
     // written frame. Reset rather than appending an ABORT to corrupt bytes.
@@ -811,8 +839,12 @@ async fn handle_frames(
     .await
     .map_err(|_| ServerError::TimedOut)??;
     let (address, port) = opened;
-    crate::diag!(Trace, "server.h2", "hello_and_open_validated",
-        "session" = Value::Count(session_id));
+    crate::diag!(
+        Trace,
+        "server.h2",
+        "hello_and_open_validated",
+        "session" = Value::Count(session_id)
+    );
     let dial = tokio::select! {
         result = context.dial_target(&address, port) => result,
         _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
@@ -822,8 +854,13 @@ async fn handle_frames(
     let tcp = match dial {
         Ok(tcp) => tcp,
         Err(code) => {
-            crate::diag!(Warn, "server.h2", "target_dial_rejected",
-                "session" = Value::Count(session_id), "code" = Value::Count(code as u64));
+            crate::diag!(
+                Warn,
+                "server.h2",
+                "target_dial_rejected",
+                "session" = Value::Count(session_id),
+                "code" = Value::Count(code as u64)
+            );
             let failure = Frame::OpenError(code);
             state
                 .apply(Direction::Send, &failure)
@@ -836,8 +873,12 @@ async fn handle_frames(
         .apply(Direction::Send, &Frame::OpenOk)
         .map_err(|_| ServerError::Protocol)?;
     send_frame(outgoing, &Frame::OpenOk).await?;
-    crate::diag!(Info, "server.h2", "open_ok_sent",
-        "session" = Value::Count(session_id));
+    crate::diag!(
+        Info,
+        "server.h2",
+        "open_ok_sent",
+        "session" = Value::Count(session_id)
+    );
     relay_tcp(tcp, incoming, outgoing, decoder, state, session_id).await
 }
 
@@ -865,16 +906,25 @@ async fn relay_tcp(
                 .map_err(|_| ServerError::Protocol)?;
             match frame {
                 Frame::Data(data) => {
-                    crate::diag!(Trace, "server.h2", "upload_frame",
-                        "session" = Value::Count(session_id), "bytes" = Value::Count(data.len() as u64));
+                    crate::diag!(
+                        Trace,
+                        "server.h2",
+                        "upload_frame",
+                        "session" = Value::Count(session_id),
+                        "bytes" = Value::Count(data.len() as u64)
+                    );
                     timeout(FRAME_IDLE_TIMEOUT, write.write_all(&data))
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
                 }
                 Frame::Fin => {
-                    crate::diag!(Debug, "server.h2", "upload_fin",
-                        "session" = Value::Count(session_id));
+                    crate::diag!(
+                        Debug,
+                        "server.h2",
+                        "upload_fin",
+                        "session" = Value::Count(session_id)
+                    );
                     timeout(FRAME_IDLE_TIMEOUT, write.shutdown())
                         .await
                         .map_err(|_| ServerError::TimedOut)?
@@ -917,9 +967,14 @@ async fn relay_tcp(
             } else {
                 Frame::Data(buffer[..size].to_vec())
             };
-            crate::diag!(Trace, "server.h2", "download_frame",
-                "session" = Value::Count(session_id), "bytes" = Value::Count(size as u64),
-                "fin" = Value::Flag(size == 0));
+            crate::diag!(
+                Trace,
+                "server.h2",
+                "download_frame",
+                "session" = Value::Count(session_id),
+                "bytes" = Value::Count(size as u64),
+                "fin" = Value::Flag(size == 0)
+            );
             tx_state
                 .apply(Direction::Send, &frame)
                 .map_err(|_| ServerError::Protocol)?;
@@ -1129,8 +1184,12 @@ pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
         crate::diag!(Warn, "server", "config_role_mismatch");
         return Err(ServerError::Config);
     };
-    crate::diag!(Info, "server", "config_valid",
-        "inbounds" = Value::Count(document.server.inbounds.len() as u64));
+    crate::diag!(
+        Info,
+        "server",
+        "config_valid",
+        "inbounds" = Value::Count(document.server.inbounds.len() as u64)
+    );
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         run_supervised_file(document, config_path).await
@@ -1616,12 +1675,20 @@ async fn run_supervised_file(
     document: ServerDocument,
     config_path: &Path,
 ) -> Result<(), ServerError> {
-    crate::diag!(Info, "server.supervisor", "initial_generation_preflight_begin",
-        "inbounds" = Value::Count(document.server.inbounds.len() as u64));
+    crate::diag!(
+        Info,
+        "server.supervisor",
+        "initial_generation_preflight_begin",
+        "inbounds" = Value::Count(document.server.inbounds.len() as u64)
+    );
     let limits = GenerationLimits::new(&document);
     let initial = prepare_generation(&document, 1, &limits, None).await?;
-    crate::diag!(Info, "server.supervisor", "initial_generation_prepared",
-        "listeners" = Value::Count(initial.listeners.len() as u64));
+    crate::diag!(
+        Info,
+        "server.supervisor",
+        "initial_generation_prepared",
+        "listeners" = Value::Count(initial.listeners.len() as u64)
+    );
     let current_identities = initial.identities.clone();
     let runtime = Arc::new(crate::runtime_generation::State::new(
         crate::runtime_generation::View {
@@ -1851,9 +1918,13 @@ async fn run_document_with_config(
             .parse()
             .map_err(|_| ServerError::Config)?;
         let material = tls_material(inbound)?;
-        crate::diag!(Debug, "server", "listener_prepare",
+        crate::diag!(
+            Debug,
+            "server",
+            "listener_prepare",
             "h2_port" = Value::Count(u64::from(addr.port())),
-            "h3_port" = Value::Count(u64::from(udp_addr.port())));
+            "h3_port" = Value::Count(u64::from(udp_addr.port()))
+        );
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         loaded_identities.push(material.identity.clone());
         let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;

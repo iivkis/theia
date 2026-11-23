@@ -974,13 +974,17 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
         StatusCommand::ApplyReload { .. } => "apply_reload",
         StatusCommand::ApplyReloadBound { .. } => "apply_reload_bound",
     };
-    crate::diag!(Info, "management", "ipc_query_begin",
-        "command" = crate::diagnostics::Value::Label(kind));
+    crate::diag!(
+        Info,
+        "management",
+        "ipc_query_begin",
+        "command" = crate::diagnostics::Value::Label(kind)
+    );
     let result = {
         #[cfg(target_os = "linux")]
         {
-            let directory = std::env::var_os("THEIA_CONTROL_DIR")
-                .ok_or(ManagementError::NotConfigured)?;
+            let directory =
+                std::env::var_os("THEIA_CONTROL_DIR").ok_or(ManagementError::NotConfigured)?;
             query_in(Path::new(&directory), command).await
         }
         #[cfg(target_os = "windows")]
@@ -992,9 +996,13 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
             Err(ManagementError::Unsupported)
         }
     };
-    crate::diag!(Info, "management", "ipc_query_result",
+    crate::diag!(
+        Info,
+        "management",
+        "ipc_query_result",
         "command" = crate::diagnostics::Value::Label(kind),
-        "success" = crate::diagnostics::Value::Flag(result.is_ok()));
+        "success" = crate::diagnostics::Value::Flag(result.is_ok())
+    );
     result
 }
 

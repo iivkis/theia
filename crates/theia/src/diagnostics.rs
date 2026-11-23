@@ -5,8 +5,14 @@
 //! paths, HTTP headers, config text, or packet contents to this module.
 
 use std::{
-    env, fs, io::{self, Write}, path::{Path, PathBuf},
-    sync::{atomic::{AtomicU64, Ordering}, mpsc::{self, SyncSender, TrySendError}, OnceLock},
+    env, fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, SyncSender, TrySendError},
+        OnceLock,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -95,9 +101,15 @@ pub fn emit(
     for (key, value) in fields {
         use std::fmt::Write as _;
         match value {
-            Value::Count(value) => { let _ = write!(record, " {key}={value}"); }
-            Value::Flag(value) => { let _ = write!(record, " {key}={value}"); }
-            Value::Label(value) => { let _ = write!(record, " {key}={value}"); }
+            Value::Count(value) => {
+                let _ = write!(record, " {key}={value}");
+            }
+            Value::Flag(value) => {
+                let _ = write!(record, " {key}={value}");
+            }
+            Value::Label(value) => {
+                let _ = write!(record, " {key}={value}");
+            }
         }
     }
     record.push('\n');
@@ -127,7 +139,10 @@ fn start_logger() -> Option<Logger> {
         Ok(logger) => Some(logger),
         Err(error) => {
             // Paths are deliberately omitted, even when the path itself is the error.
-            eprintln!("theia: file trace unavailable ({:?}); diagnostics are incomplete", error.kind());
+            eprintln!(
+                "theia: file trace unavailable ({:?}); diagnostics are incomplete",
+                error.kind()
+            );
             None
         }
     }
@@ -148,7 +163,9 @@ fn log_directory() -> PathBuf {
     {
         let base = env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state")))
+            .or_else(|| {
+                env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
+            })
             .unwrap_or_else(env::temp_dir);
         base.join("theia").join("logs")
     }
@@ -166,13 +183,19 @@ fn private_directory(path: &Path) -> io::Result<()> {
     }
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe trace directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe trace directory",
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "trace directory not private"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "trace directory not private",
+            ));
         }
     }
     Ok(())
@@ -235,11 +258,20 @@ struct RotatingFile {
 impl RotatingFile {
     fn new(active: PathBuf, segment_bytes: u64) -> io::Result<Self> {
         if segment_bytes == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "zero segment limit"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero segment limit",
+            ));
         }
         let previous = active.with_extension("log.1");
         let file = new_file(&active)?;
-        Ok(Self { active, previous, file: Some(file), size: 0, segment_bytes })
+        Ok(Self {
+            active,
+            previous,
+            file: Some(file),
+            size: 0,
+            segment_bytes,
+        })
     }
 
     fn write(&mut self, record: &str) -> io::Result<()> {
@@ -247,7 +279,10 @@ impl RotatingFile {
         let length = u64::try_from(bytes.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record too large"))?;
         if length > self.segment_bytes {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "record exceeds segment"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "record exceeds segment",
+            ));
         }
         if self.size + length > self.segment_bytes {
             // Drop the old handle before rename, including on Windows.
@@ -262,7 +297,9 @@ impl RotatingFile {
             self.file = Some(new_file(&self.active)?);
             self.size = 0;
         }
-        let file = self.file.as_mut()
+        let file = self
+            .file
+            .as_mut()
             .ok_or_else(|| io::Error::other("trace writer is closed"))?;
         file.write_all(bytes)?;
         file.flush()?;
@@ -297,7 +334,10 @@ mod tests {
     use super::*;
 
     fn directory() -> PathBuf {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = env::temp_dir().join(format!("theia-trace-test-{}-{stamp}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         dir
@@ -308,7 +348,9 @@ mod tests {
         let dir = directory();
         let mut writer = RotatingFile::new(dir.join("trace.log"), 128).unwrap();
         for index in 0..100 {
-            writer.write(&format!("sequence={index:03} payload=static\n")).unwrap();
+            writer
+                .write(&format!("sequence={index:03} payload=static\n"))
+                .unwrap();
         }
         let active = fs::read_to_string(dir.join("trace.log")).unwrap();
         let previous = fs::read_to_string(dir.join("trace.log.1")).unwrap();
@@ -342,7 +384,18 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         private_directory(&dir).unwrap();
         let writer = RotatingFile::new(dir.join("trace.log"), 100).unwrap();
-        assert_eq!(writer.file.as_ref().unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            writer
+                .file
+                .as_ref()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         drop(writer);
         fs::remove_dir_all(dir).unwrap();
     }
