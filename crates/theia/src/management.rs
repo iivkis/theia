@@ -447,14 +447,13 @@ where
                     .await
                     {
                         Ok(Ok(candidate)) => {
-                            let result = if let (Some(runtime), Some(previous)) =
-                                (&runtime, &observed)
-                            {
-                                runtime.apply_auth(previous, &candidate, expected)
-                            } else {
-                                live.stage(&candidate, expected)
-                                    .and_then(|stage| live.publish(stage))
-                            };
+                            let result =
+                                if let (Some(runtime), Some(previous)) = (&runtime, &observed) {
+                                    runtime.apply_auth(previous, &candidate, expected)
+                                } else {
+                                    live.stage(&candidate, expected)
+                                        .and_then(|stage| live.publish(stage))
+                                };
                             match result {
                                 Ok(revision) => {
                                     format!("theia-apply-v1 applied revision={revision}\n")
@@ -476,14 +475,13 @@ where
                     // publish the exact document that was just validated.
                     match tokio::task::spawn_blocking(move || preflight.load_candidate()).await {
                         Ok(Ok(candidate)) => {
-                            let result = if let (Some(runtime), Some(previous)) =
-                                (&runtime, &observed)
-                            {
-                                runtime.apply_auth(previous, &candidate, expected)
-                            } else {
-                                live.stage(&candidate, expected)
-                                    .and_then(|stage| live.publish(stage))
-                            };
+                            let result =
+                                if let (Some(runtime), Some(previous)) = (&runtime, &observed) {
+                                    runtime.apply_auth(previous, &candidate, expected)
+                                } else {
+                                    live.stage(&candidate, expected)
+                                        .and_then(|stage| live.publish(stage))
+                                };
                             match result {
                                 Ok(revision) => {
                                     format!("theia-apply-v1 applied revision={revision}\n")
@@ -637,9 +635,7 @@ where
             Some(revision) if Some(revision) == expected_revision.checked_add(1) => {
                 Ok(StatusReply::RestartApplied { revision })
             }
-            _ if reply == b"theia-restart-v1 rejected\n" => {
-                Err(ManagementError::CandidateRejected)
-            }
+            _ if reply == b"theia-restart-v1 rejected\n" => Err(ManagementError::CandidateRejected),
             _ if reply == b"ERR unsupported\n" => Err(ManagementError::Unsupported),
             _ => Err(ManagementError::InvalidReply),
         };
