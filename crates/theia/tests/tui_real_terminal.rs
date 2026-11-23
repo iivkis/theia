@@ -149,6 +149,11 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
         ),
     )
     .unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let tcp = free_port(true);
     let udp = free_port(false);
     let mut doc = ServerDocument {
