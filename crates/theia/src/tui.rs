@@ -1392,6 +1392,86 @@ mod tests {
     }
 
     #[test]
+    fn explicit_disable_user_is_confirmed_saved_and_never_reveals_credentials() {
+        use crate::config::{self, Config};
+        use std::{fs, thread, time::Instant};
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-m44b2a-disable-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.update(&mut model, press(KeyCode::Char('x')));
+        assert!(matches!(ui.revocation, Some(DisableFlow::Input(_))));
+        for ch in "device-a".chars() {
+            ui.update(&mut model, press(KeyCode::Char(ch)));
+        }
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.revocation, Some(DisableFlow::Confirm(_))));
+        let before = rendered_interaction(120, 40, &model, &ui);
+        assert!(before.contains("всех inbound"));
+        assert!(!before.contains("theia://v1/"));
+        let Config::Server(before_doc) = config::read_file(&path).unwrap() else {
+            panic!("server");
+        };
+        assert!(!before_doc.server.users[0].disabled);
+
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        assert!(ui.saving.is_some());
+        let start = Instant::now();
+        while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ui.saving.is_none());
+        assert!(matches!(ui.revocation, Some(DisableFlow::Done)));
+        let Config::Server(after_doc) = config::read_file(&path).unwrap() else {
+            panic!("server");
+        };
+        assert!(after_doc.server.users[0].disabled);
+        assert!(after_doc.server.inbounds[0]
+            .allowed_user_ids
+            .contains(&"device-a".to_string()));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.revocation.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn disable_shortcut_rejects_client_and_dirty_server_draft() {
+        use std::fs;
+        let client_path = std::env::temp_dir().join(format!(
+            "theia-m44b2a-client-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&client_path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &client_path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Char('x')));
+        assert!(ui.revocation.is_none());
+        fs::remove_file(client_path).unwrap();
+
+        let server_path = std::env::temp_dir().join(format!(
+            "theia-m44b2a-dirty-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&server_path, server_issuance_fixture()).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &server_path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        let editor = ui.editor.as_mut().unwrap();
+        editor.begin();
+        editor.input = "other.example.org".into();
+        assert!(editor.accept());
+        ui.update(&mut model, press(KeyCode::Char('x')));
+        assert!(ui.revocation.is_none());
+        assert!(ui.editor.as_ref().unwrap().dirty());
+        fs::remove_file(server_path).unwrap();
+    }
+
+    #[test]
     fn server_discovery_panel_is_passive_until_separate_ipify_consent() {
         let mut model = Model::new(Some(Role::Server));
         let mut ui = Interaction::new(None);
