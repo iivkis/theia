@@ -5,12 +5,15 @@ Only a test tool: no fake ratatui events, injected IPC responses or snapshots.
 The real compiled server and its native IPC are started by the Rust test.
 """
 import argparse
+import codecs
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+
+import pyte
 
 CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 OSC = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
@@ -20,6 +23,9 @@ TIMEOUT = 12.0
 class Terminal:
     def __init__(self, command):
         self.raw = ""
+        self.screen = pyte.Screen(160, 42)
+        self.stream = pyte.Stream(self.screen)
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.lock = threading.Lock()
         self.error = None
         self.posix_master = None
@@ -57,7 +63,9 @@ class Terminal:
                     chunk = self.win.read()
                     if chunk:
                         with self.lock:
-                            self.raw += chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
+                            text = chunk if isinstance(chunk, str) else self.decoder.decode(chunk)
+                            self.raw += text
+                            self.stream.feed(text)
             else:
                 import select
 
@@ -74,7 +82,9 @@ class Terminal:
                     if not chunk:
                         break
                     with self.lock:
-                        self.raw += chunk.decode("utf-8", "replace")
+                        text = self.decoder.decode(chunk)
+                        self.raw += text
+                        self.stream.feed(text)
         except EOFError:
             pass
         except Exception as exc:
@@ -84,15 +94,14 @@ class Terminal:
         with self.lock:
             return len(self.raw)
 
-    def cleaned(self, start=0):
+    def visible(self):
         with self.lock:
-            data = self.raw[start:]
-        return OSC.sub("", CSI.sub("", data)).replace("\r", "")
+            return "\n".join(self.screen.display)
 
     def wait(self, text, since=0, seconds=TIMEOUT):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            if text in self.cleaned(since):
+            if text in self.visible():
                 return
             if self.error:
                 raise AssertionError("PTY read failed: " + self.error)
