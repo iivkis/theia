@@ -76,8 +76,7 @@ impl Ledger {
     /// ALL inbounds. No new slot can sneak in while a quota cap is resized.
     pub(crate) fn acquire_session(self: &Arc<Self>, user: &str) -> Option<Lease> {
         let mut usage = self.usage.lock().ok()?;
-        if usage.sessions >= usage.total_limit
-            || *usage.per_user.get(user)? >= usage.per_user_limit
+        if usage.sessions >= usage.total_limit || *usage.per_user.get(user)? >= usage.per_user_limit
         {
             return None;
         }
@@ -246,11 +245,8 @@ mod tests {
                 let shared = ledger.clone();
                 threads.spawn(move || {
                     for iteration in 0..200 {
-                        let _held = shared.acquire_session(if thread % 2 == 0 {
-                            "alice"
-                        } else {
-                            "bob"
-                        });
+                        let _held =
+                            shared.acquire_session(if thread % 2 == 0 { "alice" } else { "bob" });
                         if iteration % 17 == 0 {
                             let cap = if iteration % 34 == 0 { 2 } else { 8 };
                             shared.resize(&policy(cap, cap)).unwrap();
