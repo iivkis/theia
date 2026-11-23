@@ -3,7 +3,7 @@
 use crate::{
     protocol::{self, Decoder, Direction, Frame, Role, Session},
     quic_transport,
-    server::{ServerContext, ServerError},
+    server::{self, GenerationPhase, ServerContext, ServerError},
 };
 use bytes::{Buf, Bytes};
 use h3::{error::Code, quic, server::RequestStream};
@@ -12,6 +12,7 @@ use std::{collections::VecDeque, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::watch,
     task::JoinSet,
     time::timeout,
 };
@@ -48,10 +49,27 @@ pub async fn serve(
     endpoint: quinn::Endpoint,
     context: Arc<ServerContext>,
 ) -> Result<(), ServerError> {
+    let (_owner, phase) = watch::channel(GenerationPhase::Active);
+    serve_generation(endpoint, context, phase).await
+}
+
+pub(crate) async fn serve_generation(
+    endpoint: quinn::Endpoint,
+    context: Arc<ServerContext>,
+    mut phase: watch::Receiver<GenerationPhase>,
+) -> Result<(), ServerError> {
+    if !server::await_generation_activation(&mut phase).await {
+        return Ok(());
+    }
     let endpoint = EndpointGuard(endpoint);
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
+            change = phase.changed() => {
+                if change.is_err() || *phase.borrow() == GenerationPhase::Drain {
+                    break;
+                }
+            }
             _ = connections.join_next(), if !connections.is_empty() => {}
             incoming = endpoint.0.accept() => {
                 let Some(incoming) = incoming else {
@@ -72,6 +90,25 @@ pub async fn serve(
             }
         }
     }
+    // Quinn does not expose a portable accept-only half-close on Endpoint:
+    // while existing streams drain, refuse all NEW datagrams/connection
+    // attempts. EndpointGuard closes everything after the bounded window.
+    let _ = timeout(server::GENERATION_DRAIN, async {
+        while !connections.is_empty() {
+            tokio::select! {
+                _ = connections.join_next() => {}
+                incoming = endpoint.0.accept() => {
+                    if let Some(incoming) = incoming {
+                        incoming.refuse();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    Ok(())
 }
 
 async fn run_connection(connection: quinn::Connection, context: Arc<ServerContext>) {
