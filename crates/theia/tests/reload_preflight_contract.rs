@@ -1,9 +1,7 @@
 //! M4.2b0 TDD: preflight only; no config mutation or live reload.
 //! The check is deliberately narrower than full transactional Apply.
 use theia::{
-    config::{
-        Config, Inbound, Management, ServerDocument, ServerPolicy, ServerSettings, Ui, User,
-    },
+    config::{Config, Inbound, Management, ServerDocument, ServerPolicy, ServerSettings, Ui, User},
     reload_preflight::{assess_reload, ReloadCheckError},
 };
 
