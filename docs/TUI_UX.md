@@ -193,8 +193,20 @@ M4.4a реализует **только доменный codec**, не UI/CLI в
 Важно: добавление записи в server.toml **не обновляет работающий процесс**. Секрет нельзя восстановить из digest; при его потере для работы понадобится будущая ротация. В M4.4b2a отдельно добавлено подтверждённое отключение существующего пользователя, но ротация токена, защищённый файл экспорта, управление users как список, импорт ссылки в клиентскую конфигурацию и системный прокси ещё не реализованы.
 
 
+## 12. M4.4c — client-only import: masked source, trust and safe save
+
+The local client TUI with explicit \`--role client --config FILE\` offers \`i\` to import a pasted \`theia://v1\` URI or **absolute local file**. Bracketed-paste text stays in a zeroizing input state and is never rendered, even as a field being edited. Enter previews only **profile ID / endpoint / SNI / transport / bearer present?**; the token itself and source URI never appear in TUI diagnostics. A separate optional \`c\` step accepts a pre-trusted absolute CA PEM \`file:\` reference. Without CA the resulting profile is not connectable. A secretless public URI requires separate \`e\` + \`env:NAME\` rather than fabricated default credentials.
+
+Confirming \`y\` triggers worker-based protected bearer creation and guarded atomic TOML append; no profile ID overwrite, activation, reload or Windows OS proxy. A conflict/failed save preserves the existing profile, rolls back the new secret when safe and exposes no credential. The new profile is never active automatically. This is the F-14 M4.4c implementation under CI review (ADR-0055), not the cross-host M4.4d acceptance.
+
 ## 10. M4.4b2a — явное отключение существующего пользователя
 
 В серверном `theia tui --role server --config FILE` на **сохранённом** чистом TOML выбирается inbound; `x` открывает ввод ID уже существующего активного пользователя с grant на этот inbound. Enter показывает отдельное подтверждение `y` / `n` / Esc и предупреждение: `users[].disabled` **глобален для всех inbound**. `y` ставит только `disabled=true`, проверяет весь документ и использует фоновой атомарный Ctrl+S worker с обнаружением внешнего конфликта. В случае ошибки `r` повторяет запись, `d` уничтожает черновик. В client role, с несохранённым или редактируемым черновиком, для неизвестного/неразрешённого/уже отключённого ID действие блокируется.
 
 Токен и его SHA-256 не показываются и не меняются. После сохранения UI **не** вызывает IPC Apply; отдельно требуется read-only revision/status и подтверждённый auth-only CAS Apply. Действующие H2/H3 туннели не разрываются. Ротация, повторное включение, защищённый экспорт и немедленное завершение сессий остаются будущими работами. [ADR-0053](adr/0053-m4-4b2a-explicit-existing-user-disable.md).
+
+## 11. M4.4b2b1 — подтверждённая ротация токена активного пользователя
+
+В серверном редакторе после выбора inbound клавиша `t` открывает отдельный ввод ID существующего активного пользователя с grant именно на этот inbound. Enter → экран предварительного просмотра предупреждает, что токен глобально изменится **на всех inbound** этого пользователя, но grants/disabled не меняются, старые сессии остаются и runtime не меняется до отдельного auth-only CAS Apply. `y` подтверждает создание нового CSPRNG 32-byte bearer и guarded фоновое атомарное сохранение `users[].token_sha256`; `n/Esc` отменяет до генерации.
+
+При конфликте файла/отказе записи новый секрет **не показывается**; `r` повторяет попытку, `d` уничтожает черновик и секрет. После успешного сохранения требуется **отдельное `y` для одноразового просмотра** конфиденциального `theia://v1` URI, `n/Esc` отказывается, `Esc` закрывает и уничтожает показанный секрет из состояния UI. Обновление live-auth только через отдельный status/revision + CAS Apply; до него runtime продолжает принимать старый bearer для новых сессий. Отключённого пользователя нельзя молча включить ротацией. В клиентском режиме и при грязном черновике `t` не открывает ротатор. ADR-0054; не является hard revocation или готовым клиентским импортом.

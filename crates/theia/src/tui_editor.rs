@@ -4,6 +4,7 @@
 //! secret references, token hashes or path in diagnostics. All writes go
 //! through the existing strict validator and atomic store.
 use crate::{
+    client_import::{self, PrivateBearer},
     config::{self, Config, Transport, User},
     invite::Invitation,
     Role,
@@ -74,6 +75,114 @@ impl Editor {
         })
     }
 
+    /// F-14: commit a completely new client profile from a reviewed invitation.
+    /// The source's bearer is never written to TOML; the file is protected by
+    /// a fresh owner-only directory and private ACL/mode on both platforms.
+    /// Caller must explicitly review ID/endpoint/SNI/transport and CA trust.
+    pub fn import_invitation(
+        &mut self,
+        invite: &Invitation,
+        ca_ref: Option<&str>,
+        public_ref: Option<&str>,
+    ) -> Result<(), &'static str> {
+        let result = self.try_import_invitation(invite, ca_ref, public_ref);
+        if let Err(message) = result {
+            self.error = Some(message.to_owned());
+        }
+        result
+    }
+
+    fn try_import_invitation(
+        &mut self,
+        invite: &Invitation,
+        ca_ref: Option<&str>,
+        public_ref: Option<&str>,
+    ) -> Result<(), &'static str> {
+        if self.role != Role::Client || self.editing || self.dirty() || self.issued.is_some() {
+            return Err("Finish or discard all changes before importing");
+        }
+        let Config::Client(document) = &self.draft else {
+            return Err("Client config required");
+        };
+        if document.client.profiles.iter().any(|p| p.id == invite.id) {
+            return Err("An existing profile ID cannot be overwritten");
+        }
+        let ca = client_import::checked_ca_ref(ca_ref)
+            .map_err(|_| "Explicit TLS CA reference is invalid or unreadable")?;
+        // Only a NEW secret is ever written. A secretless public invitation
+        // demands a separately supplied env: reference, never a default.
+        let mut secret = if let Some(bytes) = invite.token_bytes() {
+            let token = Zeroizing::new(bytes);
+            Some(
+                PrivateBearer::create(&self.path, &token)
+                    .map_err(|_| "Cannot create protected bearer credential")?,
+            )
+        } else {
+            None
+        };
+        let credential = match secret.as_ref() {
+            Some(saved) => saved
+                .reference()
+                .map_err(|_| "Cannot build protected bearer reference")?,
+            None => {
+                let supplied =
+                    public_ref.ok_or("Public invite requires explicit env: credential")?;
+                if !client_import::valid_explicit_reference(supplied) {
+                    return Err("Public invite requires a valid explicit env: reference");
+                }
+                supplied.to_owned()
+            }
+        };
+        let profile = invite
+            .to_profile(&credential, ca)
+            .map_err(|_| "Invalid imported client profile")?;
+        let has_trust = profile.tls_ca.is_some();
+        let mut candidate = self.draft.clone();
+        let Config::Client(candidate_doc) = &mut candidate else {
+            return Err("Client config required");
+        };
+        candidate_doc.client.profiles.push(profile);
+        candidate
+            .validate()
+            .map_err(|_| "Imported profile did not pass full document validation")?;
+        let bytes = candidate
+            .to_toml()
+            .map_err(|_| "Imported profile could not be serialized")?
+            .into_bytes();
+        self.draft = candidate;
+        if !self.save() {
+            // fsync(parent) can fail *after* atomic rename. Inspect the exact
+            // serialized bytes; if the new document is present, KEEP the
+            // credential instead of creating a broken TOML file reference.
+            if read_bounded(&self.path).is_ok_and(|on_disk| on_disk == bytes) {
+                if let Some(saved) = secret.as_mut() {
+                    saved.commit();
+                }
+                self.source = bytes;
+                self.original = self.draft.clone();
+                self.notice =
+                    "Точное состояние записи неизвестно: проверьте файл, не подключайтесь.";
+                return Err("TOML replacement may have completed; verify before using");
+            }
+            self.discard();
+            return Err("Imported profile was not saved; guarded rollback completed");
+        }
+        if let Some(saved) = secret.as_mut() {
+            saved.commit();
+        }
+        let Config::Client(updated) = &self.draft else {
+            return Err("Client config required");
+        };
+        self.selected_record = updated.client.profiles.len() - 1;
+        self.error = None;
+        self.notice = if has_trust {
+            "Профиль импортирован. TLS trust выбран, но соединение НЕ проверено и НЕ запущено."
+        } else {
+            "Профиль импортирован БЕЗ CA; запуск заблокирован до отдельного TLS trust."
+        };
+        Ok(())
+    }
+
     /// Issue a new user with a cryptographically random 32-byte bearer.
     /// A saved digest is not a bearer and cannot be re-exported later.
     /// No invitation is revealable until the file write succeeds.
@@ -139,6 +248,77 @@ impl Editor {
         self.issued_ready = false;
         self.error = None;
         self.notice = "Новый пользователь: сохранить TOML перед выдачей ссылки.";
+        Ok(())
+    }
+
+    /// M4.4b2b1: replace an existing enabled user's bearer without changing
+    /// its identity, global enabled state or inbound grants. The replacement
+    /// is revealed once only after a guarded durable save; it is not live
+    /// until a separate explicit revisioned auth-only CAS Apply.
+    pub fn rotate_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+        let result = self.try_rotate_user(user_id);
+        if let Err(message) = result {
+            self.error = Some(message.to_owned());
+        }
+        result
+    }
+
+    fn try_rotate_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+        if self.role != Role::Server || self.editing || self.dirty() || self.issued.is_some() {
+            return Err("Finish or discard edits and pending issuance first");
+        }
+        let Config::Server(doc) = &self.draft else {
+            return Err("Server configuration required");
+        };
+        let Some(inbound) = doc.server.inbounds.get(self.selected_record) else {
+            return Err("Inbound missing");
+        };
+        if !inbound.allowed_user_ids.iter().any(|id| id == user_id) {
+            return Err("User is not granted on the selected inbound");
+        }
+        let Some(user) = doc.server.users.iter().find(|user| user.id == user_id) else {
+            return Err("User does not exist");
+        };
+        if user.disabled {
+            return Err("Disabled users require a separate explicit re-enable flow");
+        }
+        let previous_digest = user.token_sha256.clone();
+        let inbound_id = inbound.id.clone();
+        Invitation::public_from_server(&self.draft, &inbound_id)
+            .map_err(|_| "Selected inbound cannot issue auto invitations")?;
+
+        let mut token = Zeroizing::new([0u8; 32]);
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(&mut token[..])
+            .map_err(|_| "Secure random generator unavailable")?;
+        let digest = format!("{:x}", Sha256::digest(&token[..]));
+        if digest == previous_digest {
+            return Err("Replacement token must differ from current token");
+        }
+        let mut candidate = self.draft.clone();
+        let Config::Server(candidate_doc) = &mut candidate else {
+            return Err("Server configuration required");
+        };
+        let Some(user) = candidate_doc
+            .server
+            .users
+            .iter_mut()
+            .find(|user| user.id == user_id)
+        else {
+            return Err("User does not exist");
+        };
+        user.token_sha256 = digest;
+        candidate
+            .validate()
+            .map_err(|_| "Rotated user did not pass configuration validation")?;
+        let invitation = Invitation::issued_from_server(&candidate, &inbound_id, user_id, &token)
+            .map_err(|_| "Cannot issue replacement invitation for selected inbound")?;
+        self.draft = candidate;
+        self.issued = Some(invitation);
+        self.issued_ready = false;
+        self.error = None;
+        self.notice = "Токен заменён в черновике. Сохранение не обновляет runtime.";
         Ok(())
     }
 
@@ -649,6 +829,158 @@ mod tests {
     }
 
     #[test]
+    fn imported_secret_is_protected_and_new_profile_never_becomes_active() {
+        use crate::{client_import::read_source, invite::Invitation};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let server = config::parse(&server_source()).unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let raw = invite.encode().unwrap();
+        assert!(read_source(&raw).unwrap().has_token());
+        let temp = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        assert!(!editor.dirty());
+        assert!(editor.import_invitation(&invite, None, None).is_ok());
+        assert!(!editor.dirty());
+        let saved = fs::read_to_string(&temp.0).unwrap();
+        assert!(!saved.contains(&raw));
+        assert!(!saved.contains(&URL_SAFE_NO_PAD.encode([0x42; 32])));
+        let Config::Client(doc) = config::read_file(&temp.0).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(doc.client.active_profile, "home");
+        assert_eq!(doc.client.profiles.len(), 2);
+        let imported = &doc.client.profiles[1];
+        assert_eq!(imported.id, "public");
+        assert_eq!(imported.server, "edge.example.org:443");
+        assert_eq!(imported.server_name, "edge.example.org");
+        assert!(imported.tls_ca.is_none(), "trust is not granted by URI");
+        assert!(imported.auth_token.starts_with("file:"));
+        let secret_path = Path::new(imported.auth_token.strip_prefix("file:").unwrap());
+        assert!(secret_path.is_absolute());
+        assert_eq!(
+            fs::read_to_string(secret_path).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x42; 32])
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(secret_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(secret_path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        fs::remove_file(secret_path).unwrap();
+        fs::remove_dir(secret_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn public_import_requires_explicit_reference_and_rejects_duplicates_or_dirty_draft() {
+        use crate::invite::Invitation;
+        let temp = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        let Config::Client(original) = config::read_file(&temp.0).unwrap() else {
+            panic!("client");
+        };
+        let duplicate = Invitation::public_from_profile(&original.client.profiles[0]).unwrap();
+        assert!(editor
+            .import_invitation(&duplicate, None, Some("env:THEIA_OTHER"))
+            .is_err());
+
+        let mut second = original.client.profiles[0].clone();
+        second.id = "remote".into();
+        second.server = "remote.example.org:443".into();
+        let public = Invitation::public_from_profile(&second).unwrap();
+        assert!(editor.import_invitation(&public, None, None).is_err());
+        assert!(editor
+            .import_invitation(&public, None, Some("file:unsafe"))
+            .is_err());
+        assert!(!editor.dirty());
+        editor.begin();
+        assert!(editor
+            .import_invitation(&public, None, Some("env:REMOTE_AUTH"))
+            .is_err());
+        editor.cancel();
+        assert!(editor
+            .import_invitation(&public, None, Some("env:REMOTE_AUTH"))
+            .is_ok());
+        let Config::Client(saved) = config::read_file(&temp.0).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(saved.client.active_profile, "home");
+        assert_eq!(saved.client.profiles.len(), 2);
+        assert_eq!(saved.client.profiles[1].auth_token, "env:REMOTE_AUTH");
+        assert!(!fs::read_to_string(&temp.0).unwrap().contains("theia://v1/"));
+    }
+
+    #[test]
+    fn import_refuses_external_edit_and_rolls_back_new_bearer() {
+        use crate::invite::Invitation;
+        let server = config::parse(&server_source()).unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let temp = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        let changed = format!(
+            "# external writer\n{}",
+            include_str!("../../../examples/client.toml")
+        );
+        fs::write(&temp.0, &changed).unwrap();
+        assert!(editor.import_invitation(&invite, None, None).is_err());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), changed);
+        assert!(!editor.dirty());
+
+        let other = Temp::write(&server_source());
+        let mut server_editor = Editor::load(Role::Server, &other.0).unwrap();
+        assert!(server_editor
+            .import_invitation(&invite, None, None)
+            .is_err());
+    }
+
+    #[test]
+    fn import_requires_independent_valid_ca_file_and_never_trusts_uri_ca() {
+        use crate::invite::Invitation;
+        let cert = rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
+        let ca = Temp::write(&cert.cert.pem());
+        let ca_ref = format!("file:{}", ca.0.display());
+        let server = config::parse(&server_source()).unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let temp = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        assert!(editor
+            .import_invitation(&invite, Some("file:relative"), None)
+            .is_err());
+        assert!(editor
+            .import_invitation(&invite, Some(&ca_ref), None)
+            .is_ok());
+        let Config::Client(doc) = config::read_file(&temp.0).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(
+            doc.client.profiles[1].tls_ca.as_deref(),
+            Some(ca_ref.as_str())
+        );
+        let secret_file = Path::new(
+            doc.client.profiles[1]
+                .auth_token
+                .strip_prefix("file:")
+                .unwrap(),
+        );
+        fs::remove_file(secret_file).unwrap();
+        fs::remove_dir(secret_file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn new_user_is_scoped_to_selected_inbound_and_link_is_one_time_after_save() {
         use crate::invite::Invitation;
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -743,6 +1075,124 @@ mod tests {
         assert_ne!(first, [0; 32]);
         assert_ne!(second, [0; 32]);
         assert!(editor.issue_user("device-a").is_err());
+    }
+
+    #[test]
+    fn rotation_changes_only_existing_users_digest_and_reveals_after_durable_save() {
+        use crate::invite::Invitation;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.select_record(true);
+        let Config::Server(original) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        let before = original.server.users[0].token_sha256.clone();
+        let grants = original
+            .server
+            .inbounds
+            .iter()
+            .map(|inbound| inbound.allowed_user_ids.clone())
+            .collect::<Vec<_>>();
+        assert!(editor.rotate_user("device-a").is_ok());
+        assert!(editor.dirty());
+        assert!(!editor.issued_ready());
+        assert!(editor.take_issued().is_none());
+        assert_eq!(
+            config::read_file(&temp.0).unwrap(),
+            Config::Server(original.clone())
+        );
+        assert!(editor.save());
+        assert!(editor.issued_ready());
+        let invite = editor.take_issued().expect("one-time replacement token");
+        assert!(editor.take_issued().is_none());
+        assert!(Invitation::decode(&invite.encode().unwrap())
+            .unwrap()
+            .has_token());
+        let token = invite.token_bytes().unwrap();
+        assert_ne!(token, [0x42; 32]);
+        let stored = fs::read_to_string(&temp.0).unwrap();
+        assert!(!stored.contains(&URL_SAFE_NO_PAD.encode(token)));
+        let Config::Server(updated) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert_eq!(updated.server.users.len(), original.server.users.len());
+        assert_eq!(updated.server.users[0].id, "device-a");
+        assert!(!updated.server.users[0].disabled);
+        assert_ne!(updated.server.users[0].token_sha256, before);
+        assert_eq!(
+            updated.server.users[0].token_sha256,
+            format!("{:x}", Sha256::digest(token))
+        );
+        assert_eq!(
+            updated
+                .server
+                .inbounds
+                .iter()
+                .map(|inbound| inbound.allowed_user_ids.clone())
+                .collect::<Vec<_>>(),
+            grants
+        );
+    }
+
+    #[test]
+    fn rotation_rejects_unsafe_states_ungranted_user_and_external_conflict() {
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        for id in ["", "no-such-user", "invalid name"] {
+            assert!(editor.rotate_user(id).is_err(), "{id:?}");
+            assert!(!editor.dirty());
+        }
+        editor.begin();
+        assert!(editor.rotate_user("device-a").is_err());
+        editor.cancel();
+        editor.begin();
+        editor.input = "new.example.org".into();
+        assert!(editor.accept());
+        assert!(editor.rotate_user("device-a").is_err());
+        editor.discard();
+
+        let Config::Server(mut record) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        record.server.users.push(User {
+            id: "device-b".into(),
+            token_sha256: format!("{:x}", Sha256::digest([0x77; 32])),
+            disabled: false,
+        });
+        record.server.inbounds[1].allowed_user_ids = vec!["device-b".into()];
+        let temp2 = Temp::write(&Config::Server(record).to_toml().unwrap());
+        let mut ungranted = Editor::load(Role::Server, &temp2.0).unwrap();
+        assert!(ungranted.rotate_user("device-b").is_err());
+        ungranted.select_record(true);
+        assert!(ungranted.rotate_user("device-b").is_ok());
+        ungranted.discard();
+
+        let Config::Server(mut disabled) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        disabled.server.users[0].disabled = true;
+        let temp3 = Temp::write(&Config::Server(disabled).to_toml().unwrap());
+        let mut editor_disabled = Editor::load(Role::Server, &temp3.0).unwrap();
+        assert!(editor_disabled.rotate_user("device-a").is_err());
+        assert!(!editor_disabled.dirty());
+
+        assert!(editor.issue_user("new-device").is_ok());
+        assert!(editor.rotate_user("device-a").is_err());
+        editor.discard();
+        assert!(editor.rotate_user("device-a").is_ok());
+        let external = format!("# external edit\n{}", two_inbounds());
+        fs::write(&temp.0, &external).unwrap();
+        assert!(!editor.save());
+        assert!(!editor.issued_ready());
+        assert!(editor.take_issued().is_none());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), external);
+
+        let client = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut client_editor = Editor::load(Role::Client, &client.0).unwrap();
+        assert!(client_editor.rotate_user("device-a").is_err());
+        assert!(!client_editor.dirty());
     }
 
     #[test]
