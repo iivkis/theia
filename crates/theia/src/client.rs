@@ -406,6 +406,8 @@ impl Tunnel {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let operation = self.operation;
+        crate::diag!(Info, "client.h2", "relay_begin", "op" = Value::Count(operation));
         let (mut read, mut write) = tokio::io::split(local);
         let incoming = &mut self.incoming;
         let outgoing = &mut self.outgoing;
@@ -424,6 +426,9 @@ impl Tunnel {
                 } else {
                     Frame::Data(buffer[..size].to_vec())
                 };
+                crate::diag!(Trace, "client.h2", "upload_frame",
+                    "op" = Value::Count(operation), "bytes" = Value::Count(size as u64),
+                    "fin" = Value::Flag(size == 0));
                 upload_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
@@ -443,12 +448,15 @@ impl Tunnel {
                     .map_err(|_| ClientError::Protocol)?;
                 match frame {
                     Frame::Data(data) => {
+                        crate::diag!(Trace, "client.h2", "download_frame",
+                            "op" = Value::Count(operation), "bytes" = Value::Count(data.len() as u64));
                         timeout(IO_TIMEOUT, write.write_all(&data))
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
                     }
                     Frame::Fin => {
+                        crate::diag!(Debug, "client.h2", "download_fin", "op" = Value::Count(operation));
                         timeout(IO_TIMEOUT, write.shutdown())
                             .await
                             .map_err(|_| ClientError::Timeout)?
@@ -464,7 +472,12 @@ impl Tunnel {
             }
             Ok::<(), ClientError>(())
         };
-        tokio::try_join!(upload, download)?;
+        if let Err(error) = tokio::try_join!(upload, download) {
+            crate::diag!(Warn, "client.h2", "relay_failed",
+                "op" = Value::Count(operation), "reason" = Value::Label(error_kind(&error)));
+            return Err(error);
+        }
+        crate::diag!(Info, "client.h2", "relay_completed", "op" = Value::Count(operation));
         self.state
             .apply(Direction::Send, &Frame::Fin)
             .map_err(|_| ClientError::Protocol)?;
