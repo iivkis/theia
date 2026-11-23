@@ -209,7 +209,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      THEIA_TRACE_DIR: ${{ runner.temp }}/theia-traces
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -264,7 +264,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 35
     env:
-      THEIA_TRACE_DIR: ${{ runner.temp }}/theia-traces
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -377,7 +377,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 50
     env:
-      THEIA_TRACE_DIR: ${{ runner.temp }}/theia-traces
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -425,7 +425,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     env:
-      THEIA_TRACE_DIR: ${{ runner.temp }}/theia-traces
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -474,7 +474,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      THEIA_TRACE_DIR: ${{ runner.temp }}/theia-traces
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
       THEIA_BBR_RESULTS_PATH: ${{ github.workspace }}/theia-bbr-${{ matrix.os }}.csv
     steps:
@@ -596,7 +596,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
-      THEIA_TRACE_DIR: ${{ runner.temp }}/theia-traces
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
