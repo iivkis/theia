@@ -128,7 +128,11 @@ impl ReloadPreflight {
         }
     }
 
-    pub(crate) fn check_file(&self) -> Result<(), ReloadCheckError> {
+    /// Read the candidate exactly once and verify every restart-only
+    /// field and the actual PEM bytes loaded by the live listeners. The owned
+    /// returned document is the only one later staged/published: no second
+    /// read of TOML after validation.
+    pub(crate) fn load_candidate(&self) -> Result<ServerDocument, ReloadCheckError> {
         let candidate = match config::read_file(&self.config_path) {
             Ok(Config::Server(document)) => document,
             _ => return Err(ReloadCheckError::InvalidConfig),
@@ -146,7 +150,12 @@ impl ReloadPreflight {
                 return Err(ReloadCheckError::IdentityDrift);
             }
         }
-        Ok(())
+        Ok(candidate)
+    }
+
+    /// Still a read-only check, never an implicit Apply.
+    pub(crate) fn check_file(&self) -> Result<(), ReloadCheckError> {
+        self.load_candidate().map(|_| ())
     }
 
     #[cfg(test)]
