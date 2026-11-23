@@ -39,9 +39,9 @@ async fn main() {
         Ok(Command::ClientProxyStatus) => {
             #[cfg(windows)]
             {
-                let state = theia::windows_system_proxy::status()
-                    .map_err(CliError::SystemProxy)?;
-                Ok(format!("Windows user proxy recovery status: {state:?}; no changes"))
+                theia::windows_system_proxy::status()
+                    .map(|state| format!("Windows user proxy recovery status: {state:?}; no changes"))
+                    .map_err(CliError::SystemProxy)
             }
             #[cfg(not(windows))]
             {
@@ -51,9 +51,9 @@ async fn main() {
         Ok(Command::ClientProxyRecover) => {
             #[cfg(windows)]
             {
-                let state = theia::windows_system_proxy::recover_explicit()
-                    .map_err(CliError::SystemProxy)?;
-                Ok(format!("Windows user proxy recovery: {state:?}; no foreign edits overwritten"))
+                theia::windows_system_proxy::recover_explicit()
+                    .map(|state| format!("Windows user proxy recovery: {state:?}; no foreign edits overwritten"))
+                    .map_err(CliError::SystemProxy)
             }
             #[cfg(not(windows))]
             {
