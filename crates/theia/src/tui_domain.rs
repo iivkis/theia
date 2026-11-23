@@ -754,9 +754,10 @@ mod tests {
         assert!(dns_pin_fresh_at(at, at + DNS_PIN_TTL));
         assert!(!dns_pin_fresh_at(
             at,
-            at + DNS_PIN_TTL + Duration::from_nanos(1)
+            at + DNS_PIN_TTL + Duration::from_millis(1)
         ));
-        assert!(!dns_pin_fresh_at(at, at - Duration::from_nanos(1)));
+        // Windows Instant has coarser clock granularity than 1 nanosecond.
+        assert!(!dns_pin_fresh_at(at, at - Duration::from_millis(1)));
     }
 
     #[test]
