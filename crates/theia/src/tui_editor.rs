@@ -763,18 +763,30 @@ mod tests {
         assert!(editor.disable_user("device-a").is_err());
         editor.discard();
 
+        let Config::Server(original) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        let previous_digest = original.server.users[0].token_sha256.clone();
         assert!(editor.disable_user("device-a").is_ok());
         assert!(editor.dirty());
         assert!(editor.take_issued().is_none());
-        assert!(!config::read_file(&temp.0).unwrap().to_toml().unwrap().contains("disabled = true"));
+        assert!(!config::read_file(&temp.0)
+            .unwrap()
+            .to_toml()
+            .unwrap()
+            .contains("disabled = true"));
         assert!(editor.save());
         let Config::Server(doc) = config::read_file(&temp.0).unwrap() else {
             panic!("server");
         };
         assert!(doc.server.users[0].disabled);
+        assert_eq!(doc.server.users[0].token_sha256, previous_digest);
         assert_eq!(doc.server.inbounds[0].allowed_user_ids, ["device-a"]);
         assert_eq!(doc.server.inbounds[1].allowed_user_ids, ["device-a"]);
-        assert!(editor.disable_user("device-a").is_err(), "repeat disable must fail");
+        assert!(
+            editor.disable_user("device-a").is_err(),
+            "repeat disable must fail"
+        );
     }
 
     #[test]
@@ -782,7 +794,7 @@ mod tests {
         let temp = Temp::write(&server_source());
         let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
         assert!(editor.disable_user("device-a").is_ok());
-        let changed = format!("# external edit\\n{}", server_source());
+        let changed = format!("# external edit\n{}", server_source());
         fs::write(&temp.0, &changed).unwrap();
         assert!(!editor.save());
         assert_eq!(fs::read_to_string(&temp.0).unwrap(), changed);
