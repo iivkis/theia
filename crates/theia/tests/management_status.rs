@@ -125,7 +125,7 @@ async fn invalid_or_oversized_messages_cannot_trigger_reload_or_hang() {
     let dir = private_dir();
     let server = StatusServer::bind_in(&dir, 1).unwrap();
     let task = tokio::spawn(server.serve());
-    for message in [b"GET / HTTP/1.1\n".as_slice(), &[b'x'; 128][..]] {
+    for message in [b"GET / HTTP/1.1\n".as_slice(), &[b'x'; 256][..]] {
         let mut stream = UnixStream::connect(dir.join("theia-server.sock"))
             .await
             .unwrap();
