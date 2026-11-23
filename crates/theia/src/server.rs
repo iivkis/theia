@@ -923,7 +923,315 @@ pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
     let Config::Server(document) = parsed else {
         return Err(ServerError::Config);
     };
-    run_document_with_config(document, Some(config_path)).await
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        run_supervised_file(document, config_path).await
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        run_document_with_config(document, Some(config_path)).await
+    }
+}
+
+/// Shared admission accounting for OLD and NEW listeners. The first online
+/// cutover slice deliberately rejects changes to these limits or user IDs.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct GenerationLimits {
+    global: Arc<Semaphore>,
+    connections: Arc<Semaphore>,
+    per_user: Arc<HashMap<String, Arc<Semaphore>>>,
+    peer_budget: Arc<PeerBudget>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl GenerationLimits {
+    fn new(document: &ServerDocument) -> Self {
+        let policy = document.server.policy;
+        let per_user = document
+            .server
+            .users
+            .iter()
+            .map(|user| {
+                (
+                    user.id.clone(),
+                    Arc::new(Semaphore::new(policy.max_connections_per_user as usize)),
+                )
+            })
+            .collect();
+        Self {
+            global: Arc::new(Semaphore::new(policy.max_connections_total as usize)),
+            connections: Arc::new(Semaphore::new(policy.max_connections_total as usize)),
+            per_user: Arc::new(per_user),
+            peer_budget: Arc::new(PeerBudget::default()),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type ReadyListener = (TcpListener, TlsAcceptor, quinn::Endpoint, Arc<ServerContext>);
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct PreparedGeneration {
+    listeners: Vec<ReadyListener>,
+    identities: Vec<crate::reload_preflight::IdentityHash>,
+    live: Arc<LiveAuthorization>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn prepare_generation(
+    document: &ServerDocument,
+    revision: u64,
+    limits: &GenerationLimits,
+) -> Result<PreparedGeneration, ServerError> {
+    let live = Arc::new(
+        LiveAuthorization::new_at_revision(document.clone(), revision)
+            .map_err(|_| ServerError::Config)?,
+    );
+    let mut listeners = Vec::with_capacity(document.server.inbounds.len());
+    let mut identities = Vec::with_capacity(document.server.inbounds.len());
+    for inbound in &document.server.inbounds {
+        let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
+        let udp_addr: SocketAddr = inbound.quic_listen.parse().map_err(|_| ServerError::Config)?;
+        let material = tls_material(inbound)?;
+        identities.push(material.identity);
+        let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
+        // Prebind BOTH transports before publishing or shutting down ANY
+        // old listener. A failure drops all prepared sockets by RAII.
+        let listener = TcpListener::bind(tcp_addr).await.map_err(|_| ServerError::Io)?;
+        let endpoint = crate::quic_transport::server_endpoint(
+            udp_addr,
+            material.certs,
+            material.key,
+        )
+        .map_err(|_| ServerError::Io)?;
+        let context = Arc::new(ServerContext::with_limits(
+            inbound,
+            &document.server.policy,
+            live.shared(),
+            limits.global.clone(),
+            limits.per_user.clone(),
+            limits.connections.clone(),
+            limits.peer_budget.clone(),
+        ));
+        listeners.push((listener, acceptor, endpoint, context));
+    }
+    Ok(PreparedGeneration {
+        listeners,
+        identities,
+        live,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct RunningGeneration {
+    tasks: JoinSet<Result<(), ServerError>>,
+    phase: watch::Sender<GenerationPhase>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl RunningGeneration {
+    fn launch(listeners: Vec<ReadyListener>, phase: GenerationPhase) -> Self {
+        let (sender, receiver) = watch::channel(phase);
+        let mut tasks = JoinSet::new();
+        for (tcp, acceptor, udp, context) in listeners {
+            tasks.spawn(serve_generation(tcp, acceptor, context.clone(), receiver.clone()));
+            tasks.spawn(crate::h3_server::serve_generation(udp, context, receiver.clone()));
+        }
+        Self {
+            tasks,
+            phase: sender,
+        }
+    }
+
+    fn is_healthy_before_activation(&mut self) -> bool {
+        // Every task is waiting at an activation barrier, with the socket
+        // already bound. Any premature completion is a failed generation.
+        self.tasks.try_join_next().is_none()
+    }
+
+    fn start(&self) {
+        self.phase.send_replace(GenerationPhase::Active);
+    }
+
+    fn drain(&self) {
+        self.phase.send_replace(GenerationPhase::Drain);
+    }
+}
+
+/// Reaper is capped at one at a time. After a bounded 20-second drain, all
+/// surviving connections in the previous generation are cancelled; the new
+/// generation remains owned by the same supervisor.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn reap_previous(mut previous: RunningGeneration) {
+    previous.drain();
+    let _ = timeout(GENERATION_DRAIN + Duration::from_secs(2), async {
+        while previous.tasks.join_next().await.is_some() {}
+    })
+    .await;
+    previous.tasks.abort_all();
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn stage_fresh_generation(
+    request: &crate::runtime_generation::RestartRequest,
+    identities: &[crate::reload_preflight::IdentityHash],
+    limits: &GenerationLimits,
+    path: &Path,
+) -> Result<
+    (
+        RunningGeneration,
+        crate::runtime_generation::View,
+        Vec<crate::reload_preflight::IdentityHash>,
+        u64,
+    ),
+    (),
+> {
+    let active = request.previous.document.as_ref();
+    let candidate = &request.candidate;
+    if !crate::restart_guard::same_shared_limits(active, candidate) {
+        return Err(());
+    }
+    if crate::restart_guard::probe(active, identities, candidate)
+        != Ok(crate::restart_guard::RestartVerdict::FreshPortsBindable)
+    {
+        return Err(());
+    }
+    let next_revision = request.expected_revision.checked_add(1).ok_or(())?;
+    let prepared = prepare_generation(candidate, next_revision, limits)
+        .await
+        .map_err(|_| ())?;
+    let next = crate::runtime_generation::View {
+        document: Arc::new(candidate.clone()),
+        inbounds: candidate.server.inbounds.len(),
+        preflight: Arc::new(crate::reload_preflight::ReloadPreflight::new(
+            path.to_owned(),
+            candidate.clone(),
+            prepared.identities.clone(),
+        )),
+        live: prepared.live,
+    };
+    let mut running = RunningGeneration::launch(
+        prepared.listeners,
+        GenerationPhase::Prepared,
+    );
+    tokio::task::yield_now().await;
+    if !running.is_healthy_before_activation() {
+        return Err(());
+    }
+    Ok((running, next, prepared.identities, next_revision))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn run_supervised_file(
+    document: ServerDocument,
+    config_path: &Path,
+) -> Result<(), ServerError> {
+    let limits = GenerationLimits::new(&document);
+    let initial = prepare_generation(&document, 1, &limits).await?;
+    let current_identities = initial.identities.clone();
+    let runtime = Arc::new(crate::runtime_generation::State::new(
+        crate::runtime_generation::View {
+            document: Arc::new(document.clone()),
+            inbounds: document.server.inbounds.len(),
+            preflight: Arc::new(crate::reload_preflight::ReloadPreflight::new(
+                config_path.to_owned(),
+                document,
+                initial.identities,
+            )),
+            live: initial.live,
+        },
+    ));
+
+    // Only the original, protected management listener survives cutover.
+    // Never expose a new administrative TCP port or loosen Named Pipe DACL.
+    let (requests, mut queue) =
+        tokio::sync::mpsc::channel::<crate::runtime_generation::RestartRequest>(1);
+    #[cfg(target_os = "linux")]
+    let management = crate::management::StatusServer::from_environment(
+        runtime.snapshot().map_err(|_| ServerError::Io)?.inbounds,
+    )
+    .map_err(|_| ServerError::Io)?
+    .map(|service| service.with_supervisor(runtime.clone(), requests.clone()));
+    #[cfg(target_os = "windows")]
+    let management = crate::windows_control::WindowsServer::from_environment(
+        runtime.snapshot().map_err(|_| ServerError::Io)?.inbounds,
+    )
+    .map_err(|_| ServerError::Io)?
+    .map(|service| service.with_supervisor(runtime.clone(), requests.clone()));
+
+    let mut management_task = management.map(|service| {
+        tokio::spawn(async move { service.serve().await.map_err(|_| ServerError::Io) })
+    });
+    let mut running = RunningGeneration::launch(initial.listeners, GenerationPhase::Active);
+    let mut identities = current_identities;
+    let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
+    loop {
+        tokio::select! {
+            request = queue.recv() => {
+                let Some(request) = request else {
+                    return Err(ServerError::Io);
+                };
+                // No unbounded retired-generation backlog and no double
+                // admission during simultaneous restart attempts.
+                if retiring.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                    let _ = request.complete.send(Err(()));
+                    continue;
+                }
+                if let Some(worker) = retiring.take() {
+                    let _ = worker.await;
+                }
+                if !runtime.still_current(&request.previous, request.expected_revision) {
+                    let _ = request.complete.send(Err(()));
+                    continue;
+                }
+                let staged = stage_fresh_generation(
+                    &request,
+                    &identities,
+                    &limits,
+                    config_path,
+                )
+                .await;
+                let Ok((next_running, next_view, next_identities, revision)) = staged else {
+                    let _ = request.complete.send(Err(()));
+                    continue;
+                };
+                // Under the same short CAS barrier used for auth-only Apply:
+                // stale revisions cannot overwrite either generation.
+                if runtime.commit_restart(
+                    &request.previous,
+                    request.expected_revision,
+                    next_view,
+                ).is_err() {
+                    let _ = request.complete.send(Err(()));
+                    continue;
+                }
+                next_running.start();
+                let previous = std::mem::replace(&mut running, next_running);
+                identities = next_identities;
+                retiring = Some(tokio::spawn(reap_previous(previous)));
+                // This ACK is AFTER commit. Lost ACK is indeterminate:
+                // operator must query status; never retry blindly.
+                let _ = request.complete.send(Ok(revision));
+            }
+            result = running.tasks.join_next() => {
+                // An unexpected H2/H3 accept-loop exit is fatal, not a
+                // misleading healthy status from the management endpoint.
+                return match result {
+                    Some(Ok(Err(error))) => Err(error),
+                    _ => Err(ServerError::Io),
+                };
+            }
+            result = async {
+                match &mut management_task {
+                    Some(task) => Some(task.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                let _ = result;
+                return Err(ServerError::Io);
+            }
+        }
+    }
 }
 
 pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
