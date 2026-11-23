@@ -713,6 +713,99 @@ async fn client_binary_chromium_socks5() {
     .expect("bounded executable + Chromium CI scenario");
 }
 
+/// Native H3 counterpart of F-14 imported H2 test: the full confidential
+/// invitation is decoded and securely persisted, then the actual single
+/// binary is independently started with that file-backed bearer. The test
+/// server intentionally uses independently bound H2/H3 ports, so this
+/// fixture explicitly produces an H3-only invitation for its UDP endpoint.
+async fn launch_imported_h3_client(
+    endpoint: String,
+    pem: String,
+) -> (
+    TestDirectory,
+    ChildProcess,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+) {
+    use theia::{
+        config::{self, Config, Transport},
+        invite::Invitation,
+        tui_editor::Editor,
+        Role,
+    };
+    let dir = TestDirectory(std::env::temp_dir().join(format!(
+        "theia-f14-h3-import-ci-{}",
+        std::process::id()
+    )));
+    std::fs::create_dir(&dir.0).unwrap();
+    let ca_path = dir.0.join("trust.pem");
+    std::fs::write(&ca_path, pem).unwrap();
+    let config_path = dir.0.join("client.toml");
+    std::fs::write(&config_path, include_str!("../../../examples/client.toml")).unwrap();
+
+    // Issue an authentic digest-bound confidential URI from the same server
+    // identity and user token, then select H3-only for the distinct UDP port.
+    let source = include_str!("../../../examples/server.toml").replace(
+        "REPLACE_WITH_64_LOWERCASE_HEX",
+        &format!("{:x}", Sha256::digest(TOKEN)),
+    );
+    let Config::Server(mut server) = config::parse(&source).unwrap() else {
+        panic!("server fixture");
+    };
+    server.server.inbounds[0].server_name = "localhost".into();
+    server.server.inbounds[0].h2_listen = "127.0.0.1:443".into();
+    server.server.inbounds[0].quic_listen = "127.0.0.1:443".into();
+    let mut invitation =
+        Invitation::issued_from_server(&Config::Server(server), "public", "device-a", &TOKEN)
+            .unwrap();
+    invitation.endpoint = endpoint.clone();
+    invitation.transport = Transport::H3;
+    let link = invitation.encode().unwrap();
+    let invitation = theia::client_import::read_source(&link).unwrap();
+    let mut editor = Editor::load(Role::Client, &config_path).unwrap();
+    editor
+        .import_invitation(
+            &invitation,
+            Some(&format!("file:{}", ca_path.display())),
+            None,
+        )
+        .unwrap();
+    let Config::Client(mut client) = config::read_file(&config_path).unwrap() else {
+        panic!("client fixture");
+    };
+    assert_eq!(client.client.active_profile, "home");
+    assert_eq!(client.client.profiles.len(), 2);
+    assert_eq!(client.client.profiles[1].transport, Transport::H3);
+    assert!(client.client.profiles[1].auth_token.starts_with("file:"));
+    assert!(!std::fs::read_to_string(&config_path).unwrap().contains(&token()));
+    client.client.active_profile = invitation.id.clone();
+
+    // OS proxy remains off; reserve only private per-process localhost binds.
+    let http_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http = http_reservation.local_addr().unwrap();
+    let socks = socks_reservation.local_addr().unwrap();
+    client.client.proxy.http_listen = http.to_string();
+    client.client.proxy.socks5_listen = socks.to_string();
+    config::atomic_write(&config_path, &Config::Client(client)).unwrap();
+    drop(http_reservation);
+    drop(socks_reservation);
+    let mut child = ChildProcess(
+        std::process::Command::new(env!("CARGO_BIN_EXE_theia"))
+            .args(["client", "run", "--config"])
+            .arg(config_path)
+            .env_remove("THEIA_AUTH_TOKEN")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_proxy(http, &mut child).await;
+    wait_for_proxy(socks, &mut child).await;
+    (dir, child, http, socks)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h3_server_and_client_binaries_curl_both_local_proxies() {
     timeout(Duration::from_secs(60), async {
@@ -773,13 +866,8 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
         // A successful H2 TCP bind is a readiness barrier: UDP must already
         // have been prepared as part of the same atomic startup.
         wait_for_proxy(tcp, &mut server).await;
-        let (_client_dir, mut client, http, socks) = launch_client(
-            udp.to_string(),
-            pem,
-            "h3-curl",
-            theia::config::Transport::H3,
-        )
-        .await;
+        let (_client_dir, mut client, http, socks) =
+            launch_imported_h3_client(udp.to_string(), pem).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
         let body = b"theia-h3-cli-ci-origin";
