@@ -175,10 +175,7 @@ pub(crate) fn probe(
 /// SNI/hostname expectations, routes users differently or touches quota.
 /// Compare *every* typed field and blank only the two PEM references.
 /// A PEM file changed in place also qualifies when identity digests drift.
-pub(crate) fn same_port_tls_only(
-    active: &ServerDocument,
-    candidate: &ServerDocument,
-) -> bool {
+pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocument) -> bool {
     if active.server.inbounds.len() != candidate.server.inbounds.len() {
         return false;
     }
@@ -236,8 +233,7 @@ mod tests {
         candidate.server.policy = base.server.policy.clone();
         candidate.server.inbounds[0].quic_listen = "127.0.0.1:34567".into();
         assert!(!same_port_tls_only(&base, &candidate));
-        candidate.server.inbounds[0].quic_listen =
-            base.server.inbounds[0].quic_listen.clone();
+        candidate.server.inbounds[0].quic_listen = base.server.inbounds[0].quic_listen.clone();
         candidate.server.users[0].disabled = true;
         assert!(!same_port_tls_only(&base, &candidate));
     }
