@@ -70,11 +70,19 @@ def origin_listener(port: int, stop: threading.Event) -> None:
             threading.Thread(target=relay, args=(connection,), daemon=True).start()
 
 
-def serve(args: argparse.Namespace) -> None:
-    assert os.name == "posix" and os.uname().sysname == "Linux"
-    guest_ip = ipaddress.ip_address(args.ip)
+def require_guest_ipv4(raw: str) -> None:
+    try:
+        guest_ip = ipaddress.ip_address(raw)
+    except ValueError as error:
+        raise RuntimeError("Linux server needs a valid guest IPv4") from error
     if guest_ip.version != 4 or guest_ip.is_loopback or guest_ip.is_unspecified:
         raise RuntimeError("Linux server must bind to a valid non-loopback guest IPv4")
+
+
+def serve(args: argparse.Namespace) -> None:
+    if os.name != "posix" or os.uname().sysname != "Linux":
+        raise RuntimeError("Cross-OS server must run inside real Linux")
+    require_guest_ipv4(args.ip)
     digest = input().strip()
     if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
         raise RuntimeError("invalid 32-byte bearer SHA-256 digest")
