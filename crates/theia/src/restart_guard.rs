@@ -98,14 +98,30 @@ pub(crate) fn probe(
     let mut current_tcp = HashSet::new();
     let mut current_udp = HashSet::new();
     for inbound in &active.server.inbounds {
-        current_tcp.insert(inbound.h2_listen.parse::<SocketAddr>().map_err(|_| RestartError::InvalidConfig)?);
-        current_udp.insert(inbound.quic_listen.parse::<SocketAddr>().map_err(|_| RestartError::InvalidConfig)?);
+        current_tcp.insert(
+            inbound
+                .h2_listen
+                .parse::<SocketAddr>()
+                .map_err(|_| RestartError::InvalidConfig)?,
+        );
+        current_udp.insert(
+            inbound
+                .quic_listen
+                .parse::<SocketAddr>()
+                .map_err(|_| RestartError::InvalidConfig)?,
+        );
     }
     let mut next_tcp = Vec::new();
     let mut next_udp = Vec::new();
     for inbound in &candidate.server.inbounds {
-        let tcp: SocketAddr = inbound.h2_listen.parse().map_err(|_| RestartError::InvalidConfig)?;
-        let udp: SocketAddr = inbound.quic_listen.parse().map_err(|_| RestartError::InvalidConfig)?;
+        let tcp: SocketAddr = inbound
+            .h2_listen
+            .parse()
+            .map_err(|_| RestartError::InvalidConfig)?;
+        let udp: SocketAddr = inbound
+            .quic_listen
+            .parse()
+            .map_err(|_| RestartError::InvalidConfig)?;
         if current_tcp.contains(&tcp) || current_udp.contains(&udp) {
             return Ok(RestartVerdict::RequiresMaintenance);
         }
