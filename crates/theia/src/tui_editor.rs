@@ -901,7 +901,6 @@ mod tests {
         assert!(!editor.save());
     }
 
-    #[cfg(unix)]
     #[test]
     fn m4_2c_saved_digest_tracks_only_durable_bytes_not_unsaved_editor_draft() {
         let path = std::env::temp_dir().join(format!(
@@ -940,6 +939,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_config_is_rejected() {
         use std::os::unix::fs::symlink;
