@@ -216,13 +216,30 @@ jobs:
       - name: Cross-logon Windows pipe kernel-denial E2E (mandatory)
         shell: pwsh
         run: ./scripts/windows-cross-sid-ci.ps1
+      - name: Stage Windows E2E binaries already compiled by all-targets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $harnesses = @(Get-ChildItem 'target/debug/deps' -Filter 'f14_cross_host-*.exe' -File)
+          if ($harnesses.Count -ne 1) { throw 'Expected exactly one native F-14 test executable' }
+          if (!(Test-Path 'target/debug/theia.exe' -PathType Leaf)) { throw 'Missing compiled native Windows client' }
+          Copy-Item $harnesses[0].FullName (Join-Path $env:RUNNER_TEMP 'f14_cross_host.exe')
+          Copy-Item 'target/debug/theia.exe' (Join-Path $env:RUNNER_TEMP 'theia.exe')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f14-windows-compiled
+          path: |
+            ${{ runner.temp }}/f14_cross_host.exe
+            ${{ runner.temp }}/theia.exe
+          if-no-files-found: error
+          retention-days: 1
       - name: Native Windows release compilation only after main merge
         if: github.event_name != 'pull_request'
         run: cargo build --workspace --release --locked
 
   f14-cross-host:
     name: F-14 Linux VM server to native Windows client
-    needs: [specification, rust-tests]
+    needs: [specification, rust-tests, windows-smoke]
     if: needs.specification.outputs.rust_ready == 'true'
     runs-on: windows-2025
     timeout-minutes: 50
@@ -230,14 +247,14 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: "f14-cross-os"
       - uses: actions/download-artifact@v4
         with:
           name: f14-linux-server
           path: ${{ runner.temp }}/theia-linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: f14-windows-compiled
+          path: ${{ runner.temp }}/theia-windows
       # Pin the audited v7.2.0 tag commit, not a mutable branch.
       - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4
         with:
@@ -252,9 +269,7 @@ jobs:
       - name: Run native Windows import and real Linux H2/H3 end-to-end
         shell: pwsh
         run: |
-          cargo build --workspace --locked --bin theia
-          if ($LASTEXITCODE -ne 0) { throw 'Native Windows Theia compilation failed' }
-          python scripts/f14-cross-os-ci.py --linux-binary "$env:RUNNER_TEMP/theia-linux/theia"
+          python scripts/f14-cross-os-ci.py --linux-binary "$env:RUNNER_TEMP/theia-linux/theia" --windows-test "$env:RUNNER_TEMP/theia-windows/f14_cross_host.exe" --windows-client "$env:RUNNER_TEMP/theia-windows/theia.exe"
           if ($LASTEXITCODE -ne 0) { throw 'F-14 Linux/Windows cross-OS E2E failed' }
 
   browser-e2e:
