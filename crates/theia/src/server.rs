@@ -1356,7 +1356,14 @@ fn commit_same_port_tls(
     request: &crate::runtime_generation::RestartRequest,
     loaded_identities: &[crate::reload_preflight::IdentityHash],
     path: &Path,
-) -> Result<(Vec<crate::reload_preflight::IdentityHash>, u64, RollbackSlot), ()> {
+) -> Result<
+    (
+        Vec<crate::reload_preflight::IdentityHash>,
+        u64,
+        RollbackSlot,
+    ),
+    (),
+> {
     let candidate = &request.candidate;
     let original = request.previous.document.as_ref();
     let snapshot = request.material.as_ref().ok_or(())?;
@@ -1392,7 +1399,10 @@ fn commit_same_port_tls(
     let previous_h2 = held.iter().map(|guard| (**guard).clone()).collect();
     let previous_h3 = running.active_h3.clone();
     let next_h3 = prepared.h3.clone();
-    let refs = original.server.inbounds.iter()
+    let refs = original
+        .server
+        .inbounds
+        .iter()
         .map(|inbound| (inbound.tls_cert.clone(), inbound.tls_key.clone()))
         .collect();
     let previous_identities = loaded_identities.to_vec();
@@ -1456,14 +1466,17 @@ fn commit_tls_rollback(
     if !crate::restart_guard::same_port_tls_only(&previous.document, &target) {
         return Err(());
     }
-    let (rebased_live, staged_auth) = previous.live
+    let (rebased_live, staged_auth) = previous
+        .live
         .prepare_tls_rebase(&target, expected_revision)
         .map_err(|_| ())?;
     let next = crate::runtime_generation::View {
         document: Arc::new(target.clone()),
         inbounds: target.server.inbounds.len(),
         preflight: Arc::new(crate::reload_preflight::ReloadPreflight::new(
-            path.to_owned(), target, slot.identities.clone(),
+            path.to_owned(),
+            target,
+            slot.identities.clone(),
         )),
         live: Arc::new(rebased_live),
     };
@@ -1475,20 +1488,16 @@ fn commit_tls_rollback(
     }
     let h2 = slot.h2.clone();
     let h3 = slot.h3.clone();
-    let revision = runtime.commit_tls_rotation(
-        &previous,
-        expected_revision,
-        next,
-        staged_auth,
-        || {
+    let revision = runtime
+        .commit_tls_rotation(&previous, expected_revision, next, staged_auth, || {
             for (guard, acceptor) in locks.iter_mut().zip(h2) {
                 **guard = acceptor;
             }
             for (handle, config) in running.identities.iter().zip(h3) {
                 handle.h3.set_server_config(Some(config));
             }
-        },
-    ).map_err(|_| ())?;
+        })
+        .map_err(|_| ())?;
     running.active_h3.clone_from(&slot.h3);
     Ok((slot.identities.clone(), revision))
 }
