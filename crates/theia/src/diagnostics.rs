@@ -317,6 +317,7 @@ mod tests {
         assert!(active.len() <= 128);
         assert!(previous.len() <= 128);
         assert!(active.len() + previous.len() <= 256);
+        drop(writer);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -327,6 +328,7 @@ mod tests {
         writer.write("ok\n").unwrap();
         assert!(writer.write("very-long-record\n").is_err());
         assert_eq!(fs::read_to_string(dir.join("trace.log")).unwrap(), "ok\n");
+        drop(writer);
         fs::remove_dir_all(dir).unwrap();
     }
 
