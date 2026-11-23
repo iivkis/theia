@@ -76,9 +76,8 @@ async fn response_head(stream: &mut TcpStream) -> Vec<u8> {
 
 async fn http_connect(proxy: SocketAddr, origin: u16, successful: bool) {
     let mut stream = TcpStream::connect(proxy).await.unwrap();
-    let request = format!(
-        "CONNECT 127.0.0.1:{origin} HTTP/1.1\r\nHost: 127.0.0.1:{origin}\r\n\r\n"
-    );
+    let request =
+        format!("CONNECT 127.0.0.1:{origin} HTTP/1.1\r\nHost: 127.0.0.1:{origin}\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let reply = response_head(&mut stream).await;
     if !successful {
@@ -94,7 +93,10 @@ async fn http_connect(proxy: SocketAddr, origin: u16, successful: bool) {
     stream.shutdown().await.unwrap();
     let mut echoed = Vec::new();
     stream.read_to_end(&mut echoed).await.unwrap();
-    assert_eq!(echoed, payload, "cross-OS HTTP CONNECT relay corrupted data");
+    assert_eq!(
+        echoed, payload,
+        "cross-OS HTTP CONNECT relay corrupted data"
+    );
 }
 
 async fn socks5_connect(proxy: SocketAddr, origin: u16, successful: bool) {
@@ -141,10 +143,9 @@ async fn client_scenario(
         invalid_token,
         invalid_ca
     );
-    let dir = Directory(std::env::temp_dir().join(format!(
-        "theia-f14-cross-os-{}-{label}",
-        std::process::id()
-    )));
+    let dir = Directory(
+        std::env::temp_dir().join(format!("theia-f14-cross-os-{}-{label}", std::process::id())),
+    );
     fs::create_dir(&dir.0).unwrap();
     let config_path = dir.0.join("client.toml");
     fs::write(&config_path, include_str!("../../../examples/client.toml")).unwrap();
@@ -164,7 +165,9 @@ async fn client_scenario(
         .import_invitation(&invitation, Some(&format!("file:{}", ca.display())), None)
         .unwrap();
     assert!(
-        editor.import_invitation(&invitation, Some(&format!("file:{}", ca.display())), None).is_err(),
+        editor
+            .import_invitation(&invitation, Some(&format!("file:{}", ca.display())), None)
+            .is_err(),
         "duplicate profile ID must be rejected"
     );
     let Config::Client(mut client_doc) = config::read_file(&config_path).unwrap() else {
@@ -176,7 +179,9 @@ async fn client_scenario(
     assert_eq!(imported.transport, transport);
     assert!(imported.auth_token.starts_with("file:"));
     assert_eq!(client_doc.client.proxy.system_proxy, SystemProxy::Off);
-    assert!(!fs::read_to_string(&config_path).unwrap().contains(&URL_SAFE_NO_PAD.encode(token)));
+    assert!(!fs::read_to_string(&config_path)
+        .unwrap()
+        .contains(&URL_SAFE_NO_PAD.encode(token)));
 
     client_doc.client.active_profile = invitation.id.clone();
     if invalid_token {
