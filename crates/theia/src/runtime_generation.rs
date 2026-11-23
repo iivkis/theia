@@ -97,7 +97,11 @@ mod tests {
 
     #[test]
     fn restart_rejects_foreign_and_stale_snapshots_without_any_publication() {
-        let active = crate::server::hardening_tests::live_auth_fixture();
+        let raw = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
+        let crate::config::Config::Server(active) = crate::config::parse(&raw).unwrap() else {
+            panic!("example server config must be valid");
+        };
         let a = Arc::new(LiveAuthorization::new(active.clone()).unwrap());
         let b = Arc::new(LiveAuthorization::new(active.clone()).unwrap());
         let preflight = || {
