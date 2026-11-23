@@ -186,6 +186,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 .ok()
                 .filter(|value| *value > 0)
                 .filter(|_| !revision.starts_with('0'))
+                .filter(|_| revision.bytes().all(|byte| byte.is_ascii_digit()))
                 .ok_or(CliError::InvalidArguments)?;
             let candidate_sha256 =
                 parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?;
@@ -286,6 +287,50 @@ mod tests {
         assert!(execute(Command::Help(None))
             .unwrap()
             .contains("H2 server inbound"));
+    }
+
+    #[test]
+    fn supervised_restart_requires_explicit_confirmation_and_exact_sha256() {
+        let digest = "ab".repeat(32);
+        assert_eq!(
+            command(&[
+                "server", "restart", "--apply", "--expected-revision",
+                "7", "--sha256", &digest, "--confirm"
+            ]),
+            Ok(Command::ServerApplyRestart {
+                expected_revision: 7,
+                candidate_sha256: [0xabu8; 32],
+            })
+        );
+        for wrong_revision in ["0", "07", "-1", "+1", "1x", "18446744073709551616"] {
+            assert_eq!(
+                command(&[
+                    "server", "restart", "--apply", "--expected-revision",
+                    wrong_revision, "--sha256", &digest, "--confirm"
+                ]),
+                Err(CliError::InvalidArguments)
+            );
+        }
+        for wrong_digest in [
+            "AB".repeat(32), "ab".repeat(31), format!("{}f", digest),
+            "xx".repeat(32)
+        ] {
+            assert_eq!(
+                command(&[
+                    "server", "restart", "--apply", "--expected-revision",
+                    "7", "--sha256", &wrong_digest, "--confirm"
+                ]),
+                Err(CliError::InvalidArguments)
+            );
+        }
+        assert_eq!(
+            command(&[
+                "server", "restart", "--apply", "--expected-revision",
+                "7", "--sha256", &digest
+            ]),
+            Err(CliError::InvalidArguments),
+            "a restart without --confirm may never become executable"
+        );
     }
 
     #[test]
