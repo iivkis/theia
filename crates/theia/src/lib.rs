@@ -415,32 +415,54 @@ mod tests {
         );
         assert_eq!(
             command(&[
-                "server", "tls", "rollback", "--apply",
-                "--expected-revision", "3", "--confirm",
+                "server",
+                "tls",
+                "rollback",
+                "--apply",
+                "--expected-revision",
+                "3",
+                "--confirm",
             ]),
-            Ok(Command::ServerTlsRollbackApply { expected_revision: 3 }),
+            Ok(Command::ServerTlsRollbackApply {
+                expected_revision: 3
+            }),
         );
         for bad in ["0", "03", "+3", "-3", "3x", "18446744073709551616"] {
             assert_eq!(
                 command(&[
-                    "server", "tls", "rollback", "--apply",
-                    "--expected-revision", bad, "--confirm",
+                    "server",
+                    "tls",
+                    "rollback",
+                    "--apply",
+                    "--expected-revision",
+                    bad,
+                    "--confirm",
                 ]),
                 Err(CliError::InvalidArguments),
             );
         }
         assert_eq!(
             command(&[
-                "server", "tls", "rollback", "--apply",
-                "--expected-revision", "3",
+                "server",
+                "tls",
+                "rollback",
+                "--apply",
+                "--expected-revision",
+                "3",
             ]),
             Err(CliError::InvalidArguments),
             "an unconfirmed TLS rollback must never be executable",
         );
         assert_eq!(
             command(&[
-                "server", "tls", "rollback", "--apply",
-                "--expected-revision", "3", "--confirm", "--force",
+                "server",
+                "tls",
+                "rollback",
+                "--apply",
+                "--expected-revision",
+                "3",
+                "--confirm",
+                "--force",
             ]),
             Err(CliError::InvalidArguments),
         );
