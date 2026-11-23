@@ -102,7 +102,8 @@ ACTIVE_H3/H2 → stream ends → CLOSED
 - Два независимых файла `server.toml` и `client.toml` по умолчанию, явно передаваемые через `--config`; пути ОС — в `docs/CONFIGURATION.md`.
 - TUI применяет изменения в два этапа: parse+validate → atomic temp write, fsync, rename → локальный `reload`. При неудачном reload живой runtime остаётся на предыдущем snapshot; UI показывает расхождение.
 - Локальный IPC: **M4.2a частично реализован** как *read-only* Linux Unix socket `theia-server.sock` под euid-owned 0700 `THEIA_CONTROL_DIR`, socket 0600, `health/status` и явный отказ `reload`, без TCP-админки ([ADR-0038](adr/0038-m4-2a-linux-readonly-management-ipc.md)). Важный контракт будущего M4.2: Windows Named Pipe с ACL, корректные runtime revision/health counters, транзакционный reload и rollback, интеграция TUI. Не считать сохранённый TOML применённым только потому, что local status сообщает running.
-- Runtime snapshots конфигурации иммутабельны, заменяются атомарно после проверки; отказ применения не ломает старые потоки.
+- **M4.2b0:** подготовка к reload ограничена read-only `server reload --check` через Linux private Unix socket: сравнение strict typed candidate TOML с *запущенным* документом и SHA-256 PEM bytes, использованных listener'ами, с отклонением restart-only изменений. Возвращает только `compatible`/ошибку, **не** применяет изменения и не резервирует candidate от последующей подмены ([ADR-0039](adr/0039-m4-2b0-readonly-reload-preflight.md)).
+- Runtime snapshots конфигурации иммутабельны, заменяются атомарно после проверки; отказ применения не ломает старые потоки. **Это ещё проектное требование M4.2b1+, не поведение M4.2b0**.
 - Не считать логи и безопасный файл резервного состояния Windows «базой данных».
 
 ## 6. Безопасность и эксплуатация
