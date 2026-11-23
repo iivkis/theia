@@ -733,10 +733,9 @@ async fn launch_imported_h3_client(
         tui_editor::Editor,
         Role,
     };
-    let dir = TestDirectory(std::env::temp_dir().join(format!(
-        "theia-f14-h3-import-ci-{}",
-        std::process::id()
-    )));
+    let dir = TestDirectory(
+        std::env::temp_dir().join(format!("theia-f14-h3-import-ci-{}", std::process::id())),
+    );
     std::fs::create_dir(&dir.0).unwrap();
     let ca_path = dir.0.join("trust.pem");
     std::fs::write(&ca_path, pem).unwrap();
@@ -777,7 +776,9 @@ async fn launch_imported_h3_client(
     assert_eq!(client.client.profiles.len(), 2);
     assert_eq!(client.client.profiles[1].transport, Transport::H3);
     assert!(client.client.profiles[1].auth_token.starts_with("file:"));
-    assert!(!std::fs::read_to_string(&config_path).unwrap().contains(&token()));
+    assert!(!std::fs::read_to_string(&config_path)
+        .unwrap()
+        .contains(&token()));
     client.client.active_profile = invitation.id.clone();
 
     // OS proxy remains off; reserve only private per-process localhost binds.
