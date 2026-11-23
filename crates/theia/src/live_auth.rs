@@ -241,5 +241,17 @@ mod tests {
         let committed = live.stage(&changed, 1).unwrap();
         assert_eq!(live.publish(committed), Ok(2));
         assert!(live.shared().load().unwrap().users[0].disabled);
+
+        // No wrap to zero and no ambiguous successful commit receipt at the
+        // revision boundary; the loaded state must remain unchanged.
+        {
+            let mut guard = live.shared.current.write().unwrap();
+            *guard = Arc::new(AuthSnapshot::for_document(&changed, u64::MAX));
+        }
+        assert!(matches!(
+            live.stage(&changed, u64::MAX),
+            Err(LiveAuthError::RevisionExhausted)
+        ));
+        assert_eq!(live.revision(), Ok(u64::MAX));
     }
 }
