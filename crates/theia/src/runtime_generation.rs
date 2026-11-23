@@ -150,6 +150,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auth_only_cas_updates_tls_rotation_baseline_and_rejects_old_generation() {
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
+        let crate::config::Config::Server(active) = crate::config::parse(&source).unwrap()
+        else {
+            panic!("server config fixture must parse");
+        };
+        let live = Arc::new(LiveAuthorization::new(active.clone()).unwrap());
+        let preflight = Arc::new(ReloadPreflight::new(
+            std::path::PathBuf::from("/nonexistent"),
+            active.clone(),
+            Vec::new(),
+        ));
+        let state = State::new(View {
+            document: Arc::new(active.clone()),
+            inbounds: active.server.inbounds.len(),
+            preflight,
+            live,
+        });
+        let old = state.snapshot().unwrap();
+        let mut updated = active.clone();
+        updated.server.users[0].token_sha256 = "b".repeat(64);
+        assert_eq!(state.apply_auth(&old, &updated, 1), Ok(2));
+        let current = state.snapshot().unwrap();
+        assert_eq!(current.live.revision(), Ok(2));
+        assert_eq!(current.document.as_ref(), &updated);
+        assert!(!Arc::ptr_eq(&old, &current));
+        assert!(matches!(
+            state.apply_auth(&old, &updated, 2),
+            Err(LiveAuthError::StaleRevision)
+        ));
+        let mut next_identity = updated.clone();
+        next_identity.server.inbounds[0].tls_cert =
+            "file:rotated-cert.pem".to_owned();
+        assert!(
+            crate::restart_guard::same_port_tls_only(&current.document, &next_identity),
+            "TLS rotation after auth CAS must compare the newest auth user state"
+        );
+    }
+
+    #[test]
     fn restart_rejects_foreign_and_stale_snapshots_without_any_publication() {
         let raw = include_str!("../../../examples/server.toml")
             .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
