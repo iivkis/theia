@@ -1,7 +1,7 @@
 //! Black-box CLI regression tests. Run natively on Linux and Windows.
 use std::process::{Command, Output};
 
-fn invoke( args: &[&str] ) -> Output {
+fn invoke(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_theia"))
         .args(args)
         .output()
