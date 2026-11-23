@@ -857,6 +857,14 @@ fn tls_acceptor(
     Ok(TlsAcceptor::from(Arc::new(tls)))
 }
 
+/// Validate a restart candidate using the exact production TLS identity parser
+/// and TLS1.3/H2 acceptor builder, without starting a server or binding ports.
+pub(crate) fn validate_listener_identity(inbound: &Inbound) -> Result<(), ServerError> {
+    let material = tls_material(inbound)?;
+    let _ = tls_acceptor(material.certs, material.key)?;
+    Ok(())
+}
+
 /// Prepare all TCP and UDP listeners and TLS identity before launching tasks.
 pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
     let parsed = config::read_file(config_path).map_err(|_| ServerError::Config)?;
