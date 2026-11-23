@@ -40,6 +40,8 @@ pub(crate) mod tui_probe;
 pub(crate) mod tui_runtime;
 #[cfg(target_os = "windows")]
 pub mod windows_control;
+#[cfg(target_os = "windows")]
+pub mod windows_system_proxy;
 
 use std::fmt;
 use std::path::Path;
