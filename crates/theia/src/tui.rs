@@ -5,7 +5,7 @@
 use crate::{
     tui_candidate_batch::CandidateBatchPanel, tui_candidates::CandidateReview,
     tui_discovery::DiscoveryPanel, tui_domain::DomainPanel, tui_editor::Editor,
-    tui_probe::ProbePanel, Role,
+    tui_probe::ProbePanel, tui_runtime::RuntimePanel, Role,
 };
 use crossterm::{
     cursor::{Hide, Show},
@@ -187,6 +187,7 @@ struct Interaction {
     candidate_batch: Option<CandidateBatchPanel>,
     domain: Option<DomainPanel>,
     probe: Option<ProbePanel>,
+    runtime: Option<RuntimePanel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
 }
@@ -201,6 +202,7 @@ impl Interaction {
             candidate_batch: None,
             domain: None,
             probe: None,
+            runtime: None,
             pending: None,
             saving: None,
         }
@@ -252,6 +254,12 @@ impl Interaction {
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press || self.saving.is_some() {
+            return false;
+        }
+        if let Some(runtime) = self.runtime.as_mut() {
+            if runtime.key(key) {
+                self.runtime = None;
+            }
             return false;
         }
         if let Some(domain) = self.domain.as_mut() {
@@ -380,6 +388,10 @@ impl Interaction {
             return false;
         }
         let Some(editor) = self.editor.as_mut() else {
+            if model.screen == Screen::Server && key.code == KeyCode::Char('v') {
+                self.runtime = Some(RuntimePanel::open(None, false));
+                return false;
+            }
             if model.screen == Screen::Server && key.code == KeyCode::Char('p') {
                 self.discovery = Some(DiscoveryPanel::new());
                 return false;
@@ -497,6 +509,28 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            // An editable draft is never silently sent to the server.
+            // Ctrl+R requires an explicit saved source and then a second 'y'.
+            let apply_shortcut = key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('r');
+            if editor.role() == Role::Server
+                && (key.code == KeyCode::Char('v') || apply_shortcut)
+            {
+                if apply_shortcut && editor.dirty() {
+                    editor.error = Some(
+                        "Сначала Ctrl+S: нельзя применять несохранённый черновик.".into(),
+                    );
+                } else {
+                    let saved = if editor.dirty() {
+                        None
+                    } else {
+                        Some(editor.saved_sha256())
+                    };
+                    self.runtime = Some(RuntimePanel::open(saved, apply_shortcut));
+                    editor.error = None;
+                }
+                return false;
+            }
             if editor.role() == Role::Server && key.code == KeyCode::Char('p') {
                 if editor.dirty() {
                     editor.error =
@@ -664,7 +698,15 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         ),
     }
-    if interaction.is_some_and(|ui| ui.saving.is_some()) {
+    if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
+        panel(
+            frame,
+            parts[1],
+            runtime.title(),
+            &runtime.body(),
+            true,
+        );
+    } else if interaction.is_some_and(|ui| ui.saving.is_some()) {
         panel(
             frame,
             parts[1],
@@ -830,6 +872,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
     loop {
         if interaction.poll_save(&mut model)? {
             return Ok(());
+        }
+        if let Some(runtime) = interaction.runtime.as_mut() {
+            runtime.poll();
         }
         if let Some(discovery) = interaction.discovery.as_mut() {
             discovery.poll();
