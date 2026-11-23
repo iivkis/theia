@@ -927,7 +927,7 @@ fn tls_material_from_bytes(
     key_bytes: &[u8],
 ) -> Result<TlsMaterial, ServerError> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let identity = crate::reload_preflight::IdentityHash::from_pem(&cert_bytes, &key_bytes);
+    let identity = crate::reload_preflight::IdentityHash::from_pem(cert_bytes, key_bytes);
     let mut cert_reader = BufReader::new(cert_bytes);
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
@@ -1049,14 +1049,6 @@ fn tls_acceptor(
     tls.alpn_protocols = vec![b"h2".to_vec()];
     tls.max_early_data_size = 0;
     Ok(TlsAcceptor::from(Arc::new(tls)))
-}
-
-/// Validate a restart candidate using the exact production TLS identity parser
-/// and TLS1.3/H2 acceptor builder, without starting a server or binding ports.
-pub(crate) fn validate_listener_identity(inbound: &Inbound) -> Result<(), ServerError> {
-    let material = tls_material(inbound)?;
-    let _ = tls_acceptor(material.certs, material.key)?;
-    Ok(())
 }
 
 /// Prepare all TCP and UDP listeners and TLS identity before launching tasks.
