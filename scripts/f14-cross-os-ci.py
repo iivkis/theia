@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Mandatory native Windows + Linux WSL2 VM F-14 acceptance driver.
+"""Mandatory native Windows client -> real Linux WSL2 VM F-14 acceptance.
 
-Not a cross-machine Internet test: both OS instances share an ephemeral hosted
-Windows runner, but WSL2 uses a separate *real Linux kernel*, process space and
-virtual NIC. There is no external relay, public scanner, private credential,
-or "skip when unsupported": failure to provision WSL2 fails the CI job.
+WSL2 is a separate Linux kernel and virtual NIC on a Windows-hosted runner,
+NOT two independent physical/Internet machines. Files cross the OS boundary
+only through explicit bounded stdin/stdout streams, NEVER through fragile
+DrvFs /mnt/c or wslpath assumptions. No raw bearer is sent into Linux, TOML,
+argv or logs; Linux receives its SHA-256 digest through a private pipe.
 """
 from __future__ import annotations
 
@@ -14,7 +15,6 @@ import hashlib
 import ipaddress
 import os
 from pathlib import Path
-import shutil
 import secrets
 import socket
 import subprocess
@@ -23,11 +23,16 @@ import tempfile
 import time
 
 DISTRO = "Ubuntu-24.04"
+MAX_TRANSFER_BYTES = 64 * 1024 * 1024
+
+
+def wsl_command(*args: str) -> list[str]:
+    return ["wsl.exe", "--distribution", DISTRO, "--", *args]
 
 
 def linux(*args: str, timeout: float = 20) -> str:
     result = subprocess.run(
-        ["wsl.exe", "--distribution", DISTRO, "--", *args],
+        wsl_command(*args),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -36,10 +41,6 @@ def linux(*args: str, timeout: float = 20) -> str:
         timeout=timeout,
     )
     return result.stdout.strip()
-
-
-def wsl_path(path: Path) -> str:
-    return linux("wslpath", "-a", "-u", str(path.resolve()))
 
 
 def guest_ip() -> str:
@@ -62,6 +63,52 @@ def is_listening(ip: str, port: int) -> bool:
         return False
 
 
+def guest_exists(path: str) -> bool:
+    result = subprocess.run(
+        wsl_command("test", "-f", path),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=12,
+    )
+    return result.returncode == 0
+
+
+def copy_into_guest(source: Path, destination: str) -> None:
+    """Stream a non-secret source into a private absolute Linux path."""
+    data = source.read_bytes()
+    if not 0 < len(data) <= MAX_TRANSFER_BYTES:
+        raise RuntimeError("Linux input artifact is empty or oversized")
+    result = subprocess.run(
+        wsl_command("sh", "-c", 'cat > "$1" && chmod 700 "$1"', "f14-copy", destination),
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=65,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"WSL stdin artifact streaming failed (status {result.returncode})")
+    expected = hashlib.sha256(data).hexdigest()
+    actual = linux("sha256sum", destination).split()[0]
+    if expected != actual:
+        raise RuntimeError("Linux artifact differs from the original Windows-side bytes")
+
+
+def copy_public_from_guest(source: str, destination: Path) -> None:
+    """Fetch only explicitly enumerated public certs and hash-only TOML."""
+    result = subprocess.run(
+        wsl_command("cat", source),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+    if result.returncode != 0 or not 0 < len(result.stdout) <= 1024 * 1024:
+        raise RuntimeError("Cannot read bounded Linux guest public fixture")
+    destination.write_bytes(result.stdout)
+
+
 def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
     if os.name != "nt":
         raise RuntimeError("native Windows runner is mandatory")
@@ -72,94 +119,103 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
     if not windows_test.is_file() or not windows_client.is_file():
         raise RuntimeError("Precompiled native Windows test/client artifacts are missing")
     ip = guest_ip()
-    print("F-14: native Windows client + WSL2 Linux VM; separate virtual NIC validated")
+    print("F-14: native Windows client and separate WSL2 Linux VM virtual NIC verified")
     token = secrets.token_bytes(32)
     digest = hashlib.sha256(token).hexdigest()
     token_b64 = base64.urlsafe_b64encode(token).decode("ascii").rstrip("=")
-    # Nothing here logs either secret, serialized invitation, or token file.
     port = secrets.randbelow(8000) + 42000
     origin = secrets.randbelow(8000) + 52000
     if port == origin:
         origin += 1
 
-    # GitHub-hosted Windows checks out onto D:\\a, which is NOT guaranteed
-    # to be mounted in Ubuntu's WSL2 VM. Stage only CI test inputs on C:
-    # (the normal DrvFs /mnt/c mount), never a secret or bearer token.
-    user_home = Path(os.environ["USERPROFILE"])
-    c_temp = user_home / "AppData" / "Local" / "Temp"
-    c_temp.mkdir(parents=True, exist_ok=True)
-    if user_home.drive.lower() != "c:":
-        raise RuntimeError("Windows profile must reside on WSL-mounted system drive C:")
-    with tempfile.TemporaryDirectory(prefix="theia-f14-xhost-", dir=c_temp) as dirname:
-        shared = Path(dirname)
+    # /tmp path is generated locally, cannot escape this fixed safe prefix.
+    guest_dir = "/tmp/theia-f14-xhost-" + secrets.token_hex(12)
+    subprocess.run(
+        wsl_command("mkdir", "-m", "700", guest_dir),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=True,
+        timeout=15,
+    )
+    try:
         server_script = Path(__file__).resolve().with_name("f14-wsl-server.py")
-        guest_script = shared / "f14-wsl-server.py"
-        guest_binary = shared / "theia-linux"
-        shutil.copy2(server_script, guest_script)
-        shutil.copy2(binary, guest_binary)
-        guest_shared_path = wsl_path(shared)
-        guest_script_path = wsl_path(guest_script)
-        guest_binary_path = wsl_path(guest_binary)
-        linux("test", "-r", guest_script_path)
-        linux("test", "-r", guest_binary_path)
-        print("F-14: verified Windows C: staged artifact visibility inside the Linux VM")
-        command = [
-            "wsl.exe", "--distribution", DISTRO, "--",
-            "python3", guest_script_path,
-            "--shared", guest_shared_path,
-            "--binary", guest_binary_path,
-            "--ip", ip, "--port", str(port), "--origin-port", str(origin),
-        ]
-        server = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            assert server.stdin is not None
-            server.stdin.write(digest.encode("ascii") + b"\n")
-            server.stdin.close()
-            deadline = time.monotonic() + 65
-            while time.monotonic() < deadline:
-                if server.poll() is not None:
-                    details = server.stderr.read().decode("utf-8", "replace")
-                    raise RuntimeError("Linux test server failed to boot: " + details[-1500:])
-                if (shared / "ready").is_file() and is_listening(ip, port):
-                    break
-                time.sleep(0.25)
-            else:
-                raise RuntimeError("Windows cannot reach Linux VM's actual TCP listener")
+        guest_script = guest_dir + "/f14-wsl-server.py"
+        guest_binary = guest_dir + "/theia"
+        copy_into_guest(server_script, guest_script)
+        copy_into_guest(binary, guest_binary)
+        print("F-14: SHA-256 verified both Linux inputs over WSL stdin without DrvFs mounts")
 
-            print("F-14: verified Linux VM listener from native Windows over its guest IPv4")
-            env = os.environ.copy()
-            env.update(
-                THEIA_F14_XHOST_RUN="yes",
-                THEIA_F14_XHOST_ENDPOINT=f"{ip}:{port}",
-                THEIA_F14_XHOST_ORIGIN_PORT=str(origin),
-                THEIA_F14_XHOST_SERVER_CONFIG=str(shared / "server.toml"),
-                THEIA_F14_XHOST_CA=str(shared / "trusted-ca.pem"),
-                THEIA_F14_XHOST_WRONG_CA=str(shared / "wrong-ca.pem"),
-                THEIA_F14_XHOST_TOKEN=token_b64,
-                THEIA_F14_CLIENT_BIN=str(windows_client.resolve()),
+        with tempfile.TemporaryDirectory(prefix="theia-f14-host-") as dirname:
+            host_files = Path(dirname)
+            command = wsl_command(
+                "python3", guest_script,
+                "--shared", guest_dir,
+                "--binary", guest_binary,
+                "--ip", ip, "--port", str(port), "--origin-port", str(origin),
             )
-            subprocess.run(
-                [
-                    str(windows_test.resolve()), "--ignored", "--exact",
-                    "linux_server_windows_client_f14_h2_h3_open_ok", "--nocapture",
-                ],
-                env=env,
-                check=True,
-                timeout=270,
+            server = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
-            print("F-14: real H2/H3 OPEN_OK, SOCKS5/CONNECT and negative PKI/auth passed")
-        finally:
-            (shared / "stop").write_text("stop\n", encoding="ascii")
             try:
-                server.wait(timeout=12)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait(timeout=5)
+                assert server.stdin is not None
+                server.stdin.write(digest.encode("ascii") + b"\n")
+                server.stdin.close()
+                deadline = time.monotonic() + 65
+                while time.monotonic() < deadline:
+                    if server.poll() is not None:
+                        details = server.stderr.read().decode("utf-8", "replace")
+                        raise RuntimeError("Linux server failed to start: " + details[-1500:])
+                    if guest_exists(guest_dir + "/ready") and is_listening(ip, port):
+                        break
+                    time.sleep(0.25)
+                else:
+                    raise RuntimeError("Native Windows cannot reach real WSL2 Linux TCP listener")
+
+                print("F-14: Windows connected to the Linux VM on its non-loopback IPv4")
+                for filename in ("server.toml", "trusted-ca.pem", "wrong-ca.pem"):
+                    copy_public_from_guest(guest_dir + "/" + filename, host_files / filename)
+                env = os.environ.copy()
+                env.update(
+                    THEIA_F14_XHOST_RUN="yes",
+                    THEIA_F14_XHOST_ENDPOINT=f"{ip}:{port}",
+                    THEIA_F14_XHOST_ORIGIN_PORT=str(origin),
+                    THEIA_F14_XHOST_SERVER_CONFIG=str(host_files / "server.toml"),
+                    THEIA_F14_XHOST_CA=str(host_files / "trusted-ca.pem"),
+                    THEIA_F14_XHOST_WRONG_CA=str(host_files / "wrong-ca.pem"),
+                    THEIA_F14_XHOST_TOKEN=token_b64,
+                    THEIA_F14_CLIENT_BIN=str(windows_client.resolve()),
+                )
+                subprocess.run(
+                    [
+                        str(windows_test.resolve()), "--ignored", "--exact",
+                        "linux_server_windows_client_f14_h2_h3_open_ok", "--nocapture",
+                    ],
+                    env=env,
+                    check=True,
+                    timeout=270,
+                )
+                print("F-14: real H2/H3 OPEN_OK, SOCKS5/CONNECT and PKI/auth negatives passed")
+            finally:
+                subprocess.run(
+                    wsl_command("touch", guest_dir + "/stop"),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=15, check=False,
+                )
+                try:
+                    server.wait(timeout=12)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=5)
+    finally:
+        subprocess.run(
+            wsl_command("rm", "-rf", guest_dir),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=20, check=False,
+        )
 
 
 if __name__ == "__main__":
