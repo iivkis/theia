@@ -2,6 +2,7 @@
 //! A listener, not the untrusted HTTP Host/authority, determines authorization.
 use crate::{
     config::{self, Config, Inbound, ServerDocument, ServerPolicy, User},
+    live_auth::{AuthCell, LiveAuthorization},
     protocol::{self, Address, Decoder, Direction, ErrorCode, Frame, Role, Session},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -118,8 +119,7 @@ impl AuthFailure {
 /// contexts protects aggregate connection and user quotas across inbounds.
 pub struct ServerContext {
     pub inbound_id: String,
-    allowed_users: HashSet<String>,
-    users: Vec<User>,
+    authorization: Arc<AuthCell>,
     policy: ServerPolicy,
     global_streams: Arc<Semaphore>,
     user_streams: Arc<HashMap<String, Arc<Semaphore>>>,
@@ -145,8 +145,8 @@ impl ServerContext {
             .collect();
         Self::with_limits(
             inbound,
-            users,
             policy,
+            AuthCell::isolated(inbound, users),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
             Arc::new(all_users),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
@@ -156,8 +156,8 @@ impl ServerContext {
 
     fn with_limits(
         inbound: &Inbound,
-        users: &[User],
         policy: &ServerPolicy,
+        authorization: Arc<AuthCell>,
         global_streams: Arc<Semaphore>,
         user_streams: Arc<HashMap<String, Arc<Semaphore>>>,
         connection_slots: Arc<Semaphore>,
@@ -165,8 +165,7 @@ impl ServerContext {
     ) -> Self {
         Self {
             inbound_id: inbound.id.clone(),
-            allowed_users: inbound.allowed_user_ids.iter().cloned().collect(),
-            users: users.to_vec(),
+            authorization,
             policy: policy.clone(),
             global_streams,
             user_streams,
@@ -249,8 +248,15 @@ impl ServerContext {
             return Err(AuthFailure::Unauthorized);
         }
         let candidate = Sha256::digest(&decoded);
+        // One immutable view of *all* users and grants per request. This
+        // Arc is independent of the short-lived shared RwLock, so a future
+        // publication cannot cut off an already admitted session.
+        let snapshot = self
+            .authorization
+            .load()
+            .map_err(|_| AuthFailure::Unauthorized)?;
         let mut matching_user: Option<&User> = None;
-        for user in &self.users {
+        for user in &snapshot.users {
             // The structural TOML validator has already confirmed lower-hex
             // digest shape; skip damaged runtime fixtures rather than trusting.
             if let Some(stored) = decode_digest(&user.token_sha256) {
@@ -261,7 +267,12 @@ impl ServerContext {
             }
         }
         let user = matching_user.ok_or(AuthFailure::Unauthorized)?;
-        if user.disabled || !self.allowed_users.contains(&user.id) {
+        if user.disabled
+            || !snapshot
+                .grants
+                .get(&self.inbound_id)
+                .is_some_and(|grants| grants.contains(&user.id))
+        {
             return Err(AuthFailure::Forbidden);
         }
         let global = self
@@ -868,6 +879,10 @@ async fn run_document_with_config(
     if !document.server.enabled {
         return Err(ServerError::Config);
     }
+    // One shared authorization snapshot for every H2/H3 inbound. The
+    // controller's stage/commit API is NOT exposed by management IPC yet.
+    let live_authorization =
+        LiveAuthorization::new(document.clone()).map_err(|_| ServerError::Config)?;
     #[cfg(target_os = "linux")]
     let baseline = document.clone();
     #[cfg(target_os = "linux")]
@@ -909,8 +924,8 @@ async fn run_document_with_config(
                 })?;
         let context = Arc::new(ServerContext::with_limits(
             inbound,
-            &document.server.users,
             &policy,
+            live_authorization.shared(),
             global.clone(),
             per_user.clone(),
             connections.clone(),
