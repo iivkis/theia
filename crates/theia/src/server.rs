@@ -124,12 +124,21 @@ pub struct ServerContext {
     global_streams: Arc<Semaphore>,
     user_streams: Arc<HashMap<String, Arc<Semaphore>>>,
     connection_slots: Arc<Semaphore>,
+    // Supervised file runtime: same occupancy ledger for every generation.
+    // Library-only unsupervised contexts continue using fixed semaphores.
+    live_quota: Option<Arc<crate::quota::Ledger>>,
     peer_budget: Arc<PeerBudget>,
 }
 
 pub struct SessionPermit {
-    _global: OwnedSemaphorePermit,
-    _user: OwnedSemaphorePermit,
+    _global: Option<OwnedSemaphorePermit>,
+    _user: Option<OwnedSemaphorePermit>,
+    _live: Option<crate::quota::Lease>,
+}
+
+pub(crate) struct ConnectionSlot {
+    _legacy: Option<OwnedSemaphorePermit>,
+    _live: Option<crate::quota::Lease>,
 }
 
 impl ServerContext {
@@ -170,12 +179,22 @@ impl ServerContext {
             global_streams,
             user_streams,
             connection_slots,
+            live_quota: None,
             peer_budget,
         }
     }
 
-    pub(crate) fn connection_slot(&self) -> Option<OwnedSemaphorePermit> {
-        self.connection_slots.clone().try_acquire_owned().ok()
+    pub(crate) fn connection_slot(&self) -> Option<ConnectionSlot> {
+        if let Some(ledger) = &self.live_quota {
+            return Some(ConnectionSlot {
+                _legacy: None,
+                _live: Some(ledger.acquire_connection()?),
+            });
+        }
+        Some(ConnectionSlot {
+            _legacy: Some(self.connection_slots.clone().try_acquire_owned().ok()?),
+            _live: None,
+        })
     }
 
     pub(crate) async fn dial_target(
@@ -275,6 +294,16 @@ impl ServerContext {
         {
             return Err(AuthFailure::Forbidden);
         }
+        // Admission and quota resize serialize through a single short
+        // occupancy lock across old/new H2 and QUIC listener generations.
+        if let Some(ledger) = &self.live_quota {
+            let permit = ledger.acquire_session(&user.id).ok_or(AuthFailure::Busy)?;
+            return Ok(SessionPermit {
+                _global: None,
+                _user: None,
+                _live: Some(permit),
+            });
+        }
         let global = self
             .global_streams
             .clone()
@@ -289,8 +318,9 @@ impl ServerContext {
             .try_acquire_owned()
             .map_err(|_| AuthFailure::Busy)?;
         Ok(SessionPermit {
-            _global: global,
-            _user: per_user,
+            _global: Some(global),
+            _user: Some(per_user),
+            _live: None,
         })
     }
 }
@@ -955,6 +985,7 @@ struct GenerationLimits {
     global: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     per_user: Arc<HashMap<String, Arc<Semaphore>>>,
+    ledger: Arc<crate::quota::Ledger>,
     peer_budget: Arc<PeerBudget>,
 }
 
@@ -977,6 +1008,7 @@ impl GenerationLimits {
             global: Arc::new(Semaphore::new(policy.max_connections_total as usize)),
             connections: Arc::new(Semaphore::new(policy.max_connections_total as usize)),
             per_user: Arc::new(per_user),
+            ledger: crate::quota::Ledger::new(policy, &document.server.users),
             peer_budget: Arc::new(PeerBudget::default()),
         }
     }
@@ -1026,7 +1058,7 @@ async fn prepare_generation(
         let endpoint =
             crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
                 .map_err(|_| ServerError::Io)?;
-        let context = Arc::new(ServerContext::with_limits(
+        let mut context = ServerContext::with_limits(
             inbound,
             &document.server.policy,
             live.shared(),
@@ -1034,8 +1066,9 @@ async fn prepare_generation(
             limits.per_user.clone(),
             limits.connections.clone(),
             limits.peer_budget.clone(),
-        ));
-        listeners.push((listener, acceptor, endpoint, context));
+        );
+        context.live_quota = Some(limits.ledger.clone());
+        listeners.push((listener, acceptor, endpoint, Arc::new(context)));
     }
     Ok(PreparedGeneration {
         listeners,
@@ -1254,6 +1287,41 @@ fn commit_same_port_tls(
     Ok((identities, revision))
 }
 
+/// Quota-only CAS: nothing is rebound or restarted, and all previously
+/// acquired permits remain counted by the SAME ledger across both transports.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn commit_live_quota(
+    runtime: &crate::runtime_generation::State,
+    request: &crate::runtime_generation::RestartRequest,
+    ledger: &crate::quota::Ledger,
+) -> Result<u64, ()> {
+    let active = request.previous.document.as_ref();
+    let candidate = &request.candidate;
+    if !crate::restart_guard::quota_only(active, candidate) {
+        return Err(());
+    }
+    let (rebased_live, staged_auth) = request
+        .previous
+        .live
+        .prepare_tls_rebase(candidate, request.expected_revision)
+        .map_err(|_| ())?;
+    let next = crate::runtime_generation::View {
+        document: Arc::new(candidate.clone()),
+        inbounds: request.previous.inbounds,
+        preflight: Arc::new(request.previous.preflight.rebased(candidate.clone())),
+        live: Arc::new(rebased_live),
+    };
+    runtime
+        .commit_quota(
+            &request.previous,
+            request.expected_revision,
+            next,
+            staged_auth,
+            ledger,
+        )
+        .map_err(|_| ())
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn run_supervised_file(
     document: ServerDocument,
@@ -1321,6 +1389,11 @@ async fn run_supervised_file(
                 // Never start or commit a speculative restart whose operator
                 // is no longer listening for its result.
                 if request.complete.is_closed() {
+                    continue;
+                }
+                if request.kind == crate::runtime_generation::ChangeKind::Quota {
+                    let result = commit_live_quota(&runtime, &request, &limits.ledger);
+                    let _ = request.complete.send(result);
                     continue;
                 }
                 if crate::restart_guard::same_port_tls_only(

@@ -92,6 +92,10 @@ TLS-in-TLS в расширенных настройках: будущий пер
 
 После явного `THEIA_CONTROL_PIPE=id` действующий Windows-сервер предоставляет тот же status/revision и **подтверждаемый** auth-only CAS Apply, что Linux. TUI в роли server (`--role server --config FILE`) открывает `v` (read-only), `Ctrl+R` показывает ожидаемую running revision, и только отдельное `y` передаёт SHA-256 **сохранённого** TOML. Client TUI, dirty draft, неверная revision, отсутствующий Named Pipe/SID/DACL, incompatible или TLS-drift не должны применять. IPC не затрагивает Windows system proxy; потерянный ACK остаётся indeterminate, требуется status. Системное имя pipe формируется по TokenUser SID, из env принимается только короткий ASCII идентификатор. [ADR-0043](adr/0043-m4-2d-windows-sid-named-pipe.md).
 
+### M4.2j: live quota changes are explicit CLI-only
+
+Серверная TUI не выполняет и не предлагает quota Apply автоматически. Оператор сохраняет TOML (допускаются только два max_connections*), запускает read-only `theia server quota --check` через private IPC, затем отдельно даёт `theia server quota --apply --expected-revision N --sha256 HEX --confirm`. Уже открытые H2/H3 sessions продолжают работу; при снижении caps ниже occupancy новые admissions блокируются до освобождения permits, при увеличении новые slots сразу доступны. Status показывает монотонную revision, но текущие counts и отдельная графическая панель квот пока не реализованы. При timeout/потере ACK нельзя повторять Apply по предположению. ADR-0050.
+
 ### M4.2i: same-port TLS identity readiness, no TUI Apply
 
 Серверная TUI `Shift+R` теперь показывает отдельное состояние готовности `same-port TLS rotation ready`, если меняется только TLS PEM (не адреса, grants, policy или user roster), и подчёркивает, что это только проверка. Ни `y`, ни `a` не публикуют TLS identity и не перезапускают службу. Подтверждение same-port H2/H3 TLS rotation делается отдельной native CLI командой с expected revision, SHA-256 сохранённого TOML и `--confirm` (ADR-0049). Старые туннели не обрываются. Следует заранее распространить новое доверие CA; TLS handshakes, начатые до CAS, могут сохранить прежний сертификат.

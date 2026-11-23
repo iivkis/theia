@@ -85,6 +85,13 @@ pub enum StatusCommand {
     /// Read-only restart readiness: validates TLS and tests fresh TCP/UDP ports.
     /// Never reserves a port, stops listeners or commits new runtime state.
     CheckRestart,
+    /// Read-only validation of a quota-only saved candidate.
+    CheckQuota,
+    /// Native occupancy-aware quota resize, mandatory revision/SHA CAS.
+    ApplyQuotaBound {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
+    },
     /// Explicit restart cutover, requires saved TOML SHA-256 and revision CAS.
     /// Only distinct new ports with unchanged quotas/roster are supported.
     ApplyRestartBound {
@@ -121,6 +128,11 @@ pub enum StatusReply {
     RestartRequiresMaintenance,
     /// Exact existing TCP/UDP ports can rotate fully prevalidated TLS identities.
     RestartSamePortTlsReady,
+    /// Valid quota-only candidate, no active connection is revoked.
+    QuotaReady,
+    QuotaApplied {
+        revision: u64,
+    },
     /// All NEW candidate ports were temporarily bound, then released.
     RestartFreshPortsBindable,
     RestartApplied {
@@ -348,41 +360,77 @@ where
                     format!("theia-status-v1 running inbounds={inbounds}\n")
                 }
             }
-            candidate if parse_restart_revision(candidate).is_some() => {
+            candidate
+                if parse_restart_revision(candidate).is_some()
+                    || parse_quota_revision(candidate).is_some() =>
+            {
                 if let (Some(preflight), Some(runtime), Some(previous), Some(restarts)) =
                     (&preflight, &runtime, &observed, &restarts)
                 {
-                    let (expected, sha256) =
-                        parse_restart_revision(candidate).expect("already parsed");
-                    // A worker may finish after client timeout, but cannot
-                    // publish or even request a new generation after the
-                    // calling IPC handler has been cancelled.
+                    let (expected, sha256, kind) =
+                        if let Some((revision, digest)) = parse_quota_revision(candidate) {
+                            (
+                                revision,
+                                digest,
+                                crate::runtime_generation::ChangeKind::Quota,
+                            )
+                        } else {
+                            let (revision, digest) =
+                                parse_restart_revision(candidate).expect("already parsed");
+                            (
+                                revision,
+                                digest,
+                                crate::runtime_generation::ChangeKind::Restart,
+                            )
+                        };
+                    let verb = if kind == crate::runtime_generation::ChangeKind::Quota {
+                        "theia-quota-v1"
+                    } else {
+                        "theia-restart-v1"
+                    };
+                    // A timed-out worker may finish a bounded filesystem read
+                    // but can NEVER commit a cancelled management operation.
                     let preflight = Arc::clone(preflight);
                     let candidate = tokio::task::spawn_blocking(move || {
-                        preflight.load_restart_candidate_bound(sha256)
+                        if kind == crate::runtime_generation::ChangeKind::Quota {
+                            preflight.load_quota_candidate_bound(sha256)
+                        } else {
+                            preflight.load_restart_candidate_bound(sha256)
+                        }
                     })
                     .await;
                     match candidate {
                         Ok(Ok(candidate)) if runtime.still_current(previous, expected) => {
                             let (complete, result) = oneshot::channel();
                             let request = crate::runtime_generation::RestartRequest {
+                                kind,
                                 previous: Arc::clone(previous),
                                 expected_revision: expected,
                                 candidate,
                                 complete,
                             };
                             if restarts.try_send(request).is_err() {
-                                "theia-restart-v1 rejected\n".to_owned()
+                                format!("{verb} rejected\n")
                             } else {
                                 match result.await {
                                     Ok(Ok(revision)) => {
-                                        format!("theia-restart-v1 applied revision={revision}\n")
+                                        format!("{verb} applied revision={revision}\n")
                                     }
-                                    _ => "theia-restart-v1 rejected\n".to_owned(),
+                                    _ => format!("{verb} rejected\n"),
                                 }
                             }
                         }
-                        _ => "theia-restart-v1 rejected\n".to_owned(),
+                        _ => format!("{verb} rejected\n"),
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
+            }
+            b"check-quota" => {
+                if let Some(preflight) = preflight {
+                    match tokio::task::spawn_blocking(move || preflight.check_quota_file()).await {
+                        Ok(Ok(())) => "theia-quota-v1 ready\n".to_owned(),
+                        _ => "theia-quota-v1 rejected\n".to_owned(),
                     }
                 } else {
                     "ERR unsupported\n".to_owned()
@@ -542,6 +590,11 @@ fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_quota_revision(command: &[u8]) -> Option<(u64, [u8; 32])> {
+    parse_bound_command(command, b"quota-apply rev=")
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_bound_command(command: &[u8], prefix: &[u8]) -> Option<(u64, [u8; 32])> {
     let rest = std::str::from_utf8(command.strip_prefix(prefix)?).ok()?;
     let (revision, digest) = rest.split_once(" sha256=")?;
@@ -562,6 +615,20 @@ where
         StatusCommand::Reload => b"reload\n".to_vec(),
         StatusCommand::CheckReload => b"check-reload\n".to_vec(),
         StatusCommand::CheckRestart => b"check-restart\n".to_vec(),
+        StatusCommand::CheckQuota => b"check-quota\n".to_vec(),
+        StatusCommand::ApplyQuotaBound {
+            expected_revision,
+            candidate_sha256,
+        } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
+            let digest = candidate_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("quota-apply rev={expected_revision} sha256={digest}\n").into_bytes()
+        }
         StatusCommand::ApplyRestartBound {
             expected_revision,
             candidate_sha256,
@@ -613,6 +680,32 @@ where
     }
     if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
         return Ok(StatusReply::Unsupported);
+    }
+    if command == StatusCommand::CheckQuota {
+        return match reply.as_slice() {
+            b"theia-quota-v1 ready\n" => Ok(StatusReply::QuotaReady),
+            b"theia-quota-v1 rejected\n" => Err(ManagementError::CandidateRejected),
+            b"ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
+        };
+    }
+    if let StatusCommand::ApplyQuotaBound {
+        expected_revision, ..
+    } = command
+    {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        let applied = text
+            .strip_prefix("theia-quota-v1 applied revision=")
+            .and_then(|line| line.strip_suffix('\n'))
+            .and_then(positive_decimal);
+        return match applied {
+            Some(revision) if Some(revision) == expected_revision.checked_add(1) => {
+                Ok(StatusReply::QuotaApplied { revision })
+            }
+            _ if reply == b"theia-quota-v1 rejected\n" => Err(ManagementError::CandidateRejected),
+            _ if reply == b"ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
+        };
     }
     if let StatusCommand::ApplyRestartBound {
         expected_revision, ..

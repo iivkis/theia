@@ -51,6 +51,38 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
+        Ok(Command::ServerCheckQuota) => {
+            match management::query_environment(management::StatusCommand::CheckQuota).await {
+                Ok(management::StatusReply::QuotaReady) => Ok(
+                    "quota-only candidate ready: live session/connection limits may change under CAS; existing tunnels UNCHANGED; nothing applied".to_owned(),
+                ),
+                Ok(_) => Err(CliError::Management(
+                    management::ManagementError::InvalidReply,
+                )),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
+        Ok(Command::ServerApplyQuota {
+            expected_revision,
+            candidate_sha256,
+        }) => {
+            match management::query_environment(
+                management::StatusCommand::ApplyQuotaBound {
+                    expected_revision,
+                    candidate_sha256,
+                },
+            )
+            .await
+            {
+                Ok(management::StatusReply::QuotaApplied { revision }) => Ok(format!(
+                    "quota caps applied live; revision={revision}; old tunnels retained; cap contraction blocks new admission until occupancy drops"
+                )),
+                Ok(_) => Err(CliError::Management(
+                    management::ManagementError::InvalidReply,
+                )),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
         Ok(Command::ServerApplyRestart {
             expected_revision,
             candidate_sha256,

@@ -674,3 +674,281 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
     .await
     .expect("native H2+H3 same-port TLS identity rotation must complete");
 }
+
+fn quota_apply(env_key: &str, endpoint: &str, expected: u64, sha: &str, succeeds: bool) {
+    let output = cli(
+        env_key,
+        endpoint,
+        &[
+            "server",
+            "quota",
+            "--apply",
+            "--expected-revision",
+            &expected.to_string(),
+            "--sha256",
+            sha,
+            "--confirm",
+        ],
+    );
+    assert_eq!(
+        output.status.success(),
+        succeeds,
+        "quota CAS: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if succeeds {
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("quota caps applied live"),
+            "a successful quota update must acknowledge real occupancy resize"
+        );
+    }
+}
+
+/// M4.2j: The OS-level H2/TLS and H3/QUIC servers retain REAL authenticated
+/// streams, and shrinking BOTH caps below occupancy must NOT cut them off or
+/// allow new sessions. Growing beyond startup caps must actually admit more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
+    timeout(Duration::from_secs(65), async {
+        let base = std::env::temp_dir().join(format!(
+            "theia-quota-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir(&base).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _temp = Temp(base.clone());
+        let cert = base.join("cert.pem");
+        let key = base.join("key.pem");
+        let config = base.join("server.toml");
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        write_identity(&cert, &key, &identity);
+        let mut roots = RootCertStore::empty();
+        roots.add(identity.cert.der().clone()).unwrap();
+        let tcp_port = port(true);
+        let udp_port = port(false);
+        let mut document = ServerDocument {
+            schema_version: 1,
+            server: ServerSettings {
+                enabled: true,
+                inbounds: vec![Inbound {
+                    id: "edge".into(),
+                    allowed_user_ids: vec!["device-a".into()],
+                    h2_listen: format!("127.0.0.1:{tcp_port}"),
+                    quic_listen: format!("127.0.0.1:{udp_port}"),
+                    server_name: "localhost".into(),
+                    tls_cert: format!("file:{}", cert.display()),
+                    tls_key: format!("file:{}", key.display()),
+                }],
+                users: vec![User {
+                    id: "device-a".into(),
+                    token_sha256: digest(0x42),
+                    disabled: false,
+                }],
+                policy: ServerPolicy {
+                    allow_private_ips: true,
+                    max_connections_per_user: 2,
+                    max_connections_total: 2,
+                    connect_timeout_ms: 2000,
+                },
+            },
+            management: Management {
+                ipc: "auto".into(),
+                log_level: "info".into(),
+            },
+            ui: Ui {
+                language: "ru".into(),
+            },
+        };
+        save(&config, &document);
+        #[cfg(target_os = "linux")]
+        let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
+        #[cfg(target_os = "windows")]
+        let (env_key, endpoint) = (
+            "THEIA_CONTROL_PIPE",
+            format!("m42j{}{}", std::process::id(), tcp_port),
+        );
+        let mut server = Running(
+            Command::new(env!("CARGO_BIN_EXE_theia"))
+                .args(["server", "run", "--config"])
+                .arg(&config)
+                .env(env_key, &endpoint)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        timeout(Duration::from_secs(12), async {
+            loop {
+                if revision(env_key, &endpoint, 1) {
+                    break;
+                }
+                assert!(server.0.try_wait().unwrap().is_none(), "server exited");
+                sleep(Duration::from_millis(35)).await;
+            }
+        })
+        .await
+        .expect("compiled server must publish a native control endpoint");
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = echo.accept().await {
+                tokio::spawn(echo_one(socket));
+            }
+        });
+        let address = Address::V4([127, 0, 0, 1]);
+        let old_h2 = H2Client::new(
+            &format!("127.0.0.1:{tcp_port}"),
+            "localhost",
+            &credential(0x42),
+            roots.clone(),
+        )
+        .unwrap();
+        let old_h3 = H3Client::new(
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            "localhost",
+            &credential(0x42),
+            roots.clone(),
+        )
+        .unwrap();
+        let old_tunnel_h2 = old_h2.open(address.clone(), echo_port).await.unwrap();
+        let old_tunnel_h3 = old_h3.open(address.clone(), echo_port).await.unwrap();
+
+        // Wrong SHA, invalid limit, and non-quota changes fail without
+        // changing either bound listener, revision or held tunnel.
+        let mut shrink = document.clone();
+        shrink.server.policy.max_connections_total = 1;
+        shrink.server.policy.max_connections_per_user = 1;
+        let sha = save(&config, &shrink);
+        let advisory = cli(env_key, &endpoint, &["server", "quota", "--check"]);
+        assert!(
+            advisory.status.success()
+                && String::from_utf8_lossy(&advisory.stdout).contains("quota-only candidate ready"),
+            "quota check must be non-mutating: {}",
+            String::from_utf8_lossy(&advisory.stderr),
+        );
+        assert!(revision(env_key, &endpoint, 1));
+        quota_apply(env_key, &endpoint, 1, &"0".repeat(64), false);
+
+        let mut mixed = shrink.clone();
+        mixed.server.policy.allow_private_ips = false;
+        quota_apply(env_key, &endpoint, 1, &save(&config, &mixed), false);
+        // The typed serializer correctly refuses invalid caps; create an
+        // intentionally malformed-on-disk candidate to exercise the native
+        // manager's own structural validator, not the test helper.
+        let invalid_toml = Config::Server(shrink.clone()).to_toml().unwrap().replace(
+            "max_connections_per_user = 1",
+            "max_connections_per_user = 3",
+        );
+        assert!(invalid_toml.contains("max_connections_per_user = 3"));
+        fs::write(&config, &invalid_toml).unwrap();
+        let invalid_hash = format!("{:x}", Sha256::digest(invalid_toml.as_bytes()));
+        quota_apply(env_key, &endpoint, 1, &invalid_hash, false);
+        assert!(revision(env_key, &endpoint, 1));
+
+        let actual_sha = save(&config, &shrink);
+        assert_eq!(sha, actual_sha);
+        quota_apply(env_key, &endpoint, 1, &actual_sha, true);
+        assert!(revision(env_key, &endpoint, 2));
+        quota_apply(env_key, &endpoint, 1, &actual_sha, false);
+        assert!(revision(env_key, &endpoint, 2));
+
+        // Two existing transport connections and two fully authenticated
+        // streams are still held while the new configured cap is ONE.
+        let try_h2 = old_h2.open(address.clone(), echo_port);
+        assert!(
+            timeout(Duration::from_secs(3), try_h2)
+                .await
+                .map_or(true, |attempt| attempt.is_err()),
+            "H2 admission must fail while existing occupancy exceeds cap"
+        );
+        let try_h3 = old_h3.open(address.clone(), echo_port);
+        assert!(
+            timeout(Duration::from_secs(3), try_h3)
+                .await
+                .map_or(true, |attempt| attempt.is_err()),
+            "H3 admission must fail while existing occupancy exceeds cap"
+        );
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "quota shrink stopped server"
+        );
+        assert!(revision(env_key, &endpoint, 2));
+
+        // Growth beyond the ORIGINAL cap of 2 must use the same ledger,
+        // not an old fixed-size semaphore silently throttling new sessions.
+        let mut grown = shrink.clone();
+        grown.server.policy.max_connections_per_user = 4;
+        grown.server.policy.max_connections_total = 4;
+        let grown_sha = save(&config, &grown);
+        quota_apply(env_key, &endpoint, 2, &grown_sha, true);
+        assert!(revision(env_key, &endpoint, 3));
+        let more_h2 = old_h2.open(address.clone(), echo_port).await.unwrap();
+        let more_h3 = old_h3.open(address.clone(), echo_port).await.unwrap();
+
+        // Every pre-quota-change authenticated tunnel still relays bytes.
+        let (mut old_h2_app, old_h2_local) = tokio::io::duplex(256);
+        let h2_task = tokio::spawn(async move { old_tunnel_h2.relay(old_h2_local).await });
+        old_h2_app.write_all(b"still-live").await.unwrap();
+        let mut h2_echo = [0u8; 10];
+        old_h2_app.read_exact(&mut h2_echo).await.unwrap();
+        assert_eq!(&h2_echo, b"still-live");
+        old_h2_app.shutdown().await.unwrap();
+        h2_task.await.unwrap().unwrap();
+
+        let (mut old_h3_app, old_h3_local) = tokio::io::duplex(256);
+        let h3_task = tokio::spawn(async move { old_tunnel_h3.relay(old_h3_local).await });
+        old_h3_app.write_all(b"still-live").await.unwrap();
+        let mut h3_echo = [0u8; 10];
+        old_h3_app.read_exact(&mut h3_echo).await.unwrap();
+        assert_eq!(&h3_echo, b"still-live");
+        old_h3_app.shutdown().await.unwrap();
+        h3_task.await.unwrap().unwrap();
+        drop((more_h2, more_h3));
+
+        // The snapshot must have been rebased to the quota-adjusted policy,
+        // so ordinary auth-only CAS remains compatible.
+        document = grown;
+        document.server.users[0].token_sha256 = digest(0x43);
+        save(&config, &document);
+        let auth = cli(
+            env_key,
+            &endpoint,
+            &["server", "reload", "--expected-revision", "3"],
+        );
+        assert!(
+            auth.status.success(),
+            "auth-only CAS after quotas must succeed: {}",
+            String::from_utf8_lossy(&auth.stderr)
+        );
+        assert!(revision(env_key, &endpoint, 4));
+        let new_h2 = H2Client::new(
+            &format!("127.0.0.1:{tcp_port}"),
+            "localhost",
+            &credential(0x43),
+            roots.clone(),
+        )
+        .unwrap();
+        let new_h3 = H3Client::new(
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            "localhost",
+            &credential(0x43),
+            roots,
+        )
+        .unwrap();
+        assert!(new_h2.open(address.clone(), echo_port).await.is_ok());
+        assert!(new_h3.open(address, echo_port).await.is_ok());
+        echo_task.abort();
+    })
+    .await
+    .expect("live quota resize native E2E must finish without hanging");
+}

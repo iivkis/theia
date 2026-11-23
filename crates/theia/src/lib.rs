@@ -24,6 +24,7 @@ pub mod local_proxy;
 pub mod management;
 pub mod protocol;
 pub mod quic_transport;
+pub(crate) mod quota;
 pub mod reload_preflight;
 pub mod restart_guard;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -66,6 +67,11 @@ pub enum Command {
     ServerStatus,
     ServerCheckReload,
     ServerCheckRestart,
+    ServerCheckQuota,
+    ServerApplyQuota {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
+    },
     ServerApplyRestart {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
@@ -184,7 +190,8 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["server", "status"] => Ok(Command::ServerStatus),
         ["server", "reload", "--check"] => Ok(Command::ServerCheckReload),
         ["server", "restart", "--check"] => Ok(Command::ServerCheckRestart),
-        ["server", "restart", "--apply", "--expected-revision", revision, "--sha256", digest, "--confirm"] =>
+        ["server", "quota", "--check"] => Ok(Command::ServerCheckQuota),
+        ["server", verb @ ("restart" | "quota"), "--apply", "--expected-revision", revision, "--sha256", digest, "--confirm"] =>
         {
             let expected_revision = revision
                 .parse::<u64>()
@@ -195,10 +202,17 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 .ok_or(CliError::InvalidArguments)?;
             let candidate_sha256 =
                 parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?;
-            Ok(Command::ServerApplyRestart {
-                expected_revision,
-                candidate_sha256,
-            })
+            if verb == &"quota" {
+                Ok(Command::ServerApplyQuota {
+                    expected_revision,
+                    candidate_sha256,
+                })
+            } else {
+                Ok(Command::ServerApplyRestart {
+                    expected_revision,
+                    candidate_sha256,
+                })
+            }
         }
         ["server", "reload", "--expected-revision", raw] => {
             if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|b| b.is_ascii_digit()) {
@@ -229,6 +243,8 @@ Usage:\n\
   theia server reload --check        # read-only compatibility check\n\
   theia server restart --check       # read-only restart readiness; never commits\n\
   theia server restart --apply --expected-revision N --sha256 HEX --confirm\n\
+  theia server quota --check         # read-only occupancy-aware quota validation\n\
+  theia server quota --apply --expected-revision N --sha256 HEX --confirm\n\
   theia server reload --expected-revision N  # Linux CAS auth Apply\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
@@ -243,7 +259,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
-            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server restart --apply --expected-revision N --sha256 HEX --confirm | theia server reload --expected-revision N\nSupervised restart cutover supports only fresh, nonoverlapping listeners with unchanged quota and user IDs; old connections drain 20s. SHA256 must match exact saved TOML bytes; changes to overlapping ports and quotas require separate maintenance. Existing sessions are not migrated. A lost ACK is indeterminate, query status. CAS auth Apply requires private Linux THEIA_CONTROL_DIR or Windows THEIA_CONTROL_PIPE, plus expected running revision.")
+            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server restart --apply --expected-revision N --sha256 HEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --expected-revision N\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses its separate command.")
         }
         Command::Help(Some("client")) => {
             Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")
@@ -258,6 +274,8 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
         Command::ServerStatus
         | Command::ServerCheckReload
         | Command::ServerCheckRestart
+        | Command::ServerCheckQuota
+        | Command::ServerApplyQuota { .. }
         | Command::ServerApplyRestart { .. }
         | Command::ServerApplyReload { .. } => {
             Err(CliError::NotImplemented("async management IPC"))
@@ -292,6 +310,71 @@ mod tests {
         assert!(execute(Command::Help(None))
             .unwrap()
             .contains("H2 server inbound"));
+    }
+
+    #[test]
+    fn quota_apply_requires_canonical_digest_and_explicit_confirmation() {
+        let digest = "ab".repeat(32);
+        assert_eq!(
+            command(&["server", "quota", "--check"]),
+            Ok(Command::ServerCheckQuota)
+        );
+        assert_eq!(
+            command(&[
+                "server",
+                "quota",
+                "--apply",
+                "--expected-revision",
+                "3",
+                "--sha256",
+                &digest,
+                "--confirm"
+            ]),
+            Ok(Command::ServerApplyQuota {
+                expected_revision: 3,
+                candidate_sha256: [0xabu8; 32],
+            })
+        );
+        for bad in ["0", "03", "+3", "-3", "3x"] {
+            assert_eq!(
+                command(&[
+                    "server",
+                    "quota",
+                    "--apply",
+                    "--expected-revision",
+                    bad,
+                    "--sha256",
+                    &digest,
+                    "--confirm"
+                ]),
+                Err(CliError::InvalidArguments)
+            );
+        }
+        assert_eq!(
+            command(&[
+                "server",
+                "quota",
+                "--apply",
+                "--expected-revision",
+                "3",
+                "--sha256",
+                &digest
+            ]),
+            Err(CliError::InvalidArguments)
+        );
+        assert_eq!(
+            command(&[
+                "server",
+                "quota",
+                "--apply",
+                "--expected-revision",
+                "3",
+                "--sha256",
+                &"AB".repeat(32),
+                "--confirm"
+            ]),
+            Err(CliError::InvalidArguments)
+        );
     }
 
     #[test]
