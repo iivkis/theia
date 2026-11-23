@@ -23,6 +23,7 @@ pub mod local_proxy;
 pub mod management;
 pub mod protocol;
 pub mod quic_transport;
+pub mod reload_preflight;
 pub mod server;
 pub mod tui;
 pub(crate) mod tui_candidate_batch;
@@ -49,6 +50,7 @@ pub enum Command {
     TuiEdit { role: Role, config: String },
     ServerRun { config: String },
     ServerStatus,
+    ServerCheckReload,
     ClientRun { config: String },
     ConfigValidate { config: String },
 }
@@ -138,6 +140,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             config: config_path(path)?,
         }),
         ["server", "status"] => Ok(Command::ServerStatus),
+        ["server", "reload", "--check"] => Ok(Command::ServerCheckReload),
         ["server", "run", "--config", path] => Ok(Command::ServerRun {
             config: config_path(path)?,
         }),
@@ -157,6 +160,7 @@ Usage:\n\
   theia tui [--role server|client] [--config <path>]\n\
   theia server run --config <path>\n\
   theia server status                # read-only Linux opt-in IPC\n\
+  theia server reload --check        # check only, no Apply/reload\n\
   theia client run --config <path>\n\
   theia config validate --config <path>\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
@@ -170,7 +174,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Command::Help(Some("server")) => {
-            Ok("Usage: theia server run --config <path> | theia server status\nTLS 1.3/H2 and QUIC/H3 server inbounds; Linux read-only status requires a private THEIA_CONTROL_DIR.")
+            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check\nTLS 1.3/H2 and QUIC/H3 server inbounds; Linux read-only status requires a private THEIA_CONTROL_DIR.")
         }
         Command::Help(Some("client")) => {
             Ok("Usage: theia client run --config <path>\nHTTP CONNECT/SOCKS5 via H2, H3 or QUIC-first auto; requires tls_ca PEM bundle.")
@@ -182,7 +186,7 @@ pub fn execute(command: Command) -> Result<&'static str, CliError> {
         Command::Version => Ok(concat!("theia ", env!("CARGO_PKG_VERSION"))),
         Command::Tui { .. } | Command::TuiEdit { .. } => Err(CliError::NotImplemented("TUI")),
         Command::ServerRun { .. } => Err(CliError::NotImplemented("server runtime")),
-        Command::ServerStatus => Err(CliError::NotImplemented("async management status")),
+        Command::ServerStatus | Command::ServerCheckReload => Err(CliError::NotImplemented("async management preflight")),
         Command::ClientRun { .. } => Err(CliError::NotImplemented("client runtime")),
         Command::ConfigValidate { config } => {
             config::read_file(Path::new(&config)).map_err(CliError::Config)?;
