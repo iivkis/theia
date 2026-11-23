@@ -1,6 +1,6 @@
 # Theia connection invitations: portable v1 (F-14, P0)
 
-**Нормативный контракт F-14; актуальный статус на 2026-11-24 см. [STATUS.md](STATUS.md).** M4.4a delivers the codec; M4.4b1 adds server TUI new-user issuance and one-time confidential link display after durable TOML save. M4.4b2a adds explicit existing-user disable with confirmation and safe TOML save; token rotation, secure export files/clipboard and client import remain missing. Do not call F-14 P0 complete until M4.4b2/M4.4c/d pass Linux/Windows CI.
+**Нормативный контракт F-14; актуальный статус на 2026-11-24 см. [STATUS.md](STATUS.md).** M4.4a delivers the codec; M4.4b1 adds server TUI new-user issuance and one-time confidential link display after durable TOML save. M4.4b2a adds explicit existing-user disable with confirmation and safe TOML save; token rotation and secure export files/clipboard remain separately under review; client import is now proposed in ADR-0055 with CI pending. Do not call F-14 P0 complete until M4.4b2/M4.4c/d pass Linux/Windows CI.
 
 ## User model
 
@@ -54,6 +54,16 @@ The new `theia://v1` link is offered only **after** strict document validation a
 - TLS trust is **not shipped or replaced by the share URI**. The client must obtain/verify its trusted certificate authority separately and verify the TLS SNI/chain exactly as for a manually configured client. If explicit `tls_ca` is needed for runtime, import without a trusted CA may save a non-connected draft but cannot claim ready to connect. No insecure verifier, silent downgrade, trust-on-first-use or arbitrary file import.
 - Durable profile and credential-file writes need a tested transaction/rollback strategy; Windows ACL checks, crash and collision tests must pass before declaring P0. Safe preview must work with token masked.
 - Client file import and TUI profile creation are **M4.4c**; real server-issue → file/link → Windows-client import → validated H3/H2 OPEN_OK E2E (and negative cases) is **M4.4d**.
+
+## M4.4c client-side local import (implementation under native CI)
+
+With explicit \`theia tui --role client --config FILE\`, \`i\` accepts a pasted \`theia://v1\` URI or absolute local text-file path. Input is **never echoed**, including in error paths; preview shows only ID, endpoint, TLS SNI, transport and whether a token is included. Bracketed paste is enabled in the terminal. No remote URL, file from invitation, or automatic connect/system proxy.
+
+An optional separate \`c\` step selects a **pre-trusted** \`file:/absolute/ca.pem\` validated as an actual PEM containing CA anchors. The import cannot silently weaken CA trust: without CA the new profile is saved but **not connectable** by the runtime. For a public secretless URI, a separate \`e\` step requires explicit \`env:NAME\` credential reference. For a confidential URI a fresh random private subdirectory under the trusted existing TOML parent stores canonical 43-byte token with Unix \`0700/0600\` and explicit protected Windows user SID + LocalSystem DACL on both directory and file. Only a \`file:\` reference enters TOML, never raw bearer. The existing profile list grows only with a **unique ID**, while \`active_profile\`, proxy settings and existing credential references remain unchanged.
+
+After final \`y\` the importer reuses guarded typed TOML validation/atomic save in a background worker. External edits/failed saves roll back the new private token when safe. A post-rename fsync ambiguity preserves the file referenced by the observed committed TOML rather than deleting it and silently breaking configuration. Link input is dropped/zeroized best-effort; caller retains responsibility for source file, terminal/SSH scrollback and private folder. Import success is **not** a claim of TLS connection or token acceptance until a separately selected profile reaches real \`OPEN_OK\`.
+
+Native Linux/Windows integration verifies the actual \`theia client run\` binary with imported private bearer, separately trusted CA, SOCKS5 and HTTP CONNECT over real authenticated H2 (including distinct user action to change active profile). This PR **does not** complete F-14: cross-host Linux→Windows/H3, full ACL/adversarial and crash/recovery matrix, more protected export options and M4.3 Windows proxy remain release blockers. [ADR-0055](adr/0055-f14-secure-client-import.md).
 
 ## Security tests and limitations of M4.4a
 

@@ -189,6 +189,12 @@ M4.4a реализует **только доменный codec**, не UI/CLI в
 Важно: добавление записи в server.toml **не обновляет работающий процесс**. Секрет нельзя восстановить из digest; при его потере для работы понадобится будущая ротация. В M4.4b2a отдельно добавлено подтверждённое отключение существующего пользователя, но ротация токена, защищённый файл экспорта, управление users как список, импорт ссылки в клиентскую конфигурацию и системный прокси ещё не реализованы.
 
 
+## 12. M4.4c — client-only import: masked source, trust and safe save
+
+The local client TUI with explicit \`--role client --config FILE\` offers \`i\` to import a pasted \`theia://v1\` URI or **absolute local file**. Bracketed-paste text stays in a zeroizing input state and is never rendered, even as a field being edited. Enter previews only **profile ID / endpoint / SNI / transport / bearer present?**; the token itself and source URI never appear in TUI diagnostics. A separate optional \`c\` step accepts a pre-trusted absolute CA PEM \`file:\` reference. Without CA the resulting profile is not connectable. A secretless public URI requires separate \`e\` + \`env:NAME\` rather than fabricated default credentials.
+
+Confirming \`y\` triggers worker-based protected bearer creation and guarded atomic TOML append; no profile ID overwrite, activation, reload or Windows OS proxy. A conflict/failed save preserves the existing profile, rolls back the new secret when safe and exposes no credential. The new profile is never active automatically. This is the F-14 M4.4c implementation under CI review (ADR-0055), not the cross-host M4.4d acceptance.
+
 ## 10. M4.4b2a — явное отключение существующего пользователя
 
 В серверном `theia tui --role server --config FILE` на **сохранённом** чистом TOML выбирается inbound; `x` открывает ввод ID уже существующего активного пользователя с grant на этот inbound. Enter показывает отдельное подтверждение `y` / `n` / Esc и предупреждение: `users[].disabled` **глобален для всех inbound**. `y` ставит только `disabled=true`, проверяет весь документ и использует фоновой атомарный Ctrl+S worker с обнаружением внешнего конфликта. В случае ошибки `r` повторяет запись, `d` уничтожает черновик. В client role, с несохранённым или редактируемым черновиком, для неизвестного/неразрешённого/уже отключённого ID действие блокируется.

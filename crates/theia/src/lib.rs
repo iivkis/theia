@@ -13,6 +13,7 @@ pub mod camouflage_interfaces;
 pub mod camouflage_probe;
 pub mod camouflage_workflow;
 pub mod client;
+pub mod client_import;
 pub mod config;
 #[cfg(feature = "experimental-btls-h2")]
 mod h2_btls;
