@@ -81,6 +81,9 @@ http_listen = "127.0.0.1:7890"
 socks5_listen = "127.0.0.1:7891"
 system_proxy = "off"
 
+**Windows F-07 / M4.3 (ADR-0056, proposed pending CI):** setting `system_proxy = "manual"` in TOML **does not** enable anything. Only the separately confirmed Windows command `theia client run --config FILE --system-proxy --confirm` modifies the *current user's* default-LAN WinINet HTTP(S) proxy, after successful local HTTP CONNECT/SOCKS5 binds and strict TLS credential validation. The process holds a per-SID ownership mutex and conditionally restores the exact previous flags, server, bypass and PAC URL on normal Ctrl+C. After a hard crash, `theia client proxy --status` is read-only; `theia client proxy --recover --confirm` CAS-restores only if Windows settings still equal Theia's recorded applied state. Any foreign edit refuses recovery, no `--force`. Plain `client run`, server mode, import and TUI do not change WinINet. This is not WinHTTP/TUN or all-app routing; policy/VPN and hard-kill E2E remain release blockers.
+
+
 [management]
 ipc = "auto"
 log_level = "info"
