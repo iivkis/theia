@@ -110,7 +110,7 @@ async fn main() {
             .await
             {
                 Ok(management::StatusReply::RestartApplied { revision }) => Ok(format!(
-                    "supervised fresh-port restart applied; revision={revision}; old connections draining (max 20s); no same-port rollback guarantee"
+                    "supervised H2/H3 restart applied; revision={revision}; same-port TLS keeps old tunnels, fresh-port cutover drains old up to 20s; no automatic rollback"
                 )),
                 Ok(_) => Err(CliError::Management(
                     management::ManagementError::InvalidReply,
