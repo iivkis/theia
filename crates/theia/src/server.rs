@@ -1211,7 +1211,7 @@ mod hardening_tests {
             Err(LiveAuthError::StaleRevision)
         ));
         assert_eq!(control.revision(), Ok(2));
-        assert_eq!(a.authorize(Some(&live_bearer(7))).is_ok(), true);
+        assert!(a.authorize(Some(&live_bearer(7))).is_ok());
         assert_eq!(b.authorize(Some(&live_bearer(9))).err(), Some(AuthFailure::Forbidden));
     }
 
