@@ -88,7 +88,9 @@ pub enum StatusCommand {
     /// Advisory last-same-port-identity recovery readiness (no PEM values).
     CheckTlsRollback,
     /// Explicit one-shot CAS on the protected native management endpoint.
-    ApplyTlsRollback { expected_revision: u64 },
+    ApplyTlsRollback {
+        expected_revision: u64,
+    },
     /// Read-only validation of a quota-only saved candidate.
     CheckQuota,
     /// Native occupancy-aware quota resize, mandatory revision/SHA CAS.
@@ -144,8 +146,13 @@ pub enum StatusReply {
     RestartApplied {
         revision: u64,
     },
-    TlsRollbackReady { revision: u64, remaining_seconds: u64 },
-    TlsRollbackApplied { revision: u64 },
+    TlsRollbackReady {
+        revision: u64,
+        remaining_seconds: u64,
+    },
+    TlsRollbackApplied {
+        revision: u64,
+    },
     Applied {
         revision: u64,
     },
@@ -484,8 +491,9 @@ where
                             "theia-tls-rollback-v1 rejected\n".to_owned()
                         } else {
                             match response.await {
-                                Ok(Ok(revision)) =>
-                                    format!("theia-tls-rollback-v1 applied revision={revision}\n"),
+                                Ok(Ok(revision)) => {
+                                    format!("theia-tls-rollback-v1 applied revision={revision}\n")
+                                }
                                 _ => "theia-tls-rollback-v1 rejected\n".to_owned(),
                             }
                         }
@@ -668,9 +676,7 @@ fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_tls_rollback_revision(command: &[u8]) -> Option<u64> {
-    let raw = std::str::from_utf8(
-        command.strip_prefix(b"tls-rollback-apply rev=")?
-    ).ok()?;
+    let raw = std::str::from_utf8(command.strip_prefix(b"tls-rollback-apply rev=")?).ok()?;
     positive_decimal(raw)
 }
 
@@ -790,7 +796,10 @@ where
             let remaining_seconds = positive_decimal(seconds);
             if let (Some(revision), Some(remaining_seconds)) = (revision, remaining_seconds) {
                 if remaining_seconds <= 300 {
-                    return Ok(StatusReply::TlsRollbackReady { revision, remaining_seconds });
+                    return Ok(StatusReply::TlsRollbackReady {
+                        revision,
+                        remaining_seconds,
+                    });
                 }
             }
         }
@@ -810,8 +819,9 @@ where
             Some(revision) if Some(revision) == expected_revision.checked_add(1) => {
                 Ok(StatusReply::TlsRollbackApplied { revision })
             }
-            _ if reply == b"theia-tls-rollback-v1 rejected\n" =>
-                Err(ManagementError::CandidateRejected),
+            _ if reply == b"theia-tls-rollback-v1 rejected\n" => {
+                Err(ManagementError::CandidateRejected)
+            }
             _ if reply == b"ERR unsupported\n" => Err(ManagementError::Unsupported),
             _ => Err(ManagementError::InvalidReply),
         };
@@ -973,7 +983,10 @@ mod tls_rollback_protocol_tests {
 
     #[test]
     fn rollback_wire_requires_exact_positive_revision() {
-        assert_eq!(parse_tls_rollback_revision(b"tls-rollback-apply rev=7"), Some(7));
+        assert_eq!(
+            parse_tls_rollback_revision(b"tls-rollback-apply rev=7"),
+            Some(7)
+        );
         for invalid in [
             "tls-rollback-apply rev=0",
             "tls-rollback-apply rev=07",
@@ -992,11 +1005,16 @@ mod tls_rollback_protocol_tests {
     async fn standalone_native_ipc_never_exposes_rollback_or_acknowledges_apply() {
         for command in [
             StatusCommand::CheckTlsRollback,
-            StatusCommand::ApplyTlsRollback { expected_revision: 1 },
+            StatusCommand::ApplyTlsRollback {
+                expected_revision: 1,
+            },
         ] {
             let (client, server) = tokio::io::duplex(512);
             let handler = tokio::spawn(handle_internal(server, 1, None, None, None, None));
-            assert_eq!(exchange(client, command).await, Err(ManagementError::Unsupported));
+            assert_eq!(
+                exchange(client, command).await,
+                Err(ManagementError::Unsupported)
+            );
             handler.await.unwrap().unwrap();
         }
     }
