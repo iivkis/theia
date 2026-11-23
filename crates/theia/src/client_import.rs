@@ -1,14 +1,16 @@
 //! F-14 client import: local-only invitation input and a private, create-new
 //! bearer file. No network, account activation or Windows proxy operations.
 //! A caller must perform strict typed TOML validation and guarded commit.
-use crate::invite::{Invitation, InviteError};
+use crate::invite::Invitation;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 
 const MAX_URI: u64 = 4096;
 const RANDOM_BYTES: usize = 16;
@@ -17,7 +19,6 @@ const RANDOM_BYTES: usize = 16;
 pub enum ImportError {
     InvalidSource,
     UnsafeStorage,
-    InvalidCredential,
 }
 
 impl std::fmt::Display for ImportError {
@@ -145,7 +146,7 @@ impl PrivateBearer {
         let directory = parent.join(format!(".theia-bearer-{suffix}"));
         new_private_directory(&directory).map_err(|_| ImportError::UnsafeStorage)?;
         let file = directory.join("token");
-        let mut guard = Self {
+        let guard = Self {
             directory,
             file,
             committed: false,
@@ -275,14 +276,3 @@ fn new_private_directory(_: &Path) -> io::Result<()> { Err(io::Error::other("uns
 #[cfg(not(any(unix, windows)))]
 fn new_private_file(_: &Path) -> io::Result<File> { Err(io::Error::other("unsupported platform")) }
 
-pub fn read_token_ref(reference: &str) -> Result<Zeroizing<String>, ImportError> {
-    let path = reference.strip_prefix("file:").ok_or(ImportError::InvalidCredential)?;
-    let bytes = fs::read(path).map_err(|_| ImportError::InvalidCredential)?;
-    if bytes.len() != 43 {
-        return Err(ImportError::InvalidCredential);
-    }
-    let value = String::from_utf8(bytes).map_err(|_| ImportError::InvalidCredential)?;
-    Ok(Zeroizing::new(value))
-}
-
-pub fn _type_contract(_: Result<Invitation, InviteError>) {}
