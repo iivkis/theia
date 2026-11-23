@@ -790,6 +790,34 @@ mod tests {
     }
 
     #[test]
+    fn user_disable_requires_exact_existing_inbound_grant_not_just_global_user() {
+        let Config::Server(mut doc) = config::parse(&two_inbounds()).unwrap() else {
+            panic!("server");
+        };
+        doc.server.users.push(User {
+            id: "device-b".into(),
+            token_sha256: format!("{:x}", Sha256::digest([0x43; 32])),
+            disabled: false,
+        });
+        doc.server.inbounds[1].allowed_user_ids = vec!["device-b".into()];
+        let temp = Temp::write(&Config::Server(doc).to_toml().unwrap());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.disable_user("device-b").is_err());
+        assert!(!editor.dirty());
+        editor.select_record(true);
+        assert_eq!(editor.selected_record_id(), "backup");
+        assert!(editor.disable_user("device-b").is_ok());
+        assert!(editor.save());
+        let Config::Server(after) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert!(!after.server.users[0].disabled);
+        assert!(after.server.users[1].disabled);
+        assert_eq!(after.server.inbounds[0].allowed_user_ids, ["device-a"]);
+        assert_eq!(after.server.inbounds[1].allowed_user_ids, ["device-b"]);
+    }
+
+    #[test]
     fn user_disable_refuses_external_file_conflict_and_client_role() {
         let temp = Temp::write(&server_source());
         let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
