@@ -20,8 +20,8 @@ use theia::{
     config::{Config, Inbound, Management, ServerDocument, ServerPolicy, ServerSettings, Ui, User},
     h3_client::H3Client,
     management::{ManagementError, StatusCommand, StatusReply},
-    windows_control::query_pipe,
     protocol::Address,
+    windows_control::query_pipe,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -91,7 +91,11 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&dir).unwrap();
-        let pipe_id = format!("m42d{}{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+        let pipe_id = format!(
+            "m42d{}{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
         let toml = dir.join("server.toml");

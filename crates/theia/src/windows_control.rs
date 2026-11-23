@@ -7,13 +7,7 @@ use crate::{
     management::{self, ManagementError, StatusCommand, StatusReply},
     reload_preflight::ReloadPreflight,
 };
-use std::{
-    ffi::c_void,
-    mem::size_of,
-    ptr::null_mut,
-    sync::Arc,
-    time::Duration,
-};
+use std::{ffi::c_void, mem::size_of, ptr::null_mut, sync::Arc, time::Duration};
 use tokio::{
     net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions},
     sync::Semaphore,
@@ -23,7 +17,9 @@ use tokio::{
 use windows_sys::Win32::{
     Foundation::{CloseHandle, LocalFree, ERROR_PIPE_BUSY, HANDLE},
     Security::{
-        Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW},
+        Authorization::{
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        },
         GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     },
     System::Threading::{GetCurrentProcess, OpenProcessToken},
@@ -32,7 +28,9 @@ use windows_sys::Win32::{
 fn valid_identifier(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 48
-        && id.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-')
+        && id
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-')
 }
 
 struct Token(HANDLE);
@@ -71,7 +69,16 @@ pub fn current_user_sid() -> Result<String, ManagementError> {
     // Aligned buffer: TOKEN_USER contains a SID pointer.
     let mut buffer = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
     // SAFETY: aligned buffer with at least the reported byte capacity.
-    if unsafe { GetTokenInformation(token.0, TokenUser, buffer.as_mut_ptr().cast(), size, &mut size) } == 0 {
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            size,
+            &mut size,
+        )
+    } == 0
+    {
         return Err(ManagementError::UnsafeEndpoint);
     }
     // SAFETY: successful TokenUser call populated the aligned TOKEN_USER.
@@ -98,7 +105,9 @@ pub fn current_user_sid() -> Result<String, ManagementError> {
         let value = String::from_utf16(unsafe { std::slice::from_raw_parts(text, count) })
             .map_err(|_| ManagementError::UnsafeEndpoint)?;
         if !value.starts_with("S-1-")
-            || !value.bytes().all(|b| b.is_ascii_digit() || b == b'-' || b == b'S')
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b'-' || b == b'S')
         {
             return Err(ManagementError::UnsafeEndpoint);
         }
@@ -113,17 +122,30 @@ pub fn pipe_name(id: &str) -> Result<String, ManagementError> {
     if !valid_identifier(id) {
         return Err(ManagementError::UnsafeEndpoint);
     }
-    Ok(format!(r"\\.\pipe\theia-control-{}-{id}", current_user_sid()?))
+    Ok(format!(
+        r"\\.\pipe\theia-control-{}-{id}",
+        current_user_sid()?
+    ))
 }
 
 fn descriptor() -> Result<Descriptor, ManagementError> {
     let sddl = format!("D:P(A;;GA;;;{})(A;;GA;;;SY)", current_user_sid()?);
-    let wide = sddl.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let wide = sddl
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
     let mut security: *mut c_void = null_mut();
     // SAFETY: NUL-terminated SDDL and writable output descriptor pointer.
     if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(wide.as_ptr(), 1, &mut security, null_mut())
-    } == 0 || security.is_null() {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            1,
+            &mut security,
+            null_mut(),
+        )
+    } == 0
+        || security.is_null()
+    {
         return Err(ManagementError::UnsafeEndpoint);
     }
     Ok(Descriptor(security))
@@ -169,14 +191,22 @@ impl WindowsServer {
         }
         let name = pipe_name(id)?;
         let current = create_instance(&name, true)?;
-        Ok(Self { name, current, inbounds, preflight: None, live: None })
+        Ok(Self {
+            name,
+            current,
+            inbounds,
+            preflight: None,
+            live: None,
+        })
     }
 
     pub fn from_environment(inbounds: usize) -> Result<Option<Self>, ManagementError> {
         let Some(raw) = std::env::var_os("THEIA_CONTROL_PIPE") else {
             return Ok(None);
         };
-        let id = raw.into_string().map_err(|_| ManagementError::UnsafeEndpoint)?;
+        let id = raw
+            .into_string()
+            .map_err(|_| ManagementError::UnsafeEndpoint)?;
         Self::bind(&id, inbounds).map(Some)
     }
 
@@ -194,9 +224,16 @@ impl WindowsServer {
         let permits = Arc::new(Semaphore::new(management::MAX_CLIENTS));
         let mut tasks = JoinSet::new();
         loop {
-            self.current.connect().await.map_err(|_| ManagementError::Io)?;
+            self.current
+                .connect()
+                .await
+                .map_err(|_| ManagementError::Io)?;
             // Eight active handlers plus one pending socket maximum.
-            let permit = permits.clone().acquire_owned().await.map_err(|_| ManagementError::Io)?;
+            let permit = permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| ManagementError::Io)?;
             let fresh = create_instance(&self.name, false)?;
             let stream = std::mem::replace(&mut self.current, fresh);
             let inbounds = self.inbounds;
@@ -207,7 +244,8 @@ impl WindowsServer {
                 let _ = timeout(
                     management::IO_TIMEOUT,
                     management::handle(stream, inbounds, preflight, live),
-                ).await;
+                )
+                .await;
             });
             while tasks.try_join_next().is_some() {}
         }
@@ -226,7 +264,9 @@ pub async fn query_pipe(id: &str, command: StatusCommand) -> Result<StatusReply,
                 Err(_) => return Err(ManagementError::SocketUnavailable),
             }
         }
-    }).await.map_err(|_| ManagementError::TimedOut)?
+    })
+    .await
+    .map_err(|_| ManagementError::TimedOut)?
 }
 
 pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, ManagementError> {
@@ -243,7 +283,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     fn id() -> String {
-        format!("p{}x{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "p{}x{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
     }
     #[test]
     fn id_is_canonical_and_derived_from_process_sid() {
@@ -262,15 +306,36 @@ mod tests {
     async fn private_named_pipe_is_first_instance_and_standalone_has_no_apply() {
         let id = id();
         let server = WindowsServer::bind(&id, 2).unwrap();
-        assert!(WindowsServer::bind(&id, 2).is_err(), "must reject competing first instance");
+        assert!(
+            WindowsServer::bind(&id, 2).is_err(),
+            "must reject competing first instance"
+        );
         let task = tokio::spawn(server.serve());
-        assert_eq!(query_pipe(&id, StatusCommand::Status).await,
-            Ok(StatusReply::Running { inbounds: 2 }));
-        assert_eq!(query_pipe(&id, StatusCommand::ApplyReload { expected_revision: 1 }).await,
-            Err(ManagementError::Unsupported));
-        assert_eq!(query_pipe(&id, StatusCommand::ApplyReloadBound {
-            expected_revision: 1, candidate_sha256: [1u8; 32],
-        }).await, Err(ManagementError::Unsupported));
+        assert_eq!(
+            query_pipe(&id, StatusCommand::Status).await,
+            Ok(StatusReply::Running { inbounds: 2 })
+        );
+        assert_eq!(
+            query_pipe(
+                &id,
+                StatusCommand::ApplyReload {
+                    expected_revision: 1
+                }
+            )
+            .await,
+            Err(ManagementError::Unsupported)
+        );
+        assert_eq!(
+            query_pipe(
+                &id,
+                StatusCommand::ApplyReloadBound {
+                    expected_revision: 1,
+                    candidate_sha256: [1u8; 32],
+                }
+            )
+            .await,
+            Err(ManagementError::Unsupported)
+        );
         task.abort();
     }
 }

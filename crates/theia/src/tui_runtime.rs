@@ -96,7 +96,9 @@ impl RuntimePanel {
                         .enable_all()
                         .build()
                         .map_err(|_| ManagementError::Io)
-                        .and_then(|runtime| runtime.block_on(crate::management::query_environment(command)))
+                        .and_then(|runtime| {
+                            runtime.block_on(crate::management::query_environment(command))
+                        })
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
