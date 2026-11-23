@@ -80,15 +80,23 @@ def copy_into_guest(source: Path, destination: str) -> None:
     data = source.read_bytes()
     if not 0 < len(data) <= MAX_TRANSFER_BYTES:
         raise RuntimeError("Linux input artifact is empty or oversized")
+    # Run dd directly: WSL command-line translation on Windows does not
+    # preserve nested sh -c quotes reliably (exit 2 on native runners).
+    # Linux coreutils dd is a binary-safe, bounded stdin consumer.
     result = subprocess.run(
-        wsl_command("sh", "-c", 'cat > "$1" && chmod 700 "$1"', "f14-copy", destination),
+        wsl_command("dd", f"of={destination}", "bs=1M", "status=none"),
         input=data,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=65,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"WSL stdin artifact streaming failed (status {result.returncode})")
+        # Paths are random fixture names and no credentials were sent in stdin.
+        diagnostics = result.stderr.decode("utf-8", "replace")[-800:].strip()
+        raise RuntimeError(
+            f"WSL dd transfer failed (status {result.returncode}): {diagnostics}"
+        )
+    linux("chmod", "700", destination)
     expected = hashlib.sha256(data).hexdigest()
     actual = linux("sha256sum", destination).split()[0]
     if expected != actual:
