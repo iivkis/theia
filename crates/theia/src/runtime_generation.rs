@@ -107,6 +107,40 @@ impl State {
         Ok(actual)
     }
 
+    /// M4.2j: one guarded quota limit/revision publication. The shared
+    /// ledger counts ALL held H2+H3 permits, including those created before
+    /// cutover. A cap smaller than occupancy creates admission debt; no
+    /// currently authenticated stream or transport is forcibly revoked.
+    pub(crate) fn commit_quota(
+        &self,
+        previous: &Arc<View>,
+        expected: u64,
+        next: View,
+        authorization: StagedAuthorization,
+        ledger: &crate::quota::Ledger,
+    ) -> Result<u64, LiveAuthError> {
+        let mut guard = self
+            .current
+            .write()
+            .map_err(|_| LiveAuthError::Unavailable)?;
+        if !Arc::ptr_eq(&guard, previous) || previous.live.revision()? != expected {
+            return Err(LiveAuthError::StaleRevision);
+        }
+        let expected_next = expected
+            .checked_add(1)
+            .ok_or(LiveAuthError::RevisionExhausted)?;
+        let held = ledger
+            .prepare_resize(&next.document.server.policy)
+            .map_err(|_| LiveAuthError::Unavailable)?;
+        // No fallible quota action after revision publication: held.commit
+        // sets two small integers under the already acquired ledger lock.
+        let revision = previous.live.publish(authorization)?;
+        debug_assert_eq!(revision, expected_next);
+        held.commit();
+        *guard = Arc::new(next);
+        Ok(revision)
+    }
+
     /// Linearization point for a prepared fresh-port listener generation.
     /// In-flight and future requests on the former generation are denied
     /// NEW admission before the protected IPC view points to the successor.
@@ -138,7 +172,14 @@ impl State {
 
 /// The request contains an owned, validated, content-bound document. No
 /// restart work runs on a blocking IPC thread after that handler is cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangeKind {
+    Restart,
+    Quota,
+}
+
 pub(crate) struct RestartRequest {
+    pub(crate) kind: ChangeKind,
     pub(crate) previous: Arc<View>,
     pub(crate) expected_revision: u64,
     pub(crate) candidate: ServerDocument,
