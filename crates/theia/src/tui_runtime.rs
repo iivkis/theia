@@ -168,7 +168,9 @@ impl RuntimePanel {
             Phase::RestartChecking => {
                 self.phase = match result {
                     Ok(StatusReply::RestartAuthorizationOnly) => Phase::RestartAuthorizationOnly,
-                    Ok(StatusReply::RestartRequiresMaintenance) => Phase::RestartRequiresMaintenance,
+                    Ok(StatusReply::RestartRequiresMaintenance) => {
+                        Phase::RestartRequiresMaintenance
+                    }
                     Ok(StatusReply::RestartFreshPortsBindable) => Phase::RestartFreshPortsBindable,
                     Err(ManagementError::CandidateRejected) => Phase::RestartRejected,
                     _ => Phase::RestartUnavailable,
@@ -331,10 +333,22 @@ mod tests {
     #[test]
     fn restart_preview_never_exposes_a_confirmable_apply_even_after_success() {
         for (reply, expected_phase) in [
-            (Ok(StatusReply::RestartAuthorizationOnly), Phase::RestartAuthorizationOnly),
-            (Ok(StatusReply::RestartRequiresMaintenance), Phase::RestartRequiresMaintenance),
-            (Ok(StatusReply::RestartFreshPortsBindable), Phase::RestartFreshPortsBindable),
-            (Err(ManagementError::CandidateRejected), Phase::RestartRejected),
+            (
+                Ok(StatusReply::RestartAuthorizationOnly),
+                Phase::RestartAuthorizationOnly,
+            ),
+            (
+                Ok(StatusReply::RestartRequiresMaintenance),
+                Phase::RestartRequiresMaintenance,
+            ),
+            (
+                Ok(StatusReply::RestartFreshPortsBindable),
+                Phase::RestartFreshPortsBindable,
+            ),
+            (
+                Err(ManagementError::CandidateRejected),
+                Phase::RestartRejected,
+            ),
             (Err(ManagementError::TimedOut), Phase::RestartUnavailable),
         ] {
             let mut panel = fake(None, false);
