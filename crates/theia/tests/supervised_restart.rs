@@ -646,8 +646,7 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
         // documents that would falsely classify valid PEM-only candidates as
         // an unauthorized user mutation.
         let mut rotate_again = document.clone();
-        rotate_again.server.inbounds[0].tls_cert =
-            format!("file:{}", old_cert.display());
+        rotate_again.server.inbounds[0].tls_cert = format!("file:{}", old_cert.display());
         rotate_again.server.inbounds[0].tls_key = format!("file:{}", old_key.display());
         let again_hash = save(&config_path, &rotate_again);
         apply(env_key, &endpoint, 3, &again_hash, true);
