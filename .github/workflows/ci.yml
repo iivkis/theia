@@ -220,15 +220,30 @@ jobs:
       - name: Cross-logon Windows pipe kernel-denial E2E (mandatory)
         shell: pwsh
         run: ./scripts/windows-cross-sid-ci.ps1
-      - name: Stage Windows E2E binaries already compiled by all-targets
+      - name: Stage Windows E2E binaries from Cargo JSON artifact paths
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $harnesses = @(Get-ChildItem 'target/debug/deps' -Filter 'f14_cross_host-*.exe' -File)
-          if ($harnesses.Count -ne 1) { throw 'Expected exactly one native F-14 test executable' }
-          if (!(Test-Path 'target/debug/theia.exe' -PathType Leaf)) { throw 'Missing compiled native Windows client' }
-          Copy-Item $harnesses[0].FullName (Join-Path $env:RUNNER_TEMP 'f14_cross_host.exe')
-          Copy-Item 'target/debug/theia.exe' (Join-Path $env:RUNNER_TEMP 'theia.exe')
+          # Cargo may use target/debug/build/<crate>/<hash>/out instead of
+          # target/debug/deps. Compiler-artifact JSON is the authoritative path.
+          $testEvents = @(cargo test --workspace --locked --test f14_cross_host --no-run --message-format=json |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native F-14 harness' }
+          $tests = @($testEvents | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'f14_cross_host' -and $_.executable
+          })
+          if ($tests.Count -ne 1) { throw 'Expected exactly one compiled native F-14 test harness' }
+          $binEvents = @(cargo build --workspace --locked --bin theia --message-format=json |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native Windows client' }
+          $bins = @($binEvents | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and $_.executable
+          })
+          if ($bins.Count -ne 1) { throw 'Expected exactly one compiled Windows client executable' }
+          if (!(Test-Path $tests[0].executable -PathType Leaf)) { throw 'Missing compiled F-14 test harness' }
+          if (!(Test-Path $bins[0].executable -PathType Leaf)) { throw 'Missing compiled Windows client' }
+          Copy-Item $tests[0].executable (Join-Path $env:RUNNER_TEMP 'f14_cross_host.exe')
+          Copy-Item $bins[0].executable (Join-Path $env:RUNNER_TEMP 'theia.exe')
       - uses: actions/upload-artifact@v4
         with:
           name: f14-windows-compiled
