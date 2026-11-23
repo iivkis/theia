@@ -1572,6 +1572,7 @@ async fn run_supervised_file(
     let mut running = RunningGeneration::launch(initial.listeners, GenerationPhase::Active);
     let mut identities = current_identities;
     let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
+    let mut rollback: Option<RollbackSlot> = None;
     loop {
         tokio::select! {
             request = queue.recv() => {
@@ -1597,6 +1598,31 @@ async fn run_supervised_file(
                 if request.complete.is_closed() {
                     continue;
                 }
+                if request.kind == crate::runtime_generation::ChangeKind::Rollback {
+                    let applied = rollback.as_ref().ok_or(()).and_then(|slot| {
+                        commit_tls_rollback(
+                            &runtime,
+                            &mut running,
+                            slot,
+                            request.expected_revision,
+                            config_path,
+                        )
+                    });
+                    match applied {
+                        Ok((old_identities, revision)) => {
+                            identities = old_identities;
+                            // A rollback is one-shot, never a toggle or an
+                            // unbounded cache of previous private identities.
+                            rollback = None;
+                            runtime.set_rollback_until(None);
+                            let _ = request.complete.send(Ok(revision));
+                        }
+                        Err(()) => {
+                            let _ = request.complete.send(Err(()));
+                        }
+                    }
+                    continue;
+                }
                 if request.kind == crate::runtime_generation::ChangeKind::Quota {
                     let result = commit_live_quota(&runtime, &request, &limits.ledger);
                     let _ = request.complete.send(result);
@@ -1608,14 +1634,16 @@ async fn run_supervised_file(
                 ) {
                     let applied = commit_same_port_tls(
                         &runtime,
-                        &running,
+                        &mut running,
                         &request,
                         &identities,
                         config_path,
                     );
                     match applied {
-                        Ok((new_identities, revision)) => {
+                        Ok((new_identities, revision, previous_tls)) => {
                             identities = new_identities;
+                            runtime.set_rollback_until(Some(previous_tls.expires));
+                            rollback = Some(previous_tls);
                             let _ = request.complete.send(Ok(revision));
                         }
                         Err(()) => {
@@ -1651,10 +1679,22 @@ async fn run_supervised_file(
                 next_running.start();
                 let previous = std::mem::replace(&mut running, next_running);
                 identities = next_identities;
+                rollback = None;
+                runtime.set_rollback_until(None);
                 retiring = Some(tokio::spawn(reap_previous(previous)));
                 // This ACK is AFTER commit. Lost ACK is indeterminate:
                 // operator must query status; never retry blindly.
                 let _ = request.complete.send(Ok(revision));
+            }
+            _ = async {
+                if let Some(slot) = &rollback {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(slot.expires)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                rollback = None;
+                runtime.set_rollback_until(None);
             }
             result = running.tasks.join_next() => {
                 // An unexpected H2/H3 accept-loop exit is fatal, not a
