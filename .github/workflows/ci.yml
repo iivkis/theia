@@ -160,6 +160,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install pinned CI-only VT screen driver for real Linux PTY
+        run: python3 -m pip install --user pyte==0.8.2
       - name: Tests first
         run: cargo test --workspace --all-targets --locked
       - name: Formatting
