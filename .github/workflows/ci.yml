@@ -10,7 +10,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A new CI DAG epoch isolates this job topology from an unresponsive
+  # cancelled v1 Windows runner. PR head supersession still cancels within v2.
+  group: ci-native-v2-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
