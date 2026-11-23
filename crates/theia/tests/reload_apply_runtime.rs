@@ -1,7 +1,10 @@
 //! M4.2b1b: compiled Linux server, real H2 + H3 and private IPC Apply.
 //! No public network, TUI Apply or system proxy modifications.
 #![cfg(target_os = "linux")]
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use rustls::RootCertStore;
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,16 +38,28 @@ impl Drop for Running {
 }
 fn port(tcp: bool) -> u16 {
     if tcp {
-        StdTcp::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        StdTcp::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     } else {
-        UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 }
 fn save(path: &Path, doc: &ServerDocument) {
     fs::write(path, Config::Server(doc.clone()).to_toml().unwrap()).unwrap();
 }
-fn token(byte: u8) -> String { URL_SAFE_NO_PAD.encode([byte; 32]) }
-fn hash(byte: u8) -> String { format!("{:x}", Sha256::digest([byte; 32])) }
+fn token(byte: u8) -> String {
+    URL_SAFE_NO_PAD.encode([byte; 32])
+}
+fn hash(byte: u8) -> String {
+    format!("{:x}", Sha256::digest([byte; 32]))
+}
 async fn echo_one(tcp: tokio::net::TcpStream) {
     let (mut input, mut output) = tcp.into_split();
     let _ = tokio::io::copy(&mut input, &mut output).await;
@@ -60,25 +75,35 @@ fn cli(dir: &Path, args: &[&str]) -> std::process::Output {
 async fn has_revision(dir: &Path, revision: u64) {
     assert_eq!(
         query_in(dir, StatusCommand::Status).await,
-        Ok(StatusReply::RunningRevision { inbounds: 1, revision })
+        Ok(StatusReply::RunningRevision {
+            inbounds: 1,
+            revision
+        })
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas() {
     timeout(Duration::from_secs(35), async {
-        let dir = std::env::temp_dir().join(format!("theia-apply-{}-{}",
-            std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "theia-apply-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
         let toml = dir.join("server.toml");
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert = format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-            STANDARD.encode(generated.cert.der()));
-        let key = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-            STANDARD.encode(generated.key_pair.serialize_der()));
+        let cert = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            STANDARD.encode(generated.cert.der())
+        );
+        let key = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            STANDARD.encode(generated.key_pair.serialize_der())
+        );
         fs::write(&cert_path, &cert).unwrap();
         fs::write(&key_path, &key).unwrap();
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -112,59 +137,120 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
                 },
             },
             management: Management {
-                ipc: "auto".into(), log_level: "info".into(),
+                ipc: "auto".into(),
+                log_level: "info".into(),
             },
-            ui: Ui { language: "ru".into() },
+            ui: Ui {
+                language: "ru".into(),
+            },
         };
         save(&toml, &doc);
-        let mut server = Running(Command::new(env!("CARGO_BIN_EXE_theia"))
-            .args(["server", "run", "--config"]).arg(&toml)
-            .env("THEIA_CONTROL_DIR", &dir)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().unwrap());
+        let mut server = Running(
+            Command::new(env!("CARGO_BIN_EXE_theia"))
+                .args(["server", "run", "--config"])
+                .arg(&toml)
+                .env("THEIA_CONTROL_DIR", &dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
         timeout(Duration::from_secs(8), async {
             loop {
-                if query_in(&dir, StatusCommand::Status).await ==
-                    Ok(StatusReply::RunningRevision { inbounds: 1, revision: 1 }) { break; }
+                if query_in(&dir, StatusCommand::Status).await
+                    == Ok(StatusReply::RunningRevision {
+                        inbounds: 1,
+                        revision: 1,
+                    })
+                {
+                    break;
+                }
                 assert!(server.0.try_wait().unwrap().is_none(), "server exited");
                 sleep(Duration::from_millis(25)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         has_revision(&dir, 1).await;
 
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = target.local_addr().unwrap().port();
         let echo_task = tokio::spawn(async move {
             loop {
-                let Ok((tcp, _)) = target.accept().await else { break; };
+                let Ok((tcp, _)) = target.accept().await else {
+                    break;
+                };
                 tokio::spawn(echo_one(tcp));
             }
         });
         let addr = Address::V4([127, 0, 0, 1]);
-        let h2old = H2Client::new(&format!("127.0.0.1:{tcp}"), "localhost", &token(0x42), roots.clone()).unwrap();
-        let h3old = H3Client::new(format!("127.0.0.1:{udp}").parse().unwrap(), "localhost", &token(0x42), roots.clone()).unwrap();
+        let h2old = H2Client::new(
+            &format!("127.0.0.1:{tcp}"),
+            "localhost",
+            &token(0x42),
+            roots.clone(),
+        )
+        .unwrap();
+        let h3old = H3Client::new(
+            format!("127.0.0.1:{udp}").parse().unwrap(),
+            "localhost",
+            &token(0x42),
+            roots.clone(),
+        )
+        .unwrap();
         let mut h2_open = Some(h2old.open(addr.clone(), target_port).await.unwrap());
         let mut h3_open = Some(h3old.open(addr.clone(), target_port).await.unwrap());
 
         // Stage is a safe read-only preview, not an implicit commit.
         doc.server.users[0].token_sha256 = hash(0x43);
         save(&toml, &doc);
-        assert_eq!(query_in(&dir, StatusCommand::CheckReload).await, Ok(StatusReply::Compatible));
+        assert_eq!(
+            query_in(&dir, StatusCommand::CheckReload).await,
+            Ok(StatusReply::Compatible)
+        );
         has_revision(&dir, 1).await;
 
         assert_eq!(
-            query_in(&dir, StatusCommand::ApplyReload { expected_revision: 1 }).await,
+            query_in(
+                &dir,
+                StatusCommand::ApplyReload {
+                    expected_revision: 1
+                }
+            )
+            .await,
             Ok(StatusReply::Applied { revision: 2 })
         );
         has_revision(&dir, 2).await;
-        assert_eq!(query_in(&dir, StatusCommand::ApplyReload { expected_revision: 1 }).await,
-            Err(ManagementError::CandidateRejected), "stale CAS must not apply twice");
+        assert_eq!(
+            query_in(
+                &dir,
+                StatusCommand::ApplyReload {
+                    expected_revision: 1
+                }
+            )
+            .await,
+            Err(ManagementError::CandidateRejected),
+            "stale CAS must not apply twice"
+        );
         let old_h2 = h2old.open(addr.clone(), target_port).await.err();
         let old_h3 = h3old.open(addr.clone(), target_port).await.err();
         assert_eq!(old_h2, Some(ClientError::Unauthorized));
         assert_eq!(old_h3, Some(ClientError::Unauthorized));
-        let h2new = H2Client::new(&format!("127.0.0.1:{tcp}"), "localhost", &token(0x43), roots.clone()).unwrap();
-        let h3new = H3Client::new(format!("127.0.0.1:{udp}").parse().unwrap(), "localhost", &token(0x43), roots.clone()).unwrap();
+        let h2new = H2Client::new(
+            &format!("127.0.0.1:{tcp}"),
+            "localhost",
+            &token(0x43),
+            roots.clone(),
+        )
+        .unwrap();
+        let h3new = H3Client::new(
+            format!("127.0.0.1:{udp}").parse().unwrap(),
+            "localhost",
+            &token(0x43),
+            roots.clone(),
+        )
+        .unwrap();
         assert!(h2new.open(addr.clone(), target_port).await.is_ok());
         assert!(h3new.open(addr.clone(), target_port).await.is_ok());
 
@@ -191,7 +277,13 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         doc.server.policy.max_connections_total += 1;
         save(&toml, &doc);
         assert_eq!(
-            query_in(&dir, StatusCommand::ApplyReload { expected_revision: 2 }).await,
+            query_in(
+                &dir,
+                StatusCommand::ApplyReload {
+                    expected_revision: 2
+                }
+            )
+            .await,
             Err(ManagementError::CandidateRejected)
         );
         has_revision(&dir, 2).await;
@@ -199,7 +291,13 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         save(&toml, &doc);
         fs::write(&cert_path, b"swapped PEM").unwrap();
         assert_eq!(
-            query_in(&dir, StatusCommand::ApplyReload { expected_revision: 2 }).await,
+            query_in(
+                &dir,
+                StatusCommand::ApplyReload {
+                    expected_revision: 2
+                }
+            )
+            .await,
             Err(ManagementError::CandidateRejected)
         );
         has_revision(&dir, 2).await;
@@ -212,31 +310,45 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         let accepted = tokio::task::spawn_blocking({
             let dir = dir.clone();
             move || cli(&dir, &["server", "reload", "--expected-revision", "2"])
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(accepted.status.success(), "{:?}", accepted.stderr);
         assert_eq!(
             accepted.stdout,
             b"authorization applied; revision=3; existing tunnels retained\n"
         );
         has_revision(&dir, 3).await;
-        assert_eq!(h2new.open(addr.clone(), target_port).await.err(), Some(ClientError::Unauthorized));
-        assert_eq!(h3new.open(addr, target_port).await.err(), Some(ClientError::Unauthorized));
+        assert_eq!(
+            h2new.open(addr.clone(), target_port).await.err(),
+            Some(ClientError::Unauthorized)
+        );
+        assert_eq!(
+            h3new.open(addr, target_port).await.err(),
+            Some(ClientError::Unauthorized)
+        );
 
         let rejected = tokio::task::spawn_blocking({
             let dir = dir.clone();
             move || cli(&dir, &["server", "reload", "--expected-revision", "2"])
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(!rejected.status.success());
         assert!(!String::from_utf8_lossy(&rejected.stderr).contains(&token(0x43)));
         let status = tokio::task::spawn_blocking({
             let dir = dir.clone();
             move || cli(&dir, &["server", "status"])
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(status.status.success());
         assert!(String::from_utf8_lossy(&status.stdout).contains("revision=3"));
 
         echo_task.abort();
         drop(server);
         fs::remove_dir_all(dir).unwrap();
-    }).await.expect("H2/H3 apply E2E must stay bounded");
+    })
+    .await
+    .expect("H2/H3 apply E2E must stay bounded");
 }
