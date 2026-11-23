@@ -2030,7 +2030,7 @@ mod hardening_tests {
         let prepared = prepare_same_port_tls(&doc, &captured).unwrap();
         assert_eq!(prepared.h2.len(), doc.server.inbounds.len());
         assert_eq!(prepared.h3.len(), doc.server.inbounds.len());
-        assert_eq!(prepared.identities, captured.identities());
+        assert!(prepared.identities == captured.identities());
         // Order of inbound identities is part of the cryptographic pin.
         std::fs::write(&cert_path, &cert_pem).unwrap();
         std::fs::write(&key_path, &key_pem).unwrap();
