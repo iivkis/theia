@@ -309,7 +309,8 @@ where
                     // binds are read-only with respect to the running server.
                     // A worker completing AFTER IPC timeout still cannot
                     // swap the runtime, publish authorization or terminate it.
-                    match tokio::task::spawn_blocking(move || preflight.check_restart_file()).await {
+                    match tokio::task::spawn_blocking(move || preflight.check_restart_file()).await
+                    {
                         Ok(Ok(crate::restart_guard::RestartVerdict::AuthorizationOnly)) => {
                             "theia-restart-v1 auth-only\n".to_owned()
                         }
