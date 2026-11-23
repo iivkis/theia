@@ -263,7 +263,7 @@ fn query_with_flags(flag_id: u32) -> Result<Snapshot, ProxyError> {
         let ptr = unsafe { field.value.text };
         if !ptr.is_null() {
             unsafe {
-                windows_sys::Win32::System::Memory::GlobalFree(ptr.cast());
+                windows_sys::Win32::Foundation::GlobalFree(ptr.cast());
             }
         }
     }
