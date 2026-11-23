@@ -185,8 +185,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install pinned CI-only Windows ConPTY driver
-        run: python -m pip install pywinpty==3.0.5
+      - name: Install pinned CI-only Windows ConPTY and VT screen drivers
+        run: python -m pip install pywinpty==3.0.5 pyte==0.8.2
       - name: Native Windows tests
         run: cargo test --workspace --all-targets --locked
       - name: Native Windows release compilation only after main merge
