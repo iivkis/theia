@@ -693,6 +693,56 @@ mod tests {
     }
 
     #[test]
+    fn user_disable_requires_clean_server_editor_and_explicit_selected_grant() {
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+
+        for user_id in ["", "missing", "bad id"] {
+            assert!(editor.disable_user(user_id).is_err());
+            assert!(!editor.dirty());
+        }
+        editor.begin();
+        assert!(editor.disable_user("device-a").is_err());
+        editor.cancel();
+        editor.begin();
+        editor.input = "other.example.org".into();
+        assert!(editor.accept());
+        assert!(editor.disable_user("device-a").is_err());
+        editor.discard();
+
+        assert!(editor.disable_user("device-a").is_ok());
+        assert!(editor.dirty());
+        assert!(editor.take_issued().is_none());
+        assert!(!config::read_file(&temp.0).unwrap().to_toml().unwrap().contains("disabled = true"));
+        assert!(editor.save());
+        let Config::Server(doc) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert!(doc.server.users[0].disabled);
+        assert_eq!(doc.server.inbounds[0].allowed_user_ids, ["device-a"]);
+        assert_eq!(doc.server.inbounds[1].allowed_user_ids, ["device-a"]);
+        assert!(editor.disable_user("device-a").is_err(), "repeat disable must fail");
+    }
+
+    #[test]
+    fn user_disable_refuses_external_file_conflict_and_client_role() {
+        let temp = Temp::write(&server_source());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.disable_user("device-a").is_ok());
+        let changed = format!("# external edit\\n{}", server_source());
+        fs::write(&temp.0, &changed).unwrap();
+        assert!(!editor.save());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), changed);
+        editor.discard();
+        assert!(!editor.dirty());
+
+        let client = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut client_editor = Editor::load(Role::Client, &client.0).unwrap();
+        assert!(client_editor.disable_user("device-a").is_err());
+        assert!(!client_editor.dirty());
+    }
+
+    #[test]
     fn selects_second_inbound_and_edits_three_fields_without_changing_first() {
         let temp = Temp::write(&two_inbounds());
         let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
