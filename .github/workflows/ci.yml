@@ -510,7 +510,6 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
-      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -524,12 +523,15 @@ jobs:
           go-version: '1.24.x'
           cache: true
           cache-dependency-path: spikes/m0_1/utls_reference/go.sum
-      - name: Save formatting to the unchanged same-repository PR head
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-formatted-source
+          path: ${{ runner.temp }}/ci-formatted-source
+      - name: Persist only source bytes proven by the green CI jobs
         shell: bash
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
@@ -538,14 +540,12 @@ jobs:
           cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all
           mapfile -d '' -t go_files < <(git ls-files -z -- '*.go')
           if (( ${#go_files[@]} )); then gofmt -w "${go_files[@]}"; fi
-          python3 - <<'PY'
-          import subprocess
-          names = subprocess.check_output(["git", "diff", "--name-only", "-z"])
-          changed = [name.decode() for name in names.split(b"\0") if name]
-          if any(not name.endswith((".rs", ".go")) for name in changed):
-              raise SystemExit("Formatter unexpectedly changed non-source files")
-          print("Formatted source files:", len(changed))
-          PY
+          python3 scripts/ci-format.py "$RUNNER_TEMP/rebuilt-formatted-source.tar"
+          # Byte-for-byte identity: persist exactly the source files already
+          # overlaid and tested by every mandatory job, never fresh edits.
+          cmp "$RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar" \
+              "$RUNNER_TEMP/rebuilt-formatted-source.tar"
+          git diff --exit-code -- . ':!*.rs' ':!*.go'
           if git diff --quiet; then
             echo "Formatter made no changes: tested PR head is already canonical."
             exit 0
@@ -557,7 +557,7 @@ jobs:
           git commit -m "style(ci): persist rustfmt and gofmt after passing tests"
           # A fast-forward push rejects PR branches changed since tests began.
           git push origin "HEAD:refs/heads/$HEAD_REF"
-          # GITHUB_TOKEN pushes do not retrigger pull_request CI.
-          # Explicit workflow_dispatch MUST verify the newly written commit.
-          gh workflow run ci.yml --ref "$HEAD_REF"
-          echo "Autoformatted commit pushed; requested exact-new-head CI."
+          # GITHUB_TOKEN pushes do not retrigger PR/push workflows.
+          # No second full test run: git tree differs only by formatting
+          # bytes that were already tested by the green ci-gate.
+          echo "Saved exactly the CI-tested formatted files; no redundant rerun."
