@@ -3,8 +3,7 @@
 #![cfg(target_os = "windows")]
 
 use std::{
-    env, ffi::c_void, mem::size_of, path::PathBuf, process::Command, ptr::null_mut,
-    time::Duration,
+    env, ffi::c_void, mem::size_of, path::PathBuf, process::Command, ptr::null_mut, time::Duration,
 };
 use theia::{
     management::{StatusCommand, StatusReply},
@@ -87,15 +86,18 @@ async fn different_windows_sid_is_denied_by_kernel_dacl() {
             {
                 break;
             }
-            assert!(!task.is_finished(), "the actual pipe server must remain alive");
+            assert!(
+                !task.is_finished(),
+                "the actual pipe server must remain alive"
+            );
             sleep(Duration::from_millis(25)).await;
         }
     })
     .await
     .expect("same-SID status must succeed before cross-logon negative test");
 
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../scripts/windows-cross-sid-probe.ps1");
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/windows-cross-sid-probe.ps1");
     let run = tokio::task::spawn_blocking(move || {
         Command::new("pwsh")
             .args(["-NoProfile", "-NonInteractive", "-File"])
