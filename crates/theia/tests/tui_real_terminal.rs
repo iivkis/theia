@@ -80,6 +80,7 @@ async fn drive_terminal(
     let endpoint = endpoint.to_owned();
     let config = config.to_path_buf();
     let scenario = scenario.to_owned();
+    let scenario_for_child = scenario.clone();
     let output = timeout(
         Duration::from_secs(78),
         tokio::task::spawn_blocking(move || {
@@ -90,7 +91,7 @@ async fn drive_terminal(
                 .arg("--config")
                 .arg(config)
                 .arg("--scenario")
-                .arg(&scenario)
+                .arg(&scenario_for_child)
                 .arg("--revision")
                 .arg(revision.to_string())
                 .env(&env_key, endpoint)
