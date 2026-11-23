@@ -946,7 +946,7 @@ struct GenerationLimits {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl GenerationLimits {
     fn new(document: &ServerDocument) -> Self {
-        let policy = document.server.policy;
+        let policy = &document.server.policy;
         let per_user = document
             .server
             .users
