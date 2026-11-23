@@ -961,7 +961,24 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
 }
 
 async fn auto_connect(proxy: std::net::SocketAddr, port: u16) -> String {
-    let mut socket = TcpStream::connect(proxy).await.unwrap();
+    // Binding both listeners does not imply Windows/Linux has already
+    // published the HTTP accept loop. A transient local ConnectionRefused
+    // during fixture startup must not fail this *transport policy* test.
+    // Keep the retry strictly on the local TCP handshake; never retry an
+    // H3 TLS, bearer or OPEN denial through H2.
+    let mut socket = timeout(Duration::from_secs(3), async {
+        loop {
+            match TcpStream::connect(proxy).await {
+                Ok(stream) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("local HTTP proxy connection failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("local HTTP listener must become reachable within 3 seconds");
     socket
         .write_all(
             format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
@@ -1086,9 +1103,22 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
         .with_single_cert(vec![der.clone()], key.clone_key().into())
         .unwrap();
         tls.alpn_protocols = vec![b"h2".to_vec()];
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let remote = listener.local_addr().unwrap();
-        let udp = theia::quic_transport::server_endpoint(remote, vec![der], key.into()).unwrap();
+        // Random Windows TCP ephemeral ports are not necessarily available
+        // for UDP/QUIC (WSAEACCES/10013). Keep both real sockets reserved
+        // before starting either transport, retrying only local port choice.
+        let mut pair = None;
+        for _ in 0..64 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let remote = listener.local_addr().unwrap();
+            if let Ok(udp) =
+                theia::quic_transport::server_endpoint(remote, vec![der.clone()], key.clone_key().into())
+            {
+                pair = Some((listener, remote, udp));
+                break;
+            }
+        }
+        let (listener, remote, udp) =
+            pair.expect("CI must provide a TCP/QUIC port available on native OS");
         let mut inbound = Inbound {
             id: "h2-test".into(),
             allowed_user_ids: vec!["client".into()],
