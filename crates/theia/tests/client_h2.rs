@@ -465,9 +465,12 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         source.server.inbounds[0].quic_listen = format!("127.0.0.1:{endpoint_port}");
         source.server.inbounds[0].allowed_user_ids = vec!["client".into()];
         source.server.users[0].id = "client".into();
-        let invitation =
+        let mut invitation =
             Invitation::issued_from_server(&Config::Server(source), "public", "client", &TOKEN)
                 .unwrap();
+        // Native loopback fixture is bound on IPv4; keep independent SNI=localhost.
+        // A real deployment must advertise an operator-controlled endpoint.
+        invitation.endpoint = endpoint.clone();
         let confidential = invitation.encode().unwrap();
         let decoded = theia::client_import::read_source(&confidential).unwrap();
         let mut editor = Editor::load(Role::Client, &config_path).unwrap();
