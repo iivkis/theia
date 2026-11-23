@@ -22,6 +22,12 @@ enum Phase {
     Rejected,
     Indeterminate,
     Unavailable,
+    RestartChecking,
+    RestartAuthorizationOnly,
+    RestartRequiresMaintenance,
+    RestartFreshPortsBindable,
+    RestartRejected,
+    RestartUnavailable,
 }
 
 /// A modal: status is always fetched first. An Apply only happens following
@@ -47,6 +53,35 @@ impl RuntimePanel {
         Self::open_at(endpoint, saved_sha256, start_with_review)
     }
 
+    /// Explicit read-only restart readiness review. This modal never sends
+    /// Apply or attempts a runtime swap, even if the operator presses y.
+    pub(crate) fn open_restart() -> Self {
+        #[cfg(target_os = "linux")]
+        let endpoint = std::env::var_os("THEIA_CONTROL_DIR").map(PathBuf::from);
+        #[cfg(target_os = "windows")]
+        let endpoint = std::env::var_os("THEIA_CONTROL_PIPE").map(PathBuf::from);
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let endpoint: Option<PathBuf> = None;
+        Self::open_restart_at(endpoint)
+    }
+
+    fn open_restart_at(directory: Option<PathBuf>) -> Self {
+        let mut panel = Self {
+            phase: Phase::RestartChecking,
+            directory,
+            saved_sha256: None,
+            start_with_review: false,
+            receiver: None,
+        };
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        panel.start(StatusCommand::CheckRestart);
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            panel.phase = Phase::RestartUnavailable;
+        }
+        panel
+    }
+
     fn open_at(
         directory: Option<PathBuf>,
         saved_sha256: Option<[u8; 32]>,
@@ -70,7 +105,11 @@ impl RuntimePanel {
 
     fn start(&mut self, command: StatusCommand) {
         let Some(directory) = self.directory.clone() else {
-            self.phase = Phase::Unavailable;
+            self.phase = if command == StatusCommand::CheckRestart {
+                Phase::RestartUnavailable
+            } else {
+                Phase::Unavailable
+            };
             return;
         };
         let (sender, receiver) = mpsc::channel();
@@ -126,6 +165,15 @@ impl RuntimePanel {
                 };
                 self.start_with_review = false;
             }
+            Phase::RestartChecking => {
+                self.phase = match result {
+                    Ok(StatusReply::RestartAuthorizationOnly) => Phase::RestartAuthorizationOnly,
+                    Ok(StatusReply::RestartRequiresMaintenance) => Phase::RestartRequiresMaintenance,
+                    Ok(StatusReply::RestartFreshPortsBindable) => Phase::RestartFreshPortsBindable,
+                    Err(ManagementError::CandidateRejected) => Phase::RestartRejected,
+                    _ => Phase::RestartUnavailable,
+                };
+            }
             Phase::Applying => {
                 self.phase = match result {
                     Ok(StatusReply::Applied { revision }) => Phase::Applied { revision },
@@ -163,6 +211,20 @@ impl RuntimePanel {
             return false;
         }
         match (self.phase, key.code) {
+            (Phase::RestartChecking, KeyCode::Esc) => true,
+            (Phase::RestartChecking, _) => false,
+            (
+                Phase::RestartAuthorizationOnly
+                | Phase::RestartRequiresMaintenance
+                | Phase::RestartFreshPortsBindable
+                | Phase::RestartRejected
+                | Phase::RestartUnavailable,
+                KeyCode::Char('r'),
+            ) => {
+                self.phase = Phase::RestartChecking;
+                self.start(StatusCommand::CheckRestart);
+                false
+            }
             (Phase::Checking, KeyCode::Esc) => true,
             (Phase::Checking | Phase::Applying, _) => false,
             (Phase::Viewing { inbounds, revision }, KeyCode::Char('a'))
@@ -201,6 +263,12 @@ impl RuntimePanel {
 
     pub(crate) fn title(&self) -> &'static str {
         match self.phase {
+            Phase::RestartChecking
+            | Phase::RestartAuthorizationOnly
+            | Phase::RestartRequiresMaintenance
+            | Phase::RestartFreshPortsBindable
+            | Phase::RestartRejected
+            | Phase::RestartUnavailable => "Проверка готовности к перезапуску",
             Phase::Confirming { .. } => "Подтвердить применение авторизации",
             Phase::Applying => "Применение авторизации H2/H3",
             Phase::Applied { .. } => "Применено: подтверждено сервером",
@@ -212,6 +280,12 @@ impl RuntimePanel {
 
     pub(crate) fn body(&self) -> String {
         match self.phase {
+            Phase::RestartChecking => "Проверка сохранённого TOML, TLS identity и TCP/UDP в защищённом IPC...\nЭто ТОЛЬКО проверка. Никаких изменений runtime.\nEsc: закрыть".into(),
+            Phase::RestartAuthorizationOnly => "Достаточно существующего auth-only CAS Apply; restart не требуется.\nЭтот экран ничего не применяет.\nr: перепроверить | Esc: закрыть".into(),
+            Phase::RestartRequiresMaintenance => "Для смены listener/TLS/квот нужен контролируемый перерыв: текущий порт не может быть независимо подготовлен.\nСервер работает БЕЗ ИЗМЕНЕНИЙ. НЕ останавливать его на основании этой проверки.\nr: перепроверить | Esc: закрыть".into(),
+            Phase::RestartFreshPortsBindable => "Все НОВЫЕ TCP и UDP порты удалось одновременно пробно открыть.\nОни уже освобождены: НЕТ гарантии будущего bind, НЕТ restart, НЕТ rollback.\nСервер работает БЕЗ ИЗМЕНЕНИЙ.\nr: перепроверить | Esc: закрыть".into(),
+            Phase::RestartRejected => "Отказ: кандидат TOML, TLS identity или TCP/UDP bind не прошёл проверку.\nСтарые listeners, авторизация и туннели не изменены этой операцией.\nr: перепроверить | Esc: закрыть".into(),
+            Phase::RestartUnavailable => "Нет доступного защищённого IPC/снимка конфигурации для проверки restart.\nНичего не изменено.\nr: повторить | Esc: закрыть".into(),
             Phase::Checking => "Запрос IPC status...\nТолько чтение; ничего не применяется.\nEsc: закрыть".into(),
             Phase::Viewing { inbounds, revision } => format!(
                 "Сервер работает. Inbounds: {inbounds}. Авторизация: revision={revision}.\n\n{}\nr: обновить статус | Esc: закрыть",
