@@ -18,6 +18,10 @@ server_name, bind addresses и набор inbound остаются restart-only.
   защищённым Unix IPC (Linux, mode 0700/0600) либо SID+SYSTEM
   Named Pipe (Windows) доступен операторский CLI
   theia server restart --check.
+- Отдельная серверная TUI клавиша R (Shift+R) открывает только
+  модальную read-only проверку и умеет показать результат или отказ;
+  клавиши y/a в этой модалке НИКОГДА не выполняют Apply.
+  Несохранённый TUI draft требует Ctrl+S или discard до проверки.
 - Запрос check-restart ограничен существующими 128/128-байтными
   IPC лимитами, 8 активными клиентами и 2-секундным deadline.
   Без конфигурационного file snapshot или защищённого IPC
@@ -78,7 +82,9 @@ Native Linux и Windows автоматический integration test запус
 TCP/UDP, отказ на уже занятом TCP и UDP, MAINTENANCE при
 same-port изменении квот, отказ на неверном TLS name/PEM,
 сохранение status revision=1 после каждого случая, затем
-существующий настоящий TUI CAS Apply 1→2. Pure unit-test
+настоящая серверная TUI по R показывает отдельный read-only результат
+(и не реагирует на y как Apply), после чего существующий TUI CAS
+Apply 1→2 остаётся неизменным. Pure unit-test
 проверяет wildcard / dual-stack alias classification.
 Без IPC явная CLI команда отказывает. Все обязательные
 14 GitHub Actions jobs, Linux fmt/Clippy, native Windows,
