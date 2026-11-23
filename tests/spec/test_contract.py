@@ -45,7 +45,7 @@ class SpecContractTests(unittest.TestCase):
             "docs/TUI_UX.md", "docs/IMPLEMENTATION_PLAN.md",
             "docs/STEALTH_REALITY.md",
             "docs/adr/0020-reality-like-and-tls-in-tls.md",
-            "docs/TESTING_CI.md", "docs/SPEC_REVIEW.md",
+            "docs/TESTING_CI.md", "docs/STATUS.md",
             "docs/adr/0001-standard-h3-h2-embedding.md",
             "docs/adr/0002-inbound-authorization-and-tcp-ack.md",
             "docs/adr/0003-mvp-bbr-and-fingerprint.md",
@@ -71,6 +71,27 @@ class SpecContractTests(unittest.TestCase):
                     continue
                 with self.subTest(file=file, link=path):
                     self.assertTrue((file.parent / path).exists(), f"{file}: {path}")
+
+    def test_live_readme_and_status_are_not_stale_preimplementation_notes(self):
+        readme = read("README.md")
+        status = read("docs/STATUS.md")
+        self.assertLess(len(readme), 14_000, "README must not regrow into PR-by-PR history")
+        self.assertIn("Experimental / unreleased", readme)
+        self.assertIn("M4.4b2a", readme)
+        self.assertNotIn("M4.4a (in review)", readme)
+        self.assertNotIn("Windows пока только Unsupported", readme)
+        self.assertNotIn("реализация ядра по-прежнему **отсутствует**", readme)
+        self.assertIn("docs/STATUS.md", readme)
+        self.assertIn("14/14 SUCCESS", status)
+        self.assertIn("только после", status)
+        for item in ("F-13", "F-14", "F-18", "F-19", "M4.3"):
+            with self.subTest(item=item):
+                self.assertIn(item, readme)
+                self.assertIn(item, status)
+        self.assertFalse((ROOT / "docs/SPEC_REVIEW.md").exists())
+        archive = read("docs/archive/spec-review-2026-11-22.md")
+        self.assertIn("Исторический документ", archive)
+        self.assertIn("устарели", archive)
 
     def test_toml_schema_versions(self):
         for kind in ("server", "client"):
