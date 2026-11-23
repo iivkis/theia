@@ -22,6 +22,10 @@ jobs:
       rust_ready: ${{ steps.detect.outputs.rust_ready }}
     steps:
       - uses: actions/checkout@v4
+      - name: Preflight all Python CI drivers and WSL guest network regression
+        run: |
+          python3 -m compileall -q scripts tests
+          python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'
       - name: Test documentation and TOML contracts
         run: bash scripts/check-spec.sh
       - name: Test required CI DAG, native E2E and Go cache contract
