@@ -1,7 +1,8 @@
 //! Offline operator interface for the candidate signed descriptor store.
 //! No network, profile writes, trust-on-first-use, secrets or runtime Apply.
 use crate::{
-    descriptor::{self, Anchor, Error, Scope, Store, Verified},
+    config::{Transport, XhttpMode},
+    descriptor::{self, Anchor, ClientPolicy, Error, Scope, Store, Verified},
     CliError,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -20,7 +21,7 @@ theia trust preview-update --anchor PATH --store PATH --document PATH\n\
 theia trust update --anchor PATH --store PATH --document PATH --expected-revision N --sha256 HEX --confirm\n\
 theia trust preview-rotation --anchor PATH --store PATH --document PATH --next-key KEY\n\
 theia trust rotate --anchor PATH --store PATH --document PATH --next-key KEY --expected-revision N --sha256 HEX --confirm\n\
-All paths must be absolute local files. Anchor TOML: schema_version=1, inbound, endpoint, public_key (canonical unpadded base64url), minimum_revision. Obtain and verify the anchor independently. Confirm SHA-256 of exact descriptor bytes from preview. Rotate only with separately confirmed public key. For compromise or missed overlap obtain a new independent anchor and use a NEW store; never overwrite an existing store. No private keys accepted.";
+All paths must be absolute local files. Anchor TOML: schema_version=1, inbound, endpoint, public_key (canonical unpadded base64url), minimum_revision, transport (auto/h2/h3), xhttp_mode (auto/stream-one/stream-up). Obtain and verify the anchor independently; both policy fields are required. Confirm SHA-256 of exact descriptor bytes from preview. Rotate only with separately confirmed public key. For compromise or missed overlap obtain a new independent anchor and use a NEW store; never overwrite an existing store. No private keys accepted.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -141,6 +142,8 @@ struct AnchorFile {
     endpoint: String,
     public_key: String,
     minimum_revision: u64,
+    transport: Transport,
+    xhttp_mode: XhttpMode,
 }
 fn read(path: &str, limit: u64, private: bool) -> Result<String, Error> {
     let bytes = crate::bounded_input::read(Path::new(path), limit, true, private)
@@ -162,6 +165,10 @@ fn load_anchor(path: &str) -> Result<Anchor, Error> {
         },
         public_key(&file.public_key)?,
         file.minimum_revision,
+        ClientPolicy {
+            transport: file.transport,
+            xhttp_mode: file.xhttp_mode,
+        },
     )
 }
 
@@ -178,6 +185,12 @@ fn preview(value: &Verified, now: u64, current: Option<u64>, raw: Option<&str>) 
     let mut result = format!("OFFLINE ONLY; runtime UNCHANGED\nrevision={}\nvalid_now={}\nidentity_sha256={}\ntransports=h2{}\nstream_one={}\nstream_up={}",
         d.revision, value.check_time(now).is_ok(), hex(&Sha256::digest(value.signer())),
         if d.h3 { ",h3" } else { "" }, d.stream_one, d.stream_up);
+    let modes = value.effective_modes();
+    result.push_str(&format!(
+        "\neffective_h2={}\neffective_h3={}\neffective_stream_one={}\neffective_stream_up={}\nnot_before={}\nnot_after={}\nreference_count={}\nactive_reference_index={}",
+        modes.h2, modes.h3, modes.stream_one, modes.stream_up,
+        d.not_before, d.not_after, d.references.len(), d.active_reference
+    ));
     if let Some(revision) = current {
         result.push_str(&format!("\nexpected_revision={revision}"));
     }

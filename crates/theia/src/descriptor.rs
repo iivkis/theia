@@ -3,7 +3,7 @@
 //! TLS, perform network I/O, or activate a successor identity. Its encoding
 //! and integration require security review before production use.
 #![forbid(unsafe_code)]
-use crate::config::{self, WriteFailure};
+use crate::config::{self, Transport, WriteFailure, XhttpMode};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ const SIGN_DOMAIN: &[u8] = b"SmartTheia/inbound-descriptor/v1\0";
 pub enum Error {
     Format,
     Scope,
+    Policy,
     Signature,
     Validity,
     Rollback,
@@ -36,6 +37,7 @@ impl fmt::Display for Error {
         f.write_str(match self {
             Self::Format => "invalid descriptor format",
             Self::Scope => "descriptor outside pinned scope",
+            Self::Policy => "descriptor conflicts with explicit local transport or XHTTP policy",
             Self::Signature => "descriptor signature rejected",
             Self::Validity => "descriptor outside validity interval",
             Self::Rollback => "descriptor revision rollback",
@@ -61,16 +63,53 @@ impl Scope {
     }
 }
 
+/// Explicit, independently stored operator restrictions. The signed server
+/// descriptor may narrow the offered modes, never override these restrictions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientPolicy {
+    pub transport: Transport,
+    pub xhttp_mode: XhttpMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EffectiveModes {
+    pub h2: bool,
+    pub h3: bool,
+    pub stream_one: bool,
+    pub stream_up: bool,
+}
+
+impl ClientPolicy {
+    pub fn intersect(self, descriptor: &Descriptor) -> Result<EffectiveModes, Error> {
+        let modes = EffectiveModes {
+            h2: self.transport != Transport::H3,
+            h3: self.transport != Transport::H2 && descriptor.h3,
+            stream_one: self.xhttp_mode != XhttpMode::StreamUp && descriptor.stream_one,
+            stream_up: self.xhttp_mode != XhttpMode::StreamOne && descriptor.stream_up,
+        };
+        if !(modes.h2 || modes.h3) || !(modes.stream_one || modes.stream_up) {
+            return Err(Error::Policy);
+        }
+        Ok(modes)
+    }
+}
+
 /// Must come from an independently authenticated enrollment, never from the
-/// descriptor itself. A minimum revision may be pinned during enrollment.
+/// descriptor itself. A minimum revision and local policy are pinned here.
 #[derive(Clone)]
 pub struct Anchor {
     scope: Scope,
     public_key: [u8; 32],
     minimum_revision: u64,
+    policy: ClientPolicy,
 }
 impl Anchor {
-    pub fn new(scope: Scope, public_key: [u8; 32], minimum_revision: u64) -> Result<Self, Error> {
+    pub fn new(
+        scope: Scope,
+        public_key: [u8; 32],
+        minimum_revision: u64,
+        policy: ClientPolicy,
+    ) -> Result<Self, Error> {
         if !scope.valid() || public_key == [0; 32] || minimum_revision == 0 {
             return Err(Error::Format);
         }
@@ -78,6 +117,7 @@ impl Anchor {
             scope,
             public_key,
             minimum_revision,
+            policy,
         })
     }
 }
@@ -242,6 +282,7 @@ pub struct Verified {
     descriptor: Descriptor,
     digest: [u8; 32],
     signer: [u8; 32],
+    effective_modes: EffectiveModes,
 }
 impl Verified {
     pub fn descriptor(&self) -> &Descriptor {
@@ -249,6 +290,9 @@ impl Verified {
     }
     pub fn signer(&self) -> [u8; 32] {
         self.signer
+    }
+    pub fn effective_modes(&self) -> EffectiveModes {
+        self.effective_modes
     }
     pub fn check_time(&self, now: u64) -> Result<(), Error> {
         if now < self.descriptor.not_before || now >= self.descriptor.not_after {
@@ -312,10 +356,12 @@ pub fn verify(document: &str, anchor: &Anchor) -> Result<Verified, Error> {
             return Err(Error::Format);
         }
     }
+    let effective_modes = anchor.policy.intersect(&descriptor)?;
     Ok(Verified {
         descriptor,
         digest: Sha256::digest(payload).into(),
         signer: anchor.public_key,
+        effective_modes,
     })
 }
 
@@ -425,7 +471,12 @@ impl History {
             .revision
             .checked_add(1)
             .ok_or(Error::ReenrollmentRequired)?;
-        let new_anchor = Anchor::new(self.anchor.scope.clone(), next_key, minimum)?;
+        let new_anchor = Anchor::new(
+            self.anchor.scope.clone(),
+            next_key,
+            minimum,
+            self.anchor.policy,
+        )?;
         let next = verify(successor, &new_anchor)?;
         next.check_time(now)?;
         if let Some(raw) = &next.descriptor.next_identity {

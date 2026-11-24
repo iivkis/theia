@@ -9,20 +9,35 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
-use theia::descriptor::{
-    self, Anchor, Change, Descriptor, Error, Padding, Reference, Rotation, Scope, SecurityMode,
-    Store,
+use theia::{
+    config::{Transport, XhttpMode},
+    descriptor::{
+        self, Anchor, Change, ClientPolicy, Descriptor, Error, Padding, Reference, Rotation,
+        Scope, SecurityMode, Store,
+    },
 };
 
 fn key() -> Ed25519KeyPair {
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
     Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
 }
+fn auto_policy() -> ClientPolicy {
+    ClientPolicy {
+        transport: Transport::Auto,
+        xhttp_mode: XhttpMode::Auto,
+    }
+}
+
 fn anchor(d: &Descriptor, key: &Ed25519KeyPair) -> Anchor {
+    policy_anchor(d, key, auto_policy())
+}
+
+fn policy_anchor(d: &Descriptor, key: &Ed25519KeyPair, policy: ClientPolicy) -> Anchor {
     Anchor::new(
         d.scope.clone(),
         key.public_key().as_ref().try_into().unwrap(),
         1,
+        policy,
     )
     .unwrap()
 }
@@ -90,6 +105,7 @@ fn signed_descriptor_binds_every_field_to_independent_anchor() {
         d.scope.clone(),
         key.public_key().as_ref().try_into().unwrap(),
         2,
+        auto_policy(),
     )
     .unwrap();
     assert_error(descriptor::verify(&raw, &floor), Error::Rollback);
@@ -588,7 +604,7 @@ fn offline_cli_requires_exact_preview_digest_and_guarded_revision() {
     let anchor_path = scratch.0.join("anchor.toml");
     let store = scratch.0.join("store.toml");
     let document = scratch.0.join("descriptor.toml");
-    let anchor_text = format!("schema_version = 1\ninbound = \"edge\"\nendpoint = \"edge.example.org:443\"\npublic_key = \"{}\"\nminimum_revision = 1\n", URL_SAFE_NO_PAD.encode(public(&root)));
+    let anchor_text = format!("schema_version = 1\ninbound = \"edge\"\nendpoint = \"edge.example.org:443\"\npublic_key = \"{}\"\nminimum_revision = 1\ntransport = \"auto\"\nxhttp_mode = \"auto\"\n", URL_SAFE_NO_PAD.encode(public(&root)));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -620,7 +636,12 @@ fn offline_cli_requires_exact_preview_digest_and_guarded_revision() {
         "{}",
         String::from_utf8_lossy(&preview.stderr)
     );
-    assert!(String::from_utf8_lossy(&preview.stdout).contains(&hash(&raw)));
+    let verified_text = String::from_utf8_lossy(&preview.stdout);
+    assert!(verified_text.contains(&hash(&raw)));
+    assert!(verified_text.contains("effective_h2=true"));
+    assert!(verified_text.contains("effective_h3=true"));
+    assert!(verified_text.contains("effective_stream_one=true"));
+    assert!(verified_text.contains("effective_stream_up=true"));
     assert!(!store.exists());
     let bad_hash = "00".repeat(32);
     assert!(!invoke(&[
@@ -790,4 +811,121 @@ fn persisted_acceptance_time_prevents_ordinary_clock_rollback() {
     );
     assert_eq!(fs::read(&path).unwrap(), saved);
     assert_eq!(reopened.load(150).unwrap().descriptor().revision, 2);
+}
+
+#[test]
+fn local_policy_intersects_offers_without_overriding_explicit_modes() {
+    let mut descriptor = fixture(1);
+    for (transport, h2, h3) in [
+        (Transport::Auto, true, true),
+        (Transport::H2, true, false),
+        (Transport::H3, false, true),
+    ] {
+        for (xhttp_mode, stream_one, stream_up) in [
+            (XhttpMode::Auto, true, true),
+            (XhttpMode::StreamOne, true, false),
+            (XhttpMode::StreamUp, false, true),
+        ] {
+            let modes = ClientPolicy {
+                transport,
+                xhttp_mode,
+            }
+            .intersect(&descriptor)
+            .unwrap();
+            assert_eq!((modes.h2, modes.h3), (h2, h3));
+            assert_eq!((modes.stream_one, modes.stream_up), (stream_one, stream_up));
+        }
+    }
+    descriptor.h3 = false;
+    descriptor.stream_up = false;
+    let modes = auto_policy().intersect(&descriptor).unwrap();
+    assert!(modes.h2 && modes.stream_one);
+    assert!(!modes.h3 && !modes.stream_up);
+    for policy in [
+        ClientPolicy {
+            transport: Transport::H3,
+            xhttp_mode: XhttpMode::Auto,
+        },
+        ClientPolicy {
+            transport: Transport::Auto,
+            xhttp_mode: XhttpMode::StreamUp,
+        },
+    ] {
+        assert_error(policy.intersect(&descriptor), Error::Policy);
+    }
+}
+
+#[test]
+fn incompatible_signed_update_cannot_replace_working_snapshot() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("store.toml");
+    let root = key();
+    let first = fixture(1);
+    let policy = ClientPolicy {
+        transport: Transport::H3,
+        xhttp_mode: XhttpMode::StreamUp,
+    };
+    let anchor = policy_anchor(&first, &root, policy);
+    let store = Store::new(&path, anchor.clone()).unwrap();
+    let raw = descriptor::sign(&first, &root).unwrap();
+    store.initialize(&raw, 120).unwrap();
+    let before = fs::read(&path).unwrap();
+    for remove_h3 in [true, false] {
+        let mut next = fixture(2);
+        if remove_h3 {
+            next.h3 = false;
+        } else {
+            next.stream_up = false;
+        }
+        let signed = descriptor::sign(&next, &root).unwrap();
+        assert_error(store.preview_update(&signed, 121), Error::Policy);
+        assert_error(store.update_at(&signed, 1, 121), Error::Policy);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    let reopened = Store::new(&path, anchor).unwrap();
+    let verified = reopened.load(122).unwrap();
+    assert_eq!(verified.descriptor().revision, 1);
+    let modes = verified.effective_modes();
+    assert!(modes.h3 && modes.stream_up);
+    assert!(!modes.h2 && !modes.stream_one);
+}
+
+#[test]
+fn incompatible_successor_cannot_bypass_local_policy_during_rotation() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("store.toml");
+    let root = key();
+    let successor = key();
+    let mut first = fixture(1);
+    first.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&successor)));
+    let policy = ClientPolicy {
+        transport: Transport::H3,
+        xhttp_mode: XhttpMode::StreamOne,
+    };
+    let anchor = policy_anchor(&first, &root, policy);
+    let store = Store::new(&path, anchor.clone()).unwrap();
+    store.initialize(&descriptor::sign(&first, &root).unwrap(), 120).unwrap();
+    let before = fs::read(&path).unwrap();
+    let mut next = fixture(2);
+    next.h3 = false;
+    let signed = descriptor::sign(&next, &successor).unwrap();
+    assert_error(
+        store.preview_promotion(&signed, public(&successor), 121),
+        Error::Policy,
+    );
+    assert_error(
+        store.promote(&signed, 1, public(&successor), 121),
+        Error::Policy,
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    next.h3 = true;
+    let signed = descriptor::sign(&next, &successor).unwrap();
+    assert_eq!(
+        store.promote(&signed, 1, public(&successor), 121).unwrap(),
+        Change::Advanced
+    );
+    let reopened = Store::new(&path, anchor).unwrap();
+    let effective = reopened.load(122).unwrap().effective_modes();
+    assert!(effective.h3 && effective.stream_one);
+    assert!(!effective.h2 && !effective.stream_up);
 }
