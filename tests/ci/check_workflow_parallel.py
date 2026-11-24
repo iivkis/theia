@@ -41,7 +41,6 @@ mandatory = {
     "browser-e2e",
     "m0-1-api-spike",
     "m0-1-windows-spike",
-    "m3-3-bbr-comparison",
     "m3-4-btls-spike",
     "m3-4e-btls-production-feature",
 }
@@ -139,6 +138,29 @@ require("cargo test --workspace --all-targets --locked" in linux,
         "mandatory Linux all-target tests must run")
 require("cargo clippy --workspace --all-targets --all-features -- -D warnings" in linux,
         "mandatory Clippy warnings-as-errors must run")
+
+# The 16 actual BBR/CUBIC impairment trials still run on BOTH native
+# operating systems, but reuse the existing M0.1 compiled Rust workspace.
+# Keep the validator and per-OS evidence artifacts as mandatory acceptance.
+bbr_command = (
+    "cargo test --manifest-path spikes/m0_1/Cargo.toml --locked "
+    "--test quic_congestion_comparison "
+    "comparison_records_all_controller_scenarios_ci_only "
+    "-- --ignored --exact --nocapture"
+)
+for name, platform in (("m0-1-api-spike", "ubuntu-latest"),
+                       ("m0-1-windows-spike", "windows-latest")):
+    payload = job(name)
+    require(bbr_command in payload, f"{name}: native BBR/CUBIC evidence must run")
+    require("python tests/benchmark/check_bbr_comparison.py $env:THEIA_BBR_RESULTS_PATH" in payload,
+            f"{name}: all 16 CSV scenarios must be validated")
+    require(f"THEIA_BBR_RESULTS_PATH: ${{{{ github.workspace }}}}/theia-bbr-{platform}.csv" in payload,
+            f"{name}: native BBR evidence CSV path is missing")
+    require("name: m3-3-quic-comparison-${{ runner.os }}" in payload
+            and "if: always()" in payload and "if-no-files-found: error" in payload,
+            f"{name}: do not silently skip the CSV artifact on an error")
+require("  m3-3-bbr-comparison:" not in workflow,
+        "duplicate BBR Rust build runners must stay removed")
 require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
 require("Real Linux H2 fingerprint vs pinned Go uTLS (reuse compiled root harness)" in linux
         and "cargo test --workspace --locked --test fingerprint_h2" in linux
