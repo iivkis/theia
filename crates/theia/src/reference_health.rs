@@ -585,6 +585,70 @@ impl State {
             .collect())
     }
 
+    /// Validate the active signed reference without requiring every inactive
+    /// reserve to be currently reachable. References remain an approved
+    /// inventory, not a promise that all of them are currently healthy.
+    pub fn validate_active(
+        &self,
+        signed: &crate::descriptor::Descriptor,
+        now: u64,
+    ) -> Result<(), Error> {
+        self.validate()?;
+        if now < self.last_checked_at {
+            return Err(Error::Clock);
+        }
+        if now > self.next_check_at()?.saturating_add(JITTER)
+            || signed.scope.inbound != self.plan.inbound
+            || signed.scope.endpoint != self.plan.endpoint
+            || signed.references.len() != self.plan.references.len()
+            || signed.references.iter().zip(&self.plan.references).any(|(reference, target)| {
+                reference.server_name != target.server_name || reference.port != target.address.port()
+            })
+        {
+            return Err(Error::NotEligible);
+        }
+        let active = self.health.get(usize::from(signed.active_reference)).ok_or(Error::Format)?;
+        if !active.evidence.eligible() || (signed.h3 && !active.evidence.h3()) {
+            return Err(Error::NotEligible);
+        }
+        Ok(())
+    }
+
+    /// A candidate is not a live switch. The two-cycle failure threshold
+    /// applies to the currently published reference, not always index zero.
+    /// All newly admitted transport modes must be retained.
+    pub fn failover_candidate(
+        &self,
+        signed: &crate::descriptor::Descriptor,
+        now: u64,
+    ) -> Result<usize, Error> {
+        self.validate()?;
+        if now < self.last_checked_at {
+            return Err(Error::Clock);
+        }
+        if now - self.last_checked_at > 60
+            || signed.scope.inbound != self.plan.inbound
+            || signed.scope.endpoint != self.plan.endpoint
+            || signed.references.len() != self.plan.references.len()
+            || signed.references.iter().zip(&self.plan.references).any(|(reference, target)| {
+                reference.server_name != target.server_name || reference.port != target.address.port()
+            })
+        {
+            return Err(Error::NotEligible);
+        }
+        let active_index = usize::from(signed.active_reference);
+        let active = self.health.get(active_index).ok_or(Error::Format)?;
+        if active.failures < FAILURE_THRESHOLD || active.evidence.eligible() {
+            return Err(Error::NotEligible);
+        }
+        self.health.iter().enumerate()
+            .filter(|(index, health)| *index != active_index && health.evidence.eligible()
+                && (!signed.h3 || (health.evidence.h3() && signed.references[*index].h3)))
+            .max_by_key(|(index, health)| (health.evidence.score(), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index)
+            .ok_or(Error::NotEligible)
+    }
+
     pub fn next_check_at(&self) -> Result<u64, Error> {
         let mut hash = Sha256::new();
         hash.update(self.plan.digest()?);

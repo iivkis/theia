@@ -186,18 +186,7 @@ pub fn validate_publication(
         auto_policy(),
         now,
     )?;
-    let offered = &value.descriptor().references;
-    let fresh = state.eligible_references(now).map_err(|_| Error::Health)?;
-    if fresh.len() != offered.len()
-        || fresh.iter().zip(offered).any(|(current, signed)| {
-            current.server_name != signed.server_name
-                || current.port != signed.port
-                || (signed.h3 && !current.h3)
-        })
-    {
-        return Err(Error::Health);
-    }
-    Ok(())
+    state.validate_active(value.descriptor(), now).map_err(|_| Error::Health)
 }
 
 pub fn refresh_descriptor(
@@ -217,19 +206,7 @@ pub fn refresh_descriptor(
     if now <= next.not_before {
         return Err(Error::Clock);
     }
-    let references = state.eligible_references(now).map_err(|_| Error::Health)?;
-    if references.len() != next.references.len()
-        || references
-            .iter()
-            .zip(&next.references)
-            .any(|(fresh, prior)| {
-                fresh.server_name != prior.server_name
-                    || fresh.port != prior.port
-                    || (prior.h3 && !fresh.h3)
-            })
-    {
-        return Err(Error::Health);
-    }
+    state.validate_active(&next, now).map_err(|_| Error::Health)?;
     // Do not enable a previously unavailable transport by refresh alone.
     next.revision = next.revision.checked_add(1).ok_or(Error::Descriptor)?;
     next.not_before = now;

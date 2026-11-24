@@ -24,6 +24,8 @@ theia reality recovery-apply --profile PATH --descriptor PATH --expected-revisio
 theia reality publish-new --health PATH --key PATH --publication PATH --confirm\n\
 theia reality publish-status --publication PATH\n\
 theia reality publish-refresh --health PATH --publication PATH --sha256 HEX --confirm\n\
+theia reality failover-preview --health PATH --publication PATH\n\
+theia reality failover-apply --health PATH --publication PATH --sha256 HEX --health-sha256 HEX --reference N --confirm-recovery-plan\n\
 theia reality rotation-stage --publication PATH --next-key PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality rotation-promote --publication PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality publish-export --publication PATH --output PATH --confirm\n\
@@ -101,6 +103,15 @@ pub enum Command {
         health: String,
         publication: String,
         digest: [u8; 32],
+    },
+    FailoverPreview {
+        health: String,
+        publication: String,
+    },
+    FailoverApply {
+        health: String,
+        publication: String,
+        approval: crate::identity_publication::FailoverApproval,
     },
     RotationStage {
         publication: String,
@@ -240,6 +251,24 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
                 digest: hash(d)?,
             }
         }
+        ["failover-preview", "--health", h, "--publication", p] => Command::FailoverPreview {
+            health: path(h)?, publication: path(p)?,
+        },
+        ["failover-apply", "--health", h, "--publication", p, "--sha256", d, "--health-sha256", e, "--reference", r, "--confirm-recovery-plan"] => {
+            let selected_reference = match *r {
+                "0" => 0, "1" => 1, "2" => 2,
+                _ => return Err(CliError::InvalidArguments),
+            };
+            Command::FailoverApply {
+                health: path(h)?,
+                publication: path(p)?,
+                approval: crate::identity_publication::FailoverApproval {
+                    publication_sha256: hash(d)?,
+                    health_sha256: hash(e)?,
+                    selected_reference,
+                },
+            }
+        }
         ["rotation-stage", "--publication", p, "--next-key", k, "--sha256", d, "--identity-sha256", i, "--confirm"] => {
             Command::RotationStage {
                 publication: path(p)?,
@@ -300,8 +329,8 @@ fn publication_status(
         .overlap_ends_at
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".into());
-    Ok(format!("Local publication; runtime UNCHANGED\ngeneration={}\nrevision={}\nvalid_now={}\nidentity_sha256={}\nnext_identity_sha256={}\noverlap_ends_at={}\nplan_sha256={}\nsnapshot_sha256={}",
-        status.generation, status.revision, status.valid_now, hex(status.active_fingerprint), next, ends, hex(status.plan_sha256), hex(status.snapshot_sha256)))
+    Ok(format!("Local publication; runtime UNCHANGED\ngeneration={}\nrevision={}\nactive_reference={}\nvalid_now={}\nidentity_sha256={}\nnext_identity_sha256={}\noverlap_ends_at={}\nplan_sha256={}\nsnapshot_sha256={}",
+        status.generation, status.revision, status.active_reference, status.valid_now, hex(status.active_fingerprint), next, ends, hex(status.plan_sha256), hex(status.snapshot_sha256)))
 }
 
 pub fn run(command: Command) -> Result<String, Error> {
@@ -352,6 +381,21 @@ pub fn run(command: Command) -> Result<String, Error> {
             let publication =
                 crate::identity_publication::Publication::new(Path::new(&publication))?;
             publication.refresh(&state, digest, now)?;
+            publication_status(&publication, now)
+        }
+        Command::FailoverPreview { health, publication } => {
+            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?
+                .inspect().map_err(|_| Error::Health)?;
+            let publication = crate::identity_publication::Publication::new(Path::new(&publication))?;
+            let preview = publication.preview_failover(&state, now)?;
+            Ok(format!("Offline failover preview; runtime UNCHANGED\ncurrent_reference={}\nselected_reference={}\nnext_revision={}\npublication_sha256={}\nhealth_sha256={}\nRequires explicit confirmed recovery plan for all existing clients; export the updated signed document and distribute it through authenticated recovery. Evidence must be at most 60s old.",
+                preview.current_reference, preview.selected_reference, preview.next_revision, hex(preview.publication_sha256), hex(preview.health_sha256)))
+        }
+        Command::FailoverApply { health, publication, approval } => {
+            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?
+                .inspect().map_err(|_| Error::Health)?;
+            let publication = crate::identity_publication::Publication::new(Path::new(&publication))?;
+            publication.apply_failover(&state, approval, now)?;
             publication_status(&publication, now)
         }
         Command::RotationStage {
