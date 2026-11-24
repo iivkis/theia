@@ -717,14 +717,20 @@ fn atomic_write_bytes(
         temp_name.push(name);
         temp_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
         let temp = parent.join(temp_name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&temp) {
+        #[cfg(windows)]
+        let opened = crate::client_import::new_private_file(&temp);
+        #[cfg(not(windows))]
+        let opened = {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&temp)
+        };
+        match opened {
             Ok(file) => {
                 pending = Some((temp, file));
                 break;

@@ -34,6 +34,7 @@ pub mod reference_health;
 pub mod identity_tls;
 pub mod reference_cli;
 pub mod reality_bootstrap;
+pub mod identity_publication;
 pub mod identity_data;
 pub mod reality_cli;
 pub(crate) mod quota;

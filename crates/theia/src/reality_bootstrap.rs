@@ -22,7 +22,7 @@ const PREFIX: &str = "theia://v1/";
 pub const MAX_URI: usize = 32 * 1024;
 const MAX_DATA: usize = 24 * 1024;
 const MAX_PROFILE: usize = 64 * 1024;
-const VALIDITY: u64 = 7 * 24 * 60 * 60;
+pub(crate) const VALIDITY: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -93,7 +93,7 @@ fn scope_of(state: &reference_health::State) -> Scope {
     }
 }
 
-fn auto_policy() -> ClientPolicy {
+pub(crate) fn auto_policy() -> ClientPolicy {
     ClientPolicy { transport: Transport::Auto, xhttp_mode: XhttpMode::Auto }
 }
 

@@ -20,6 +20,13 @@ theia reality preview-import --invitation PATH\n\
 theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --token-ref REF --confirm\n\
 theia reality inspect --profile PATH\n\
+theia reality publish-new --health PATH --key PATH --publication PATH --confirm\n\
+theia reality publish-status --publication PATH\n\
+theia reality publish-refresh --health PATH --publication PATH --sha256 HEX --confirm\n\
+theia reality rotation-stage --publication PATH --next-key PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
+theia reality rotation-promote --publication PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
+theia reality publish-export --publication PATH --output PATH --confirm\n\
+theia reality successor-export --publication PATH --output PATH --confirm\n\
 Identity SHA-256 must be obtained independently. Import never changes active profile, runtime or system proxy. Descriptor-refresh creates a new file; no automatic publication or reference switch.";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +39,12 @@ pub enum Command {
     Preview { invitation: String },
     Import { invitation: String, profile: String, trust: String, digest: [u8; 32], identity: [u8; 32], token_ref: Option<String> },
     Inspect { profile: String },
+    PublishNew { health: String, key: String, publication: String },
+    PublishStatus { publication: String },
+    PublishRefresh { health: String, publication: String, digest: [u8; 32] },
+    RotationStage { publication: String, next_key: String, digest: [u8; 32], identity: [u8; 32] },
+    RotationPromote { publication: String, digest: [u8; 32], identity: [u8; 32] },
+    PublishExport { publication: String, output: String, successor: bool },
 }
 
 fn path(raw: &str) -> Result<String, CliError> {
@@ -81,6 +94,17 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
                 identity: hash(k)?, token_ref: Some((*r).to_owned()),
             },
         ["inspect", "--profile", p] => Command::Inspect { profile: path(p)? },
+        ["publish-new", "--health", h, "--key", k, "--publication", p, "--confirm"] =>
+            Command::PublishNew { health: path(h)?, key: path(k)?, publication: path(p)? },
+        ["publish-status", "--publication", p] => Command::PublishStatus { publication: path(p)? },
+        ["publish-refresh", "--health", h, "--publication", p, "--sha256", d, "--confirm"] =>
+            Command::PublishRefresh { health: path(h)?, publication: path(p)?, digest: hash(d)? },
+        ["rotation-stage", "--publication", p, "--next-key", k, "--sha256", d, "--identity-sha256", i, "--confirm"] =>
+            Command::RotationStage { publication: path(p)?, next_key: path(k)?, digest: hash(d)?, identity: hash(i)? },
+        ["rotation-promote", "--publication", p, "--sha256", d, "--identity-sha256", i, "--confirm"] =>
+            Command::RotationPromote { publication: path(p)?, digest: hash(d)?, identity: hash(i)? },
+        [kind @ ("publish-export" | "successor-export"), "--publication", p, "--output", o, "--confirm"] =>
+            Command::PublishExport { publication: path(p)?, output: path(o)?, successor: *kind == "successor-export" },
         _ => return Err(CliError::InvalidArguments),
     })
 }
@@ -98,9 +122,49 @@ fn publish(output: &str, raw: &str) -> Result<String, Error> {
     Ok(format!("Local candidate saved; runtime UNCHANGED\ndocument_sha256={}", hex(bootstrap::digest(raw))))
 }
 
+fn publication_status(publication: &crate::identity_publication::Publication, now: u64) -> Result<String, Error> {
+    let status = publication.inspect(now)?;
+    let next = status.next_fingerprint.map(hex).unwrap_or_else(|| "none".into());
+    let ends = status.overlap_ends_at.map(|value| value.to_string()).unwrap_or_else(|| "none".into());
+    Ok(format!("Local publication; runtime UNCHANGED\ngeneration={}\nrevision={}\nvalid_now={}\nidentity_sha256={}\nnext_identity_sha256={}\noverlap_ends_at={}\nsnapshot_sha256={}",
+        status.generation, status.revision, status.valid_now, hex(status.active_fingerprint), next, ends, hex(status.snapshot_sha256)))
+}
+
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
+        Command::PublishNew { health, key, publication } => {
+            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?
+                .inspect().map_err(|_| Error::Health)?;
+            let publication = crate::identity_publication::Publication::new(Path::new(&publication))?;
+            publication.initialize(&state, Path::new(&key), now)?;
+            publication_status(&publication, now)
+        }
+        Command::PublishStatus { publication } => {
+            publication_status(&crate::identity_publication::Publication::new(Path::new(&publication))?, now)
+        }
+        Command::PublishRefresh { health, publication, digest } => {
+            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?
+                .inspect().map_err(|_| Error::Health)?;
+            let publication = crate::identity_publication::Publication::new(Path::new(&publication))?;
+            publication.refresh(&state, digest, now)?;
+            publication_status(&publication, now)
+        }
+        Command::RotationStage { publication, next_key, digest, identity } => {
+            let publication = crate::identity_publication::Publication::new(Path::new(&publication))?;
+            publication.begin_rotation(Path::new(&next_key), digest, identity, now)?;
+            publication_status(&publication, now)
+        }
+        Command::RotationPromote { publication, digest, identity } => {
+            let publication = crate::identity_publication::Publication::new(Path::new(&publication))?;
+            publication.promote(digest, identity, now)?;
+            publication_status(&publication, now)
+        }
+        Command::PublishExport { publication, output, successor } => {
+            let publication = crate::identity_publication::Publication::new(Path::new(&publication))?;
+            let (current, next) = publication.documents(now)?;
+            publish(&output, if successor { next.as_deref().ok_or(Error::Identity)? } else { &current })
+        }
         Command::Identity { inbound, endpoint, key } => {
             let identity = Identity::generate(Scope { inbound, endpoint }).map_err(|_| Error::Identity)?;
             identity.save_new(Path::new(&key)).map_err(|e| match e {
