@@ -119,7 +119,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
     let ttl = Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s));
     match profile.transport {
         Transport::H2 => {
-            let endpoint = if auto_xhttp {
+            let endpoint = if certificate_pin.is_none() {
                 resolve_server(profile).await?.to_string()
             } else {
                 profile.server.clone()
@@ -132,7 +132,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             } else {
                 client
             };
-            Ok(ProxyClient::H2(Arc::new(client)))
+            Ok(ProxyClient::H2(Arc::new(client.with_connection_pool())))
         }
         Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
@@ -143,6 +143,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 .with_connect_timeout(Duration::from_millis(u64::from(
                     profile.quic_connect_timeout_ms,
                 )))?;
+            let h3 = h3.with_connection_pool();
             let h3 = Arc::new(if auto_xhttp {
                 h3.with_auto_stream_up(ttl)?
             } else {
@@ -157,6 +158,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             let h2 = H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
                 .with_certificate_pin(certificate_pin)?
                 .with_stream_up(stream_up)?;
+            let h2 = h2.with_connection_pool();
             let h2 = Arc::new(if auto_xhttp {
                 h2.with_auto_stream_up(ttl)?
             } else {

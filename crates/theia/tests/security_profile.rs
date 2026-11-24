@@ -671,3 +671,54 @@ async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
     .await
     .expect("bounded native H3 exporter admission");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pooled_own_tls_h2_h3_keep_parallel_tunnels_independent() {
+    timeout(Duration::from_secs(30), async {
+        let fixture = Fixture::start(SecurityMode::Plain).await;
+        for split in [false, true] {
+            for h3 in [false, true] {
+                let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = target.local_addr().unwrap().port();
+                let address = Address::V4([127, 0, 0, 1]);
+                let token = URL_SAFE_NO_PAD.encode(TOKEN);
+                let (mut left, left_local) = tokio::io::duplex(4096);
+                let (mut right, right_local) = tokio::io::duplex(4096);
+                let (a, b) = if h3 {
+                    let client = H3Client::new(fixture.h3, "localhost", &token, fixture.roots.clone())
+                        .unwrap().with_stream_up(split).unwrap().with_connection_pool();
+                    let a = client.open(address.clone(), port).await.unwrap();
+                    let b = client.open(address.clone(), port).await.unwrap();
+                    (tokio::spawn(a.relay(left_local)), tokio::spawn(b.relay(right_local)))
+                } else {
+                    let client = H2Client::new(&fixture.h2.to_string(), "localhost", &token, fixture.roots.clone())
+                        .unwrap().with_stream_up(split).unwrap().with_connection_pool();
+                    let a = client.open(address.clone(), port).await.unwrap();
+                    let b = client.open(address.clone(), port).await.unwrap();
+                    (tokio::spawn(a.relay(left_local)), tokio::spawn(b.relay(right_local)))
+                };
+                let (mut first, _) = target.accept().await.unwrap();
+                let (mut second, _) = target.accept().await.unwrap();
+                left.write_all(b"left").await.unwrap();
+                right.write_all(b"right").await.unwrap();
+                let mut l = [0; 4];
+                let mut r = [0; 5];
+                first.read_exact(&mut l).await.unwrap();
+                second.read_exact(&mut r).await.unwrap();
+                assert_eq!(&l, b"left");
+                assert_eq!(&r, b"right");
+                // Dropping one tunnel must not close the other's HTTP driver.
+                a.abort();
+                let _ = a.await;
+                second.write_all(b"alive").await.unwrap();
+                right.read_exact(&mut r).await.unwrap();
+                assert_eq!(&r, b"alive");
+                right.shutdown().await.unwrap();
+                second.read_to_end(&mut Vec::new()).await.unwrap();
+                second.shutdown().await.unwrap();
+                right.read_to_end(&mut Vec::new()).await.unwrap();
+                b.await.unwrap().unwrap();
+            }
+        }
+    }).await.unwrap();
+}

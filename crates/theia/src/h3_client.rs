@@ -1,4 +1,4 @@
-//! Explicit H3 client core. No fallback, CLI or connection pooling yet.
+//! Explicit H3 client core with bounded per-profile connection reuse.
 use crate::{
     client::{bearer_header, error_kind, ClientError},
     diagnostics::{self, Value},
@@ -32,6 +32,8 @@ pub struct H3Client {
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     stream_up: bool,
     auto_mode: Option<crate::split_http::AutoMode>,
+    pool: crate::connection_pool::Pool<H3Connection>,
+    reuse_connections: bool,
 }
 
 impl H3Client {
@@ -65,7 +67,15 @@ impl H3Client {
             certificate_pin: None,
             stream_up: false,
             auto_mode: None,
+            pool: crate::connection_pool::Pool::default(),
+            reuse_connections: false,
         })
+    }
+
+    /// Reuse verified own-TLS connections within this immutable profile.
+    pub fn with_connection_pool(mut self) -> Self {
+        self.reuse_connections = true;
+        self
     }
 
     pub fn with_certificate_pin(
@@ -239,13 +249,7 @@ impl H3Client {
         }
     }
 
-    async fn open_inner(
-        &self,
-        open: &Frame,
-        operation: u64,
-        stream_up: bool,
-        stage: &mut crate::split_http::HelloOutcome,
-    ) -> Result<H3Tunnel, ClientError> {
+    async fn connect_verified(&self, operation: u64) -> Result<H3Connection, ClientError> {
         let (endpoint, connection) = self.verified_connection().await?;
         let binding = if self.certificate_pin.is_some() {
             let mut key = zeroize::Zeroizing::new([0u8; 32]);
@@ -268,7 +272,7 @@ impl H3Client {
         );
         let mut builder = h3::client::builder();
         builder.max_field_section_size(MAX_HEADERS);
-        let (mut driver, mut sender) = builder
+        let (mut driver, sender) = builder
             .build::<_, _, Bytes>(h3_quinn::Connection::new(connection))
             .await
             .map_err(|_| ClientError::Http3)?;
@@ -279,20 +283,44 @@ impl H3Client {
             let _keep_sender = keep_sender;
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         }));
+        Ok(H3Connection {
+            sender: std::sync::Mutex::new(sender),
+            driver,
+            binding,
+            _endpoint: endpoint,
+        })
+    }
+
+    async fn open_inner(
+        &self,
+        open: &Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &mut crate::split_http::HelloOutcome,
+    ) -> Result<H3Tunnel, ClientError> {
+        let route = crate::local_proxy::route_source(self.remote);
+        let reusable = self.reuse_connections && self.certificate_pin.is_none();
+        let mut lease = self.pool.acquire(route, stream_up, reusable,
+            |connection| !connection.driver.0.is_finished(),
+            self.connect_verified(operation)).await?;
+        let connection = lease.connection();
+        let binding = connection.binding.as_ref();
+        let mut sender = connection.sender.lock().map_err(|_| ClientError::Http3)?.clone();
+        let pair_id = lease.id();
         let (response, mut tx, mut rx) = if stream_up {
             use crate::split_http::{self, Leg};
             let mut download = sender
                 .send_request(crate::channel_binding::attach(
-                    binding.as_ref(),
-                    split_http::request(&self.uri, Leg::Download, &self.authorization, 1)?,
+                    binding,
+                    split_http::request(&self.uri, Leg::Download, &self.authorization, pair_id)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             download.finish().await.map_err(|_| ClientError::Http3)?;
             let mut upload = sender
                 .send_request(crate::channel_binding::attach(
-                    binding.as_ref(),
-                    split_http::request(&self.uri, Leg::Upload, &self.authorization, 1)?,
+                    binding,
+                    split_http::request(&self.uri, Leg::Upload, &self.authorization, pair_id)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
@@ -328,7 +356,7 @@ impl H3Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let mut stream = sender
-                .send_request(crate::channel_binding::attach(binding.as_ref(), request)?)
+                .send_request(crate::channel_binding::attach(binding, request)?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             let response = stream
@@ -408,15 +436,12 @@ impl H3Client {
             break frame;
         };
         match answer {
-            Frame::OpenOk if state.tunnel_open() => Ok(H3Tunnel {
-                operation,
-                tx,
-                rx,
-                decoder,
-                state,
-                _driver: driver,
-                _endpoint: endpoint,
-            }),
+            Frame::OpenOk if state.tunnel_open() => {
+                lease.admitted();
+                Ok(H3Tunnel {
+                    operation, tx, rx, decoder, state, _lease: lease,
+                })
+            }
             Frame::OpenError(code) => {
                 crate::diag!(
                     Warn,
@@ -443,6 +468,13 @@ fn quic_error(error: QuicError) -> ClientError {
     }
 }
 
+struct H3Connection {
+    sender: std::sync::Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
+    driver: Driver,
+    binding: Option<crate::channel_binding::Key>,
+    _endpoint: ObservedEndpoint,
+}
+
 struct Driver(JoinHandle<()>);
 
 impl Drop for Driver {
@@ -451,7 +483,7 @@ impl Drop for Driver {
     }
 }
 
-/// A tunnel owns one dedicated verified QUIC connection and the H3 driver.
+/// A tunnel retains a lease on its verified QUIC connection.
 /// Its constructor is private and reachable only after valid OPEN_OK.
 pub struct H3Tunnel {
     operation: u64,
@@ -459,8 +491,7 @@ pub struct H3Tunnel {
     rx: Rx,
     decoder: Incoming,
     state: Session,
-    _driver: Driver,
-    _endpoint: ObservedEndpoint,
+    _lease: crate::connection_pool::Lease<H3Connection>,
 }
 
 impl H3Tunnel {

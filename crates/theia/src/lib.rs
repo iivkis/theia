@@ -16,6 +16,7 @@ mod channel_binding;
 pub mod client;
 pub mod client_import;
 pub mod config;
+mod connection_pool;
 pub mod diagnostics;
 #[cfg(feature = "experimental-btls-h2")]
 mod h2_btls;

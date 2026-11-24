@@ -109,8 +109,7 @@ enum H2Tls {
     },
 }
 
-/// One explicit H2 endpoint. Every tunnel owns a dedicated, verified TLS/H2
-/// connection driver. The default backend remains rustls; an experimental
+/// One explicit H2 endpoint with independently verified TLS/H2 connections. The default backend remains rustls; an experimental
 /// BoringSSL backend is only available through an explicit feature-gated API.
 pub struct H2Client {
     endpoint: String,
@@ -122,6 +121,8 @@ pub struct H2Client {
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     stream_up: bool,
     auto_mode: Option<crate::split_http::AutoMode>,
+    pool: crate::connection_pool::Pool<H2Connection>,
+    reuse_connections: bool,
 }
 
 impl H2Client {
@@ -231,10 +232,18 @@ impl H2Client {
             certificate_pin: None,
             stream_up: false,
             auto_mode: None,
+            pool: crate::connection_pool::Pool::default(),
+            reuse_connections: false,
         })
     }
 
     /// Opt in to an additional exact leaf certificate identity, retaining PKI.
+    /// Reuse verified own-TLS connections within this immutable profile.
+    pub fn with_connection_pool(mut self) -> Self {
+        self.reuse_connections = true;
+        self
+    }
+
     pub fn with_certificate_pin(
         mut self,
         pin: Option<crate::security_profile::CertificatePin>,
@@ -371,13 +380,7 @@ impl H2Client {
         result
     }
 
-    async fn open_inner(
-        &self,
-        open: &Frame,
-        operation: u64,
-        stream_up: bool,
-        stage: &mut crate::split_http::HelloOutcome,
-    ) -> Result<Tunnel, ClientError> {
+    async fn connect_verified(&self, operation: u64) -> Result<H2Connection, ClientError> {
         let (socket, controller) = crate::tcp_bbr::connect(self.endpoint.as_str())
             .await
             .map_err(|error| match error {
@@ -391,7 +394,7 @@ impl H2Client {
             "controller" = Value::Label(controller.label()),
             "op" = Value::Count(operation)
         );
-        let (mut sender, driver, binding) = match &self.connector {
+        let (sender, driver, binding) = match &self.connector {
             H2Tls::Rustls(connector) => {
                 let tls = connector
                     .connect(self.server_name.clone(), socket)
@@ -443,15 +446,39 @@ impl H2Client {
             "tls_and_h2_verified",
             "op" = Value::Count(operation)
         );
-        // Build and send the credential-bearing POST ONLY after the selected
-        // backend verified TLS identity and ALPN and established HTTP/2.
+        Ok(H2Connection {
+            sender: std::sync::Mutex::new(sender),
+            driver,
+            binding,
+        })
+    }
+
+    async fn open_inner(
+        &self,
+        open: &Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &mut crate::split_http::HelloOutcome,
+    ) -> Result<Tunnel, ClientError> {
+        let route = self.endpoint.parse().ok().and_then(crate::local_proxy::route_source);
+        let reusable = self.reuse_connections && self.certificate_pin.is_none()
+            && matches!(&self.connector, H2Tls::Rustls(_));
+        let mut lease = self.pool.acquire(route, stream_up, reusable,
+            |connection| !connection.driver.0.is_finished(),
+            self.connect_verified(operation)).await?;
+        let connection = lease.connection();
+        let binding = connection.binding.as_ref();
+        let sender = connection.sender.lock().map_err(|_| ClientError::Http2)?.clone();
+        let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+        let pair_id = lease.id();
+        // Bearer is sent only on a verified connection.
         let (response, mut outgoing) = if stream_up {
             use crate::split_http::{self, Leg};
             let (download, _) = sender
                 .send_request(
                     crate::channel_binding::attach(
-                        binding.as_ref(),
-                        split_http::request(&self.uri, Leg::Download, &self.authorization, 1)?,
+                        binding,
+                        split_http::request(&self.uri, Leg::Download, &self.authorization, pair_id)?,
                     )?,
                     true,
                 )
@@ -460,8 +487,8 @@ impl H2Client {
             let (upload, tx) = sender
                 .send_request(
                     crate::channel_binding::attach(
-                        binding.as_ref(),
-                        split_http::request(&self.uri, Leg::Upload, &self.authorization, 1)?,
+                        binding,
+                        split_http::request(&self.uri, Leg::Upload, &self.authorization, pair_id)?,
                     )?,
                     false,
                 )
@@ -487,7 +514,7 @@ impl H2Client {
                 .map_err(|_| ClientError::Configuration)?;
             let (response, tx) = sender
                 .send_request(
-                    crate::channel_binding::attach(binding.as_ref(), request)?,
+                    crate::channel_binding::attach(binding, request)?,
                     false,
                 )
                 .map_err(|_| ClientError::Http2)?;
@@ -571,14 +598,12 @@ impl H2Client {
             break frame;
         };
         match result {
-            Frame::OpenOk if state.tunnel_open() => Ok(Tunnel {
-                operation,
-                incoming,
-                outgoing,
-                decoder,
-                state,
-                _driver: driver,
-            }),
+            Frame::OpenOk if state.tunnel_open() => {
+                lease.admitted();
+                Ok(Tunnel {
+                    operation, incoming, outgoing, decoder, state, _lease: lease,
+                })
+            }
             Frame::OpenError(code) => {
                 crate::diag!(
                     Warn,
@@ -630,6 +655,12 @@ where
     Ok((sender, driver))
 }
 
+struct H2Connection {
+    sender: std::sync::Mutex<h2::client::SendRequest<Bytes>>,
+    driver: Driver,
+    binding: Option<crate::channel_binding::Key>,
+}
+
 struct Driver(JoinHandle<()>);
 
 impl Drop for Driver {
@@ -639,14 +670,14 @@ impl Drop for Driver {
 }
 
 /// Construction is private: a Tunnel always represents a verified OPEN_OK.
-/// Dropping it also aborts the dedicated HTTP/2 connection driver.
+/// A lease keeps the shared verified connection alive for this tunnel.
 pub struct Tunnel {
     operation: u64,
     incoming: h2::RecvStream,
     outgoing: h2::SendStream<Bytes>,
     decoder: IncomingFrames,
     state: Session,
-    _driver: Driver,
+    _lease: crate::connection_pool::Lease<H2Connection>,
 }
 
 impl Tunnel {
