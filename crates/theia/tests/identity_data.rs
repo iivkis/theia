@@ -45,6 +45,7 @@ fn config(remote: SocketAddr) -> (Inbound, Vec<User>) {
     let inbound = Inbound {
         id: "edge".into(),
         security_mode: Default::default(),
+        reality: None,
         allowed_user_ids: vec!["allowed".into()],
         quic_listen: remote.to_string(),
         h2_listen: remote.to_string(),

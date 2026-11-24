@@ -1444,6 +1444,9 @@ pub(crate) fn configured_certificate_pin(
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
+    if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality || inbound.reality.is_some() {
+        return Err(ServerError::Config);
+    }
     let cert_bytes = pem_data(&inbound.tls_cert, false)?;
     let key_bytes = pem_data(&inbound.tls_key, true)?;
     tls_material_from_bytes(inbound, &cert_bytes, &key_bytes)
@@ -1456,6 +1459,9 @@ fn tls_material_from_bytes(
 ) -> Result<TlsMaterial, ServerError> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let identity = crate::reload_preflight::IdentityHash::from_pem(cert_bytes, key_bytes);
+    if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality || inbound.reality.is_some() {
+        return Err(ServerError::Config);
+    }
     let mut cert_reader = BufReader::new(cert_bytes);
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
@@ -1662,6 +1668,9 @@ async fn prepare_generation(
     limits: &GenerationLimits,
     captured: Option<&CapturedTls>,
 ) -> Result<PreparedGeneration, ServerError> {
+    if document.server.inbounds.iter().any(|i| i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
+        return Err(ServerError::Config);
+    }
     let live = Arc::new(
         LiveAuthorization::new_at_revision(document.clone(), revision)
             .map_err(|_| ServerError::Config)?,
@@ -2286,7 +2295,8 @@ async fn run_document_with_config(
 ) -> Result<(), ServerError> {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = config_path;
-    if !document.server.enabled {
+    if !document.server.enabled || document.server.inbounds.iter().any(|i|
+        i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
         return Err(ServerError::Config);
     }
     // One shared authorization snapshot for every H2/H3 inbound.
@@ -2515,6 +2525,7 @@ mod hardening_tests {
                         server_name: "a.example.org".into(),
                         tls_cert: "file:/tmp/theia-a.crt".into(),
                         security_mode: Default::default(),
+                        reality: None,
                         tls_key: "file:/tmp/theia-a.key".into(),
                     },
                     Inbound {
@@ -2525,6 +2536,7 @@ mod hardening_tests {
                         server_name: "b.example.org".into(),
                         tls_cert: "file:/tmp/theia-b.crt".into(),
                         security_mode: Default::default(),
+                        reality: None,
                         tls_key: "file:/tmp/theia-b.key".into(),
                     },
                 ],

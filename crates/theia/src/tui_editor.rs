@@ -789,6 +789,7 @@ impl Editor {
                 doc.server.inbounds.push(config::Inbound {
                     id: fields[0].clone(),
                     security_mode: Default::default(),
+                    reality: None,
                     allowed_user_ids: grants.clone(),
                     quic_listen: fields[1].clone(),
                     h2_listen: fields[1].clone(),
@@ -812,6 +813,7 @@ impl Editor {
                     server_name: fields[2].clone(),
                     auth_token: fields[4].clone(),
                     tls_profile: "default".into(),
+                    reality_profile: None,
                     xhttp_mode: Some(XhttpMode::Auto),
                     tls_ca: Some(fields[3].clone()),
                     transport: Transport::Auto,

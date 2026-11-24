@@ -55,6 +55,11 @@ fn load_file(
 }
 
 async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
+    if profile.tls_profile == "smart-reality" || profile.reality_profile.is_some() {
+        // The current carrier does not implement the external admission contract.
+        // Fail before any credential read, connection or system proxy change.
+        return Err(ClientError::Configuration);
+    }
     let cert = load_file(
         profile
             .tls_ca

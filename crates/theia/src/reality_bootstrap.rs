@@ -622,6 +622,14 @@ impl Profile {
         Ok(secret)
     }
 
+    pub fn endpoint(&self) -> &str { &self.endpoint }
+    pub fn policy(&self) -> ClientPolicy {
+        ClientPolicy { transport: self.transport, xhttp_mode: self.xhttp_mode }
+    }
+    pub fn enrollment_identity(&self) -> Result<[u8; 32], Error> {
+        Ok(fingerprint(key(&self.public_key)?))
+    }
+
     pub fn credential_reference(&self) -> &str {
         &self.auth_token
     }
