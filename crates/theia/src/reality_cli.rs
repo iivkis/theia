@@ -10,6 +10,8 @@ use crate::{
 use std::path::Path;
 
 pub const HELP: &str = "REALITY provisioning candidate; runtime UNCHANGED. All paths absolute.\n\
+theia reality provision-preview --health PATH\n\
+theia reality provision-apply --health PATH --output NEW_DIRECTORY --health-sha256 HEX --confirm\n\
 theia reality admission-new --inbound ID --endpoint HOST:PORT --key PATH --confirm\n\
 theia reality admission-check --inbound ID --endpoint HOST:PORT --key PATH\n\
 theia reality identity-new --inbound ID --endpoint HOST:PORT --key PATH --confirm\n\
@@ -38,6 +40,8 @@ Identity SHA-256 must be obtained independently. Import never changes active pro
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    ProvisionPreview { health: String },
+    ProvisionApply { health: String, output: String, digest: [u8; 32] },
     Admission {
         inbound: String,
         endpoint: String,
@@ -170,6 +174,8 @@ fn hex(bytes: [u8; 32]) -> String {
 
 pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
     Ok(match args {
+        ["provision-preview", "--health", h] => Command::ProvisionPreview { health: path(h)? },
+        ["provision-apply", "--health", h, "--output", o, "--health-sha256", d, "--confirm"] => Command::ProvisionApply { health: path(h)?, output: path(o)?, digest: hash(d)? },
         ["admission-new", "--inbound", i, "--endpoint", e, "--key", k, "--confirm"]
             if config::valid_id(i) && config::valid_remote(e) =>
         {
@@ -385,6 +391,16 @@ fn publication_status(
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
+        Command::ProvisionPreview { health } => {
+            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?.inspect().map_err(|_| Error::Health)?;
+            let preview = crate::reality_provision::preview(&state, now)?;
+            Ok(format!("Initial provisioning preview; runtime UNCHANGED\nhealth_sha256={}\nplan_sha256={}\n{}", hex(preview.health_sha256), hex(preview.plan_sha256), state.plan().preview().map_err(|_| Error::Health)?))
+        }
+        Command::ProvisionApply { health, output, digest } => {
+            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?.inspect().map_err(|_| Error::Health)?;
+            let record = crate::reality_provision::create(&state, digest, Path::new(&output), now)?;
+            Ok(format!("Private candidate bundle created; runtime UNCHANGED\nidentity_sha256={}\npublication_sha256={}", hex(record.identity_sha256), hex(record.publication_sha256)))
+        }
         Command::Admission { inbound, endpoint, key, create } => {
             let scope = Scope { inbound, endpoint };
             if create {

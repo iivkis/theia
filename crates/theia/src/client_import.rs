@@ -188,7 +188,7 @@ impl Drop for PrivateBearer {
 }
 
 #[cfg(unix)]
-fn new_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn new_private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
@@ -300,7 +300,7 @@ mod private_windows {
 }
 
 #[cfg(windows)]
-fn new_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn new_private_directory(path: &Path) -> io::Result<()> {
     private_windows::directory(path)
 }
 #[cfg(windows)]
@@ -309,7 +309,7 @@ pub(crate) fn new_private_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn new_private_directory(_: &Path) -> io::Result<()> {
+pub(crate) fn new_private_directory(_: &Path) -> io::Result<()> {
     Err(io::Error::other("unsupported platform"))
 }
 #[cfg(not(any(unix, windows)))]

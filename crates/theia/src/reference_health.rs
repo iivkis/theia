@@ -556,6 +556,16 @@ impl State {
         Ok(digest(&self.encode()?))
     }
 
+    /// Initial provisioning requires recent observations, not merely the
+    /// periodic monitoring inventory's ordinary lifetime.
+    pub fn provisioning_ready(&self, now: u64) -> Result<(), Error> {
+        if now.checked_sub(self.last_checked_at).ok_or(Error::Clock)? > 60 {
+            return Err(Error::NotEligible);
+        }
+        self.eligible_references(now)?;
+        Ok(())
+    }
+
     pub fn plan(&self) -> &Plan {
         &self.plan
     }
