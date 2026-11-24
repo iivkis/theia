@@ -460,15 +460,31 @@ impl H2Client {
         stream_up: bool,
         stage: &mut crate::split_http::HelloOutcome,
     ) -> Result<Tunnel, ClientError> {
-        let route = self.endpoint.parse().ok().and_then(crate::local_proxy::route_source);
-        let reusable = self.reuse_connections && self.certificate_pin.is_none()
+        let route = self
+            .endpoint
+            .parse()
+            .ok()
+            .and_then(crate::local_proxy::route_source);
+        let reusable = self.reuse_connections
+            && self.certificate_pin.is_none()
             && matches!(&self.connector, H2Tls::Rustls(_));
-        let mut lease = self.pool.acquire(route, stream_up, reusable,
-            |connection| !connection.driver.0.is_finished(),
-            self.connect_verified(operation)).await?;
+        let mut lease = self
+            .pool
+            .acquire(
+                route,
+                stream_up,
+                reusable,
+                |connection| !connection.driver.0.is_finished(),
+                self.connect_verified(operation),
+            )
+            .await?;
         let connection = lease.connection();
         let binding = connection.binding.as_ref();
-        let sender = connection.sender.lock().map_err(|_| ClientError::Http2)?.clone();
+        let sender = connection
+            .sender
+            .lock()
+            .map_err(|_| ClientError::Http2)?
+            .clone();
         let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
         let pair_id = lease.id();
         // Bearer is sent only on a verified connection.
@@ -478,7 +494,12 @@ impl H2Client {
                 .send_request(
                     crate::channel_binding::attach(
                         binding,
-                        split_http::request(&self.uri, Leg::Download, &self.authorization, pair_id)?,
+                        split_http::request(
+                            &self.uri,
+                            Leg::Download,
+                            &self.authorization,
+                            pair_id,
+                        )?,
                     )?,
                     true,
                 )
@@ -513,10 +534,7 @@ impl H2Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let (response, tx) = sender
-                .send_request(
-                    crate::channel_binding::attach(binding, request)?,
-                    false,
-                )
+                .send_request(crate::channel_binding::attach(binding, request)?, false)
                 .map_err(|_| ClientError::Http2)?;
             (response.await.map_err(|_| ClientError::Http2)?, tx)
         };
@@ -601,7 +619,12 @@ impl H2Client {
             Frame::OpenOk if state.tunnel_open() => {
                 lease.admitted();
                 Ok(Tunnel {
-                    operation, incoming, outgoing, decoder, state, _lease: lease,
+                    operation,
+                    incoming,
+                    outgoing,
+                    decoder,
+                    state,
+                    _lease: lease,
                 })
             }
             Frame::OpenError(code) => {

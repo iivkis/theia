@@ -300,12 +300,23 @@ impl H3Client {
     ) -> Result<H3Tunnel, ClientError> {
         let route = crate::local_proxy::route_source(self.remote);
         let reusable = self.reuse_connections && self.certificate_pin.is_none();
-        let mut lease = self.pool.acquire(route, stream_up, reusable,
-            |connection| !connection.driver.0.is_finished(),
-            self.connect_verified(operation)).await?;
+        let mut lease = self
+            .pool
+            .acquire(
+                route,
+                stream_up,
+                reusable,
+                |connection| !connection.driver.0.is_finished(),
+                self.connect_verified(operation),
+            )
+            .await?;
         let connection = lease.connection();
         let binding = connection.binding.as_ref();
-        let mut sender = connection.sender.lock().map_err(|_| ClientError::Http3)?.clone();
+        let mut sender = connection
+            .sender
+            .lock()
+            .map_err(|_| ClientError::Http3)?
+            .clone();
         let pair_id = lease.id();
         let (response, mut tx, mut rx) = if stream_up {
             use crate::split_http::{self, Leg};
@@ -439,7 +450,12 @@ impl H3Client {
             Frame::OpenOk if state.tunnel_open() => {
                 lease.admitted();
                 Ok(H3Tunnel {
-                    operation, tx, rx, decoder, state, _lease: lease,
+                    operation,
+                    tx,
+                    rx,
+                    decoder,
+                    state,
+                    _lease: lease,
                 })
             }
             Frame::OpenError(code) => {

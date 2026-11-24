@@ -39,7 +39,10 @@ fn proof<T>(key: &Key, request: &Request<T>) -> Option<HeaderValue> {
         context.update(&length.to_be_bytes());
         context.update(value);
     }
-    if request.headers().contains_key(crate::split_http::PAIR_HEADER) {
+    if request
+        .headers()
+        .contains_key(crate::split_http::PAIR_HEADER)
+    {
         let id = crate::split_http::pair_id(request)?;
         context.update(&4u32.to_be_bytes());
         context.update(&id.to_be_bytes());

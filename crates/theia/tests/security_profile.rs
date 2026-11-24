@@ -685,19 +685,43 @@ async fn pooled_own_tls_h2_h3_keep_parallel_tunnels_independent() {
                 let (mut left, left_local) = tokio::io::duplex(4096);
                 let (mut right, right_local) = tokio::io::duplex(4096);
                 let (a, b) = if h3 {
-                    let client = H3Client::new(fixture.h3, "localhost", &token, fixture.roots.clone())
-                        .unwrap().with_stream_up(split).unwrap().with_connection_pool();
+                    let client =
+                        H3Client::new(fixture.h3, "localhost", &token, fixture.roots.clone())
+                            .unwrap()
+                            .with_stream_up(split)
+                            .unwrap()
+                            .with_connection_pool();
                     let a = client.open(address.clone(), port).await.unwrap();
                     let b = client.open(address.clone(), port).await.unwrap();
-                    assert!(a.shares_transport_with(&b), "both tunnels must use the same verified carrier");
-                    (tokio::spawn(a.relay(left_local)), tokio::spawn(b.relay(right_local)))
+                    assert!(
+                        a.shares_transport_with(&b),
+                        "both tunnels must use the same verified carrier"
+                    );
+                    (
+                        tokio::spawn(a.relay(left_local)),
+                        tokio::spawn(b.relay(right_local)),
+                    )
                 } else {
-                    let client = H2Client::new(&fixture.h2.to_string(), "localhost", &token, fixture.roots.clone())
-                        .unwrap().with_stream_up(split).unwrap().with_connection_pool();
+                    let client = H2Client::new(
+                        &fixture.h2.to_string(),
+                        "localhost",
+                        &token,
+                        fixture.roots.clone(),
+                    )
+                    .unwrap()
+                    .with_stream_up(split)
+                    .unwrap()
+                    .with_connection_pool();
                     let a = client.open(address.clone(), port).await.unwrap();
                     let b = client.open(address.clone(), port).await.unwrap();
-                    assert!(a.shares_transport_with(&b), "both tunnels must use the same verified carrier");
-                    (tokio::spawn(a.relay(left_local)), tokio::spawn(b.relay(right_local)))
+                    assert!(
+                        a.shares_transport_with(&b),
+                        "both tunnels must use the same verified carrier"
+                    );
+                    (
+                        tokio::spawn(a.relay(left_local)),
+                        tokio::spawn(b.relay(right_local)),
+                    )
                 };
                 let (mut first, _) = target.accept().await.unwrap();
                 let (mut second, _) = target.accept().await.unwrap();
@@ -722,5 +746,7 @@ async fn pooled_own_tls_h2_h3_keep_parallel_tunnels_independent() {
                 b.await.unwrap().unwrap();
             }
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

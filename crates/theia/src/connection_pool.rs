@@ -5,7 +5,10 @@ use crate::client::ClientError;
 use std::{
     future::Future,
     net::SocketAddr,
-    sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -36,9 +39,15 @@ pub(crate) struct Lease<C> {
     admitted: bool,
 }
 impl<C> Lease<C> {
-    pub(crate) fn connection(&self) -> &C { &self.entry.connection }
-    pub(crate) fn id(&self) -> u32 { self.id }
-    pub(crate) fn admitted(&mut self) { self.admitted = true; }
+    pub(crate) fn connection(&self) -> &C {
+        &self.entry.connection
+    }
+    pub(crate) fn id(&self) -> u32 {
+        self.id
+    }
+    pub(crate) fn admitted(&mut self) {
+        self.admitted = true;
+    }
     pub(crate) fn shares_connection(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.entry, &other.entry)
     }
@@ -78,34 +87,55 @@ impl<C> Pool<C> {
         });
         if reusable && route.is_some() {
             for entry in entries.iter() {
-                if entry.split != split || entry.active.load(Ordering::Acquire) >= MAX_TUNNELS
-                    || entry.retired.load(Ordering::Acquire) {
+                if entry.split != split
+                    || entry.active.load(Ordering::Acquire) >= MAX_TUNNELS
+                    || entry.retired.load(Ordering::Acquire)
+                {
                     continue;
                 }
                 let id = entry.next_id.fetch_add(1, Ordering::AcqRel) as u32;
                 entry.active.fetch_add(1, Ordering::AcqRel);
-                return Ok(Lease { entry: entry.clone(), id, admitted: false });
+                return Ok(Lease {
+                    entry: entry.clone(),
+                    id,
+                    admitted: false,
+                });
             }
         }
         // Count draining connections as well as reusable ones; active
         // leases retain the permit even after their entry is evicted.
         if self.connections.available_permits() == 0 {
-            if let Some(index) = entries.iter().position(|entry| entry.active.load(Ordering::Acquire) == 0) {
+            if let Some(index) = entries
+                .iter()
+                .position(|entry| entry.active.load(Ordering::Acquire) == 0)
+            {
                 entries.remove(index);
             }
         }
-        let permit = self.connections.clone().try_acquire_owned()
+        let permit = self
+            .connections
+            .clone()
+            .try_acquire_owned()
             .map_err(|_| ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))?;
         let connection = create.await?;
         let entry = Arc::new(Entry {
-            connection, route, split, created: Instant::now(),
-            active: AtomicUsize::new(1), next_id: AtomicUsize::new(2),
-            retired: AtomicBool::new(false), _permit: permit,
+            connection,
+            route,
+            split,
+            created: Instant::now(),
+            active: AtomicUsize::new(1),
+            next_id: AtomicUsize::new(2),
+            retired: AtomicBool::new(false),
+            _permit: permit,
         });
         if reusable && route.is_some() {
             entries.push(entry.clone());
         }
-        Ok(Lease { entry, id: 1, admitted: false })
+        Ok(Lease {
+            entry,
+            id: 1,
+            admitted: false,
+        })
     }
 }
 
@@ -116,22 +146,47 @@ mod tests {
     async fn scope_retirement_and_capacity_keep_live_leases() {
         let pool = Pool::default();
         let route = Some("127.0.0.1:0".parse().unwrap());
-        let mut a = pool.acquire(route, true, true, |_| true, async { Ok(1) }).await.unwrap();
+        let mut a = pool
+            .acquire(route, true, true, |_| true, async { Ok(1) })
+            .await
+            .unwrap();
         a.admitted();
-        let b = pool.acquire(route, true, true, |_| true, async { Ok(2) }).await.unwrap();
-        assert_eq!((*a.connection(), *b.connection(), a.id(), b.id()), (1, 1, 1, 2));
+        let b = pool
+            .acquire(route, true, true, |_| true, async { Ok(2) })
+            .await
+            .unwrap();
+        assert_eq!(
+            (*a.connection(), *b.connection(), a.id(), b.id()),
+            (1, 1, 1, 2)
+        );
         drop(b);
-        let mut c = pool.acquire(route, true, true, |_| true, async { Ok(3) }).await.unwrap();
+        let mut c = pool
+            .acquire(route, true, true, |_| true, async { Ok(3) })
+            .await
+            .unwrap();
         c.admitted();
         assert_eq!((*a.connection(), *c.connection()), (1, 3));
-        let mut d = pool.acquire(route, false, true, |_| true, async { Ok(4) }).await.unwrap();
+        let mut d = pool
+            .acquire(route, false, true, |_| true, async { Ok(4) })
+            .await
+            .unwrap();
         d.admitted();
         assert_eq!(*d.connection(), 4);
         let other = Some("127.0.0.2:0".parse().unwrap());
-        let e = pool.acquire(other, true, true, |_| true, async { Ok(5) }).await.unwrap();
+        let e = pool
+            .acquire(other, true, true, |_| true, async { Ok(5) })
+            .await
+            .unwrap();
         assert_eq!(*e.connection(), 5);
-        assert!(matches!(pool.acquire(other, false, true, |_| true, async { Ok(6) }).await, Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))));
+        assert!(matches!(
+            pool.acquire(other, false, true, |_| true, async { Ok(6) })
+                .await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))
+        ));
         drop(a);
-        assert!(pool.acquire(other, false, true, |_| true, async { Ok(6) }).await.is_ok());
+        assert!(pool
+            .acquire(other, false, true, |_| true, async { Ok(6) })
+            .await
+            .is_ok());
     }
 }

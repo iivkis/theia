@@ -238,7 +238,10 @@ impl<T> Pair<T> {
                 }
                 return None;
             }
-            if states.values().filter(|state| matches!(state, State::Waiting(..))).count()
+            if states
+                .values()
+                .filter(|state| matches!(state, State::Waiting(..)))
+                .count()
                 >= MAX_PENDING_PAIRS
             {
                 // Burn rejected IDs too, so a late leg cannot be reassociated.
@@ -304,10 +307,21 @@ mod tests {
 
     #[test]
     fn pair_id_is_canonical_and_single() {
-        for (value, expected) in [("1", Some(1)), ("1024", Some(1024)), ("0", None), ("01", None), ("+1", None), ("1025", None)] {
-            let mut req = Request::builder().header(PAIR_HEADER, value).body(()).unwrap();
+        for (value, expected) in [
+            ("1", Some(1)),
+            ("1024", Some(1024)),
+            ("0", None),
+            ("01", None),
+            ("+1", None),
+            ("1025", None),
+        ] {
+            let mut req = Request::builder()
+                .header(PAIR_HEADER, value)
+                .body(())
+                .unwrap();
             assert_eq!(pair_id(&req), expected);
-            req.headers_mut().append(PAIR_HEADER, HeaderValue::from_static("1"));
+            req.headers_mut()
+                .append(PAIR_HEADER, HeaderValue::from_static("1"));
             assert_eq!(pair_id(&req), None);
         }
         assert_eq!(pair_id(&Request::new(())), None);
@@ -368,7 +382,10 @@ mod tests {
         assert_eq!(pair.join(1, Leg::Download, 3).await, None);
         let left = Pair::new();
         let right = Pair::new();
-        let (a, b) = tokio::join!(left.join(1, Leg::Upload, 1), right.join(1, Leg::Download, 2));
+        let (a, b) = tokio::join!(
+            left.join(1, Leg::Upload, 1),
+            right.join(1, Leg::Download, 2)
+        );
         assert_eq!((a, b), (None, None));
     }
 }

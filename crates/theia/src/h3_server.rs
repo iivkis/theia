@@ -279,7 +279,8 @@ async fn handle_split_request(
         reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
         return;
     };
-    let Some(((upload, mut up), (download, mut down))) = pair.join(id, leg, (request, stream)).await
+    let Some(((upload, mut up), (download, mut down))) =
+        pair.join(id, leg, (request, stream)).await
     else {
         return;
     };
