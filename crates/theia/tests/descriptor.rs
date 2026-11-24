@@ -243,7 +243,9 @@ fn durable_revision_floor_rejects_rollback_equivocation_and_key_substitution_aft
         reopened.update(&descriptor::sign(&substituted, &successor).unwrap(), 220),
         Error::Signature,
     );
-    assert_eq!(fs::read_to_string(&path).unwrap(), next);
+    let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["current"].as_str(), Some(next.as_str()));
+    assert_eq!(saved["transitions"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -285,7 +287,8 @@ fn concurrent_signed_updates_never_publish_a_lower_revision_over_a_higher_one() 
         assert_eq!(store.update(&third, 120).unwrap(), Change::Advanced);
     }
     assert_error(store.update(&second, 120), Error::Rollback);
-    assert_eq!(fs::read_to_string(&path).unwrap(), third);
+    let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["current"].as_str(), Some(third.as_str()));
 }
 
 #[test]
@@ -300,4 +303,103 @@ fn initialization_never_overwrites_corrupt_or_unrelated_local_state() {
     assert_error(store.initialize(&signed, 120), Error::Storage);
     assert!(store.update(&signed, 120).is_err());
     assert_eq!(fs::read(&path).unwrap(), b"unrelated");
+}
+
+fn public(key: &Ed25519KeyPair) -> [u8; 32] {
+    key.public_key().as_ref().try_into().unwrap()
+}
+
+#[test]
+fn explicit_rotation_survives_restart_and_retires_previous_signers() {
+    let temp = Scratch::new();
+    let path = temp.0.join("trust.toml");
+    let root = key();
+    let next = key();
+    let third = key();
+    let mut initial = fixture(1);
+    initial.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&next)));
+    let pinned = anchor(&initial, &root);
+    let store = Store::new(&path, pinned.clone()).unwrap();
+    store.initialize(&descriptor::sign(&initial, &root).unwrap(), 120).unwrap();
+    let mut second = fixture(2);
+    second.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&third)));
+    let signed = descriptor::sign(&second, &next).unwrap();
+    let before = fs::read(&path).unwrap();
+    assert_error(store.update(&signed, 120), Error::Signature);
+    assert_error(store.promote(&signed, 2, public(&next), 120), Error::Rotation);
+    assert_error(store.promote(&signed, 1, public(&third), 120), Error::Rotation);
+    assert_error(store.promote(&descriptor::sign(&second, &root).unwrap(), 1, public(&next), 120), Error::Signature);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(store.promote(&signed, 1, public(&next), 120).unwrap(), Change::Advanced);
+    drop(store);
+    let reopened = Store::new(&path, pinned.clone()).unwrap();
+    assert_eq!(reopened.load(120).unwrap().signer(), public(&next));
+    assert_error(reopened.load(119), Error::Validity);
+    assert_error(reopened.update(&descriptor::sign(&fixture(3), &root).unwrap(), 130), Error::Signature);
+    let mut retired = fixture(3);
+    retired.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&root)));
+    assert_error(reopened.update(&descriptor::sign(&retired, &next).unwrap(), 130), Error::Rotation);
+    let final_signed = descriptor::sign(&fixture(4), &third).unwrap();
+    assert_eq!(reopened.promote(&final_signed, 2, public(&third), 130).unwrap(), Change::Advanced);
+    drop(reopened);
+    let reopened = Store::new(&path, pinned).unwrap();
+    let current = reopened.load(130).unwrap();
+    assert_eq!(current.signer(), public(&third));
+    assert_eq!(current.descriptor().revision, 4);
+    assert_error(reopened.update(&descriptor::sign(&fixture(5), &next).unwrap(), 130), Error::Signature);
+}
+
+#[test]
+fn missed_overlap_requires_independent_enrollment_and_preserves_snapshot() {
+    let temp = Scratch::new();
+    let path = temp.0.join("trust.toml");
+    let root = key();
+    let next = key();
+    let mut first = fixture(1);
+    first.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&next)));
+    let store = Store::new(&path, anchor(&first, &root)).unwrap();
+    store.initialize(&descriptor::sign(&first, &root).unwrap(), 120).unwrap();
+    let before = fs::read(&path).unwrap();
+    let mut second = fixture(2);
+    second.not_before = 200;
+    second.not_after = 300;
+    let successor = descriptor::sign(&second, &next).unwrap();
+    assert_error(store.promote(&successor, 1, public(&next), 199), Error::Validity);
+    assert_error(store.promote(&successor, 1, public(&next), 200), Error::ReenrollmentRequired);
+    assert_error(store.load(200), Error::Validity);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    // Recovery must independently pin a new key, in a fresh store.
+    let fresh = Store::new(&temp.0.join("reenrolled.toml"), anchor(&second, &next)).unwrap();
+    fresh.initialize(&successor, 220).unwrap();
+    assert_eq!(fresh.load(220).unwrap().signer(), public(&next));
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn persisted_transition_tampering_is_rejected_without_partial_update() {
+    let temp = Scratch::new();
+    let path = temp.0.join("trust.toml");
+    let root = key();
+    let next = key();
+    let unrelated = key();
+    let mut initial = fixture(1);
+    initial.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&next)));
+    let pinned = anchor(&initial, &root);
+    let store = Store::new(&path, pinned.clone()).unwrap();
+    store.initialize(&descriptor::sign(&initial, &root).unwrap(), 120).unwrap();
+    let signed = descriptor::sign(&fixture(2), &next).unwrap();
+    store.promote(&signed, 1, public(&next), 120).unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    let mut forged: toml::Table = toml::from_str(&saved).unwrap();
+    let transitions = forged.get_mut("transitions").unwrap().as_array_mut().unwrap();
+    transitions[0].as_table_mut().unwrap().insert(
+        "successor".into(),
+        toml::Value::String(descriptor::sign(&fixture(2), &unrelated).unwrap()),
+    );
+    // Deliberately corrupt an already private fixture, not the product store.
+    fs::write(&path, toml::to_string(&forged).unwrap()).unwrap();
+    assert_error(Store::new(&path, pinned).unwrap().load(120), Error::Signature);
+    let corrupt = fs::read(&path).unwrap();
+    assert_error(store.update(&descriptor::sign(&fixture(3), &next).unwrap(), 130), Error::Signature);
+    assert_eq!(fs::read(&path).unwrap(), corrupt);
 }

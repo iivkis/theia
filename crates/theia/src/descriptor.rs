@@ -12,6 +12,9 @@ use std::{fmt, path::Path};
 
 pub const MAX_DOCUMENT: usize = 16 * 1024;
 const MAX_PAYLOAD: usize = 8 * 1024;
+/// Provisional local trust-history bounds, not negotiated wire parameters.
+const MAX_TRANSITIONS: usize = 8;
+const MAX_SNAPSHOT: usize = 512 * 1024;
 const SIGN_DOMAIN: &[u8] = b"SmartTheia/inbound-descriptor/v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +25,8 @@ pub enum Error {
     Validity,
     Rollback,
     Equivocation,
+    Rotation,
+    ReenrollmentRequired,
     Storage,
     Indeterminate,
 }
@@ -35,6 +40,8 @@ impl fmt::Display for Error {
             Self::Validity => "descriptor outside validity interval",
             Self::Rollback => "descriptor revision rollback",
             Self::Equivocation => "conflicting content at one descriptor revision",
+            Self::Rotation => "identity transition refused",
+            Self::ReenrollmentRequired => "independent enrollment required",
             Self::Storage => "trust snapshot storage refused",
             Self::Indeterminate => "trust snapshot publication uncertain; reopen before retry",
         })
@@ -236,6 +243,9 @@ impl Verified {
     pub fn descriptor(&self) -> &Descriptor {
         &self.descriptor
     }
+    pub fn signer(&self) -> [u8; 32] {
+        self.signer
+    }
     pub fn check_time(&self, now: u64) -> Result<(), Error> {
         if now < self.descriptor.not_before || now >= self.descriptor.not_after {
             return Err(Error::Validity);
@@ -303,9 +313,153 @@ pub fn verify(document: &str, anchor: &Anchor) -> Result<Verified, Error> {
     })
 }
 
+/// Each explicit transition retains both signed documents. History is
+/// validated from the independent enrollment root on EVERY reopen. No
+/// unsigned current-key field is trusted and retired keys are never reused.
+/// The local acceptance timestamp is not a remotely authenticated timestamp.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Transition {
+    announcement: String,
+    successor: String,
+    accepted_at: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Snapshot {
+    schema_version: u16,
+    current: String,
+    transitions: Vec<Transition>,
+}
+
+struct History {
+    anchor: Anchor,
+    retired: Vec<[u8; 32]>,
+    last_transition: u64,
+    floor: Option<Verified>,
+}
+
+impl History {
+    fn new(anchor: &Anchor) -> Self {
+        Self {
+            anchor: anchor.clone(),
+            retired: Vec::new(),
+            last_transition: 0,
+            floor: None,
+        }
+    }
+
+    fn check_clock(&self, now: u64) -> Result<(), Error> {
+        if now < self.last_transition {
+            return Err(Error::Validity);
+        }
+        Ok(())
+    }
+
+    fn check_retired(&self, verified: &Verified) -> Result<(), Error> {
+        if let Some(raw) = &verified.descriptor.next_identity {
+            let next = canonical_base64::<32>(raw)?;
+            if self.retired.contains(&next) {
+                return Err(Error::Rotation);
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_current(&self, document: &str) -> Result<Verified, Error> {
+        let current = verify(document, &self.anchor)?;
+        if let Some(floor) = &self.floor {
+            floor.compare(&current)?;
+        }
+        self.check_retired(&current)?;
+        Ok(current)
+    }
+
+    fn advance(
+        &mut self,
+        announcement: &Verified,
+        successor: &str,
+        expected_key: [u8; 32],
+        now: u64,
+    ) -> Result<Verified, Error> {
+        if self.retired.len() >= MAX_TRANSITIONS {
+            return Err(Error::ReenrollmentRequired);
+        }
+        self.check_clock(now)?;
+        if announcement.signer != self.anchor.public_key
+            || announcement.descriptor.scope != self.anchor.scope
+        {
+            return Err(Error::Scope);
+        }
+        if let Some(floor) = &self.floor {
+            floor.compare(announcement)?;
+        }
+        // The current identity must still be valid at the transition.
+        // A client that missed overlap cannot recover through an expired
+        // announcement or a key supplied by the untrusted successor alone.
+        announcement.check_time(now).map_err(|_| Error::ReenrollmentRequired)?;
+        let raw = announcement.descriptor.next_identity.as_ref().ok_or(Error::Rotation)?;
+        let next_key = canonical_base64::<32>(raw)?;
+        if next_key != expected_key
+            || next_key == self.anchor.public_key
+            || self.retired.contains(&next_key)
+        {
+            return Err(Error::Rotation);
+        }
+        let minimum = announcement.descriptor.revision.checked_add(1)
+            .ok_or(Error::ReenrollmentRequired)?;
+        let new_anchor = Anchor::new(self.anchor.scope.clone(), next_key, minimum)?;
+        let next = verify(successor, &new_anchor)?;
+        next.check_time(now)?;
+        if let Some(raw) = &next.descriptor.next_identity {
+            let proposed = canonical_base64::<32>(raw)?;
+            if proposed == self.anchor.public_key || self.retired.contains(&proposed) {
+                return Err(Error::Rotation);
+            }
+        }
+        self.retired.push(self.anchor.public_key);
+        self.anchor = new_anchor;
+        self.last_transition = now;
+        Ok(next)
+    }
+}
+
+impl Snapshot {
+    fn encode(&self) -> Result<String, Error> {
+        let encoded = toml::to_string(self).map_err(|_| Error::Format)?;
+        if encoded.len() > MAX_SNAPSHOT {
+            return Err(Error::Format);
+        }
+        Ok(encoded)
+    }
+
+    fn validate(&self, root: &Anchor) -> Result<(History, Verified), Error> {
+        if self.schema_version != 1 || self.transitions.len() > MAX_TRANSITIONS {
+            return Err(Error::Format);
+        }
+        let mut history = History::new(root);
+        for transition in &self.transitions {
+            let announcement = history.verify_current(&transition.announcement)?;
+            let raw = announcement.descriptor.next_identity.as_ref().ok_or(Error::Rotation)?;
+            let key = canonical_base64::<32>(raw)?;
+            let next = history.advance(
+                &announcement,
+                &transition.successor,
+                key,
+                transition.accepted_at,
+            )?;
+            history.floor = Some(next);
+        }
+        let current = history.verify_current(&self.current)?;
+        Ok((history, current))
+    }
+}
+
 /// Local-only store. The path must be absolute and its directory trusted.
 /// The independently pinned Anchor must survive restart outside this file.
-/// Local filesystem rollback by a privileged actor is not covered.
+/// Local filesystem rollback or timestamp manipulation by a privileged actor
+/// is not covered. This is a candidate for review, not a live trust adapter.
 pub struct Store {
     anchor: Anchor,
     path: std::path::PathBuf,
@@ -321,16 +475,18 @@ impl Store {
         })
     }
 
-    fn snapshot(&self) -> Result<(String, Verified), Error> {
-        let bytes = crate::bounded_input::read(&self.path, MAX_DOCUMENT as u64, true, true)
+    fn snapshot(&self) -> Result<(String, Snapshot, History, Verified), Error> {
+        let bytes = crate::bounded_input::read(&self.path, MAX_SNAPSHOT as u64, true, true)
             .map_err(|_| Error::Storage)?;
-        let document = std::str::from_utf8(&bytes).map_err(|_| Error::Format)?;
-        let verified = verify(document, &self.anchor)?;
-        Ok((document.to_owned(), verified))
+        let raw = std::str::from_utf8(&bytes).map_err(|_| Error::Format)?;
+        let snapshot: Snapshot = toml::from_str(raw).map_err(|_| Error::Format)?;
+        let (history, verified) = snapshot.validate(&self.anchor)?;
+        Ok((raw.to_owned(), snapshot, history, verified))
     }
 
     pub fn load(&self, now: u64) -> Result<Verified, Error> {
-        let (_, verified) = self.snapshot()?;
+        let (_, _, history, verified) = self.snapshot()?;
+        history.check_clock(now)?;
         verified.check_time(now)?;
         Ok(verified)
     }
@@ -340,21 +496,55 @@ impl Store {
     pub fn initialize(&self, document: &str, now: u64) -> Result<(), Error> {
         let next = verify(document, &self.anchor)?;
         next.check_time(now)?;
-        config::guarded_trust_write(&self.path, document, None).map_err(storage_error)
+        let snapshot = Snapshot {
+            schema_version: 1,
+            current: document.to_owned(),
+            transitions: Vec::new(),
+        };
+        config::guarded_trust_write(&self.path, &snapshot.encode()?, None).map_err(storage_error)
     }
 
-    /// Read/verify old and new, then CAS the entire signed snapshot. No
-    /// active runtime state is changed by this offline component.
+    /// Ordinary updates cannot change identity. Read/verify old and new,
+    /// then CAS the entire signed snapshot, including the immutable history.
     pub fn update(&self, document: &str, now: u64) -> Result<Change, Error> {
-        let (old, previous) = self.snapshot()?;
-        let next = verify(document, &self.anchor)?;
+        let (old, mut snapshot, history, previous) = self.snapshot()?;
+        history.check_clock(now)?;
+        let next = history.verify_current(document)?;
         next.check_time(now)?;
         let change = previous.compare(&next)?;
-        // Even idempotent updates check CAS, so concurrent advancement is
-        // not reported as an accepted stale state.
-        config::guarded_trust_write(&self.path, document, Some(old.as_bytes()))
+        snapshot.current = document.to_owned();
+        config::guarded_trust_write(&self.path, &snapshot.encode()?, Some(old.as_bytes()))
             .map_err(storage_error)?;
         Ok(change)
+    }
+
+    /// Explicit, revision-guarded normal rotation, NOT compromise recovery.
+    /// Caller must independently confirm the intended key and current
+    /// revision; never call from an automatic descriptor download.
+    /// Both signatures and both validity intervals must be verified before
+    /// publication. The current signer is retired only at the CAS commit.
+    pub fn promote(
+        &self,
+        successor: &str,
+        expected_revision: u64,
+        expected_key: [u8; 32],
+        now: u64,
+    ) -> Result<Change, Error> {
+        let (old, mut snapshot, mut history, previous) = self.snapshot()?;
+        if previous.descriptor.revision != expected_revision {
+            return Err(Error::Rotation);
+        }
+        history.advance(&previous, successor, expected_key, now)?;
+        snapshot.transitions.push(Transition {
+            announcement: std::mem::replace(&mut snapshot.current, successor.to_owned()),
+            successor: successor.to_owned(),
+            accepted_at: now,
+        });
+        // Re-verify the exact candidate from the independent root before CAS.
+        snapshot.validate(&self.anchor)?;
+        config::guarded_trust_write(&self.path, &snapshot.encode()?, Some(old.as_bytes()))
+            .map_err(storage_error)?;
+        Ok(Change::Advanced)
     }
 }
 fn storage_error(error: WriteFailure) -> Error {
