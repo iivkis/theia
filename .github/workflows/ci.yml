@@ -257,8 +257,12 @@ jobs:
           path: target/debug/theia
           if-no-files-found: error
           retention-days: 1
-      - name: Release compilation only after main merge
-        if: github.ref == 'refs/heads/main'
+      # Release artifacts are not published by CI and are not consumed by
+      # native or cross-host tests. Do not delay every main push for a second
+      # full optimized compilation; explicit workflow_dispatch runs still
+      # verify the real release profile on both operating systems.
+      - name: Manual release compilation (Linux)
+        if: github.event_name == 'workflow_dispatch'
         run: cargo build --workspace --release --locked
       - name: Upload sanitized trace logs on CI failure
         if: failure()
@@ -368,8 +372,12 @@ jobs:
             ${{ runner.temp }}/theia.exe
           if-no-files-found: error
           retention-days: 1
-      - name: Native Windows release compilation only after main merge
-        if: github.ref == 'refs/heads/main'
+      # Release artifacts are not published by CI and are not consumed by
+      # native or cross-host tests. Do not delay every main push for a second
+      # full optimized compilation; explicit workflow_dispatch runs still
+      # verify the real release profile on both operating systems.
+      - name: Manual release compilation (Windows)
+        if: github.event_name == 'workflow_dispatch'
         run: cargo build --workspace --release --locked
       - name: Upload sanitized trace logs on CI failure
         if: failure()

@@ -105,6 +105,23 @@ require('CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in windows
 require("CARGO_PROFILE_RELEASE_DEBUG" not in windows,
         "release profile must remain unchanged by the test-only optimization")
 
+# Optimized release artifacts are neither published nor used by any acceptance
+# job. Keep the costly compilation available when explicitly requested, never
+# silently run it on every main push/PR or remove the manual safety check.
+require("  workflow_dispatch:" in workflow,
+        "manual CI entrypoint must remain available for release compilation")
+for os, payload in (("Linux", job("rust-tests")), ("Windows", windows)):
+    require(re.search(
+        rf"(?m)^      - name: Manual release compilation \({os}\)\n"
+        r"        if: github.event_name == 'workflow_dispatch'\n"
+        r"        run: cargo build --workspace --release --locked$",
+        payload,
+    ) is not None, f"{os}: optimized release build must be manual and unmodified")
+    require("github.ref == 'refs/heads/main'" not in payload,
+            f"{os}: do not rebuild an unused release binary on each main push")
+require(workflow.count("run: cargo build --workspace --release --locked") == 2,
+        "only the two explicitly requested release compilations may exist")
+
 require("Real Windows live Theia H2 fingerprint vs pinned Go uTLS" in windows
         and "cargo test --workspace --locked --test fingerprint_h2" in windows,
         "Windows fingerprint must reuse the previously compiled root workspace")

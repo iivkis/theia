@@ -115,3 +115,38 @@ Next bottlenecks: pinned Go 1.24 setup (~20–30 s on Windows), actual
 second-user SID test and WSL2 guest provisioning (~50 s), both of which must
 retain native/security correctness. Do not replace these with mocks or
 unverified reusable fixtures just to reduce reported CI time.
+
+## Remove unused release compilation from ordinary CI (PR pending)
+
+The optimized `cargo build --workspace --release --locked` had been executed
+**on every main push**, twice, at the *end* of `rust-tests` (Linux) and
+`windows-smoke` (Windows). Neither release binary was uploaded or consumed
+by any CI/security/E2E job. The real F-14 Linux VM → native Windows client
+acceptance explicitly consumes **debug/dev native compiled binaries** from
+the two mandatory native jobs; releasing another optimized copy after those
+tests only delayed the Windows prerequisite and burned runner time.
+
+In [main run 45337912142](https://github.com/iivkis/theia/actions/runs/45337912142),
+the last Linux release-build step ran approximately **17 s** and the Windows
+release-build step approximately **257 s** (timestamped GitHub Actions logs).
+The main push workflow took ~807 s including queues and cross-host E2E; its
+Windows smoke job ran ~691 s, including a cold Cargo cache. These observations
+are not a forecast for future warm-cache runs.
+
+**New default:** PRs and pushes to `main` perform **all** mandatory native
+Linux/Windows tests, pinned Go uTLS comparisons, Rustfmt/Clippy, SID-DACL,
+WinINet CAS, real terminal tests, browser/BBR/BoringSSL matrix, cross-host
+WSL2 H2/H3 and the fail-closed `ci-gate`. They do **not** recompile unused
+release-mode binaries after all those checks.
+
+**When explicitly needed:** GitHub Actions → `CI (tests first)` →
+`Run workflow` (`workflow_dispatch`) still runs **the entire native
+matrix and both Linux/Windows optimized release builds** for the selected
+ref. Those manual builds are compile checks, not deployable artifacts, and
+do not by themselves certify production release readiness. GitHub Actions
+is still the only required execution environment; no local Rust toolchain
+is necessary.
+
+The CI DAG regression guard asserts exact manual-only conditions for
+both release-build steps, preventing a later edit from silently restoring
+the main-push expense or dropping release compile checks entirely.
