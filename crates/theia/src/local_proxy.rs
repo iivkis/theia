@@ -214,6 +214,7 @@ enum RealityCarrier {
 struct RealityGeneration {
     value: crate::descriptor::Verified,
     carrier: RealityCarrier,
+    credential_digest: [u8;32],
 }
 struct RealityClient {
     profile: Profile,
@@ -259,12 +260,19 @@ impl RealityClient {
             (None,Some(h3)) => RealityCarrier::H3(h3),
             _ => return Err(ClientError::Configuration),
         };
-        Ok(RealityGeneration { value, carrier })
+        use sha2::{Digest, Sha256};
+        let credential_digest = Sha256::digest(token.as_bytes()).into();
+        Ok(RealityGeneration { value, carrier, credential_digest })
     }
     async fn generation(&self) -> Result<Arc<RealityGeneration>, ClientError> {
         let mut slot = self.current.lock().await;
         let enrollment = crate::reality_config::pinned_client(&self.profile).map_err(|_| ClientError::Configuration)?;
         let value = enrollment.load(Self::now()?).map_err(|_| ClientError::Tls)?;
+        use sha2::{Digest,Sha256};
+        let credential_digest: [u8;32] = Sha256::digest(read_token(&self.profile)?.as_bytes()).into();
+        if credential_digest != slot.credential_digest {
+            return Err(ClientError::Configuration);
+        }
         let old = &slot.value;
         if old.descriptor().scope != value.descriptor().scope
             || value.descriptor().revision < old.descriptor().revision { return Err(ClientError::Tls); }
@@ -1496,6 +1504,7 @@ mod selector_tests {
             tls_cert: "unused".into(),
             tls_key: "unused".into(),
             security_mode: Default::default(),
+            reality: None,
         };
         let user = User {
             id: "client".into(),

@@ -121,7 +121,7 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
                 server_name: host.to_owned(),
                 tls_cert: String::new(), tls_key: String::new(),
             });
-            let report = format!("Register REALITY inbound (saved configuration only)\ninbound={}\nendpoint={}\nlisten={}\ngrants={}\nidentity_sha256={}\n{}\nExisting runtime remains unchanged. Current backend refuses REALITY activation; do not restart into this record until backend support exists.",
+            let report = format!("Register REALITY inbound (saved configuration only)\ninbound={}\nendpoint={}\nlisten={}\ngrants={}\nidentity_sha256={}\n{}\nExisting runtime remains unchanged. Startup uses the registered generation; live changes require a separate supported activation operation.",
                 record.scope.inbound, record.scope.endpoint, r.listen, r.grants.join(","),
                 hex(record.identity_sha256), state.report(now).map_err(|_| Error::Health)?);
             (report, record.publication_sha256)
@@ -150,7 +150,7 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
                 quic_connect_timeout_ms: 1600, quic_negative_cache_ttl_s: 900,
             });
             let modes = value.effective_modes();
-            let report = format!("Register REALITY profile (saved configuration only)\nprofile={}\nendpoint={}\nidentity_sha256={}\nrevision={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nActive profile and proxy remain unchanged. Current backend refuses REALITY activation.",
+            let report = format!("Register REALITY profile (saved configuration only)\nprofile={}\nendpoint={}\nidentity_sha256={}\nrevision={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nActive profile and proxy remain unchanged. Selected profile can be started after preflight; the current process is unchanged.",
                 r.id, profile.endpoint(), hex(bootstrap::fingerprint(value.signer())), value.descriptor().revision,
                 modes.h2, modes.h3, modes.stream_one, modes.stream_up);
             (report, value.payload_sha256())
