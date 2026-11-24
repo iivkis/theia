@@ -185,3 +185,38 @@ fn quiet_trace_keeps_failures_and_off_overrides_detailed_mode() {
     assert!(output.status.success());
     assert!(!dir.exists());
 }
+
+#[test]
+fn default_info_and_explicit_debug_filter_real_client_preflight() {
+    let root = isolated_dir();
+    fs::create_dir(&root).unwrap();
+    let config = root.join("client.toml");
+    let missing = "THEIA_DIAGNOSTICS_TEST_MISSING_BEARER";
+    let source = include_str!("../../../examples/client.toml").replace("THEIA_AUTH_TOKEN", missing);
+    fs::write(&config, source).unwrap();
+    for (name, debug) in [("default", false), ("debug", true), ("trace", true)] {
+        let dir = root.join(name);
+        let mut process = Command::new(env!("CARGO_BIN_EXE_theia"));
+        process
+            .args(["client", "run", "--config"])
+            .arg(&config)
+            .env_remove(missing)
+            .env_remove("THEIA_TRACE_OFF")
+            .env_remove("THEIA_TRACE_LEVEL")
+            .env("THEIA_TRACE_DIR", &dir);
+        if name != "default" {
+            process.env("THEIA_TRACE_LEVEL", name);
+        }
+        let output = process.output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let log = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let content = fs::read_to_string(log).unwrap();
+        assert!(content.contains("level=ERROR component=process event=failed"));
+        assert_eq!(
+            content.contains("level=DEBUG component=client.proxy event=config_valid"),
+            debug
+        );
+        assert!(!content.contains(missing));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
