@@ -400,6 +400,20 @@ async fn h2_tls_rejects_missing_bearer_before_smarttheia() {
         let (response_future, _) = sender.send_request(req, true).unwrap();
         let response = response_future.await.unwrap();
         assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+        assert!(response.into_body().data().await.is_none());
+
+        sender = sender.ready().await.unwrap();
+        let wrong = format!("Bearer {}", URL_SAFE_NO_PAD.encode([0x7e; 32]));
+        let (response_future, _) = sender.send_request(request(&wrong), true).unwrap();
+        let response = response_future.await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+        assert!(response.into_body().data().await.is_none());
+
+        // HTTP 200 acknowledges headers, not an OPEN_OK or TCP relay.
+        sender = sender.ready().await.unwrap();
+        let (response_future, _tx) = sender.send_request(request(&bearer()), false).unwrap();
+        let response = response_future.await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
         driver.abort();
         server.abort();
     })

@@ -34,6 +34,12 @@
 
 Не меняются TLS verifier, TOML/invite v1, runtime, proxy или grants. Не доказаны TLS resumption/0-RTT, persistent/distributed replay, anti-probing, browser fingerprint или REALITY mode. Приёмка: exact-head native Linux/Windows CI и `ci-gate`; до успешного CI результат не подтверждён.
 
+## M3.5a5 — реальный H2 DATA identity proof и отрицательные проверки (CI-only)
+
+[ADR-0062](adr/0062-f18-m3-5a5-h2-data-identity.md) дополняет H3 DATA из ADR-0060: отдельный loopback TLS1.3/H2 fixture с реальными HTTP/2 DATA и ограниченным телом сообщения проверяет short/oversized/zero challenge, затем валидный fragmented challenge на том же соединении. Проверка pinned Ed25519 proof использует локально вычисленный TLS exporter; неправильный pin, transport, повреждённая подпись и replay отвергаются. Production H2 regression отдельно требует HTTP 401 с пустым телом при отсутствии/ошибке bearer и HTTP 200 при верном bearer до HELLO/OPEN_OK. Это свидетельство обычной авторизации, не защита от active probing.
+
+Никаких изменений runtime, TLS verifier, TOML/invite, proxy или внешних сетевых целей. M3.5a5 не доказывает modified handshake, browser fingerprint, anti-probing, key lifecycle или самостоятельный security audit. До зелёного CI результат не подтверждён.
+
 ## M3.5b1 — чистый offline planner кандидатов (реализован частично)
 
 Файл `crates/theia/src/camouflage_discovery.rs`, integration tests `crates/theia/tests/camouflage_discovery.rs`, ADR-0022. Код в текущем *едином* Rust binary (library module) без новых зависимостей, не имеет ни socket/DNS/HTTP/TLS вызовов, ни CLI/TUI команды:
