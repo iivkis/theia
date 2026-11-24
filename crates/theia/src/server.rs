@@ -973,27 +973,24 @@ async fn handle_frames(
         state
             .apply(Direction::Receive, &hello)
             .map_err(|_| ServerError::Protocol)?;
-        send_frame(
-            outgoing,
-            &Frame::HelloAck {
-                version: protocol::VERSION,
-                accepted_capabilities: 0,
-            },
-        )
-        .await?;
-        state
-            .apply(
-                Direction::Send,
-                &Frame::HelloAck {
-                    version: protocol::VERSION,
-                    accepted_capabilities: 0,
-                },
-            )
-            .map_err(|_| ServerError::Protocol)?;
-        let open = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
-        state
-            .apply(Direction::Receive, &open)
-            .map_err(|_| ServerError::Protocol)?;
+        let Frame::Hello { capabilities, .. } = hello else {
+            return Err(ServerError::Protocol);
+        };
+        let ack = Frame::HelloAck {
+            version: protocol::VERSION,
+            accepted_capabilities: capabilities & protocol::CAP_PADDING,
+        };
+        state.apply(Direction::Send, &ack).map_err(|_| ServerError::Protocol)?;
+        send_frame(outgoing, &ack).await?;
+        let open = loop {
+            let frame = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
+            state.apply(Direction::Receive, &frame).map_err(|_| ServerError::Protocol)?;
+            if matches!(frame, Frame::Padding(_)) {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            break frame;
+        };
         let Frame::OpenTcp { address, port } = open else {
             return Err(ServerError::Protocol);
         };
@@ -1009,6 +1006,21 @@ async fn handle_frames(
         "session" = Value::Count(session_id)
     );
     let dial = tokio::select! {
+        biased;
+        next = async {
+            loop {
+                match decoder.next(incoming).await? {
+                    Some(frame @ Frame::Padding(_)) => {
+                        state.apply(Direction::Receive, &frame).map_err(|_| ServerError::Protocol)?;
+                        tokio::task::yield_now().await;
+                    }
+                    _ => return Err::<(), ServerError>(ServerError::Protocol),
+                }
+            }
+        } => {
+            next?;
+            return Err(ServerError::Protocol);
+        }
         result = context.dial_target(&address, port) => result,
         _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
             return Err(ServerError::Http2);
@@ -1073,6 +1085,7 @@ async fn relay_tcp(
                 .apply(Direction::Receive, &frame)
                 .map_err(|_| ServerError::Protocol)?;
             match frame {
+                Frame::Padding(_) => tokio::task::yield_now().await,
                 Frame::Data(data) => {
                     crate::diag!(
                         Trace,
@@ -1098,7 +1111,7 @@ async fn relay_tcp(
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
-                    activity.fin();
+                    activity.half_closed();
                     break;
                 }
                 Frame::Abort(_) => return Err(ServerError::Http2),
@@ -1108,7 +1121,20 @@ async fn relay_tcp(
         // FIN half-closes TCP upload, not the HTTP request itself. Keep
         // watching for reset, trailing frames or request EOF while downloading.
         let tail = crate::relay_liveness::receive_tail(
-            decoder.next(incoming),
+            async {
+                loop {
+                    let frame = decoder.next(incoming).await?;
+                    if let Some(padding @ Frame::Padding(_)) = &frame {
+                        if activity.both_finished() {
+                            return Err(ServerError::Protocol);
+                        }
+                        rx_state.apply(Direction::Receive, padding).map_err(|_| ServerError::Protocol)?;
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    return Ok(frame);
+                }
+            },
             download_finished,
             ServerError::TimedOut,
         )
@@ -1149,7 +1175,7 @@ async fn relay_tcp(
                 .await
                 .map_err(|_| ServerError::TimedOut)??;
             if size == 0 {
-                activity.fin();
+                activity.half_closed();
                 let _ = download_done.send(());
                 return Ok::<(), ServerError>(());
             }

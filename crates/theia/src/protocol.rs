@@ -6,6 +6,7 @@ use std::net::IpAddr;
 pub const HEADER_LEN: usize = 6;
 pub const MAX_PAYLOAD: usize = 65_536;
 pub const VERSION: u16 = 1;
+pub const CAP_PADDING: u32 = 0x1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -81,6 +82,7 @@ pub enum Frame {
     Data(Vec<u8>),
     Fin,
     Abort(ErrorCode),
+    Padding(Vec<u8>),
 }
 
 fn valid_dns(host: &str) -> bool {
@@ -108,7 +110,7 @@ fn validate(frame: &Frame) -> Result<(), ProtocolError> {
             if *version != VERSION {
                 return Err(ProtocolError::UnsupportedVersion);
             }
-            if *capabilities != 0 {
+            if *capabilities & !CAP_PADDING != 0 {
                 return Err(ProtocolError::UnsupportedCapabilities);
             }
         }
@@ -119,7 +121,7 @@ fn validate(frame: &Frame) -> Result<(), ProtocolError> {
             if *version != VERSION {
                 return Err(ProtocolError::UnsupportedVersion);
             }
-            if *accepted_capabilities != 0 {
+            if *accepted_capabilities & !CAP_PADDING != 0 {
                 return Err(ProtocolError::UnsupportedCapabilities);
             }
         }
@@ -133,7 +135,7 @@ fn validate(frame: &Frame) -> Result<(), ProtocolError> {
                 }
             }
         }
-        Frame::Data(data) if data.len() > MAX_PAYLOAD => {
+        Frame::Data(data) | Frame::Padding(data) if data.len() > MAX_PAYLOAD => {
             return Err(ProtocolError::FrameTooLarge);
         }
         _ => {}
@@ -189,6 +191,7 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
         Frame::Data(bytes) => (0x10, bytes.clone()),
         Frame::Fin => (0x11, Vec::new()),
         Frame::Abort(code) => (0x12, (*code as u16).to_be_bytes().to_vec()),
+        Frame::Padding(bytes) => (0x13, bytes.clone()),
     };
     if payload.len() > MAX_PAYLOAD {
         return Err(ProtocolError::FrameTooLarge);
@@ -203,7 +206,7 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
 
 fn frame_type(kind: u8) -> Result<(), ProtocolError> {
     match kind {
-        0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x10 | 0x11 | 0x12 => Ok(()),
+        0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x10 | 0x11 | 0x12 | 0x13 => Ok(()),
         _ => Err(ProtocolError::UnknownType),
     }
 }
@@ -302,6 +305,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
             }
         }
         0x10 => Frame::Data(p.to_vec()),
+        0x13 => Frame::Padding(p.to_vec()),
         0x11 => {
             if !p.is_empty() {
                 return Err(ProtocolError::InvalidLength);
@@ -404,6 +408,8 @@ enum Phase {
 pub struct Session {
     role: Role,
     phase: Phase,
+    offered_capabilities: u32,
+    accepted_capabilities: u32,
     sent_fin: bool,
     received_fin: bool,
 }
@@ -413,6 +419,8 @@ impl Session {
         Self {
             role,
             phase: Phase::Initial,
+            offered_capabilities: 0,
+            accepted_capabilities: 0,
             sent_fin: false,
             received_fin: false,
         }
@@ -431,17 +439,29 @@ impl Session {
         if self.is_closed() {
             return Err(ProtocolError::InvalidTransition);
         }
+        if matches!(frame, Frame::Padding(_)) {
+            return if self.accepted_capabilities & CAP_PADDING != 0 {
+                Ok(())
+            } else {
+                Err(ProtocolError::UnsupportedCapabilities)
+            };
+        }
         if matches!(frame, Frame::Abort(_)) {
             self.phase = Phase::Closed;
             return Ok(());
         }
         match (self.role, self.phase, direction, frame) {
-            (Role::Client, Phase::Initial, Direction::Send, Frame::Hello { .. })
-            | (Role::Server, Phase::Initial, Direction::Receive, Frame::Hello { .. }) => {
+            (Role::Client, Phase::Initial, Direction::Send, Frame::Hello { capabilities, .. })
+            | (Role::Server, Phase::Initial, Direction::Receive, Frame::Hello { capabilities, .. }) => {
+                self.offered_capabilities = *capabilities;
                 self.phase = Phase::NeedHelloAck;
             }
-            (Role::Client, Phase::NeedHelloAck, Direction::Receive, Frame::HelloAck { .. })
-            | (Role::Server, Phase::NeedHelloAck, Direction::Send, Frame::HelloAck { .. }) => {
+            (Role::Client, Phase::NeedHelloAck, Direction::Receive, Frame::HelloAck { accepted_capabilities, .. })
+            | (Role::Server, Phase::NeedHelloAck, Direction::Send, Frame::HelloAck { accepted_capabilities, .. }) => {
+                if *accepted_capabilities & !self.offered_capabilities != 0 {
+                    return Err(ProtocolError::UnsupportedCapabilities);
+                }
+                self.accepted_capabilities = *accepted_capabilities;
                 self.phase = Phase::NeedOpen;
             }
             (Role::Client, Phase::NeedOpen, Direction::Send, Frame::OpenTcp { .. })

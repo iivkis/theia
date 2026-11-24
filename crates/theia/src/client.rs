@@ -512,7 +512,7 @@ impl H2Client {
         let mut state = Session::new(Role::Client);
         let hello = Frame::Hello {
             version: protocol::VERSION,
-            capabilities: 0,
+            capabilities: protocol::CAP_PADDING,
         };
         state
             .apply(Direction::Send, &hello)
@@ -554,13 +554,17 @@ impl H2Client {
             .apply(Direction::Send, open)
             .map_err(|_| ClientError::Protocol)?;
         send_frame(&mut outgoing, open, false).await?;
-        let result = decoder
-            .next(&mut incoming)
-            .await?
-            .ok_or(ClientError::Protocol)?;
-        state
-            .apply(Direction::Receive, &result)
-            .map_err(|_| ClientError::Protocol)?;
+        let result = loop {
+            let frame = decoder.next(&mut incoming).await?.ok_or(ClientError::Protocol)?;
+            state.apply(Direction::Receive, &frame).map_err(|_| ClientError::Protocol)?;
+            if matches!(frame, Frame::Padding(_)) {
+                // Padding must not reset the enclosing OPEN deadline or
+                // monopolize the task when frames are already buffered.
+                tokio::task::yield_now().await;
+                continue;
+            }
+            break frame;
+        };
         match result {
             Frame::OpenOk if state.tunnel_open() => Ok(Tunnel {
                 operation,
@@ -686,7 +690,7 @@ impl Tunnel {
                     .await
                     .map_err(|_| ClientError::Timeout)??;
                 if size == 0 {
-                    activity.fin();
+                    activity.half_closed();
                     let _ = upload_done.send(());
                     return Ok::<(), ClientError>(());
                 }
@@ -700,6 +704,7 @@ impl Tunnel {
                     .apply(Direction::Receive, &frame)
                     .map_err(|_| ClientError::Protocol)?;
                 match frame {
+                    Frame::Padding(_) => tokio::task::yield_now().await,
                     Frame::Data(data) => {
                         crate::diag!(
                             Trace,
@@ -725,7 +730,7 @@ impl Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
-                        activity.fin();
+                        activity.half_closed();
                         break;
                     }
                     Frame::Abort(code) => return Err(ClientError::Open(code)),
@@ -733,7 +738,21 @@ impl Tunnel {
                 }
             }
             if crate::relay_liveness::receive_tail(
-                decoder.next(incoming),
+                async {
+                    loop {
+                        let frame = decoder.next(incoming).await?;
+                        if let Some(padding @ Frame::Padding(_)) = &frame {
+                            if activity.both_finished() {
+                                return Err(ClientError::Protocol);
+                            }
+                            download_state.apply(Direction::Receive, padding)
+                                .map_err(|_| ClientError::Protocol)?;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        return Ok(frame);
+                    }
+                },
                 upload_finished,
                 ClientError::Timeout,
             )

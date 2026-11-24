@@ -1,6 +1,6 @@
 use theia::protocol::{
     decode, encode, Address, Decoder, Direction, ErrorCode, Frame, ProtocolError, Role, Session,
-    HEADER_LEN, MAX_PAYLOAD, VERSION,
+    CAP_PADDING, HEADER_LEN, MAX_PAYLOAD, VERSION,
 };
 
 fn hello() -> Frame {
@@ -81,6 +81,8 @@ fn all_frame_variants_round_trip_and_big_endian_address_length() {
         Frame::Data(b"hello".to_vec()),
         Frame::Fin,
         Frame::Abort(ErrorCode::ResourceLimit),
+        Frame::Padding(vec![]),
+        Frame::Padding(vec![0x42; MAX_PAYLOAD]),
     ];
     for frame in frames {
         let wire = encode(&frame).unwrap();
@@ -167,7 +169,7 @@ fn malformed_payloads_flags_version_and_types_are_rejected() {
             ProtocolError::UnsupportedVersion,
         ),
         (
-            vec![0x02, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 1],
+            vec![0x02, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 2],
             ProtocolError::UnsupportedCapabilities,
         ),
         (
@@ -363,5 +365,47 @@ fn deterministic_random_chunks_never_panic_and_bound_partial_memory() {
             }
             assert!(decoder.pending_len() <= HEADER_LEN + MAX_PAYLOAD);
         }
+    }
+}
+
+#[test]
+fn padding_v1_golden_vectors_and_capability_subset() {
+    let padding = Frame::Padding(vec![0x42, 0x99]);
+    let offer = Frame::Hello { version: VERSION, capabilities: CAP_PADDING };
+    let accept = Frame::HelloAck { version: VERSION, accepted_capabilities: CAP_PADDING };
+    assert_eq!(encode(&offer).unwrap(), [1, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 1]);
+    assert_eq!(encode(&accept).unwrap(), [2, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 1]);
+    assert_eq!(encode(&padding).unwrap(), [0x13, 0, 0, 0, 0, 2, 0x42, 0x99]);
+    assert_eq!(decode(&[0x13, 0, 0, 0, 0, 0]).unwrap(), Frame::Padding(vec![]));
+    assert_eq!(encode(&Frame::Padding(vec![0; MAX_PAYLOAD + 1])), Err(ProtocolError::FrameTooLarge));
+    for role in [Role::Client, Role::Server] {
+        let (out, input) = if role == Role::Client {
+            (Direction::Send, Direction::Receive)
+        } else {
+            (Direction::Receive, Direction::Send)
+        };
+        let mut denied = Session::new(role);
+        assert_eq!(denied.apply(out, &padding), Err(ProtocolError::UnsupportedCapabilities));
+        denied.apply(out, &hello()).unwrap();
+        assert_eq!(denied.apply(input, &accept), Err(ProtocolError::UnsupportedCapabilities));
+        denied.apply(input, &ack()).unwrap();
+        assert_eq!(denied.apply(out, &padding), Err(ProtocolError::UnsupportedCapabilities));
+
+        let mut negotiated = Session::new(role);
+        negotiated.apply(out, &offer).unwrap();
+        assert_eq!(negotiated.apply(out, &padding), Err(ProtocolError::UnsupportedCapabilities));
+        negotiated.apply(input, &accept).unwrap();
+        for direction in [out, input] {
+            negotiated.apply(direction, &padding).unwrap();
+        }
+        assert!(!negotiated.tunnel_open());
+        negotiated.apply(out, &open()).unwrap();
+        negotiated.apply(input, &padding).unwrap();
+        negotiated.apply(input, &Frame::OpenOk).unwrap();
+        negotiated.apply(out, &Frame::Fin).unwrap();
+        negotiated.apply(input, &padding).unwrap();
+        negotiated.apply(input, &Frame::Fin).unwrap();
+        assert_eq!(negotiated.apply(input, &padding), Err(ProtocolError::InvalidTransition));
+        negotiated.finish().unwrap();
     }
 }

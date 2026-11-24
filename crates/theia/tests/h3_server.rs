@@ -146,6 +146,35 @@ async fn open(stream: &mut ClientStream, frames: &mut Frames, port: u16) -> Fram
     frames.next(stream).await.unwrap()
 }
 
+async fn open_with_padding(stream: &mut ClientStream, frames: &mut Frames, port: u16) -> Frame {
+    assert_eq!(stream.recv_response().await.unwrap().status(), 200);
+    send(
+        stream,
+        Frame::Hello {
+            version: protocol::VERSION,
+            capabilities: protocol::CAP_PADDING,
+        },
+    )
+    .await;
+    assert_eq!(
+        frames.next(stream).await,
+        Some(Frame::HelloAck {
+            version: protocol::VERSION,
+            accepted_capabilities: protocol::CAP_PADDING,
+        })
+    );
+    send(stream, Frame::Padding(vec![0x91; 1024])).await;
+    send(
+        stream,
+        Frame::OpenTcp {
+            address: Address::Dns("localhost".into()),
+            port,
+        },
+    )
+    .await;
+    frames.next(stream).await.unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_h3_server_relays_tcp_before_request_fin_and_after_half_close() {
     timeout(Duration::from_secs(20), async {
@@ -174,7 +203,8 @@ async fn authenticated_h3_server_relays_tcp_before_request_fin_and_after_half_cl
         });
         let mut stream = sender.send_request(request(Some(&token()))).await.unwrap();
         let mut frames = Frames::default();
-        assert_eq!(open(&mut stream, &mut frames, port).await, Frame::OpenOk);
+        assert_eq!(open_with_padding(&mut stream, &mut frames, port).await, Frame::OpenOk);
+        send(&mut stream, Frame::Padding(vec![0x13; 123])).await;
         send(&mut stream, Frame::Data(b"early".to_vec())).await;
         assert_eq!(
             frames.next(&mut stream).await,

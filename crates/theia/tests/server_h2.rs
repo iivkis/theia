@@ -269,7 +269,7 @@ async fn h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial() {
             &mut tx,
             &Frame::Hello {
                 version: VERSION,
-                capabilities: 0,
+                capabilities: theia::protocol::CAP_PADDING,
             },
             false,
         )
@@ -283,10 +283,11 @@ async fn h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial() {
             next_frame(&mut rx, &mut decoder, &mut queue).await,
             Frame::HelloAck {
                 version: VERSION,
-                accepted_capabilities: 0
+                accepted_capabilities: theia::protocol::CAP_PADDING
             }
         );
         // HELLO_ACK is intentionally received before request EOF.
+        send(&mut tx, &Frame::Padding(vec![0x72; 1024]), false).await;
         send(
             &mut tx,
             &Frame::OpenTcp {
@@ -300,6 +301,7 @@ async fn h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial() {
             next_frame(&mut rx, &mut decoder, &mut queue).await,
             Frame::OpenOk
         );
+        send(&mut tx, &Frame::Padding(vec![0x13; 123]), false).await;
         send(&mut tx, &Frame::Data(b"protected echo".to_vec()), false).await;
         send(&mut tx, &Frame::Fin, true).await;
         assert_eq!(
