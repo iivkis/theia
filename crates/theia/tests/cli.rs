@@ -116,7 +116,14 @@ fn windows_proxy_commands_fail_closed_on_other_platforms() {
     for args in [
         vec!["client", "proxy", "--status"],
         vec!["client", "proxy", "--recover", "--confirm"],
-        vec!["client", "run", "--config", "missing.toml", "--system-proxy", "--confirm"],
+        vec![
+            "client",
+            "run",
+            "--config",
+            "missing.toml",
+            "--system-proxy",
+            "--confirm",
+        ],
     ] {
         let result = invoke(&args);
         assert_eq!(result.status.code(), Some(3));

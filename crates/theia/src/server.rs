@@ -874,7 +874,7 @@ async fn handle_frames(
         .map_err(|_| ServerError::Protocol)?;
     send_frame(outgoing, &Frame::OpenOk).await?;
     crate::diag!(
-        Info,
+        Debug,
         "server.h2",
         "open_ok_sent",
         "session" = Value::Count(session_id)
