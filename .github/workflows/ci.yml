@@ -285,14 +285,6 @@ jobs:
         run: cargo test --workspace --all-targets --locked
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Build genuine Linux server for Windows cross-OS F-14 E2E
-        run: cargo build --workspace --locked --bin theia
-      - uses: actions/upload-artifact@v4
-        with:
-          name: f14-linux-server
-          path: target/debug/theia
-          if-no-files-found: error
-          retention-days: 1
       # Optional release-profile compilation uses the same post-merge CI.
       # A release-build label on the merged PR opts in without another run.
       - name: Requested release compilation (Linux)
@@ -349,38 +341,6 @@ jobs:
       - name: Cross-logon Windows pipe kernel-denial E2E (mandatory)
         shell: pwsh
         run: ./scripts/windows-cross-sid-ci.ps1
-      - name: Stage Windows E2E binaries from Cargo JSON artifact paths
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # Cargo may use target/debug/build/<crate>/<hash>/out instead of
-          # target/debug/deps. Compiler-artifact JSON is the authoritative path.
-          $testEvents = @(cargo test --workspace --locked --test f14_cross_host --no-run --message-format=json |
-            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native F-14 harness' }
-          $tests = @($testEvents | Where-Object {
-            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'f14_cross_host' -and $_.executable
-          })
-          if ($tests.Count -ne 1) { throw 'Expected exactly one compiled native F-14 test harness' }
-          $binEvents = @(cargo build --workspace --locked --bin theia --message-format=json |
-            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native Windows client' }
-          $bins = @($binEvents | Where-Object {
-            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and $_.executable
-          })
-          if ($bins.Count -ne 1) { throw 'Expected exactly one compiled Windows client executable' }
-          if (!(Test-Path $tests[0].executable -PathType Leaf)) { throw 'Missing compiled F-14 test harness' }
-          if (!(Test-Path $bins[0].executable -PathType Leaf)) { throw 'Missing compiled Windows client' }
-          Copy-Item $tests[0].executable (Join-Path $env:RUNNER_TEMP 'f14_cross_host.exe')
-          Copy-Item $bins[0].executable (Join-Path $env:RUNNER_TEMP 'theia.exe')
-      - uses: actions/upload-artifact@v4
-        with:
-          name: f14-windows-compiled
-          path: |
-            ${{ runner.temp }}/f14_cross_host.exe
-            ${{ runner.temp }}/theia.exe
-          if-no-files-found: error
-          retention-days: 1
       # Optional release-profile compilation uses the same post-merge CI.
       # A release-build label on the merged PR opts in without another run.
       - name: Requested release compilation (Windows)
@@ -397,7 +357,9 @@ jobs:
 
   f14-cross-host:
     name: F-14 Linux VM server to native Windows client
-    needs: [specification, rust-tests, windows-smoke]
+    # Native browser jobs already build the real Theia binaries; do not wait
+    # for the unrelated full native suites or the long liveness regression.
+    needs: [specification, browser-e2e]
     if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     runs-on: windows-2025
     timeout-minutes: 50
@@ -479,6 +441,50 @@ jobs:
         run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5_over_h3 -- --ignored --exact --nocapture
       - name: Capture actual Chromium H2 SETTINGS and HPACK pseudo names on loopback
         run: cargo test --workspace --locked --test chromium_h2_reference actual_chromium_h2_settings_and_pseudo_order_reference -- --ignored --exact --nocapture
+      - name: Build genuine Linux server for Windows cross-OS F-14 E2E
+        if: runner.os == 'Linux'
+        run: cargo build --workspace --locked --bin theia
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: f14-linux-server
+          path: target/debug/theia
+          if-no-files-found: error
+          retention-days: 1
+      - name: Stage Windows E2E binaries from Cargo JSON artifact paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Cargo may use target/debug/build/<crate>/<hash>/out instead of
+          # target/debug/deps. Compiler-artifact JSON is the authoritative path.
+          $testEvents = @(cargo test --workspace --locked --test f14_cross_host --no-run --message-format=json |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native F-14 harness' }
+          $tests = @($testEvents | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'f14_cross_host' -and $_.executable
+          })
+          if ($tests.Count -ne 1) { throw 'Expected exactly one compiled native F-14 test harness' }
+          $binEvents = @(cargo build --workspace --locked --bin theia --message-format=json |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native Windows client' }
+          $bins = @($binEvents | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and $_.executable
+          })
+          if ($bins.Count -ne 1) { throw 'Expected exactly one compiled Windows client executable' }
+          if (!(Test-Path $tests[0].executable -PathType Leaf)) { throw 'Missing compiled F-14 test harness' }
+          if (!(Test-Path $bins[0].executable -PathType Leaf)) { throw 'Missing compiled Windows client' }
+          Copy-Item $tests[0].executable (Join-Path $env:RUNNER_TEMP 'f14_cross_host.exe')
+          Copy-Item $bins[0].executable (Join-Path $env:RUNNER_TEMP 'theia.exe')
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: f14-windows-compiled
+          path: |
+            ${{ runner.temp }}/f14_cross_host.exe
+            ${{ runner.temp }}/theia.exe
+          if-no-files-found: error
+          retention-days: 1
       - name: Upload sanitized trace logs on CI failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -572,6 +578,35 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+  native-liveness:
+    name: Real 300s relay liveness (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-long-liveness
+      - name: Mandatory real H2 and H3 traffic beyond 300 seconds
+        shell: pwsh
+        run: |
+          cargo test --workspace --locked --test tunnel_liveness -- production_h2_h3_real_traffic_beyond_300_seconds --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
+          if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test production_h2_h3_real_traffic_beyond_300_seconds \.\.\. ok') { throw 'Real long-lived relay test failed or did not execute' }
+
   coverage-native:
     name: Coverage instrumented (${{ matrix.os }})
     needs: specification
@@ -599,8 +634,10 @@ jobs:
           tool: cargo-llvm-cov@0.9.1
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-coverage
-          cache-targets: false
+          key: native-coverage-dependencies-v2
+          workspaces: ". -> target/llvm-cov-target"
+          cache-targets: true
+          cache-workspace-crates: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -609,18 +646,20 @@ jobs:
       - name: Install pinned Windows ConPTY test dependency
         if: runner.os == 'Windows'
         run: python -m pip install pywinpty==3.0.5
+      - name: Purge any restored profile counters before instrumenting this SHA
+        run: cargo llvm-cov clean --profraw-only
       - name: Instrument full native workspace tests
-        run: cargo llvm-cov --workspace --all-targets --all-features --locked --lcov --include-build-script --output-path coverage.lcov
+        run: cargo llvm-cov test --workspace --all-targets --all-features --locked --lcov --include-build-script --output-path coverage.lcov
       - name: Instrument real disposable Windows proxy and ConPTY lifecycle
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           THEIA_WINDOWS_PROXY_E2E_ALLOWED: "yes"
         run: |
-          cargo llvm-cov --workspace --all-features --locked --no-report --lib windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override -- --ignored --exact --nocapture
-          if ($LASTEXITCODE -ne 0) { throw 'Instrumented real WinINet CAS and recovery failed' }
-          cargo llvm-cov --workspace --all-features --locked --no-report --test tui_real_terminal compiled_client_proxy_conpty_lifecycle -- --ignored --exact --nocapture
-          if ($LASTEXITCODE -ne 0) { throw 'Instrumented real ConPTY lifecycle failed' }
+          cargo llvm-cov test --workspace --all-features --locked --no-report --lib -- windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
+          if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override \.\.\. ok') { throw 'Instrumented real WinINet CAS and recovery failed or did not execute' }
+          cargo llvm-cov test --workspace --all-features --locked --no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
+          if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test compiled_client_proxy_conpty_lifecycle \.\.\. ok') { throw 'Instrumented real ConPTY lifecycle failed or did not execute' }
           cargo llvm-cov report --lcov --include-build-script --output-path coverage.lcov
           if ($LASTEXITCODE -ne 0) { throw 'Combined native LCOV export failed' }
       - name: Export independent LLVM file segments from the same profiles
@@ -684,7 +723,7 @@ jobs:
 
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-4-btls-spike, m3-4e-btls-production-feature, coverage-native, coverage-gate]
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-4-btls-spike, m3-4e-btls-production-feature, native-liveness, coverage-native, coverage-gate]
     if: ${{ always() && github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -702,7 +741,7 @@ jobs:
           import re
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-4-btls-spike", "m3-4e-btls-production-feature", "coverage-native", "coverage-gate"}
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-4-btls-spike", "m3-4e-btls-production-feature", "native-liveness", "coverage-native", "coverage-gate"}
           native = os.environ["NATIVE_REQUIRED"]
           if native != "true":
               raise SystemExit("Every merge requires full native CI; fail closed")
