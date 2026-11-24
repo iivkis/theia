@@ -57,7 +57,9 @@ In-memory ReplayWindow демонстрирует только локальну�
 - Given full replay cache, when distinct fresh proof arrives, then reject rather than evict a live nonce.
 - Given mismatched CA, when ordinary TLS handshake fails, then no exporter or identity proof is available.
 
-CI Linux/Windows: crates/theia/tests/f18_identity_lab.rs and real TLS1.3/H2 fixture in crates/theia/tests/reality_security_feasibility.rs, through cargo test --workspace --all-targets --locked. Existing H3 exporter loopback and v1 rejection tests remain required. No shipping code or user-facing flags.
+CI Linux/Windows: crates/theia/tests/f18_identity_lab.rs and real TLS1.3/H2 fixture in crates/theia/tests/reality_security_feasibility.rs, through cargo test --workspace --all-targets --locked.
+
+**Точная граница сетевого теста:** это настоящее проверенное TLS1.3-соединение с согласованным ALPN=h2, однако исследовательские challenge/signature передаются как **сырые TLS application bytes, не HTTP/2 DATA frames**. Следовательно, тест не доказывает совместимость кандидата identity protocol с работающей HTTP/2-сессией, frame dispatch, flow control или обычным production HTTP request. Эти проверки отнесены к отдельному будущему сетевому срезу, а не скрыты за успешным ALPN. Existing H3 exporter loopback and v1 rejection tests remain required. No shipping code or user-facing flags.
 
 ## Решение о выпуске и дальнейшие шаги
 
