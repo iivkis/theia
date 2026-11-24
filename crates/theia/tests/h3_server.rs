@@ -357,6 +357,49 @@ async fn production_h3_client_rejects_tls_bearer_and_acl_failures() {
     .unwrap();
 }
 
+/// Real QUIC peers with the correct certificate but an incompatible or
+/// absent application protocol must never reach SmartTheia authorization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_h3_client_refuses_incompatible_alpn_before_application_data() {
+    timeout(Duration::from_secs(25), async {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let mut roots = RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        for protocols in [vec![b"h2".to_vec()], Vec::new()] {
+            let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![der.clone()], key.clone_key().into())
+            .unwrap();
+            tls.alpn_protocols = protocols;
+            let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+            let config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+            let peer = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+            let remote = peer.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let incoming = peer.accept().await.expect("real UDP connection");
+                if let Ok(connection) = incoming.await {
+                    // If the TLS implementation permits an absent ALPN,
+                    // the application must still refuse before opening streams.
+                    assert!(connection.accept_bi().await.is_err());
+                    assert!(connection.accept_uni().await.is_err());
+                }
+            });
+            let client = H3Client::new(remote, "localhost", &token(), roots.clone()).unwrap();
+            let result = client.open(Address::V4([127, 0, 0, 1]), 443).await;
+            assert!(matches!(result, Err(ClientError::Tls)));
+            server.await.unwrap();
+        }
+    })
+    .await
+    .expect("bounded incompatible QUIC ALPN matrix");
+}
+
 #[test]
 fn production_h3_client_rejects_invalid_configuration() {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();

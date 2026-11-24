@@ -433,6 +433,9 @@ class SpecContractTests(unittest.TestCase):
         workflow = read(".github/workflows/ci.yml")
         self.assertIn("browser-e2e", workflow.split("\n  ci-gate:\n", 1)[1])
         self.assertIn("client_binary_chromium_socks5 -- --ignored --exact", workflow)
+        self.assertIn("client_binary_chromium_socks5_over_h3 -- --ignored --exact", workflow)
+        self.assertIn("production_h3_client_refuses_incompatible_alpn_before_application_data",
+                      read("crates/theia/tests/h3_server.rs"))
         self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
 
     def test_m31_h3_server_reuses_security_boundary(self):

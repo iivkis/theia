@@ -1,6 +1,6 @@
 # ADR-0074: actual browser reference policy and independent TLS interoperability
 
-**Status:** proposed; pending full native CI.
+**Status:** accepted in PR #110, exact-head run 45401698499 (13/13).
 
 Replace synthetic uTLS parity as a project requirement with actual pinned browser reference evidence. Existing Chromium H2 tests are retained; H3 browser reference is not implemented. Browser compatibility and equality of packet sequences are different claims. Existing measured discrepancies remain documented; no new fingerprint tuning, transport changes or claim of invisibility.
 

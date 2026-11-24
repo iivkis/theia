@@ -280,3 +280,17 @@ The timing regression suite includes two sanitized actual first-attempt snapshot
 The Markdown-only scope classifier also checks raw Git modes/status: regular non-executable Markdown adds/modifies/deletes may use the cheap path; symlinks, executable mode changes, gitlinks, type changes or malformed raw data force full native CI. This narrows the optimization to genuine documentation edits; it does not introduce new skip paths.
 
 **ADR-0074 migration (pending CI):** the earlier formatter-cache optimization is superseded by removing the Go toolchain altogether. Six setup-go occurrences and synthetic reference generation are retired; independent standard TLS/H2 PKI tests remain on both M0.1 jobs. No CI jobs removed. Measure actual before/after full first-attempt runs; do not infer savings from deleted setup durations alone.
+
+### Go retirement: observed completed full PR evidence (2026-11-24)
+
+| Metric (seconds) | Before: #109 run 45397074048 | After: #110 run 45401698499 | Delta |
+|---|---:|---:|---:|
+| Creation to last completed job | 312 | 310 | -2 |
+| Sum of job durations (not billed minutes) | 954 | 849 | -105 |
+| Specification | 22 | 7 | -15 |
+| M0.1 Windows | 118 | 71 | -47 |
+| M0.1 Linux | 55 | 75 | +20 |
+| Windows smoke | 194 | 192 | -2 |
+| Cross-host | 82 | 76 | -6 |
+
+Source: completed first-attempt GitHub Actions job timestamps for both exact PR heads, same 13-job matrix. The aggregate job-duration observation decreases by 11.0%; wall clock decreases by 0.6%. This is not a controlled benchmark or billed-minutes saving. Multiple changes, cache state and runner scheduling differ. Windows smoke and WSL2 remain the dominant dependency path; retain coverage. No claim that each job became faster.

@@ -673,9 +673,70 @@ async fn check_native_binary_connect_and_socks5(tls_profile: &str, label: &str) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "mandatory dedicated CI browser-e2e job provisions Playwright and Chromium"]
 async fn client_binary_chromium_socks5() {
+    let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
+    browser_socks_scenario(
+        endpoint,
+        pem,
+        server,
+        "browser",
+        theia::config::Transport::H2,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "mandatory dedicated CI browser-e2e job provisions Playwright and Chromium"]
+async fn client_binary_chromium_socks5_over_h3() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let bind = "127.0.0.1:0".parse().unwrap();
+    let endpoint =
+        theia::quic_transport::server_endpoint(bind, vec![cert.cert.der().clone()], key.into())
+            .unwrap();
+    let remote = endpoint.local_addr().unwrap().to_string();
+    let inbound = Inbound {
+        id: "browser-h3".into(),
+        allowed_user_ids: vec!["client".into()],
+        h2_listen: "127.0.0.1:0".into(),
+        quic_listen: remote.clone(),
+        server_name: "localhost".into(),
+        tls_cert: "unused-test-fixture".into(),
+        tls_key: "unused-test-fixture".into(),
+    };
+    let user = User {
+        id: "client".into(),
+        token_sha256: format!("{:x}", Sha256::digest(TOKEN)),
+        disabled: false,
+    };
+    let policy = ServerPolicy {
+        allow_private_ips: true,
+        max_connections_per_user: 8,
+        max_connections_total: 8,
+        connect_timeout_ms: 1500,
+    };
+    let context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
+    let server = tokio::spawn(theia::h3_server::serve(endpoint, context));
+    // No TCP/TLS listener exists at the remote endpoint. The explicit H3
+    // client must complete its authenticated QUIC tunnel; no H2 fallback.
+    browser_socks_scenario(
+        remote,
+        cert.cert.pem(),
+        server,
+        "browser-h3",
+        theia::config::Transport::H3,
+    )
+    .await;
+}
+
+async fn browser_socks_scenario(
+    endpoint: String,
+    pem: String,
+    server: ServerTask,
+    label: &str,
+    transport: theia::config::Transport,
+) {
     timeout(Duration::from_secs(75), async {
-        let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
-        let (_dir, mut child, _http, socks) = launch_client(endpoint, pem, "browser", theia::config::Transport::H2).await;
+        let (_dir, mut child, _http, socks) = launch_client(endpoint, pem, label, transport).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
         let origin = tokio::spawn(async move {

@@ -1,6 +1,6 @@
 # Фактический статус Theia
 
-**Срез состояния:** 2026-11-24, после merge [PR #109](https://github.com/iivkis/theia/pull/109) в `main` (`5eaabe131c6bdd7653eee4ef66e693a3a9471da4`). Это **не release-acceptance**: проект experimental/unreleased. [Exact-head CI PR #109](https://github.com/iivkis/theia/actions/runs/45397074048) успешен (13/13); push-CI проверяется отдельно.
+**Срез состояния:** 2026-11-24, после merge [PR #110](https://github.com/iivkis/theia/pull/110) в `main` (`0116ebfe3b15903669da6221e688e6f6534f58a9`). Это **не release-acceptance**: проект experimental/unreleased. [Exact-head CI PR #110](https://github.com/iivkis/theia/actions/runs/45401698499) успешен (13/13); push-CI проверяется отдельно.
 
 Этот файл — актуальная сводка реализованных контрактов. [IMPLEMENTATION_SPEC](IMPLEMENTATION_SPEC.md) остаётся нормативной спецификацией **целевой** функциональности, [IMPLEMENTATION_PLAN](IMPLEMENTATION_PLAN.md) — историческим перечнем этапов, [ADR](adr/) — архивом решений, а [TESTING_CI](TESTING_CI.md) — контрактом тестирования.
 
@@ -16,7 +16,7 @@
 | F-14 частично | Canonical `theia://v1` codec, серверные `u` (CSPRNG issuance), `x` (global disable), `t` (явно подтверждённая ротация действующего bearer); клиентская TUI `i` локально импортирует приглашение с отдельным CA/защищённым credential file. Native Linux/Windows H2 binary E2E прошёл в PR #80/#81; ни одна операция не выполняет автоматический runtime Apply. M4.4e защищённый файловый экспорт (CI run 45392909341 passed all 13 jobs); M4.4f общий bounded input runtime/preflight/import и stale reveal guard; M4.4g явная замена credential существующего профиля; M4.4h восстановление отключённого пользователя с новым bearer (M4.4f–h CI 45395505034 passed all 13 jobs); M4.4i публичная ссылка без токена и native Windows recovery parity (PR #109, CI 45397074048 passed 13/13). |
 | F-18 исследования | M3.5a0–a6 test-only TLS/exporter, identity/reconnect, H2/H3 DATA and local key lifecycle evidence; M3.5a7 v1 export downgrade fix and review packet; M3.5a8 bounded trust checkpoint reconstruction and isolated file recovery; M3.5a9–a10 native storage/process-exit, concurrent trust updates, local isolation regressions and shared F-14 local input and guarded configuration transaction hardening (CI run 45391036352 passed all 13 jobs); M3.5b1 offline candidate planning; M3.5b2a exact-consent strict H2 TLS; M4.5a–i passive discovery, DNS pin и согласованные отдельные H2/H3 кандидаты. Нет автоматического сканирования сторонних IP и нет REALITY режима. |
 
-Последний слитый срез: **F-14 / M4.4i, ADR-0073**. Exact-head CI PR #109: **13/13 SUCCESS**, включая `ci-gate`. F-13 и остальные независимые P0 остаются открытыми.
+Последний слитый срез: **CI / ADR-0074–0075, удаление Go/uTLS и конкурентное создание trace directory**. Exact-head CI PR #110: **13/13 SUCCESS**, включая `ci-gate`. F-13 и остальные независимые P0 остаются открытыми.
 
 ## Открытые P0 и ограничения безопасности
 
@@ -42,4 +42,7 @@
 
 F-14 evidence and residual gaps: [F14_ACCEPTANCE.md](F14_ACCEPTANCE.md). Do not equate a saved configuration with live authorization or release readiness.
 
-**Reference policy transition (ADR-0074, pending CI):** retire uTLS parity and Go test dependency. Real pinned Chromium H2 evidence stays mandatory; H3 browser evidence remains open. Independent TLS interoperability and PKI checks are retained via Python/OpenSSL. No new browser parity claim.
+**Reference policy transition (ADR-0074, accepted PR #110, run 45401698499):** retire uTLS parity and Go test dependency. Real pinned Chromium H2 evidence stays mandatory; H3 browser evidence remains open. Independent TLS interoperability and PKI checks are retained via Python/OpenSSL. No new browser parity claim.
+
+
+**H3 functional browser coverage (ADR-0076, pending CI):** add native Chromium navigation through the explicitly H3-configured Theia binary and a separate H3-only authenticated server; no change to TLS or HTTP wire profile. The native browser still uses SOCKS5 for its origin request; this is not a browser QUIC first-flight reference or packet parity claim. Add real incompatible/absent QUIC ALPN negative matrix.
