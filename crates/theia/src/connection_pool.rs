@@ -11,7 +11,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::{Mutex, OwnedSemaphorePermit, Semaphore}, time::Instant};
+use tokio::{
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 
 const MAX_CONNECTIONS: usize = 4;
 const MAX_TUNNELS: usize = 16;
@@ -138,9 +141,14 @@ impl<C: Send + Sync + 'static> Pool<C> {
             let deadline = entry.created + MAX_REUSE_AGE;
             tokio::spawn(async move {
                 tokio::time::sleep_until(deadline).await;
-                if let (Some(entries), Some(expired)) = (weak_entries.upgrade(), weak_entry.upgrade()) {
+                if let (Some(entries), Some(expired)) =
+                    (weak_entries.upgrade(), weak_entry.upgrade())
+                {
                     expired.retired.store(true, Ordering::Release);
-                    entries.lock().await.retain(|candidate| !Arc::ptr_eq(candidate, &expired));
+                    entries
+                        .lock()
+                        .await
+                        .retain(|candidate| !Arc::ptr_eq(candidate, &expired));
                 }
             });
         }
@@ -159,9 +167,15 @@ mod tests {
     async fn expiry_releases_idle_connection_and_drains_live_lease() {
         let pool = Pool::default();
         let route = Some("127.0.0.1:0".parse().unwrap());
-        let mut active = pool.acquire(route, false, true, |_| true, async { Ok(1) }).await.unwrap();
+        let mut active = pool
+            .acquire(route, false, true, |_| true, async { Ok(1) })
+            .await
+            .unwrap();
         active.admitted();
-        let mut idle = pool.acquire(route, true, true, |_| true, async { Ok(2) }).await.unwrap();
+        let mut idle = pool
+            .acquire(route, true, true, |_| true, async { Ok(2) })
+            .await
+            .unwrap();
         idle.admitted();
         drop(idle);
         tokio::task::yield_now().await;
@@ -170,7 +184,10 @@ mod tests {
         assert!(pool.entries.lock().await.is_empty());
         assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);
         assert_eq!(*active.connection(), 1);
-        let mut fresh = pool.acquire(route, false, true, |_| true, async { Ok(3) }).await.unwrap();
+        let mut fresh = pool
+            .acquire(route, false, true, |_| true, async { Ok(3) })
+            .await
+            .unwrap();
         fresh.admitted();
         assert_eq!(*fresh.connection(), 3);
         assert!(!active.shares_connection(&fresh));

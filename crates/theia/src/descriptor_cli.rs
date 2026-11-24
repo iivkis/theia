@@ -1,10 +1,16 @@
 //! Offline operator interface for the candidate signed descriptor store.
 //! No network, profile writes, trust-on-first-use, secrets or runtime Apply.
-use crate::{descriptor::{self, Anchor, Error, Scope, Store, Verified}, CliError};
+use crate::{
+    descriptor::{self, Anchor, Error, Scope, Store, Verified},
+    CliError,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 pub const HELP: &str = "Offline trust candidate; does not activate REALITY or change runtime.\n\
 theia trust inspect --anchor PATH --store PATH\n\
@@ -20,11 +26,22 @@ All paths must be absolute local files. Anchor TOML: schema_version=1, inbound, 
 pub enum Action {
     Inspect,
     Verify,
-    Enroll { digest: [u8; 32] },
+    Enroll {
+        digest: [u8; 32],
+    },
     PreviewUpdate,
-    Update { revision: u64, digest: [u8; 32] },
-    PreviewRotation { key: [u8; 32] },
-    Rotate { key: [u8; 32], revision: u64, digest: [u8; 32] },
+    Update {
+        revision: u64,
+        digest: [u8; 32],
+    },
+    PreviewRotation {
+        key: [u8; 32],
+    },
+    Rotate {
+        key: [u8; 32],
+        revision: u64,
+        digest: [u8; 32],
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,11 +81,48 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
     let (anchor, store, document, action) = match args {
         ["inspect", "--anchor", a, "--store", s] => (*a, Some(*s), None, Action::Inspect),
         ["verify", "--anchor", a, "--document", d] => (*a, None, Some(*d), Action::Verify),
-        ["enroll", "--anchor", a, "--store", s, "--document", d, "--sha256", hash, "--confirm"] => (*a, Some(*s), Some(*d), Action::Enroll { digest: digest(hash)? }),
-        ["preview-update", "--anchor", a, "--store", s, "--document", d] => (*a, Some(*s), Some(*d), Action::PreviewUpdate),
-        ["update", "--anchor", a, "--store", s, "--document", d, "--expected-revision", rev, "--sha256", hash, "--confirm"] => (*a, Some(*s), Some(*d), Action::Update { revision: crate::expected_revision(rev)?, digest: digest(hash)? }),
-        ["preview-rotation", "--anchor", a, "--store", s, "--document", d, "--next-key", k] => (*a, Some(*s), Some(*d), Action::PreviewRotation { key: key(k)? }),
-        ["rotate", "--anchor", a, "--store", s, "--document", d, "--next-key", k, "--expected-revision", rev, "--sha256", hash, "--confirm"] => (*a, Some(*s), Some(*d), Action::Rotate { key: key(k)?, revision: crate::expected_revision(rev)?, digest: digest(hash)? }),
+        ["enroll", "--anchor", a, "--store", s, "--document", d, "--sha256", hash, "--confirm"] => {
+            (
+                *a,
+                Some(*s),
+                Some(*d),
+                Action::Enroll {
+                    digest: digest(hash)?,
+                },
+            )
+        }
+        ["preview-update", "--anchor", a, "--store", s, "--document", d] => {
+            (*a, Some(*s), Some(*d), Action::PreviewUpdate)
+        }
+        ["update", "--anchor", a, "--store", s, "--document", d, "--expected-revision", rev, "--sha256", hash, "--confirm"] => {
+            (
+                *a,
+                Some(*s),
+                Some(*d),
+                Action::Update {
+                    revision: crate::expected_revision(rev)?,
+                    digest: digest(hash)?,
+                },
+            )
+        }
+        ["preview-rotation", "--anchor", a, "--store", s, "--document", d, "--next-key", k] => (
+            *a,
+            Some(*s),
+            Some(*d),
+            Action::PreviewRotation { key: key(k)? },
+        ),
+        ["rotate", "--anchor", a, "--store", s, "--document", d, "--next-key", k, "--expected-revision", rev, "--sha256", hash, "--confirm"] => {
+            (
+                *a,
+                Some(*s),
+                Some(*d),
+                Action::Rotate {
+                    key: key(k)?,
+                    revision: crate::expected_revision(rev)?,
+                    digest: digest(hash)?,
+                },
+            )
+        }
         _ => return Err(CliError::InvalidArguments),
     };
     Ok(Command {
@@ -89,8 +143,11 @@ struct AnchorFile {
     minimum_revision: u64,
 }
 fn read(path: &str, limit: u64, private: bool) -> Result<String, Error> {
-    let bytes = crate::bounded_input::read(Path::new(path), limit, true, private).map_err(|_| Error::Storage)?;
-    std::str::from_utf8(&bytes).map(str::to_owned).map_err(|_| Error::Format)
+    let bytes = crate::bounded_input::read(Path::new(path), limit, true, private)
+        .map_err(|_| Error::Storage)?;
+    std::str::from_utf8(&bytes)
+        .map(str::to_owned)
+        .map_err(|_| Error::Format)
 }
 fn load_anchor(path: &str) -> Result<Anchor, Error> {
     let text = read(path, 4096, true)?;
@@ -98,7 +155,14 @@ fn load_anchor(path: &str) -> Result<Anchor, Error> {
     if file.schema_version != 1 {
         return Err(Error::Format);
     }
-    Anchor::new(Scope { inbound: file.inbound, endpoint: file.endpoint }, public_key(&file.public_key)?, file.minimum_revision)
+    Anchor::new(
+        Scope {
+            inbound: file.inbound,
+            endpoint: file.endpoint,
+        },
+        public_key(&file.public_key)?,
+        file.minimum_revision,
+    )
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -118,16 +182,30 @@ fn preview(value: &Verified, now: u64, current: Option<u64>, raw: Option<&str>) 
         result.push_str(&format!("\nexpected_revision={revision}"));
     }
     if let Some(raw) = raw {
-        result.push_str(&format!("\ndocument_sha256={}", hex(&Sha256::digest(raw.as_bytes()))));
+        result.push_str(&format!(
+            "\ndocument_sha256={}",
+            hex(&Sha256::digest(raw.as_bytes()))
+        ));
     }
     result
 }
 
 pub fn run(command: Command) -> Result<String, Error> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| Error::Validity)?.as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Validity)?
+        .as_secs();
     let anchor = load_anchor(&command.anchor)?;
-    let store = command.store.as_deref().map(|p| Store::new(Path::new(p), anchor.clone())).transpose()?;
-    let document = command.document.as_deref().map(|p| read(p, descriptor::MAX_DOCUMENT as u64, false)).transpose()?;
+    let store = command
+        .store
+        .as_deref()
+        .map(|p| Store::new(Path::new(p), anchor.clone()))
+        .transpose()?;
+    let document = command
+        .document
+        .as_deref()
+        .map(|p| read(p, descriptor::MAX_DOCUMENT as u64, false))
+        .transpose()?;
     let get_store = || store.as_ref().ok_or(Error::Format);
     let get_doc = || document.as_deref().ok_or(Error::Format);
     let checked = |expected: [u8; 32]| {
@@ -165,7 +243,11 @@ pub fn run(command: Command) -> Result<String, Error> {
             let (revision, next) = get_store()?.preview_promotion(raw, key, now)?;
             Ok(preview(&next, now, Some(revision), Some(raw)))
         }
-        Action::Rotate { key, revision, digest } => {
+        Action::Rotate {
+            key,
+            revision,
+            digest,
+        } => {
             get_store()?.promote(checked(digest)?, revision, key, now)?;
             applied()
         }

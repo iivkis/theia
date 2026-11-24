@@ -86,16 +86,14 @@ impl ReviewCursor {
                         },
                     ));
                     if fresh {
-                        out.push_str(transport_review(observation.h2_verified(), observation.h3_verified()));
+                        out.push_str(transport_review(
+                            observation.h2_verified(),
+                            observation.h3_verified(),
+                        ));
                     }
                 }
             }
-            if !exact
-                || !entry
-                    .result
-                    .as_ref()
-                    .is_ok_and(|r| r.h2_verified())
-            {
+            if !exact || !entry.result.as_ref().is_ok_and(|r| r.h2_verified()) {
                 out.push_str("ОТКАЗ: нет обязательного подтверждённого TLS/H2 наблюдения.\n");
             }
         }
