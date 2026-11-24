@@ -5,11 +5,15 @@ use crate::{
     descriptor::{ClientPolicy, Scope},
     identity_tls::Identity,
     reality_bootstrap::{self as bootstrap, Error, Invitation, Profile},
-    reference_health, CliError,
+    reference_health, reality_config, CliError,
 };
 use std::path::Path;
 
 pub const HELP: &str = "REALITY provisioning candidate; runtime UNCHANGED. All paths absolute.\n\
+theia reality register-server-preview --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID\n\
+theia reality register-server-save --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID --sha256 HEX --confirm\n\
+theia reality register-client-preview --config PATH --profile PATH --identity-sha256 HEX --id ID\n\
+theia reality register-client-save --config PATH --profile PATH --identity-sha256 HEX --id ID --sha256 HEX --confirm\n\
 theia reality provision-preview --health PATH\n\
 theia reality provision-inspect --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX\n\
 theia reality provision-apply --health PATH --output NEW_DIRECTORY --health-sha256 HEX --confirm\n\
@@ -41,6 +45,11 @@ Identity SHA-256 must be obtained independently. Import never changes active pro
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    RegisterConfig {
+        config: String,
+        request: reality_config::Request,
+        approval: Option<[u8; 32]>,
+    },
     ProvisionPreview { health: String },
     ProvisionInspect { health: String, bundle: String, digest: [u8; 32], identity: [u8; 32] },
     ProvisionApply { health: String, output: String, digest: [u8; 32] },
@@ -175,8 +184,43 @@ fn hex(bytes: [u8; 32]) -> String {
     result
 }
 
+fn registration_approval(kind: &str, tail: &[&str]) -> Result<Option<[u8; 32]>, CliError> {
+    match (kind, tail) {
+        ("register-server-preview" | "register-client-preview", []) => Ok(None),
+        ("register-server-save" | "register-client-save", ["--sha256", digest, "--confirm"]) => Ok(Some(hash(digest)?)),
+        _ => Err(CliError::InvalidArguments),
+    }
+}
+
 pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
     Ok(match args {
+        [kind @ ("register-server-preview" | "register-server-save"), "--config", c, "--health", h, "--bundle", b,
+            "--health-sha256", d, "--identity-sha256", i, "--listen", listen, "--grants", grants, tail @ ..] => {
+            let listen: std::net::SocketAddr = listen.parse().map_err(|_| CliError::InvalidArguments)?;
+            let grants: Vec<String> = grants.split(',').map(str::to_owned).collect();
+            if listen.port() == 0 || grants.len() > 256 || grants.iter().any(|id| !config::valid_id(id)) {
+                return Err(CliError::InvalidArguments);
+            }
+            Command::RegisterConfig {
+                config: path(c)?,
+                request: reality_config::Request::Server(reality_config::ServerRequest {
+                    health: path(h)?.into(), bundle: path(b)?.into(),
+                    health_sha256: hash(d)?, identity_sha256: hash(i)?,
+                    listen, grants,
+                }),
+                approval: registration_approval(kind, tail)?,
+            }
+        }
+        [kind @ ("register-client-preview" | "register-client-save"), "--config", c, "--profile", p,
+            "--identity-sha256", i, "--id", id, tail @ ..] if config::valid_id(id) => {
+            Command::RegisterConfig {
+                config: path(c)?,
+                request: reality_config::Request::Client(reality_config::ClientRequest {
+                    enrollment: path(p)?.into(), identity_sha256: hash(i)?, id: (*id).to_owned(),
+                }),
+                approval: registration_approval(kind, tail)?,
+            }
+        }
         ["provision-preview", "--health", h] => Command::ProvisionPreview { health: path(h)? },
         ["provision-inspect", "--health", h, "--bundle", b, "--health-sha256", d, "--identity-sha256", i] => Command::ProvisionInspect {
             health: path(h)?, bundle: path(b)?, digest: hash(d)?, identity: hash(i)?,
@@ -399,6 +443,15 @@ fn publication_status(
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
+        Command::RegisterConfig { config, request, approval } => {
+            if let Some(expected) = approval {
+                reality_config::apply(Path::new(&config), &request, expected, now)?;
+                Ok("REALITY record saved; runtime UNCHANGED; external backend not available".into())
+            } else {
+                let preview = reality_config::prepare(Path::new(&config), &request, now)?;
+                Ok(format!("{}\napproval_sha256={}", preview.report(), hex(preview.approval_sha256())))
+            }
+        }
         Command::ProvisionInspect { health, bundle, digest, identity } => {
             let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?.inspect().map_err(|_| Error::Health)?;
             let record = crate::reality_provision::inspect_initial(&state, digest, identity, Path::new(&bundle), now)?;
@@ -1047,6 +1100,33 @@ mod tests {
         ])
         .is_err());
         assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn config_registration_requires_exact_preview_and_explicit_grants() {
+        let dir = Scratch::new();
+        let cfg = dir.file("server.toml");
+        let h = health(&dir);
+        let bundle = dir.file("bundle");
+        let p = invoke(&["provision-preview", "--health", &h]).unwrap();
+        let health_digest = field(&p, "health_sha256");
+        let created = invoke(&["provision-apply", "--health", &h, "--output", &bundle, "--health-sha256", health_digest, "--confirm"]).unwrap();
+        let identity = field(&created, "identity_sha256");
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))
+            .replace(":443", ":8443");
+        std::fs::write(&cfg, &source).unwrap();
+        let preview = ["register-server-preview", "--config", &cfg, "--health", &h, "--bundle", &bundle,
+            "--health-sha256", health_digest, "--identity-sha256", identity, "--listen", "127.0.0.1:443", "--grants", "device-a"];
+        let out = invoke(&preview).unwrap();
+        let mut save = preview.to_vec();
+        save[0] = "register-server-save";
+        assert!(parse(&save).is_err());
+        save.extend(["--sha256", field(&out, "approval_sha256"), "--confirm"]);
+        assert!(invoke(&save).unwrap().contains("runtime UNCHANGED"));
+        let config::Config::Server(doc) = config::read_file(Path::new(&cfg)).unwrap() else { panic!() };
+        assert_eq!(doc.server.inbounds.len(), 2);
+        assert!(invoke(&save).is_err());
     }
 
     #[test]
