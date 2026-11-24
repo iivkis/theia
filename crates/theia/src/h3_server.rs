@@ -127,6 +127,23 @@ pub(crate) async fn serve_generation(
 async fn run_connection(connection: quinn::Connection, context: Arc<ServerContext>) {
     let guard = ConnectionGuard(connection);
     let peer = guard.0.remote_address().ip();
+    let binding = if context.requires_channel_binding() {
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        if guard
+            .0
+            .export_keying_material(
+                &mut key[..],
+                crate::channel_binding::LABEL,
+                crate::channel_binding::H3,
+            )
+            .is_err()
+        {
+            return;
+        }
+        Some(Arc::new(crate::channel_binding::Admission::new(key)))
+    } else {
+        None
+    };
     let mut builder = h3::server::builder();
     builder.max_field_section_size(MAX_HEADERS);
     let Ok(Ok(mut h3)) = timeout(
@@ -166,6 +183,7 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
         };
         let context = context.clone();
         let pair = pair.clone();
+        let binding = binding.clone();
         handlers.spawn(async move {
             let Ok(Ok((request, stream))) =
                 timeout(HANDSHAKE_TIMEOUT, resolver.resolve_request()).await
@@ -174,9 +192,10 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
                 return;
             };
             if context.stream_up() {
-                handle_split_request(request, stream, &context, peer, &pair).await;
+                handle_split_request(request, stream, &context, peer, &pair, binding.as_deref())
+                    .await;
             } else {
-                handle_request(request, stream, &context, peer).await;
+                handle_request(request, stream, &context, peer, binding.as_deref()).await;
             }
         });
     }
@@ -187,6 +206,7 @@ async fn handle_request(
     mut stream: Stream,
     context: &ServerContext,
     peer: IpAddr,
+    binding: Option<&crate::channel_binding::Admission>,
 ) {
     let session_id = diagnostics::next_id();
     crate::diag!(
@@ -212,6 +232,10 @@ async fn handle_request(
             return;
         }
     };
+    if !crate::channel_binding::admit(binding, &[&request]) {
+        reject_split(&mut stream, StatusCode::UNAUTHORIZED).await;
+        return;
+    }
     crate::diag!(
         Debug,
         "server.h3",
@@ -246,6 +270,7 @@ async fn handle_split_request(
     context: &ServerContext,
     peer: IpAddr,
     pair: &SplitPair,
+    binding: Option<&crate::channel_binding::Admission>,
 ) {
     let Some(leg) = crate::split_http::leg(&request) else {
         reject_split(&mut stream, StatusCode::NOT_FOUND).await;
@@ -263,6 +288,11 @@ async fn handle_split_request(
             return;
         }
     };
+    if !crate::channel_binding::admit(binding, &[&upload, &download]) {
+        reject_split(&mut up, StatusCode::UNAUTHORIZED).await;
+        reject_split(&mut down, StatusCode::UNAUTHORIZED).await;
+        return;
+    }
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         down.recv_data().await.is_ok_and(|value| value.is_none())
             && down

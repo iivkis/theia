@@ -157,6 +157,19 @@ impl H3Client {
                 .map_err(|_| ClientError::Tls)?;
             pin.verify(chain.first().ok_or(ClientError::Tls)?.as_ref())?;
         }
+        let binding = if self.certificate_pin.is_some() {
+            let mut key = zeroize::Zeroizing::new([0u8; 32]);
+            connection
+                .export_keying_material(
+                    &mut key[..],
+                    crate::channel_binding::LABEL,
+                    crate::channel_binding::H3,
+                )
+                .map_err(|_| ClientError::Tls)?;
+            Some(key)
+        } else {
+            None
+        };
         crate::diag!(
             Trace,
             "client.h3",
@@ -179,19 +192,17 @@ impl H3Client {
         let (response, mut tx, mut rx) = if self.stream_up {
             use crate::split_http::{self, Leg};
             let mut download = sender
-                .send_request(split_http::request(
-                    &self.uri,
-                    Leg::Download,
-                    &self.authorization,
+                .send_request(crate::channel_binding::attach(
+                    binding.as_ref(),
+                    split_http::request(&self.uri, Leg::Download, &self.authorization)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             download.finish().await.map_err(|_| ClientError::Http3)?;
             let mut upload = sender
-                .send_request(split_http::request(
-                    &self.uri,
-                    Leg::Upload,
-                    &self.authorization,
+                .send_request(crate::channel_binding::attach(
+                    binding.as_ref(),
+                    split_http::request(&self.uri, Leg::Upload, &self.authorization)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
@@ -227,7 +238,7 @@ impl H3Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let mut stream = sender
-                .send_request(request)
+                .send_request(crate::channel_binding::attach(binding.as_ref(), request)?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             let response = stream

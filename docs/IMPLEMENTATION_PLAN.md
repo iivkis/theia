@@ -95,3 +95,11 @@ ADR хранить в `docs/adr/NNNN-title.md` с контекстом, альт
 ### Нормативный приоритет (ADR-0086, spec v0.6)
 
 Один вертикальный блок: кастомный SmartTheia XHTTP + H3/QUIC и H2/TCP + кастомный SmartTheia REALITY и мастер/manual, с собственным TLS manual как альтернативой защиты. Xray XHTTP/REALITY только вдохновение, не перенос полного набора функций или wire/config совместимость. Исторические first-flight spikes — исследование, конкретный механизм Xray не обязателен. Не закрывать этап по pin/stream-up без общего валидатора, согласованного security contract, versioned профилей, Apply и обязательных E2E; release gates сохраняются.
+
+### ADR-0087 — breaking invitation replacement and cross-host coverage
+
+ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. Existing mandatory WSL2/Linux-to-Windows job adds actual pinned stream-one/stream-up H2/H3/auto with wrong pin/mode refusal and public import. No extra job. Independent REALITY key proof, candidate Apply and F-19 remain open.
+
+### ADR-0088 — channel binding before OPEN
+
+Integrate TLS exporters into the actual H2/H3 pinned runtime before HTTP admission, verify per-leg proofs and reject replay in bounded per-connection state. Retain strict grants and all native acceptance. Independent identity and remaining F-18/F-19 work are not closed.

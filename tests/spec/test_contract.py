@@ -641,11 +641,15 @@ class SpecContractTests(unittest.TestCase):
             "tls_exporter_is_unavailable_for_untrusted_certificates",
             "v1_toml_refuses_unsupported_server_security_and_shaping_fields",
             "v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile",
-            "v1_invite_rejects_new_mode_and_identity_injection_without_a_version_bump",
+            "replacement_v1_invite_rejects_unsupported_mode_and_identity_injection",
         ):
             self.assertIn(name, tests)
         self.assertIn('profile.tls_profile == "default"', config)
-        self.assertIn('wire.tls_profile != "default"', invite)
+        self.assertIn('wire.carrier != "smarttheia-xhttp"', invite)
+        self.assertIn("replacement_v1_roundtrips_all_supported_profiles_and_refuses_legacy", invite)
+        self.assertNotIn("PREFIX_V2", invite)
+        self.assertNotIn("portable_from_profile", invite)
+        self.assertIn("leaf_sha256: Option<String>", invite)
         self.assertIn("Никакой REALITY-подобный режим", adr)
         self.assertIn("F-18/F-19", read("docs/IMPLEMENTATION_PLAN.md"))
 

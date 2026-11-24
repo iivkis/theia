@@ -12,6 +12,7 @@ pub mod camouflage_h3_probe;
 pub mod camouflage_interfaces;
 pub mod camouflage_probe;
 pub mod camouflage_workflow;
+mod channel_binding;
 pub mod client;
 pub mod client_import;
 pub mod config;

@@ -238,10 +238,14 @@ Public share and disabled-user recovery shortcuts are included in the main edito
 
 ### Дополнительная идентичность своего inbound
 
-В серверном редакторе `P` запускает локальную проверку сохранённых TOML/cert/key в worker. Просмотр показывает свой inbound, имя, порт и публичный pin; `y` повторно проверяет точный snapshot/leaf и сохраняет только `security_mode = "pinned-cert-v1"` через guarded write. `n`/Esc отменяют. Ни одного сетевого запроса или runtime Apply; отдельный restart обязателен. Профиль вручную переносится в клиент по доверенному каналу. Никаких третьих адресов, автоматической мимикрии или REALITY-ready. Существующий кандидатный `a` остаётся read-only.
+В серверном редакторе `P` запускает локальную проверку сохранённых TOML/cert/key в worker. Просмотр показывает свой inbound, имя, порт и публичный pin; `y` повторно проверяет точный snapshot/leaf и сохраняет только `security_mode = "pinned-cert-v1"` через guarded write. `n`/Esc отменяют. Ни одного сетевого запроса или runtime Apply; отдельный restart обязателен. Профиль переносится через новый theia://v1 по доверенному каналу (ADR-0087). Никаких третьих адресов, автоматической мимикрии или REALITY-ready. Существующий кандидатный `a` остаётся read-only.
 
 ### Собственный XHTTP (ADR-0084)
 
-В серверном редакторе `X` открывает guarded preview локального `pinned-cert-stream-up-v1` (H2/H3, раздельные upload/download). `P` сохраняет прежний stream-one pin профиль; `y` подтверждает именно показанный mode, без автоматического запуска или перезагрузки. Кандидаты сторонних адресов не становятся локальными TLS identity. Передача публичного pin клиенту пока ручная. Это не полная реализация SmartTheia REALITY.
+В серверном редакторе `X` открывает guarded preview локального `pinned-cert-stream-up-v1` (H2/H3, раздельные upload/download). `P` сохраняет прежний stream-one pin профиль; `y` подтверждает именно показанный mode, без автоматического запуска или перезагрузки. Кандидаты сторонних адресов не становятся локальными TLS identity. Передача публичного pin через новый theia://v1 с независимой проверкой (ADR-0087). Это не полная реализация SmartTheia REALITY.
 
 **ADR-0086:** форма inbound не предлагает Xray/VLESS, альтернативные transports или импорт Xray конфигурации. SmartTheia XHTTP (вдохновлён Xray XHTTP, не копия) фиксирован; REALITY (вдохновлён Xray REALITY, не копия) wizard/manual либо собственный TLS manual. H3/H2 — состояния одного транспорта. Исторические P/X экраны не целевые security options.
+
+### Replacement v1 (ADR-0087)
+
+ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. Server l/u/t/b and client i use the new single format. Preview shows the exact runtime TLS profile. Reissue old links. Verify public pin over an authenticated channel. Existing protected storage/rotation and separate restart rules remain.

@@ -33,7 +33,7 @@ impl PinnedModeReview {
         } else {
             ("pinned-cert-v1", self.pin.profile())
         };
-        format!("Собственный inbound: {}\nEndpoint: {}\nSNI: {}\nsecurity_mode = {mode}\nКлиентский tls_profile = {profile}\n\nСохранить режим только в TOML. Старые клиенты и theia://v1 несовместимы. Нужна отдельная перезагрузка сервера; CA/SAN остаются обязательными.\nНе полноценный REALITY. y: сохранить; n/Esc: отмена", self.inbound, self.endpoint, self.name)
+        format!("Собственный inbound: {}\nEndpoint: {}\nSNI: {}\nsecurity_mode = {mode}\nКлиентский tls_profile = {profile}\n\nСохранить режим только в TOML. Старые приглашения несовместимы; новый theia://v1 сохраняет точный режим и pin. Нужна отдельная перезагрузка сервера; CA/SAN остаются обязательными.\nНе полноценный REALITY. y: сохранить; n/Esc: отмена", self.inbound, self.endpoint, self.name)
     }
 }
 
@@ -225,7 +225,7 @@ impl Editor {
         let profile = &document.client.profiles[index];
         if profile.server != invite.endpoint
             || profile.server_name != invite.server_name
-            || profile.tls_profile != "default"
+            || profile.tls_profile != invite.tls_profile()
             || (invite.transport != Transport::Auto && profile.transport != invite.transport)
         {
             return Err("Invitation does not match saved profile identity and transport");
@@ -501,6 +501,15 @@ impl Editor {
             self.error = Some("Saved configuration changed; issuance refused".into());
             return None;
         }
+        // The saved TOML alone does not bind external certificate bytes.
+        // Consume the one-time offer if its exact pin/mode is no longer current.
+        if invite.tls_profile() != "default"
+            && !Invitation::public_from_server(&self.original, &invite.id)
+                .is_ok_and(|current| current.tls_profile() == invite.tls_profile())
+        {
+            self.error = Some("Saved certificate or TLS profile changed; issuance refused".into());
+            return None;
+        }
         Some(invite)
     }
 
@@ -526,7 +535,7 @@ impl Editor {
                 Invitation::public_from_profile(profile)
             }
         }
-        .map_err(|_| "Selected record cannot be shared in v1")?;
+        .map_err(|_| "Selected record cannot be shared without preserving its TLS profile")?;
         invite.encode().map_err(|_| "Public invitation unavailable")
     }
 
@@ -1116,7 +1125,9 @@ mod tests {
         let mut expected = doc.clone();
         expected.server.inbounds[0].security_mode = SecurityMode::PinnedCertV1;
         assert_eq!(saved, expected);
-        assert!(editor.public_share().is_err());
+        let public = Invitation::decode(&editor.public_share().unwrap()).unwrap();
+        assert_eq!(public.tls_profile(), review.pin.profile());
+        assert!(!public.has_token());
         assert!(crate::reload_preflight::assess_reload(&doc, &saved).is_err());
         assert!(!crate::restart_guard::same_port_tls_only(&doc, &saved));
         assert!(editor.apply_pinned_mode(&review).is_err());
@@ -1130,7 +1141,99 @@ mod tests {
             saved.server.inbounds[0].security_mode,
             SecurityMode::PinnedCertStreamUpV1
         );
-        assert!(editor.public_share().is_err());
+        let public = Invitation::decode(&editor.public_share().unwrap()).unwrap();
+        assert_eq!(public.tls_profile(), split.pin.stream_up_profile());
+        assert!(!public.has_token());
+    }
+
+    #[test]
+    fn pinned_invitation_issue_import_refresh_and_certificate_drift() {
+        use crate::security_profile::{CertificatePin, SecurityMode};
+
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
+        let certificate = Temp::write(&generated.cert.pem());
+        let key = Temp::write(&generated.key_pair.serialize_pem());
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key.0, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let pin = CertificatePin::from_der(generated.cert.der().as_ref());
+        for (mode, profile) in [
+            (SecurityMode::PinnedCertV1, pin.profile()),
+            (SecurityMode::PinnedCertStreamUpV1, pin.stream_up_profile()),
+        ] {
+            let Config::Server(mut doc) = config::parse(&server_source()).unwrap() else {
+                panic!("server fixture");
+            };
+            let inbound = &mut doc.server.inbounds[0];
+            inbound.tls_cert = format!("file:{}", certificate.0.display());
+            inbound.tls_key = format!("file:{}", key.0.display());
+            inbound.security_mode = mode;
+            let source = Temp::write(&Config::Server(doc).to_toml().unwrap());
+            let mut issuer = Editor::load(Role::Server, &source.0).unwrap();
+            issuer.issue_user("new-device").unwrap();
+            assert!(issuer.take_issued().is_none());
+            assert!(issuer.save());
+            let issued = issuer.take_issued().unwrap();
+            let link = Zeroizing::new(issued.encode().unwrap());
+            assert!(link.starts_with("theia://v1/"));
+            assert_eq!(issued.tls_profile(), profile);
+            assert!(issuer.take_issued().is_none());
+
+            let client_file = Temp::write(include_str!("../../../examples/client.toml"));
+            let mut client = Editor::load(Role::Client, &client_file.0).unwrap();
+            let received = client_import::read_source(&link).unwrap();
+            let ca = format!("file:{}", certificate.0.display());
+            client
+                .import_invitation(&received, Some(&ca), None)
+                .unwrap();
+            let Config::Client(saved) = config::read_file(&client_file.0).unwrap() else {
+                panic!("client fixture");
+            };
+            assert_eq!(saved.client.active_profile, "home");
+            let imported = &saved.client.profiles[1];
+            assert_eq!(imported.tls_profile, profile);
+            assert_eq!(imported.tls_ca.as_deref(), Some(ca.as_str()));
+            let old_secret = PathBuf::from(imported.auth_token.strip_prefix("file:").unwrap());
+
+            // Refresh only the bearer, never a pin, CA or carrier.
+            let plain = Invitation::issued_from_server(
+                &config::parse(&server_source()).unwrap(),
+                "public",
+                "device-a",
+                &[0x42; 32],
+            )
+            .unwrap();
+            assert!(!client.can_refresh_credential(&plain));
+            issuer.rotate_user("new-device").unwrap();
+            assert!(issuer.save());
+            let rotated = issuer.take_issued().unwrap();
+            assert!(client.can_refresh_credential(&rotated));
+            client.refresh_credential(&rotated).unwrap();
+            let Config::Client(updated) = config::read_file(&client_file.0).unwrap() else {
+                panic!("client fixture");
+            };
+            let updated = &updated.client.profiles[1];
+            assert_eq!(updated.tls_profile, imported.tls_profile);
+            assert_eq!(updated.tls_ca, imported.tls_ca);
+            assert_eq!(updated.transport, imported.transport);
+            let new_secret = PathBuf::from(updated.auth_token.strip_prefix("file:").unwrap());
+            assert_ne!(new_secret, old_secret);
+            assert!(old_secret.is_file());
+            remove_fixture_secret(&old_secret);
+            remove_fixture_secret(&new_secret);
+
+            // Changed/unreadable external cert after save consumes the offer.
+            issuer.rotate_user("new-device").unwrap();
+            assert!(issuer.save());
+            fs::write(&certificate.0, "invalid certificate").unwrap();
+            assert!(issuer.take_issued().is_none());
+            assert!(issuer.public_share().is_err());
+            fs::write(&certificate.0, generated.cert.pem()).unwrap();
+            assert!(issuer.take_issued().is_none());
+        }
     }
 
     #[test]

@@ -104,7 +104,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn versioned_profile_config_is_explicit_and_v1_invite_cannot_downgrade() {
+    fn explicit_profile_config_and_replacement_v1_preserve_pin() {
         use crate::{
             config::{self, Config, Transport},
             invite::Invitation,
@@ -125,7 +125,11 @@ mod tests {
                 config::parse(&document.to_toml().unwrap()).unwrap(),
                 document
             );
-            assert!(Invitation::public_from_profile(&client.client.profiles[0]).is_err());
+            let invitation = Invitation::public_from_profile(&client.client.profiles[0]).unwrap();
+            assert_eq!(
+                invitation.tls_profile(),
+                client.client.profiles[0].tls_profile
+            );
         }
         client.client.profiles[0].tls_profile =
             pin.profile().replace("pinned-cert-v1:", "pinned-cert-v2:");
@@ -147,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_up_profile_is_explicit_and_not_an_invitation_v1() {
+    fn stream_up_profile_is_explicit_in_replacement_invitation_v1() {
         use crate::{
             config::{self, Config, Transport},
             invite::Invitation,
@@ -168,7 +172,11 @@ mod tests {
             let config = Config::Client(client.clone());
             config.validate().unwrap();
             assert_eq!(config::parse(&config.to_toml().unwrap()).unwrap(), config);
-            assert!(Invitation::public_from_profile(&client.client.profiles[0]).is_err());
+            let invitation = Invitation::public_from_profile(&client.client.profiles[0]).unwrap();
+            assert_eq!(
+                invitation.tls_profile(),
+                client.client.profiles[0].tls_profile
+            );
         }
     }
 

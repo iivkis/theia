@@ -263,6 +263,10 @@ impl ServerContext {
         self.authorize(auth).map_err(AuthFailure::status)
     }
 
+    pub(crate) fn requires_channel_binding(&self) -> bool {
+        !self.security_mode.is_plain()
+    }
+
     pub(crate) fn stream_up(&self) -> bool {
         self.security_mode.is_stream_up()
     }
@@ -626,6 +630,19 @@ pub(crate) async fn serve_generation_with_tls(
                     }
                     crate::diag!(Trace, "server.h2", "tls_verified",
                         "connection" = Value::Count(connection_id));
+                    let binding = if context.requires_channel_binding() {
+                        let Ok(key) = tls.get_ref().1.export_keying_material(
+                            [0u8; 32], crate::channel_binding::LABEL,
+                            Some(crate::channel_binding::H2),
+                        ) else {
+                            return;
+                        };
+                        Some(Arc::new(crate::channel_binding::Admission::new(
+                            zeroize::Zeroizing::new(key),
+                        )))
+                    } else {
+                        None
+                    };
                     let mut builder = h2::server::Builder::new();
                     builder.max_concurrent_streams(MAX_H2_STREAMS);
                     builder.max_header_list_size(MAX_HEADER_BYTES);
@@ -655,11 +672,12 @@ pub(crate) async fn serve_generation_with_tls(
                         };
                         let context = context.clone();
                         let pair = pair.clone();
+                        let binding = binding.clone();
                         handlers.spawn(async move {
                             let result = if context.stream_up() {
-                                handle_split_request(request, respond, &context, peer.ip(), &pair).await
+                                handle_split_request(request, respond, &context, peer.ip(), &pair, binding.as_deref()).await
                             } else {
-                                handle_request(request, respond, context, peer.ip()).await
+                                handle_request(request, respond, context, peer.ip(), binding.as_deref()).await
                             };
                             if let Err(error) = result {
                                 crate::diag!(Warn, "server.h2", "request_failed",
@@ -702,6 +720,7 @@ async fn handle_request(
     mut respond: h2::server::SendResponse<Bytes>,
     context: Arc<ServerContext>,
     peer: IpAddr,
+    binding: Option<&crate::channel_binding::Admission>,
 ) -> Result<(), ServerError> {
     let session_id = diagnostics::next_id();
     crate::diag!(
@@ -723,6 +742,9 @@ async fn handle_request(
             return reject(&mut respond, status).await;
         }
     };
+    if !crate::channel_binding::admit(binding, &[&request]) {
+        return reject(&mut respond, StatusCode::UNAUTHORIZED).await;
+    }
     crate::diag!(
         Debug,
         "server.h2",
@@ -752,6 +774,7 @@ async fn handle_split_request(
     context: &ServerContext,
     peer: IpAddr,
     pair: &SplitPair,
+    binding: Option<&crate::channel_binding::Admission>,
 ) -> Result<(), ServerError> {
     let Some(leg) = crate::split_http::leg(&request) else {
         return reject(&mut respond, StatusCode::NOT_FOUND).await;
@@ -768,6 +791,10 @@ async fn handle_split_request(
             return reject(&mut down, status).await;
         }
     };
+    if !crate::channel_binding::admit(binding, &[&upload, &download]) {
+        let _ = reject(&mut up, StatusCode::UNAUTHORIZED).await;
+        return reject(&mut down, StatusCode::UNAUTHORIZED).await;
+    }
     // GET has no request body or trailers; never dial until its EOF is proven.
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         download.body_mut().data().await.is_none()

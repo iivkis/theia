@@ -1,13 +1,17 @@
 //! Native real TLS/QUIC pinned identity and mutually exclusive HTTP routes.
 //! No third-party endpoints; each peer uses isolated loopback certificates.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use bytes::Bytes;
+use http::{HeaderValue, Request, StatusCode};
+use ring::hmac;
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use theia::{
     client::{ClientError, H2Client},
-    config::{Inbound, ServerPolicy, User},
+    config::{self, Config, Inbound, ServerPolicy, Transport, User},
     h3_client::H3Client,
+    invite::Invitation,
     protocol::Address,
     security_profile::{CertificatePin, SecurityMode},
     server::{self, ServerContext},
@@ -160,20 +164,72 @@ impl Fixture {
         let port = target.local_addr().unwrap().port();
         let address = Address::V4([127, 0, 0, 1]);
         for h3 in [false, true] {
+            // Derive the actual runtime mode/pin from the portable invite,
+            // not the fixture's original configuration after the roundtrip.
+            let Config::Client(doc) =
+                config::parse(include_str!("../../../examples/client.toml")).unwrap()
+            else {
+                panic!("client fixture");
+            };
+            let mut profile = doc.client.profiles[0].clone();
+            profile.server = if h3 { self.h3 } else { self.h2 }.to_string();
+            profile.server_name = "localhost".into();
+            profile.transport = if h3 { Transport::H3 } else { Transport::H2 };
+            profile.tls_profile = pin.map_or_else(
+                || "default".into(),
+                |pin| {
+                    if self.stream_up {
+                        pin.stream_up_profile()
+                    } else {
+                        pin.profile()
+                    }
+                },
+            );
+            let invite = Invitation::public_from_profile(&profile)
+                .unwrap()
+                .encode()
+                .unwrap();
+            let received = Invitation::decode(&invite)
+                .unwrap()
+                .to_profile("env:TEST_TOKEN", None)
+                .unwrap();
+            assert_eq!(received.tls_profile, profile.tls_profile);
+            assert_eq!(received.transport, profile.transport);
+            let imported_pin = CertificatePin::parse_profile(&received.tls_profile);
+            let stream_up = CertificatePin::is_stream_up_profile(&received.tls_profile);
+            let token = URL_SAFE_NO_PAD.encode(TOKEN);
             let (mut app, local) = tokio::io::duplex(4096);
-            let relay = if h3 {
-                let tunnel = self
-                    .h3(pin, "localhost", &TOKEN)
-                    .open(address.clone(), port)
-                    .await
-                    .unwrap();
+            let relay = if received.transport == Transport::H3 {
+                let tunnel = H3Client::new(
+                    received.server.parse().unwrap(),
+                    &received.server_name,
+                    &token,
+                    self.roots.clone(),
+                )
+                .unwrap()
+                .with_certificate_pin(imported_pin)
+                .unwrap()
+                .with_stream_up(stream_up)
+                .unwrap()
+                .open(address.clone(), port)
+                .await
+                .unwrap();
                 tokio::spawn(tunnel.relay(local))
             } else {
-                let tunnel = self
-                    .h2(pin, "localhost", &TOKEN)
-                    .open(address.clone(), port)
-                    .await
-                    .unwrap();
+                let tunnel = H2Client::new(
+                    &received.server,
+                    &received.server_name,
+                    &token,
+                    self.roots.clone(),
+                )
+                .unwrap()
+                .with_certificate_pin(imported_pin)
+                .unwrap()
+                .with_stream_up(stream_up)
+                .unwrap()
+                .open(address.clone(), port)
+                .await
+                .unwrap();
                 tokio::spawn(tunnel.relay(local))
             };
             let (mut remote, _) = target.accept().await.unwrap();
@@ -314,4 +370,147 @@ async fn h2_h3_stream_up_separate_http_legs_and_identity() {
     })
     .await
     .expect("bounded real H2/H3 split transport matrix");
+}
+
+// Independent wire witness, not a call to the production proof helper.
+fn raw_pinned_request(proof: Option<&HeaderValue>) -> Request<()> {
+    let mut request = Request::post("https://localhost/v1/pinned-session")
+        .header("content-type", "application/octet-stream")
+        .header(
+            "authorization",
+            format!("Bearer {}", URL_SAFE_NO_PAD.encode(TOKEN)),
+        )
+        .body(())
+        .unwrap();
+    if let Some(proof) = proof {
+        request
+            .headers_mut()
+            .insert("theia-channel-proof", proof.clone());
+    }
+    request
+}
+
+fn witness(key: &[u8; 32]) -> HeaderValue {
+    let request = raw_pinned_request(None);
+    let signing_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    let mut data = b"SmartTheia/XHTTP/admission/v1\0".to_vec();
+    for part in [
+        b"POST".as_slice(),
+        b"/v1/pinned-session".as_slice(),
+        request.headers()["authorization"].as_bytes(),
+    ] {
+        data.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        data.extend_from_slice(part);
+    }
+    let tag = hmac::sign(&signing_key, &data);
+    let mut header = HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(tag.as_ref())).unwrap();
+    header.set_sensitive(true);
+    header
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
+    timeout(Duration::from_secs(20), async {
+        let fixture = Fixture::start(SecurityMode::PinnedCertV1).await;
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(fixture.roots.clone())
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let mut old = None;
+        for _ in 0..2 {
+            let socket = tokio::net::TcpStream::connect(fixture.h2).await.unwrap();
+            let tls = connector
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                    socket,
+                )
+                .await
+                .unwrap();
+            let key = zeroize::Zeroizing::new(
+                tls.get_ref()
+                    .1
+                    .export_keying_material(
+                        [0u8; 32],
+                        b"EXPORTER-SmartTheia-XHTTP-Admission-v1",
+                        Some(b"h2"),
+                    )
+                    .unwrap(),
+            );
+            let current = witness(&key);
+            let (mut sender, connection) = h2::client::handshake(tls).await.unwrap();
+            let driver = tokio::spawn(connection);
+            for (proof, expected) in [
+                (None, StatusCode::UNAUTHORIZED),
+                (old.as_ref(), StatusCode::UNAUTHORIZED),
+                (Some(&current), StatusCode::OK),
+                (Some(&current), StatusCode::UNAUTHORIZED),
+            ] {
+                sender = sender.ready().await.unwrap();
+                let (response, _body) = sender
+                    .send_request(raw_pinned_request(proof), true)
+                    .unwrap();
+                assert_eq!(response.await.unwrap().status(), expected);
+            }
+            old = Some(current);
+            driver.abort();
+        }
+    })
+    .await
+    .expect("bounded native H2 exporter admission");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
+    timeout(Duration::from_secs(20), async {
+        let fixture = Fixture::start(SecurityMode::PinnedCertV1).await;
+        let endpoint = theia::quic_transport::client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.roots.clone(),
+        )
+        .unwrap();
+        let mut old = None;
+        for _ in 0..2 {
+            let connection = theia::quic_transport::connect(&endpoint, fixture.h3, "localhost")
+                .await
+                .unwrap();
+            let mut key = zeroize::Zeroizing::new([0u8; 32]);
+            connection
+                .export_keying_material(
+                    &mut key[..],
+                    b"EXPORTER-SmartTheia-XHTTP-Admission-v1",
+                    b"h3",
+                )
+                .unwrap();
+            let current = witness(&key);
+            let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
+            let driver_task = tokio::spawn(async move {
+                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            });
+            for (proof, expected) in [
+                (None, StatusCode::UNAUTHORIZED),
+                (old.as_ref(), StatusCode::UNAUTHORIZED),
+                (Some(&current), StatusCode::OK),
+                (Some(&current), StatusCode::UNAUTHORIZED),
+            ] {
+                let mut stream: h3::client::RequestStream<_, Bytes> = sender
+                    .send_request(raw_pinned_request(proof))
+                    .await
+                    .unwrap();
+                // Receiving headers requires no HELLO or OPEN; 200 is only
+                // admission. The test never requests an external target.
+                assert_eq!(stream.recv_response().await.unwrap().status(), expected);
+            }
+            old = Some(current);
+            driver_task.abort();
+        }
+    })
+    .await
+    .expect("bounded native H3 exporter admission");
 }

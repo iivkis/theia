@@ -51,3 +51,11 @@ ADR-0082/0083: read-only второй шаг мастера с exact/fresh dual 
 ### Pending ADR-0084
 
 Спецификация 0.6 (ADR-0086): единственный кастомный SmartTheia XHTTP, вдохновлён Xray XHTTP, не копия; H3/QUIC и H2/TCP; собственный SmartTheia REALITY, вдохновлён Xray REALITY, не копия, либо собственный TLS. Никакой Xray interoperability как цели. Предложен native split stream-up на одном проверенном соединении с общим FSM и pin. Промежуточный split stream-up с pin прошёл CI da21649; это не приёмка полноценного SmartTheia REALITY, целевой формы inbound или Apply. F-18/F-19 остаются открытыми.
+
+## ADR-0087 — replacement invitation and cross-host pinned XHTTP acceptance
+
+ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. Implementation and extended mandatory WSL2 Linux/native Windows binary tests are submitted; no new acceptance result is claimed. Prior PR #116 was merged at 45f42b1 after CI 45429164950. F-18/F-19 remain open.
+
+## ADR-0088 — exporter-bound pinned XHTTP admission
+
+Implementation submitted: H2 and H3 use separate TLS-exporter contexts, per-request HMAC, both stream-up legs and atomic one-admission connection state. Added independent raw H2/H3 negative tests and pure race/route/credential regressions. Acceptance requires exact-head CI. Independent server identity, complete candidate Apply, active-probing and F-19 remain open.
