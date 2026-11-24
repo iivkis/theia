@@ -14,7 +14,7 @@ theia reference inspect --store PATH\n\
 theia reference recheck --store PATH --expected-revision N --plan-sha256 HEX --confirm\n\
 theia reference monitor --store PATH --plan-sha256 HEX --confirm\n\
 Plan TOML: schema_version=1, inbound, endpoint, own_ips=[all known public/NAT and local server IPs], [[references]] server_name, address (exact public IP:443). Primary first, at most two reserves.\n\
-Preview binds exact plan bytes; inspect displays canonical plan SHA for rechecks. Confirm permission for each target, DNS, H2/H3 HEAD /. Checks never follow redirects or send credentials. Monitor checks at a jittered 12h interval until Ctrl+C. No automatic reference switch, runtime Apply, or trust changes.";
+Preview binds exact plan bytes; inspect displays canonical plan SHA for rechecks. Confirm permission for each target, inbound endpoint DNS, reference DNS, and H2/H3 HEAD /. Checks never follow redirects or send credentials. Monitor checks at a jittered 12h interval until Ctrl+C. No automatic reference switch, runtime Apply, or trust changes.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -98,7 +98,7 @@ async fn monitor(store: &Store, approved: [u8; 32]) -> Result<String, Error> {
         loop {
             let state = store.inspect()?;
             if state.plan().digest()? != approved {
-                return Err(Error::Approval);
+                return Err::<String, Error>(Error::Approval);
             }
             let now = health::unix_now()?;
             state.status(now)?;
@@ -112,8 +112,6 @@ async fn monitor(store: &Store, approved: [u8; 32]) -> Result<String, Error> {
                 tokio::time::sleep(Duration::from_secs((due - now).min(60))).await;
             }
         }
-        #[allow(unreachable_code)]
-        Ok::<String, Error>(String::new())
     };
     tokio::select! {
         biased;

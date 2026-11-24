@@ -161,7 +161,7 @@ impl Plan {
                 target.server_name, target.address
             ));
         }
-        out.push_str("\nConsent covers DNS and two HTTPS HEAD / attempts on each exact pin, H2 and H3; no redirects, bearer or request body.");
+        out.push_str("\nConsent covers inbound endpoint DNS, reference DNS and two HTTPS HEAD / attempts on each exact pin, H2 and H3; no redirects, bearer or request body.");
         Ok(out)
     }
 }
@@ -192,13 +192,20 @@ pub fn unix_now() -> Result<u64, Error> {
 }
 
 fn own_addresses(plan: &Plan) -> Result<HashSet<IpAddr>, Error> {
-    let mut own: HashSet<_> = plan.own_ips.iter().copied().map(normalize).collect();
+    let own: HashSet<_> = plan.own_ips.iter().copied().map(normalize).collect();
     #[cfg(target_os = "linux")]
-    {
+    let own = {
+        let mut own = own;
         let interfaces = crate::camouflage_interfaces::collect_assigned_interfaces()
             .map_err(|_| Error::Dns)?;
-        own.extend(interfaces.interfaces.into_iter().map(|item| normalize(item.address)));
-    }
+        own.extend(
+            interfaces
+                .interfaces
+                .into_iter()
+                .map(|item| normalize(item.address)),
+        );
+        own
+    };
     Ok(own)
 }
 
@@ -221,6 +228,40 @@ fn vet_pin(
         return Err(Error::Dns);
     }
     Ok(())
+}
+
+async fn extend_endpoint_addresses(
+    plan: &Plan,
+    mut own: HashSet<IpAddr>,
+) -> Result<HashSet<IpAddr>, Error> {
+    if plan.endpoint.parse::<SocketAddr>().is_ok() {
+        return Ok(own);
+    }
+    let (name, port) = plan.endpoint.rsplit_once(':').ok_or(Error::Format)?;
+    let port: u16 = port.parse().map_err(|_| Error::Format)?;
+    let absolute = format!("{name}.");
+    timeout(ATTEMPT, async {
+        let answers = tokio::net::lookup_host((absolute.as_str(), port))
+            .await
+            .map_err(|_| Error::Dns)?;
+        let mut count = 0;
+        for address in answers {
+            count += 1;
+            if count > MAX_DNS_ANSWERS {
+                return Err(Error::Dns);
+            }
+            own.insert(normalize(address.ip()));
+        }
+        if count == 0 {
+            return Err(Error::Dns);
+        }
+        if plan.references.iter().any(|target| own.contains(&normalize(target.address.ip()))) {
+            return Err(Error::SelfReference);
+        }
+        Ok(own)
+    })
+    .await
+    .map_err(|_| Error::Timeout)?
 }
 
 async fn fresh_dns(target: &Target, own: &HashSet<IpAddr>) -> Result<(), Error> {
@@ -403,6 +444,10 @@ pub async fn check(plan: &Plan, approved: [u8; 32]) -> Result<Vec<Evidence>, Err
     if plan.references.iter().any(|target| own.contains(&normalize(target.address.ip()))) {
         return Err(Error::SelfReference);
     }
+    // Also resolve the operator-declared endpoint when it is a DNS name.
+    // This is DNS only, never a connection to the inbound or a new target.
+    // Reject references resolving back to any of those addresses.
+    let own = extend_endpoint_addresses(plan, own).await?;
     timeout(BATCH, async {
         let _permit = ACTIVE.acquire().await.map_err(|_| Error::Timeout)?;
         let mut results = Vec::with_capacity(plan.references.len());
@@ -744,5 +789,153 @@ mod tests {
     #[tokio::test]
     async fn incorrect_digest_is_rejected_before_any_network() {
         assert_eq!(check(&plan(), [0; 32]).await, Err(Error::Approval));
+    }
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "theia-reference-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_inventory_rejects_stale_revision_and_wrong_digest_before_network() {
+        let dir = Scratch::new();
+        let path = dir.0.join("health.toml");
+        let state = State::new(plan(), vec![good(false); 3], 100).unwrap();
+        let store = Store::new(&path).unwrap();
+        store.enroll(&state).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(store.enroll(&state).is_err());
+        let reopened = Store::new(&path).unwrap();
+        let restored = reopened.inspect().unwrap();
+        assert_eq!(restored.revision(), 1);
+        let approved = restored.plan().digest().unwrap();
+        assert!(matches!(reopened.recheck(2, approved).await, Err(Error::Conflict)));
+        assert!(matches!(reopened.recheck(1, [0; 32]).await, Err(Error::Approval)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    fn assert_head(request: &Request<()>) {
+        assert_eq!(request.method(), Method::HEAD);
+        assert_eq!(request.uri().path(), "/");
+        assert!(!request.headers().contains_key(http::header::AUTHORIZATION));
+        assert!(!request.headers().contains_key(http::header::COOKIE));
+    }
+
+    async fn application_fixture(
+        h2_status: u16,
+        h3_status: u16,
+    ) -> (Target, RootCertStore, Driver, Driver) {
+        use rcgen::generate_simple_self_signed;
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let signed = generate_simple_self_signed(vec!["reference.example.org".into()]).unwrap();
+        let cert = signed.cert.der().clone();
+        let key = PrivatePkcs8KeyDer::from(signed.key_pair.serialize_der());
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key.clone_key().into())
+        .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = Driver(tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let Ok(tls) = acceptor.accept(socket).await else {
+                return;
+            };
+            let mut h2 = h2::server::handshake(tls).await.unwrap();
+            while let Some(Ok((request, mut response))) = h2.accept().await {
+                let (parts, _) = request.into_parts();
+                assert_head(&Request::from_parts(parts, ()));
+                response.send_response(
+                    http::Response::builder().status(h2_status).body(()).unwrap(),
+                    true,
+                ).unwrap();
+            }
+        }));
+        let endpoint = crate::quic_transport::server_endpoint(address, vec![cert], key.into())
+            .unwrap();
+        let udp = Driver(tokio::spawn(async move {
+            let incoming = endpoint.accept().await.unwrap();
+            let Ok(connection) = crate::quic_transport::accept(incoming).await else {
+                return;
+            };
+            let mut builder = h3::server::builder();
+            builder.max_field_section_size(8192);
+            let mut server = builder
+                .build::<_, Bytes>(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
+            while let Ok(Some(resolver)) = server.accept().await {
+                let Ok((request, mut stream)) = resolver.resolve_request().await else {
+                    break;
+                };
+                assert_head(&request);
+                stream.send_response(http::Response::builder().status(h3_status).body(()).unwrap())
+                    .await.unwrap();
+                stream.finish().await.unwrap();
+            }
+        }));
+        (Target { server_name: "reference.example.org".into(), address }, roots, tcp, udp)
+    }
+
+    // Private fixture bypasses only the public-IP/DNS gate, not PKI or ALPN.
+    // Production callers can reach these functions only through check().
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_local_h2_h3_head_responses_are_observed() {
+        let (target, roots, _tcp, _udp) = application_fixture(204, 302).await;
+        let (h2, h3) = tokio::join!(
+            timeout(ATTEMPT, h2_head(&target, roots.clone())),
+            timeout(ATTEMPT, h3_head(&target, roots))
+        );
+        assert_eq!(h2.unwrap(), Some(204));
+        assert_eq!(h3.unwrap(), Some(302));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_probes_refuse_untrusted_or_wrong_name_before_head() {
+        let (mut target, roots, _tcp, _udp) = application_fixture(200, 200).await;
+        target.server_name = "wrong.example.org".into();
+        let (h2, h3) = tokio::join!(
+            timeout(ATTEMPT, h2_head(&target, roots.clone())),
+            timeout(ATTEMPT, h3_head(&target, roots))
+        );
+        assert_eq!(h2.unwrap(), None);
+        assert_eq!(h3.unwrap(), None);
+        let (target, _, _tcp, _udp) = application_fixture(200, 200).await;
+        let other = rcgen::generate_simple_self_signed(vec!["reference.example.org".into()])
+            .unwrap();
+        let mut wrong = RootCertStore::empty();
+        wrong.add(other.cert.der().clone()).unwrap();
+        let (h2, h3) = tokio::join!(
+            timeout(ATTEMPT, h2_head(&target, wrong.clone())),
+            timeout(ATTEMPT, h3_head(&target, wrong))
+        );
+        assert_eq!(h2.unwrap(), None);
+        assert_eq!(h3.unwrap(), None);
     }
 }
