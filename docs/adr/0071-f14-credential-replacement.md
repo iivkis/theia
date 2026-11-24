@@ -1,6 +1,6 @@
 # ADR-0071: F-14 M4.4g — explicit credential-only replacement
 
-**Status:** pending full native CI.
+**Status:** accepted in PR #108, exact-head run 45395505034 (13/13).
 
 Server rotation previously required a new client profile ID or manual credential file editing because duplicate import is deliberately rejected. Preserve that refusal. Add a separate credential replacement transaction, only after explicit user review of a matching existing profile.
 

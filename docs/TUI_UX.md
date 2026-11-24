@@ -218,3 +218,7 @@ For uncertain TOML replacement, issuance/rotation and disable failure panels mus
 **M4.4g credential replacement:** in client import preview, matching confidential invitation permits r → dedicated review → y. Ordinary y still rejects duplicate IDs. The review identifies profile, endpoint and SNI; no bearer is shown. Only the auth_token reference changes; selected preview CA is ignored. Cancellation has no effect, success retains the old file, and the active profile/runtime/system proxy are unchanged.
 
 **M4.4h:** server editor b → disabled user ID → review of global recovery on existing grants → y; the new bearer remains hidden until successful guarded save and separate reveal/export. Esc cancels. Active users, ungranted users and dirty/conflicted editors refuse. No runtime Apply or restoration of old bearer.
+
+**M4.4i:** l in the loaded editor opens the public tokenless link for the selected saved server inbound or client profile; Enter/Esc closes. No file write, secret lookup, runtime Apply or account change. Confidential issuance remains a distinct action. Dirty/stale/unsupported records refuse. Native Windows recovery parity is tested through the existing Named Pipe Apply scenario.
+
+Public share and disabled-user recovery shortcuts are included in the main editor and help. The public-share panel is separate from confidential issuance; no implicit token retrieval.
