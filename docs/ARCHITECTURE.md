@@ -20,7 +20,7 @@
             «Для сервера»       «Для клиента»
 ```
 
-**Не писать свой QUIC/HTTP/TLS.** Приложение владеет SmartTheia frames/FSM, собственным XHTTP carrier, авторизацией, transport negotiation и бизнес-правилами. SmartTheia XHTTP использует стандартные H2/TCP/TLS1.3 и H3/QUIC/TLS1.3; SmartTheia REALITY — отдельный собственный security adapter. Xray — концептуальный референс, не wire-совместимость. XHTTP — единственный транспорт. Inbound явно выбирает SmartTheia REALITY (wizard/manual) либо собственный TLS (manual cert chain/private key). Оба используют H3-first → H2 только при сетевой недоступности QUIC. См. ADR-0084/0085.
+**Не писать свой QUIC/HTTP/TLS.** Приложение владеет SmartTheia frames/FSM, собственным XHTTP carrier, авторизацией, transport negotiation и бизнес-правилами. SmartTheia XHTTP использует стандартные H2/TCP/TLS1.3 и H3/QUIC/TLS1.3; SmartTheia REALITY — отдельный собственный security adapter. SmartTheia XHTTP вдохновлён Xray XHTTP, не копия; SmartTheia REALITY вдохновлён Xray REALITY, не копия. Xray — только концептуальный референс, не wire/API/config совместимость и не обязательный набор функций. XHTTP — единственный транспорт. Inbound явно выбирает SmartTheia REALITY (wizard/manual) либо собственный TLS (manual cert chain/private key). Оба используют H3-first → H2 только при сетевой недоступности QUIC. См. ADR-0084/0085/0086.
 
 ## 2. Rust workspace (целевая, не обязательная физическая разбивка)
 

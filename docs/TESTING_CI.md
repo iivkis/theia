@@ -70,3 +70,5 @@ Required check: `ci-gate` на актуальном SHA; настройка bran
 ### Целевая приёмка ADR-0085 (ещё не выполнена)
 
 Обязательны нативные E2E XHTTP × два security modes × H2/H3, для каждого QUIC-first и network-only fallback с неизменными identity/security/XHTTP/auth, отказ при TLS/key/ALPN/auth/protocol ошибках. REALITY wizard/manual формируют один тип и используют один валидатор. TLS только ручные cert/key paths, отказ при неверной паре, без wizard. Guarded Apply/rollback, byte-exact DATA, OPEN_OK, FIN, cancellation и backpressure. Матрица — нормативное требование, не результат тестирования.
+
+**ADR-0086:** acceptance измеряет собственный SmartTheia contract, не Xray interoperability или побайтовое воспроизведение его handshake. Никакого требования копировать Xray XHTTP modes, REALITY key format или config. Нативные H2/H3 E2E каждого security mode, fallback, crypto/security review, F-13/F-19 независимые измерения, Apply/rollback и все existing mandatory checks остаются обязательными. Spec assertions защищают формулировки, но не заменяют behavioral tests.

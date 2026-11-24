@@ -4,7 +4,7 @@
 
 ## 1. Transport embedding: SmartTheia XHTTP
 
-Единственный целевой транспорт — собственная реализация SmartTheia XHTTP, не wire-копия Xray XHTTP/VLESS. На каждом inbound явно выбирается один security mode: SmartTheia REALITY (wizard/manual) либо собственный TLS (только ручные X.509 cert/chain и private key). Оба используют один XHTTP и QUIC-first. H2/H3 — нижележащие HTTP стеки, не разные транспорты. ADR-0085. Один frame/FSM поверх двух стандартных HTTP носителей; legacy streaming POST остаётся явно версионированным stream-one совместимым режимом. Новый stream-up — отдельные HTTP upload/download на одном проверенном соединении. SmartTheia REALITY — самостоятельный security adapter, не Xray REALITY. Ни один режим не считается автоматически эквивалентным другому.
+Единственный целевой транспорт — кастомный SmartTheia XHTTP, вдохновлён Xray XHTTP, не копия. Ни набор режимов, ни формат HTTP-запросов Xray не являются обязательным контрактом. SmartTheia REALITY вдохновлён Xray REALITY, не копия; его самостоятельная схема идентичности не требует Xray wire/handshake совместимости (ADR-0086). На каждом inbound явно выбирается один security mode: SmartTheia REALITY (wizard/manual) либо собственный TLS (только ручные X.509 cert/chain и private key). Оба используют один XHTTP и QUIC-first. H2/H3 — нижележащие HTTP стеки, не разные транспорты. ADR-0085. Один frame/FSM поверх двух стандартных HTTP носителей; legacy streaming POST остаётся явно версионированным stream-one совместимым режимом. Новый stream-up — отдельные HTTP upload/download на одном проверенном соединении. SmartTheia REALITY — самостоятельный security adapter, не Xray REALITY. Ни один режим не считается автоматически эквивалентным другому.
 
 | Предпочтение | Стек | ALPN | HTTP |
 | --- | --- | --- | --- |
@@ -123,7 +123,7 @@ The versioned theia://v1 invitation is **not** a SmartTheia frame, HTTP endpoint
 
 ## F-18/F-19: будущие security mode и TLS-in-TLS (не реализовано)
 
-Текущий SmartTheia frame v1 и H2/H3 transport contract **не меняются**. REALITY-подобная проверка идентичности сервера и camouflaged handshake является задачей внешнего security/transport adapter, не новым SmartTheia type или собственным TLS cipher. Anti-TLS-in-TLS flow shaping не дешифрует inner TLS и обязан сохранять byte-exact TCP и OPEN_OK/FIN/backpressure. H2 и H3 требуют отдельных wire feasibility/CI и явного согласования security mode без silent downgrade. Расширения version/capabilities, TOML и invite v2 требуют ADR, миграции, негативных TLS/auth/replay/probing тестов. До реализации такого режима в бинарнике нет; см. docs/STEALTH_REALITY.md и ADR-0020.
+Историческая frame v1 семантика остаётся общей; будущие wire-изменения требуют явно версионированного контракта. SmartTheia REALITY — отдельный security adapter, а не новый frame type или собственный TLS cipher. Способ реализации определяется собственным security contract, не обязательным повторением modified handshake Xray. Anti-TLS-in-TLS flow shaping не дешифрует inner TLS и обязан сохранять byte-exact TCP и OPEN_OK/FIN/backpressure. H2 и H3 требуют отдельных wire feasibility/CI и явного согласования security mode без silent downgrade. Расширения version/capabilities, TOML и invite v2 требуют ADR, миграции, негативных TLS/auth/replay/probing тестов. До реализации такого режима в бинарнике нет; см. docs/STEALTH_REALITY.md и ADR-0020.
 
 ## Дополнительный pinned-cert-v1 route (ADR-0083)
 

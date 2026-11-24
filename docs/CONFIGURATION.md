@@ -170,3 +170,5 @@ Client runtime: `client.profiles[].tls_ca` is an absolute `file:` reference to a
 ### Целевая конфигурация inbound (спецификация 0.5, ADR-0085)
 
 Транспорт фиксирован: SmartTheia XHTTP. Ровно один явно выбранный security mode: SmartTheia REALITY (wizard/manual, один валидируемый профиль) либо собственный TLS (manual only). Для TLS `tls_cert` — X.509 сертификат/цепочка, `tls_key` — соответствующий защищённый приватный ключ, `server_name` — проверяемое DNS-имя. Без мастера или генерации сертификата в TLS-ветке. Параметры REALITY определяет собственный security contract. TCP/UDP один порт, QUIC-first, без downgrade. Это нормативная модель, не описание принимаемого сейчас TOML; legacy/pin требуют явной миграции.
+
+**ADR-0086:** собственные versioned SmartTheia XHTTP и SmartTheia REALITY вдохновлены Xray, но не копируют его конфигурационные поля, ключи, URI или wire. Ни Xray config import, ни VLESS/XTLS совместимость не являются требованиями. Текущие TOML v1 и pin-профили описывают реализованные пути, не финальную схему inbound.

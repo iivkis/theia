@@ -1,6 +1,6 @@
 # Theia / Тея
 
-**Experimental / unreleased.** Theia — один Rust-бинарник с двумя ролями: сервер (в том числе Linux-сервер через SSH) и клиент (Windows/Linux). Транспорт SmartTheia v1 поверх стандартных HTTP/3 (QUIC/TLS 1.3, ALPN `h3`) и HTTP/2 (TLS 1.3, ALPN `h2`); локальные HTTP CONNECT/SOCKS5, TOML v1 и терминальная панель ratatui. Это не реализация протоколов Xray/VLESS/REALITY и не обещание обхода DPI.
+**Experimental / unreleased.** Theia — один Rust-бинарник с двумя ролями: сервер (в том числе Linux-сервер через SSH) и клиент (Windows/Linux). Целевая архитектура: SmartTheia с единственным кастомным SmartTheia XHTTP (вдохновлён Xray XHTTP, не копия), стандартными HTTP/3 (QUIC/TLS 1.3, ALPN `h3`) и HTTP/2 (TLS 1.3, ALPN `h2`), собственным SmartTheia REALITY (вдохновлён Xray REALITY, не копия) либо обычным TLS; локальные HTTP CONNECT/SOCKS5, TOML v1 и терминальная панель ratatui. Совместимость с протоколами Xray/VLESS/XTLS и полный перенос их функций не являются целями; готовность собственного REALITY пока не подтверждена.
 
 **Текущее состояние на 2026-11-24:** [матрица готовности и релизных блокеров](docs/STATUS.md). Исторические состояния отдельных этапов находятся в [плане реализации](docs/IMPLEMENTATION_PLAN.md) и [ADR](docs/adr/), а не в этом README.
 
@@ -75,7 +75,7 @@ theia tui --role client --config client.toml
 
 Проект пока без выбранной лицензии и не предназначен для публичной production-поставки.
 
-### Архитектурный контракт SmartTheia (spec v0.5)
+### Архитектурный контракт SmartTheia (spec v0.6)
 
 SmartTheia XHTTP — единственный транспорт поверх H2/TCP/TLS1.3 и H3/QUIC/TLS1.3 с общим frame/FSM. SmartTheia REALITY — самостоятельный security adapter, не копия Xray REALITY. Совместимость с Xray XHTTP/VLESS не требуется. Статус реализации и доказанные ограничения: [спецификация](docs/IMPLEMENTATION_SPEC.md), [ADR-0084](docs/adr/0084-native-smarttheia-xhttp-and-reality-boundary.md), [STATUS](docs/STATUS.md).
 

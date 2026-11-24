@@ -91,3 +91,7 @@ ADR хранить в `docs/adr/NNNN-title.md` с контекстом, альт
 ### Уточнение единого этапа (ADR-0085)
 
 Форма inbound: XHTTP фиксирован, REALITY wizard/manual, TLS только manual cert/key. Оба H2/H3 на одном порту, QUIC-first. Один валидатор REALITY, версионированные профили и приглашения, guarded Apply/rollback и реальные позитивные/негативные E2E. Pin/legacy не полноценный третий режим.
+
+### Нормативный приоритет (ADR-0086, spec v0.6)
+
+Один вертикальный блок: кастомный SmartTheia XHTTP + H3/QUIC и H2/TCP + кастомный SmartTheia REALITY и мастер/manual, с собственным TLS manual как альтернативой защиты. Xray XHTTP/REALITY только вдохновение, не перенос полного набора функций или wire/config совместимость. Исторические first-flight spikes — исследование, конкретный механизм Xray не обязателен. Не закрывать этап по pin/stream-up без общего валидатора, согласованного security contract, versioned профилей, Apply и обязательных E2E; release gates сохраняются.

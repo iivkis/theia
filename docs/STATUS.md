@@ -50,4 +50,4 @@ ADR-0082/0083: read-only второй шаг мастера с exact/fresh dual 
 
 ### Pending ADR-0084
 
-Спецификация 0.4: SmartTheia REALITY и XHTTP — собственные аналоги; XHTTP carrier H2/H3. Предложен native split stream-up на одном проверенном соединении с общим FSM и pin. Нативная приёмка не подтверждена; F-18/F-19 и полноценный мастер остаются открытыми.
+Спецификация 0.6 (ADR-0086): единственный кастомный SmartTheia XHTTP, вдохновлён Xray XHTTP, не копия; H3/QUIC и H2/TCP; собственный SmartTheia REALITY, вдохновлён Xray REALITY, не копия, либо собственный TLS. Никакой Xray interoperability как цели. Предложен native split stream-up на одном проверенном соединении с общим FSM и pin. Нативная приёмка не подтверждена; F-18/F-19 и полноценный мастер остаются открытыми.
