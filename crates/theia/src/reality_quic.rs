@@ -13,22 +13,27 @@ use crate::{
     reality_quic_wire::{self as wire, Cid, Flight, Inspection, Kind},
     server::{ServerContext, ServerError},
 };
-use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, TokioRuntime, UdpPoller, udp::{RecvMeta, Transmit}};
+use quinn::{AsyncUdpSocket, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, TokioRuntime, UdpPoller, udp::{RecvMeta, Transmit}};
+use ring::{hmac, rand::{SecureRandom, SystemRandom}};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 use std::{
     collections::{HashMap, HashSet},
     fmt, io::{self, IoSliceMut},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet, time::{Instant, timeout}};
+use tokio::{net::UdpSocket, sync::{mpsc, Semaphore}, task::JoinSet, time::{Instant, timeout}};
 
 const SESSIONS: usize = 64;
 const PATHS: usize = 4;
 const CIDS: usize = 8;
 const QUEUE: usize = 16;
+const LOCAL_MAX: usize = 1472;
+const LOCAL_CID_LEN: usize = 20;
 const MAX_FIRST_BYTES: usize = 64 * 1024;
 const FIRST_DEADLINE: Duration = Duration::from_secs(3);
 const LIFETIME: Duration = Duration::from_secs(60);
@@ -150,6 +155,7 @@ impl Session {
 
 struct Pending {
     flight: Flight,
+    client: Cid,
     datagrams: Vec<Vec<u8>>,
     bytes: usize,
     deadline: Instant,
@@ -178,7 +184,7 @@ fn wildcard(ip: IpAddr) -> SocketAddr {
 /// Responses return only to the physical peer owning this socket.
 async fn reference_path(
     generation: Arc<Lease>, id: SessionId, peer: SocketAddr, deadline: Instant,
-    mut incoming: mpsc::Receiver<Vec<u8>>, replies: mpsc::Sender<Reply>,
+    incoming: mpsc::Receiver<Vec<u8>>, replies: mpsc::Sender<Reply>,
 ) {
     let publication = generation.publication();
     let value = publication.active().verified();
@@ -187,20 +193,25 @@ async fn reference_path(
     let Ok(address) = lease.address() else { return; };
     let Ok(socket) = UdpSocket::bind(wildcard(address.ip())).await else { return; };
     if socket.connect(address).await.is_err() || lease.address().ok() != Some(address) { return; }
+    pump_path(socket, id, peer, deadline, incoming, replies, || lease.address().is_ok()).await;
+}
+
+async fn pump_path(socket: UdpSocket, id: SessionId, peer: SocketAddr, deadline: Instant,
+    mut incoming: mpsc::Receiver<Vec<u8>>, replies: mpsc::Sender<Reply>, eligible: impl Fn() -> bool) {
     let mut buf = vec![0; wire::MAX_DATAGRAM + 1];
     loop {
-        if lease.address().is_err() { return; }
+        if incoming.is_closed() || !eligible() { return; }
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return,
             data = incoming.recv() => {
                 let Some(data) = data else { return; };
-                if lease.address().is_err() { return; }
+                if incoming.is_closed() || !eligible() { return; }
                 if !matches!(timeout(Duration::from_secs(1), socket.send(&data)).await,
                     Ok(Ok(n)) if n == data.len()) { return; }
             }
             result = socket.recv(&mut buf) => {
                 let Ok(n) = result else { return; };
-                if lease.address().is_err() { return; }
+                if incoming.is_closed() || !eligible() { return; }
                 if n > 0 && n <= wire::MAX_DATAGRAM {
                     let _ = replies.try_send(Reply { id, peer, data: buf[..n].to_vec() });
                 }
@@ -232,6 +243,52 @@ fn route(sessions: &HashMap<SessionId, Session>, peer: SocketAddr, bytes: &[u8],
     unique(sessions.iter().filter(|(_, s)| s.paths.contains_key(&peer)).map(|(&id, _)| id))
 }
 
+// A generation-specific authenticated CID namespace permits routing all
+// native Quinn-issued CIDs, including encrypted NEW_CONNECTION_ID frames.
+// It does not authenticate packets, grant admission, or validate a path.
+// The pseudorandom prefix hides the counter and the independent tag avoids
+// a visible generation identifier. Quinn owns connection/retirement state.
+struct LocalCidKey {
+    key: hmac::Key,
+    sequence: AtomicU64,
+}
+impl LocalCidKey {
+    fn fresh() -> Result<Self, ServerError> {
+        let mut secret = Zeroizing::new([0u8; 32]);
+        SystemRandom::new().fill(&mut secret[..]).map_err(|_| ServerError::Tls)?;
+        Ok(Self { key: hmac::Key::new(hmac::HMAC_SHA256, &secret[..]), sequence: AtomicU64::new(0) })
+    }
+    fn tag(&self, prefix: &[u8]) -> hmac::Tag {
+        let mut mac = hmac::Context::with_key(&self.key);
+        mac.update(b"Theia/QUIC/local-cid/tag/v1");
+        mac.update(prefix);
+        mac.sign()
+    }
+    fn matches(&self, cid: &[u8]) -> bool {
+        if cid.len() != LOCAL_CID_LEN { return false; }
+        let tag = self.tag(&cid[..10]);
+        bool::from(cid[10..].ct_eq(&tag.as_ref()[..10]))
+    }
+    fn next(&self) -> [u8; LOCAL_CID_LEN] {
+        let counter = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let mut mac = hmac::Context::with_key(&self.key);
+        mac.update(b"Theia/QUIC/local-cid/prefix/v1");
+        mac.update(&counter.to_be_bytes());
+        let prefix = mac.sign();
+        let mut cid = [0; LOCAL_CID_LEN];
+        cid[..10].copy_from_slice(&prefix.as_ref()[..10]);
+        let tag = self.tag(&cid[..10]);
+        cid[10..].copy_from_slice(&tag.as_ref()[..10]);
+        cid
+    }
+}
+struct NativeCids(Arc<LocalCidKey>);
+impl ConnectionIdGenerator for NativeCids {
+    fn generate_cid(&mut self) -> ConnectionId { ConnectionId::new(&self.0.next()) }
+    fn cid_len(&self) -> usize { LOCAL_CID_LEN }
+    fn cid_lifetime(&self) -> Option<Duration> { None }
+}
+
 // Quinn receives the original physical source address, not a loopback proxy
 // address. Its own authenticated path validation and amplification rules
 // therefore remain applicable. No extra listener can bypass admission.
@@ -239,7 +296,6 @@ fn route(sessions: &HashMap<SessionId, Session>, peer: SocketAddr, bytes: &[u8],
 struct LocalSocket {
     socket: Arc<UdpSocket>,
     receive: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
-    cids: Arc<Mutex<HashMap<Cid, Instant>>>,
 }
 impl fmt::Debug for LocalSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RealityQuicSocket(<redacted>)") }
@@ -258,20 +314,7 @@ impl AsyncUdpSocket for LocalSocket {
         if transmit.segment_size.is_some() { return Err(io::ErrorKind::InvalidInput.into()); }
         let result = self.socket.try_send_to(transmit.contents, transmit.destination);
         match result {
-            Ok(n) if n == transmit.contents.len() => {
-                if let Some(h) = wire::long(transmit.contents) {
-                    if !h.scid.is_empty() && h.kind != Kind::VersionNegotiation {
-                        if let Ok(mut cids) = self.cids.lock() {
-                            let now = Instant::now();
-                            cids.retain(|_, deadline| *deadline > now);
-                            if cids.len() < SESSIONS * CIDS || cids.contains_key(h.scid) {
-                                cids.insert(h.scid.to_vec(), now + LIFETIME);
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
+            Ok(n) if n == transmit.contents.len() => Ok(()),
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e),
@@ -284,7 +327,10 @@ impl AsyncUdpSocket for LocalSocket {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
             Poll::Ready(Some((addr, bytes))) => {
-                if bytes.len() > bufs[0].len() { return Poll::Ready(Err(io::ErrorKind::InvalidData.into())); }
+                if bytes.len() > bufs[0].len() {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 bufs[0][..bytes.len()].copy_from_slice(&bytes);
                 meta[0] = RecvMeta { addr, len: bytes.len(), stride: bytes.len(), ecn: None, dst_ip: None };
                 Poll::Ready(Ok(1))
@@ -304,7 +350,8 @@ pub struct PreparedQuic {
     socket: Arc<UdpSocket>,
     endpoint: Endpoint,
     local: mpsc::Sender<(SocketAddr, Vec<u8>)>,
-    local_cids: Arc<Mutex<HashMap<Cid, Instant>>>,
+    local_cids: Arc<LocalCidKey>,
+    path_slots: Arc<Semaphore>,
     context: Arc<ServerContext>,
     generation: Arc<Lease>,
     guard: ReplayGuard,
@@ -323,10 +370,13 @@ impl PreparedQuic {
         let material = publication.active();
         let value = material.verified();
         if !value.effective_modes().h3 { return Err(ServerError::Config); }
-        let d = value.descriptor();
-        let reference = d.references.get(usize::from(d.active_reference)).ok_or(ServerError::Config)?;
-        let mut tls = material.identity().server_tls(&reference.server_name, Branch::H3).map_err(|_| ServerError::Tls)?;
-        tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        // The dispatcher consumes admission once for routing. A separate
+        // guard at the native TLS boundary consumes it once for handshake
+        // authorization. This also rejects a new Initial using a formerly
+        // issued CID after Quinn has retired the original connection.
+        let handshake_guard = Arc::new(ReplayGuard::new(65536, now).map_err(|_| ServerError::Config)?);
+        let tls = crate::identity_tls::checked_server_tls(material.identity(), value, Branch::H3,
+            generation.admission(), handshake_guard).map_err(|_| ServerError::Tls)?;
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|_| ServerError::Tls)?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         server.transport_config(crate::quic_transport::transport_config());
@@ -335,12 +385,17 @@ impl PreparedQuic {
             &doc.server.policy, value, Arc::from(material.signed()))?);
         let socket = Arc::new(socket);
         let (local, rx) = mpsc::channel(SESSIONS * 2);
-        let local_cids = Arc::new(Mutex::new(HashMap::new()));
-        let virtual_socket = Arc::new(LocalSocket { socket: socket.clone(), receive: Mutex::new(rx), cids: local_cids.clone() });
-        let endpoint = Endpoint::new_with_abstract_socket(EndpointConfig::default(), Some(server),
+        let local_cids = Arc::new(LocalCidKey::fresh()?);
+        let mut endpoint_config = EndpointConfig::default();
+        let cid_key = local_cids.clone();
+        endpoint_config.cid_generator(move || Box::new(NativeCids(cid_key.clone())));
+        endpoint_config.max_udp_payload_size(LOCAL_MAX as u16).map_err(|_| ServerError::Config)?;
+        let virtual_socket = Arc::new(LocalSocket { socket: socket.clone(), receive: Mutex::new(rx) });
+        let endpoint = Endpoint::new_with_abstract_socket(endpoint_config, Some(server),
             virtual_socket, Arc::new(TokioRuntime)).map_err(|_| ServerError::Io)?;
         let guard = ReplayGuard::new(65536, now).map_err(|_| ServerError::Config)?;
-        Ok(Self { socket, endpoint, local, local_cids, context, generation, guard })
+        Ok(Self { socket, endpoint, local, local_cids, context, generation, guard,
+            path_slots: Arc::new(Semaphore::new(SESSIONS * PATHS)) })
     }
 
     pub async fn serve(self) -> Result<(), ServerError> {
@@ -357,10 +412,17 @@ impl PreparedQuic {
         session: &mut Session, peer: SocketAddr) -> bool {
         if session.paths.contains_key(&peer) { return true; }
         if session.paths_opened >= PATHS { return false; }
+        let Ok(slot) = self.path_slots.clone().try_acquire_owned() else { return false; };
         let (tx, rx) = mpsc::channel(QUEUE);
         session.paths.insert(peer, Path { queue: tx, budget: Budget::default() });
         session.paths_opened += 1;
-        workers.spawn(reference_path(self.generation.clone(), id, peer, session.deadline, rx, replies.clone()));
+        let generation = self.generation.clone();
+        let deadline = session.deadline;
+        let replies = replies.clone();
+        workers.spawn(async move {
+            let _slot = slot;
+            reference_path(generation, id, peer, deadline, rx, replies).await;
+        });
         true
     }
 
@@ -382,7 +444,6 @@ impl PreparedQuic {
                     pending.retain(|_, p| p.deadline > now);
                     sessions.retain(|_, s| !s.expired(now));
                     admitted.retain(|_, (_, until)| *until > now);
-                    if let Ok(mut cids) = self.local_cids.lock() { cids.retain(|_, until| *until > now); }
                 }
                 _ = workers.join_next(), if !workers.is_empty() => {}
                 reply = replies.recv() => {
@@ -403,17 +464,27 @@ impl PreparedQuic {
                     let header = wire::long(data);
                     let short = data[0] & 0x80 == 0;
                     let local_peer = admitted.keys().any(|(addr, _)| *addr == peer);
-                    let local_known = self.local_cids.lock().map(|cids| cids.iter().any(|(cid, deadline)| {
-                        *deadline > now && if short { wire::short_matches(data, cid) }
-                            else { header.as_ref().is_some_and(|h| h.dcid == cid.as_slice()) }
-                    })).unwrap_or(false);
+                    let local_known = if short {
+                        data.get(1..1 + LOCAL_CID_LEN).is_some_and(|cid| self.local_cids.matches(cid))
+                    } else {
+                        header.as_ref().is_some_and(|h| self.local_cids.matches(h.dcid))
+                    };
+                    let is_initial = header.as_ref().is_some_and(|h| h.kind == Kind::Initial);
                     let existing_local = header.as_ref().is_some_and(|h| {
                         admitted.get(&(peer, h.dcid.to_vec())).is_some_and(|(scid, until)| *until > now && h.scid == scid.as_slice())
                     });
                     let relay = route(&sessions, peer, data, local_peer || local_known);
                     if (local_known || existing_local) && relay.is_some() { continue; }
                     if local_known || existing_local {
-                        let _ = self.local.try_send((peer, data.to_vec()));
+                        // An issued local CID alone is not authorization to
+                        // create a fresh connection. Only a previously
+                        // classified client Initial may reach TLS on it.
+                        let initial_continuation = header.as_ref().is_some_and(|h|
+                            admitted.iter().any(|((addr, _), (scid, until))|
+                                *addr == peer && *until > now && h.scid == scid.as_slice()));
+                        if n <= LOCAL_MAX && (!is_initial || existing_local || initial_continuation) {
+                            let _ = self.local.try_send((peer, data.to_vec()));
+                        }
                         continue;
                     }
                     if let Some(id) = relay {
@@ -424,22 +495,14 @@ impl PreparedQuic {
                         }
                         continue;
                     }
-                    if short {
-                        // Unknown short CID on a known admitted tuple can
-                        // be a legitimate CID rotation. Quinn authenticates
-                        // it; a tuple shared with a relay is ambiguous.
-                        if local_peer && !sessions.values().any(|s| s.paths.contains_key(&peer)) {
-                            let _ = self.local.try_send((peer, data.to_vec()));
-                        }
-                        continue;
-                    }
+                    if short { continue; }
                     let Some(h) = header else { continue; };
                     if h.kind != Kind::Initial || n < wire::MIN_INITIAL || h.dcid.len() < 8 { continue; }
                     let key = (peer, h.dcid.to_vec());
                     if !pending.contains_key(&key) {
-                        if pending.len() + sessions.len() >= SESSIONS || admitted.len() >= SESSIONS { continue; }
+                        if pending.len() + sessions.len() >= SESSIONS { continue; }
                         let Some(flight) = Flight::new(&h) else { continue; };
-                        pending.insert(key.clone(), Pending { flight, datagrams: Vec::new(), bytes: 0, deadline: now + FIRST_DEADLINE });
+                        pending.insert(key.clone(), Pending { flight, client: h.scid.to_vec(), datagrams: Vec::new(), bytes: 0, deadline: now + FIRST_DEADLINE });
                     }
                     let decision = pending.get_mut(&key).and_then(|p| {
                         if now >= p.deadline { None } else { p.add(data.to_vec()) }
@@ -462,12 +525,13 @@ impl PreparedQuic {
                     };
                     if allowed {
                         if admitted.len() >= SESSIONS { continue; }
-                        admitted.insert(key, (h.scid.to_vec(), now + LIFETIME));
+                        if p.datagrams.iter().any(|packet| packet.len() > LOCAL_MAX) { continue; }
+                        admitted.insert(key, (p.client, now + LIFETIME));
                         for packet in p.datagrams { let _ = self.local.try_send((peer, packet)); }
                     } else {
                         let Some(next) = sequence.checked_add(1) else { return Err(ServerError::Io); };
                         sequence = next;
-                        let mut s = Session::new(peer, h.dcid.to_vec(), h.scid.to_vec(), now);
+                        let mut s = Session::new(peer, h.dcid.to_vec(), p.client, now);
                         if !self.open_path(&mut workers, &reply_tx, sequence, &mut s, peer) { continue; }
                         for packet in p.datagrams { s.enqueue(peer, packet, now); }
                         sessions.insert(sequence, s);
@@ -540,5 +604,68 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), bytes);
         assert!(s.can_reply(p, 3600));
         assert!(!s.can_reply(p, 3601));
+    }
+
+    #[test]
+    fn local_cids_are_generation_bound_and_not_a_visible_prefix() {
+        let a = LocalCidKey::fresh().unwrap();
+        let b = LocalCidKey::fresh().unwrap();
+        let first = a.next();
+        let second = a.next();
+        assert_ne!(first, second);
+        assert!(a.matches(&first) && a.matches(&second));
+        assert!(!b.matches(&first));
+        for i in 0..first.len() {
+            let mut bad = first;
+            bad[i] ^= 1;
+            assert!(!a.matches(&bad));
+        }
+        assert!(!a.matches(&first[..19]));
+    }
+
+    #[tokio::test]
+    async fn actual_udp_pump_preserves_datagrams_and_isolates_paths() {
+        let reference = UdpSocket::bind(peer(0)).await.unwrap();
+        let upstream_a = UdpSocket::bind(peer(0)).await.unwrap();
+        let upstream_b = UdpSocket::bind(peer(0)).await.unwrap();
+        let rogue = UdpSocket::bind(peer(0)).await.unwrap();
+        let target = reference.local_addr().unwrap();
+        upstream_a.connect(target).await.unwrap();
+        upstream_b.connect(target).await.unwrap();
+        let addr_a = upstream_a.local_addr().unwrap();
+        let addr_b = upstream_b.local_addr().unwrap();
+        let (a_tx, a_rx) = mpsc::channel(4);
+        let (b_tx, b_rx) = mpsc::channel(4);
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let a = tokio::spawn(pump_path(upstream_a, 1, peer(100), deadline, a_rx, reply_tx.clone(), || true));
+        let b = tokio::spawn(pump_path(upstream_b, 1, peer(200), deadline, b_rx, reply_tx, || true));
+        let first = vec![0xc0; 1200];
+        let second = vec![0x40; 49];
+        a_tx.send(first.clone()).await.unwrap();
+        b_tx.send(second.clone()).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let mut seen = HashMap::new();
+        for _ in 0..2 {
+            let (n, addr) = timeout(Duration::from_secs(1), reference.recv_from(&mut buf)).await.unwrap().unwrap();
+            seen.insert(addr, buf[..n].to_vec());
+        }
+        assert_eq!(seen.get(&addr_a), Some(&first));
+        assert_eq!(seen.get(&addr_b), Some(&second));
+        rogue.send_to(b"rogue", addr_a).await.unwrap();
+        reference.send_to(b"old-path", addr_a).await.unwrap();
+        reference.send_to(b"new-path", addr_b).await.unwrap();
+        let mut replies = HashMap::new();
+        for _ in 0..2 {
+            let reply = timeout(Duration::from_secs(1), reply_rx.recv()).await.unwrap().unwrap();
+            assert_eq!(reply.id, 1);
+            replies.insert(reply.peer, reply.data);
+        }
+        assert_eq!(replies.get(&peer(100)).map(Vec::as_slice), Some(b"old-path".as_slice()));
+        assert_eq!(replies.get(&peer(200)).map(Vec::as_slice), Some(b"new-path".as_slice()));
+        drop(a_tx);
+        drop(b_tx);
+        timeout(Duration::from_secs(1), a).await.unwrap().unwrap();
+        timeout(Duration::from_secs(1), b).await.unwrap().unwrap();
     }
 }

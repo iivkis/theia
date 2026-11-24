@@ -291,4 +291,50 @@ mod tests {
         assert!(flight.frames(&[6,0x7f,0xff,2,0,0]).is_none());
         for n in 0..raw.len() { assert!(long(&raw[..n]).is_none()); }
     }
+
+    fn initial_packet(pn: u16, frames: &[u8]) -> Vec<u8> {
+        let dcid = [1,2,3,4,5,6,7,8];
+        let keys = InitialKeys::client(&dcid).unwrap();
+        let mut packet = vec![0xc1,0,0,0,1,8];
+        packet.extend_from_slice(&dcid);
+        packet.extend_from_slice(&[8,9,10,11,12,13,14,15,16,0]);
+        // Two-byte length, two-byte packet number, 16-byte tag.
+        let payload_len = MIN_INITIAL - packet.len() - 2 - 2 - 16;
+        let length = (payload_len + 2 + 16) as u16 | 0x4000;
+        packet.extend_from_slice(&length.to_be_bytes());
+        let offset = packet.len();
+        packet.extend_from_slice(&pn.to_be_bytes());
+        let mut plain = frames.to_vec();
+        plain.resize(payload_len, 0);
+        let mut nonce = keys.iv;
+        for (a,b) in nonce[4..].iter_mut().zip(u64::from(pn).to_be_bytes()) { *a ^= b; }
+        keys.packet.seal_in_place_append_tag(aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(packet.as_slice()), &mut plain).unwrap();
+        packet.extend_from_slice(&plain);
+        let mask = keys.hp.new_mask(&packet[offset+4..offset+20]).unwrap();
+        packet[0] ^= mask[0] & 15;
+        packet[offset] ^= mask[1];
+        packet[offset+1] ^= mask[2];
+        assert_eq!(packet.len(), MIN_INITIAL);
+        packet
+    }
+
+    #[test]
+    fn encrypted_initials_reassemble_out_of_order_without_modifying_datagrams() {
+        let mut hello = vec![1,0,0,34];
+        hello.extend_from_slice(&[7;34]);
+        let mut tail = vec![6, 12, 26];
+        tail.extend_from_slice(&hello[12..]);
+        let mut head = vec![6,0,12];
+        head.extend_from_slice(&hello[..12]);
+        let second = initial_packet(1, &tail);
+        let first = initial_packet(0, &head);
+        let mut flight = Flight::new(&long(&second).unwrap()).unwrap();
+        assert!(matches!(flight.inspect(&second), Inspection::Pending));
+        assert!(matches!(flight.inspect(&second), Inspection::Pending));
+        assert!(matches!(flight.inspect(&first), Inspection::Hello(value) if value == hello));
+        let mut forged = first.clone();
+        forged[1199] ^= 1;
+        assert!(matches!(Flight::new(&long(&forged).unwrap()).unwrap().inspect(&forged), Inspection::Invalid));
+    }
 }

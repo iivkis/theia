@@ -8,7 +8,8 @@ the native H3 application endpoint, and a byte-exact UDP reference relay.
   protection), packet number reconstruction, bounded CRYPTO reassembly,
   exact first-flight datagram retention. Admission before any reference
   socket; a valid marker goes exclusively to Quinn, with physical peer
-  addresses preserved. No loopback listener bypass. Initial inspection
+  addresses preserved. Independent TLS-bound admission guard rejects fresh
+  handshakes on retired or guessed CIDs. No loopback listener bypass. Initial inspection
   timeout or memory exhaustion drops incomplete flights. Only QUIC v1 is
   supported by this candidate; unsupported versions are dropped.
 * Reference: immutable approved plan and signed active reference; each
@@ -24,10 +25,12 @@ the native H3 application endpoint, and a byte-exact UDP reference relay.
   tag nor an opaque token is proof of external path validation. The relay
   does not lift the cap because reference PATH_RESPONSE and authenticated
   Handshake/1-RTT processing cannot be verified by a passive intermediary.
-  Quinn retains native validation for admitted traffic.
+  Quinn retains native validation for admitted traffic. Its local CIDs use
+  a generation-specific HMAC namespace so encrypted CID issuance and NAT
+  rebinding can route to Quinn without accepting unknown probe packets.
 * Absolute 60s / idle 15s / 8 MiB aggregate per relay session; at most 64
   pending + relay sessions, four paths per session, eight visible server
-  CIDs, bounded queues and first-flight storage. Cancelled dispatch drops
+  CIDs, bounded queues, a global 256-worker semaphore and first-flight storage. Cancelled dispatch drops
   workers and closes the local endpoint. No wire errors reveal admission.
 
 ## Open interoperability boundary
@@ -42,12 +45,16 @@ reference or separately reviewed protocol-level routing/validation design
 is required for unrestricted simultaneous CID rotation and migration.
 Do not infer validation from successful UDP send, observed CID, public
 Initial integrity or Retry token echo. Zero-length CID migration is not
-supported. Native admitted endpoint routing is also limited to visible
-server CIDs and unambiguous admitted tuples in this candidate.
+supported. Native admitted endpoint uses a generation-specific authenticated
+CID namespace; only classified Initial retransmits may reach its TLS
+boundary and it still delegates packet and path authentication to Quinn.
 
 Written unit tests cover RFC 9001 Retry and header-protection vectors,
-packet truncation, conflicting CRYPTO overlap, routing ambiguity,
-per-path amplification, idle/absolute expiry and backpressure.
+packet truncation, encrypted fragmented Initial reassembly, conflicting
+CRYPTO overlap, routing ambiguity, generation-bound native CIDs,
+per-path amplification, idle/absolute expiry and backpressure; a real
+connected-loopback UDP fixture checks byte preservation, isolation of two
+physical paths and rejection of a foreign source.
 Independent real reference QUIC E2E (Retry, migration, CID rotation,
 probe parity, quota exhaustion), admitted path lifetime/retirement,
 production multi-inbound activation and post-merge CI remain required.
