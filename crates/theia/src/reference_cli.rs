@@ -223,4 +223,48 @@ mod tests {
         ])
         .is_ok());
     }
+
+    #[tokio::test]
+    async fn preview_and_inspection_bind_digests_and_refuse_unapproved_checks() {
+        let dir = std::env::temp_dir().join(format!("theia-reference-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan_path = dir.join("plan.toml");
+        let state_path = dir.join("state.toml");
+        let plan = Plan {
+            schema_version: 1,
+            inbound: "edge".into(),
+            endpoint: "edge.example.com:443".into(),
+            own_ips: vec!["8.8.8.8".parse().unwrap()],
+            references: vec![health::Target {
+                server_name: "reference.example.com".into(),
+                address: "1.1.1.1:443".parse().unwrap(),
+            }],
+        };
+        let document = toml::to_string(&plan).unwrap();
+        std::fs::write(&plan_path, &document).unwrap();
+        let p = plan_path.to_str().unwrap();
+        let s = state_path.to_str().unwrap();
+        let preview = run(parse(&["preview", "--plan", p]).unwrap()).await.unwrap();
+        assert!(preview.contains(&format!("document_sha256={}", hex(&health::digest(&document)))));
+        assert!(preview.contains("no network, no runtime Apply"));
+        assert!(preview.contains("reference.example.com"));
+        let wrong = "00".repeat(32);
+        assert!(matches!(run(parse(&["check","--plan",p,"--sha256",&wrong,"--confirm"]).unwrap()).await, Err(Error::Approval)));
+        assert!(matches!(run(parse(&["enroll","--plan",p,"--store",s,"--sha256",&wrong,"--confirm"]).unwrap()).await, Err(Error::Approval)));
+        assert!(!state_path.exists());
+        let digest = hex(&plan.digest().unwrap());
+        let state = State::new(plan, vec![health::Evidence { h2_status: Some(200), h3_status: Some(200) }], health::unix_now().unwrap()).unwrap();
+        Store::new(&state_path).unwrap().enroll(&state).unwrap();
+        let original = std::fs::read(&state_path).unwrap();
+        let report = run(parse(&["inspect","--store",s]).unwrap()).await.unwrap();
+        assert!(report.contains("revision=1"));
+        assert!(report.contains("primary_status=Healthy"));
+        assert!(report.contains(&format!("plan_sha256={digest}")));
+        assert!(matches!(run(parse(&["recheck","--store",s,"--expected-revision","2","--plan-sha256",&digest,"--confirm"]).unwrap()).await, Err(Error::Conflict)));
+        assert!(matches!(run(parse(&["recheck","--store",s,"--expected-revision","1","--plan-sha256",&wrong,"--confirm"]).unwrap()).await, Err(Error::Approval)));
+        assert!(matches!(run(parse(&["monitor","--store",s,"--plan-sha256",&wrong,"--confirm"]).unwrap()).await, Err(Error::Approval)));
+        assert_eq!(std::fs::read(&state_path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 }

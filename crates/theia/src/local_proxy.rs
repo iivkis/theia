@@ -1208,7 +1208,7 @@ mod selector_tests {
             assert_eq!(http_target(&mut proxy).await,Err(*error));
         }
         let (mut client,mut proxy) = paired().await;
-        client.write_all(&vec![b'x';HEADER_LIMIT]).await.unwrap();
+        client.write_all(&[b'x';HEADER_LIMIT]).await.unwrap();
         assert_eq!(http_target(&mut proxy).await,Err(HTTP_BAD));
     }
 
