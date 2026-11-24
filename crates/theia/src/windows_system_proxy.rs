@@ -135,7 +135,7 @@ impl Snapshot {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
     version: u32,
@@ -605,6 +605,10 @@ fn recover_locked() -> Result<Recovery, ProxyError> {
     let Some(journal) = read_journal()? else {
         return Ok(Recovery::NothingPending);
     };
+    restore_journal(&journal)
+}
+
+fn restore_journal(journal: &Journal) -> Result<Recovery, ProxyError> {
     let current = query()?;
     if current == journal.before {
         // Process crashed before WinINet commit or another actor restored the
@@ -634,6 +638,77 @@ pub fn recover_explicit() -> Result<Recovery, ProxyError> {
     recover_locked()
 }
 
+/// Redacted observation for TUI. A matching journal is not proof that this
+/// process owns the mutex; only its own live lease can establish ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObservedProxy {
+    Direct,
+    External,
+    Journal(ProxyStatus),
+}
+
+pub(crate) fn observed_proxy() -> Result<ObservedProxy, ProxyError> {
+    let state = status()?;
+    if state != ProxyStatus::NoJournal {
+        return Ok(ObservedProxy::Journal(state));
+    }
+    let current = query()?;
+    Ok(if current.flags == PROXY_TYPE_DIRECT {
+        ObservedProxy::Direct
+    } else {
+        ObservedProxy::External
+    })
+}
+
+/// Opaque exact snapshot retained in memory only. Never format its strings.
+pub(crate) struct ApplyReview(Snapshot);
+
+impl ApplyReview {
+    pub(crate) fn description(&self) -> &'static str {
+        if self.0.flags == PROXY_TYPE_DIRECT {
+            "Текущие параметры: прямое подключение."
+        } else {
+            "Текущие параметры: внешний прокси/PAC/автоопределение."
+        }
+    }
+}
+
+pub(crate) fn review_apply(bind: SocketAddr) -> Result<ApplyReview, ProxyError> {
+    let _lock = Mutex::acquire()?;
+    if read_journal()?.is_some() {
+        return Err(ProxyError::RecoveryRequired);
+    }
+    let before = query()?;
+    if before.for_loopback(bind)? == before {
+        return Err(ProxyError::InvalidSettings);
+    }
+    Ok(ApplyReview(before))
+}
+
+/// Bind the recovery consent to one exact journal and observed OS state.
+pub(crate) struct RecoveryReview {
+    journal: Journal,
+    current: Snapshot,
+}
+
+pub(crate) fn review_recovery() -> Result<RecoveryReview, ProxyError> {
+    let _lock = Mutex::acquire()?;
+    let journal = read_journal()?.ok_or(ProxyError::RecoveryRequired)?;
+    let current = query()?;
+    if current != journal.before && current != journal.applied {
+        return Err(ProxyError::Conflict);
+    }
+    Ok(RecoveryReview { journal, current })
+}
+
+pub(crate) fn recover_reviewed(review: RecoveryReview) -> Result<Recovery, ProxyError> {
+    let _lock = Mutex::acquire()?;
+    if read_journal()?.as_ref() != Some(&review.journal) || query()? != review.current {
+        return Err(ProxyError::Conflict);
+    }
+    restore_journal(&review.journal)
+}
+
 /// The Windows mutex is **thread-owned**, not task-owned. A Tokio task can
 /// resume on another OS thread after any await; therefore the mutex, WinINet
 /// apply and every CAS restore are pinned to this dedicated native thread.
@@ -643,12 +718,15 @@ struct NativeOwner {
 }
 
 impl NativeOwner {
-    fn apply(bind: SocketAddr) -> Result<Self, ProxyError> {
+    fn apply(bind: SocketAddr, review: Option<ApplyReview>) -> Result<Self, ProxyError> {
         let lock = Mutex::acquire()?;
         if read_journal()?.is_some() {
             return Err(ProxyError::RecoveryRequired);
         }
         let before = query()?;
+        if review.is_some_and(|review| review.0 != before) {
+            return Err(ProxyError::Conflict);
+        }
         let applied = before.for_loopback(bind)?;
         if applied == before {
             return Err(ProxyError::InvalidSettings);
@@ -704,12 +782,20 @@ impl OwnedProxy {
     /// Called ONLY after config/credential/CA validation and both loopback
     /// listeners have successfully bound, on explicit --system-proxy --confirm.
     pub fn apply(bind: SocketAddr) -> Result<Self, ProxyError> {
+        Self::apply_inner(bind, None)
+    }
+
+    pub(crate) fn apply_reviewed(bind: SocketAddr, review: ApplyReview) -> Result<Self, ProxyError> {
+        Self::apply_inner(bind, Some(review))
+    }
+
+    fn apply_inner(bind: SocketAddr, review: Option<ApplyReview>) -> Result<Self, ProxyError> {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (commands_tx, commands_rx) = std::sync::mpsc::channel::<RestoreReply>();
         let thread = std::thread::Builder::new()
             .name("theia-wininet-owner".into())
             .spawn(move || {
-                let mut owner = match NativeOwner::apply(bind) {
+                let mut owner = match NativeOwner::apply(bind, review) {
                     Ok(owner) => owner,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
@@ -877,7 +963,20 @@ mod tests {
         }
         let original = query().unwrap();
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
-        let mut proxy = OwnedProxy::apply("127.0.0.1:45991".parse().unwrap()).unwrap();
+        let bind = "127.0.0.1:45991".parse().unwrap();
+        let review = review_apply(bind).unwrap();
+        let mut changed = original.clone();
+        changed.bypass.push_str(";review-drift.invalid");
+        set(&changed).unwrap();
+        assert!(matches!(
+            OwnedProxy::apply_reviewed(bind, review),
+            Err(ProxyError::Conflict)
+        ));
+        assert_eq!(query().unwrap(), changed);
+        assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
+        set(&original).unwrap();
+        let review = review_apply(bind).unwrap();
+        let mut proxy = OwnedProxy::apply_reviewed(bind, review).unwrap();
         let applied = query().unwrap();
         assert_eq!(applied.server, "http=127.0.0.1:45991;https=127.0.0.1:45991");
         assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
@@ -914,7 +1013,17 @@ mod tests {
             "child must simulate hard exit after apply"
         );
         assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
-        assert_eq!(recover_explicit(), Ok(Recovery::Restored));
+        let review = review_recovery().unwrap();
+        let applied = query().unwrap();
+        let mut changed = applied.clone();
+        changed.bypass.push_str(";recovery-drift.invalid");
+        set(&changed).unwrap();
+        assert_eq!(recover_reviewed(review), Err(ProxyError::Conflict));
+        assert_eq!(query().unwrap(), changed);
+        assert_eq!(status().unwrap(), ProxyStatus::PendingConflict);
+        set(&applied).unwrap();
+        let review = review_recovery().unwrap();
+        assert_eq!(recover_reviewed(review), Ok(Recovery::Restored));
         assert_eq!(query().unwrap(), original);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
 
