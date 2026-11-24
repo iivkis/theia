@@ -212,6 +212,8 @@ for name in ("m0-1-api-spike", "m0-1-windows-spike"):
             f"{name}: independent strict PKI/H2 test cannot be removed")
 require("test_independent_h2_probe.py" in spec and "test_ci_timing.py" in spec,
         "cheap probe and timing regressions must run")
+require("client_binary_chromium_socks5_over_h3 -- --ignored --exact" in job("browser-e2e"),
+        "native browser functional navigation over explicit H3 must run")
 require("actual_chromium_h2_settings_and_pseudo_order_reference" in job("browser-e2e"),
         "real browser H2 reference remains mandatory")
 

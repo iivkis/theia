@@ -81,3 +81,5 @@ ADR хранить в `docs/adr/NNNN-title.md` с контекстом, альт
 **M4.4i — public share and native lifecycle parity:** tokenless saved-record share in TUI; native Windows Named Pipe recovery test mirrors existing Linux IPC evidence; consolidate F-14 acceptance and remaining release limits. Accepted in PR #109, run 45397074048 (13/13).
 
 **ADR-0074 — browser-reference policy:** retire Go/uTLS synthetic reference and retain independent TLS compatibility via standard OpenSSL. Actual pinned browser evidence is the only browser reference; H2 existing evidence remains partial, H3 reference remains open. Earlier Go milestones remain historical evidence only. No runtime profile changes.
+
+**ADR-0076 — native H3 functional browser acceptance:** explicitly H3-configured native Theia client, H3-only authenticated server, shared guarded Chromium SOCKS5 navigation (request/response bytes and DOM); real mismatched/missing QUIC ALPN refusal. No production transport profile change; not a browser QUIC reference or full F-13 acceptance. Pending exact-head CI.

@@ -1,6 +1,6 @@
 # ADR-0075: atomic private trace directory creation
 
-**Status:** proposed, pending full native CI.
+**Status:** accepted in PR #110, exact-head run 45401698499 (13/13).
 
 Run 45401060957 failed the original CLI contract because successful --help emitted unexpected stderr. The old assertion did not print the warning, so the exact cause is not established by the log. Inspection found a real race: create_dir_all followed by chmod allows concurrent process initialization to encounter a transient public mode. Repair the race without disabling diagnostics or weakening stderr checks.
 

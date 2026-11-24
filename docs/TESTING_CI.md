@@ -265,8 +265,10 @@ The [F-14 acceptance matrix](F14_ACCEPTANCE.md) maps evidence to requirements an
 
 The docs-only scope optimization now requires regular non-executable Git modes and add/modify/delete raw diff status, with real mode-change regression and malformed raw records. Actual sanitized run metadata supplements synthetic timing fixtures. No additional workflow jobs or broader skip rule.
 
-## ADR-0074: current reference policy (pending CI)
+## ADR-0074: current reference policy (accepted PR #110, run 45401698499)
 
 Historical Go/uTLS comparisons above describe previously executed milestones, not current requirements. Remove the Go generator, synthetic parity tests and Go setup entirely. Existing native Chromium H2 reference and browser E2E remain mandatory; browser H3 reference is not yet available. No runtime TLS/HTTP change. Replace independent Go-to-Rust H2 compatibility with a test-only Python 3.12/OpenSSL TLS1.3 GET/204 client, strict independent CA/hostname and ALPN, wrong-name/untrusted-CA refusal before HTTP data. Both M0.1 native jobs execute it; ordinary Rust/BoringSSL PKI and first-flight baselines, BBR and all 13 jobs remain. Tests in specification cover loopback-only and bounded H2 framing. No claim of browser packet parity.
 
 **Native trace initialization regression (ADR-0075):** concurrent CLI startup must create a shared new trace directory without stderr warnings and with distinct complete startup/completion logs. Linux directory creation requests mode 0700 at creation rather than chmod afterward; already existing nonprivate directories are refused without changing their mode. Final directory symlinks/reparse points refuse. Keep original black-box CLI stderr contract and path-free diagnostic warnings on genuine failure. No weakening of native gates.
+
+**ADR-0076 native H3 functional browser acceptance (pending CI):** reuse the guarded Chromium navigation scenario on Linux/Windows with explicit H3 transport and H3-only Rust server. Require SOCKS5 CONNECT success, real forwarded request/response markers and DOM assertion; the H2 scenario remains independently mandatory. Add real QUIC peer with correct trust but incompatible or absent ALPN; the production client must return TLS failure before application streams. No profile tuning, browser packet parity, or new CI jobs. Existing native PKI/auth/ACL and cross-host gates remain.
