@@ -400,8 +400,9 @@ async fn f18_current_h3_active_probe_sees_unauthorized_response_but_no_tunnel() 
         assert_ne!(exporter, [0u8; 32]);
         zeroize::Zeroize::zeroize(&mut exporter);
 
-        let (mut driver, mut sender) =
-            h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
         let driver_task = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
@@ -429,7 +430,10 @@ async fn f18_current_h3_active_probe_sees_unauthorized_response_but_no_tunnel() 
             .send_request(request(Some(&valid_bearer)))
             .await
             .unwrap();
-        assert_eq!(authorized.recv_response().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            authorized.recv_response().await.unwrap().status(),
+            StatusCode::OK
+        );
 
         driver_task.abort();
         server.abort();

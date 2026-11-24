@@ -190,7 +190,9 @@ fn decrypt_initial(datagram: &[u8], quic_crypto: &QuicServerConfig) -> Option<Ve
     let pn_len = usize::from(packet[0] & 0x03) + 1;
     let header_len = pn_offset.checked_add(pn_len)?;
     let pn_bytes = packet.get(pn_offset..header_len)?;
-    let packet_number = pn_bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+    let packet_number = pn_bytes
+        .iter()
+        .fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
     let mut ciphertext = BytesMut::from(packet.get(header_len..)?);
     let clear = keys
         .packet
@@ -319,9 +321,7 @@ async fn true_wire_initial_exposes_tls13_sni_h3_alpn_and_quic_params_without_ser
             let _ = service_done_rx.await;
             conn.close(0u32.into(), b"research-only");
         });
-        let connection = connect(&client, witness_addr, "localhost")
-            .await
-            .unwrap();
+        let connection = connect(&client, witness_addr, "localhost").await.unwrap();
 
         let mut datagram = first_rx.await.unwrap();
         let mut plaintext = decrypt_initial(&datagram, &crypto)
@@ -337,8 +337,14 @@ async fn true_wire_initial_exposes_tls13_sni_h3_alpn_and_quic_params_without_ser
         assert!(shape.cipher_count > 0);
         assert!(shape.extension_count > 3);
         // This is visibility evidence, NOT a claim of matching a browser.
-        assert!(!shape.alps_present, "baseline rustls H3 changed; re-evaluate F-13 fingerprint");
-        assert!(!shape.grease_extension, "baseline rustls H3 changed; re-evaluate F-13 fingerprint");
+        assert!(
+            !shape.alps_present,
+            "baseline rustls H3 changed; re-evaluate F-13 fingerprint"
+        );
+        assert!(
+            !shape.grease_extension,
+            "baseline rustls H3 changed; re-evaluate F-13 fingerprint"
+        );
 
         // AEAD must reject a modified ciphertext instead of furnishing
         // untrusted/partial CRYPTO bytes to the observer's parser.
