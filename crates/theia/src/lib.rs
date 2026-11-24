@@ -33,6 +33,8 @@ pub mod quic_transport;
 pub mod reference_health;
 pub mod identity_tls;
 pub mod reference_cli;
+pub mod reality_bootstrap;
+pub mod reality_cli;
 pub(crate) mod quota;
 mod relay_liveness;
 pub mod reload_preflight;
@@ -74,6 +76,7 @@ pub enum Command {
     Version,
     Trust(descriptor_cli::Command),
     Reference(reference_cli::Command),
+    Reality(reality_cli::Command),
     Tui {
         role: Option<Role>,
     },
@@ -131,6 +134,7 @@ pub enum CliError {
     Config(config::ConfigError),
     Trust(descriptor::Error),
     Reference(reference_health::Error),
+    Reality(reality_bootstrap::Error),
     Server(server::ServerError),
     Management(management::ManagementError),
     Client(client::ClientError),
@@ -161,6 +165,7 @@ impl fmt::Display for CliError {
             Self::Config(error) => write!(f, "configuration invalid: {error}"),
             Self::Trust(error) => write!(f, "offline trust: {error}"),
             Self::Reference(error) => write!(f, "reference health: {error}"),
+            Self::Reality(error) => write!(f, "reality provisioning: {error}"),
             Self::Server(error) => write!(f, "server failed: {error}"),
             Self::Management(error) => write!(f, "management status unavailable: {error}"),
             Self::Client(error) => write!(f, "client failed: {error}"),
@@ -232,6 +237,8 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["trust", rest @ ..] => descriptor_cli::parse(rest).map(Command::Trust),
         ["reference", "--help" | "-h"] => Ok(Command::Help(Some("reference"))),
         ["reference", rest @ ..] => reference_cli::parse(rest).map(Command::Reference),
+        ["reality", "--help" | "-h"] => Ok(Command::Help(Some("reality"))),
+        ["reality", rest @ ..] => reality_cli::parse(rest).map(Command::Reality),
         ["tui", "--role", selected] => Ok(Command::Tui {
             role: Some(role(selected)?),
         }),
@@ -325,6 +332,7 @@ Usage:\n\
   theia config validate --config <path>\n\
   theia trust --help                  # offline candidate, no runtime Apply\n\
   theia reference --help              # consented reference health checks\n\
+  theia reality --help                # guarded identity and enrollment\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
 Client requires tls_ca PEM bundle. Windows system proxy requires explicit --system-proxy --confirm, a manual config flag and live bound listeners; normal client run and TUI never alter OS proxy.";
 
@@ -343,6 +351,7 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
         }
         Some("trust") => Ok(descriptor_cli::HELP),
         Some("reference") => Ok(reference_cli::HELP),
+        Some("reality") => Ok(reality_cli::HELP),
         Some("config") => {
             Ok("Usage: theia config validate --config <path>\nValidate TOML v1 without reading secret values.")
         }

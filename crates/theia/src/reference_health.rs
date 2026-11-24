@@ -527,6 +527,24 @@ impl State {
         &self.plan
     }
 
+    /// A fresh, all-eligible inventory for descriptor provisioning. Does not
+    /// authorize a switch, expand approved targets or activate a listener.
+    pub fn eligible_references(&self, now: u64) -> Result<Vec<crate::descriptor::Reference>, Error> {
+        self.validate()?;
+        if self.status(now)?.0 != PrimaryStatus::Healthy
+            || !self.health.iter().all(|entry| entry.evidence.eligible())
+        {
+            return Err(Error::NotEligible);
+        }
+        Ok(self.plan.references.iter().zip(&self.health).map(|(target, entry)| {
+            crate::descriptor::Reference {
+                server_name: target.server_name.clone(),
+                port: target.address.port(),
+                h3: entry.evidence.h3(),
+            }
+        }).collect())
+    }
+
     pub fn next_check_at(&self) -> Result<u64, Error> {
         let mut hash = Sha256::new();
         hash.update(self.plan.digest()?);

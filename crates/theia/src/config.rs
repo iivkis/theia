@@ -278,7 +278,7 @@ fn valid_file_ref(raw: &str) -> bool {
             .any(|part| matches!(part, std::path::Component::ParentDir))
         && !raw.contains(['\n', '\r', '\0'])
 }
-fn valid_secret_ref(raw: &str) -> bool {
+pub(crate) fn valid_secret_ref(raw: &str) -> bool {
     if valid_file_ref(raw) {
         return true;
     }

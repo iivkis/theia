@@ -245,6 +245,7 @@ async fn main() {
         Ok(Command::Reference(command)) => theia::reference_cli::run(command)
             .await
             .map_err(CliError::Reference),
+        Ok(Command::Reality(command)) => theia::reality_cli::run(command).map_err(CliError::Reality),
         Ok(Command::Help(topic)) => help(topic).map(str::to_owned),
         Ok(Command::Version) => Ok(version().to_owned()),
         Ok(Command::ConfigValidate { config }) => {
@@ -266,6 +267,8 @@ async fn main() {
                 CliError::NotImplemented(_) => "not_implemented",
                 CliError::Config(_) => "config",
                 CliError::Trust(_) => "offline_trust",
+                CliError::Reference(_) => "offline_trust",
+                CliError::Reality(_) => "offline_trust",
                 CliError::Server(_) => "server",
                 CliError::Management(_) => "management",
                 CliError::Client(_) => "client",
