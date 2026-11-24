@@ -1255,4 +1255,119 @@ mod selector_tests {
         }
     }
 
+
+    #[tokio::test]
+    async fn real_local_proxy_modes_validate_credentials_and_relay_over_both_transports() {
+        use crate::{config::{Inbound,User,ServerPolicy}, server::ServerContext};
+        use sha2::{Digest,Sha256};
+        let directory = std::env::temp_dir().join(format!("theia-local-proxy-modes-{}-{:?}",std::process::id(),std::thread::current().id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(directory.clone());
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path = directory.join("ca.pem");
+        std::fs::write(&cert_path,cert.cert.pem()).unwrap();
+        let token = [42;32];
+        let secret = crate::client_import::PrivateBearer::create(&directory.join("client.toml"),&token).unwrap();
+        let Config::Client(doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else { panic!("client fixture"); };
+        let mut profile = doc.client.profiles[0].clone();
+        profile.auth_token = secret.reference().unwrap();
+        profile.server_name = "localhost".into();
+        profile.tls_ca = Some(format!("file:{}",cert_path.display()));
+        profile.transport = Transport::H2;
+        profile.server = "127.0.0.1:443".into();
+        profile.xhttp_mode = Some(XhttpMode::StreamOne);
+        let mut invalid = profile.clone();
+        invalid.tls_ca = None;
+        assert!(load_client(&invalid).await.is_err());
+        invalid = profile.clone();
+        invalid.auth_token = "file:relative".into();
+        assert!(load_client(&invalid).await.is_err());
+        invalid = profile.clone();
+        invalid.tls_profile = "unknown".into();
+        assert!(load_client(&invalid).await.is_err());
+        invalid = profile.clone();
+        invalid.tls_profile = "browser-h2-btls-v1".into();
+        assert!(load_client(&invalid).await.is_err());
+        invalid.xhttp_mode = None;
+        invalid.transport = Transport::H3;
+        assert!(load_client(&invalid).await.is_err());
+        #[cfg(feature = "experimental-btls-h2")]
+        {
+            invalid.transport = Transport::H2;
+            assert!(matches!(load_client(&invalid).await,Ok(ProxyClient::H2(_))));
+        }
+        let mut pinned = profile.clone();
+        pinned.xhttp_mode = None;
+        pinned.tls_profile = crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
+        assert!(matches!(load_client(&pinned).await,Ok(ProxyClient::H2(_))));
+        let mut automatic_mode = profile.clone();
+        automatic_mode.xhttp_mode = Some(XhttpMode::Auto);
+        assert!(matches!(load_client(&automatic_mode).await,Ok(ProxyClient::H2(_))));
+        automatic_mode.transport = Transport::Auto;
+        assert!(matches!(load_client(&automatic_mode).await,Ok(ProxyClient::Auto(_))));
+
+        let inbound = Inbound {
+            id:"edge".into(),allowed_user_ids:vec!["client".into()],
+            h2_listen:"127.0.0.1:0".into(),quic_listen:"127.0.0.1:0".into(),
+            server_name:"localhost".into(),tls_cert:"unused".into(),tls_key:"unused".into(),
+            security_mode:Default::default(),
+        };
+        let user = User { id:"client".into(),token_sha256:format!("{:x}",Sha256::digest(token)),disabled:false };
+        let policy = ServerPolicy { allow_private_ips:true,max_connections_per_user:8,max_connections_total:8,connect_timeout_ms:1500 };
+        let context = Arc::new(ServerContext::new(&inbound,&[user],&policy));
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13]).unwrap().with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()],rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+        tls.alpn_protocols=vec![b"h2".to_vec()];
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp.local_addr().unwrap();
+        let h2 = tokio::spawn(crate::server::serve(tcp,tokio_rustls::TlsAcceptor::from(Arc::new(tls)),context.clone()));
+        let quic = crate::quic_transport::server_endpoint("127.0.0.1:0".parse().unwrap(),vec![cert.cert.der().clone()],rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+        let quic_addr = quic.local_addr().unwrap();
+        let h3 = tokio::spawn(crate::h3_server::serve(quic,context));
+
+        timeout(Duration::from_secs(25),async {
+            for (transport,remote,http) in [(Transport::H2,tcp_addr,true),(Transport::H3,quic_addr,false),(Transport::Auto,quic_addr,true)] {
+                profile.transport=transport;
+                profile.server=remote.to_string();
+                let proxy_client = load_client(&profile).await.unwrap();
+                let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port=target.local_addr().unwrap().port();
+                let echo = tokio::spawn(async move {
+                    let (mut stream,_) = target.accept().await.unwrap();
+                    let mut bytes=Vec::new();
+                    stream.read_to_end(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes,b"byte-exact proxy");
+                    stream.write_all(&bytes).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                });
+                let (mut app,local) = paired().await;
+                let proxy = tokio::spawn(async move { handle(local,http,&proxy_client,1).await });
+                if http {
+                    app.write_all(format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes()).await.unwrap();
+                    let mut reply=vec![0;HTTP_OK.len()];
+                    app.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(reply,HTTP_OK);
+                } else {
+                    let mut request=vec![5,1,0,5,1,0,1,127,0,0,1];
+                    request.extend(port.to_be_bytes());
+                    app.write_all(&request).await.unwrap();
+                    let mut reply=[0;12];
+                    app.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(reply,[5,0,5,0,0,1,0,0,0,0,0,0]);
+                }
+                app.write_all(b"byte-exact proxy").await.unwrap();
+                app.shutdown().await.unwrap();
+                let mut result=Vec::new();
+                app.read_to_end(&mut result).await.unwrap();
+                assert_eq!(&result,b"byte-exact proxy");
+                proxy.await.unwrap().unwrap();
+                echo.await.unwrap();
+            }
+        }).await.unwrap();
+        h2.abort(); h3.abort();
+    }
+
 }
