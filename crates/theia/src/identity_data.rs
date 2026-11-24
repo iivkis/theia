@@ -168,7 +168,7 @@ pub struct FixtureClient {
 
 pub enum FixtureTunnel {
     H2(Tunnel),
-    H3(H3Tunnel),
+    H3(Box<H3Tunnel>),
 }
 
 impl FixtureTunnel {
@@ -178,7 +178,7 @@ impl FixtureTunnel {
     {
         match self {
             Self::H2(tunnel) => tunnel.relay(socket).await,
-            Self::H3(tunnel) => tunnel.relay(socket).await,
+            Self::H3(tunnel) => (*tunnel).relay(socket).await,
         }
     }
 }
@@ -206,7 +206,7 @@ impl FixtureClient {
             .map_err(|_| ClientError::Tls)?;
         match &self.carrier {
             Carrier::H2(client) => client.open(target, port).await.map(FixtureTunnel::H2),
-            Carrier::H3(client) => client.open(target, port).await.map(FixtureTunnel::H3),
+            Carrier::H3(client) => client.open(target, port).await.map(|tunnel| FixtureTunnel::H3(Box::new(tunnel))),
         }
     }
 

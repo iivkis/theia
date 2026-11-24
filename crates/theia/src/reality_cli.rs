@@ -459,8 +459,10 @@ pub fn run(command: Command) -> Result<String, Error> {
             let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, false)?;
             bootstrap::import(
                 &uri,
-                digest,
-                identity,
+                bootstrap::ImportApproval {
+                    document_sha256: digest,
+                    identity_sha256: identity,
+                },
                 Path::new(&profile),
                 Path::new(&trust),
                 token_ref.as_deref(),

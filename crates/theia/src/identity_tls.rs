@@ -203,7 +203,7 @@ impl Identity {
         let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(&*self.pkcs8));
         let raw = Zeroizing::new(format!(
             "{KEY_FILE_PREFIX}\n{}\n{}\n{}\n",
-            self.scope.inbound, self.scope.endpoint, &*encoded
+            self.scope.inbound, self.scope.endpoint, encoded.as_str()
         ));
         config::guarded_trust_write(path, &raw, None).map_err(storage_error)
     }

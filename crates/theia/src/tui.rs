@@ -259,7 +259,7 @@ enum RecordFlow {
         fields: Vec<String>,
         focus: usize,
     },
-    Confirm(RecordReview),
+    Confirm(Box<RecordReview>),
 }
 
 impl RecordFlow {
@@ -720,7 +720,7 @@ impl Interaction {
             match flow {
                 RecordFlow::Confirm(review) => match key.code {
                     KeyCode::Char('y') if key.modifiers.is_empty() => {
-                        match editor.stage_record(review) {
+                        match editor.stage_record(*review) {
                             Ok(()) => self.start_save(),
                             Err(message) => editor.error = Some(message.into()),
                         }
@@ -738,7 +738,7 @@ impl Interaction {
                         KeyCode::Enter => match editor.review_record(action, &fields) {
                             Ok(review) => {
                                 editor.error = None;
-                                self.records = Some(RecordFlow::Confirm(review));
+                                self.records = Some(RecordFlow::Confirm(Box::new(review)));
                                 return false;
                             }
                             Err(message) => editor.error = Some(message.into()),
@@ -1205,7 +1205,7 @@ impl Interaction {
                         match editor.review_record(action, &fields) {
                             Ok(review) => {
                                 editor.error = None;
-                                self.records = Some(RecordFlow::Confirm(review));
+                                self.records = Some(RecordFlow::Confirm(Box::new(review)));
                             }
                             Err(message) => editor.error = Some(message.into()),
                         }

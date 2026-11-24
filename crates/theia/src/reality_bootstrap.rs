@@ -532,17 +532,24 @@ impl Profile {
     }
 }
 
+/// Two independent confirmations: exact received bytes and an identity
+/// fingerprint obtained outside the invitation.
+#[derive(Clone, Copy)]
+pub struct ImportApproval {
+    pub document_sha256: [u8; 32],
+    pub identity_sha256: [u8; 32],
+}
+
 pub fn import(
     uri: &str,
-    expected_document: [u8; 32],
-    expected_identity: [u8; 32],
+    approval: ImportApproval,
     profile_path: &Path,
     trust_path: &Path,
     external_token: Option<&str>,
     policy: ClientPolicy,
     now: u64,
 ) -> Result<(), Error> {
-    if !bool::from(digest(uri).ct_eq(&expected_document)) {
+    if !bool::from(digest(uri).ct_eq(&approval.document_sha256)) {
         return Err(Error::Approval);
     }
     if !crate::bounded_input::explicit_file_path(profile_path)
@@ -559,7 +566,7 @@ pub fn import(
         }
     }
     let invitation = Invitation::decode(uri, now)?;
-    let anchor = invitation.confirmed(expected_identity, policy, now)?;
+    let anchor = invitation.confirmed(approval.identity_sha256, policy, now)?;
     let trust_store = trust_path.to_str().ok_or(Error::Storage)?.to_owned();
     let mut staged = None;
     let auth_token = match (&invitation.bearer, external_token) {
@@ -712,7 +719,7 @@ mod tests {
                 NOW
             )
             .is_err());
-        assert!(Invitation::decode(&format!("{uri}="), NOW).is_err());
+        assert!(Invitation::decode(&format!("{}=", uri.as_str()), NOW).is_err());
         assert!(Invitation::decode(&uri, NOW + VALIDITY).is_err());
         let wire = received.wire();
         let mut value = toml::to_string(&wire).unwrap();
@@ -772,8 +779,7 @@ mod tests {
         assert_eq!(
             import(
                 &uri,
-                expected,
-                [0; 32],
+                ImportApproval { document_sha256: expected, identity_sha256: [0; 32] },
                 &profile,
                 &trust,
                 Some("env:TEST_TOKEN"),
@@ -786,8 +792,7 @@ mod tests {
         assert_eq!(
             import(
                 &uri,
-                expected,
-                pin,
+                ImportApproval { document_sha256: expected, identity_sha256: pin },
                 &profile,
                 &trust,
                 None,
@@ -799,8 +804,7 @@ mod tests {
         assert!(!profile.exists() && !trust.exists());
         import(
             &uri,
-            expected,
-            pin,
+            ImportApproval { document_sha256: expected, identity_sha256: pin },
             &profile,
             &trust,
             Some("env:TEST_TOKEN"),
@@ -815,8 +819,7 @@ mod tests {
         assert_eq!(
             import(
                 &uri,
-                expected,
-                pin,
+                ImportApproval { document_sha256: expected, identity_sha256: pin },
                 &profile,
                 &trust,
                 Some("env:OTHER"),
@@ -869,8 +872,7 @@ mod tests {
         let trust = scratch.0.join("trust.toml");
         import(
             &uri,
-            digest(&uri),
-            invite.fingerprint(),
+            ImportApproval { document_sha256: digest(&uri), identity_sha256: invite.fingerprint() },
             &profile,
             &trust,
             None,
