@@ -376,3 +376,69 @@ fn production_h3_client_rejects_invalid_configuration() {
         Err(ClientError::Configuration)
     ));
 }
+
+/// F-18 negative architectural evidence: the *current* conventional H3
+/// listener accepts fully authenticated QUIC/TLS before knowing the bearer,
+/// and an unauthorized active probe can read its HTTP 401 response. This is
+/// a deliberately red readiness *claim*, not a failing CI assertion: the
+/// existing server must preserve strict bearer denial and must not pretend
+/// it provides REALITY-like anti-probing before TLS/HTTP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f18_current_h3_active_probe_sees_unauthorized_response_but_no_tunnel() {
+    timeout(Duration::from_secs(15), async {
+        let (endpoint, remote, server) = fixture(false);
+        let conn = quic_transport::connect(&endpoint, remote, "localhost")
+            .await
+            .expect("standard QUIC handshake is permitted without bearer");
+        let mut exporter = [0u8; 32];
+        conn.export_keying_material(
+            &mut exporter,
+            b"EXPORTER-Theia-F18-active-probe-baseline-only",
+            b"this-fixture-is-NOT-REALITY",
+        )
+        .expect("TLS channel exists before HTTP application authentication");
+        assert_ne!(exporter, [0u8; 32]);
+        zeroize::Zeroize::zeroize(&mut exporter);
+
+        let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        // An observer with a valid CA can distinguish this endpoint by a
+        // visible rejection on the production /v1/session route. It cannot
+        // obtain an authorized tunnel, and this is not a pre-TLS proof.
+        let mut anonymous = sender.send_request(request(None)).await.unwrap();
+        assert_eq!(
+            anonymous.recv_response().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut invalid = sender
+            .send_request(request(Some(&URL_SAFE_NO_PAD.encode([0x7e; 32]))))
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid.recv_response().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Correct bearer can provoke HTTP 200 even without SmartTheia
+        // HELLO/OPEN_OK; this is not authorization to relay application data.
+        let valid_bearer = token();
+        let mut authorized = sender
+            .send_request(request(Some(&valid_bearer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            authorized.recv_response().await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        driver_task.abort();
+        server.abort();
+        endpoint.close(0u32.into(), b"done");
+    })
+    .await
+    .expect("bounded real H3 active-probing baseline completed");
+}
