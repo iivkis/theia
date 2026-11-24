@@ -330,4 +330,55 @@ mod tests {
         assert!(state.commit_restart(&foreign, 1, invalid).is_err());
         assert!(Arc::ptr_eq(&state.snapshot().unwrap(), &before));
     }
+
+    #[test]
+    fn quota_tls_and_restart_commits_publish_one_monotonic_generation() {
+        let raw = include_str!("../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX",&"a".repeat(64));
+        let crate::config::Config::Server(active) = crate::config::parse(&raw).unwrap() else { panic!("server fixture"); };
+        let make_view = |doc: &ServerDocument, live: LiveAuthorization| View {
+            document: Arc::new(doc.clone()),
+            inbounds: doc.server.inbounds.len(),
+            preflight: Arc::new(ReloadPreflight::new(std::path::PathBuf::from("/nonexistent"),doc.clone(),Vec::new())),
+            live: Arc::new(live),
+        };
+        let state = State::new(make_view(&active, LiveAuthorization::new(active.clone()).unwrap()));
+        let before = state.snapshot().unwrap();
+        assert!(state.still_current(&before,1));
+        assert!(!state.still_current(&before,2));
+        let ledger = crate::quota::Ledger::new(&active.server.policy,&active.server.users);
+        let user = &active.server.users[0].id;
+        let occupied = ledger.acquire_session(user).unwrap();
+        let mut quota = active.clone();
+        quota.server.policy.max_connections_per_user = 1;
+        quota.server.policy.max_connections_total = 1;
+        let (rebased,stage) = before.live.prepare_tls_rebase(&quota,1).unwrap();
+        assert_eq!(state.commit_quota(&before,1,make_view(&quota,rebased),stage,&ledger),Ok(2));
+        assert!(ledger.acquire_session(user).is_none());
+        drop(occupied);
+        assert!(ledger.acquire_session(user).is_some());
+        assert!(!state.still_current(&before,1));
+        let current = state.snapshot().unwrap();
+        assert!(state.still_current(&current,2));
+        let mut rotation = quota.clone();
+        rotation.server.inbounds[0].tls_cert = "file:rotated-cert.pem".into();
+        let (rebased,stage) = current.live.prepare_tls_rebase(&rotation,2).unwrap();
+        let called = std::cell::Cell::new(false);
+        assert_eq!(state.commit_tls_rotation(&current,2,make_view(&rotation,rebased),stage,|| called.set(true)),Ok(3));
+        assert!(called.get());
+        let rotated = state.snapshot().unwrap();
+        assert_eq!(rotated.document.as_ref(),&rotation);
+        assert!(state.still_current(&rotated,3));
+        let (rebased,stage) = rotated.live.prepare_tls_rebase(&rotation,3).unwrap();
+        assert_eq!(state.commit_tls_rotation(&current,2,make_view(&rotation,rebased),stage,|| panic!("stale TLS swap")),Err(LiveAuthError::StaleRevision));
+        let mut fresh = rotation.clone();
+        fresh.server.inbounds[0].h2_listen = "127.0.0.1:39991".into();
+        assert_eq!(state.commit_restart(&rotated,3,make_view(&fresh,LiveAuthorization::new_at_revision(fresh.clone(),3).unwrap())),Err(LiveAuthError::StaleRevision));
+        state.commit_restart(&rotated,3,make_view(&fresh,LiveAuthorization::new_at_revision(fresh.clone(),4).unwrap())).unwrap();
+        let successor = state.snapshot().unwrap();
+        assert!(state.still_current(&successor,4));
+        assert_eq!(successor.document.as_ref(),&fresh);
+        assert!(!state.still_current(&rotated,3));
+        assert_eq!(rotated.live.revision(),Ok(3));
+    }
+
 }

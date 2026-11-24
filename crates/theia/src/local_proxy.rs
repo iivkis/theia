@@ -1170,4 +1170,89 @@ mod selector_tests {
             std::io::ErrorKind::WouldBlock
         );
     }
+
+    async fn paired() -> (TcpStream,TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (left,right) = tokio::join!(TcpStream::connect(address),listener.accept());
+        (left.unwrap(),right.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn http_connect_validation_preserves_pipelined_bytes_and_rejects_ambiguous_requests() {
+        let (mut client,mut proxy) = paired().await;
+        client.write_all(b"CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:443\r\n\r\nsentinel").await.unwrap();
+        assert_eq!(http_target(&mut proxy).await.unwrap(),(Address::V6(Ipv6Addr::LOCALHOST.octets()),443));
+        let mut trailing = [0;8];
+        proxy.read_exact(&mut trailing).await.unwrap();
+        assert_eq!(&trailing,b"sentinel");
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"GET example.org:443 HTTP/1.1\r\nHost: example.org:443\r\n\r\n",HTTP_METHOD),
+            (b"CONNECT example.org:443 HTTP/1.1\r\n\r\n",HTTP_BAD),
+            (b"CONNECT example.org:443 HTTP/1.1\r\nHost: other.org:443\r\n\r\n",HTTP_BAD),
+            (b"CONNECT example.org:443 HTTP/1.1\r\nHost: example.org:443\r\nHost: example.org:443\r\n\r\n",HTTP_BAD),
+            (b"CONNECT example.org:443 HTTP/1.1\r\nHost: example.org:443\r\nContent-Length: 0\r\n\r\n",HTTP_BAD),
+            (b"CONNECT example.org:443 HTTP/1.1\r\nHost: example.org:443\r\nTransfer-Encoding: chunked\r\n\r\n",HTTP_BAD),
+            (b"CONNECT [bad]:443 HTTP/1.0\r\n\r\n",HTTP_BAD),
+            (b"CONNECT example.org:0 HTTP/1.0\r\n\r\n",HTTP_BAD),
+            (b"CONNECT example.org:65536 HTTP/1.0\r\n\r\n",HTTP_BAD),
+            (b"CONNECT invalid HTTP/1.0\r\n\r\n",HTTP_BAD),
+            (b"CONNECT example.org:443 HTTP/2\r\n\r\n",HTTP_BAD),
+            (b"CONNECT example.org:443 HTTP/1.1\r\nHost: \xff\r\n\r\n",HTTP_BAD),
+            (b"CONNECT example.org:443 HTTP/1.0\r\nbroken\r\n\r\n",HTTP_BAD),
+        ];
+        for (request,error) in cases {
+            let (mut client,mut proxy) = paired().await;
+            client.write_all(request).await.unwrap();
+            client.shutdown().await.unwrap();
+            assert_eq!(http_target(&mut proxy).await,Err(*error));
+        }
+        let (mut client,mut proxy) = paired().await;
+        client.write_all(&vec![b'x';HEADER_LIMIT]).await.unwrap();
+        assert_eq!(http_target(&mut proxy).await,Err(HTTP_BAD));
+    }
+
+    #[tokio::test]
+    async fn socks_connect_rejects_bad_methods_addresses_commands_and_truncation() {
+        let (mut client,mut proxy) = paired().await;
+        client.write_all(&[5,1,2]).await.unwrap();
+        assert_eq!(socks_target(&mut proxy).await,Err(ClientError::Protocol));
+        let mut response = [0;2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response,[5,255]);
+        for (request,reply) in [
+            (vec![4,1,0,1],1),
+            (vec![5,1,1,1],1),
+            (vec![5,2,0,1],7),
+            (vec![5,1,0,9],8),
+            (vec![5,1,0,3,1,255],8),
+            (vec![5,1,0,1,127,0,0,1,0,0],8),
+        ] {
+            let (mut client,mut proxy) = paired().await;
+            client.write_all(&[5,1,0]).await.unwrap();
+            client.write_all(&request).await.unwrap();
+            assert_eq!(socks_target(&mut proxy).await,Err(ClientError::Protocol));
+            let mut response = [0;12];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response[..2],&[5,0]);
+            assert_eq!(&response[2..],&[5,reply,0,1,0,0,0,0,0,0]);
+        }
+        let mut v6 = vec![5,1,0,5,1,0,4];
+        v6.extend(Ipv6Addr::LOCALHOST.octets());
+        v6.extend(443u16.to_be_bytes());
+        v6.extend(b"tail");
+        let (mut client,mut proxy) = paired().await;
+        client.write_all(&v6).await.unwrap();
+        assert_eq!(socks_target(&mut proxy).await.unwrap(),(Address::V6(Ipv6Addr::LOCALHOST.octets()),443));
+        let mut tail = [0;4];
+        proxy.read_exact(&mut tail).await.unwrap();
+        assert_eq!(&tail,b"tail");
+        for prefix in [vec![4,0],vec![5,0],vec![5,1,0,5,1,0,1,127],vec![5,1,0,5,1,0,4,0],vec![5,1,0,5,1,0,3,4,b'a']] {
+            let (mut client,mut proxy) = paired().await;
+            client.write_all(&prefix).await.unwrap();
+            client.shutdown().await.unwrap();
+            assert!(socks_target(&mut proxy).await.is_err());
+        }
+    }
+
 }
