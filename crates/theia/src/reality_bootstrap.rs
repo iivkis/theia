@@ -462,6 +462,8 @@ pub struct Profile {
     xhttp_mode: XhttpMode,
     trust_store: String,
     auth_token: String,
+    admission_ref: String,
+    admission_commitment: [u8; 32],
 }
 
 impl Profile {
@@ -469,6 +471,8 @@ impl Profile {
         if self.schema_version != 1
             || !config::valid_secret_ref(&self.auth_token)
             || !crate::bounded_input::explicit_file_path(Path::new(&self.trust_store))
+            || !self.admission_ref.strip_prefix("file:").is_some_and(|path|
+                crate::bounded_input::explicit_file_path(Path::new(path)))
         {
             return Err(Error::Format);
         }
@@ -493,10 +497,12 @@ impl Profile {
         let profile: Self = toml::from_str(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
             .map_err(|_| Error::Format)?;
         profile.anchor()?;
+        profile.admission()?;
         Ok(profile)
     }
 
     pub fn load(&self, now: u64) -> Result<Verified, Error> {
+        self.admission()?;
         descriptor::Store::new(Path::new(&self.trust_store), self.anchor()?)
             .map_err(|_| Error::Storage)?
             .load(now)
@@ -603,6 +609,19 @@ impl Profile {
         Ok(())
     }
 
+    /// Reopen the private copied admission material and bind it to this
+    /// enrollment. No fallback to a public-only marker or bearer.
+    pub fn admission(&self) -> Result<crate::reality_admission::Secret, Error> {
+        let path = self.admission_ref.strip_prefix("file:").ok_or(Error::Credential)?;
+        let scope = Scope { inbound: self.inbound.clone(), endpoint: self.endpoint.clone() };
+        let secret = crate::reality_admission::Secret::load(&scope, Path::new(path))
+            .map_err(|_| Error::Credential)?;
+        if !bool::from(secret.commitment().ct_eq(&self.admission_commitment)) {
+            return Err(Error::Credential);
+        }
+        Ok(secret)
+    }
+
     pub fn credential_reference(&self) -> &str {
         &self.auth_token
     }
@@ -654,12 +673,31 @@ pub struct ImportApproval {
     pub identity_sha256: [u8; 32],
 }
 
+/// Admission material is transferred independently of the invitation.
+/// A UI may bind the exact private preview without ever displaying it.
+#[derive(Clone, Copy)]
+pub struct EnrollmentMaterial<'a> {
+    pub admission_path: &'a Path,
+    pub expected_admission: Option<[u8; 32]>,
+    pub external_token: Option<&'a str>,
+}
+
+impl Invitation {
+    pub fn has_token(&self) -> bool { self.bearer.is_some() }
+
+    pub(crate) fn admission_preview(&self, path: &Path) -> Result<[u8; 32], Error> {
+        crate::reality_admission::Secret::load(&self.scope, path)
+            .map(|secret| secret.commitment())
+            .map_err(|_| Error::Credential)
+    }
+}
+
 pub fn import(
     uri: &str,
     approval: ImportApproval,
     profile_path: &Path,
     trust_path: &Path,
-    external_token: Option<&str>,
+    material: EnrollmentMaterial<'_>,
     policy: ClientPolicy,
     now: u64,
 ) -> Result<(), Error> {
@@ -681,9 +719,16 @@ pub fn import(
     }
     let invitation = Invitation::decode(uri, now)?;
     let anchor = invitation.confirmed(approval.identity_sha256, policy, now)?;
+    let admission = crate::reality_admission::Secret::load(&invitation.scope, material.admission_path)
+        .map_err(|_| Error::Credential)?;
+    let admission_commitment = admission.commitment();
+    if material.expected_admission.is_some_and(|expected|
+        !bool::from(expected.ct_eq(&admission_commitment))) {
+        return Err(Error::Approval);
+    }
     let trust_store = trust_path.to_str().ok_or(Error::Storage)?.to_owned();
     let mut staged = None;
-    let auth_token = match (&invitation.bearer, external_token) {
+    let auth_token = match (&invitation.bearer, material.external_token) {
         (Some(bearer), None) => {
             let guard = crate::client_import::PrivateBearer::create(profile_path, bearer)
                 .map_err(|_| Error::Storage)?;
@@ -694,6 +739,9 @@ pub fn import(
         (None, Some(reference)) if config::valid_secret_ref(reference) => reference.to_owned(),
         _ => return Err(Error::Credential),
     };
+    let mut staged_admission = admission.stage_for_profile(&invitation.scope, profile_path)
+        .map_err(|_| Error::Storage)?;
+    let admission_ref = staged_admission.reference().map_err(|_| Error::Storage)?;
     let profile = Profile {
         schema_version: 1,
         inbound: invitation.scope.inbound.clone(),
@@ -704,6 +752,8 @@ pub fn import(
         xhttp_mode: policy.xhttp_mode,
         trust_store,
         auth_token,
+        admission_ref,
+        admission_commitment,
     };
     profile.anchor()?;
     let raw = Zeroizing::new(toml::to_string(&profile).map_err(|_| Error::Format)?);
@@ -721,12 +771,14 @@ pub fn import(
     // Never remove a path which might be observed/replaced by another process.
     match config::guarded_trust_write(profile_path, &raw, None) {
         Ok(()) => {
+            staged_admission.commit();
             if let Some(guard) = &mut staged {
                 guard.commit();
             }
             Ok(())
         }
         Err(WriteFailure::AfterReplace(_)) => {
+            staged_admission.commit();
             if let Some(guard) = &mut staged {
                 guard.commit();
             }
@@ -811,6 +863,16 @@ mod tests {
         }
     }
 
+    fn admission_file(scratch: &Scratch, identity: &Identity) -> std::path::PathBuf {
+        let path = scratch.0.join("transferred-admission");
+        crate::reality_admission::Secret::generate().unwrap().save_new(identity.scope(), &path).unwrap();
+        path
+    }
+
+    fn material<'a>(admission: &'a Path, token: Option<&'a str>) -> EnrollmentMaterial<'a> {
+        EnrollmentMaterial { admission_path: admission, expected_admission: None, external_token: token }
+    }
+
     #[test]
     fn bootstrap_is_canonical_and_independent_confirmation_is_required() {
         let (state, identity) = fixture();
@@ -888,7 +950,7 @@ mod tests {
         let invitation = Invitation::public(&identity, &initial, NOW).unwrap().encode().unwrap();
         import(&invitation, ImportApproval {
             document_sha256: digest(&invitation), identity_sha256: fingerprint(identity.public_key()),
-        }, &profile_path, &trust_path, Some("env:THEIA_TOKEN"), auto_policy(), NOW).unwrap();
+        }, &profile_path, &trust_path, material(&admission_file(&dir, &identity), Some("env:THEIA_TOKEN")), auto_policy(), NOW).unwrap();
         let profile = Profile::read(&profile_path).unwrap();
         let profile_bytes = std::fs::read(&profile_path).unwrap();
         let mut announcement = profile.load(NOW).unwrap().descriptor().clone();
@@ -958,7 +1020,7 @@ mod tests {
             },
             &profile_path,
             &trust_path,
-            Some("env:THEIA_TOKEN"),
+            material(&admission_file(&dir, &identity), Some("env:THEIA_TOKEN")),
             auto_policy(),
             NOW,
         )
@@ -1039,6 +1101,7 @@ mod tests {
         let trust = scratch.0.join("trust.toml");
         let expected = digest(&uri);
         let pin = fingerprint(identity.public_key());
+        let admission = admission_file(&scratch, &identity);
         assert_eq!(
             import(
                 &uri,
@@ -1048,7 +1111,7 @@ mod tests {
                 },
                 &profile,
                 &trust,
-                Some("env:TEST_TOKEN"),
+                material(&admission, Some("env:TEST_TOKEN")),
                 auto_policy(),
                 NOW
             ),
@@ -1064,7 +1127,7 @@ mod tests {
                 },
                 &profile,
                 &trust,
-                None,
+                material(&admission, None),
                 auto_policy(),
                 NOW
             ),
@@ -1079,7 +1142,7 @@ mod tests {
             },
             &profile,
             &trust,
-            Some("env:TEST_TOKEN"),
+            material(&admission, Some("env:TEST_TOKEN")),
             auto_policy(),
             NOW,
         )
@@ -1088,6 +1151,11 @@ mod tests {
         let loaded = Profile::read(&profile).unwrap();
         assert_eq!(loaded.credential_reference(), "env:TEST_TOKEN");
         assert_eq!(loaded.load(NOW).unwrap().signer(), identity.public_key());
+        let copied = loaded.admission_ref.strip_prefix("file:").unwrap();
+        assert_ne!(Path::new(copied), admission);
+        assert!(loaded.admission().is_ok());
+        std::fs::remove_file(&admission).unwrap();
+        assert!(loaded.admission().is_ok());
         assert_eq!(
             import(
                 &uri,
@@ -1097,7 +1165,7 @@ mod tests {
                 },
                 &profile,
                 &trust,
-                Some("env:OTHER"),
+                material(&admission, Some("env:OTHER")),
                 auto_policy(),
                 NOW
             ),
@@ -1119,6 +1187,10 @@ mod tests {
                 .revision,
             2
         );
+        std::fs::remove_file(copied).unwrap();
+        crate::reality_admission::Secret::generate().unwrap().save_new(identity.scope(), Path::new(copied)).unwrap();
+        assert!(matches!(Profile::read(&profile), Err(Error::Credential)));
+        assert!(loaded.load(NOW + 1).is_err());
     }
 
     #[test]
@@ -1153,7 +1225,7 @@ mod tests {
             },
             &profile,
             &trust,
-            None,
+            material(&admission_file(&scratch, &identity), None),
             auto_policy(),
             NOW,
         )

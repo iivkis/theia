@@ -99,7 +99,7 @@ impl PrivateBearer {
         Self::create_payload(config_path, "bearer", "token", encoded.as_bytes())
     }
 
-    fn create_payload(
+    pub(crate) fn create_payload(
         config_path: &Path,
         kind: &str,
         filename: &str,

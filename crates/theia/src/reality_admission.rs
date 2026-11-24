@@ -198,13 +198,26 @@ impl Secret {
             || !crate::bounded_input::explicit_file_path(path) {
             return Err(Error::Scope);
         }
-        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(self.0.as_ref()));
-        let raw = Zeroizing::new(format!("THEIA-ADMISSION-V1\n{}\n{}\n{}\n",
-            scope.inbound, scope.endpoint, encoded.as_str()));
+        let raw = self.encode(scope);
         config::guarded_trust_write(path, &raw, None).map_err(|error| match error {
             config::WriteFailure::BeforeReplace(_) => Error::Storage,
             config::WriteFailure::AfterReplace(_) => Error::Indeterminate,
         })
+    }
+
+    fn encode(&self, scope: &Scope) -> Zeroizing<String> {
+        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(&self.0[..]));
+        Zeroizing::new(format!("THEIA-ADMISSION-V1\n{}\n{}\n{}\n",
+            scope.inbound, scope.endpoint, encoded.as_str()))
+    }
+
+    /// Copy the already validated private input into a new protected file
+    /// owned by this enrollment transaction. The source is never modified.
+    pub(crate) fn stage_for_profile(&self, scope: &Scope, profile: &Path)
+        -> Result<crate::client_import::PrivateBearer, Error> {
+        let raw = self.encode(scope);
+        crate::client_import::PrivateBearer::create_payload(profile, "admission", "key", raw.as_bytes())
+            .map_err(|_| Error::Storage)
     }
 
     pub fn load(scope: &Scope, path: &Path) -> Result<Self, Error> {
@@ -245,7 +258,7 @@ impl Secret {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"Theia/provision/admission-integrity/v1\0");
-        hash.update(self.0.as_ref());
+        hash.update(&self.0[..]);
         hash.finalize().into()
     }
 

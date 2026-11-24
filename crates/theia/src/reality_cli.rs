@@ -21,8 +21,8 @@ theia reality descriptor-refresh --health PATH --key PATH --previous PATH --outp
 theia reality invite-public --health PATH --key PATH --descriptor PATH --output PATH --confirm\n\
 theia reality invite-issued --health PATH --key PATH --descriptor PATH --server PATH --user ID --token-file PATH --output PATH --confirm\n\
 theia reality preview-import --invitation PATH\n\
-theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
-theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --token-ref REF --confirm\n\
+theia reality import --invitation PATH --admission PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
+theia reality import --invitation PATH --admission PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --token-ref REF --confirm\n\
 theia reality inspect --profile PATH\n\
 theia reality promotion-preview --profile PATH --descriptor PATH\n\
 theia reality promotion-apply --profile PATH --descriptor PATH --expected-revision N --snapshot-sha256 HEX --sha256 HEX --identity-sha256 HEX --confirm\n\
@@ -87,6 +87,7 @@ pub enum Command {
     },
     Import {
         invitation: String,
+        admission: String,
         profile: String,
         trust: String,
         digest: [u8; 32],
@@ -240,9 +241,10 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
         ["preview-import", "--invitation", i] => Command::Preview {
             invitation: path(i)?,
         },
-        ["import", "--invitation", i, "--profile", p, "--trust", t, "--sha256", d, "--identity-sha256", k, "--confirm"] => {
+        ["import", "--invitation", i, "--admission", a, "--profile", p, "--trust", t, "--sha256", d, "--identity-sha256", k, "--confirm"] => {
             Command::Import {
                 invitation: path(i)?,
+                admission: path(a)?,
                 profile: path(p)?,
                 trust: path(t)?,
                 digest: hash(d)?,
@@ -250,11 +252,12 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
                 token_ref: None,
             }
         }
-        ["import", "--invitation", i, "--profile", p, "--trust", t, "--sha256", d, "--identity-sha256", k, "--token-ref", r, "--confirm"]
+        ["import", "--invitation", i, "--admission", a, "--profile", p, "--trust", t, "--sha256", d, "--identity-sha256", k, "--token-ref", r, "--confirm"]
             if config::valid_secret_ref(r) =>
         {
             Command::Import {
                 invitation: path(i)?,
+                admission: path(a)?,
                 profile: path(p)?,
                 trust: path(t)?,
                 digest: hash(d)?,
@@ -663,7 +666,7 @@ pub fn run(command: Command) -> Result<String, Error> {
             publish(&output, &invite.encode()?)
         }
         Command::Preview { invitation } => {
-            let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, false)?;
+            let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, true)?;
             let invite = Invitation::decode(&uri, now)?;
             Ok(format!(
                 "{}\ndocument_sha256={}",
@@ -673,13 +676,14 @@ pub fn run(command: Command) -> Result<String, Error> {
         }
         Command::Import {
             invitation,
+            admission,
             profile,
             trust,
             digest,
             identity,
             token_ref,
         } => {
-            let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, false)?;
+            let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, true)?;
             bootstrap::import(
                 &uri,
                 bootstrap::ImportApproval {
@@ -688,7 +692,11 @@ pub fn run(command: Command) -> Result<String, Error> {
                 },
                 Path::new(&profile),
                 Path::new(&trust),
-                token_ref.as_deref(),
+                bootstrap::EnrollmentMaterial {
+                    admission_path: Path::new(&admission),
+                    expected_admission: None,
+                    external_token: token_ref.as_deref(),
+                },
                 ClientPolicy {
                     transport: Transport::Auto,
                     xhttp_mode: XhttpMode::Auto,
@@ -784,6 +792,8 @@ mod tests {
         let i = dir.file("invitation");
         let p = dir.file("profile.toml");
         let t = dir.file("trust.toml");
+        let admission = dir.file("admission.key");
+        invoke(&["admission-new", "--inbound", "edge", "--endpoint", "edge.example.org:443", "--key", &admission, "--confirm"]).unwrap();
         let a = [
             "identity-new",
             "--inbound",
@@ -835,6 +845,8 @@ mod tests {
             "import",
             "--invitation",
             &i,
+            "--admission",
+            &admission,
             "--profile",
             &p,
             "--trust",
@@ -854,6 +866,8 @@ mod tests {
             "import",
             "--invitation",
             &i,
+            "--admission",
+            &admission,
             "--profile",
             &p,
             "--trust",
@@ -1115,6 +1129,8 @@ mod tests {
         assert!(parse(&[
             "import",
             "--invitation",
+            &d,
+            "--admission",
             &d,
             "--profile",
             &p,
