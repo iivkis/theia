@@ -494,6 +494,20 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("crate::tcp_bbr::select(&socket)", server)
         self.assertIn("BbrConfig::default()", read("crates/theia/src/quic_transport.rs"))
 
+    def test_offline_signed_descriptor_has_fail_closed_acceptance_contract(self):
+        source = read("crates/theia/src/descriptor.rs")
+        tests = read("crates/theia/tests/descriptor.rs")
+        for term in ("SmartTheia/inbound-descriptor/v1", "UnparsedPublicKey",
+                     "deny_unknown_fields", "minimum_revision", "Error::Rollback",
+                     "Error::Equivocation", "guarded_trust_write"):
+            self.assertIn(term, source)
+        for term in ("signed_descriptor_binds_every_field_to_independent_anchor",
+                     "signed_invalid_fields_and_unsupported_contract_are_refused",
+                     "durable_revision_floor_rejects_rollback_equivocation_and_key_substitution_after_restart"):
+            self.assertIn(term, tests)
+        for path in ("client.rs", "h3_client.rs", "server.rs", "h3_server.rs"):
+            self.assertNotIn("descriptor::Store", read("crates/theia/src/" + path))
+
     def test_retired_local_tls_reality_has_no_production_or_compatibility_path(self):
         self.assertFalse((ROOT / "crates/theia/src/reality_identity.rs").exists())
         self.assertNotIn("SmartRealityV1", read("crates/theia/src/security_profile.rs"))

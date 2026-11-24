@@ -18,6 +18,7 @@ pub mod client_import;
 pub mod config;
 mod connection_pool;
 pub mod diagnostics;
+pub mod descriptor;
 #[cfg(feature = "experimental-btls-h2")]
 mod h2_btls;
 pub mod h3_client;

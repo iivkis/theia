@@ -247,13 +247,13 @@ impl Config {
     }
 }
 
-fn valid_id(s: &str) -> bool {
+pub(crate) fn valid_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
-fn valid_dns(name: &str) -> bool {
+pub(crate) fn valid_dns(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 253
         && name.parse::<IpAddr>().is_err()
@@ -455,7 +455,7 @@ impl ServerDocument {
         )
     }
 }
-fn valid_remote(raw: &str) -> bool {
+pub(crate) fn valid_remote(raw: &str) -> bool {
     if let Ok(addr) = raw.parse::<SocketAddr>() {
         return addr.port() > 0 && !addr.ip().is_unspecified();
     }
@@ -638,7 +638,7 @@ fn editor_lock(path: &Path) -> Result<fs::File, ConfigError> {
 /// Callers must supply a trusted destination directory.
 pub fn atomic_write(path: &Path, config: &Config) -> Result<(), ConfigError> {
     let data = config.to_toml()?;
-    atomic_write_bytes(path, &data, None, sync_directory).map_err(WriteFailure::into_error)
+    atomic_write_bytes(path, &data, None, false, sync_directory).map_err(WriteFailure::into_error)
 }
 
 /// Cooperating editor writes are serialized across threads and processes.
@@ -660,8 +660,23 @@ fn guarded_write_with_sync(
     let data = config.to_toml()?;
     let _lock = editor_lock(path)?;
     require_unchanged(path, expected)?;
-    atomic_write_bytes(path, &data, Some(expected), sync_parent)?;
+    atomic_write_bytes(path, &data, Some(expected), false, sync_parent)?;
     Ok(data.into_bytes())
+}
+
+/// Signed trust snapshots share the same cooperating CAS lock and atomic
+/// publication as config. None is an explicit create-only operation, never
+/// an overwrite. The caller must validate the whole document before use.
+pub(crate) fn guarded_trust_write(
+    path: &Path,
+    data: &str,
+    expected: Option<&[u8]>,
+) -> Result<(), WriteFailure> {
+    let _lock = editor_lock(path)?;
+    if let Some(expected) = expected {
+        require_unchanged(path, expected)?;
+    }
+    atomic_write_bytes(path, data, expected, expected.is_none(), sync_directory)
 }
 
 fn sync_directory(parent: &Path) -> Check {
@@ -680,6 +695,7 @@ fn atomic_write_bytes(
     path: &Path,
     data: &str,
     expected: Option<&[u8]>,
+    create_only: bool,
     sync_parent: impl FnOnce(&Path) -> Check,
 ) -> Result<(), WriteFailure> {
     ensure(
@@ -732,8 +748,18 @@ fn atomic_write_bytes(
         if let Some(expected) = expected {
             require_unchanged(path, expected)?;
         }
-        fs::rename(&temp, path)
-            .map_err(|_| ConfigError::new("config", "cannot atomically replace configuration"))?;
+        if create_only {
+            // Link a complete synced inode without replacing an existing
+            // pathname (including a symlink). Unsupported filesystems refuse.
+            fs::hard_link(&temp, path)
+                .map_err(|_| ConfigError::new("config", "cannot publish new trust snapshot"))?;
+            fs::remove_file(&temp).map_err(|_| WriteFailure::AfterReplace(
+                ConfigError::new("config", "cannot remove published temporary link")
+            ))?;
+        } else {
+            fs::rename(&temp, path)
+                .map_err(|_| ConfigError::new("config", "cannot atomically replace configuration"))?;
+        }
         sync_parent(parent).map_err(WriteFailure::AfterReplace)?;
         Ok(())
     })();
