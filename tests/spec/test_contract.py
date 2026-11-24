@@ -481,6 +481,8 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("SmartTheia XHTTP", spec)
         self.assertIn("не реализуем полную копию Xray REALITY или Xray XHTTP", spec)
         self.assertIn("0.6 (проектная)", spec)
+        self.assertIn("не смена протокола или транспорта SmartTheia", spec)
+        self.assertIn("параметров единственного XHTTP", spec)
         self.assertIn("Xray XHTTP и Xray REALITY — только источники идей", spec)
         self.assertIn("полное копирование реализации Xray не является целью", spec)
         self.assertIn("воспроизведение Xray first flight", spec)

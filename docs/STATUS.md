@@ -46,8 +46,8 @@ F-14 evidence and residual gaps: [F14_ACCEPTANCE.md](F14_ACCEPTANCE.md). Do not 
 
 ### F-18 дополнительная идентичность (предлагаемый срез)
 
-ADR-0082/0083: read-only второй шаг мастера с exact/fresh dual evidence и дополнительный `pinned-cert-v1` для собственного server inbound, H2/H3/auto client, mutual mode refusal, guarded сохранение с отдельным restart. Это не modified REALITY handshake, не pin key lifecycle audit, не F-18/F-19 acceptance. CI нового блока ещё не подтверждён.
+ADR-0082/0083: read-only второй шаг мастера с exact/fresh dual evidence и дополнительный `pinned-cert-v1` для собственного server inbound, H2/H3/auto client, mutual mode refusal, guarded сохранение с отдельным restart. Это не modified REALITY handshake, не pin key lifecycle audit, не F-18/F-19 acceptance. Промежуточный код прошёл 13/13 проверок на [точном head da21649](https://github.com/iivkis/theia/actions/runs/45425811970); текущая ветка PR #116 ещё не принята в main.
 
 ### Pending ADR-0084
 
-Спецификация 0.6 (ADR-0086): единственный кастомный SmartTheia XHTTP, вдохновлён Xray XHTTP, не копия; H3/QUIC и H2/TCP; собственный SmartTheia REALITY, вдохновлён Xray REALITY, не копия, либо собственный TLS. Никакой Xray interoperability как цели. Предложен native split stream-up на одном проверенном соединении с общим FSM и pin. Нативная приёмка не подтверждена; F-18/F-19 и полноценный мастер остаются открытыми.
+Спецификация 0.6 (ADR-0086): единственный кастомный SmartTheia XHTTP, вдохновлён Xray XHTTP, не копия; H3/QUIC и H2/TCP; собственный SmartTheia REALITY, вдохновлён Xray REALITY, не копия, либо собственный TLS. Никакой Xray interoperability как цели. Предложен native split stream-up на одном проверенном соединении с общим FSM и pin. Промежуточный split stream-up с pin прошёл CI da21649; это не приёмка полноценного SmartTheia REALITY, целевой формы inbound или Apply. F-18/F-19 остаются открытыми.
