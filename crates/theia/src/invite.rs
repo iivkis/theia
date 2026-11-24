@@ -72,6 +72,11 @@ struct Wire {
 impl Invitation {
     /// Safe, token-free share for manual credential provisioning.
     pub fn public_from_profile(profile: &Profile) -> Result<Self, InviteError> {
+        // v1 cannot represent a non-default TLS profile. Refuse export
+        // rather than silently converting the caller's explicit selection.
+        if profile.tls_profile != "default" {
+            return Err(InviteError::Invalid);
+        }
         let invite = Self {
             id: profile.id.clone(),
             endpoint: profile.server.clone(),
@@ -349,6 +354,38 @@ mod tests {
         assert!(invite
             .to_profile("env:THEIA_AUTH_TOKEN", Some("file:relative.pem".into()))
             .is_err());
+    }
+
+    #[test]
+    fn public_export_preserves_default_transport_and_rejects_profile_downgrade() {
+        let Config::Client(doc) =
+            crate::config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
+            panic!("client");
+        };
+        let mut profile = doc.client.profiles[0].clone();
+        for transport in [Transport::Auto, Transport::H2, Transport::H3] {
+            profile.transport = transport;
+            let encoded = Invitation::public_from_profile(&profile)
+                .unwrap()
+                .encode()
+                .unwrap();
+            let decoded = Invitation::decode(&encoded).unwrap();
+            assert!(!decoded.has_token());
+            let restored = decoded.to_profile("env:TOKEN", None).unwrap();
+            assert_eq!(restored.tls_profile, "default");
+            assert_eq!(restored.transport, transport);
+        }
+        for name in ["browser-h2-btls-v1", "smart-reality-v1", "unknown", ""] {
+            profile.tls_profile = name.into();
+            for transport in [Transport::Auto, Transport::H2, Transport::H3] {
+                profile.transport = transport;
+                assert_eq!(
+                    Invitation::public_from_profile(&profile).unwrap_err(),
+                    InviteError::Invalid
+                );
+            }
+        }
     }
 
     #[test]

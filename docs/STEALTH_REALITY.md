@@ -46,6 +46,10 @@
 
 Используются настоящие test-only Ed25519 signatures и существующий research verifier, но synthetic exporter/nonce/time. Это **не** production key storage, authenticated update channel, persistent revocation, cross-process isolation или реальная реализация F-18. TLS и TOML/invite v1 неизменны. Обязателен полный native exact-head CI; до него результаты не подтверждены.
 
+## M3.5a7 — граница доверия v1 и пакет для review
+
+[ADR-0064](adr/0064-f18-m3-5a7-version-boundary-review.md) фиксирует production исправление: `Invitation::public_from_profile` отвергает любой non-default TLS profile вместо незаметной подмены на default. Формат theia://v1 не меняется. Проверяются public/issued invite, version mismatch, duplicate/nested trust fields, попытки добавить pin/generation/retired history и неподдерживаемые TLS/security modes; default export сохраняет transport H2/H3/auto. Отдельно зафиксированы доказательства M3.5a0–a6 и условия независимого security review. Никакой новый security mode, schema v2 или modified handshake не включён.
+
 ## M3.5b1 — чистый offline planner кандидатов (реализован частично)
 
 Файл `crates/theia/src/camouflage_discovery.rs`, integration tests `crates/theia/tests/camouflage_discovery.rs`, ADR-0022. Код в текущем *едином* Rust binary (library module) без новых зависимостей, не имеет ни socket/DNS/HTTP/TLS вызовов, ни CLI/TUI команды:

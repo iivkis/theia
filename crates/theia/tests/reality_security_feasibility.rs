@@ -101,11 +101,17 @@ fn v1_toml_refuses_unsupported_server_security_and_shaping_fields() {
     let cfg = checked_server_fixture();
     assert!(cfg.validate().is_ok());
     let baseline = cfg.to_toml().unwrap();
+    let changed = baseline.replace("schema_version = 1", "schema_version = 2");
+    assert_ne!(changed, baseline);
+    assert!(config::parse(&changed).is_err());
     let anchor = "server_name = \"edge.example.org\"\n";
     assert!(baseline.contains(anchor));
     for proposed in [
         "security_mode = \"smart-reality-v1\"\n",
         "reality_private_key = \"file:/private/server-key\"\n",
+        "trust_generation = 2\n",
+        "identity_required = true\n",
+        "retired_keys = []\n",
         "flow_shaping = \"required\"\n",
         "camouflage_target = \"example.net\"\n",
         "insecure_skip_verify = true\n",
@@ -122,6 +128,9 @@ fn v1_toml_refuses_unsupported_server_security_and_shaping_fields() {
 fn v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile() {
     let document = config::parse(include_str!("../../../examples/client.toml")).unwrap();
     let baseline = document.to_toml().unwrap();
+    let changed = baseline.replace("schema_version = 1", "schema_version = 2");
+    assert_ne!(changed, baseline);
+    assert!(config::parse(&changed).is_err());
     let anchor = "tls_profile = \"default\"\n";
     assert!(baseline.contains(anchor));
     for unsupported in ["smart-reality-v1", "reality", "chrome133", "insecure"] {
@@ -133,6 +142,9 @@ fn v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile() {
     }
     for extra in [
         "server_public_key = \"test-only-not-an-identity\"\n",
+        "trust_generation = 2\n",
+        "identity_required = true\n",
+        "retired_keys = []\n",
         "security_mode = \"smart-reality-v1\"\n",
         "flow_shaping = \"required\"\n",
         "disable_certificate_verification = true\n",
@@ -145,32 +157,46 @@ fn v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile() {
 fn v1_invite_rejects_new_mode_and_identity_injection_without_a_version_bump() {
     let cfg = checked_server_fixture();
     let public = Invitation::public_from_server(&cfg, "public").unwrap();
-    assert!(!public.has_token());
-    let v1 = public.encode().unwrap();
-    assert!(Invitation::decode(&v1).is_ok());
-    assert!(Invitation::decode(&v1.replacen("theia://v1/", "theia://v2/", 1)).is_err());
-    let wire = URL_SAFE_NO_PAD
-        .decode(v1.strip_prefix("theia://v1/").unwrap())
-        .unwrap();
-    let text = std::str::from_utf8(&wire).unwrap();
-    for candidate in [
-        text.replace(
-            "tls_profile = \"default\"",
-            "tls_profile = \"smart-reality-v1\"",
-        ),
-        text.replace("version = 1", "version = 2"),
-        format!("{text}server_public_key = \"test-only-key\"\n"),
-        format!("{text}flow_shaping = \"required\"\n"),
-        format!("{text}insecure_skip_verify = true\n"),
-    ] {
-        let link = format!(
-            "theia://v1/{}",
-            URL_SAFE_NO_PAD.encode(candidate.as_bytes())
-        );
-        assert!(
-            Invitation::decode(&link).is_err(),
-            "v1 must reject new trust and anti-DPI fields"
-        );
+    let token = [0x42; 32];
+    let issued = Invitation::issued_from_server(&cfg, "public", "device-a", &token).unwrap();
+    for invite in [public, issued] {
+        let v1 = invite.encode().unwrap();
+        let decoded = Invitation::decode(&v1).unwrap();
+        assert_eq!(decoded.has_token(), invite.has_token());
+        assert!(Invitation::decode(&v1.replacen("theia://v1/", "theia://v2/", 1)).is_err());
+        let wire = URL_SAFE_NO_PAD
+            .decode(v1.strip_prefix("theia://v1/").unwrap())
+            .unwrap();
+        let text = std::str::from_utf8(&wire).unwrap();
+        for profile in ["smart-reality-v1", "browser-h2-btls-v1", "reality"] {
+            let changed = text.replace(
+                "tls_profile = \"default\"",
+                &format!("tls_profile = \"{profile}\""),
+            );
+            assert!(changed != text);
+            let encoded = URL_SAFE_NO_PAD.encode(changed.as_bytes());
+            let link = format!("theia://v1/{encoded}");
+            assert!(Invitation::decode(&link).is_err());
+        }
+        for candidate in [
+            text.replace("version = 1", "version = 2"),
+            format!("{text}server_public_key = \"test-only-key\"\n"),
+            format!("{text}security_mode = \"smart-reality-v1\"\n"),
+            format!("{text}trust_generation = 2\n"),
+            format!("{text}retired_keys = []\n"),
+            format!("{text}flow_shaping = \"required\"\n"),
+            format!("{text}insecure_skip_verify = true\n"),
+            format!("{text}tls_profile = \"default\"\n"),
+            format!("{text}[identity]\nrequired = true\n"),
+        ] {
+            assert!(candidate != text);
+            let encoded = URL_SAFE_NO_PAD.encode(candidate.as_bytes());
+            let link = format!("theia://v1/{encoded}");
+            assert!(
+                Invitation::decode(&link).is_err(),
+                "v1 must reject new trust and anti-DPI fields"
+            );
+        }
     }
 }
 
