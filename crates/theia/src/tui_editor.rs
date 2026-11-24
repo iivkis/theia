@@ -722,7 +722,11 @@ impl Editor {
         let Config::Server(doc) = &self.original else {
             return Err("Server required");
         };
-        let inbound = doc.server.inbounds.get(self.selected_record).ok_or("Inbound missing")?;
+        let inbound = doc
+            .server
+            .inbounds
+            .get(self.selected_record)
+            .ok_or("Inbound missing")?;
         if !doc.server.enabled || inbound.security_mode.is_reality() {
             return Err("Select an enabled own inbound; existing REALITY key rotation is manual");
         }
@@ -1332,7 +1336,8 @@ mod tests {
 
     #[test]
     fn generated_reality_key_preview_cancel_drift_and_commit() {
-        let generated = rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
         let certificate = Temp::write(&generated.cert.pem());
         let tls_key = Temp::write(&generated.key_pair.serialize_pem());
         #[cfg(unix)]
@@ -1378,8 +1383,16 @@ mod tests {
         let Config::Server(saved) = config::read_file(&file.0).unwrap() else {
             panic!("server");
         };
-        assert_eq!(saved.server.inbounds[0].reality_key.as_deref(), Some(reference.as_str()));
-        assert_eq!(Invitation::decode(&editor.public_share().unwrap()).unwrap().tls_profile(), public.profile());
+        assert_eq!(
+            saved.server.inbounds[0].reality_key.as_deref(),
+            Some(reference.as_str())
+        );
+        assert_eq!(
+            Invitation::decode(&editor.public_share().unwrap())
+                .unwrap()
+                .tls_profile(),
+            public.profile()
+        );
         assert!(editor.review_generated_reality_mode().is_err());
         fs::remove_file(&path).unwrap();
         fs::remove_dir(path.parent().unwrap()).unwrap();

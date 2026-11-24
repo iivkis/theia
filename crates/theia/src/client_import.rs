@@ -501,15 +501,19 @@ mod storage_tests {
             assert_private(&key.directory, true);
             assert_private(&key.file, false);
             let der = crate::reality_identity::read_key(Some(&key.reference().unwrap()))
-                .unwrap().unwrap();
+                .unwrap()
+                .unwrap();
             assert!(crate::reality_identity::Signer::from_der(&der).is_ok());
         }
         let kept = retained.file.clone();
         let discarded = cancelled.file.clone();
         let public = |key: &PrivateBearer| {
             let der = crate::reality_identity::read_key(Some(&key.reference().unwrap()))
-                .unwrap().unwrap();
-            crate::reality_identity::Signer::from_der(&der).unwrap().public()
+                .unwrap()
+                .unwrap();
+            crate::reality_identity::Signer::from_der(&der)
+                .unwrap()
+                .public()
         };
         assert_ne!(public(&retained), public(&cancelled));
         retained.commit();
