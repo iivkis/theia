@@ -30,7 +30,6 @@ pub struct H3Client {
     roots: RootCertStore,
     connect_timeout: Duration,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
-    server_identity: Option<crate::reality_identity::PublicIdentity>,
     stream_up: bool,
 }
 
@@ -63,7 +62,6 @@ impl H3Client {
             roots,
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
-            server_identity: None,
             stream_up: false,
         })
     }
@@ -73,9 +71,6 @@ impl H3Client {
         pin: Option<crate::security_profile::CertificatePin>,
     ) -> Result<Self, ClientError> {
         if pin.is_some() {
-            if self.server_identity.is_some() {
-                return Err(ClientError::Configuration);
-            }
             self.uri = Uri::builder()
                 .scheme("https")
                 .authority(self.name.as_str())
@@ -89,28 +84,9 @@ impl H3Client {
         Ok(self)
     }
 
-    /// Independent server signing key, verified before bearer is transmitted.
-    pub fn with_server_identity(
-        mut self,
-        identity: Option<crate::reality_identity::PublicIdentity>,
-    ) -> Result<Self, ClientError> {
-        if identity.is_some() {
-            if self.certificate_pin.is_some() || self.server_identity.is_some() {
-                return Err(ClientError::Configuration);
-            }
-            self.stream_up = true;
-        } else if self.server_identity.is_some() {
-            return Err(ClientError::Configuration);
-        }
-        self.server_identity = identity;
-        Ok(self)
-    }
-
     /// An explicit second HTTP stream; cannot weaken the selected identity.
     pub fn with_stream_up(mut self, enabled: bool) -> Result<Self, ClientError> {
-        if (enabled && self.certificate_pin.is_none() && self.server_identity.is_none())
-            || (self.stream_up && !enabled)
-        {
+        if (enabled && self.certificate_pin.is_none()) || (self.stream_up && !enabled) {
             return Err(ClientError::Configuration);
         }
         self.stream_up = enabled;
@@ -181,7 +157,7 @@ impl H3Client {
                 .map_err(|_| ClientError::Tls)?;
             pin.verify(chain.first().ok_or(ClientError::Tls)?.as_ref())?;
         }
-        let binding = if self.certificate_pin.is_some() || self.server_identity.is_some() {
+        let binding = if self.certificate_pin.is_some() {
             let mut key = zeroize::Zeroizing::new([0u8; 32]);
             connection
                 .export_keying_material(
@@ -213,32 +189,6 @@ impl H3Client {
             let _keep_sender = keep_sender;
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         }));
-        if let Some(identity) = self.server_identity {
-            let key = binding.as_ref().ok_or(ClientError::Tls)?;
-            let mut stream = sender
-                .send_request(crate::reality_identity::request(&self.uri)?)
-                .await
-                .map_err(|_| ClientError::Http3)?;
-            stream.finish().await.map_err(|_| ClientError::Http3)?;
-            let response = stream
-                .recv_response()
-                .await
-                .map_err(|_| ClientError::Http3)?;
-            identity.verify(key, &response)?;
-            if stream
-                .recv_data()
-                .await
-                .map_err(|_| ClientError::Http3)?
-                .is_some()
-                || stream
-                    .recv_trailers()
-                    .await
-                    .map_err(|_| ClientError::Http3)?
-                    .is_some()
-            {
-                return Err(ClientError::Protocol);
-            }
-        }
         let (response, mut tx, mut rx) = if self.stream_up {
             use crate::split_http::{self, Leg};
             let mut download = sender

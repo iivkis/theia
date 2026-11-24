@@ -1,5 +1,7 @@
 # ADR-0092 — Explicit local REALITY key provisioning
 
+**Superseded by ADR-0094; historical record only. The production adapter described here is retired, not a supported configuration or implementation target.**
+
 Status: implementation submitted; full exact-head native acceptance pending. Builds on ADR-0089 and ADR-0091.
 
 ## Decision

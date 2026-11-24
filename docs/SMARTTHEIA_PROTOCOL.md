@@ -1,5 +1,7 @@
 # SmartTheia v1: wire и transport контракт
 
+**Целевой контракт ADR-0094:** REALITY должен использовать внешний HTTPS/TLS ресурс без собственного домена и TLS cert/key. Прежний ADR-0089 post-TLS identity adapter с локальной TLS парой удалён. Требуется отдельный проверенный security contract для H2 и H3; новый handshake/schema ещё не определён. Не отключать проверку доверия, не считать публичный сертификат заменой приватного ключа. Будущий контракт заменяет v1 без legacy reader или v2. Собственный TLS остаётся стандартным ручным X.509 cert/key.
+
 **Версия:** 1 (pure frame codec и FSM в `crates/theia/src/protocol.rs`; production H2/H3 client/server и ограниченный QUIC-first fallback реализованы). **Область:** прикладной протокол проксирования поверх аутентифицированных TLS/QUIC HTTP-streams. Не собственный аналог TLS или QUIC.
 
 ## 1. Transport embedding: SmartTheia XHTTP
@@ -123,7 +125,7 @@ The versioned theia://v1 invitation is **not** a SmartTheia frame, HTTP endpoint
 
 ## F-18/F-19: будущие security mode и TLS-in-TLS (не реализовано)
 
-Историческая frame v1 семантика остаётся общей; будущие wire-изменения требуют явно версионированного контракта. SmartTheia REALITY — отдельный security adapter, а не новый frame type или собственный TLS cipher. Способ реализации определяется собственным security contract, не обязательным повторением modified handshake Xray. Anti-TLS-in-TLS flow shaping не дешифрует inner TLS и обязан сохранять byte-exact TCP и OPEN_OK/FIN/backpressure. H2 и H3 требуют отдельных wire feasibility/CI и явного согласования security mode без silent downgrade. Расширения version/capabilities, TOML и invite v2 требуют ADR, миграции, негативных TLS/auth/replay/probing тестов. До реализации такого режима в бинарнике нет; см. docs/STEALTH_REALITY.md и ADR-0020.
+Историческая frame v1 семантика остаётся общей; будущие wire-изменения требуют явно версионированного контракта. SmartTheia REALITY — отдельный security adapter, а не новый frame type или собственный TLS cipher. Способ реализации определяется собственным security contract, не обязательным повторением modified handshake Xray. Anti-TLS-in-TLS flow shaping не дешифрует inner TLS и обязан сохранять byte-exact TCP и OPEN_OK/FIN/backpressure. H2 и H3 требуют отдельных wire feasibility/CI и явного согласования security mode без silent downgrade. Расширения version/capabilities, TOML и замена invite v1 требуют ADR, негативных TLS/auth/replay/probing тестов. До реализации такого режима в бинарнике нет; см. docs/STEALTH_REALITY.md и ADR-0020.
 
 ## Дополнительный pinned-cert-v1 route (ADR-0083)
 
@@ -138,10 +140,6 @@ Explicit `security_mode = "pinned-cert-stream-up-v1"` requires two requests on t
 ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. The invitation is out-of-band; existing network frame and HTTP route contracts are unchanged.
 
 ADR-0088: both pinned XHTTP profiles require theia-channel-proof per HTTP request, including both stream-up legs. Exact TLS exporter/HMAC encoding and one-admission-per-connection rule are normative in ADR-0088. Missing/wrong/duplicate/replayed proof is refused before HTTP success and OPEN. Own TLS is unchanged; no compatibility path for old pinned HTTP requests.
-
-### Independent identity before bearer (ADR-0089)
-
-For smart-reality-v1 only, the TLS1.3-verified client issues one empty GET /v1/identity before any Authorization. The response has status 200, no body or trailers, exactly one theia-server-identity header carrying a canonical base64url Ed25519 signature over the fixed domain plus the connection-specific ADR-0088 exporter. See ADR-0089 for exact encoding and bounds. Require separate provisioned server public key and strict verification. The existing stream-up pair is only admitted after identity issuance and both bound leg proofs. A valid identity proof is not OPEN_OK. No fallback on identity rejection. No hidden-first-flight or active-probing claim.
 
 ### BBR-first congestion control (ADR-0090)
 

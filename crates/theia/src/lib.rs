@@ -28,7 +28,6 @@ pub mod management;
 pub mod protocol;
 pub mod quic_transport;
 pub(crate) mod quota;
-pub mod reality_identity;
 mod relay_liveness;
 pub mod reload_preflight;
 pub mod restart_guard;

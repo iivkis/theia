@@ -1,5 +1,7 @@
 # План реализации для ИИ-агента
 
+**Следующий целевой срез F-18 (ADR-0094):** пересмотреть backend/trust model для внешнего HTTPS/TLS ресурса без собственной TLS пары; отдельно доказать H2 и H3. Подготовить единый ранжированный список проверенных разрешённых кандидатов, ручной импорт публичных параметров, общий preview/валидатор и transactional Apply. Старый локальный TLS+Ed25519 контракт удалён; реализовать заменяющий v1 без legacy compatibility, сохранить native CI и independent review. Старые этапы ниже — история, не предписание локальной TLS пары для целевого REALITY.
+
 **Важно (2026-11-24):** строки этой таблицы представляют **историческое** состояние соответствующего вертикального среза в момент создания PR. Фразы «ожидает CI», «данный PR» и «не реализовано» в ранних строках **не** являются текущим статусом всего проекта. Каноническая актуальная сводка и открытые P0: [STATUS.md](STATUS.md). Это не заменяет тестов точного head SHA.
 
 Спецификация — источник требований, а не уже написанный код. Каждая фаза делится на небольшие reviewable PR с тестами сначала. Не пытаться за один PR «сделать полный Xray», иначе получится красивое название над 4000 строками заглушек.
@@ -104,18 +106,6 @@ ADR-0087: the sole replacement theia://v1/ invitation explicitly represents Smar
 
 Integrate TLS exporters into the actual H2/H3 pinned runtime before HTTP admission, verify per-leg proofs and reject replay in bounded per-connection state. Retain strict grants and all native acceptance. Independent identity and remaining F-18/F-19 work are not closed.
 
-### ADR-0089 — independent identity and guarded manual configuration
-
-Production-path H2/H3 identity proof before bearer, explicit separate Ed25519 key, strict v1 invitation, captured key lifecycle, guarded manual TUI save and native negative/positive loopback tests. Next acceptance still requires independent review, candidate Apply, active-probing evidence, cross-host independent-key E2E and measured F-19. No new CI job.
-
 ### ADR-0090 — BBR-first with CUBIC fallback
 
 Linux TCP_CONGESTION selection before connect/listen and real socket readback; CUBIC when BBR is unavailable. Windows native TCP continues with its OS-managed controller and CUBIC deployment preference. H3 retains available Quinn BBR. Keep full native and cross-host CI; measure actual H2/H3 performance separately. No user setting or global edits.
-
-### ADR-0091 — F-18 independent native acceptance slice
-
-Extend the existing mandatory cross-host fixture with a fourth, independent-key inbound. Generate standard Ed25519 DER on Linux, transfer only the public identities. Verify real Windows invitation import and byte-exact CONNECT/SOCKS5 relay on H2/H3/auto, wrong public key, bearer, trust and mode refusal. Add independent raw wire signature and one-response witnesses plus exact material fingerprint at local guarded save. No new CI job or dependency. Review packet documents open third-party candidate Apply, HTTP application evidence and independent audit; F-19 remains separate.
-
-### ADR-0092 — local REALITY provisioning
-
-G stages a protected fresh Ed25519 DER key for the selected enabled saved own inbound; preview uses the manual local validator, y saves with full material and source revalidation, n/Esc drops the staged key. Refuse automatic rotation of an existing REALITY profile. Keep independent candidate/active-probing and audit gates open. No new dependencies or jobs.

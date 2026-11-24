@@ -13,7 +13,6 @@ use theia::{
     h3_client::H3Client,
     invite::Invitation,
     protocol::Address,
-    reality_identity::PublicIdentity,
     security_profile::{CertificatePin, SecurityMode},
     server::{self, ServerContext},
 };
@@ -34,7 +33,6 @@ struct Fixture {
     pin: CertificatePin,
     other_pin: CertificatePin,
     stream_up: bool,
-    identity: Option<PublicIdentity>,
     _servers: JoinSet<Result<(), server::ServerError>>,
 }
 
@@ -72,46 +70,9 @@ impl Fixture {
         )
         .unwrap();
         let h3 = udp.local_addr().unwrap();
-        let (identity, reality_key, key_path) = if mode.is_reality() {
-            use ring::{
-                rand::SystemRandom,
-                signature::{Ed25519KeyPair, KeyPair},
-            };
-            use std::io::Write;
-            let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-            let pair = Ed25519KeyPair::from_pkcs8(der.as_ref()).unwrap();
-            let profile = format!(
-                "smart-reality-v1:{}",
-                URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
-            );
-            let identity = PublicIdentity::parse_profile(&profile).unwrap();
-            let path = std::env::temp_dir().join(format!(
-                "theia-reality-{}-{}.der",
-                std::process::id(),
-                URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
-            ));
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&path).unwrap();
-            file.write_all(der.as_ref()).unwrap();
-            drop(file);
-            (
-                Some(identity),
-                Some(format!("file:{}", path.display())),
-                Some(path),
-            )
-        } else {
-            (None, None, None)
-        };
         let inbound = Inbound {
             id: "test".into(),
             security_mode: mode,
-            reality_key,
             allowed_user_ids: vec!["client".into()],
             h2_listen: h2.to_string(),
             quic_listen: h3.to_string(),
@@ -131,9 +92,6 @@ impl Fixture {
             connect_timeout_ms: 2000,
         };
         let context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
-        if let Some(path) = key_path {
-            std::fs::remove_file(path).unwrap();
-        }
         let mut servers = JoinSet::new();
         servers.spawn(server::serve(
             tcp,
@@ -147,8 +105,7 @@ impl Fixture {
             roots,
             pin,
             other_pin,
-            stream_up: mode == SecurityMode::PinnedCertStreamUpV1 || mode.is_reality(),
-            identity,
+            stream_up: mode == SecurityMode::PinnedCertStreamUpV1,
             _servers: servers,
         }
     }
@@ -228,9 +185,6 @@ impl Fixture {
                     }
                 },
             );
-            if let Some(identity) = self.identity {
-                profile.tls_profile = identity.profile();
-            }
             let invite = Invitation::public_from_profile(&profile)
                 .unwrap()
                 .encode()
@@ -242,9 +196,7 @@ impl Fixture {
             assert_eq!(received.tls_profile, profile.tls_profile);
             assert_eq!(received.transport, profile.transport);
             let imported_pin = CertificatePin::parse_profile(&received.tls_profile);
-            let identity = PublicIdentity::parse_profile(&received.tls_profile);
-            let stream_up =
-                identity.is_some() || CertificatePin::is_stream_up_profile(&received.tls_profile);
+            let stream_up = CertificatePin::is_stream_up_profile(&received.tls_profile);
             let token = URL_SAFE_NO_PAD.encode(TOKEN);
             let (mut app, local) = tokio::io::duplex(4096);
             let relay = if received.transport == Transport::H3 {
@@ -256,8 +208,6 @@ impl Fixture {
                 )
                 .unwrap()
                 .with_certificate_pin(imported_pin)
-                .unwrap()
-                .with_server_identity(identity)
                 .unwrap()
                 .with_stream_up(stream_up)
                 .unwrap()
@@ -274,8 +224,6 @@ impl Fixture {
                 )
                 .unwrap()
                 .with_certificate_pin(imported_pin)
-                .unwrap()
-                .with_server_identity(identity)
                 .unwrap()
                 .with_stream_up(stream_up)
                 .unwrap()
@@ -565,206 +513,4 @@ async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
     })
     .await
     .expect("bounded native H3 exporter admission");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reality_independent_identity_h2_h3_and_wrong_key_refusal() {
-    timeout(Duration::from_secs(40), async {
-        let fixture = Fixture::start(SecurityMode::SmartRealityV1).await;
-        let other = Fixture::start(SecurityMode::SmartRealityV1).await;
-        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = target.local_addr().unwrap().port();
-        let address = Address::V4([127, 0, 0, 1]);
-        let token = URL_SAFE_NO_PAD.encode(TOKEN);
-        let wrong = other.identity.unwrap();
-        assert_ne!(Some(wrong), fixture.identity);
-        let h2 = H2Client::new(
-            &fixture.h2.to_string(),
-            "localhost",
-            &token,
-            fixture.roots.clone(),
-        )
-        .unwrap()
-        .with_server_identity(Some(wrong))
-        .unwrap();
-        let h3 = H3Client::new(fixture.h3, "localhost", &token, fixture.roots.clone())
-            .unwrap()
-            .with_server_identity(Some(wrong))
-            .unwrap();
-        assert_eq!(
-            h2.open(address.clone(), port).await.err(),
-            Some(ClientError::Tls)
-        );
-        assert_eq!(
-            h3.open(address.clone(), port).await.err(),
-            Some(ClientError::Tls)
-        );
-
-        // The ordinary pinned stream-up client must not silently enter the
-        // independent-identity mode even with valid PKI, pin and bearer.
-        let h2 = fixture.h2(Some(fixture.pin), "localhost", &TOKEN);
-        let h3 = fixture.h3(Some(fixture.pin), "localhost", &TOKEN);
-        assert!(h2.open(address.clone(), port).await.is_err());
-        assert!(h3.open(address, port).await.is_err());
-        assert!(timeout(Duration::from_millis(250), target.accept())
-            .await
-            .is_err());
-        fixture.transfer(None, &target).await;
-    })
-    .await
-    .expect("bounded independent identity H2/H3 matrix");
-}
-
-// Independent wire verification of the actual Ed25519 proof. The witness
-// does not call the production identity request or verification helpers.
-fn check_identity_wire(identity: PublicIdentity, exporter: &[u8; 32], header: &HeaderValue) {
-    let key = URL_SAFE_NO_PAD.decode(identity.encoded()).unwrap();
-    let signature = URL_SAFE_NO_PAD.decode(header.as_bytes()).unwrap();
-    assert_eq!(signature.len(), 64);
-    let mut transcript = b"SmartTheia/REALITY/server-identity/v1\0".to_vec();
-    transcript.extend_from_slice(exporter);
-    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
-        .verify(&transcript, &signature)
-        .unwrap();
-}
-
-fn raw_identity_request(path: &str) -> Request<()> {
-    Request::get(format!("https://localhost{path}"))
-        .body(())
-        .unwrap()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn independent_wire_identity_h2_h3_signature_scope_and_one_response() {
-    timeout(Duration::from_secs(30), async {
-        let fixture = Fixture::start(SecurityMode::SmartRealityV1).await;
-        let identity = fixture.identity.unwrap();
-        let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(fixture.roots.clone())
-        .with_no_client_auth();
-        tls_config.alpn_protocols = vec![b"h2".to_vec()];
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-        let mut witnesses = Vec::new();
-        for _ in 0..2 {
-            let tcp = tokio::net::TcpStream::connect(fixture.h2).await.unwrap();
-            let tls = connector
-                .connect(
-                    rustls::pki_types::ServerName::try_from("localhost").unwrap(),
-                    tcp,
-                )
-                .await
-                .unwrap();
-            let key = tls
-                .get_ref()
-                .1
-                .export_keying_material(
-                    [0; 32],
-                    b"EXPORTER-SmartTheia-XHTTP-Admission-v1",
-                    Some(b"h2"),
-                )
-                .unwrap();
-            let (mut sender, connection) = h2::client::handshake(tls).await.unwrap();
-            let driver = tokio::spawn(connection);
-            for (path, expected) in [
-                ("/v1/identity?x=1", StatusCode::NOT_FOUND),
-                ("/v1/identity", StatusCode::OK),
-                ("/v1/identity", StatusCode::UNAUTHORIZED),
-            ] {
-                sender = sender.ready().await.unwrap();
-                let (response, _) = sender
-                    .send_request(raw_identity_request(path), true)
-                    .unwrap();
-                let mut response = response.await.unwrap();
-                assert_eq!(response.status(), expected);
-                if expected == StatusCode::OK {
-                    let header = response.headers()["theia-server-identity"].clone();
-                    assert_eq!(
-                        response
-                            .headers()
-                            .get_all("theia-server-identity")
-                            .iter()
-                            .count(),
-                        1
-                    );
-                    check_identity_wire(identity, &key, &header);
-                    assert!(response.body_mut().data().await.is_none());
-                    assert!(response.body_mut().trailers().await.unwrap().is_none());
-                    witnesses.push((key, header));
-                } else {
-                    assert!(!response.headers().contains_key("theia-server-identity"));
-                }
-            }
-            driver.abort();
-        }
-        let endpoint = theia::quic_transport::client_endpoint(
-            "127.0.0.1:0".parse().unwrap(),
-            fixture.roots.clone(),
-        )
-        .unwrap();
-        for _ in 0..2 {
-            let connection = theia::quic_transport::connect(&endpoint, fixture.h3, "localhost")
-                .await
-                .unwrap();
-            let mut key = [0; 32];
-            connection
-                .export_keying_material(&mut key, b"EXPORTER-SmartTheia-XHTTP-Admission-v1", b"h3")
-                .unwrap();
-            let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
-                .await
-                .unwrap();
-            let task = tokio::spawn(async move {
-                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            });
-            for (path, expected) in [
-                ("/v1/identity?x=1", StatusCode::NOT_FOUND),
-                ("/v1/identity", StatusCode::OK),
-                ("/v1/identity", StatusCode::UNAUTHORIZED),
-            ] {
-                let mut stream: h3::client::RequestStream<_, Bytes> = sender
-                    .send_request(raw_identity_request(path))
-                    .await
-                    .unwrap();
-                stream.finish().await.unwrap();
-                let response = stream.recv_response().await.unwrap();
-                assert_eq!(response.status(), expected);
-                if expected == StatusCode::OK {
-                    let header = response.headers()["theia-server-identity"].clone();
-                    assert_eq!(
-                        response
-                            .headers()
-                            .get_all("theia-server-identity")
-                            .iter()
-                            .count(),
-                        1
-                    );
-                    check_identity_wire(identity, &key, &header);
-                    assert!(stream.recv_data().await.unwrap().is_none());
-                    assert!(stream.recv_trailers().await.unwrap().is_none());
-                    witnesses.push((key, header));
-                } else {
-                    assert!(!response.headers().contains_key("theia-server-identity"));
-                }
-            }
-            task.abort();
-        }
-        // The four independently negotiated H2/H3 exporters must never
-        // authenticate another connection's proof, even for the same signer.
-        let public = URL_SAFE_NO_PAD.decode(identity.encoded()).unwrap();
-        let verifier = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public);
-        for (i, (exporter, _)) in witnesses.iter().enumerate() {
-            let mut transcript = b"SmartTheia/REALITY/server-identity/v1\0".to_vec();
-            transcript.extend_from_slice(exporter);
-            for (j, (_, header)) in witnesses.iter().enumerate() {
-                let signature = URL_SAFE_NO_PAD.decode(header.as_bytes()).unwrap();
-                assert_eq!(verifier.verify(&transcript, &signature).is_ok(), i == j);
-            }
-        }
-        assert_eq!(witnesses.len(), 4);
-    })
-    .await
-    .expect("bounded independent H2/H3 signature wire matrix");
 }

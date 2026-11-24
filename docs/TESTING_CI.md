@@ -1,5 +1,7 @@
 # Testing strategy и CI
 
+**Будущие обязательные F-18 проверки (ADR-0094):** настоящий собственный backend внешнего TLS ресурса без локальной TLS пары, независимые H2/H3/auto E2E, доверие/identity/replay/authorization failure, отказ старому локальному TLS+Ed25519 формату v1 после замены, ранжирование/импорт/guarded Apply и rollback. Сетевые тесты только изолированные fixtures или явно разрешённые цели; никаких live scans в CI. Независимый review и текущие mandatory jobs сохраняются. Старый REALITY backend удалён; regression tests требуют отказа старому серверному TOML, клиентскому профилю и приглашению. Обычный TLS, XHTTP и BBR/CUBIC gates не ослаблены. Документирование не заменяет реализацию.
+
 **CI-only.** Этот документ определяет текущие обязательные проверки, а не хронологию PR. Фактическая готовность: [STATUS](STATUS.md); исторические решения и свидетельства отдельных этапов: [IMPLEMENTATION_PLAN](IMPLEMENTATION_PLAN.md) и [ADR](adr/). Метрики и история оптимизаций CI: [CI_PERFORMANCE](CI_PERFORMANCE.md). Не считать исследовательский тест готовой функцией.
 
 ## 1. Порядок GitHub Actions
@@ -81,18 +83,6 @@ ADR-0087: the sole replacement theia://v1/ invitation explicitly represents Smar
 
 Mandatory existing workspace tests cover pure proof mutation/race and independent raw real TLS/H2 and QUIC/H3 same/fresh connection replay refusal. Existing full relay and cross-host pinned tests exercise the new adapter. No job or dependency version changes; exact-head CI required.
 
-### ADR-0089 independent identity acceptance
-
-Existing mandatory workspace tests cover independent Ed25519 signatures and strict v1 profile encoding, actual H2/H3 loopback identity + stream-up, wrong identity and old-mode refusal, no target dial, byte-exact full-duplex relay, guarded editor and key drift. Existing cross-host, browser, security and resource jobs are preserved. This is not a new cross-host independent-key or active-probing/F-19 benchmark result.
-
 ### ADR-0090 BBR-first acceptance
 
 Keep existing H3 BBR assertion. Linux test verifies listener and both TCP peers, transfers bytes, accepts CUBIC and rejects Reno when selectable. Missing kernel BBR is permitted via verified CUBIC. Windows native test transfers bytes using OS-managed TCP without claiming verified per-socket BBR/CUBIC. Keep Windows and cross-host jobs; no test skip or new job. Comparable performance measurements remain mandatory.
-
-### ADR-0091 F-18 independent native acceptance
-
-No new CI job. Extend the existing F-14 Linux VM/native Windows job to a fourth inbound, separate standard Ed25519 PKCS#8 DER generated on Linux, only canonical public identities copied to Windows, replacement v1 import and byte-exact real CONNECT/SOCKS5 with H2/H3/auto; wrong key, wrong CA, wrong bearer and pinned-mode mismatch negatives. Raw independent H2/H3 proof witness verifies signature and exact one response, and rejects signatures across four connection exporters. Local review drift test also changes certificate encoding without changing the leaf. Full exact-head CI required; no performance or independent-review claim.
-
-### ADR-0092 provisioning acceptance
-
-Native tests verify generated Ed25519 DER with distinct public keys, Linux 0700/0600 and Windows owner+SYSTEM DACL, no overwrite, cancellation cleanup, exact file drift rejection, guarded commit, invitation export and refusal to automatically rotate an existing REALITY key. The existing Auto denial test retries only local TCP connect refusal/reset before sending CONNECT; remote denial and no-target-dial assertions remain unchanged. Keep all mandatory jobs, no new job.

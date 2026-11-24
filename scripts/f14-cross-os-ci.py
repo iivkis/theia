@@ -131,7 +131,7 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
     token = secrets.token_bytes(32)
     digest = hashlib.sha256(token).hexdigest()
     token_b64 = base64.urlsafe_b64encode(token).decode("ascii").rstrip("=")
-    # Reserve three adjacent ports for pinned and independent-identity inbounds.
+    # Reserve two adjacent ports for the pinned inbounds.
     port = secrets.randbelow(7998) + 42000
     origin = secrets.randbelow(8000) + 52000
     if port == origin:
@@ -178,17 +178,14 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
                     if server.poll() is not None:
                         details = server.stderr.read().decode("utf-8", "replace")
                         raise RuntimeError("Linux server failed to start: " + details[-1500:])
-                    if guest_exists(guest_dir + "/ready") and all(is_listening(ip, port + offset) for offset in range(4)):
+                    if guest_exists(guest_dir + "/ready") and all(is_listening(ip, port + offset) for offset in range(3)):
                         break
                     time.sleep(0.25)
                 else:
                     raise RuntimeError("Native Windows cannot reach real WSL2 Linux TCP listener")
 
                 print("F-14: Windows connected to the Linux VM on its non-loopback IPv4")
-                for filename in (
-                    "server.toml", "trusted-ca.pem", "wrong-ca.pem",
-                    "reality-public.txt", "wrong-reality-public.txt",
-                ):
+                for filename in ("server.toml", "trusted-ca.pem", "wrong-ca.pem"):
                     copy_public_from_guest(guest_dir + "/" + filename, host_files / filename)
                 env = os.environ.copy()
                 env.update(
@@ -198,8 +195,6 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
                     THEIA_F14_XHOST_SERVER_CONFIG=str(host_files / "server.toml"),
                     THEIA_F14_XHOST_CA=str(host_files / "trusted-ca.pem"),
                     THEIA_F14_XHOST_WRONG_CA=str(host_files / "wrong-ca.pem"),
-                    THEIA_F18_XHOST_PUBLIC=str(host_files / "reality-public.txt"),
-                    THEIA_F18_XHOST_WRONG_PUBLIC=str(host_files / "wrong-reality-public.txt"),
                     THEIA_F14_XHOST_TOKEN=token_b64,
                     THEIA_F14_CLIENT_BIN=str(windows_client.resolve()),
                 )
@@ -212,7 +207,7 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
                     check=True,
                     timeout=300,
                 )
-                print("F-14/F-18: real H2/H3 OPEN_OK, pinned XHTTP, independent REALITY and PKI/auth/identity negatives passed")
+                print("F-14/F-18: real H2/H3 OPEN_OK, pinned XHTTP and PKI/auth/identity negatives passed")
             finally:
                 subprocess.run(
                     wsl_command("touch", guest_dir + "/stop"),

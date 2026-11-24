@@ -1,5 +1,7 @@
 # ADR-0091 — F-18 independent native acceptance and review boundary
 
+**Superseded by ADR-0094; historical record only. The production adapter described here is retired, not a supported configuration or implementation target.**
+
 Status: submitted for full exact-head native CI. ADR-0089 implementation was merged via PR #118 after 13/13 checks (head 68773a4; workflow 45440123346). This ADR does not assert F-18 release acceptance or independent review.
 
 ## Changes

@@ -24,17 +24,10 @@ pub(crate) struct PinnedModeReview {
     endpoint: String,
     pin: crate::security_profile::CertificatePin,
     mode: crate::security_profile::SecurityMode,
-    reality: Option<crate::reality_identity::PublicIdentity>,
-    key_reference: Option<String>,
-    material_fingerprint: Option<[u8; 32]>,
-    generated_key: Option<PrivateBearer>,
 }
 
 impl PinnedModeReview {
     pub(crate) fn body(&self) -> String {
-        if let Some(identity) = self.reality {
-            return format!("Собственный inbound: {}\nEndpoint: {}\nSNI: {}\nsecurity_mode = smart-reality-v1\nКлиентский tls_profile = {}\n\nПроверены собственный TLS cert/key и отдельный Ed25519 ключ. Путь и private key скрыты. Новый staged key удаляется при отмене. y: guarded save; n/Esc: отмена. Отдельный restart/Apply обязателен. Не доказана устойчивость к active probing.", self.inbound, self.endpoint, self.name, identity.profile());
-        }
         let (mode, profile) = if self.mode.is_stream_up() {
             ("pinned-cert-stream-up-v1", self.pin.stream_up_profile())
         } else {
@@ -613,9 +606,6 @@ impl Editor {
             .inbounds
             .get(self.selected_record)
             .ok_or("Inbound missing")?;
-        if inbound.security_mode.is_reality() {
-            return Err("Refuse downgrade of a saved REALITY profile");
-        }
         let tcp: std::net::SocketAddr =
             inbound.h2_listen.parse().map_err(|_| "Invalid TCP bind")?;
         let udp: std::net::SocketAddr = inbound
@@ -638,128 +628,19 @@ impl Editor {
             } else {
                 crate::security_profile::SecurityMode::PinnedCertV1
             },
-            reality: None,
-            key_reference: None,
-            material_fingerprint: None,
-            generated_key: None,
         })
-    }
-
-    /// Explicit operator-selected local file, never a third-party candidate.
-    pub(crate) fn review_reality_mode(
-        &self,
-        reference: &str,
-    ) -> Result<PinnedModeReview, &'static str> {
-        if self.editing
-            || self.dirty()
-            || self.issued.is_some()
-            || !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source)
-        {
-            return Err("Save/reload clean server config first");
-        }
-        let Config::Server(mut doc) = self.original.clone() else {
-            return Err("Server required");
-        };
-        if !doc.server.enabled {
-            return Err("Server disabled");
-        }
-        let inbound = doc
-            .server
-            .inbounds
-            .get_mut(self.selected_record)
-            .ok_or("Inbound missing")?;
-        inbound.security_mode = crate::security_profile::SecurityMode::SmartRealityV1;
-        inbound.reality_key = Some(reference.to_owned());
-        let candidate = Config::Server(doc);
-        candidate
-            .validate()
-            .map_err(|_| "Invalid REALITY configuration")?;
-        let Config::Server(doc) = &candidate else {
-            return Err("Server required");
-        };
-        let inbound = doc
-            .server
-            .inbounds
-            .get(self.selected_record)
-            .ok_or("Inbound missing")?;
-        let tcp: std::net::SocketAddr =
-            inbound.h2_listen.parse().map_err(|_| "Invalid TCP bind")?;
-        let udp: std::net::SocketAddr = inbound
-            .quic_listen
-            .parse()
-            .map_err(|_| "Invalid UDP bind")?;
-        if tcp.port() != udp.port() || tcp.port() == 0 {
-            return Err("H2/H3 ports must agree");
-        }
-        let (public, pin, material_fingerprint) = crate::server::configured_reality_review(inbound)
-            .map_err(|_| "Cannot verify own TLS and separate Ed25519 identity")?;
-        Ok(PinnedModeReview {
-            source: self.saved_sha256(),
-            inbound: inbound.id.clone(),
-            name: inbound.server_name.clone(),
-            endpoint: format!("{}:{}", inbound.server_name, tcp.port()),
-            pin,
-            mode: crate::security_profile::SecurityMode::SmartRealityV1,
-            reality: Some(public),
-            key_reference: Some(reference.to_owned()),
-            material_fingerprint: Some(material_fingerprint),
-            generated_key: None,
-        })
-    }
-
-    /// Wizard path: explicit generation for an existing own inbound.
-    /// No DNS, third-party certificate or target substitution. The fresh
-    /// private file is staged and removed on cancellation/failure; the same
-    /// local validator used by manual REALITY configuration is authoritative.
-    pub(crate) fn review_generated_reality_mode(&self) -> Result<PinnedModeReview, &'static str> {
-        if self.editing
-            || self.dirty()
-            || self.issued.is_some()
-            || !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source)
-        {
-            return Err("Save/reload clean server config first");
-        }
-        let Config::Server(doc) = &self.original else {
-            return Err("Server required");
-        };
-        let inbound = doc
-            .server
-            .inbounds
-            .get(self.selected_record)
-            .ok_or("Inbound missing")?;
-        if !doc.server.enabled || inbound.security_mode.is_reality() {
-            return Err("Select an enabled own inbound; existing REALITY key rotation is manual");
-        }
-        let staged = PrivateBearer::create_reality_key(&self.path)
-            .map_err(|_| "Cannot stage a protected independent key")?;
-        let reference = staged.reference().map_err(|_| "Invalid key reference")?;
-        let mut review = self.review_reality_mode(&reference)?;
-        review.generated_key = Some(staged);
-        Ok(review)
     }
 
     pub(crate) fn apply_pinned_mode(
         &mut self,
-        review: &mut PinnedModeReview,
+        review: &PinnedModeReview,
     ) -> Result<(), &'static str> {
-        let current = if review.mode.is_reality() {
-            self.review_reality_mode(
-                review
-                    .key_reference
-                    .as_deref()
-                    .ok_or("Missing key reference")?,
-            )?
-        } else {
-            self.review_pinned_mode(review.mode.is_stream_up())?
-        };
+        let current = self.review_pinned_mode(review.mode.is_stream_up())?;
         if current.source != review.source
             || current.inbound != review.inbound
             || current.name != review.name
             || current.endpoint != review.endpoint
             || current.pin != review.pin
-            || current.reality != review.reality
-            || current.key_reference != review.key_reference
-            || current.material_fingerprint != review.material_fingerprint
         {
             return Err("Configuration or certificate changed; review again");
         }
@@ -772,21 +653,13 @@ impl Editor {
             .get_mut(self.selected_record)
             .ok_or("Inbound missing")?;
         inbound.security_mode = review.mode;
-        inbound.reality_key.clone_from(&review.key_reference);
         if !self.save() {
             // Preserve uncertain-write protection; never assert rollback of a
             // committed file if the guarded writer cannot establish outcome.
             if !self.write_uncertain {
                 self.draft = self.original.clone();
-            } else if let Some(key) = &mut review.generated_key {
-                // The config may already refer to this key after an
-                // uncertain replace; preserve it rather than break startup.
-                key.commit();
             }
             return Err("Guarded save failed; inspect/reload configuration");
-        }
-        if let Some(key) = &mut review.generated_key {
-            key.commit();
         }
         Ok(())
     }
@@ -1224,23 +1097,23 @@ mod tests {
         let source = Config::Server(doc.clone()).to_toml().unwrap();
         let file = Temp::write(&source);
         let mut editor = Editor::load(Role::Server, &file.0).unwrap();
-        let mut review = editor.review_pinned_mode(false).unwrap();
+        let review = editor.review_pinned_mode(false).unwrap();
         assert!(review.pin == CertificatePin::from_der(generated.cert.der().as_ref()));
         assert!(review.body().contains("pinned-cert-v1:"));
         assert_eq!(fs::read_to_string(&file.0).unwrap(), source);
         fs::write(&file.0, format!("{source}\n# external edit")).unwrap();
-        assert!(editor.apply_pinned_mode(&mut review).is_err());
+        assert!(editor.apply_pinned_mode(&review).is_err());
         assert!(fs::read_to_string(&file.0)
             .unwrap()
             .contains("external edit"));
         fs::write(&file.0, &source).unwrap();
 
         fs::write(&certificate.0, "invalid certificate").unwrap();
-        assert!(editor.apply_pinned_mode(&mut review).is_err());
+        assert!(editor.apply_pinned_mode(&review).is_err());
         assert_eq!(fs::read_to_string(&file.0).unwrap(), source);
         fs::write(&certificate.0, generated.cert.pem()).unwrap();
 
-        editor.apply_pinned_mode(&mut review).unwrap();
+        editor.apply_pinned_mode(&review).unwrap();
         assert!(!editor.dirty());
         let Config::Server(saved) = config::read_file(&file.0).unwrap() else {
             panic!("saved server");
@@ -1257,10 +1130,10 @@ mod tests {
         assert!(!public.has_token());
         assert!(crate::reload_preflight::assess_reload(&doc, &saved).is_err());
         assert!(!crate::restart_guard::same_port_tls_only(&doc, &saved));
-        assert!(editor.apply_pinned_mode(&mut review).is_err());
-        let mut split = editor.review_pinned_mode(true).unwrap();
+        assert!(editor.apply_pinned_mode(&review).is_err());
+        let split = editor.review_pinned_mode(true).unwrap();
         assert!(split.body().contains("pinned-cert-stream-up-v1:"));
-        editor.apply_pinned_mode(&mut split).unwrap();
+        editor.apply_pinned_mode(&split).unwrap();
         let Config::Server(saved) = config::read_file(&file.0).unwrap() else {
             panic!("saved server");
         };
@@ -1271,131 +1144,6 @@ mod tests {
         let public = Invitation::decode(&editor.public_share().unwrap()).unwrap();
         assert_eq!(public.tls_profile(), split.pin.stream_up_profile());
         assert!(!public.has_token());
-    }
-
-    #[test]
-    fn reality_review_refuses_key_drift_and_preserves_independent_identity() {
-        use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
-        let generated =
-            rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
-        let certificate = Temp::write(&generated.cert.pem());
-        let tls_key = Temp::write(&generated.key_pair.serialize_pem());
-        let key = Temp::write("");
-        let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        let rotated = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for path in [&tls_key.0, &key.0] {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-            }
-        }
-        fs::write(&key.0, der.as_ref()).unwrap();
-        let Config::Server(mut doc) = config::parse(&server_source()).unwrap() else {
-            panic!("server fixture");
-        };
-        doc.server.inbounds[0].tls_cert = format!("file:{}", certificate.0.display());
-        doc.server.inbounds[0].tls_key = format!("file:{}", tls_key.0.display());
-        let source = Config::Server(doc.clone()).to_toml().unwrap();
-        let file = Temp::write(&source);
-        let mut editor = Editor::load(Role::Server, &file.0).unwrap();
-        let reference = format!("file:{}", key.0.display());
-        assert!(editor.review_reality_mode("file:relative.der").is_err());
-        assert!(editor
-            .review_reality_mode(&doc.server.inbounds[0].tls_key)
-            .is_err());
-        let mut review = editor.review_reality_mode(&reference).unwrap();
-        assert!(!review.body().contains(&reference));
-        assert!(review.body().contains("smart-reality-v1:"));
-        fs::write(&key.0, rotated.as_ref()).unwrap();
-        assert!(editor.apply_pinned_mode(&mut review).is_err());
-        assert_eq!(fs::read_to_string(&file.0).unwrap(), source);
-        fs::write(&key.0, der.as_ref()).unwrap();
-        // A byte change with the same leaf/public key is still a different
-        // reviewed material snapshot (including full cert/key encodings).
-        fs::write(&certificate.0, format!("{}\n", generated.cert.pem())).unwrap();
-        assert!(editor.apply_pinned_mode(&mut review).is_err());
-        assert_eq!(fs::read_to_string(&file.0).unwrap(), source);
-        fs::write(&certificate.0, generated.cert.pem()).unwrap();
-        editor.apply_pinned_mode(&mut review).unwrap();
-        let Config::Server(saved) = config::read_file(&file.0).unwrap() else {
-            panic!("server");
-        };
-        assert!(saved.server.inbounds[0].security_mode.is_reality());
-        assert_eq!(
-            saved.server.inbounds[0].reality_key.as_deref(),
-            Some(reference.as_str())
-        );
-        let invitation = Invitation::decode(&editor.public_share().unwrap()).unwrap();
-        assert_eq!(invitation.tls_profile(), review.reality.unwrap().profile());
-        assert!(!invitation.has_token());
-        assert!(editor.review_pinned_mode(true).is_err());
-        assert!(crate::reload_preflight::assess_reload(&doc, &saved).is_err());
-        assert!(!crate::restart_guard::same_port_tls_only(&saved, &saved));
-    }
-
-    #[test]
-    fn generated_reality_key_preview_cancel_drift_and_commit() {
-        let generated =
-            rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
-        let certificate = Temp::write(&generated.cert.pem());
-        let tls_key = Temp::write(&generated.key_pair.serialize_pem());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tls_key.0, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let Config::Server(mut doc) = config::parse(&server_source()).unwrap() else {
-            panic!("server fixture");
-        };
-        doc.server.inbounds[0].tls_cert = format!("file:{}", certificate.0.display());
-        doc.server.inbounds[0].tls_key = format!("file:{}", tls_key.0.display());
-        let source = Config::Server(doc).to_toml().unwrap();
-        let file = Temp::write(&source);
-        let mut editor = Editor::load(Role::Server, &file.0).unwrap();
-        let review = editor.review_generated_reality_mode().unwrap();
-        let reference = review.key_reference.clone().unwrap();
-        let path = PathBuf::from(reference.strip_prefix("file:").unwrap());
-        assert!(path.is_file());
-        assert!(!review.body().contains(&reference));
-        assert_eq!(fs::read_to_string(&file.0).unwrap(), source);
-        drop(review);
-        assert!(!path.exists());
-        assert!(!path.parent().unwrap().exists());
-
-        let mut review = editor.review_generated_reality_mode().unwrap();
-        let reference = review.key_reference.clone().unwrap();
-        let path = PathBuf::from(reference.strip_prefix("file:").unwrap());
-        fs::write(&certificate.0, format!("{}\n", generated.cert.pem())).unwrap();
-        assert!(editor.apply_pinned_mode(&mut review).is_err());
-        drop(review);
-        assert!(!path.exists());
-        assert_eq!(fs::read_to_string(&file.0).unwrap(), source);
-
-        fs::write(&certificate.0, generated.cert.pem()).unwrap();
-        let mut review = editor.review_generated_reality_mode().unwrap();
-        let reference = review.key_reference.clone().unwrap();
-        let path = PathBuf::from(reference.strip_prefix("file:").unwrap());
-        let public = review.reality.unwrap();
-        editor.apply_pinned_mode(&mut review).unwrap();
-        drop(review);
-        assert!(path.is_file());
-        let Config::Server(saved) = config::read_file(&file.0).unwrap() else {
-            panic!("server");
-        };
-        assert_eq!(
-            saved.server.inbounds[0].reality_key.as_deref(),
-            Some(reference.as_str())
-        );
-        assert_eq!(
-            Invitation::decode(&editor.public_share().unwrap())
-                .unwrap()
-                .tls_profile(),
-            public.profile()
-        );
-        assert!(editor.review_generated_reality_mode().is_err());
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 
     #[test]

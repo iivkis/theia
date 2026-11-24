@@ -1,5 +1,7 @@
 # TOML configuration: v1 schema
 
+**Целевая схема (ADR-0094, ещё не реализована):** только собственный TLS требует `tls_cert` (X.509 cert/chain) и `tls_key` (matching private key), задаваемых вручную. REALITY выбирает внешний HTTPS/TLS ресурс и независимую identity, не требует собственной TLS пары. Промежуточная схема ADR-0089 удалена. Прежний smart-reality-v1 и reality_key явно отклоняются. Поля нового контракта будут определены отдельным security ADR. Будущая замена v1 — без legacy compatibility, не v2.
+
 **Статус:** строгая схема TOML v1, структурная проверка и атомарная запись реализованы. `config validate` не читает secret/PEM content; runtime отдельно проверяет credentials, TLS identity/trust и bind H2/H3. Подтверждаемое управление runtime работает через native Linux/Windows IPC. Границы защиты произвольных файлов и текущая приёмка описаны ниже и в [STATUS](STATUS.md). База данных не используется.
 
 ## 1. Файлы и расположения
@@ -177,14 +179,6 @@ ADR-0087: the sole replacement theia://v1/ invitation explicitly represents Smar
 
 ADR-0088: existing pinned profile strings select mandatory TLS-exporter-bound admission over H2 and H3 without a new config field, secret, or migration fallback. Both peers must use the updated implementation. Certificate/CA requirements remain.
 
-### ADR-0089 — independent SmartTheia REALITY identity
-
-For an explicitly selected own inbound, add `security_mode = "smart-reality-v1"` and `reality_key = "file:/absolute/identity.der"` alongside the existing TLS certificate/chain and private key references. The separate file is Ed25519 PKCS#8 DER, ≤4096 bytes, regular and no-follow, with private Unix permissions. Other modes forbid reality_key. The client uses `tls_profile = "smart-reality-v1:<canonical base64url 32-byte public key>"`, independently trusted `tls_ca`, and auto/h2/h3. This mode requires stream-up, verified independent identity before bearer and the existing exporter-bound admission. Do not reuse the TLS key. Existing captured restart fingerprint also covers identity bytes. Auth/quota-only Apply refuses identity drift; same-port TLS-only rotation is not available for a REALITY generation. TUI Y permits explicit local review and guarded save; runtime activation remains separate. This is not full F-18/F-19 acceptance.
-
 ### ADR-0090 — BBR-first / CUBIC fallback
 
 Встроенная политика, без TOML/CLI/env/TUI/invite переключателя. Linux H2 выбирает TCP_CONGESTION=bbr, при отказе — cubic, проверяет контроллер. H3 использует Quinn BBR. Windows H2 использует нативный TCP stack (CUBIC — штатное предпочтение клиентских Windows); без per-socket readback фактический алгоритм не объявляется проверенным. Не менять глобальные TCP templates/sysctl. Отсутствие BBR2 не блокирует H2.
-
-### ADR-0092 generated local identity
-
-In the server TUI, select a saved own enabled inbound with an existing TLS certificate/chain and key. G stages a fresh independent Ed25519 PKCS#8 DER in a randomly named private directory adjacent to the config; y explicitly saves the validated reality_key file reference. n/Esc cancels and removes the staged file. On uncertain write retain the file and reload/inspect; after abrupt process exit an unreferenced private file may remain. Y is the manual path, including explicit rotation. No runtime activation or DNS/remote probing is performed by G.

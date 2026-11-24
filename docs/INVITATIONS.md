@@ -1,5 +1,7 @@
 # Theia connection invitations: portable v1 (F-14, P0)
 
+**Нормативное изменение ADR-0094:** целевой REALITY использует внешний HTTPS/TLS ресурс без локальной TLS пары. Старый smart-reality v1 с локальным TLS+Ed25519 удалён; импорт явно отклоняется. Его замена должна быть единственным новым контрактом theia://v1, без v2 или legacy reader; не переносить приватный ключ, не принимать чужой сертификат как самостоятельное доказательство identity. Точный schema/trust contract требует отдельного ADR; новый REALITY codec пока не реализован.
+
 **Нормативный контракт F-14; актуальный статус на 2026-11-24 см. [STATUS.md](STATUS.md).** M4.4a реализует codec, M4.4b1 серверную выдачу, M4.4b2a отключение, M4.4b2b1 подтверждённую ротацию bearer, а M4.4c локальный клиентский импорт с защищённым хранением (PR #80/#81, native Linux/Windows CI успешен). F-14 P0 отслеживается в STATUS.md и матрице F14_ACCEPTANCE.md. Защищённый файловый экспорт и WSL2 Linux → native Windows H2/H3 E2E подтверждены CI; M4.4i принят в PR #109, CI 45397074048 (13/13).
 
 ## User model
@@ -108,5 +110,3 @@ The existing cross-host harness also verifies the public form with an explicitly
 The previous default-only envelope is retired. No compatibility reader, v2 or automatic migration. Reissue all invitations. The new strict v1 carries explicit carrier, security_mode, xhttp_mode and (for pinned-tls) leaf_sha256. It maps to the exact existing runtime TLS profile with separate CA selection. Public import does not activate a profile; confidential bearer remains protected. Saved own cert/key validation and one-time stale leaf refusal apply to pinned issuance. Native acceptance is tracked in STATUS.md. No full REALITY or candidate Apply claim.
 
 ADR-0088: the imported pinned profile implies mandatory channel-bound HTTP admission on both carriers. No new invitation field and no old pinned runtime fallback. This is not a full REALITY identity.
-
-ADR-0089: the same replacement v1 adds an explicit `security_mode = "smart-reality"`, `xhttp_mode = "stream-up"`, `server_public_key = "<canonical unpadded base64url 32-byte Ed25519 key>"`. Require exactly that public identity, not a leaf hash; forbid private key references and mixed security fields. The client reconstructs its exact independent identity profile. Transfer/verify the public key through an authenticated channel; CA remains separately trusted. No old v1 reader, v2 or fallback.

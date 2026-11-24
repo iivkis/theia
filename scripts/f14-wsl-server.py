@@ -9,7 +9,6 @@ process: it receives only a SHA-256 digest on stdin.
 from __future__ import annotations
 
 import argparse
-import base64
 import ipaddress
 import os
 from pathlib import Path
@@ -45,28 +44,6 @@ def certificate(directory: Path, name: str) -> tuple[Path, Path]:
         timeout=25,
     )
     return cert, key
-
-
-def independent_identity(directory: Path, name: str) -> tuple[Path, str]:
-    # Standard Ed25519 PKCS#8 private DER and RFC 8410 public SPKI.
-    # Private material is generated and retained exclusively inside Linux.
-    key = directory / (name + ".der")
-    subprocess.run(
-        ["openssl", "genpkey", "-algorithm", "ED25519", "-outform", "DER", "-out", str(key)],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        check=True, timeout=15,
-    )
-    key.chmod(0o600)
-    public = subprocess.run(
-        ["openssl", "pkey", "-inform", "DER", "-in", str(key), "-pubout", "-outform", "DER"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        check=True, timeout=15,
-    ).stdout
-    prefix = bytes.fromhex("302a300506032b6570032100")
-    if len(public) != len(prefix) + 32 or not public.startswith(prefix):
-        raise RuntimeError("unexpected Ed25519 public SPKI")
-    encoded = base64.urlsafe_b64encode(public[len(prefix):]).decode("ascii").rstrip("=")
-    return key, "smart-reality-v1:" + encoded
 
 
 def relay(socket_to_echo: socket.socket) -> None:
@@ -122,12 +99,6 @@ def serve(args: argparse.Namespace) -> None:
         private = Path(raw)
         trusted, key = certificate(private, "server")
         untrusted, _ = certificate(private, "untrusted")
-        reality_key, public_identity = independent_identity(private, "reality")
-        _, wrong_identity = independent_identity(private, "wrong-reality")
-        if public_identity == wrong_identity:
-            raise RuntimeError("independent Ed25519 identities must differ")
-        (shared / "reality-public.txt").write_text(public_identity + "\n", encoding="ascii")
-        (shared / "wrong-reality-public.txt").write_text(wrong_identity + "\n", encoding="ascii")
         binary = private / "theia"
         shutil.copy2(args.binary, binary)
         binary.chmod(0o700)
@@ -163,17 +134,6 @@ security_mode = "pinned-cert-stream-up-v1"
 allowed_user_ids = ["cross-user"]
 quic_listen = "0.0.0.0:{args.port + 2}"
 h2_listen = "0.0.0.0:{args.port + 2}"
-server_name = "localhost"
-tls_cert = "file:{trusted}"
-tls_key = "file:{key}"
-
-[[server.inbounds]]
-id = "cross-reality"
-security_mode = "smart-reality-v1"
-reality_key = "file:{reality_key}"
-allowed_user_ids = ["cross-user"]
-quic_listen = "0.0.0.0:{args.port + 3}"
-h2_listen = "0.0.0.0:{args.port + 3}"
 server_name = "localhost"
 tls_cert = "file:{trusted}"
 tls_key = "file:{key}"

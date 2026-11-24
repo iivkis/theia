@@ -1,5 +1,7 @@
 # ADR-0089 — Independent Ed25519 server identity for SmartTheia XHTTP
 
+**Superseded by ADR-0094; historical record only. The production adapter described here is retired, not a supported configuration or implementation target.**
+
 Status: implementation submitted for exact-head mandatory native acceptance; independent security review and complete F-18/F-19 release acceptance remain open.
 
 ## Contract and provisioning

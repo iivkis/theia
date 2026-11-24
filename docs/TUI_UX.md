@@ -1,5 +1,7 @@
 # TUI / UX specification (ratatui)
 
+**Целевой визард (ADR-0094, ещё не реализован):** Создать inbound → SmartTheia REALITY → «Проверить и подобрать» → выбрать внешний HTTPS/TLS ресурс → typed preview → «Применить». Единый ранжированный список IP/доменов, публичные TLS сведения, отдельные H2/H3 результаты, confidence, причины и давность; безопасное пассивное обнаружение и отдельное согласие для проверок явно разрешённых диапазонов/доменов. Импортирует параметры ресурса и независимую identity, не чужой приватный ключ; локальная TLS пара не нужна. Ручной REALITY использует тот же валидатор. Собственный TLS — только ручной X.509 cert/chain + private key, без визарда. Ошибочные G/Y локального TLS workflow удалены; выбор кандидата пока read-only.
+
 **M4.2f terminal acceptance:** Отображаемые TUI modal title/status, два шага Ctrl+R → явно отдельное y, n/Esc отказ, revision после Apply, реакция на изменённый извне сохранённый файл и dirty/client/no-config границы теперь проверяются обязательным CI через реальный Linux PTY и Windows ConPTY, а не только unit KeyEvent/TestBackend. Проверка появления надписи успеха сама по себе недостаточна: реальный compiled server status должен показать CAS 1→2. TerminalGuard восстанавливает alternate screen после выхода. Удалённый SSH E2E остаётся отдельным этапом (ADR-0045).
 
 **Задача:** понятная локальная консоль управления без веб-панели. И сервер, и клиент доступны из одного `theia tui`. Полноценный keyboard-first workflow, минимальное число модалок, ошибки по делу. Тексты основного интерфейса — русский, с перспективой en.
@@ -201,7 +203,6 @@ M4.4a реализует **только доменный codec**, не UI/CLI в
 
 Важно: добавление записи в server.toml **не обновляет работающий процесс**. Секрет нельзя восстановить из digest; для утраченного bearer используется отдельная подтверждаемая ротация. Отключение `x`, ротация `t`, восстановление `b`, экспорт `f`, публичная ссылка `l` и импорт `i` описаны в [INVITATIONS](INVITATIONS.md).
 
-
 ## 10. M4.4c — client-only import: masked source, trust and safe save
 
 The local client TUI with explicit \`--role client --config FILE\` offers \`i\` to import a pasted \`theia://v1\` URI or **absolute local file**. Bracketed-paste text stays in a zeroizing input state and is never rendered, even as a field being edited. Enter previews only **profile ID / endpoint / SNI / transport / bearer present?**; the token itself and source URI never appear in TUI diagnostics. A separate optional \`c\` step accepts a pre-trusted absolute CA PEM \`file:\` reference. Without CA the resulting profile is not connectable. A secretless public URI requires separate \`e\` + \`env:NAME\` rather than fabricated default credentials.
@@ -249,15 +250,3 @@ Public share and disabled-user recovery shortcuts are included in the main edito
 ### Replacement v1 (ADR-0087)
 
 ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. Server l/u/t/b and client i use the new single format. Preview shows the exact runtime TLS profile. Reissue old links. Verify public pin over an authenticated channel. Existing protected storage/rotation and separate restart rules remain.
-
-### Independent own-key review (ADR-0089)
-
-On a clean saved server inbound, Y opens hidden input for an operator-provisioned absolute `file:` Ed25519 PKCS#8 DER key reference. Enter validates own TLS cert/key, name and separate identity key; preview displays public key/profile and never the key path or private bytes. y revalidates the original saved snapshot and identities before guarded save; n/Esc cancels. Existing restart/Apply is separate. No candidate is allowed to supply the local private key or silently change the local TLS identity. The external candidate review remains read-only until its independent security/evidence requirements are satisfied.
-
-### ADR-0091 local REALITY review
-
-Y still requires an explicit own key file and saved local inbound. The reviewed snapshot now binds exact certificate/chain PEM, TLS key PEM and independent Ed25519 DER bytes, not merely the leaf/public key. Both H2 and H3 TLS builders validate the same captured bytes; y re-reads and refuses any material drift before guarded TOML save. Runtime activation remains a separate explicit operation. Third-party candidate report is not a trusted local identity; no automatic configuration or activation from a TLS/ALPN observation.
-
-### ADR-0092 local provisioning wizard
-
-G: stage a new independent key for the selected saved own inbound. Review displays the validated inbound, endpoint, SNI and public identity only; y commits the same guarded local validator as Y, n/Esc cancels. No existing REALITY key is automatically rotated. On uncertain save, preserve the staged private key and require inspection. External candidate reports are not local key ownership; Apply remains blocked in their read-only view.

@@ -1,5 +1,7 @@
 # Фактический статус Theia
 
+**Уточнение F-18 (ADR-0094):** PR #119 принят в main ef5a97b с 13/13 CI на ce5aeac. Исторический CI доказывал независимую Ed25519 identity поверх собственного TLS, но не целевой REALITY. В данном изменении этот адаптер удалён из runtime, TOML, приглашений и TUI. Старые профили отклоняются, без downgrade. Внешний TLS backend без собственного домена/cert/key, ранжированный wizard импорта ресурса, транзакционный Apply и независимый review остаются открыты. ADR-0094 определяет требования; удаление старого backend не означает реализации нового. Текущий head требует полной CI-приёмки.
+
 **Срез состояния:** 2026-11-24, после merge [PR #115](https://github.com/iivkis/theia/pull/115) в `main` (`c85e5c3847d5bb3c91b7203b90dc6b9b31c67e69`). Это **не release-acceptance**: проект experimental/unreleased. [Exact-head CI PR #115](https://github.com/iivkis/theia/actions/runs/45419559187): **13/13 SUCCESS**, format-repair skipped. H2/H3 relay liveness принят.
 
 Этот файл — актуальная сводка реализованных контрактов. [IMPLEMENTATION_SPEC](IMPLEMENTATION_SPEC.md) остаётся нормативной спецификацией **целевой** функциональности, [IMPLEMENTATION_PLAN](IMPLEMENTATION_PLAN.md) — историческим перечнем этапов, [ADR](adr/) — архивом решений, а [TESTING_CI](TESTING_CI.md) — контрактом тестирования.
@@ -60,18 +62,6 @@ ADR-0087: the sole replacement theia://v1/ invitation explicitly represents Smar
 
 Implementation submitted: H2 and H3 use separate TLS-exporter contexts, per-request HMAC, both stream-up legs and atomic one-admission connection state. Added independent raw H2/H3 negative tests and pure race/route/credential regressions. Acceptance requires exact-head CI. Independent server identity, complete candidate Apply, active-probing and F-19 remain open.
 
-## ADR-0089 — independent server identity (implementation submitted)
-
-PR #117 was merged at 5cd3a41 after exact-head CI 45434713045 (all 13 required jobs successful). New implementation: explicit smart-reality-v1 mode with independent Ed25519 key, verified over actual H2/H3 exporter before bearer; same-connection stream-up admission; strict replacement v1 invitation; captured key lifecycle and guarded local TUI review/save. New native and negative tests are submitted; this block requires its own exact-head CI. Candidate Apply, anti-probing, F-19 measurements and independent security review remain open.
-
 ## ADR-0090 — BBR-first with CUBIC fallback
 
-Owner superseded the strict BBR-only draft. Linux selects BBR, falls back to CUBIC and verifies sockets; H3 retains Quinn BBR. Windows H2 uses OS-managed TCP (CUBIC deployment preference, not verified per socket). No global settings or user-facing switch. Native tests and previous REALITY fixes are submitted together; exact-head CI remains required.
-
-## ADR-0091 — F-18 native independent identity evidence and guarded review
-
-PR #118 merged into main at b503c6f after all 13 mandatory jobs succeeded for head 68773a4 (run 45440123346). ADR-0091 submits the next single-commit F-18 slice: native Linux VM/Windows binary cross-host independent Ed25519 positive and wrong-key/PKI/bearer/mode negative matrix (H2/H3/auto); independent raw wire signatures on four connections and one-response enforcement; exact full material fingerprint at guarded local review/save. Tests are submitted, not yet accepted. Candidate observations still lack HTTP/3 application semantics and ownership proof; external candidate Apply and independent review remain open, and no active-probing-resistance or F-19 claim is made.
-
-## ADR-0092 — local REALITY key provisioning wizard
-
-The next consolidated F-18 PR adds G on a selected own saved inbound: stage a fresh protected Ed25519 PKCS#8 key, verify the same cert/key and identity with both H2/H3 builders, show only public identity, explicitly save or cancel. Cancel/definite failure removes the staged key; uncertain write retains it for inspection. Native mode/DACL and guarded-save regression tests included. The preceding exact-head run failed in an existing Auto test's local TCP connect before CONNECT; the test now retries only local handshake refusal/reset, preserving the remote denial assertions. Full current-head CI, independent review and external candidate Apply remain pending; no claim of full F-18 or active-probing resistance.
+Owner superseded the strict BBR-only draft. Linux selects BBR, falls back to CUBIC and verifies sockets; H3 retains Quinn BBR. Windows H2 uses OS-managed TCP (CUBIC deployment preference, not verified per socket). No global settings or user-facing switch. Политика BBR/CUBIC сохранена без изменений; exact-head CI remains required.

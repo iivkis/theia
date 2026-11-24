@@ -16,7 +16,6 @@ pub enum SecurityMode {
     Plain,
     PinnedCertV1,
     PinnedCertStreamUpV1,
-    SmartRealityV1,
 }
 
 impl SecurityMode {
@@ -25,18 +24,14 @@ impl SecurityMode {
     }
 
     pub(crate) fn is_stream_up(self) -> bool {
-        matches!(self, Self::PinnedCertStreamUpV1 | Self::SmartRealityV1)
-    }
-
-    pub fn is_reality(self) -> bool {
-        self == Self::SmartRealityV1
+        self == Self::PinnedCertStreamUpV1
     }
 
     pub(crate) fn path(self) -> &'static str {
         match self {
             Self::Plain => "/v1/session",
             Self::PinnedCertV1 => PINNED_PATH,
-            Self::PinnedCertStreamUpV1 | Self::SmartRealityV1 => crate::split_http::UPLOAD_PATH,
+            Self::PinnedCertStreamUpV1 => crate::split_http::UPLOAD_PATH,
         }
     }
 }

@@ -8,15 +8,12 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 
-
 def read(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
-
 
 def toml(name: str) -> dict:
     with (ROOT / name).open("rb") as stream:
         return tomllib.load(stream)
-
 
 def explicit_grants_are_valid(server: dict) -> bool:
     """Sanity check of documented template references, not a production validator."""
@@ -34,7 +31,6 @@ def explicit_grants_are_valid(server: dict) -> bool:
         if len(grants) != len(set(grants)) or any(i not in ids for i in grants):
             return False
     return True
-
 
 class SpecContractTests(unittest.TestCase):
     def test_required_files(self):
@@ -364,7 +360,6 @@ class SpecContractTests(unittest.TestCase):
             with self.subTest(example=example.splitlines()[0]):
                 tomllib.loads(example)
 
-
     def test_m12_typed_toml_implementation_is_strict(self):
         manifest = tomllib.loads(read("crates/theia/Cargo.toml"))
         self.assertIn("serde", manifest["dependencies"])
@@ -475,6 +470,24 @@ class SpecContractTests(unittest.TestCase):
                       read("crates/theia/tests/security_profile.rs"))
         self.assertIn("pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_silence",
                       read("crates/theia/tests/client_h2.rs"))
+
+    def test_f18_external_tls_target_is_normative_not_implemented(self):
+        spec = read("docs/IMPLEMENTATION_SPEC.md")
+        adr = read("docs/adr/0094-external-tls-reality-product-contract.md")
+        self.assertIn("без собственного домена и TLS cert/key", spec)
+        self.assertIn("Собственный TLS: исключительно ручная настройка", spec)
+        self.assertIn("единый список результатов IP и доменов, отсортированный", spec)
+        self.assertIn("только собственных или явно разрешённых целей", spec)
+        self.assertIn("без v2 и обратной совместимости", spec)
+        self.assertIn("не целевой REALITY", adr)
+        self.assertIn("Промежуточная схема ADR-0089 удалена", read("docs/CONFIGURATION.md"))
+        self.assertIn("не реализован", read("docs/TUI_UX.md"))
+        for path in ("AGENTS.md", "README.md", "docs/ARCHITECTURE.md",
+                     "docs/SMARTTHEIA_PROTOCOL.md", "docs/STEALTH_REALITY.md",
+                     "docs/IMPLEMENTATION_PLAN.md", "docs/INVITATIONS.md",
+                     "docs/STATUS.md", "docs/TESTING_CI.md"):
+            with self.subTest(path=path):
+                self.assertIn("ADR-0094", read(path))
 
     def test_smarttheia_native_xhttp_contract(self):
         spec = read("docs/IMPLEMENTATION_SPEC.md")
@@ -626,7 +639,6 @@ class SpecContractTests(unittest.TestCase):
         checker = read("tests/benchmark/check_bbr_comparison.py")
         self.assertIn("no relative performance ranking", checker)
 
-
     def test_bbr_first_cubic_fallback_policy(self):
         tcp = read("crates/theia/src/tcp_bbr.rs")
         self.assertIn("libc::TCP_CONGESTION", tcp)
@@ -640,46 +652,20 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("BbrConfig::default()", read("crates/theia/src/quic_transport.rs"))
         self.assertIn("not configurable", read("docs/adr/0090-mandatory-bbr-for-h2-and-h3.md"))
 
-    def test_reality_identity_before_bearer_and_no_new_invitation_version(self):
-        identity = read("crates/theia/src/reality_identity.rs")
-        self.assertIn("signature::ED25519", identity)
-        self.assertIn("from_pkcs8_maybe_unchecked", identity)
-        self.assertIn("theia-server-identity", identity)
-        for name in ("client.rs", "h3_client.rs"):
-            client = read("crates/theia/src/" + name)
-            self.assertLess(client.index("identity.verify(key, &response)?"), client.index("let (response, mut"))
-        for name in ("server.rs", "h3_server.rs"):
-            self.assertIn("handle_identity_request", read("crates/theia/src/" + name))
-        invite = read("crates/theia/src/invite.rs")
-        self.assertIn("server_public_key: Option<String>", invite)
-        self.assertNotIn("PREFIX_V2", invite)
-        self.assertIn("reality_key", read("crates/theia/src/reload_preflight.rs"))
-        self.assertIn("active probing", read("docs/adr/0089-independent-ed25519-xhttp-identity.md"))
-
-    def test_f18_independent_native_acceptance_contract(self):
-        guest = read("scripts/f14-wsl-server.py")
-        host = read("scripts/f14-cross-os-ci.py")
-        cross = read("crates/theia/tests/f14_cross_host.rs")
-        self.assertIn("independent_identity", guest)
-        self.assertIn('security_mode = "smart-reality-v1"', guest)
-        self.assertIn("reality-public.txt", host)
-        self.assertNotIn('"reality.der"', host)
-        self.assertIn("reality_client_scenario(&fixture, transport)", cross)
-        self.assertIn("THEIA_F18_XHOST_WRONG_PUBLIC", cross)
-        self.assertIn("independent_wire_identity_h2_h3_signature_scope_and_one_response",
-                      read("crates/theia/tests/security_profile.rs"))
-        self.assertIn("material_fingerprint", read("crates/theia/src/tui_editor.rs"))
-        self.assertIn("theia-reality-local-review-v1", read("crates/theia/src/server.rs"))
-
-    def test_f18_generated_local_identity_uses_guarded_manual_validator(self):
-        editor = read("crates/theia/src/tui_editor.rs")
-        storage = read("crates/theia/src/client_import.rs")
-        self.assertIn("review_generated_reality_mode", editor)
-        self.assertIn("self.review_reality_mode(&reference)?", editor)
-        self.assertIn("generated_reality_key_preview_cancel_drift_and_commit", editor)
-        self.assertIn("generated_reality_storage_is_private_distinct_and_guarded", storage)
-        self.assertIn('Self::create_payload(config_path, "reality", "identity.der"', storage)
-        self.assertIn("start_generated_reality_review", read("crates/theia/src/tui.rs"))
+    def test_retired_local_tls_reality_has_no_production_or_compatibility_path(self):
+        self.assertFalse((ROOT / "crates/theia/src/reality_identity.rs").exists())
+        self.assertNotIn("SmartRealityV1", read("crates/theia/src/security_profile.rs"))
+        self.assertNotIn("SmartReality", read("crates/theia/src/invite.rs"))
+        self.assertNotIn("reality_key", read("crates/theia/src/config.rs"))
+        self.assertNotIn("handle_identity_request", read("crates/theia/src/server.rs"))
+        self.assertNotIn("handle_identity_request", read("crates/theia/src/h3_server.rs"))
+        self.assertNotIn("with_server_identity", read("crates/theia/src/client.rs"))
+        self.assertNotIn("with_server_identity", read("crates/theia/src/h3_client.rs"))
+        self.assertNotIn("review_generated_reality_mode", read("crates/theia/src/tui_editor.rs"))
+        self.assertIn("retired_local_tls_reality_invitation_and_profile_fail_closed",
+                      read("crates/theia/src/invite.rs"))
+        self.assertIn("retired_local_tls_reality_server_schema_is_rejected",
+                      read("crates/theia/tests/reality_security_feasibility.rs"))
 
     def test_m35a_test_only_feasibility_never_claims_security_mode(self):
         spec = read("docs/STEALTH_REALITY.md")
@@ -706,7 +692,6 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("leaf_sha256: Option<String>", invite)
         self.assertIn("Никакой REALITY-подобный режим", adr)
         self.assertIn("F-18/F-19", read("docs/IMPLEMENTATION_PLAN.md"))
-
 
 if __name__ == "__main__":
     unittest.main()
