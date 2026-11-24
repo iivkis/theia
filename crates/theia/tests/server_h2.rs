@@ -869,19 +869,42 @@ async fn h2_rejects_unnegotiated_padding_before_target_dial() {
         let mut rx = response.into_body();
         let mut decoder = Decoder::new();
         let mut queued = VecDeque::new();
-        send(&mut tx, &Frame::Hello { version: VERSION, capabilities: 0 }, false).await;
-        assert_eq!(next_frame(&mut rx, &mut decoder, &mut queued).await,
-            Frame::HelloAck { version: VERSION, accepted_capabilities: 0 });
+        send(
+            &mut tx,
+            &Frame::Hello {
+                version: VERSION,
+                capabilities: 0,
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            next_frame(&mut rx, &mut decoder, &mut queued).await,
+            Frame::HelloAck {
+                version: VERSION,
+                accepted_capabilities: 0
+            }
+        );
         // Independent wire vector: PADDING followed by an otherwise valid OPEN.
         let mut bytes = vec![0x13, 0, 0, 0, 0, 1, 0x42];
-        bytes.extend(theia::protocol::encode(&Frame::OpenTcp {
-            address: Address::V4([127, 0, 0, 1]), port,
-        }).unwrap());
+        bytes.extend(
+            theia::protocol::encode(&Frame::OpenTcp {
+                address: Address::V4([127, 0, 0, 1]),
+                port,
+            })
+            .unwrap(),
+        );
         tx.send_data(Bytes::from(bytes), false).unwrap();
-        assert_eq!(next_frame(&mut rx, &mut decoder, &mut queued).await,
-            Frame::Abort(ErrorCode::ProtocolError));
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        assert_eq!(
+            next_frame(&mut rx, &mut decoder, &mut queued).await,
+            Frame::Abort(ErrorCode::ProtocolError)
+        );
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
         driver.abort();
         server.abort();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

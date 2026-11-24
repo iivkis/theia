@@ -453,7 +453,9 @@ async fn handle_frames(
         send(tx, &ack).await?;
         let open = loop {
             let frame = incoming.next(rx).await?.ok_or(ServerError::Protocol)?;
-            state.apply(Direction::Receive, &frame).map_err(|_| ServerError::Protocol)?;
+            state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ServerError::Protocol)?;
             if matches!(frame, Frame::Padding(_)) {
                 tokio::task::yield_now().await;
                 continue;
@@ -584,7 +586,9 @@ async fn relay(
                         if activity.both_finished() {
                             return Err(ServerError::Protocol);
                         }
-                        upload_state.apply(Direction::Receive, padding).map_err(|_| ServerError::Protocol)?;
+                        upload_state
+                            .apply(Direction::Receive, padding)
+                            .map_err(|_| ServerError::Protocol)?;
                         tokio::task::yield_now().await;
                         continue;
                     }

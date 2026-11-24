@@ -452,12 +452,33 @@ impl Session {
         }
         match (self.role, self.phase, direction, frame) {
             (Role::Client, Phase::Initial, Direction::Send, Frame::Hello { capabilities, .. })
-            | (Role::Server, Phase::Initial, Direction::Receive, Frame::Hello { capabilities, .. }) => {
+            | (
+                Role::Server,
+                Phase::Initial,
+                Direction::Receive,
+                Frame::Hello { capabilities, .. },
+            ) => {
                 self.offered_capabilities = *capabilities;
                 self.phase = Phase::NeedHelloAck;
             }
-            (Role::Client, Phase::NeedHelloAck, Direction::Receive, Frame::HelloAck { accepted_capabilities, .. })
-            | (Role::Server, Phase::NeedHelloAck, Direction::Send, Frame::HelloAck { accepted_capabilities, .. }) => {
+            (
+                Role::Client,
+                Phase::NeedHelloAck,
+                Direction::Receive,
+                Frame::HelloAck {
+                    accepted_capabilities,
+                    ..
+                },
+            )
+            | (
+                Role::Server,
+                Phase::NeedHelloAck,
+                Direction::Send,
+                Frame::HelloAck {
+                    accepted_capabilities,
+                    ..
+                },
+            ) => {
                 if *accepted_capabilities & !self.offered_capabilities != 0 {
                     return Err(ProtocolError::UnsupportedCapabilities);
                 }

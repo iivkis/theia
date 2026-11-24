@@ -555,8 +555,13 @@ impl H2Client {
             .map_err(|_| ClientError::Protocol)?;
         send_frame(&mut outgoing, open, false).await?;
         let result = loop {
-            let frame = decoder.next(&mut incoming).await?.ok_or(ClientError::Protocol)?;
-            state.apply(Direction::Receive, &frame).map_err(|_| ClientError::Protocol)?;
+            let frame = decoder
+                .next(&mut incoming)
+                .await?
+                .ok_or(ClientError::Protocol)?;
+            state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ClientError::Protocol)?;
             if matches!(frame, Frame::Padding(_)) {
                 // Padding must not reset the enclosing OPEN deadline or
                 // monopolize the task when frames are already buffered.
@@ -745,7 +750,8 @@ impl Tunnel {
                             if activity.both_finished() {
                                 return Err(ClientError::Protocol);
                             }
-                            download_state.apply(Direction::Receive, padding)
+                            download_state
+                                .apply(Direction::Receive, padding)
                                 .map_err(|_| ClientError::Protocol)?;
                             tokio::task::yield_now().await;
                             continue;

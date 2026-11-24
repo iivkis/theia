@@ -203,7 +203,10 @@ async fn authenticated_h3_server_relays_tcp_before_request_fin_and_after_half_cl
         });
         let mut stream = sender.send_request(request(Some(&token()))).await.unwrap();
         let mut frames = Frames::default();
-        assert_eq!(open_with_padding(&mut stream, &mut frames, port).await, Frame::OpenOk);
+        assert_eq!(
+            open_with_padding(&mut stream, &mut frames, port).await,
+            Frame::OpenOk
+        );
         send(&mut stream, Frame::Padding(vec![0x13; 123])).await;
         send(&mut stream, Frame::Data(b"early".to_vec())).await;
         assert_eq!(
@@ -523,30 +526,57 @@ async fn h3_rejects_unnegotiated_padding_before_target_dial() {
         let (endpoint, remote, server) = fixture(true);
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
-        let conn = quic_transport::connect(&endpoint, remote, "localhost").await.unwrap();
-        let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        let conn = quic_transport::connect(&endpoint, remote, "localhost")
+            .await
+            .unwrap();
+        let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
         let driver = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
         let mut stream = sender.send_request(request(Some(&token()))).await.unwrap();
-        assert_eq!(stream.recv_response().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            stream.recv_response().await.unwrap().status(),
+            StatusCode::OK
+        );
         let mut frames = Frames::default();
-        send(&mut stream, Frame::Hello { version: protocol::VERSION, capabilities: 0 }).await;
-        assert_eq!(frames.next(&mut stream).await,
-            Some(Frame::HelloAck { version: protocol::VERSION, accepted_capabilities: 0 }));
+        send(
+            &mut stream,
+            Frame::Hello {
+                version: protocol::VERSION,
+                capabilities: 0,
+            },
+        )
+        .await;
+        assert_eq!(
+            frames.next(&mut stream).await,
+            Some(Frame::HelloAck {
+                version: protocol::VERSION,
+                accepted_capabilities: 0
+            })
+        );
         let mut bytes = vec![0x13, 0, 0, 0, 0, 1, 0x42];
-        bytes.extend(protocol::encode(&Frame::OpenTcp {
-            address: Address::V4([127, 0, 0, 1]), port,
-        }).unwrap());
+        bytes.extend(
+            protocol::encode(&Frame::OpenTcp {
+                address: Address::V4([127, 0, 0, 1]),
+                port,
+            })
+            .unwrap(),
+        );
         stream.send_data(Bytes::from(bytes)).await.unwrap();
         match stream.recv_data().await {
             Err(h3::error::StreamError::RemoteTerminate { code, .. })
                 if code == h3::error::Code::H3_REQUEST_CANCELLED => {}
             _ => panic!("unnegotiated PADDING must cancel the H3 stream"),
         }
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
         driver.abort();
         server.abort();
         endpoint.close(0u32.into(), b"done");
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

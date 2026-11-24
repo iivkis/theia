@@ -226,8 +226,12 @@ mod tests {
             (Method::POST, "/v2/stream-up/upload", None),
             (Method::GET, "/v2/stream-up/download", None),
         ] {
-            let req = Request::builder().method(method).uri(path)
-                .header(header::CONTENT_TYPE, "application/octet-stream").body(()).unwrap();
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(())
+                .unwrap();
             assert!(leg(&req) == expected);
         }
     }

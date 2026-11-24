@@ -3,7 +3,10 @@
 //! and successful half-closes refresh the per-tunnel progress deadline.
 use std::{
     future::Future,
-    sync::{atomic::{AtomicU8, Ordering}, Mutex},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Mutex,
+    },
     time::Duration,
 };
 use tokio::{
@@ -159,17 +162,19 @@ mod padding_tests {
     #[tokio::test(start_paused = true)]
     async fn padding_does_not_refresh_idle() {
         let activity = Activity::new();
-        let result = activity.run(
-            async {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    // Receiving a padding frame deliberately does not call data/fin.
-                    tokio::task::yield_now().await;
-                }
-            },
-            std::future::pending::<Result<(), &'static str>>(),
-            "idle",
-        ).await;
+        let result = activity
+            .run(
+                async {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        // Receiving a padding frame deliberately does not call data/fin.
+                        tokio::task::yield_now().await;
+                    }
+                },
+                std::future::pending::<Result<(), &'static str>>(),
+                "idle",
+            )
+            .await;
         assert_eq!(result, Err("idle"));
         activity.half_closed();
         assert!(!activity.both_finished());

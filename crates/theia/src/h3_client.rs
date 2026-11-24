@@ -396,7 +396,9 @@ impl H3Client {
         send(&mut tx, open).await?;
         let answer = loop {
             let frame = decoder.next(&mut rx).await?.ok_or(ClientError::Protocol)?;
-            state.apply(Direction::Receive, &frame).map_err(|_| ClientError::Protocol)?;
+            state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ClientError::Protocol)?;
             if matches!(frame, Frame::Padding(_)) {
                 // Padding must not reset the enclosing OPEN deadline or
                 // monopolize the task when frames are already buffered.
@@ -562,7 +564,8 @@ impl H3Tunnel {
                             if activity.both_finished() {
                                 return Err(ClientError::Protocol);
                             }
-                            download_state.apply(Direction::Receive, padding)
+                            download_state
+                                .apply(Direction::Receive, padding)
                                 .map_err(|_| ClientError::Protocol)?;
                             tokio::task::yield_now().await;
                             continue;
