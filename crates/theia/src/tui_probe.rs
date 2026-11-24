@@ -449,6 +449,7 @@ impl ProbePanel {
                     ProbeUiError::Dual(DualProbeError::DomainNameMismatch) => {
                         "SNI не соответствует явно выбранному домену"
                     }
+                    ProbeUiError::Dual(DualProbeError::SelfReference) => "референс совпадает с известным адресом сервера",
                     ProbeUiError::Dual(DualProbeError::DomainAddressMismatch) => {
                         "закреплённый IP домена не соответствует цели"
                     }

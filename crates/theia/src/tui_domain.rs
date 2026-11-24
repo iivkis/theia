@@ -6,7 +6,7 @@
 use crate::{
     camouflage_discovery::{CandidateHost, CandidateSource, Transport, POPULAR_HTTPS_DOMAINS},
     camouflage_domain_dns::{resolve_catalogued_domain, DnsConsent, DnsError, MAX_PINNED_IPS},
-    camouflage_dual::{CandidateConsent, DualProbeTarget},
+    camouflage_dual::{known_server_address, CandidateConsent, DualProbeTarget},
     camouflage_dual_batch::{probe_dual_batch, DualBatchError, DualBatchReport, DualBatchTarget},
     camouflage_probe::{ProbeApproval, ProbeRequest},
     camouflage_workflow::DiscoveryPreview,
@@ -387,6 +387,11 @@ impl DomainPanel {
                 if observation.addresses.is_empty() {
                     self.reset_pins();
                     self.state = DomainState::DnsFailed(DnsError::NoPublicAddresses);
+                } else if observation.addresses.iter().any(|ip| {
+                    known_server_address(&self.preview, *ip)
+                }) {
+                    self.reset_pins();
+                    self.state = DomainState::DnsFailed(DnsError::UnsafeAddress);
                 } else if !dns_pin_fresh_at(observation.completed_at, Instant::now()) {
                     self.reset_pins();
                     self.state = DomainState::DnsFailed(DnsError::StaleObservation);
@@ -492,7 +497,7 @@ impl DomainPanel {
                     DnsError::StaleObservation => "устаревший DNS-ответ, требуется новое согласие",
                     DnsError::LookupFailed => "DNS-запрос не выполнен",
                     DnsError::NoPublicAddresses => "нет публичных адресов",
-                    DnsError::UnsafeAddress => "опасный/приватный IP в DNS, все ответы отклонены",
+                    DnsError::UnsafeAddress => "опасный/приватный IP или известный адрес сервера в DNS, все ответы отклонены",
                     DnsError::TooManyAnswers => "слишком много DNS адресов",
                 };
                 out.push_str(&format!(

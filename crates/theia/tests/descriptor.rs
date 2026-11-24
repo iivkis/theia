@@ -175,6 +175,30 @@ fn signed_invalid_fields_and_unsupported_contract_are_refused() {
     bad = d.clone();
     bad.padding.frame_max = 65_537;
     assert_error(descriptor::sign(&bad, &key), Error::Format);
+    bad = d.clone();
+    bad.references[0].server_name = "edge.example.org".into();
+    assert_error(descriptor::sign(&bad, &key), Error::Format);
+    bad = d.clone();
+    bad.scope.endpoint = "EDGE.example.org:8443".into();
+    bad.references[0].server_name = "edge.example.org".into();
+    assert_error(descriptor::sign(&bad, &key), Error::Format);
+}
+
+#[test]
+fn valid_signature_does_not_make_noncanonical_envelope_acceptable() {
+    let key = key();
+    let d = fixture(1);
+    let a = anchor(&d, &key);
+    let raw = descriptor::sign(&d, &key).unwrap();
+    assert!(descriptor::verify(&raw, &a).is_ok());
+    assert_error(
+        descriptor::verify(&format!("# extra envelope text\n{raw}"), &a),
+        Error::Format,
+    );
+    assert_error(
+        descriptor::verify(&format!("{raw}\n"), &a),
+        Error::Format,
+    );
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);

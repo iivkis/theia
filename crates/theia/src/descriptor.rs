@@ -172,8 +172,12 @@ impl Descriptor {
         {
             return Err(Error::Format);
         }
+        // Reject the obvious self-reference even before resolution. DNS
+        // aliases and actual local addresses require a separate runtime check.
+        let endpoint_host = self.scope.endpoint.rsplit_once(':').ok_or(Error::Format)?.0;
         for (i, reference) in self.references.iter().enumerate() {
-            if !config::valid_dns(&reference.server_name)
+            if reference.server_name.eq_ignore_ascii_case(endpoint_host)
+                || !config::valid_dns(&reference.server_name)
                 || reference.port == 0
                 || reference.server_name != reference.server_name.to_ascii_lowercase()
                 || self.references[..i].iter().any(|old| {
@@ -292,7 +296,9 @@ pub fn verify(document: &str, anchor: &Anchor) -> Result<Verified, Error> {
         .map_err(|_| Error::Signature)?;
     let text = std::str::from_utf8(&payload).map_err(|_| Error::Format)?;
     let descriptor: Descriptor = toml::from_str(text).map_err(|_| Error::Format)?;
-    if descriptor.payload()? != text {
+    if descriptor.payload()? != text
+        || toml::to_string(&envelope).map_err(|_| Error::Format)? != document
+    {
         return Err(Error::Format);
     }
     if descriptor.scope != anchor.scope {

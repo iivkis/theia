@@ -48,6 +48,7 @@ pub enum DualProbeError {
     UnplannedDomain,
     DomainNameMismatch,
     DomainAddressMismatch,
+    SelfReference,
 }
 
 /// Both observations are retained independently, including a timeout or
@@ -107,6 +108,15 @@ impl DualProbeReport {
     }
 }
 
+/// A passive preview can identify known local/egress addresses. This is
+/// a rejection check only: an absent match is not proof of non-self routing.
+pub(crate) fn known_server_address(preview: &DiscoveryPreview, ip: IpAddr) -> bool {
+    preview.plan.candidates.iter().any(|candidate| {
+        candidate.source == CandidateSource::ServerAddress
+            && candidate.host == CandidateHost::Ip(ip)
+    })
+}
+
 /// Validate source consent, the explicitly pinned destination and security
 /// prerequisites without any DNS or network traffic. Domain names must be
 /// in the passive candidate catalogue, and the selected SNI must match the
@@ -156,6 +166,9 @@ pub fn validate_dual_target(
             }
             if address.ip() != pinned_ip {
                 return Err(DualProbeError::DomainAddressMismatch);
+            }
+            if known_server_address(preview, pinned_ip) {
+                return Err(DualProbeError::SelfReference);
             }
         }
     }
@@ -346,6 +359,45 @@ mod tests {
         assert_eq!(
             validate_dual_target(&preview, &denied, approved),
             Err(DualProbeError::NotApproved)
+        );
+    }
+
+    #[test]
+    fn known_local_reference_is_rejected_before_trust_or_network() {
+        use crate::camouflage_discovery::Candidate;
+        use crate::camouflage_interfaces::NativeInterfaces;
+        use crate::camouflage_workflow::{build_preview, PreviewScope};
+
+        let mut preview = build_preview(
+            &NativeInterfaces::default(),
+            None,
+            PreviewScope::PassiveOnly,
+        );
+        let ip = "93.184.216.10".parse().unwrap();
+        preview.plan.candidates.push(Candidate {
+            host: CandidateHost::Ip(ip),
+            source: CandidateSource::ServerAddress,
+        });
+        let target = DualProbeTarget {
+            request: ProbeRequest {
+                address: SocketAddr::new(ip, 443),
+                server_name: "google.com".to_owned(),
+                deadline: Duration::from_secs(1),
+            },
+            roots: RootCertStore::empty(),
+            approval: ProbeApproval::public_https_ip(ip),
+        };
+        assert!(known_server_address(&preview, ip));
+        assert_eq!(
+            validate_dual_target(
+                &preview,
+                &target,
+                CandidateConsent::PinnedDomain {
+                    domain: "google.com",
+                    pinned_ip: ip,
+                },
+            ),
+            Err(DualProbeError::SelfReference)
         );
     }
 

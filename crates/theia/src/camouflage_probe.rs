@@ -130,9 +130,16 @@ pub async fn probe_tls_h2(
     if !matches!(server_name, ServerName::DnsName(_)) {
         return Err(ProbeError::InvalidServerName);
     }
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
+    // F-18 requires a real TLS 1.3 X25519 witness. A successful
+    // handshake using a different group is not that evidence.
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+        .kx_groups
+        .retain(|group| group.name() == rustls::NamedGroup::X25519);
+    if provider.kx_groups.is_empty() {
+        return Err(ProbeError::TlsRejected);
+    }
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
     .with_protocol_versions(&[&rustls::version::TLS13])
     .map_err(|_| ProbeError::TlsRejected)?
     .with_root_certificates(roots)
@@ -162,8 +169,9 @@ pub async fn probe_tls_h2(
         if peer.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3) {
             return Err(ProbeError::TlsRejected);
         }
-        // On success rustls has verified server chain, DNS name, validity,
-        // TLS version and ALPN on this *actual* connected TCP peer.
+        // The provider offers only X25519. Standard certificate, hostname,
+        // CertificateVerify and Finished checks remain enabled.
+        // HTTP semantics and REALITY identity are still unmeasured.
         Ok(ProbeReport {
             connected_ip: request.address.ip(),
             handshake_elapsed: start.elapsed(),

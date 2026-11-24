@@ -108,12 +108,13 @@ impl ReviewCursor {
     }
 }
 
-// H3 is optional in the target contract. Neither transport observation
-// proves X25519, application semantics, authorization or REALITY readiness.
+// H3 is optional in the target contract. The H2 probe requires X25519,
+// but neither transport observation proves HTTP application semantics,
+// authorization or REALITY readiness.
 fn transport_review(h2: bool, h3: bool) -> &'static str {
     match (h2, h3) {
         (true, true) => "Оба TLS/ALPN наблюдения актуальны. Это не проверка HTTP/3 или REALITY.\n",
-        (true, false) => "TLS/H2 подтверждён. H3 не подтверждён; отсутствие H3 само по себе не исключает H2-кандидат.\n",
+        (true, false) => "TLS/H2 подтверждён (TLS 1.3/X25519). H3 не подтверждён; отсутствие H3 само по себе не исключает H2-кандидат.\n",
         (false, _) => "TLS/H2 не подтверждён; H3 не заменяет обязательную проверку H2.\n",
     }
 }
