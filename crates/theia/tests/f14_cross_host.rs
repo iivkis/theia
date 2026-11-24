@@ -14,7 +14,7 @@ use std::{
 };
 use theia::{
     client_import,
-    config::{self, Config, SystemProxy, Transport},
+    config::{self, ClientDocument, Config, SystemProxy, Transport},
     invite::Invitation,
     tui_editor::Editor,
     Role,
@@ -164,18 +164,37 @@ async fn client_scenario(
     let mut issued = Invitation::issued_from_server(source, "cross", "cross-user", token).unwrap();
     issued.endpoint = endpoint.to_owned();
     issued.transport = transport;
-    let confidential_uri = issued.encode().unwrap();
+    let confidential_uri = zeroize::Zeroizing::new(issued.encode().unwrap());
     let invitation = client_import::read_source(&confidential_uri).unwrap();
     assert!(invitation.has_token());
     assert!(!format!("{invitation:?}").contains(&URL_SAFE_NO_PAD.encode(token)));
 
     let mut editor = Editor::load(Role::Client, &config_path).unwrap();
-    editor
-        .import_invitation(&invitation, Some(&format!("file:{}", ca.display())), None)
-        .unwrap();
+    let ca_ref = format!("file:{}", ca.display());
+    if invalid_token {
+        let mut public = Invitation::public_from_server(source, "cross").unwrap();
+        public.endpoint = endpoint.to_owned();
+        public.transport = transport;
+        let link = public.encode().unwrap();
+        let decoded = client_import::read_source(&link).unwrap();
+        assert!(!decoded.has_token());
+        let missing = editor.import_invitation(&decoded, Some(&ca_ref), None);
+        assert!(missing.is_err());
+        editor
+            .import_invitation(
+                &decoded,
+                Some(&ca_ref),
+                Some("env:THEIA_F14_XHOST_WRONG_TOKEN"),
+            )
+            .unwrap();
+    } else {
+        editor
+            .import_invitation(&invitation, Some(&ca_ref), None)
+            .unwrap();
+    }
     assert!(
         editor
-            .import_invitation(&invitation, Some(&format!("file:{}", ca.display())), None)
+            .import_invitation(&invitation, Some(&ca_ref), None)
             .is_err(),
         "duplicate profile ID must be rejected"
     );
@@ -186,27 +205,61 @@ async fn client_scenario(
     assert_eq!(client_doc.client.active_profile, "home");
     let imported = &client_doc.client.profiles[1];
     assert_eq!(imported.transport, transport);
-    assert!(imported.auth_token.starts_with("file:"));
+    if invalid_token {
+        assert_eq!(imported.auth_token, "env:THEIA_F14_XHOST_WRONG_TOKEN");
+    } else {
+        assert!(imported.auth_token.starts_with("file:"));
+    }
     assert_eq!(client_doc.client.proxy.system_proxy, SystemProxy::Off);
     assert!(!fs::read_to_string(&config_path)
         .unwrap()
         .contains(&URL_SAFE_NO_PAD.encode(token)));
 
     client_doc.client.active_profile = invitation.id.clone();
-    if invalid_token {
-        let wrong = URL_SAFE_NO_PAD.encode([0x99; 32]);
-        client_doc.client.profiles[1].auth_token = "env:THEIA_F14_XHOST_WRONG_TOKEN".into();
-        std::env::set_var("THEIA_F14_XHOST_WRONG_TOKEN", wrong);
-    }
     if invalid_ca {
         let wrong_ca = std::env::var("THEIA_F14_XHOST_WRONG_CA").unwrap();
         client_doc.client.profiles[1].tls_ca = Some(format!("file:{wrong_ca}"));
     }
+    let successful = !invalid_token && !invalid_ca;
+    run_client(&config_path, client_doc, origin, successful).await;
+    if invalid_token {
+        // The failed client is now stopped. Use the same saved profile,
+        // not a new import or a manual overwrite of its auth reference.
+        let mut editor = Editor::load(Role::Client, &config_path).unwrap();
+        let before = config::read_file(&config_path).unwrap();
+        editor.refresh_credential(&invitation).unwrap();
+        let after = config::read_file(&config_path).unwrap();
+        let Config::Client(mut expected) = before else {
+            panic!("client");
+        };
+        let Config::Client(updated) = after else {
+            panic!("client");
+        };
+        assert_eq!(
+            expected.client.profiles[1].auth_token,
+            "env:THEIA_F14_XHOST_WRONG_TOKEN"
+        );
+        let new_ref = &updated.client.profiles[1].auth_token;
+        let new_file = Path::new(new_ref.strip_prefix("file:").unwrap());
+        let bytes = zeroize::Zeroizing::new(fs::read_to_string(new_file).unwrap());
+        assert!(bytes.as_str() == URL_SAFE_NO_PAD.encode(token));
+        expected.client.profiles[1].auth_token = new_ref.clone();
+        assert_eq!(updated, expected);
+        run_client(&config_path, updated, origin, true).await;
+    }
+}
+
+async fn run_client(
+    config_path: &Path,
+    mut client_doc: ClientDocument,
+    origin: u16,
+    successful: bool,
+) {
     let (http_socket, http) = reserve_address();
     let (socks_socket, socks) = reserve_address();
     client_doc.client.proxy.http_listen = http.to_string();
     client_doc.client.proxy.socks5_listen = socks.to_string();
-    config::atomic_write(&config_path, &Config::Client(client_doc)).unwrap();
+    config::atomic_write(config_path, &Config::Client(client_doc)).unwrap();
     drop(http_socket);
     drop(socks_socket);
 
@@ -215,8 +268,12 @@ async fn client_scenario(
     let mut process = Running(
         Command::new(client_bin)
             .args(["client", "run", "--config"])
-            .arg(&config_path)
+            .arg(config_path)
             .env_remove("THEIA_AUTH_TOKEN")
+            .env(
+                "THEIA_F14_XHOST_WRONG_TOKEN",
+                URL_SAFE_NO_PAD.encode([0x99; 32]),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -225,8 +282,8 @@ async fn client_scenario(
     );
     await_client(http, &mut process).await;
     await_client(socks, &mut process).await;
-    http_connect(http, origin, !invalid_token && !invalid_ca).await;
-    socks5_connect(socks, origin, !invalid_token && !invalid_ca).await;
+    http_connect(http, origin, successful).await;
+    socks5_connect(socks, origin, successful).await;
     assert!(process.0.try_wait().unwrap().is_none());
 }
 

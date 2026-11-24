@@ -1,6 +1,6 @@
 # ADR-0070: shared bounded configuration and credential input lifecycle
 
-**Status:** prepared; pending full native CI.
+**Status:** accepted in PR #108, exact-head run 45395505034 (13/13).
 
 ## Decision
 

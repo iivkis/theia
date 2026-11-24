@@ -201,6 +201,7 @@ enum IssueFlow {
     Exported(PathBuf),
     ExportFailed,
     Showing(Zeroizing<String>),
+    Public(String),
 }
 
 /// Client-only F-14 local file/pasted URI import. Only safe fields may render.
@@ -655,6 +656,11 @@ impl Interaction {
                         self.issuance = Some(IssueFlow::ExportFailed);
                     }
                 }
+                IssueFlow::Public(link) => {
+                    if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                        self.issuance = Some(IssueFlow::Public(link));
+                    }
+                }
                 IssueFlow::Showing(link) => {
                     if key.code == KeyCode::Esc {
                         editor.clear_issued();
@@ -1016,6 +1022,16 @@ impl Interaction {
                 }
                 return false;
             }
+            if key.code == KeyCode::Char('l') {
+                match editor.public_share() {
+                    Ok(link) => {
+                        editor.error = None;
+                        self.issuance = Some(IssueFlow::Public(link));
+                    }
+                    Err(message) => editor.error = Some(message.into()),
+                }
+                return false;
+            }
             if editor.role() == Role::Server && key.code == KeyCode::Char('u') {
                 if editor.dirty() {
                     editor.error =
@@ -1211,7 +1227,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer. В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer. В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
             true,
         ),
     }
@@ -1298,7 +1314,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     frame.render_widget(
         Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  i: импорт  u: новый  t: ротация  x: отключить  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить",
+            "j/k: запись  Tab: поле  Enter/e: ввод  i: импорт  l: публичная ссылка  u: новый  t: ротация  x: отключить  b: восстановить  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить",
         )
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
@@ -1410,6 +1426,12 @@ fn draw_issuance(
             "Защищённый экспорт не выполнен",
             "Секрет повторно не выдаётся. При необходимости отдельно выполните ротацию. Esc: закрыть."
                 .into(),
+        ),
+        IssueFlow::Public(link) => (
+            "Публичное приглашение без токена",
+            format!(
+                "Только данные профиля. Не содержит bearer, CA или grant. Получателю нужны отдельные доверенные credentials и CA.\n\n{link}\n\nEnter/Esc: закрыть."
+            ),
         ),
         IssueFlow::Showing(link) => (
             "СЕКРЕТ: ссылка подключения (однократный просмотр)",
@@ -1534,7 +1556,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Клиентский импорт: i (URI/локальный файл, скрытый ввод). Ctrl+S только сохраняет; runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (URI/локальный файл, скрытый ввод). Ctrl+S только сохраняет; runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
@@ -2099,6 +2121,34 @@ mod tests {
         fs::remove_dir(secret.parent().unwrap()).unwrap();
         fs::remove_file(&path).unwrap();
         fs::remove_file(config::lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn public_share_is_repeatable_and_never_enters_confidential_flow() {
+        use std::fs;
+
+        let name = format!("theia-public-share-ui-{}.toml", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        let source = server_issuance_fixture();
+        fs::write(&path, &source).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+        for _ in 0..2 {
+            ui.update(&mut model, press(KeyCode::Char('l')));
+            let Some(IssueFlow::Public(link)) = ui.issuance.as_ref() else {
+                panic!("public link expected");
+            };
+            let invite = Invitation::decode(link).unwrap();
+            assert!(!invite.has_token());
+            assert!(!ui.editor.as_ref().unwrap().issued_ready());
+            assert!(ui.saving.is_none());
+            assert!(ui.exporting.is_none());
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(ui.issuance.is_none());
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # ADR-0072: explicit disabled-user recovery and lifecycle acceptance
 
-**Status:** proposed, pending native CI.
+**Status:** accepted in PR #108, exact-head run 45395505034 (13/13).
 
 Recovering an existing disabled account must be separate from normal rotation. The server editor accepts only a disabled user explicitly granted on the selected inbound, requires a clean editor and separate confirmation, creates a fresh CSPRNG 32-byte bearer and updates only digest and disabled flag. Existing grants are unchanged; a saved account is not a live authorization update. Existing guarded transaction and one-time offer semantics remain. Ordinary rotation of a disabled user and recovery of an enabled user refuse.
 

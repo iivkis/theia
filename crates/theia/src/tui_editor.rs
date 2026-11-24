@@ -484,6 +484,32 @@ impl Editor {
         Some(invite)
     }
 
+    /// Export only saved public profile metadata. This never accesses a
+    /// bearer file, environment secret or server digest for issuance.
+    pub fn public_share(&self) -> Result<String, &'static str> {
+        if self.editing || self.dirty() || self.issued.is_some() {
+            return Err("Finish or discard changes and pending issuance first");
+        }
+        if !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source) {
+            return Err("Saved configuration changed; reload before sharing");
+        }
+        let invite = match &self.original {
+            Config::Server(_) => {
+                Invitation::public_from_server(&self.original, self.selected_record_id())
+            }
+            Config::Client(doc) => {
+                let profile = doc
+                    .client
+                    .profiles
+                    .get(self.selected_record)
+                    .ok_or("Selected profile missing")?;
+                Invitation::public_from_profile(profile)
+            }
+        }
+        .map_err(|_| "Selected record cannot be shared in v1")?;
+        invite.encode().map_err(|_| "Public invitation unavailable")
+    }
+
     /// Consume the confirmed one-time offer, without rendering the URI.
     /// A stale saved document or failed export does not make the token
     /// available for another attempt.
@@ -1140,6 +1166,65 @@ mod tests {
             fs::remove_file(&path).unwrap();
             fs::remove_dir(path.parent().unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn public_share_uses_saved_selected_record_without_credentials_or_writes() {
+        let server = Temp::write(&server_source());
+        let mut issuer = Editor::load(Role::Server, &server.0).unwrap();
+        let original = fs::read(&server.0).unwrap();
+        let link = issuer.public_share().unwrap();
+        let invite = Invitation::decode(&link).unwrap();
+        assert!(!invite.has_token());
+        assert_eq!(invite.id, "public");
+        assert!(issuer.take_issued().is_none());
+        assert_eq!(fs::read(&server.0).unwrap(), original);
+        issuer.issue_user("pending-device").unwrap();
+        assert!(issuer.public_share().is_err());
+        issuer.discard();
+        assert!(issuer.public_share().is_ok());
+        let mut external = original;
+        external.extend_from_slice(b"\n# changed\n");
+        fs::write(&server.0, external).unwrap();
+        assert!(issuer.public_share().is_err());
+
+        let client = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &client.0).unwrap();
+        let before = fs::read(&client.0).unwrap();
+        let link = editor.public_share().unwrap();
+        let invite = Invitation::decode(&link).unwrap();
+        assert!(!invite.has_token());
+        assert_eq!(invite.id, "home");
+        assert_eq!(fs::read(&client.0).unwrap(), before);
+        editor.begin();
+        assert!(editor.public_share().is_err());
+    }
+
+    #[cfg(feature = "experimental-btls-h2")]
+    #[test]
+    fn public_share_refuses_named_tls_profile_without_downgrade() {
+        let source = include_str!("../../../examples/client.toml");
+        let Config::Client(mut doc) = config::parse(source).unwrap() else {
+            panic!("client");
+        };
+        doc.client.profiles[0].transport = Transport::H2;
+        doc.client.profiles[0].tls_profile = "browser-h2-btls-v1".into();
+        let temp = Temp::write(&Config::Client(doc).to_toml().unwrap());
+        let editor = Editor::load(Role::Client, &temp.0).unwrap();
+        assert!(editor.public_share().is_err());
+    }
+
+    #[test]
+    fn public_share_refuses_unrepresentable_port_pair() {
+        let server = config::parse(&server_source()).unwrap();
+        let Config::Server(mut server) = server else {
+            panic!("server");
+        };
+        server.server.inbounds[0].quic_listen = "0.0.0.0:444".into();
+        let source = Config::Server(server).to_toml().unwrap();
+        let temp = Temp::write(&source);
+        let editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.public_share().is_err());
     }
 
     #[test]
