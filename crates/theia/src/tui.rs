@@ -26,7 +26,7 @@ use ratatui::{
 use std::{
     fmt,
     io::{self, IsTerminal},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{self, TryRecvError},
     time::Duration,
 };
@@ -195,6 +195,10 @@ enum IssueFlow {
     Saving,
     SaveFailed,
     Offer,
+    ConfirmExport,
+    Exporting,
+    Exported(PathBuf),
+    ExportFailed,
     Showing(Zeroizing<String>),
 }
 
@@ -234,6 +238,8 @@ enum DisableFlow {
 
 /// UI dispatch is separate from all configuration/OS effects. A queued
 /// transition never runs until the user saves, discards or cancels explicitly.
+type ExportResult = (Editor, Result<PathBuf, &'static str>);
+
 struct Interaction {
     editor: Option<Editor>,
     issuance: Option<IssueFlow>,
@@ -248,6 +254,7 @@ struct Interaction {
     runtime: Option<RuntimePanel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
+    exporting: Option<mpsc::Receiver<ExportResult>>,
 }
 
 impl Interaction {
@@ -266,6 +273,7 @@ impl Interaction {
             runtime: None,
             pending: None,
             saving: None,
+            exporting: None,
         }
     }
 
@@ -279,6 +287,18 @@ impl Interaction {
         let _save_worker = std::thread::spawn(move || {
             let saved = editor.save();
             let _ = tx.send((editor, saved));
+        });
+    }
+
+    fn start_export(&mut self) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.exporting = Some(rx);
+        let _worker = std::thread::spawn(move || {
+            let result = editor.export_issued_file();
+            let _ = tx.send((editor, result));
         });
     }
 
@@ -312,6 +332,24 @@ impl Interaction {
     }
 
     fn poll_save(&mut self, model: &mut Model) -> Result<bool, TuiError> {
+        if let Some(receiver) = self.exporting.as_ref() {
+            match receiver.try_recv() {
+                Ok((mut editor, result)) => {
+                    self.exporting = None;
+                    self.issuance = Some(match result {
+                        Ok(path) => IssueFlow::Exported(path),
+                        Err(message) => {
+                            editor.error = Some(message.into());
+                            IssueFlow::ExportFailed
+                        }
+                    });
+                    self.editor = Some(editor);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => return Err(TuiError::Io),
+            }
+            return Ok(false);
+        }
         let Some(receiver) = self.saving.as_ref() else {
             return Ok(false);
         };
@@ -357,7 +395,7 @@ impl Interaction {
     }
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
-        if key.kind != KeyEventKind::Press || self.saving.is_some() {
+        if key.kind != KeyEventKind::Press || self.saving.is_some() || self.exporting.is_some() {
             return false;
         }
         if let Some(runtime) = self.runtime.as_mut() {
@@ -545,7 +583,7 @@ impl Interaction {
                 },
                 IssueFlow::Saving => self.issuance = Some(IssueFlow::Saving),
                 IssueFlow::SaveFailed => match key.code {
-                    KeyCode::Char('r') => {
+                    KeyCode::Char('r') if !editor.write_uncertain() => {
                         self.issuance = Some(IssueFlow::Saving);
                         self.start_save();
                     }
@@ -553,6 +591,9 @@ impl Interaction {
                     _ => self.issuance = Some(IssueFlow::SaveFailed),
                 },
                 IssueFlow::Offer => match key.code {
+                    KeyCode::Char('f') => {
+                        self.issuance = Some(IssueFlow::ConfirmExport);
+                    }
                     KeyCode::Char('y') => {
                         if let Some(invite) = editor.take_issued() {
                             match invite.encode() {
@@ -569,6 +610,27 @@ impl Interaction {
                     KeyCode::Char('n') | KeyCode::Esc => editor.clear_issued(),
                     _ => self.issuance = Some(IssueFlow::Offer),
                 },
+                IssueFlow::ConfirmExport => match key.code {
+                    KeyCode::Char('y') => {
+                        self.issuance = Some(IssueFlow::Exporting);
+                        self.start_export();
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        self.issuance = Some(IssueFlow::Offer);
+                    }
+                    _ => self.issuance = Some(IssueFlow::ConfirmExport),
+                },
+                IssueFlow::Exporting => self.issuance = Some(IssueFlow::Exporting),
+                IssueFlow::Exported(path) => {
+                    if key.code != KeyCode::Esc {
+                        self.issuance = Some(IssueFlow::Exported(path));
+                    }
+                }
+                IssueFlow::ExportFailed => {
+                    if key.code != KeyCode::Esc {
+                        self.issuance = Some(IssueFlow::ExportFailed);
+                    }
+                }
                 IssueFlow::Showing(link) => {
                     if key.code == KeyCode::Esc {
                         editor.clear_issued();
@@ -615,7 +677,7 @@ impl Interaction {
                 },
                 DisableFlow::Saving => self.revocation = Some(DisableFlow::Saving),
                 DisableFlow::SaveFailed => match key.code {
-                    KeyCode::Char('r') => {
+                    KeyCode::Char('r') if !editor.write_uncertain() => {
                         self.revocation = Some(DisableFlow::Saving);
                         self.start_save();
                     }
@@ -1242,6 +1304,11 @@ fn draw_issuance(
             "Проверка и атомарная запись TOML. Конфиденциальная ссылка скрыта; runtime не меняется."
                 .into(),
         ),
+        IssueFlow::SaveFailed if editor.is_some_and(Editor::write_uncertain) => (
+            "Состояние записи неизвестно: ссылка заблокирована",
+            "TOML мог быть заменён. Токен уничтожен; runtime не обновлён. Откройте редактор заново и проверьте состояние. d: закрыть черновик."
+                .into(),
+        ),
         IssueFlow::SaveFailed => (
             "Сохранение НЕ удалось: ссылка заблокирована",
             format!(
@@ -1257,12 +1324,32 @@ fn draw_issuance(
         IssueFlow::Offer => (
             "Одноразовая выдача конфиденциальной ссылки",
             if rotating {
-                "Новый digest сохранён в server.toml, runtime НЕ обновлён. Старый bearer ещё принимается runtime до отдельного auth-only CAS Apply. Ссылка содержит НОВЫЙ bearer, повторное восстановление невозможно.\n\ny: показать один раз  n/Esc: отказаться и стереть токен"
+                "Новый digest сохранён в server.toml, runtime НЕ обновлён. Старый bearer ещё принимается runtime до отдельного auth-only CAS Apply. Ссылка содержит НОВЫЙ bearer, повторное восстановление невозможно.\n\ny: показать один раз  f: экспорт в защищённый файл  n/Esc: отказаться и стереть токен"
                     .into()
             } else {
-                "server.toml сохранён. Runtime ещё не обновлён.\nСсылка содержит действующий bearer-токен. Не публиковать.\nПовторного показа после закрытия не будет.\n\ny: показать ссылку один раз\nn/Esc: отказаться и уничтожить токен в памяти"
+                "server.toml сохранён. Runtime ещё не обновлён.\nСсылка содержит действующий bearer-токен. Не публиковать.\nПовторного показа после закрытия не будет.\n\ny: показать ссылку один раз\nf: экспорт в защищённый файл\nn/Esc: отказаться и уничтожить токен в памяти"
                     .into()
             },
+        ),
+        IssueFlow::ConfirmExport => (
+            "Подтверждение конфиденциального экспорта",
+            "Создать новый защищённый файл рядом с конфигурацией сервера? Ссылка не будет показана. Файл содержит bearer; храните и передавайте его только доверенным способом. Повторная выдача недоступна.\n\ny: сохранить  n/Esc: назад"
+                .into(),
+        ),
+        IssueFlow::Exporting => (
+            "Защищённый экспорт",
+            "Создаётся новый конфиденциальный файл. Runtime не обновляется.".into(),
+        ),
+        IssueFlow::Exported(path) => (
+            "Конфиденциальный файл создан",
+            format!(
+                "Файл содержит bearer. Не публикуйте его.\n\n{path:?}\n\nПуть показан в кавычках. Esc: закрыть. Runtime не обновлён."
+            ),
+        ),
+        IssueFlow::ExportFailed => (
+            "Защищённый экспорт не выполнен",
+            "Секрет повторно не выдаётся. При необходимости отдельно выполните ротацию. Esc: закрыть."
+                .into(),
         ),
         IssueFlow::Showing(link) => (
             "СЕКРЕТ: ссылка подключения (однократный просмотр)",
@@ -1294,6 +1381,11 @@ fn draw_revocation(frame: &mut Frame<'_>, area: Rect, flow: &DisableFlow, editor
         DisableFlow::Saving => (
             "Отзыв доступа: сохранение",
             "Проверка и атомарная запись TOML. Runtime не изменяется.".into(),
+        ),
+        DisableFlow::SaveFailed if editor.is_some_and(Editor::write_uncertain) => (
+            "Отзыв доступа: состояние записи неизвестно",
+            "TOML мог быть заменён. Runtime не обновлён. Откройте редактор заново; d: закрыть черновик."
+                .into(),
         ),
         DisableFlow::SaveFailed => (
             "Отзыв доступа: ошибка сохранения",
@@ -1958,6 +2050,55 @@ mod tests {
         assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
         assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn protected_export_requires_confirmation_and_never_renders_bearer() {
+        use std::{fs, thread, time::Instant};
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-protected-export-ui-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        editor.issue_user("export-device").unwrap();
+        assert!(editor.save());
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+        ui.issuance = Some(IssueFlow::Offer);
+
+        ui.update(&mut model, press(KeyCode::Char('f')));
+        assert!(matches!(ui.issuance, Some(IssueFlow::ConfirmExport)));
+        assert!(ui.exporting.is_none());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(matches!(ui.issuance, Some(IssueFlow::Offer)));
+        assert!(ui.editor.as_ref().unwrap().issued_ready());
+        ui.update(&mut model, press(KeyCode::Char('f')));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        assert!(ui.exporting.is_some());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+
+        let start = Instant::now();
+        while ui.exporting.is_some() && start.elapsed() < Duration::from_secs(5) {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        let Some(IssueFlow::Exported(export)) = ui.issuance.as_ref() else {
+            panic!("protected file export expected");
+        };
+        let export = export.clone();
+        let invitation = client_import::read_source(export.to_str().unwrap()).unwrap();
+        assert!(invitation.has_token());
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.issuance.is_none());
+        fs::remove_file(&export).unwrap();
+        fs::remove_dir(export.parent().unwrap()).unwrap();
+        fs::remove_file(&path).unwrap();
+        let lock = crate::config::lock_path(&path).unwrap();
+        fs::remove_file(lock).unwrap();
     }
 
     #[test]

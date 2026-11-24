@@ -756,18 +756,15 @@ async fn client_binary_chromium_socks5() {
 async fn launch_imported_h3_client(
     endpoint: String,
     pem: String,
+    exported: &std::path::Path,
 ) -> (
     TestDirectory,
     ChildProcess,
     std::net::SocketAddr,
     std::net::SocketAddr,
 ) {
-    use theia::{
-        config::{self, Config, Transport},
-        invite::Invitation,
-        tui_editor::Editor,
-        Role,
-    };
+    use theia::config::{self, Config, Transport};
+    use theia::{tui_editor::Editor, Role};
     let dir = TestDirectory(
         std::env::temp_dir().join(format!("theia-f14-h3-import-ci-{}", std::process::id())),
     );
@@ -777,25 +774,11 @@ async fn launch_imported_h3_client(
     let config_path = dir.0.join("client.toml");
     std::fs::write(&config_path, include_str!("../../../examples/client.toml")).unwrap();
 
-    // Issue an authentic digest-bound confidential URI from the same server
-    // identity and user token, then select H3-only for the distinct UDP port.
-    let source = include_str!("../../../examples/server.toml").replace(
-        "REPLACE_WITH_64_LOWERCASE_HEX",
-        &format!("{:x}", Sha256::digest(TOKEN)),
-    );
-    let Config::Server(mut server) = config::parse(&source).unwrap() else {
-        panic!("server fixture");
-    };
-    server.server.inbounds[0].server_name = "localhost".into();
-    server.server.inbounds[0].h2_listen = "127.0.0.1:443".into();
-    server.server.inbounds[0].quic_listen = "127.0.0.1:443".into();
-    let mut invitation =
-        Invitation::issued_from_server(&Config::Server(server), "public", "device-a", &TOKEN)
-            .unwrap();
-    invitation.endpoint = endpoint.clone();
-    invitation.transport = Transport::H3;
-    let link = invitation.encode().unwrap();
-    let invitation = theia::client_import::read_source(&link).unwrap();
+    // Consume a real file produced by the server editor, not a synthesized
+    // URI. The endpoint override below is an explicit local fixture edit.
+    let invitation = theia::client_import::read_source(exported.to_str().unwrap()).unwrap();
+    let issued_token = invitation.token_bytes().unwrap();
+    assert_eq!(invitation.transport, Transport::Auto);
     let mut editor = Editor::load(Role::Client, &config_path).unwrap();
     editor
         .import_invitation(
@@ -809,12 +792,14 @@ async fn launch_imported_h3_client(
     };
     assert_eq!(client.client.active_profile, "home");
     assert_eq!(client.client.profiles.len(), 2);
-    assert_eq!(client.client.profiles[1].transport, Transport::H3);
+    assert_eq!(client.client.profiles[1].transport, Transport::Auto);
     assert!(client.client.profiles[1].auth_token.starts_with("file:"));
     assert!(!std::fs::read_to_string(&config_path)
         .unwrap()
-        .contains(&token()));
+        .contains(&URL_SAFE_NO_PAD.encode(issued_token)));
     client.client.active_profile = invitation.id.clone();
+    client.client.profiles[1].transport = Transport::H3;
+    client.client.profiles[1].server = endpoint;
 
     // OS proxy remains off; reserve only private per-process localhost binds.
     let http_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -867,8 +852,15 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
             key.write_all(cert.key_pair.serialize_pem().as_bytes())
                 .unwrap();
         }
-        let tcp_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let udp_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // The v1 server issuer requires a common TCP/UDP port. Reserve both
+        // before starting the binary; retry only local fixture allocation.
+        let (tcp_reservation, udp_reservation) = (0..32)
+            .find_map(|_| {
+                let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+                let udp = std::net::UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
+                Some((tcp, udp))
+            })
+            .expect("reserve common TCP/UDP port");
         let tcp = tcp_reservation.local_addr().unwrap();
         let udp = udp_reservation.local_addr().unwrap();
         let source = include_str!("../../../examples/server.toml").replace(
@@ -887,6 +879,11 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
         doc.server.policy.allow_private_ips = true;
         let config = dir.0.join("server.toml");
         theia::config::atomic_write(&config, &theia::config::Config::Server(doc)).unwrap();
+        let mut issuer = theia::tui_editor::Editor::load(theia::Role::Server, &config).unwrap();
+        issuer.issue_user("export-device").unwrap();
+        assert!(issuer.save());
+        let exported = issuer.export_issued_file().unwrap();
+        assert!(issuer.take_issued().is_none());
         drop(tcp_reservation);
         drop(udp_reservation);
         let mut server = ChildProcess(
@@ -903,7 +900,7 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
         // have been prepared as part of the same atomic startup.
         wait_for_proxy(tcp, &mut server).await;
         let (_client_dir, mut client, http, socks) =
-            launch_imported_h3_client(udp.to_string(), pem).await;
+            launch_imported_h3_client(udp.to_string(), pem, &exported).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
         let body = b"theia-h3-cli-ci-origin";

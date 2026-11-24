@@ -379,6 +379,21 @@ impl Editor {
         self.issued.take()
     }
 
+    /// Consume the confirmed one-time offer, without rendering the URI.
+    /// A stale saved document or failed export does not make the token
+    /// available for another attempt.
+    pub fn export_issued_file(&mut self) -> Result<PathBuf, &'static str> {
+        if self.role != Role::Server {
+            return Err("Server issuance required");
+        }
+        let invite = self.take_issued().ok_or("No saved invitation available")?;
+        if !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source) {
+            return Err("Saved configuration changed; export refused");
+        }
+        client_import::export_invitation_file(&self.path, &invite)
+            .map_err(|_| "Protected export failed; issue or rotate again")
+    }
+
     pub fn clear_issued(&mut self) {
         self.issued = None;
         self.issued_ready = false;
@@ -580,6 +595,10 @@ impl Editor {
         output
     }
 
+    pub(crate) fn write_uncertain(&self) -> bool {
+        self.write_uncertain
+    }
+
     pub fn dirty(&self) -> bool {
         self.write_uncertain || self.draft != self.original
     }
@@ -592,6 +611,10 @@ impl Editor {
     }
 
     pub fn begin(&mut self) {
+        if self.write_uncertain {
+            self.error = Some("config: uncertain previous write; reload editor".into());
+            return;
+        }
         if self.issued.is_some() {
             self.error = Some("Завершите одноразовую выдачу ссылки.".into());
             return;
@@ -927,6 +950,107 @@ mod tests {
         assert!(!discarded.exists());
         assert!(!discarded.parent().unwrap().exists());
         assert_eq!(fs::read_to_string(&temp.0).unwrap(), initial);
+    }
+
+    #[test]
+    fn protected_export_consumes_offer_and_imports_exact_issued_bearer() {
+        let server = Temp::write(&server_source());
+        let mut issuer = Editor::load(Role::Server, &server.0).unwrap();
+        assert!(issuer.export_issued_file().is_err());
+        issuer.issue_user("export-device").unwrap();
+        assert!(issuer.export_issued_file().is_err());
+        assert!(issuer.save());
+        let path = issuer.export_issued_file().unwrap();
+        assert!(path.is_absolute());
+        assert!(issuer.export_issued_file().is_err());
+        assert!(issuer.take_issued().is_none());
+
+        let invite = client_import::read_source(path.to_str().unwrap()).unwrap();
+        let token = Zeroizing::new(invite.token_bytes().unwrap());
+        let Config::Server(doc) = config::read_file(&server.0).unwrap() else {
+            panic!("server");
+        };
+        let user = doc
+            .server
+            .users
+            .iter()
+            .find(|u| u.id == "export-device")
+            .unwrap();
+        assert_eq!(user.token_sha256, format!("{:x}", Sha256::digest(*token)));
+        let client = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut importer = Editor::load(Role::Client, &client.0).unwrap();
+        importer.import_invitation(&invite, None, None).unwrap();
+        let Config::Client(doc) = config::read_file(&client.0).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(doc.client.active_profile, "home");
+        let reference = &doc.client.profiles[1].auth_token;
+        let secret = Path::new(reference.strip_prefix("file:").unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let directory = path.parent().unwrap();
+            let mode = fs::metadata(directory).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        fs::remove_file(secret).unwrap();
+        fs::remove_dir(secret.parent().unwrap()).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rotation_export_is_new_bearer_and_preserves_existing_grants() {
+        let server = Temp::write(&server_source());
+        let initial = config::read_file(&server.0).unwrap();
+        let mut editor = Editor::load(Role::Server, &server.0).unwrap();
+        editor.rotate_user("device-a").unwrap();
+        assert!(editor.save());
+        let first = editor.export_issued_file().unwrap();
+        let invite = client_import::read_source(first.to_str().unwrap()).unwrap();
+        let token = Zeroizing::new(invite.token_bytes().unwrap());
+        assert!(*token != [0x42; 32]);
+
+        let Config::Server(before) = initial else {
+            panic!("server");
+        };
+        let Config::Server(after) = config::read_file(&server.0).unwrap() else {
+            panic!("server");
+        };
+        assert_eq!(before.server.inbounds, after.server.inbounds);
+        assert_eq!(
+            after.server.users[0].token_sha256,
+            format!("{:x}", Sha256::digest(*token))
+        );
+        assert!(!after.server.users[0].disabled);
+        assert!(editor.export_issued_file().is_err());
+        editor.rotate_user("device-a").unwrap();
+        assert!(editor.save());
+        let second = editor.export_issued_file().unwrap();
+        assert_ne!(first, second);
+        let old = client_import::read_source(first.to_str().unwrap()).unwrap();
+        assert!(old.token_bytes() == Some(*token));
+        let newer = client_import::read_source(second.to_str().unwrap()).unwrap();
+        assert!(newer.token_bytes() != Some(*token));
+        for path in [first, second] {
+            fs::remove_file(&path).unwrap();
+            fs::remove_dir(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn stale_saved_issuance_cannot_be_exported_or_revealed_after_refusal() {
+        let server = Temp::write(&server_source());
+        let mut issuer = Editor::load(Role::Server, &server.0).unwrap();
+        issuer.issue_user("export-device").unwrap();
+        assert!(issuer.save());
+        let current = fs::read_to_string(&server.0).unwrap();
+        fs::write(&server.0, format!("# changed externally\n{current}")).unwrap();
+        assert!(issuer.export_issued_file().is_err());
+        assert!(issuer.take_issued().is_none());
+        assert!(issuer.export_issued_file().is_err());
     }
 
     #[test]
