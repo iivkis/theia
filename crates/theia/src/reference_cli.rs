@@ -16,7 +16,7 @@ theia reference monitor --store PATH --plan-sha256 HEX --confirm\n\
 theia reference publication-status --store PATH --publication PATH --plan-sha256 HEX\n\
 theia reference publication-monitor --store PATH --publication PATH --plan-sha256 HEX --confirm-refresh\n\
 Plan TOML: schema_version=1, inbound, endpoint, own_ips=[all known public/NAT and local server IPs], [[references]] server_name, address (exact public IP:443). Primary first, at most two reserves.\n\
-Preview binds exact plan bytes; inspect displays canonical plan SHA for rechecks. Confirm permission for each target, inbound endpoint DNS, reference DNS, and H2/H3 HEAD /. Checks never follow redirects or send credentials. Monitor checks at a jittered 12h interval until Ctrl+C. No automatic reference switch, runtime Apply, or trust changes.";
+Preview binds exact plan bytes; inspect displays canonical plan SHA for rechecks. Confirm permission for each target, inbound endpoint DNS, reference DNS, and H2/H3 HEAD /. Checks never follow redirects or send credentials. Monitor checks at a jittered 12h interval until Ctrl+C. Publication monitor uses a bounded 5min follow-up after the first active transport failure and may renew an unexpired compatible signed document after fresh health evidence. No automatic reference switch, live runtime Apply, or identity change.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {

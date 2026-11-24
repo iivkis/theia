@@ -1644,7 +1644,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     let footer = if model.screen == Screen::Client {
         "N/D/A/E: профили  p: Windows proxy  i: импорт  Ctrl+S: сохранить"
     } else {
-        "N/D/G/U/E: записи  W: REALITY  j/k: выбор  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
+        "N/D/G/U/E: записи  W: REALITY  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
     };
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
@@ -3005,6 +3005,21 @@ mod tests {
         assert!(ui.revocation.is_none());
         assert!(ui.editor.as_ref().unwrap().dirty());
         fs::remove_file(server_path).unwrap();
+    }
+
+    #[test]
+    fn reality_provision_panel_is_server_only_and_does_not_change_runtime() {
+        let mut ui = Interaction::new(None);
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Char('W')));
+        assert!(ui.reality_provision.is_none());
+        model.update(press(KeyCode::Char('1')));
+        ui.update(&mut model, press(KeyCode::Char('W')));
+        assert!(ui.reality_provision.is_some());
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("F-18: подготовка REALITY"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.reality_provision.is_none());
+        assert_eq!(model.screen, Screen::Server);
     }
 
     #[test]

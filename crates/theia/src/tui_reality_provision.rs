@@ -100,7 +100,7 @@ impl ProvisionPanel {
                         let (health, output) = self.paths();
                         let (tx, rx) = mpsc::channel();
                         self.stage = Stage::Applying(rx);
-                        std::thread::spawn(move || {
+                        let _worker = std::thread::spawn(move || {
                             let result = reference_health::unix_now().map_err(|_| Error::Clock)
                                 .and_then(|now| apply(&health, &output, digest, now));
                             let _ = tx.send(result);
@@ -122,7 +122,7 @@ impl ProvisionPanel {
                 let (tx, rx) = mpsc::channel();
                 self.error = None;
                 self.stage = Stage::Loading(rx);
-                std::thread::spawn(move || {
+                let _worker = std::thread::spawn(move || {
                     let result = reference_health::unix_now().map_err(|_| Error::Clock)
                         .and_then(|now| preview(&health, &output, now));
                     let _ = tx.send(result);
