@@ -137,7 +137,7 @@ fn hello_shape(handshake: &[u8]) -> Option<HelloShape> {
                 answer.tls13 = versions.chunks_exact(2).any(|v| v == [0x03, 0x04]);
             }
             57 => answer.quic_transport_parameters = !payload.is_empty(),
-            0x4469 => answer.alps_present = true,
+            0x4469 | 0x44cd => answer.alps_present = true,
             _ => {}
         }
         answer.grease_extension |= is_grease(kind);
