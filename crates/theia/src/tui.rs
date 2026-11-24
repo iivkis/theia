@@ -352,6 +352,20 @@ impl Interaction {
         });
     }
 
+    fn start_owned_candidate_review(&mut self, candidate: crate::tui_reality_review::SelectedCandidate) {
+        let Some(mut editor) = self.editor.take() else { return; };
+        self.candidate_batch = None;
+        self.candidates = None;
+        self.discovery = None;
+        let (tx, rx) = mpsc::channel();
+        self.pinned_loading = Some(rx);
+        let _worker = std::thread::spawn(move || {
+            let result = editor.review_owned_candidate(candidate);
+            editor.error = result.as_ref().err().map(|message| (*message).to_owned());
+            let _ = tx.send((editor, result));
+        });
+    }
+
     fn start_pinned_save(&mut self, mut review: PinnedModeReview) {
         let Some(mut editor) = self.editor.take() else {
             return;
@@ -586,6 +600,12 @@ impl Interaction {
             return false;
         }
         if let Some(batch) = self.candidate_batch.as_mut() {
+            if key.code == KeyCode::Char('g') {
+                if let Some(candidate) = batch.owned_candidate() {
+                    self.start_owned_candidate_review(candidate);
+                }
+                return false;
+            }
             match key.code {
                 KeyCode::Esc => {
                     if batch.back_or_close() {
@@ -1424,7 +1444,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         );
     } else if interaction.is_some_and(|ui| ui.pinned_loading.is_some()) {
-        panel(frame, parts[1], "Локальная проверка TLS identity", "Проверяются сохранённый TOML и собственная пара сертификат/ключ. Сеть не используется.", true);
+        panel(frame, parts[1], "Локальная проверка TLS identity", "Проверяются сохранённый TOML и собственная пара сертификат/ключ. Только при отдельном g в отчёте выполняются разрешённые HEAD к выбранному локальному адресу.", true);
     } else if interaction.is_some_and(|ui| ui.saving.is_some()) {
         panel(
             frame,

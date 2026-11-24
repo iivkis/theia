@@ -17,6 +17,12 @@ use zeroize::Zeroizing;
 
 const MAX_INPUT: usize = 255;
 
+fn own_bind_matches(bind: std::net::SocketAddr, target: std::net::SocketAddr) -> bool {
+    bind.port() == target.port()
+        && bind.is_ipv4() == target.is_ipv4()
+        && (bind.ip() == target.ip() || bind.ip().is_unspecified())
+}
+
 pub(crate) struct PinnedModeReview {
     source: [u8; 32],
     inbound: String,
@@ -28,12 +34,17 @@ pub(crate) struct PinnedModeReview {
     key_reference: Option<String>,
     material_fingerprint: Option<[u8; 32]>,
     generated_key: Option<PrivateBearer>,
+    owned_witness: Option<(crate::tui_reality_review::SelectedCandidate, crate::owned_endpoint::HttpWitness)>,
 }
 
 impl PinnedModeReview {
     pub(crate) fn body(&self) -> String {
         if let Some(identity) = self.reality {
-            return format!("Собственный inbound: {}\nEndpoint: {}\nSNI: {}\nsecurity_mode = smart-reality-v1\nКлиентский tls_profile = {}\n\nПроверены собственный TLS cert/key и отдельный Ed25519 ключ. Путь и private key скрыты. Новый staged key удаляется при отмене. y: guarded save; n/Esc: отмена. Отдельный restart/Apply обязателен. Не доказана устойчивость к active probing.", self.inbound, self.endpoint, self.name, identity.profile());
+            let mut body = format!("Собственный inbound: {}\nEndpoint: {}\nSNI: {}\nsecurity_mode = smart-reality-v1\nКлиентский tls_profile = {}\n\nПроверены собственный TLS cert/key и отдельный Ed25519 ключ. Путь и private key скрыты. Новый staged key удаляется при отмене. y: guarded save; n/Esc: отмена. Отдельный restart/Apply обязателен. Не доказана устойчивость к active probing.", self.inbound, self.endpoint, self.name, identity.profile());
+            if let Some((candidate, witness)) = &self.owned_witness {
+                body.push_str(&format!("\n\nСобственный адрес: {}. HEAD H2: {}; HEAD H3: {}. Оба ответа проверены с локальным сертификатом и PKI. Это не доказательство DPI-невидимости. Давность ограничена 60с; при y снова проверяются scope и файлы.", candidate.address, witness.h2, witness.h3));
+            }
+            return body;
         }
         let (mode, profile) = if self.mode.is_stream_up() {
             ("pinned-cert-stream-up-v1", self.pin.stream_up_profile())
@@ -642,6 +653,7 @@ impl Editor {
             key_reference: None,
             material_fingerprint: None,
             generated_key: None,
+            owned_witness: None,
         })
     }
 
@@ -704,6 +716,7 @@ impl Editor {
             key_reference: Some(reference.to_owned()),
             material_fingerprint: Some(material_fingerprint),
             generated_key: None,
+            owned_witness: None,
         })
     }
 
@@ -738,10 +751,65 @@ impl Editor {
         Ok(review)
     }
 
+    fn check_owned_candidate(
+        &self,
+        candidate: &crate::tui_reality_review::SelectedCandidate,
+    ) -> Result<(), &'static str> {
+        if !candidate.fresh() || self.dirty() || self.editing
+            || !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source)
+        {
+            return Err("Candidate/config changed or expired; review again");
+        }
+        let Config::Server(doc) = &self.original else { return Err("Server required"); };
+        let inbound = doc.server.inbounds.get(self.selected_record).ok_or("Inbound missing")?;
+        if !doc.server.enabled || inbound.server_name != candidate.name {
+            return Err("Candidate is not the selected own inbound name");
+        }
+        let tcp = inbound.h2_listen.parse().map_err(|_| "Invalid TCP bind")?;
+        let udp = inbound.quic_listen.parse().map_err(|_| "Invalid UDP bind")?;
+        if !own_bind_matches(tcp, candidate.address) || !own_bind_matches(udp, candidate.address) {
+            return Err("Candidate is outside both configured listener binds");
+        }
+        let assigned = crate::camouflage_interfaces::collect_assigned_interfaces()
+            .map_err(|_| "Cannot verify assigned local address")?;
+        if !assigned.interfaces.iter().any(|interface| interface.is_up
+            && interface.address == candidate.address.ip()) {
+            return Err("Candidate is not a currently assigned local address");
+        }
+        Ok(())
+    }
+
+    /// Consumes only an explicitly selected own-address transport report.
+    /// Verify actual HTTP semantics with the same locally configured leaf
+    /// and independent system roots. Neither a catalogue host nor an
+    /// authorized neighbouring subnet address can enter this path.
+    pub(crate) fn review_owned_candidate(
+        &self,
+        candidate: crate::tui_reality_review::SelectedCandidate,
+    ) -> Result<PinnedModeReview, &'static str> {
+        self.check_owned_candidate(&candidate)?;
+        let mut review = self.review_generated_reality_mode()?;
+        let mut roots = rustls::RootCertStore::empty();
+        let (trusted, _) = roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        if trusted == 0 { return Err("No trusted system roots"); }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .map_err(|_| "HTTP verification worker unavailable")?;
+        self.check_owned_candidate(&candidate)?;
+        let witness = runtime.block_on(crate::owned_endpoint::verify(
+            candidate.address, &candidate.name, roots, review.pin,
+        ))?;
+        self.check_owned_candidate(&candidate)?;
+        review.owned_witness = Some((candidate, witness));
+        Ok(review)
+    }
+
     pub(crate) fn apply_pinned_mode(
         &mut self,
         review: &mut PinnedModeReview,
     ) -> Result<(), &'static str> {
+        if let Some((candidate, _)) = &review.owned_witness {
+            self.check_owned_candidate(candidate)?;
+        }
         let current = if review.mode.is_reality() {
             self.review_reality_mode(
                 review
@@ -762,6 +830,9 @@ impl Editor {
             || current.material_fingerprint != review.material_fingerprint
         {
             return Err("Configuration or certificate changed; review again");
+        }
+        if let Some((candidate, _)) = &review.owned_witness {
+            self.check_owned_candidate(candidate)?;
         }
         let Config::Server(doc) = &mut self.draft else {
             return Err("Server required");
@@ -1332,6 +1403,17 @@ mod tests {
         assert!(editor.review_pinned_mode(true).is_err());
         assert!(crate::reload_preflight::assess_reload(&doc, &saved).is_err());
         assert!(!crate::restart_guard::same_port_tls_only(&saved, &saved));
+    }
+
+    #[test]
+    fn owned_candidate_requires_exact_port_and_address_family() {
+        let target = "93.184.216.10:443".parse().unwrap();
+        for bind in ["93.184.216.10:443", "0.0.0.0:443"] {
+            assert!(own_bind_matches(bind.parse().unwrap(), target));
+        }
+        for bind in ["93.184.216.11:443", "0.0.0.0:8443", "[::]:443"] {
+            assert!(!own_bind_matches(bind.parse().unwrap(), target));
+        }
     }
 
     #[test]

@@ -14,6 +14,21 @@ pub(crate) fn evidence_fresh(started_at: Option<Instant>, now: Instant) -> bool 
         .is_some_and(|age| age <= EVIDENCE_TTL)
 }
 
+/// Move from a fresh, exact transport review to an independent own-endpoint
+/// validation. The timestamp is never refreshed by navigation.
+#[derive(Clone)]
+pub(crate) struct SelectedCandidate {
+    pub address: SocketAddr,
+    pub name: String,
+    pub started_at: Instant,
+}
+
+impl SelectedCandidate {
+    pub(crate) fn fresh(&self) -> bool {
+        evidence_fresh(Some(self.started_at), Instant::now())
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ReviewCursor {
     index: usize,
@@ -54,6 +69,26 @@ impl ReviewCursor {
 
     pub(crate) fn is_open(&self) -> bool {
         self.open
+    }
+
+    pub(crate) fn selected_candidate(
+        &self,
+        report: &DualBatchReport,
+        selected: &[IpAddr],
+        name: &str,
+        started_at: Option<Instant>,
+    ) -> Option<SelectedCandidate> {
+        let started_at = started_at?;
+        if !self.open || !evidence_fresh(Some(started_at), Instant::now())
+            || !matches_selection(report, selected) || name.is_empty() {
+            return None;
+        }
+        let entry = report.results.get(self.index)?;
+        let observation = entry.result.as_ref().ok()?;
+        if observation.address != entry.address || !observation.both_transports_verified() {
+            return None;
+        }
+        Some(SelectedCandidate { address: entry.address, name: name.to_owned(), started_at })
     }
 
     pub(crate) fn body(
@@ -105,7 +140,7 @@ impl ReviewCursor {
         if !fresh {
             out.push_str("ОТКАЗ: измерение или DNS pin устарели/неизвестны; требуется новая проверка с согласием.\n");
         }
-        out.push_str("Apply ЗАБЛОКИРОВАН: security mode, независимый server identity, HTTP/3 semantics и security review не готовы.\nКонфигурация, runtime, ключи и приглашения не изменены.\nEsc/n: к отчёту; y не применяет настройки.");
+        out.push_str("Apply ЗАБЛОКИРОВАН из одного TLS/ALPN отчёта: требуется проверка собственного локального адреса, HTTP и identity.\nКонфигурация, runtime, ключи и приглашения не изменены.\nEsc/n: к отчёту; y не применяет настройки.");
         out
     }
 }
@@ -168,6 +203,49 @@ mod tests {
         assert!(text.contains("устарели/неизвестны"));
         assert!(cursor.close());
         assert!(!cursor.is_open());
+    }
+
+    #[test]
+    fn own_candidate_requires_open_fresh_exact_dual_observation() {
+        use crate::{
+            camouflage_discovery::{Observation, TlsEvidence},
+            camouflage_dual::DualProbeReport,
+            camouflage_h3_probe::H3ProbeReport,
+            camouflage_probe::ProbeReport,
+        };
+        let ip: IpAddr = "93.184.216.10".parse().unwrap();
+        let other: IpAddr = "93.184.216.11".parse().unwrap();
+        let address = SocketAddr::new(ip, 443);
+        let evidence = TlsEvidence {
+            tls13: Observation::Verified,
+            trusted_chain: Observation::Verified,
+            sni_san_match: Observation::Verified,
+            certificate_current: Observation::Verified,
+            reachable: Observation::Verified,
+            alpn_h2: Observation::Verified,
+            alpn_h3: Observation::Verified,
+            theia_fingerprint_match: Observation::Unknown,
+        };
+        let mut report = DualBatchReport { results: vec![DualBatchOutcome {
+            address,
+            result: Ok(DualProbeReport {
+                address,
+                h2: Ok(ProbeReport { connected_ip: ip, handshake_elapsed: Duration::from_millis(1), evidence }),
+                h3: Ok(H3ProbeReport { connected_ip: ip, handshake_elapsed: Duration::from_millis(1), evidence }),
+            }),
+        }] };
+        let mut cursor = ReviewCursor::default();
+        let started = Instant::now();
+        assert!(cursor.selected_candidate(&report, &[ip], "example.org", Some(started)).is_none());
+        cursor.open(&report);
+        let selected = cursor.selected_candidate(&report, &[ip], "example.org", Some(started)).unwrap();
+        assert_eq!(selected.address, address);
+        assert_eq!(selected.started_at, started);
+        assert!(cursor.selected_candidate(&report, &[other], "example.org", Some(started)).is_none());
+        assert!(cursor.selected_candidate(&report, &[ip], "example.org", Some(started - Duration::from_secs(61))).is_none());
+        assert!(cursor.selected_candidate(&report, &[ip], "example.org", Some(started + Duration::from_secs(5))).is_none());
+        report.results[0].result.as_mut().unwrap().h3.as_mut().unwrap().connected_ip = other;
+        assert!(cursor.selected_candidate(&report, &[ip], "example.org", Some(started)).is_none());
     }
 
     #[test]

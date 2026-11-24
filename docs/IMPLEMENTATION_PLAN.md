@@ -119,3 +119,7 @@ Extend the existing mandatory cross-host fixture with a fourth, independent-key 
 ### ADR-0092 — local REALITY provisioning
 
 G stages a protected fresh Ed25519 DER key for the selected enabled saved own inbound; preview uses the manual local validator, y saves with full material and source revalidation, n/Esc drops the staged key. Refuse automatic rotation of an existing REALITY profile. Keep independent candidate/active-probing and audit gates open. No new dependencies or jobs.
+
+### ADR-0093 — selected own-address application witness
+
+Fresh exact dual observation on an actually assigned own IP can proceed only with a separate g approval for two bounded HEAD requests. Require both binds and SNI to match saved inbound, verify exact reviewed leaf and standard PKI, receive final HTTP response on both protocols, stage the independent key through the same local validator, then y for guarded save. Recheck local scope and original evidence age. Native loopback test includes QUIC ALPN without HTTP/3. Third-party catalogues and subnet neighbours remain read-only; runtime cutover and independent audit remain open.

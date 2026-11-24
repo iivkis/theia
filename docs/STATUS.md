@@ -75,3 +75,7 @@ PR #118 merged into main at b503c6f after all 13 mandatory jobs succeeded for he
 ## ADR-0092 — local REALITY key provisioning wizard
 
 The next consolidated F-18 PR adds G on a selected own saved inbound: stage a fresh protected Ed25519 PKCS#8 key, verify the same cert/key and identity with both H2/H3 builders, show only public identity, explicitly save or cancel. Cancel/definite failure removes the staged key; uncertain write retains it for inspection. Native mode/DACL and guarded-save regression tests included. The preceding exact-head run failed in an existing Auto test's local TCP connect before CONNECT; the test now retries only local handshake refusal/reset, preserving the remote denial assertions. Full current-head CI, independent review and external candidate Apply remain pending; no claim of full F-18 or active-probing resistance.
+
+## ADR-0093 — own endpoint HTTP review to guarded provisioning
+
+PR #119 merged at ef5a97b after mandatory 13/13 CI on ce5aeac (run 45443507977), including native independent REALITY H2/H3/auto. ADR-0093 submits the next F-18 slice: select a fresh dual-transport observation of an actual assigned own address, explicitly approve a bounded HEAD on H2 and H3, require exact locally reviewed leaf with independent PKI and both real final HTTP responses, then use the existing staged Ed25519 review and guarded save. Recheck scope and expiry before save. No external identity adoption, runtime activation, probing-resistance or independent-audit claim. CI of this new slice is pending.

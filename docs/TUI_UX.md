@@ -261,3 +261,7 @@ Y still requires an explicit own key file and saved local inbound. The reviewed 
 ### ADR-0092 local provisioning wizard
 
 G: stage a new independent key for the selected saved own inbound. Review displays the validated inbound, endpoint, SNI and public identity only; y commits the same guarded local validator as Y, n/Esc cancels. No existing REALITY key is automatically rotated. On uncertain save, preserve the staged private key and require inspection. External candidate reports are not local key ownership; Apply remains blocked in their read-only view.
+
+### ADR-0093 own candidate to guarded local setup
+
+In the exact-IP batch report, a opens the read-only result. Only a fresh, dual-verified address originally listed as assigned to this server can show g: separately approve one HEAD / per H2 and H3 to the shown address/name, validate the current own inbound bind/name/certificate and proceed to the staged Ed25519 preview. On Linux the current assigned address is rechecked via native interface collection; unsupported platforms refuse this path (manual Y and local G remain available). y on the preview rechecks original evidence freshness, config, local scope and key material before guarded TOML save. No automatic runtime activation; catalogue and neighboring IP reports remain read-only.

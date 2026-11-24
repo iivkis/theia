@@ -96,3 +96,7 @@ No new CI job. Extend the existing F-14 Linux VM/native Windows job to a fourth 
 ### ADR-0092 provisioning acceptance
 
 Native tests verify generated Ed25519 DER with distinct public keys, Linux 0700/0600 and Windows owner+SYSTEM DACL, no overwrite, cancellation cleanup, exact file drift rejection, guarded commit, invitation export and refusal to automatically rotate an existing REALITY key. The existing Auto denial test retries only local TCP connect refusal/reset before sending CONNECT; remote denial and no-target-dial assertions remain unchanged. Keep all mandatory jobs, no new job.
+
+### ADR-0093 own endpoint application acceptance
+
+Native unit integration fixture binds real loopback TCP and QUIC on one port, runs real HTTP handlers, verifies exact certificate and independent trust, expects two actual final HTTP status responses, and refuses a wrong leaf/name/empty trust or a valid QUIC handshake without HTTP/3. Selection tests cover unopened, wrong-scope, expired, future and mismatched-inner-IP observations. Existing full native CI required; no new job or dependency.

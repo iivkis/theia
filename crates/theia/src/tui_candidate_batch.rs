@@ -268,6 +268,18 @@ impl CandidateBatchPanel {
 
     /// Escape from confirmation returns to selection. Escape from the list
     /// or the completed/running view leaves and discards all scope/consent.
+    /// Only an address actually listed as assigned to this server can
+    /// enter own-inbound provisioning; CIDR neighbours and catalogues cannot.
+    pub(crate) fn owned_candidate(&self) -> Option<crate::tui_reality_review::SelectedCandidate> {
+        let BatchState::Complete(Ok(report)) = &self.state else { return None; };
+        let candidate = self.review.selected_candidate(
+            report, &self.selected, self.server_name.as_deref()?, self.observed_at,
+        )?;
+        self.entries.iter().any(|(ip, source)| {
+            *ip == candidate.address.ip() && *source == CandidateSource::ServerAddress
+        }).then_some(candidate)
+    }
+
     pub(crate) fn open_review(&mut self) {
         if let BatchState::Complete(Ok(report)) = &self.state {
             self.review.open(report);
@@ -360,7 +372,11 @@ impl CandidateBatchPanel {
             }
             BatchState::Complete(Ok(report)) => {
                 if self.review.is_open() {
-                    return self.review.body(report, &self.selected, self.server_name.as_deref().unwrap_or(""), self.observed_at, true);
+                    let mut body = self.review.body(report, &self.selected, self.server_name.as_deref().unwrap_or(""), self.observed_at, true);
+                    if self.owned_candidate().is_some() {
+                        body.push_str("\n\ng: разрешить по одному HEAD / через H2 и H3 к этому собственному IP/SNI, проверить локальный сертификат и подготовить REALITY preview. Без bearer и перенаправлений; y на следующем экране сохранит TOML.");
+                    }
+                    return body;
                 }
                 let age = self.observed_at.map_or_else(
                     || "давность неизвестна".to_owned(),

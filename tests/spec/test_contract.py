@@ -681,6 +681,23 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn('Self::create_payload(config_path, "reality", "identity.der"', storage)
         self.assertIn("start_generated_reality_review", read("crates/theia/src/tui.rs"))
 
+    def test_f18_owned_endpoint_http_application_and_guarded_review(self):
+        own = read("crates/theia/src/owned_endpoint.rs")
+        self.assertIn("Request::head", own)
+        self.assertIn("pin.verify", own)
+        self.assertIn("recv_response()", own)
+        self.assertIn("tokio::try_join!", own)
+        self.assertNotIn("lookup_host", own)
+        self.assertNotIn("AUTHORIZATION", own)
+        editor = read("crates/theia/src/tui_editor.rs")
+        self.assertIn("review_owned_candidate", editor)
+        self.assertIn("collect_assigned_interfaces()", editor)
+        self.assertIn("self.check_owned_candidate(candidate)?", editor)
+        self.assertIn("self.review_generated_reality_mode()?", editor)
+        self.assertIn("CandidateSource::ServerAddress", read("crates/theia/src/tui_candidate_batch.rs"))
+        self.assertIn("owned_readiness_requires_real_http_on_both_transports_and_exact_leaf",
+                      read("crates/theia/src/owned_endpoint_tests.rs"))
+
     def test_m35a_test_only_feasibility_never_claims_security_mode(self):
         spec = read("docs/STEALTH_REALITY.md")
         adr = read("docs/adr/0021-m3-5a-rustls-quic-auth-feasibility.md")
