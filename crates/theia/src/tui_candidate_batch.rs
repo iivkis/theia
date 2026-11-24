@@ -271,13 +271,21 @@ impl CandidateBatchPanel {
     /// Only an address actually listed as assigned to this server can
     /// enter own-inbound provisioning; CIDR neighbours and catalogues cannot.
     pub(crate) fn owned_candidate(&self) -> Option<crate::tui_reality_review::SelectedCandidate> {
-        let BatchState::Complete(Ok(report)) = &self.state else { return None; };
+        let BatchState::Complete(Ok(report)) = &self.state else {
+            return None;
+        };
         let candidate = self.review.selected_candidate(
-            report, &self.selected, self.server_name.as_deref()?, self.observed_at,
+            report,
+            &self.selected,
+            self.server_name.as_deref()?,
+            self.observed_at,
         )?;
-        self.entries.iter().any(|(ip, source)| {
-            *ip == candidate.address.ip() && *source == CandidateSource::ServerAddress
-        }).then_some(candidate)
+        self.entries
+            .iter()
+            .any(|(ip, source)| {
+                *ip == candidate.address.ip() && *source == CandidateSource::ServerAddress
+            })
+            .then_some(candidate)
     }
 
     pub(crate) fn open_review(&mut self) {

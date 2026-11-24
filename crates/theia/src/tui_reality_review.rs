@@ -79,8 +79,11 @@ impl ReviewCursor {
         started_at: Option<Instant>,
     ) -> Option<SelectedCandidate> {
         let started_at = started_at?;
-        if !self.open || !evidence_fresh(Some(started_at), Instant::now())
-            || !matches_selection(report, selected) || name.is_empty() {
+        if !self.open
+            || !evidence_fresh(Some(started_at), Instant::now())
+            || !matches_selection(report, selected)
+            || name.is_empty()
+        {
             return None;
         }
         let entry = report.results.get(self.index)?;
@@ -88,7 +91,11 @@ impl ReviewCursor {
         if observation.address != entry.address || !observation.both_transports_verified() {
             return None;
         }
-        Some(SelectedCandidate { address: entry.address, name: name.to_owned(), started_at })
+        Some(SelectedCandidate {
+            address: entry.address,
+            name: name.to_owned(),
+            started_at,
+        })
     }
 
     pub(crate) fn body(
@@ -226,26 +233,65 @@ mod tests {
             alpn_h3: Observation::Verified,
             theia_fingerprint_match: Observation::Unknown,
         };
-        let mut report = DualBatchReport { results: vec![DualBatchOutcome {
-            address,
-            result: Ok(DualProbeReport {
+        let mut report = DualBatchReport {
+            results: vec![DualBatchOutcome {
                 address,
-                h2: Ok(ProbeReport { connected_ip: ip, handshake_elapsed: Duration::from_millis(1), evidence }),
-                h3: Ok(H3ProbeReport { connected_ip: ip, handshake_elapsed: Duration::from_millis(1), evidence }),
-            }),
-        }] };
+                result: Ok(DualProbeReport {
+                    address,
+                    h2: Ok(ProbeReport {
+                        connected_ip: ip,
+                        handshake_elapsed: Duration::from_millis(1),
+                        evidence,
+                    }),
+                    h3: Ok(H3ProbeReport {
+                        connected_ip: ip,
+                        handshake_elapsed: Duration::from_millis(1),
+                        evidence,
+                    }),
+                }),
+            }],
+        };
         let mut cursor = ReviewCursor::default();
         let started = Instant::now();
-        assert!(cursor.selected_candidate(&report, &[ip], "example.org", Some(started)).is_none());
+        assert!(cursor
+            .selected_candidate(&report, &[ip], "example.org", Some(started))
+            .is_none());
         cursor.open(&report);
-        let selected = cursor.selected_candidate(&report, &[ip], "example.org", Some(started)).unwrap();
+        let selected = cursor
+            .selected_candidate(&report, &[ip], "example.org", Some(started))
+            .unwrap();
         assert_eq!(selected.address, address);
         assert_eq!(selected.started_at, started);
-        assert!(cursor.selected_candidate(&report, &[other], "example.org", Some(started)).is_none());
-        assert!(cursor.selected_candidate(&report, &[ip], "example.org", Some(started - Duration::from_secs(61))).is_none());
-        assert!(cursor.selected_candidate(&report, &[ip], "example.org", Some(started + Duration::from_secs(5))).is_none());
-        report.results[0].result.as_mut().unwrap().h3.as_mut().unwrap().connected_ip = other;
-        assert!(cursor.selected_candidate(&report, &[ip], "example.org", Some(started)).is_none());
+        assert!(cursor
+            .selected_candidate(&report, &[other], "example.org", Some(started))
+            .is_none());
+        assert!(cursor
+            .selected_candidate(
+                &report,
+                &[ip],
+                "example.org",
+                Some(started - Duration::from_secs(61))
+            )
+            .is_none());
+        assert!(cursor
+            .selected_candidate(
+                &report,
+                &[ip],
+                "example.org",
+                Some(started + Duration::from_secs(5))
+            )
+            .is_none());
+        report.results[0]
+            .result
+            .as_mut()
+            .unwrap()
+            .h3
+            .as_mut()
+            .unwrap()
+            .connected_ip = other;
+        assert!(cursor
+            .selected_candidate(&report, &[ip], "example.org", Some(started))
+            .is_none());
     }
 
     #[test]

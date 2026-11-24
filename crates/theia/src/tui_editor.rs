@@ -34,7 +34,10 @@ pub(crate) struct PinnedModeReview {
     key_reference: Option<String>,
     material_fingerprint: Option<[u8; 32]>,
     generated_key: Option<PrivateBearer>,
-    owned_witness: Option<(crate::tui_reality_review::SelectedCandidate, crate::owned_endpoint::HttpWitness)>,
+    owned_witness: Option<(
+        crate::tui_reality_review::SelectedCandidate,
+        crate::owned_endpoint::HttpWitness,
+    )>,
 }
 
 impl PinnedModeReview {
@@ -755,25 +758,39 @@ impl Editor {
         &self,
         candidate: &crate::tui_reality_review::SelectedCandidate,
     ) -> Result<(), &'static str> {
-        if !candidate.fresh() || self.dirty() || self.editing
+        if !candidate.fresh()
+            || self.dirty()
+            || self.editing
             || !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source)
         {
             return Err("Candidate/config changed or expired; review again");
         }
-        let Config::Server(doc) = &self.original else { return Err("Server required"); };
-        let inbound = doc.server.inbounds.get(self.selected_record).ok_or("Inbound missing")?;
+        let Config::Server(doc) = &self.original else {
+            return Err("Server required");
+        };
+        let inbound = doc
+            .server
+            .inbounds
+            .get(self.selected_record)
+            .ok_or("Inbound missing")?;
         if !doc.server.enabled || inbound.server_name != candidate.name {
             return Err("Candidate is not the selected own inbound name");
         }
         let tcp = inbound.h2_listen.parse().map_err(|_| "Invalid TCP bind")?;
-        let udp = inbound.quic_listen.parse().map_err(|_| "Invalid UDP bind")?;
+        let udp = inbound
+            .quic_listen
+            .parse()
+            .map_err(|_| "Invalid UDP bind")?;
         if !own_bind_matches(tcp, candidate.address) || !own_bind_matches(udp, candidate.address) {
             return Err("Candidate is outside both configured listener binds");
         }
         let assigned = crate::camouflage_interfaces::collect_assigned_interfaces()
             .map_err(|_| "Cannot verify assigned local address")?;
-        if !assigned.interfaces.iter().any(|interface| interface.is_up
-            && interface.address == candidate.address.ip()) {
+        if !assigned
+            .interfaces
+            .iter()
+            .any(|interface| interface.is_up && interface.address == candidate.address.ip())
+        {
             return Err("Candidate is not a currently assigned local address");
         }
         Ok(())
@@ -790,13 +807,21 @@ impl Editor {
         self.check_owned_candidate(&candidate)?;
         let mut review = self.review_generated_reality_mode()?;
         let mut roots = rustls::RootCertStore::empty();
-        let (trusted, _) = roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-        if trusted == 0 { return Err("No trusted system roots"); }
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+        let (trusted, _) =
+            roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        if trusted == 0 {
+            return Err("No trusted system roots");
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .map_err(|_| "HTTP verification worker unavailable")?;
         self.check_owned_candidate(&candidate)?;
         let witness = runtime.block_on(crate::owned_endpoint::verify(
-            candidate.address, &candidate.name, roots, review.pin,
+            candidate.address,
+            &candidate.name,
+            roots,
+            review.pin,
         ))?;
         self.check_owned_candidate(&candidate)?;
         review.owned_witness = Some((candidate, witness));

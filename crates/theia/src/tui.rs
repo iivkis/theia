@@ -352,8 +352,13 @@ impl Interaction {
         });
     }
 
-    fn start_owned_candidate_review(&mut self, candidate: crate::tui_reality_review::SelectedCandidate) {
-        let Some(mut editor) = self.editor.take() else { return; };
+    fn start_owned_candidate_review(
+        &mut self,
+        candidate: crate::tui_reality_review::SelectedCandidate,
+    ) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
         self.candidate_batch = None;
         self.candidates = None;
         self.discovery = None;
