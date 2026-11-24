@@ -135,7 +135,6 @@ impl AuthFailure {
 pub struct ServerContext {
     pub inbound_id: String,
     security_mode: crate::security_profile::SecurityMode,
-    reality_signer: Option<Arc<crate::reality_identity::Signer>>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
     global_streams: Arc<Semaphore>,
@@ -169,7 +168,7 @@ impl ServerContext {
                 )
             })
             .collect();
-        let mut context = Self::with_limits(
+        Self::with_limits(
             inbound,
             policy,
             AuthCell::isolated(inbound, users),
@@ -177,18 +176,7 @@ impl ServerContext {
             Arc::new(all_users),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
             Arc::new(PeerBudget::default()),
-        );
-        // Library callers have no prepared generation. A missing/invalid key
-        // leaves REALITY unready, and both serve entry points refuse startup.
-        if inbound.security_mode.is_reality() {
-            context.reality_signer =
-                crate::reality_identity::read_key(inbound.reality_key.as_deref())
-                    .ok()
-                    .flatten()
-                    .and_then(|der| crate::reality_identity::Signer::from_der(&der).ok())
-                    .map(Arc::new);
-        }
-        context
+        )
     }
 
     fn with_limits(
@@ -203,7 +191,6 @@ impl ServerContext {
         Self {
             inbound_id: inbound.id.clone(),
             security_mode: inbound.security_mode,
-            reality_signer: None,
             authorization,
             policy: policy.clone(),
             global_streams,
@@ -281,25 +268,6 @@ impl ServerContext {
 
     pub(crate) fn requires_channel_binding(&self) -> bool {
         !self.security_mode.is_plain()
-    }
-
-    pub(crate) fn requires_identity(&self) -> bool {
-        self.security_mode.is_reality()
-    }
-
-    pub(crate) fn identity_ready(&self) -> bool {
-        !self.requires_identity() || self.reality_signer.is_some()
-    }
-
-    pub(crate) fn identity_response(
-        &self,
-        peer: IpAddr,
-        binding: Option<&crate::channel_binding::Admission>,
-    ) -> Option<Response<()>> {
-        if !self.requires_identity() || !self.peer_budget.admit(peer, Instant::now()) {
-            return None;
-        }
-        binding?.identity_response(self.reality_signer.as_deref()?)
     }
 
     pub(crate) fn stream_up(&self) -> bool {
@@ -612,9 +580,6 @@ pub(crate) async fn serve_generation_with_tls(
     context: Arc<ServerContext>,
     mut phase: watch::Receiver<GenerationPhase>,
 ) -> Result<(), ServerError> {
-    if !context.identity_ready() {
-        return Err(ServerError::Config);
-    }
     // Public library serve() callers may supply a prebound listener.
     // Apply the fixed BBR-first policy before activating it.
     crate::tcp_bbr::select(&listener).map_err(|_| ServerError::TcpControllerUnavailable)?;
@@ -688,7 +653,7 @@ pub(crate) async fn serve_generation_with_tls(
                         };
                         Some(Arc::new(crate::channel_binding::Admission::new(
                             zeroize::Zeroizing::new(key),
-                        ).requiring_identity(context.requires_identity())))
+                        )))
                     } else {
                         None
                     };
@@ -723,9 +688,7 @@ pub(crate) async fn serve_generation_with_tls(
                         let pair = pair.clone();
                         let binding = binding.clone();
                         handlers.spawn(async move {
-                            let result = if request.uri().path() == crate::reality_identity::PATH {
-                                handle_identity_request(request, respond, &context, peer.ip(), binding.as_deref()).await
-                            } else if context.stream_up() {
+                            let result = if context.stream_up() {
                                 handle_split_request(request, respond, &context, peer.ip(), &pair, binding.as_deref()).await
                             } else {
                                 handle_request(request, respond, context, peer.ip(), binding.as_deref()).await
@@ -760,38 +723,6 @@ async fn reject(
         .status(status)
         .body(())
         .map_err(|_| ServerError::Http2)?;
-    respond
-        .send_response(response, true)
-        .map_err(|_| ServerError::Http2)?;
-    Ok(())
-}
-
-async fn handle_identity_request(
-    mut request: Request<h2::RecvStream>,
-    mut respond: h2::server::SendResponse<Bytes>,
-    context: &ServerContext,
-    peer: IpAddr,
-    binding: Option<&crate::channel_binding::Admission>,
-) -> Result<(), ServerError> {
-    if !context.requires_identity() || !crate::reality_identity::is_request(&request) {
-        return reject(&mut respond, StatusCode::NOT_FOUND).await;
-    }
-    let empty = timeout(HANDSHAKE_TIMEOUT, async {
-        request.body_mut().data().await.is_none()
-            && request
-                .body_mut()
-                .trailers()
-                .await
-                .is_ok_and(|value| value.is_none())
-    })
-    .await
-    .unwrap_or(false);
-    if !empty {
-        return reject(&mut respond, StatusCode::BAD_REQUEST).await;
-    }
-    let Some(response) = context.identity_response(peer, binding) else {
-        return reject(&mut respond, StatusCode::UNAUTHORIZED).await;
-    };
     respond
         .send_response(response, true)
         .map_err(|_| ServerError::Http2)?;
@@ -1265,7 +1196,6 @@ fn check_certificate_name(
 struct TlsMaterial {
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
-    reality_signer: Option<Arc<crate::reality_identity::Signer>>,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     identity: crate::reload_preflight::IdentityHash,
 }
@@ -1289,72 +1219,19 @@ pub(crate) fn configured_certificate_pin(
     Ok(pin)
 }
 
-pub(crate) fn configured_reality_identity(
-    inbound: &Inbound,
-) -> Result<crate::reality_identity::PublicIdentity, ServerError> {
-    configured_reality_review(inbound).map(|(public, _, _)| public)
-}
-
-pub(crate) fn configured_reality_review(
-    inbound: &Inbound,
-) -> Result<
-    (
-        crate::reality_identity::PublicIdentity,
-        crate::security_profile::CertificatePin,
-        [u8; 32],
-    ),
-    ServerError,
-> {
-    let cert_bytes = pem_data(&inbound.tls_cert, false)?;
-    let key_bytes = pem_data(&inbound.tls_key, true)?;
-    let reality_bytes = crate::reality_identity::read_key(inbound.reality_key.as_deref())?
-        .ok_or(ServerError::Config)?;
-    let material = tls_material_from_bytes(inbound, &cert_bytes, &key_bytes, Some(&reality_bytes))?;
-    let mut fingerprint = Sha256::new();
-    fingerprint.update(b"theia-reality-local-review-v1\0");
-    for chunk in [
-        cert_bytes.as_slice(),
-        key_bytes.as_slice(),
-        reality_bytes.as_slice(),
-    ] {
-        fingerprint.update((chunk.len() as u64).to_be_bytes());
-        fingerprint.update(chunk);
-    }
-    let fingerprint = fingerprint.finalize().into();
-    let public = material
-        .reality_signer
-        .as_ref()
-        .ok_or(ServerError::Config)?
-        .public();
-    let leaf = material.certs.first().ok_or(ServerError::Config)?;
-    let pin = crate::security_profile::CertificatePin::from_der(leaf.as_ref());
-    let _ = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
-    let _ = crate::quic_transport::server_config(material.certs, material.key)
-        .map_err(|_| ServerError::Tls)?;
-    Ok((public, pin, fingerprint))
-}
-
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     let cert_bytes = pem_data(&inbound.tls_cert, false)?;
     let key_bytes = pem_data(&inbound.tls_key, true)?;
-    let reality = crate::reality_identity::read_key(inbound.reality_key.as_deref())?;
-    tls_material_from_bytes(
-        inbound,
-        &cert_bytes,
-        &key_bytes,
-        reality.as_ref().map(|bytes| bytes.as_slice()),
-    )
+    tls_material_from_bytes(inbound, &cert_bytes, &key_bytes)
 }
 
 fn tls_material_from_bytes(
     inbound: &Inbound,
     cert_bytes: &[u8],
     key_bytes: &[u8],
-    reality_bytes: Option<&[u8]>,
 ) -> Result<TlsMaterial, ServerError> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let identity = crate::reload_preflight::IdentityHash::from_pem(cert_bytes, key_bytes)
-        .with_reality(reality_bytes);
+    let identity = crate::reload_preflight::IdentityHash::from_pem(cert_bytes, key_bytes);
     let mut cert_reader = BufReader::new(cert_bytes);
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
@@ -1364,26 +1241,9 @@ fn tls_material_from_bytes(
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_bytes))
         .map_err(|_| ServerError::Config)?
         .ok_or(ServerError::Config)?;
-    let reality_signer = match (inbound.security_mode.is_reality(), reality_bytes) {
-        (true, Some(bytes)) => {
-            let signer = crate::reality_identity::Signer::from_der(bytes)?;
-            // Reject reuse of the TLS Ed25519 key even in a different file.
-            if let rustls::pki_types::PrivateKeyDer::Pkcs8(tls_key) = &key {
-                if crate::reality_identity::Signer::from_der(tls_key.secret_pkcs8_der())
-                    .is_ok_and(|tls_signer| tls_signer.public() == signer.public())
-                {
-                    return Err(ServerError::Config);
-                }
-            }
-            Some(Arc::new(signer))
-        }
-        (false, None) => None,
-        _ => return Err(ServerError::Config),
-    };
     Ok(TlsMaterial {
         certs,
         key,
-        reality_signer,
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         identity,
     })
@@ -1402,7 +1262,6 @@ pub(crate) struct CapturedTls {
 struct CapturedPem {
     cert: zeroize::Zeroizing<Vec<u8>>,
     key: zeroize::Zeroizing<Vec<u8>>,
-    reality: Option<zeroize::Zeroizing<Vec<u8>>>,
     identity: crate::reload_preflight::IdentityHash,
 }
 
@@ -1421,9 +1280,7 @@ impl CapturedTls {
             let key = pem_data(&inbound.tls_key, true)?;
             // A successful fingerprint is proof of a usable TLS1.3 identity,
             // not simply that two arbitrary private files could be hashed.
-            let reality = crate::reality_identity::read_key(inbound.reality_key.as_deref())?;
-            let reality_bytes = reality.as_ref().map(|bytes| bytes.as_slice());
-            let material = tls_material_from_bytes(inbound, &cert, &key, reality_bytes)?;
+            let material = tls_material_from_bytes(inbound, &cert, &key)?;
             let _h2 = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
             let _h3 = crate::quic_transport::server_config(material.certs, material.key)
                 .map_err(|_| ServerError::Tls)?;
@@ -1432,17 +1289,10 @@ impl CapturedTls {
                 hash.update((chunk.len() as u64).to_be_bytes());
                 hash.update(chunk);
             }
-            if let Some(bytes) = reality_bytes {
-                hash.update(b"theia-reality-key\0");
-                hash.update((bytes.len() as u64).to_be_bytes());
-                hash.update(bytes);
-            }
-            let identity = crate::reload_preflight::IdentityHash::from_pem(&cert, &key)
-                .with_reality(reality_bytes);
+            let identity = crate::reload_preflight::IdentityHash::from_pem(&cert, &key);
             pairs.push(CapturedPem {
                 cert,
                 key,
-                reality,
                 identity,
             });
         }
@@ -1465,12 +1315,7 @@ impl CapturedTls {
 
     fn material(&self, inbound: &Inbound, index: usize) -> Result<TlsMaterial, ServerError> {
         let pair = self.pairs.get(index).ok_or(ServerError::Config)?;
-        tls_material_from_bytes(
-            inbound,
-            &pair.cert,
-            &pair.key,
-            pair.reality.as_ref().map(|bytes| bytes.as_slice()),
-        )
+        tls_material_from_bytes(inbound, &pair.cert, &pair.key)
     }
 }
 
@@ -1631,7 +1476,6 @@ async fn prepare_generation(
             limits.connections.clone(),
             limits.peer_budget.clone(),
         );
-        context.reality_signer = material.reality_signer;
         context.live_quota = Some(limits.ledger.clone());
         listeners.push((listener, acceptor, endpoint, Arc::new(context), h3_config));
     }
@@ -2274,7 +2118,7 @@ async fn run_document_with_config(
                     crate::quic_transport::QuicError::Bind => ServerError::Io,
                     _ => ServerError::Tls,
                 })?;
-        let mut context = ServerContext::with_limits(
+        let context = Arc::new(ServerContext::with_limits(
             inbound,
             &policy,
             live_authorization.shared(),
@@ -2282,9 +2126,8 @@ async fn run_document_with_config(
             per_user.clone(),
             connections.clone(),
             peer_budget.clone(),
-        );
-        context.reality_signer = material.reality_signer;
-        prepared.push((listener, acceptor, endpoint, Arc::new(context)));
+        ));
+        prepared.push((listener, acceptor, endpoint, context));
     }
     // Both platforms require explicit private local IPC opt-in. Advertise
     // status only AFTER all TCP/UDP listeners and TLS have been prepared.
@@ -2448,7 +2291,6 @@ mod hardening_tests {
                         server_name: "a.example.org".into(),
                         tls_cert: "file:/tmp/theia-a.crt".into(),
                         security_mode: Default::default(),
-                        reality_key: None,
                         tls_key: "file:/tmp/theia-a.key".into(),
                     },
                     Inbound {
@@ -2459,7 +2301,6 @@ mod hardening_tests {
                         server_name: "b.example.org".into(),
                         tls_cert: "file:/tmp/theia-b.crt".into(),
                         security_mode: Default::default(),
-                        reality_key: None,
                         tls_key: "file:/tmp/theia-b.key".into(),
                     },
                 ],

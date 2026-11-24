@@ -65,7 +65,6 @@ pub fn assess_reload(
             || before.tls_cert != after.tls_cert
             || before.tls_key != after.tls_key
             || before.security_mode != after.security_mode
-            || before.reality_key != after.reality_key
         {
             return Err(ReloadCheckError::RequiresRestart);
         }
@@ -89,7 +88,6 @@ pub fn assess_reload(
 pub(crate) struct IdentityHash {
     cert: [u8; 32],
     key: [u8; 32],
-    reality: Option<[u8; 32]>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
@@ -98,22 +96,12 @@ impl IdentityHash {
         Self {
             cert: Sha256::digest(cert).into(),
             key: Sha256::digest(key).into(),
-            reality: None,
         }
     }
 
-    pub(crate) fn with_reality(mut self, reality: Option<&[u8]>) -> Self {
-        self.reality = reality.map(|bytes| Sha256::digest(bytes).into());
-        self
-    }
-
-    fn matches_full(&self, cert: &[u8], key: &[u8], reality: Option<&[u8]>) -> bool {
-        *self == Self::from_pem(cert, key).with_reality(reality)
-    }
-
-    #[cfg(test)]
     pub(crate) fn matches(&self, cert: &[u8], key: &[u8]) -> bool {
-        self.matches_full(cert, key, None)
+        let expected = Self::from_pem(cert, key);
+        self.cert == expected.cert && self.key == expected.key
     }
 }
 
@@ -225,9 +213,7 @@ impl ReloadPreflight {
                 .map_err(|_| ReloadCheckError::IdentityDrift)?;
             let key = crate::server::pem_data(&inbound.tls_key, true)
                 .map_err(|_| ReloadCheckError::IdentityDrift)?;
-            let reality = crate::reality_identity::read_key(inbound.reality_key.as_deref())
-                .map_err(|_| ReloadCheckError::IdentityDrift)?;
-            if !identity.matches_full(&cert, &key, reality.as_ref().map(|bytes| bytes.as_slice())) {
+            if !identity.matches(&cert, &key) {
                 return Err(ReloadCheckError::IdentityDrift);
             }
         }
@@ -252,11 +238,7 @@ impl ReloadPreflight {
                 let Ok(key) = crate::server::pem_data(&inbound.tls_key, true) else {
                     return false;
                 };
-                let Ok(reality) = crate::reality_identity::read_key(inbound.reality_key.as_deref())
-                else {
-                    return false;
-                };
-                identity.matches_full(&cert, &key, reality.as_ref().map(|bytes| bytes.as_slice()))
+                identity.matches(&cert, &key)
             })
     }
 
@@ -366,7 +348,6 @@ mod tests {
                     server_name: "edge.example.org".into(),
                     tls_cert: "file:/tmp/theia-cert.pem".into(),
                     security_mode: Default::default(),
-                    reality_key: None,
                     tls_key: "file:/tmp/theia-key.pem".into(),
                 }],
                 users: vec![User {

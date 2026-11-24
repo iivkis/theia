@@ -99,15 +99,6 @@ impl PrivateBearer {
         Self::create_payload(config_path, "bearer", "token", encoded.as_bytes())
     }
 
-    /// Provision one independent Ed25519 key in a fresh protected directory.
-    /// The guard is retained until the configuration commit is established.
-    pub(crate) fn create_reality_key(config_path: &Path) -> Result<Self, ImportError> {
-        use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
-        let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-            .map_err(|_| ImportError::UnsafeStorage)?;
-        Self::create_payload(config_path, "reality", "identity.der", der.as_ref())
-    }
-
     fn create_payload(
         config_path: &Path,
         kind: &str,
@@ -488,40 +479,6 @@ mod storage_tests {
             .unwrap()
             .encode()
             .unwrap()
-    }
-
-    #[test]
-    fn generated_reality_storage_is_private_distinct_and_guarded() {
-        let scratch = Scratch::new();
-        let config = scratch.0.join("server.toml");
-        let mut retained = PrivateBearer::create_reality_key(&config).unwrap();
-        let cancelled = PrivateBearer::create_reality_key(&config).unwrap();
-        assert_ne!(retained.file, cancelled.file);
-        for key in [&retained, &cancelled] {
-            assert_private(&key.directory, true);
-            assert_private(&key.file, false);
-            let der = crate::reality_identity::read_key(Some(&key.reference().unwrap()))
-                .unwrap()
-                .unwrap();
-            assert!(crate::reality_identity::Signer::from_der(&der).is_ok());
-        }
-        let kept = retained.file.clone();
-        let discarded = cancelled.file.clone();
-        let public = |key: &PrivateBearer| {
-            let der = crate::reality_identity::read_key(Some(&key.reference().unwrap()))
-                .unwrap()
-                .unwrap();
-            crate::reality_identity::Signer::from_der(&der)
-                .unwrap()
-                .public()
-        };
-        assert_ne!(public(&retained), public(&cancelled));
-        retained.commit();
-        drop(retained);
-        drop(cancelled);
-        assert!(kept.is_file());
-        assert!(!discarded.exists());
-        assert!(!discarded.parent().unwrap().exists());
     }
 
     #[test]

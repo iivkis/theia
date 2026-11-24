@@ -188,17 +188,6 @@ pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocu
     if active.server.inbounds.len() != candidate.server.inbounds.len() {
         return false;
     }
-    // REALITY's separate signer belongs to a captured generation, not the
-    // old TLS-only swap/rollback slot. Require fresh ports or explicit restart.
-    if active
-        .server
-        .inbounds
-        .iter()
-        .chain(&candidate.server.inbounds)
-        .any(|inbound| inbound.security_mode.is_reality())
-    {
-        return false;
-    }
     let mut normalized = candidate.clone();
     for (original, normalized_inbound) in active
         .server

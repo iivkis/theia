@@ -120,7 +120,6 @@ pub struct H2Client {
     connector: H2Tls,
     wire_shape: H2WireShape,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
-    server_identity: Option<crate::reality_identity::PublicIdentity>,
     stream_up: bool,
 }
 
@@ -229,7 +228,6 @@ impl H2Client {
             connector,
             wire_shape,
             certificate_pin: None,
-            server_identity: None,
             stream_up: false,
         })
     }
@@ -240,9 +238,6 @@ impl H2Client {
         pin: Option<crate::security_profile::CertificatePin>,
     ) -> Result<Self, ClientError> {
         if pin.is_some() {
-            if self.server_identity.is_some() {
-                return Err(ClientError::Configuration);
-            }
             if !matches!(&self.connector, H2Tls::Rustls(_)) {
                 return Err(ClientError::Configuration);
             }
@@ -264,31 +259,9 @@ impl H2Client {
         Ok(self)
     }
 
-    /// Independent server signing key, verified before bearer is transmitted.
-    pub fn with_server_identity(
-        mut self,
-        identity: Option<crate::reality_identity::PublicIdentity>,
-    ) -> Result<Self, ClientError> {
-        if identity.is_some() {
-            if self.certificate_pin.is_some() || self.server_identity.is_some() {
-                return Err(ClientError::Configuration);
-            }
-            if !matches!(&self.connector, H2Tls::Rustls(_)) {
-                return Err(ClientError::Configuration);
-            }
-            self.stream_up = true;
-        } else if self.server_identity.is_some() {
-            return Err(ClientError::Configuration);
-        }
-        self.server_identity = identity;
-        Ok(self)
-    }
-
     /// An explicit second HTTP stream; cannot weaken the selected identity.
     pub fn with_stream_up(mut self, enabled: bool) -> Result<Self, ClientError> {
-        if (enabled && self.certificate_pin.is_none() && self.server_identity.is_none())
-            || (self.stream_up && !enabled)
-        {
+        if (enabled && self.certificate_pin.is_none()) || (self.stream_up && !enabled) {
             return Err(ClientError::Configuration);
         }
         self.stream_up = enabled;
@@ -363,7 +336,7 @@ impl H2Client {
                             .as_ref(),
                     )?;
                 }
-                let binding = if self.certificate_pin.is_some() || self.server_identity.is_some() {
+                let binding = if self.certificate_pin.is_some() {
                     Some(zeroize::Zeroizing::new(
                         tls.get_ref()
                             .1
@@ -396,25 +369,6 @@ impl H2Client {
             "tls_and_h2_verified",
             "op" = Value::Count(operation)
         );
-        if let Some(identity) = self.server_identity {
-            let key = binding.as_ref().ok_or(ClientError::Tls)?;
-            let (response, _) = sender
-                .send_request(crate::reality_identity::request(&self.uri)?, true)
-                .map_err(|_| ClientError::Http2)?;
-            let response = response.await.map_err(|_| ClientError::Http2)?;
-            identity.verify(key, &response)?;
-            let mut body = response.into_body();
-            if body.data().await.is_some()
-                || body
-                    .trailers()
-                    .await
-                    .map_err(|_| ClientError::Http2)?
-                    .is_some()
-            {
-                return Err(ClientError::Protocol);
-            }
-            sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
-        }
         // Build and send the credential-bearing POST ONLY after the selected
         // backend verified TLS identity and ALPN and established HTTP/2.
         let (response, mut outgoing) = if self.stream_up {

@@ -58,9 +58,6 @@ pub(crate) async fn serve_generation(
     context: Arc<ServerContext>,
     mut phase: watch::Receiver<GenerationPhase>,
 ) -> Result<(), ServerError> {
-    if !context.identity_ready() {
-        return Err(ServerError::Config);
-    }
     if !server::await_generation_activation(&mut phase).await {
         crate::diag!(Info, "server.h3", "generation_aborted_before_activation");
         return Ok(());
@@ -142,10 +139,7 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
         {
             return;
         }
-        Some(Arc::new(
-            crate::channel_binding::Admission::new(key)
-                .requiring_identity(context.requires_identity()),
-        ))
+        Some(Arc::new(crate::channel_binding::Admission::new(key)))
     } else {
         None
     };
@@ -196,9 +190,7 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
                 crate::diag!(Warn, "server.h3", "request_headers_failed_or_timeout");
                 return;
             };
-            if request.uri().path() == crate::reality_identity::PATH {
-                handle_identity_request(request, stream, &context, peer, binding.as_deref()).await;
-            } else if context.stream_up() {
+            if context.stream_up() {
                 handle_split_request(request, stream, &context, peer, &pair, binding.as_deref())
                     .await;
             } else {
@@ -206,41 +198,6 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
             }
         });
     }
-}
-
-async fn handle_identity_request(
-    request: Request<()>,
-    mut stream: Stream,
-    context: &ServerContext,
-    peer: IpAddr,
-    binding: Option<&crate::channel_binding::Admission>,
-) {
-    if !context.requires_identity() || !crate::reality_identity::is_request(&request) {
-        reject_split(&mut stream, StatusCode::NOT_FOUND).await;
-        return;
-    }
-    let empty = timeout(HANDSHAKE_TIMEOUT, async {
-        stream.recv_data().await.is_ok_and(|value| value.is_none())
-            && stream
-                .recv_trailers()
-                .await
-                .is_ok_and(|value| value.is_none())
-    })
-    .await
-    .unwrap_or(false);
-    if !empty {
-        reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
-        return;
-    }
-    let Some(response) = context.identity_response(peer, binding) else {
-        reject_split(&mut stream, StatusCode::UNAUTHORIZED).await;
-        return;
-    };
-    let _ = timeout(CLOSE_TIMEOUT, async {
-        stream.send_response(response).await?;
-        stream.finish().await
-    })
-    .await;
 }
 
 async fn handle_request(

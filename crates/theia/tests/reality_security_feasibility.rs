@@ -780,3 +780,21 @@ fn check_reconnect_proof_matrix(
     client_nonce.zeroize();
     server_nonce.zeroize();
 }
+
+#[test]
+fn retired_local_tls_reality_server_schema_is_rejected() {
+    let original = include_str!("../../../examples/server.toml")
+        .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"42".repeat(32));
+    assert!(theia::config::parse(&original).is_ok());
+    for fields in [
+        "security_mode = \"smart-reality-v1\"\n",
+        "reality_key = \"file:/tmp/identity.der\"\n",
+        "security_mode = \"smart-reality-v1\"\nreality_key = \"file:/tmp/identity.der\"\n",
+    ] {
+        let invalid = original.replace(
+            "[[server.inbounds]]",
+            &format!("[[server.inbounds]]\n{fields}"),
+        );
+        assert!(theia::config::parse(&invalid).is_err());
+    }
+}

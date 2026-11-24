@@ -61,8 +61,6 @@ pub(crate) fn attach<T>(
 pub(crate) struct Admission {
     key: Key,
     used: AtomicBool,
-    identity_required: bool,
-    identity_issued: AtomicBool,
 }
 
 impl Admission {
@@ -70,29 +68,7 @@ impl Admission {
         Self {
             key,
             used: AtomicBool::new(false),
-            identity_required: false,
-            identity_issued: AtomicBool::new(false),
         }
-    }
-
-    pub(crate) fn requiring_identity(mut self, required: bool) -> Self {
-        self.identity_required = required;
-        self
-    }
-
-    pub(crate) fn identity_response(
-        &self,
-        signer: &crate::reality_identity::Signer,
-    ) -> Option<http::Response<()>> {
-        if !self.identity_required
-            || self
-                .identity_issued
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return None;
-        }
-        signer.response(&self.key)
     }
 
     fn verifies<T>(&self, request: &Request<T>) -> bool {
@@ -111,8 +87,7 @@ impl Admission {
     /// At most one logical admission per verified pinned connection.
     /// Pairing remains same-connection and each leg has its own proof.
     pub(crate) fn admit<T>(&self, requests: &[&Request<T>]) -> bool {
-        if (self.identity_required && !self.identity_issued.load(Ordering::Acquire))
-            || !(1..=2).contains(&requests.len())
+        if !(1..=2).contains(&requests.len())
             || !requests.iter().all(|request| self.verifies(request))
         {
             return false;
@@ -175,40 +150,6 @@ mod tests {
         assert!(!server.admit(&[&duplicate]));
         assert!(server.admit(&[&signed]));
         assert!(!server.admit(&[&signed]));
-    }
-
-    #[test]
-    fn independent_identity_required_before_admission_and_issued_once() {
-        use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
-        let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        let signer = crate::reality_identity::Signer::from_der(der.as_ref()).unwrap();
-        let key = Zeroizing::new([4; 32]);
-        let upload = attach(Some(&key), request("POST", "/upload", "Bearer fixture")).unwrap();
-        let download = attach(Some(&key), request("GET", "/download", "Bearer fixture")).unwrap();
-        let binding = Admission::new(key.clone()).requiring_identity(true);
-        assert!(!binding.admit(&[&upload, &download]));
-        assert!(Admission::new(key.clone())
-            .identity_response(&signer)
-            .is_none());
-        let (one, two) = std::thread::scope(|scope| {
-            let one = scope.spawn(|| binding.identity_response(&signer));
-            let two = scope.spawn(|| binding.identity_response(&signer));
-            (one.join().unwrap(), two.join().unwrap())
-        });
-        let proof = match (one, two) {
-            (Some(proof), None) | (None, Some(proof)) => proof,
-            _ => panic!("one proof per connection"),
-        };
-        assert!(signer.public().verify(&key, &proof).is_ok());
-        assert!(binding.admit(&[&upload, &download]));
-        assert!(!binding.admit(&[&upload, &download]));
-        assert!(binding.identity_response(&signer).is_none());
-        let fresh = Admission::new(Zeroizing::new([5; 32])).requiring_identity(true);
-        assert!(!fresh.admit(&[&upload, &download]));
-        assert!(signer
-            .public()
-            .verify(&Zeroizing::new([5; 32]), &proof)
-            .is_err());
     }
 
     #[test]

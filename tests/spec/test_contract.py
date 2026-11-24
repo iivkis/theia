@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import subprocess
 import tomllib
 import unittest
 
@@ -37,6 +38,17 @@ def explicit_grants_are_valid(server: dict) -> bool:
 
 
 class SpecContractTests(unittest.TestCase):
+    def test_repository_contains_no_tracked_markdown_or_logs(self):
+        # Notion is the canonical specification; keep historical docs and logs out of Git.
+        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT)
+        paths = [Path(path.decode("utf-8")) for path in tracked.split(b"\0") if path]
+        forbidden = [
+            str(path) for path in paths
+            if path.suffix.lower() in {".md", ".markdown", ".log"}
+            or any(part.lower() in {"logs", "journals"} for part in path.parts[:-1])
+        ]
+        self.assertEqual(forbidden, [], "Documentation belongs in Notion; logs are not tracked")
+
     def test_required_files(self):
         required = [
             "examples/server.toml", "examples/client.toml",
@@ -473,45 +485,20 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("crate::tcp_bbr::select(&socket)", server)
         self.assertIn("BbrConfig::default()", read("crates/theia/src/quic_transport.rs"))
 
-    def test_reality_identity_before_bearer_and_no_new_invitation_version(self):
-        identity = read("crates/theia/src/reality_identity.rs")
-        self.assertIn("signature::ED25519", identity)
-        self.assertIn("from_pkcs8_maybe_unchecked", identity)
-        self.assertIn("theia-server-identity", identity)
-        for name in ("client.rs", "h3_client.rs"):
-            client = read("crates/theia/src/" + name)
-            self.assertLess(client.index("identity.verify(key, &response)?"), client.index("let (response, mut"))
-        for name in ("server.rs", "h3_server.rs"):
-            self.assertIn("handle_identity_request", read("crates/theia/src/" + name))
-        invite = read("crates/theia/src/invite.rs")
-        self.assertIn("server_public_key: Option<String>", invite)
-        self.assertNotIn("PREFIX_V2", invite)
-        self.assertIn("reality_key", read("crates/theia/src/reload_preflight.rs"))
-
-    def test_f18_independent_native_acceptance_contract(self):
-        guest = read("scripts/f14-wsl-server.py")
-        host = read("scripts/f14-cross-os-ci.py")
-        cross = read("crates/theia/tests/f14_cross_host.rs")
-        self.assertIn("independent_identity", guest)
-        self.assertIn('security_mode = "smart-reality-v1"', guest)
-        self.assertIn("reality-public.txt", host)
-        self.assertNotIn('"reality.der"', host)
-        self.assertIn("reality_client_scenario(&fixture, transport)", cross)
-        self.assertIn("THEIA_F18_XHOST_WRONG_PUBLIC", cross)
-        self.assertIn("independent_wire_identity_h2_h3_signature_scope_and_one_response",
-                      read("crates/theia/tests/security_profile.rs"))
-        self.assertIn("material_fingerprint", read("crates/theia/src/tui_editor.rs"))
-        self.assertIn("theia-reality-local-review-v1", read("crates/theia/src/server.rs"))
-
-    def test_f18_generated_local_identity_uses_guarded_manual_validator(self):
-        editor = read("crates/theia/src/tui_editor.rs")
-        storage = read("crates/theia/src/client_import.rs")
-        self.assertIn("review_generated_reality_mode", editor)
-        self.assertIn("self.review_reality_mode(&reference)?", editor)
-        self.assertIn("generated_reality_key_preview_cancel_drift_and_commit", editor)
-        self.assertIn("generated_reality_storage_is_private_distinct_and_guarded", storage)
-        self.assertIn('Self::create_payload(config_path, "reality", "identity.der"', storage)
-        self.assertIn("start_generated_reality_review", read("crates/theia/src/tui.rs"))
+    def test_retired_local_tls_reality_has_no_production_or_compatibility_path(self):
+        self.assertFalse((ROOT / "crates/theia/src/reality_identity.rs").exists())
+        self.assertNotIn("SmartRealityV1", read("crates/theia/src/security_profile.rs"))
+        self.assertNotIn("SmartReality", read("crates/theia/src/invite.rs"))
+        self.assertNotIn("reality_key", read("crates/theia/src/config.rs"))
+        self.assertNotIn("handle_identity_request", read("crates/theia/src/server.rs"))
+        self.assertNotIn("handle_identity_request", read("crates/theia/src/h3_server.rs"))
+        self.assertNotIn("with_server_identity", read("crates/theia/src/client.rs"))
+        self.assertNotIn("with_server_identity", read("crates/theia/src/h3_client.rs"))
+        self.assertNotIn("review_generated_reality_mode", read("crates/theia/src/tui_editor.rs"))
+        self.assertIn("retired_local_tls_reality_invitation_and_profile_fail_closed",
+                      read("crates/theia/src/invite.rs"))
+        self.assertIn("retired_local_tls_reality_server_schema_is_rejected",
+                      read("crates/theia/tests/reality_security_feasibility.rs"))
 
     def test_m35a_test_only_feasibility_never_claims_security_mode(self):
         tests = read("crates/theia/tests/reality_security_feasibility.rs")
