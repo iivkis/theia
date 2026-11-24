@@ -54,7 +54,7 @@ impl fmt::Display for QuicError {
 }
 impl std::error::Error for QuicError {}
 
-fn transport_config() -> Arc<TransportConfig> {
+pub(crate) fn transport_config() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
     config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     // Bounded per-connection stream credit. Leave unidirectional credit for
@@ -254,7 +254,10 @@ pub(crate) struct ObservedEndpoint {
 
 impl ObservedEndpoint {
     pub fn new(bind: SocketAddr, roots: RootCertStore) -> Result<Self, QuicError> {
-        let config = client_config(roots)?;
+        Self::with_config(bind, client_config(roots)?)
+    }
+
+    pub(crate) fn with_config(bind: SocketAddr, config: quinn::ClientConfig) -> Result<Self, QuicError> {
         let runtime = Arc::new(TokioRuntime);
         let udp = UdpSocket::bind(bind).map_err(|_| QuicError::Bind)?;
         udp.set_nonblocking(true).map_err(|_| QuicError::Bind)?;

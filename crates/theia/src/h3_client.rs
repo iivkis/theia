@@ -1,4 +1,4 @@
-//! Explicit H3 client core. No fallback, CLI or connection pooling yet.
+//! Explicit H3 client core with bounded per-profile connection reuse.
 use crate::{
     client::{bearer_header, error_kind, ClientError},
     diagnostics::{self, Value},
@@ -28,9 +28,14 @@ pub struct H3Client {
     uri: Uri,
     authorization: HeaderValue,
     roots: RootCertStore,
+    identity_quic: Option<quinn::ClientConfig>,
+    identity_routes: Option<crate::split_http::IdentityRoutes>,
     connect_timeout: Duration,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     stream_up: bool,
+    auto_mode: Option<crate::split_http::AutoMode>,
+    pool: crate::connection_pool::Pool<H3Connection>,
+    reuse_connections: bool,
 }
 
 impl H3Client {
@@ -60,16 +65,99 @@ impl H3Client {
             uri,
             authorization: bearer_header(token)?,
             roots,
+            identity_quic: None,
+            identity_routes: None,
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
             stream_up: false,
+            auto_mode: None,
+            pool: crate::connection_pool::Pool::default(),
+            reuse_connections: false,
         })
+    }
+
+    pub(crate) fn identity_fixture(
+        remote: SocketAddr,
+        token: &str,
+        value: &crate::descriptor::Verified,
+    ) -> Result<Self, ClientError> {
+        let d = value.descriptor();
+        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string()
+            || !value.effective_modes().h3 {
+            return Err(ClientError::Configuration);
+        }
+        let quic = crate::identity_tls::quic_client(&d.scope, value.signer())
+            .map_err(|_| ClientError::Tls)?;
+        let routes = crate::split_http::IdentityRoutes::new(&d.path_prefix)?;
+        let uri = Uri::builder().scheme("https").authority("localhost")
+            .path_and_query(routes.single.as_str()).build().map_err(|_| ClientError::Configuration)?;
+        let mut client = Self {
+            remote,
+            name: "localhost".into(),
+            uri,
+            authorization: bearer_header(token)?,
+            roots: RootCertStore::empty(),
+            identity_quic: Some(quic),
+            identity_routes: Some(routes),
+            connect_timeout: Duration::from_secs(10),
+            certificate_pin: None,
+            stream_up: false,
+            auto_mode: None,
+            pool: crate::connection_pool::Pool::default(),
+            reuse_connections: false,
+        };
+        let modes = value.effective_modes();
+        client = if modes.stream_one && modes.stream_up {
+            client.with_auto_stream_up(Duration::from_secs(900))?
+        } else {
+            client.with_stream_up(modes.stream_up)?
+        };
+        Ok(client)
+    }
+
+    pub(crate) async fn fetch_identity_descriptor(&self) -> Result<String, ClientError> {
+        let routes = self.identity_routes.as_ref().ok_or(ClientError::Configuration)?;
+        timeout(OPEN_TIMEOUT, async {
+            let connection = self.connect_verified(diagnostics::next_id()).await?;
+            let mut sender = connection.sender.lock().map_err(|_| ClientError::Http3)?.clone();
+            let mut parts = self.uri.clone().into_parts();
+            parts.path_and_query = Some(routes.descriptor.parse().map_err(|_| ClientError::Configuration)?);
+            let uri = Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+            let request = Request::get(uri).header(header::AUTHORIZATION, self.authorization.clone())
+                .body(()).map_err(|_| ClientError::Configuration)?;
+            let mut stream = sender.send_request(request).await.map_err(|_| ClientError::Http3)?;
+            stream.finish().await.map_err(|_| ClientError::Http3)?;
+            let response = stream.recv_response().await.map_err(|_| ClientError::Http3)?;
+            crate::split_http::check_status(response.status())?;
+            let expected = crate::identity_data::validate_descriptor_headers(response.headers())?;
+            let mut bytes = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.map_err(|_| ClientError::Http3)? {
+                if chunk.remaining() > expected.saturating_sub(bytes.len()) {
+                    return Err(ClientError::Protocol);
+                }
+                let chunk = chunk.copy_to_bytes(chunk.remaining());
+                crate::identity_data::append_descriptor(&mut bytes, &chunk, expected)?;
+            }
+            if stream.recv_trailers().await.map_err(|_| ClientError::Http3)?.is_some() {
+                return Err(ClientError::Protocol);
+            }
+            crate::identity_data::finish_descriptor(bytes, expected)
+        }).await.map_err(|_| ClientError::Timeout)?
+    }
+
+    /// Reuse verified own-TLS connections within this immutable profile.
+    pub fn with_connection_pool(mut self) -> Self {
+        self.reuse_connections = true;
+        self
     }
 
     pub fn with_certificate_pin(
         mut self,
         pin: Option<crate::security_profile::CertificatePin>,
     ) -> Result<Self, ClientError> {
+        if pin.is_some() && self.auto_mode.is_some() {
+            return Err(ClientError::Configuration);
+        }
         if pin.is_some() {
             self.uri = Uri::builder()
                 .scheme("https")
@@ -84,13 +172,29 @@ impl H3Client {
         Ok(self)
     }
 
-    /// An explicit second HTTP stream; cannot weaken the selected identity.
+    /// Explicit XHTTP split mode with the same TLS verification and credentials.
     pub fn with_stream_up(mut self, enabled: bool) -> Result<Self, ClientError> {
-        if (enabled && self.certificate_pin.is_none()) || (self.stream_up && !enabled) {
+        if self.auto_mode.is_some() || (self.stream_up && !enabled) {
             return Err(ClientError::Configuration);
         }
         self.stream_up = enabled;
         Ok(self)
+    }
+
+    /// Opt-in auto XHTTP for own TLS; legacy pinned profiles remain exact.
+    pub fn with_auto_stream_up(mut self, ttl: Duration) -> Result<Self, ClientError> {
+        if self.certificate_pin.is_some() || self.stream_up || self.auto_mode.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        self.auto_mode = Some(crate::split_http::AutoMode::new(self.remote, ttl));
+        Ok(self)
+    }
+
+    pub(crate) fn preferred_stream_up(&self) -> Result<bool, ClientError> {
+        match &self.auto_mode {
+            Some(mode) => Ok(mode.select()?.stream_up),
+            None => Ok(self.stream_up),
+        }
     }
 
     pub(crate) fn remote(&self) -> SocketAddr {
@@ -106,6 +210,15 @@ impl H3Client {
     }
 
     pub async fn open(&self, address: Address, port: u16) -> Result<H3Tunnel, ClientError> {
+        self.open_preferred(address, port, None).await
+    }
+
+    pub(crate) async fn open_preferred(
+        &self,
+        address: Address,
+        port: u16,
+        preferred: Option<bool>,
+    ) -> Result<H3Tunnel, ClientError> {
         let operation = diagnostics::next_id();
         crate::diag!(
             Debug,
@@ -115,7 +228,7 @@ impl H3Client {
         );
         let open = Frame::OpenTcp { address, port };
         protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        let result = timeout(OPEN_TIMEOUT, self.open_inner(open, operation))
+        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation, preferred))
             .await
             .map_err(|_| ClientError::Timeout)
             .and_then(|result| result);
@@ -137,13 +250,20 @@ impl H3Client {
         result
     }
 
-    async fn open_inner(&self, open: Frame, operation: u64) -> Result<H3Tunnel, ClientError> {
+    /// A full authenticated transport handshake, shared by tunnel opens and
+    /// idle-cache rechecks. No HTTP request or bearer is sent here.
+    async fn verified_connection(
+        &self,
+    ) -> Result<(ObservedEndpoint, quinn::Connection), ClientError> {
         let bind = if self.remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
         } else {
             SocketAddr::from(([0u16; 8], 0))
         };
-        let endpoint = ObservedEndpoint::new(bind, self.roots.clone()).map_err(quic_error)?;
+        let endpoint = match &self.identity_quic {
+            Some(config) => ObservedEndpoint::with_config(bind, config.clone()),
+            None => ObservedEndpoint::new(bind, self.roots.clone()),
+        }.map_err(quic_error)?;
         // No credential/request data until verified full handshake and BBR.
         let connection = endpoint
             .connect(self.remote, &self.name, self.connect_timeout)
@@ -157,6 +277,56 @@ impl H3Client {
                 .map_err(|_| ClientError::Tls)?;
             pin.verify(chain.first().ok_or(ClientError::Tls)?.as_ref())?;
         }
+        Ok((endpoint, connection))
+    }
+
+    /// Check only the configured peer, PKI, ALPN, optional pin and BBR.
+    /// Dropping the endpoint closes this probe; it never opens a tunnel.
+    pub(crate) async fn probe(&self) -> Result<(), ClientError> {
+        self.verified_connection().await.map(|_| ())
+    }
+
+    async fn open_selected(
+        &self,
+        open: Frame,
+        operation: u64,
+        preferred: Option<bool>,
+    ) -> Result<H3Tunnel, ClientError> {
+        use crate::split_http::HelloOutcome;
+        let mut stage = HelloOutcome::Pending;
+        let Some(mode) = &self.auto_mode else {
+            return self
+                .open_inner(&open, operation, self.stream_up, &mut stage)
+                .await;
+        };
+        let ticket = mode.select()?;
+        let stream_up = preferred.unwrap_or(ticket.stream_up);
+        let result = self
+            .open_inner(&open, operation, stream_up, &mut stage)
+            .await;
+        if stream_up && stage == HelloOutcome::Acked {
+            mode.remember(ticket)?;
+        }
+        if stream_up || stage != HelloOutcome::Silent || !mode.current(ticket)? {
+            return result;
+        }
+        // The first attempt is fully dropped and never sent OPEN_TCP.
+        crate::diag!(Debug, "client.h3", "xhttp_pre_open_stream_up_retry");
+        let mut stage = HelloOutcome::Pending;
+        let result = self.open_inner(&open, operation, true, &mut stage).await;
+        if stage == HelloOutcome::Acked {
+            mode.remember(ticket)?;
+        }
+        // The original H3 attempt already completed HTTP admission.
+        // UDP silence in the second attempt must not authorize H2 fallback.
+        match result {
+            Err(ClientError::QuicUnreachable) => Err(ClientError::Timeout),
+            other => other,
+        }
+    }
+
+    async fn connect_verified(&self, operation: u64) -> Result<H3Connection, ClientError> {
+        let (endpoint, connection) = self.verified_connection().await?;
         let binding = if self.certificate_pin.is_some() {
             let mut key = zeroize::Zeroizing::new([0u8; 32]);
             connection
@@ -178,7 +348,7 @@ impl H3Client {
         );
         let mut builder = h3::client::builder();
         builder.max_field_section_size(MAX_HEADERS);
-        let (mut driver, mut sender) = builder
+        let (mut driver, sender) = builder
             .build::<_, _, Bytes>(h3_quinn::Connection::new(connection))
             .await
             .map_err(|_| ClientError::Http3)?;
@@ -189,20 +359,55 @@ impl H3Client {
             let _keep_sender = keep_sender;
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         }));
-        let (response, mut tx, mut rx) = if self.stream_up {
+        Ok(H3Connection {
+            sender: std::sync::Mutex::new(sender),
+            driver,
+            binding,
+            _endpoint: endpoint,
+        })
+    }
+
+    async fn open_inner(
+        &self,
+        open: &Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &mut crate::split_http::HelloOutcome,
+    ) -> Result<H3Tunnel, ClientError> {
+        let route = crate::local_proxy::route_source(self.remote);
+        let reusable = self.reuse_connections && self.certificate_pin.is_none();
+        let mut lease = self
+            .pool
+            .acquire(
+                route,
+                stream_up,
+                reusable,
+                |connection| !connection.driver.0.is_finished(),
+                self.connect_verified(operation),
+            )
+            .await?;
+        let connection = lease.connection();
+        let binding = connection.binding.as_ref();
+        let mut sender = connection
+            .sender
+            .lock()
+            .map_err(|_| ClientError::Http3)?
+            .clone();
+        let pair_id = lease.id();
+        let (response, mut tx, mut rx) = if stream_up {
             use crate::split_http::{self, Leg};
             let mut download = sender
                 .send_request(crate::channel_binding::attach(
-                    binding.as_ref(),
-                    split_http::request(&self.uri, Leg::Download, &self.authorization)?,
+                    binding,
+                    split_http::request_for(self.identity_routes.as_ref(), &self.uri, Leg::Download, &self.authorization, pair_id)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             download.finish().await.map_err(|_| ClientError::Http3)?;
             let mut upload = sender
                 .send_request(crate::channel_binding::attach(
-                    binding.as_ref(),
-                    split_http::request(&self.uri, Leg::Upload, &self.authorization)?,
+                    binding,
+                    split_http::request_for(self.identity_routes.as_ref(), &self.uri, Leg::Upload, &self.authorization, pair_id)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
@@ -238,7 +443,7 @@ impl H3Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let mut stream = sender
-                .send_request(crate::channel_binding::attach(binding.as_ref(), request)?)
+                .send_request(crate::channel_binding::attach(binding, request)?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             let response = stream
@@ -267,13 +472,26 @@ impl H3Client {
         let mut state = Session::new(Role::Client);
         let hello = Frame::Hello {
             version: protocol::VERSION,
-            capabilities: 0,
+            capabilities: protocol::CAP_PADDING,
         };
         state
             .apply(Direction::Send, &hello)
             .map_err(|_| ClientError::Protocol)?;
         send(&mut tx, &hello).await?;
-        let ack = decoder.next(&mut rx).await?.ok_or(ClientError::Protocol)?;
+        let ack = if self.auto_mode.is_some() && !stream_up {
+            match timeout(crate::split_http::HELLO_ACK_TIMEOUT, decoder.next(&mut rx)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    if !decoder.eof && decoder.decoder.pending_len() == 0 {
+                        *stage = crate::split_http::HelloOutcome::Silent;
+                    }
+                    return Err(ClientError::Timeout);
+                }
+            }
+        } else {
+            decoder.next(&mut rx).await?
+        }
+        .ok_or(ClientError::Protocol)?;
         state
             .apply(Direction::Receive, &ack)
             .map_err(|_| ClientError::Protocol)?;
@@ -286,24 +504,36 @@ impl H3Client {
         if !matches!(ack, Frame::HelloAck { .. }) {
             return Err(ClientError::Protocol);
         }
+        *stage = crate::split_http::HelloOutcome::Acked;
         state
-            .apply(Direction::Send, &open)
+            .apply(Direction::Send, open)
             .map_err(|_| ClientError::Protocol)?;
-        send(&mut tx, &open).await?;
-        let answer = decoder.next(&mut rx).await?.ok_or(ClientError::Protocol)?;
-        state
-            .apply(Direction::Receive, &answer)
-            .map_err(|_| ClientError::Protocol)?;
+        send(&mut tx, open).await?;
+        let answer = loop {
+            let frame = decoder.next(&mut rx).await?.ok_or(ClientError::Protocol)?;
+            state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ClientError::Protocol)?;
+            if matches!(frame, Frame::Padding(_)) {
+                // Padding must not reset the enclosing OPEN deadline or
+                // monopolize the task when frames are already buffered.
+                tokio::task::yield_now().await;
+                continue;
+            }
+            break frame;
+        };
         match answer {
-            Frame::OpenOk if state.tunnel_open() => Ok(H3Tunnel {
-                operation,
-                tx,
-                rx,
-                decoder,
-                state,
-                _driver: driver,
-                _endpoint: endpoint,
-            }),
+            Frame::OpenOk if state.tunnel_open() => {
+                lease.admitted();
+                Ok(H3Tunnel {
+                    operation,
+                    tx,
+                    rx,
+                    decoder,
+                    state,
+                    _lease: lease,
+                })
+            }
             Frame::OpenError(code) => {
                 crate::diag!(
                     Warn,
@@ -330,6 +560,13 @@ fn quic_error(error: QuicError) -> ClientError {
     }
 }
 
+struct H3Connection {
+    sender: std::sync::Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
+    driver: Driver,
+    binding: Option<crate::channel_binding::Key>,
+    _endpoint: ObservedEndpoint,
+}
+
 struct Driver(JoinHandle<()>);
 
 impl Drop for Driver {
@@ -338,7 +575,7 @@ impl Drop for Driver {
     }
 }
 
-/// A tunnel owns one dedicated verified QUIC connection and the H3 driver.
+/// A tunnel retains a lease on its verified QUIC connection.
 /// Its constructor is private and reachable only after valid OPEN_OK.
 pub struct H3Tunnel {
     operation: u64,
@@ -346,11 +583,16 @@ pub struct H3Tunnel {
     rx: Rx,
     decoder: Incoming,
     state: Session,
-    _driver: Driver,
-    _endpoint: ObservedEndpoint,
+    _lease: crate::connection_pool::Lease<H3Connection>,
 }
 
 impl H3Tunnel {
+    /// True when both tunnels share one verified transport connection.
+    /// Does not reveal peer addresses, credentials or connection identifiers.
+    pub fn shares_transport_with(&self, other: &Self) -> bool {
+        self._lease.shares_connection(&other._lease)
+    }
+
     pub async fn relay<S>(mut self, local: S) -> Result<(), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -396,7 +638,7 @@ impl H3Tunnel {
                         .await
                         .map_err(|_| ClientError::Timeout)?
                         .map_err(|_| ClientError::Http3)?;
-                    activity.fin();
+                    activity.half_closed();
                     let _ = upload_done.send(());
                     return Ok::<(), ClientError>(());
                 }
@@ -410,6 +652,7 @@ impl H3Tunnel {
                     .apply(Direction::Receive, &frame)
                     .map_err(|_| ClientError::Protocol)?;
                 match frame {
+                    Frame::Padding(_) => tokio::task::yield_now().await,
                     Frame::Data(data) => {
                         crate::diag!(
                             Trace,
@@ -435,7 +678,7 @@ impl H3Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
-                        activity.fin();
+                        activity.half_closed();
                         break;
                     }
                     Frame::Abort(code) => return Err(ClientError::Open(code)),
@@ -443,7 +686,22 @@ impl H3Tunnel {
                 }
             }
             if crate::relay_liveness::receive_tail(
-                decoder.next(rx),
+                async {
+                    loop {
+                        let frame = decoder.next(rx).await?;
+                        if let Some(padding @ Frame::Padding(_)) = &frame {
+                            if activity.both_finished() {
+                                return Err(ClientError::Protocol);
+                            }
+                            download_state
+                                .apply(Direction::Receive, padding)
+                                .map_err(|_| ClientError::Protocol)?;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        return Ok(frame);
+                    }
+                },
                 upload_finished,
                 ClientError::Timeout,
             )
@@ -484,6 +742,7 @@ impl H3Tunnel {
 struct Incoming {
     decoder: Decoder,
     ready: VecDeque<Frame>,
+    eof: bool,
 }
 
 impl Incoming {
@@ -497,6 +756,7 @@ impl Incoming {
             }
             let data = stream.recv_data().await.map_err(|_| ClientError::Http3)?;
             let Some(mut data) = data else {
+                self.eof = true;
                 self.decoder.finish().map_err(|_| ClientError::Protocol)?;
                 let trailers = timeout(IO_TIMEOUT, stream.recv_trailers())
                     .await
@@ -529,4 +789,67 @@ async fn send<S: quic::SendStream<Bytes>>(
         .await
         .map_err(|_| ClientError::Timeout)?
         .map_err(|_| ClientError::Http3)
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::security_profile::CertificatePin;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    async fn check_no_application_streams(server: &quinn::Endpoint) {
+        let incoming = server.accept().await.unwrap();
+        // A credential-free probe may close immediately after the verified
+        // client handshake, before the server confirms its final flight.
+        if let Ok(connection) = incoming.await {
+            assert!(!matches!(
+                timeout(Duration::from_millis(250), connection.accept_bi()).await,
+                Ok(Ok(_))
+            ));
+            assert!(!matches!(
+                timeout(Duration::from_millis(250), connection.accept_uni()).await,
+                Ok(Ok(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn background_probe_preserves_pki_hostname_and_pin() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let server = crate::quic_transport::server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![der.clone()],
+            key.into(),
+        )
+        .unwrap();
+        let remote = server.local_addr().unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let mut wrong_roots = RootCertStore::empty();
+        wrong_roots.add(other.cert.der().clone()).unwrap();
+        let token = URL_SAFE_NO_PAD.encode([0x42u8; 32]);
+        let pin = CertificatePin::from_der(der.as_ref());
+        let wrong_pin = CertificatePin::from_der(other.cert.der().as_ref());
+        let cases = [
+            ("localhost", roots.clone(), pin, Ok(())),
+            ("localhost", roots.clone(), wrong_pin, Err(ClientError::Tls)),
+            ("localhost", wrong_roots, pin, Err(ClientError::Tls)),
+            ("wrong.invalid", roots, pin, Err(ClientError::Tls)),
+        ];
+        for (name, roots, pin, expected) in cases {
+            let client = H3Client::new(remote, name, &token, roots)
+                .unwrap()
+                .with_certificate_pin(Some(pin))
+                .unwrap();
+            let (result, ()) = timeout(Duration::from_secs(15), async {
+                tokio::join!(client.probe(), check_no_application_streams(&server))
+            })
+            .await
+            .expect("bounded native handshake probe");
+            assert_eq!(result, expected);
+        }
+    }
 }

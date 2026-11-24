@@ -123,6 +123,8 @@ pub struct Profile {
     pub auth_token: String,
     pub tls_profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xhttp_mode: Option<XhttpMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<String>,
     pub transport: Transport,
     pub quic_connect_timeout_ms: u32,
@@ -134,6 +136,27 @@ pub enum Transport {
     Auto,
     H3,
     H2,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XhttpMode {
+    Auto,
+    StreamOne,
+    StreamUp,
+}
+
+impl Profile {
+    /// Own TLS defaults to adaptive XHTTP. Experimental security adapters
+    /// currently have a fixed mode and never silently downgrade.
+    pub fn effective_xhttp_mode(&self) -> XhttpMode {
+        if self.tls_profile == "default" {
+            self.xhttp_mode.unwrap_or(XhttpMode::Auto)
+        } else if crate::security_profile::CertificatePin::is_stream_up_profile(&self.tls_profile) {
+            XhttpMode::StreamUp
+        } else {
+            XhttpMode::StreamOne
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -224,13 +247,13 @@ impl Config {
     }
 }
 
-fn valid_id(s: &str) -> bool {
+pub(crate) fn valid_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
-fn valid_dns(name: &str) -> bool {
+pub(crate) fn valid_dns(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 253
         && name.parse::<IpAddr>().is_err()
@@ -255,7 +278,7 @@ fn valid_file_ref(raw: &str) -> bool {
             .any(|part| matches!(part, std::path::Component::ParentDir))
         && !raw.contains(['\n', '\r', '\0'])
 }
-fn valid_secret_ref(raw: &str) -> bool {
+pub(crate) fn valid_secret_ref(raw: &str) -> bool {
     if valid_file_ref(raw) {
         return true;
     }
@@ -432,7 +455,7 @@ impl ServerDocument {
         )
     }
 }
-fn valid_remote(raw: &str) -> bool {
+pub(crate) fn valid_remote(raw: &str) -> bool {
     if let Ok(addr) = raw.parse::<SocketAddr>() {
         return addr.port() > 0 && !addr.ip().is_unspecified();
     }
@@ -494,6 +517,11 @@ impl ClientDocument {
                         && profile.transport == Transport::H2),
                 format!("{field}.tls_profile"),
                 "unsupported TLS/HTTP fingerprint profile for this transport/backend (fail closed)",
+            )?;
+            ensure(
+                profile.xhttp_mode.is_none() || profile.tls_profile == "default",
+                format!("{field}.xhttp_mode"),
+                "explicit XHTTP selection requires own TLS; experimental profiles have a fixed mode",
             )?;
             ensure(
                 (500..=15_000).contains(&profile.quic_connect_timeout_ms),
@@ -610,7 +638,7 @@ fn editor_lock(path: &Path) -> Result<fs::File, ConfigError> {
 /// Callers must supply a trusted destination directory.
 pub fn atomic_write(path: &Path, config: &Config) -> Result<(), ConfigError> {
     let data = config.to_toml()?;
-    atomic_write_bytes(path, &data, None, sync_directory).map_err(WriteFailure::into_error)
+    atomic_write_bytes(path, &data, None, false, sync_directory).map_err(WriteFailure::into_error)
 }
 
 /// Cooperating editor writes are serialized across threads and processes.
@@ -632,8 +660,23 @@ fn guarded_write_with_sync(
     let data = config.to_toml()?;
     let _lock = editor_lock(path)?;
     require_unchanged(path, expected)?;
-    atomic_write_bytes(path, &data, Some(expected), sync_parent)?;
+    atomic_write_bytes(path, &data, Some(expected), false, sync_parent)?;
     Ok(data.into_bytes())
+}
+
+/// Signed trust snapshots share the same cooperating CAS lock and atomic
+/// publication as config. None is an explicit create-only operation, never
+/// an overwrite. The caller must validate the whole document before use.
+pub(crate) fn guarded_trust_write(
+    path: &Path,
+    data: &str,
+    expected: Option<&[u8]>,
+) -> Result<(), WriteFailure> {
+    let _lock = editor_lock(path)?;
+    if let Some(expected) = expected {
+        require_unchanged(path, expected)?;
+    }
+    atomic_write_bytes(path, data, expected, expected.is_none(), sync_directory)
 }
 
 fn sync_directory(parent: &Path) -> Check {
@@ -652,6 +695,7 @@ fn atomic_write_bytes(
     path: &Path,
     data: &str,
     expected: Option<&[u8]>,
+    create_only: bool,
     sync_parent: impl FnOnce(&Path) -> Check,
 ) -> Result<(), WriteFailure> {
     ensure(
@@ -673,14 +717,20 @@ fn atomic_write_bytes(
         temp_name.push(name);
         temp_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
         let temp = parent.join(temp_name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&temp) {
+        #[cfg(windows)]
+        let opened = crate::client_import::new_private_file(&temp);
+        #[cfg(not(windows))]
+        let opened = {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&temp)
+        };
+        match opened {
             Ok(file) => {
                 pending = Some((temp, file));
                 break;
@@ -704,8 +754,22 @@ fn atomic_write_bytes(
         if let Some(expected) = expected {
             require_unchanged(path, expected)?;
         }
-        fs::rename(&temp, path)
-            .map_err(|_| ConfigError::new("config", "cannot atomically replace configuration"))?;
+        if create_only {
+            // Link a complete synced inode without replacing an existing
+            // pathname (including a symlink). Unsupported filesystems refuse.
+            fs::hard_link(&temp, path)
+                .map_err(|_| ConfigError::new("config", "cannot publish new trust snapshot"))?;
+            fs::remove_file(&temp).map_err(|_| {
+                WriteFailure::AfterReplace(ConfigError::new(
+                    "config",
+                    "cannot remove published temporary link",
+                ))
+            })?;
+        } else {
+            fs::rename(&temp, path).map_err(|_| {
+                ConfigError::new("config", "cannot atomically replace configuration")
+            })?;
+        }
         sync_parent(parent).map_err(WriteFailure::AfterReplace)?;
         Ok(())
     })();
@@ -777,6 +841,46 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn own_tls_xhttp_mode_defaults_to_auto_and_is_strict() {
+        let original = client();
+        let Config::Client(defaults) = parse(&original).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(
+            defaults.client.profiles[0].effective_xhttp_mode(),
+            XhttpMode::Auto
+        );
+        for (raw, mode) in [
+            ("auto", XhttpMode::Auto),
+            ("stream-one", XhttpMode::StreamOne),
+            ("stream-up", XhttpMode::StreamUp),
+        ] {
+            let explicit = original.replacen(
+                "tls_profile = \"default\"",
+                &format!("tls_profile = \"default\"\nxhttp_mode = \"{raw}\""),
+                1,
+            );
+            let accepted = parse(&explicit).unwrap();
+            let Config::Client(doc) = &accepted else {
+                panic!("client");
+            };
+            assert_eq!(doc.client.profiles[0].xhttp_mode, Some(mode));
+            assert_eq!(parse(&accepted.to_toml().unwrap()).unwrap(), accepted);
+            let pinned = explicit.replace(
+                "tls_profile = \"default\"",
+                &format!("tls_profile = \"pinned-cert-v1:{}\"", "42".repeat(32)),
+            );
+            assert!(parse(&pinned).unwrap_err().field.contains("xhttp_mode"));
+        }
+        let invalid = original.replacen(
+            "tls_profile = \"default\"",
+            "tls_profile = \"default\"\nxhttp_mode = \"guess\"",
+            1,
+        );
+        assert!(parse(&invalid).is_err());
+    }
+
     #[test]
     fn rejects_unsafe_client_settings() {
         let original = client();

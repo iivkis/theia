@@ -9,7 +9,7 @@ use crate::{
     tui_candidates::CandidateReview,
     tui_discovery::DiscoveryPanel,
     tui_domain::DomainPanel,
-    tui_editor::{Editor, PinnedModeReview},
+    tui_editor::{Editor, PinnedModeReview, RecordAction, RecordReview},
     tui_probe::ProbePanel,
     tui_runtime::RuntimePanel,
     Role,
@@ -253,12 +253,44 @@ enum DisableFlow {
 type ExportResult = (Editor, Result<PathBuf, &'static str>);
 type PinnedReviewResult = (Editor, Result<PinnedModeReview, &'static str>);
 
+enum RecordFlow {
+    Input {
+        action: RecordAction,
+        fields: Vec<String>,
+        focus: usize,
+    },
+    Confirm(RecordReview),
+}
+
+impl RecordFlow {
+    fn body(&self) -> String {
+        match self {
+            Self::Confirm(review) => review.body().to_owned(),
+            Self::Input { action, fields, focus } => {
+                let mut body = format!("{}\n", action.title());
+                for (index, ((label, hidden), value)) in action.fields().iter().zip(fields).enumerate() {
+                    let marker = if index == *focus { '>' } else { ' ' };
+                    let shown = if *hidden {
+                        if value.is_empty() { "[пусто]" } else { "[скрыто]" }
+                    } else {
+                        value.as_str()
+                    };
+                    body.push_str(&format!("{marker} {label}: {shown}\n"));
+                }
+                body.push_str("\nTab/Shift+Tab: поле; Ctrl+U: очистить; Enter: preview; Esc: отменить.\nВ скрытые поля вводите только ссылки, не секреты.");
+                body
+            }
+        }
+    }
+}
+
 struct Interaction {
     editor: Option<Editor>,
     issuance: Option<IssueFlow>,
     issue_kind: IssueKind,
     revocation: Option<DisableFlow>,
     importing: Option<ImportFlow>,
+    records: Option<RecordFlow>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
     candidate_batch: Option<CandidateBatchPanel>,
@@ -282,6 +314,7 @@ impl Interaction {
             issue_kind: IssueKind::NewUser,
             revocation: None,
             importing: None,
+            records: None,
             discovery: None,
             candidates: None,
             candidate_batch: None,
@@ -380,6 +413,17 @@ impl Interaction {
             let saved = editor.refresh_credential(&invitation).is_ok();
             let _ = tx.send((editor, saved));
         });
+    }
+
+    fn paste_record_field(&mut self, text: &str) {
+        if let Some(RecordFlow::Input { fields, focus, .. }) = self.records.as_mut() {
+            let input = text.trim_end_matches(['\r', '\n']);
+            if !input.chars().any(char::is_control)
+                && fields[*focus].len().saturating_add(input.len()) <= 1024
+            {
+                fields[*focus].push_str(input);
+            }
+        }
     }
 
     /// Bracketed-paste source text stays in memory and is never rendered.
@@ -504,6 +548,22 @@ impl Interaction {
             return false;
         }
         if let Some(domain) = self.domain.as_mut() {
+            if domain.is_manual_input() {
+                match key.code {
+                    KeyCode::Esc => {
+                        domain.back_or_close();
+                    }
+                    KeyCode::Enter => domain.ask_confirmation(),
+                    KeyCode::Backspace => domain.manual_backspace(),
+                    KeyCode::Char(ch)
+                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        domain.manual_insert(ch);
+                    }
+                    _ => {}
+                }
+                return false;
+            }
             match key.code {
                 KeyCode::Esc => {
                     if domain.back_or_close() {
@@ -515,6 +575,7 @@ impl Interaction {
                 KeyCode::Char(' ') => domain.toggle_current(),
                 KeyCode::Enter => domain.ask_confirmation(),
                 KeyCode::Char('a') => domain.open_review(),
+                KeyCode::Char('m') if key.modifiers.is_empty() => domain.begin_manual(),
                 KeyCode::Char('y') if domain.is_dns_confirming() => {
                     domain.confirm_dns_and_start();
                 }
@@ -645,6 +706,51 @@ impl Interaction {
             }
             return model.update(key);
         };
+        if let Some(flow) = self.records.take() {
+            match flow {
+                RecordFlow::Confirm(review) => match key.code {
+                    KeyCode::Char('y') if key.modifiers.is_empty() => {
+                        match editor.stage_record(review) {
+                            Ok(()) => self.start_save(),
+                            Err(message) => editor.error = Some(message.into()),
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {}
+                    _ => self.records = Some(RecordFlow::Confirm(review)),
+                },
+                RecordFlow::Input { action, mut fields, mut focus } => {
+                    match key.code {
+                        KeyCode::Esc => return false,
+                        KeyCode::Enter => match editor.review_record(action, &fields) {
+                            Ok(review) => {
+                                editor.error = None;
+                                self.records = Some(RecordFlow::Confirm(review));
+                                return false;
+                            }
+                            Err(message) => editor.error = Some(message.into()),
+                        },
+                        KeyCode::Tab => focus = (focus + 1) % fields.len(),
+                        KeyCode::BackTab => focus = (focus + fields.len() - 1) % fields.len(),
+                        KeyCode::Backspace => {
+                            fields[focus].pop();
+                        }
+                        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                            fields[focus].clear();
+                        }
+                        KeyCode::Char(ch)
+                            if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                                && !ch.is_control()
+                                && fields[focus].len() + ch.len_utf8() <= 1024 =>
+                        {
+                            fields[focus].push(ch);
+                        }
+                        _ => {}
+                    }
+                    self.records = Some(RecordFlow::Input { action, fields, focus });
+                }
+            }
+            return false;
+        }
         if let Some(flow) = self.issuance.take() {
             match flow {
                 IssueFlow::Input(mut id) => match key.code {
@@ -1058,6 +1164,38 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            let record_action = if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                match (editor.role(), key.code) {
+                    (Role::Server, KeyCode::Char('N')) => Some(RecordAction::NewInbound),
+                    (Role::Client, KeyCode::Char('N')) => Some(RecordAction::NewProfile),
+                    (_, KeyCode::Char('D')) => Some(RecordAction::DeleteRecord),
+                    (Role::Client, KeyCode::Char('A')) => Some(RecordAction::ActivateProfile),
+                    (Role::Server, KeyCode::Char('G')) => Some(RecordAction::SetGrants),
+                    (Role::Server, KeyCode::Char('U')) => Some(RecordAction::DeleteUser),
+                    (Role::Server, KeyCode::Char('E')) => Some(RecordAction::EditTls),
+                    (Role::Client, KeyCode::Char('E')) => Some(RecordAction::EditTrust),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(action) = record_action {
+                match editor.record_fields(action) {
+                    Ok(fields) if fields.is_empty() => match editor.review_record(action, &fields) {
+                        Ok(review) => {
+                            editor.error = None;
+                            self.records = Some(RecordFlow::Confirm(review));
+                        }
+                        Err(message) => editor.error = Some(message.into()),
+                    },
+                    Ok(fields) => {
+                        editor.error = None;
+                        self.records = Some(RecordFlow::Input { action, fields, focus: 0 });
+                    }
+                    Err(message) => editor.error = Some(message.into()),
+                }
+                return false;
+            }
             if editor.role() == Role::Client
                 && key.code == KeyCode::Char('p')
                 && key.modifiers.is_empty()
@@ -1357,6 +1495,19 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             "Проверка изменений и атомарная запись TOML выполняются.\nRuntime не перезагружается.\nДождитесь результата операции.",
             true,
         );
+    } else if let Some(flow) = interaction.and_then(|ui| ui.records.as_ref()) {
+        let mut body = flow.body();
+        if let Some(editor) = interaction.and_then(|ui| ui.editor.as_ref()) {
+            if let Some(error) = editor.error.as_deref() {
+                body.push_str(&format!("\n\n{error}"));
+            }
+            if let RecordFlow::Input { action, .. } = flow {
+                if let Some(catalog) = editor.record_user_catalog(*action) {
+                    body.push_str(&format!("\n\n{catalog}"));
+                }
+            }
+        }
+        panel(frame, parts[1], "Управление записями TOML", &body, true);
     } else if let Some(flow) = interaction.and_then(|ui| ui.issuance.as_ref()) {
         draw_issuance(
             frame,
@@ -1439,9 +1590,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     }
     let footer = if model.screen == Screen::Client {
-        "p: Windows proxy  i: импорт  l: ссылка  Ctrl+S: сохранить"
+        "N/D/A/E: профили  p: Windows proxy  i: импорт  Ctrl+S: сохранить"
     } else {
-        "j/k: запись  Tab: поле  Enter/e: ввод  l: ссылка  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить  p: сеть"
+        "N/D/G/U/E: записи  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
     };
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
@@ -1625,9 +1776,9 @@ fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Opt
         ImportFlow::Preview { invitation, ca, public_ref } => (
             "F-14: безопасный предпросмотр подключения",
             format!(
-                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nTLS profile: {}\nTransport: {:?}\nBearer: {}\nCA trust: {}\nPin из приглашения сверяйте по доверенному каналу; это не CA.\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
+                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nTLS profile: {}\nTransport: {:?}\nXHTTP: {:?}\nBearer: {}\nCA trust: {}\nPin из приглашения сверяйте по доверенному каналу; это не CA.\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
                 invitation.id, invitation.endpoint, invitation.server_name,
-                invitation.tls_profile(), invitation.transport,
+                invitation.tls_profile(), invitation.transport, invitation.xhttp_mode(),
                 if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },
                 if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
                 if editor.is_some_and(|e| e.can_refresh_credential(invitation)) { "r: отдельная замена credential существующего профиля; выбранный CA не используется.\n" } else { "" },
@@ -1684,7 +1835,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (URI/локальный файл, скрытый ввод). Ctrl+S только сохраняет; runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (URI/локальный файл, скрытый ввод). N: создать запись; D: удалить; A: активировать профиль; G: grants; U: удалить пользователя; E: TLS/CA и credential. Ctrl+S только сохраняет; runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
@@ -1700,7 +1851,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     panel(
         frame,
         area,
-        "Редактор TOML (указанный файл, 3 поля)",
+        "Редактор TOML (указанный файл)",
         &message,
         true,
     );
@@ -1766,7 +1917,10 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
                         return Ok(());
                     }
                 }
-                Event::Paste(text) => interaction.paste_import_source(&text),
+                Event::Paste(text) => {
+                    interaction.paste_record_field(&text);
+                    interaction.paste_import_source(&text);
+                }
                 _ => {}
             }
         }
@@ -2152,6 +2306,57 @@ mod tests {
             .map(|line| line.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn record_modal_masks_references_and_requires_separate_save_confirmation() {
+        use crate::config::{self, Config};
+        use std::{fs, thread, time::Instant};
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-record-lifecycle-ui-{}.toml",
+            std::process::id()
+        ));
+        let original = include_str!("../../../examples/client.toml");
+        fs::write(&path, original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+
+        ui.update(&mut model, press(KeyCode::Char('E')));
+        assert!(matches!(ui.records, Some(RecordFlow::Input { .. })));
+        ui.paste_record_field("file:/private/ca.pem");
+        ui.update(&mut model, press(KeyCode::Tab));
+        ui.paste_record_field("env:PRIVATE_CREDENTIAL");
+        let rendered = rendered_interaction(120, 40, &model, &ui);
+        assert!(rendered.contains("скрыто"));
+        assert!(!rendered.contains("PRIVATE_CREDENTIAL"));
+        assert!(!rendered.contains("/private/ca.pem"));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.records, Some(RecordFlow::Confirm(_))));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.records.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        ui.update(&mut model, press(KeyCode::Char('E')));
+        ui.paste_record_field("file:/private/ca.pem");
+        ui.update(&mut model, press(KeyCode::Tab));
+        ui.paste_record_field("env:PRIVATE_CREDENTIAL");
+        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        let until = Instant::now() + Duration::from_secs(5);
+        while ui.saving.is_some() && Instant::now() < until {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ui.saving.is_none());
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        let Config::Client(doc) = config::read_file(&path).unwrap() else {
+            panic!("client fixture");
+        };
+        assert_eq!(doc.client.profiles[0].auth_token, "env:PRIVATE_CREDENTIAL");
+        assert_eq!(doc.client.profiles[0].tls_ca.as_deref(), Some("file:/private/ca.pem"));
+        fs::remove_file(&path).unwrap();
+        let _ = fs::remove_file(config::lock_path(&path).unwrap());
     }
 
     #[test]

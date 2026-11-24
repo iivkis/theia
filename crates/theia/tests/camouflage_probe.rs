@@ -24,12 +24,17 @@ struct Fixture {
 }
 
 async fn fixture(alpn: &[u8]) -> Fixture {
+    fixture_with_group(alpn, rustls::NamedGroup::X25519).await
+}
+
+async fn fixture_with_group(alpn: &[u8], group: rustls::NamedGroup) -> Fixture {
     let signed = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = signed.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(signed.key_pair.serialize_der());
-    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups.retain(|item| item.name() == group);
+    assert!(!provider.kx_groups.is_empty());
+    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
     .with_protocol_versions(&[&rustls::version::TLS13])
     .unwrap()
     .with_no_client_auth()
@@ -98,6 +103,23 @@ async fn strict_tls13_h2_observations_leave_fingerprint_unknown() {
         assert!(!h2.eligible, "first flight fingerprint is not verified");
         assert!(h2.score > 0 && h2.score < 100);
         assert!(!report.evidence.suitability(Transport::H3).eligible);
+        f.server.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p256_only_reference_does_not_prove_x25519() {
+    timeout(DEADLINE, async {
+        let f = fixture_with_group(b"h2", rustls::NamedGroup::secp256r1).await;
+        let result = probe_tls_h2(
+            request(f.address, "localhost"),
+            roots(f.certificate),
+            ProbeApproval::isolated_loopback_fixture(f.address),
+        )
+        .await;
+        assert!(matches!(result, Err(ProbeError::TlsRejected)));
         f.server.await.unwrap();
     })
     .await

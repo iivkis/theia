@@ -26,6 +26,7 @@ pub enum DnsConsent {
 pub enum DnsError {
     NotApproved,
     NotCatalogued,
+    InvalidDomain,
     TimedOut,
     /// DNS reply reached the UI after its 60-second freshness window.
     StaleObservation,
@@ -43,6 +44,23 @@ pub fn validate_dns_request(domain: &str, consent: DnsConsent) -> Result<(), Dns
     }
     if !POPULAR_HTTPS_DOMAINS.contains(&domain) {
         return Err(DnsError::NotCatalogued);
+    }
+    Ok(())
+}
+
+/// Explicit manual mode takes a single canonical DNS hostname, not a URL,
+/// address, wildcard or resolver-search-suffix-relative name.
+pub fn validate_manual_dns_request(domain: &str, consent: DnsConsent) -> Result<(), DnsError> {
+    if consent != DnsConsent::Approved {
+        return Err(DnsError::NotApproved);
+    }
+    if !crate::config::valid_dns(domain)
+        || !domain.contains('.')
+        || domain != domain.to_ascii_lowercase()
+        || domain.ends_with(".localhost")
+        || domain.ends_with(".local")
+    {
+        return Err(DnsError::InvalidDomain);
     }
     Ok(())
 }
@@ -81,8 +99,24 @@ pub async fn resolve_catalogued_domain(
     consent: DnsConsent,
 ) -> Result<Vec<IpAddr>, DnsError> {
     validate_dns_request(domain, consent)?;
+    resolve_validated_domain(domain).await
+}
+
+/// Manual and catalogue paths share the same bounded resolver and answer
+/// validation; neither lookup grants permission to connect.
+pub async fn resolve_manual_domain(
+    domain: &str,
+    consent: DnsConsent,
+) -> Result<Vec<IpAddr>, DnsError> {
+    validate_manual_dns_request(domain, consent)?;
+    resolve_validated_domain(domain).await
+}
+
+async fn resolve_validated_domain(domain: &str) -> Result<Vec<IpAddr>, DnsError> {
+    // An absolute DNS name avoids the OS resolver's search suffix.
+    let absolute = format!("{domain}.");
     timeout(DNS_DEADLINE, async move {
-        let resolved = tokio::net::lookup_host((domain, 443))
+        let resolved = tokio::net::lookup_host((absolute.as_str(), 443))
             .await
             .map_err(|_| DnsError::LookupFailed)?;
         let mut addresses = Vec::new();
@@ -132,6 +166,28 @@ mod tests {
         assert_eq!(
             resolve_catalogued_domain("unlisted.example", DnsConsent::Approved).await,
             Err(DnsError::NotCatalogued)
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_dns_requires_separate_consent_and_one_canonical_hostname() {
+        assert_eq!(
+            resolve_manual_domain("manual.example", DnsConsent::Denied).await,
+            Err(DnsError::NotApproved)
+        );
+        for bad in [
+            "", "localhost", "127.0.0.1", "https://example.org", "*.example.org",
+            "example.org:443", "Example.org", "example.org.", "host.local",
+            "host.localhost", "a..example.org",
+        ] {
+            assert_eq!(
+                resolve_manual_domain(bad, DnsConsent::Approved).await,
+                Err(DnsError::InvalidDomain)
+            );
+        }
+        assert_eq!(
+            validate_manual_dns_request("manual.example", DnsConsent::Approved),
+            Ok(())
         );
     }
 

@@ -254,14 +254,15 @@ class SpecContractTests(unittest.TestCase):
         for term in ("MAX_PAYLOAD: usize = 65_536", "HEADER_LEN: usize = 6",
                      "pub fn encode(", "pub fn decode(", "pub fn feed_each(",
                      "pub struct Decoder", "pub struct Session", "fn tunnel_open(",
-                     "InvalidFlags", "InvalidTransition", "UnsupportedVersion"):
+                     "InvalidFlags", "InvalidTransition", "UnsupportedVersion", "CAP_PADDING"):
             self.assertIn(term, implementation)
         for test in ("documented_golden_vectors_are_exact",
                      "size_boundaries_are_enforced_before_buffering",
                      "stream_decoder_accepts_every_split_and_multiple_coalesced_frames",
                      "local_success_is_gated_on_open_ok_not_http_or_hello_ack",
                      "full_duplex_half_close_then_both_fin_and_drain",
-                     "deterministic_random_chunks_never_panic_and_bound_partial_memory"):
+                     "deterministic_random_chunks_never_panic_and_bound_partial_memory",
+                     "padding_v1_golden_vectors_and_capability_subset"):
             self.assertIn(test, tests)
 
     def test_m21_h2_ingress_is_real_and_has_fail_closed_tests(self):
@@ -346,6 +347,9 @@ class SpecContractTests(unittest.TestCase):
         split = read("crates/theia/src/split_http.rs")
         self.assertIn("UPLOAD_PATH", split)
         self.assertIn("DOWNLOAD_PATH", split)
+        self.assertIn('"/v1/stream-up/upload"', split)
+        self.assertIn('"/v1/stream-up/download"', split)
+        self.assertIn("stream_up_only_accepts_current_v1_routes", split)
         self.assertIn("PAIR_TIMEOUT", split)
         for path in ("client.rs", "h3_client.rs"):
             self.assertIn("with_stream_up", read("crates/theia/src/" + path))
@@ -359,6 +363,7 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("matches_selection", review)
         self.assertIn("checked_duration_since", review)
         self.assertIn("Apply ЗАБЛОКИРОВАН", review)
+        self.assertIn("h3_optional_evidence_does_not_claim_readiness", review)
         for forbidden in ("probe_dual_batch(", "std::fs", "write_all(", "runtime_apply"):
             self.assertNotIn(forbidden, review)
         for path in ("tui_candidate_batch.rs", "tui_domain.rs"):
@@ -401,7 +406,7 @@ class SpecContractTests(unittest.TestCase):
             with self.subTest(adapter=adapter):
                 self.assertIn("relay_liveness::Activity::new()", source)
                 self.assertIn("activity.data(", source)
-                self.assertIn("activity.fin()", source)
+                self.assertIn("activity.half_closed()", source)
                 self.assertIn("relay_liveness::receive_tail(", source)
         tests = read("crates/theia/tests/tunnel_liveness.rs")
         self.assertIn("production_h2_h3_asymmetric_traffic_half_close_and_idle", tests)
@@ -434,6 +439,11 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("self.observation.sent.load", quic)
         self.assertIn("!self.observation.received.load", quic)
         self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", proxy)
+        self.assertIn("recheck_deadline_is_not_extended_and_only_one_generation_can_claim_it", proxy)
+        self.assertIn("idle_profile_rechecks_quic_without_opening_an_application_tunnel", proxy)
+        self.assertIn("result = &mut maintenance => return result", proxy)
+        self.assertIn("self.h3.probe().await", proxy)
+        self.assertIn("self.verified_connection().await.map(|_| ())", read("crates/theia/src/h3_client.rs"))
         self.assertIn("route_change_rejects_stale_results_and_unknown_route_disables_cache", proxy)
         self.assertIn("route_source(self.h3.remote())", proxy)
         tests = read("crates/theia/tests/client_h2.rs")
@@ -484,6 +494,35 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("crate::tcp_bbr::bind", server)
         self.assertIn("crate::tcp_bbr::select(&socket)", server)
         self.assertIn("BbrConfig::default()", read("crates/theia/src/quic_transport.rs"))
+
+    def test_offline_signed_descriptor_has_fail_closed_acceptance_contract(self):
+        source = read("crates/theia/src/descriptor.rs")
+        tests = read("crates/theia/tests/descriptor.rs")
+        for term in ("SmartTheia/inbound-descriptor/v1", "UnparsedPublicKey",
+                     "deny_unknown_fields", "minimum_revision", "Error::Rollback",
+                     "Error::Equivocation", "guarded_trust_write",
+                     "struct Transition", "MAX_TRANSITIONS", "ReenrollmentRequired",
+                     "pub fn promote", "snapshot.validate(&self.anchor)"):
+            self.assertIn(term, source)
+        for term in ("signed_descriptor_binds_every_field_to_independent_anchor",
+                     "signed_invalid_fields_and_unsupported_contract_are_refused",
+                     "durable_revision_floor_rejects_rollback_equivocation_and_key_substitution_after_restart",
+                     "explicit_rotation_survives_restart_and_retires_previous_signers",
+                     "missed_overlap_requires_independent_enrollment_and_preserves_snapshot",
+                     "persisted_transition_tampering_is_rejected_without_partial_update",
+                     "bounded_history_requires_reenrollment_instead_of_forgetting_retired_keys",
+                     "competing_promotion_and_old_key_update_have_one_revision_guard",
+                     "offline_cli_requires_exact_preview_digest_and_guarded_revision",
+                     "persisted_acceptance_time_prevents_ordinary_clock_rollback"):
+            self.assertIn(term, tests)
+        for path in ("client.rs", "h3_client.rs", "server.rs", "h3_server.rs"):
+            self.assertNotIn("descriptor::Store", read("crates/theia/src/" + path))
+        cli = read("crates/theia/src/descriptor_cli.rs")
+        for term in ("--expected-revision", "--sha256", "--confirm", "runtime UNCHANGED",
+                     "preview_promotion", "update_at"):
+            self.assertIn(term, cli)
+        for term in ("TcpStream", "UdpSocket", "reqwest", "runtime_apply"):
+            self.assertNotIn(term, cli)
 
     def test_retired_local_tls_reality_has_no_production_or_compatibility_path(self):
         self.assertFalse((ROOT / "crates/theia/src/reality_identity.rs").exists())

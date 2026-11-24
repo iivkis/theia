@@ -2,7 +2,7 @@
 //! No system proxy changes, destination DNS lookups or live tunnel migration.
 use crate::{
     client::{error_kind, ClientError, H2Client, Tunnel},
-    config::{self, Config, Profile, Transport},
+    config::{self, Config, Profile, Transport, XhttpMode},
     diagnostics::{self, Value},
     h3_client::{H3Client, H3Tunnel},
     protocol::{self, Address, ErrorCode, Frame},
@@ -18,7 +18,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Notify, Semaphore},
     task::JoinSet,
     time::timeout,
 };
@@ -28,6 +28,7 @@ const HEADER_LIMIT: usize = 8192;
 const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(10);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const CA_LIMIT: usize = 1024 * 1024;
+const AUTO_QUIC_ATTEMPTS: usize = 2;
 
 const HTTP_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const HTTP_BAD: &[u8] =
@@ -81,6 +82,9 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
     // F-13: runtime selection must match strict typed TOML validation even
     // if a direct library caller bypasses document parsing. Never downgrade
     // a named browser-style profile to rustls or apply it to QUIC/H3/auto.
+    if profile.xhttp_mode.is_some() && profile.tls_profile != "default" {
+        return Err(ClientError::Configuration);
+    }
     if profile.tls_profile == "browser-h2-btls-v1" {
         if profile.transport != Transport::H2 {
             return Err(ClientError::Configuration);
@@ -109,46 +113,75 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 .ok_or(ClientError::Configuration)?,
         )
     };
-    let stream_up =
-        crate::security_profile::CertificatePin::is_stream_up_profile(&profile.tls_profile);
+    let mode = profile.effective_xhttp_mode();
+    let stream_up = mode == XhttpMode::StreamUp;
+    let auto_xhttp = mode == XhttpMode::Auto;
+    let ttl = Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s));
     match profile.transport {
-        Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)?
-            .with_certificate_pin(certificate_pin)?
-            .with_stream_up(stream_up)
-            .map(Arc::new)
-            .map(ProxyClient::H2),
+        Transport::H2 => {
+            let endpoint = if certificate_pin.is_none() {
+                resolve_server(profile).await?.to_string()
+            } else {
+                profile.server.clone()
+            };
+            let client = H2Client::new(&endpoint, &profile.server_name, &token, roots)?
+                .with_certificate_pin(certificate_pin)?
+                .with_stream_up(stream_up)?;
+            let client = if auto_xhttp {
+                client.with_auto_stream_up(ttl)?
+            } else {
+                client
+            };
+            Ok(ProxyClient::H2(Arc::new(client.with_connection_pool())))
+        }
         Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
-            let remote = timeout(NEGOTIATE_TIMEOUT, tokio::net::lookup_host(&profile.server))
-                .await
-                .map_err(|_| ClientError::Timeout)?
-                .map_err(|_| ClientError::Io)?
-                .next()
-                .ok_or(ClientError::Io)?;
-            let h3 = Arc::new(
-                H3Client::new(remote, &profile.server_name, &token, roots.clone())?
-                    .with_certificate_pin(certificate_pin)?
-                    .with_stream_up(stream_up)?
-                    .with_connect_timeout(Duration::from_millis(u64::from(
-                        profile.quic_connect_timeout_ms,
-                    )))?,
-            );
+            let remote = resolve_server(profile).await?;
+            let h3 = H3Client::new(remote, &profile.server_name, &token, roots.clone())?
+                .with_certificate_pin(certificate_pin)?
+                .with_stream_up(stream_up)?
+                .with_connect_timeout(Duration::from_millis(u64::from(
+                    profile.quic_connect_timeout_ms,
+                )))?;
+            let h3 = h3.with_connection_pool();
+            let h3 = Arc::new(if auto_xhttp {
+                h3.with_auto_stream_up(ttl)?
+            } else {
+                h3
+            });
             if profile.transport == Transport::H3 {
                 return Ok(ProxyClient::H3(h3));
             }
-            let h2 = Arc::new(
-                H2Client::new(&profile.server, &profile.server_name, &token, roots)?
-                    .with_certificate_pin(certificate_pin)?
-                    .with_stream_up(stream_up)?,
-            );
+            // Both carriers use the same resolved endpoint. Do not resolve
+            // the hostname again during fallback; retain the configured SNI,
+            // trust anchors, certificate pin and authorization unchanged.
+            let h2 = H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
+                .with_certificate_pin(certificate_pin)?
+                .with_stream_up(stream_up)?;
+            let h2 = h2.with_connection_pool();
+            let h2 = Arc::new(if auto_xhttp {
+                h2.with_auto_stream_up(ttl)?
+            } else {
+                h2
+            });
             Ok(ProxyClient::Auto(Arc::new(AutoClient {
                 h2,
                 h3,
-                ttl: Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s)),
+                ttl,
                 negative: Mutex::new(NegativeCache::default()),
+                cache_changed: Notify::new(),
             })))
         }
     }
+}
+
+async fn resolve_server(profile: &Profile) -> Result<SocketAddr, ClientError> {
+    timeout(NEGOTIATE_TIMEOUT, tokio::net::lookup_host(&profile.server))
+        .await
+        .map_err(|_| ClientError::Timeout)?
+        .map_err(|_| ClientError::Io)?
+        .next()
+        .ok_or(ClientError::Io)
 }
 
 #[derive(Clone)]
@@ -162,7 +195,7 @@ enum ProxyClient {
 /// this temporary socket sends no application datagram and performs no DNS.
 /// Preserve IPv6 scope, discard the ephemeral local port. A failed observation
 /// must never authorize reuse of an earlier negative cache entry.
-fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
+pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
     let bind = if remote.is_ipv4() {
         SocketAddr::from(([0, 0, 0, 0], 0))
     } else {
@@ -192,7 +225,10 @@ impl NegativeCache {
             self.invalidate();
         }
         if self.expires.is_some_and(|until| now >= until) {
-            self.expires = None;
+            // A foreground request may win the expiry race. Retire the
+            // previous generation so a sleeping maintenance task cannot
+            // publish evidence for it later.
+            self.invalidate();
         }
         (self.generation, self.expires.is_some())
     }
@@ -202,10 +238,36 @@ impl NegativeCache {
         self.expires = None;
     }
 
-    fn record(&mut self, generation: u64, now: Instant, ttl: Duration) {
-        if self.generation == generation && self.route.is_some() && !ttl.is_zero() {
-            self.expires = now.checked_add(ttl);
+    fn record(&mut self, generation: u64, now: Instant, ttl: Duration) -> bool {
+        if self.generation != generation
+            || self.route.is_none()
+            || ttl.is_zero()
+            || self.expires.is_some()
+        {
+            return false;
         }
+        // Concurrent failures must not push the first recheck further away.
+        self.expires = now.checked_add(ttl);
+        self.expires.is_some()
+    }
+
+    fn begin_recheck(
+        &mut self,
+        generation: u64,
+        deadline: Instant,
+        route: Option<SocketAddr>,
+        now: Instant,
+    ) -> Option<u64> {
+        if self.generation != generation || self.expires != Some(deadline) || now < deadline {
+            return None;
+        }
+        if route.is_none() || self.route != route {
+            self.route = route;
+            self.invalidate();
+            return None;
+        }
+        self.invalidate();
+        Some(self.generation)
     }
 }
 
@@ -214,6 +276,7 @@ struct AutoClient {
     h3: Arc<H3Client>,
     ttl: Duration,
     negative: Mutex<NegativeCache>,
+    cache_changed: Notify,
 }
 
 impl AutoClient {
@@ -222,7 +285,12 @@ impl AutoClient {
             .negative
             .lock()
             .map_err(|_| ClientError::Configuration)?;
-        Ok(cache.observe(route_source(self.h3.remote()), Instant::now()))
+        let previous = cache.generation;
+        let observed = cache.observe(route_source(self.h3.remote()), Instant::now());
+        if previous != cache.generation {
+            self.cache_changed.notify_one();
+        }
+        Ok(observed)
     }
 
     fn complete(&self, generation: u64, unreachable: bool) -> Result<bool, ClientError> {
@@ -236,18 +304,88 @@ impl AutoClient {
         if current != cache.route {
             cache.route = current;
             cache.invalidate();
+            self.cache_changed.notify_one();
         }
         if !unreachable {
             if cache.generation == generation {
                 cache.invalidate();
+                self.cache_changed.notify_one();
             }
             return Ok(false);
         }
         if cache.generation != generation {
             return Ok(false);
         }
-        cache.record(generation, Instant::now(), self.ttl);
+        if cache.record(generation, Instant::now(), self.ttl) {
+            self.cache_changed.notify_one();
+        }
         Ok(true)
+    }
+
+    /// One scoped maintenance future per running auto profile. No detached
+    /// task or application credentials, and no mutex held across an await.
+    async fn maintain(&self) -> Result<(), ClientError> {
+        loop {
+            let pending = {
+                let cache = self
+                    .negative
+                    .lock()
+                    .map_err(|_| ClientError::Configuration)?;
+                cache.expires.map(|deadline| (cache.generation, deadline))
+            };
+            let Some((generation, deadline)) = pending else {
+                self.cache_changed.notified().await;
+                continue;
+            };
+            tokio::select! {
+                _ = self.cache_changed.notified() => continue,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+            }
+            let generation = {
+                let mut cache = self
+                    .negative
+                    .lock()
+                    .map_err(|_| ClientError::Configuration)?;
+                cache.begin_recheck(
+                    generation,
+                    deadline,
+                    route_source(self.h3.remote()),
+                    Instant::now(),
+                )
+            };
+            let Some(generation) = generation else {
+                continue;
+            };
+            for attempt in 0..AUTO_QUIC_ATTEMPTS {
+                match self.h3.probe().await {
+                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
+                        if self.observe()?.0 != generation {
+                            break;
+                        }
+                    }
+                    Err(ClientError::QuicUnreachable) => {
+                        self.complete(generation, true)?;
+                        break;
+                    }
+                    result => {
+                        // Verified success or a terminal failure clears the
+                        // negative cache; a new tunnel must verify its own
+                        // connection. Never authorize H2 on a TLS error.
+                        self.complete(generation, false)?;
+                        match result {
+                            Ok(()) => crate::diag!(Debug, "client.auto", "background_h3_verified"),
+                            Err(error) => crate::diag!(
+                                Warn,
+                                "client.auto",
+                                "background_h3_terminal_failure",
+                                "reason" = Value::Label(error_kind(&error))
+                            ),
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
@@ -259,48 +397,69 @@ impl AutoClient {
             "generation" = Value::Count(generation),
             "negative_cache_hit" = Value::Flag(cached)
         );
+        // Keep the actual initial XHTTP mode across a fresh H3-to-H2
+        // fallback. Cached H2-only requests may use their own carrier cache.
+        let preferred = if cached {
+            None
+        } else {
+            Some(self.h3.preferred_stream_up()?)
+        };
         if !cached {
-            match self.h3.open(address.clone(), port).await {
-                Ok(tunnel) => {
-                    self.complete(generation, false)?;
-                    crate::diag!(
-                        Debug,
-                        "client.auto",
-                        "selected_h3",
-                        "generation" = Value::Count(generation)
-                    );
-                    eprintln!("transport=h3");
-                    return Ok(ProxyTunnel::H3(Box::new(tunnel)));
-                }
-                Err(ClientError::QuicUnreachable) => {
-                    if !self.complete(generation, true)? {
+            for attempt in 0..AUTO_QUIC_ATTEMPTS {
+                match self
+                    .h3
+                    .open_preferred(address.clone(), port, preferred)
+                    .await
+                {
+                    Ok(tunnel) => {
+                        self.complete(generation, false)?;
+                        crate::diag!(
+                            Debug,
+                            "client.auto",
+                            "selected_h3",
+                            "generation" = Value::Count(generation)
+                        );
+                        eprintln!("transport=h3");
+                        return Ok(ProxyTunnel::H3(Box::new(tunnel)));
+                    }
+                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
+                        // Retry only a pre-authentication handshake with observed
+                        // UDP silence, and never carry evidence across a route change.
+                        if self.observe()?.0 != generation {
+                            return Err(ClientError::QuicUnreachable);
+                        }
+                    }
+                    Err(ClientError::QuicUnreachable) => {
+                        if !self.complete(generation, true)? {
+                            crate::diag!(
+                                Warn,
+                                "client.auto",
+                                "stale_quic_probe_rejected",
+                                "generation" = Value::Count(generation)
+                            );
+                            return Err(ClientError::QuicUnreachable);
+                        }
                         crate::diag!(
                             Warn,
                             "client.auto",
-                            "stale_quic_probe_rejected",
+                            "h3_udp_silent_fallback_h2",
                             "generation" = Value::Count(generation)
                         );
-                        return Err(ClientError::QuicUnreachable);
+                        eprintln!("transport=h2 reason=quic_unreachable");
+                        break;
                     }
-                    crate::diag!(
-                        Warn,
-                        "client.auto",
-                        "h3_udp_silent_fallback_h2",
-                        "generation" = Value::Count(generation)
-                    );
-                    eprintln!("transport=h2 reason=quic_unreachable");
-                }
-                Err(error) => {
-                    // All errors except observed UDP silence remain terminal.
-                    self.complete(generation, false)?;
-                    crate::diag!(
-                        Warn,
-                        "client.auto",
-                        "terminal_h3_failure_no_fallback",
-                        "generation" = Value::Count(generation),
-                        "reason" = Value::Label(error_kind(&error))
-                    );
-                    return Err(error);
+                    Err(error) => {
+                        // All errors except observed UDP silence remain terminal.
+                        self.complete(generation, false)?;
+                        crate::diag!(
+                            Warn,
+                            "client.auto",
+                            "terminal_h3_failure_no_fallback",
+                            "generation" = Value::Count(generation),
+                            "reason" = Value::Label(error_kind(&error))
+                        );
+                        return Err(error);
+                    }
                 }
             }
         } else {
@@ -313,7 +472,7 @@ impl AutoClient {
             eprintln!("transport=h2 reason=quic_negative_cache");
         }
         self.h2
-            .open(address, port)
+            .open_preferred(address, port, preferred)
             .await
             .map(Box::new)
             .map(ProxyTunnel::H2)
@@ -527,8 +686,18 @@ async fn serve_proxy(
     );
     let slots = Arc::new(Semaphore::new(LOCAL_LIMIT));
     let mut tasks = JoinSet::new();
+    // Tied to this accept loop: shutdown or cancellation drops maintenance,
+    // including any in-flight QUIC probe, before releasing the profile.
+    let maintenance = async {
+        match &client {
+            ProxyClient::Auto(auto) => auto.maintain().await,
+            _ => std::future::pending::<Result<(), ClientError>>().await,
+        }
+    };
+    tokio::pin!(maintenance);
     loop {
         let (socket, is_http) = tokio::select! {
+            result = &mut maintenance => return result,
             _ = tasks.join_next(), if !tasks.is_empty() => continue,
             accepted = http.accept() => (accepted.map_err(|_| ClientError::Io)?.0, true),
             accepted = socks.accept() => (accepted.map_err(|_| ClientError::Io)?.0, false),
@@ -863,11 +1032,96 @@ mod selector_tests {
         let ttl = Duration::from_secs(5);
         let (generation, cached) = cache.observe(route, now);
         assert!(!cached);
-        cache.record(generation, now, ttl);
+        assert!(cache.record(generation, now, ttl));
         assert!(cache.observe(route, now + Duration::from_secs(4)).1);
+        let (next, cached) = cache.observe(route, now + ttl);
+        assert_ne!(next, generation);
+        assert!(!cached);
+        assert!(!cache.record(next, now + ttl, Duration::ZERO));
         assert!(!cache.observe(route, now + ttl).1);
-        cache.record(generation, now, Duration::ZERO);
-        assert!(!cache.observe(route, now).1);
+    }
+
+    #[test]
+    fn recheck_deadline_is_not_extended_and_only_one_generation_can_claim_it() {
+        let mut cache = NegativeCache::default();
+        let route = Some("192.0.2.1:0".parse().unwrap());
+        let now = Instant::now();
+        let ttl = Duration::from_secs(5);
+        let deadline = now + ttl;
+        let (generation, _) = cache.observe(route, now);
+        assert!(cache.record(generation, now, ttl));
+        assert!(!cache.record(generation, now + Duration::from_secs(1), ttl));
+        assert_eq!(cache.expires, Some(deadline));
+        assert_eq!(cache.begin_recheck(generation, deadline, route, now), None);
+        let next = cache
+            .begin_recheck(generation, deadline, route, deadline)
+            .unwrap();
+        assert_ne!(generation, next);
+        assert_eq!(
+            cache.begin_recheck(generation, deadline, route, deadline),
+            None
+        );
+        assert!(!cache.record(generation, deadline, ttl));
+        assert!(cache.record(next, deadline, ttl));
+        let other = Some("198.51.100.1:0".parse().unwrap());
+        assert_eq!(
+            cache.begin_recheck(next, deadline + ttl, other, deadline + ttl),
+            None
+        );
+        assert!(cache.expires.is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_profile_rechecks_quic_without_opening_an_application_tunnel() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let server = crate::quic_transport::server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![cert.cert.der().clone()],
+            key.into(),
+        )
+        .unwrap();
+        let remote = server.local_addr().unwrap();
+        let token = URL_SAFE_NO_PAD.encode([0x42u8; 32]);
+        let auto = AutoClient {
+            h2: Arc::new(
+                H2Client::new(&remote.to_string(), "localhost", &token, roots.clone()).unwrap(),
+            ),
+            h3: Arc::new(H3Client::new(remote, "localhost", &token, roots).unwrap()),
+            ttl: Duration::from_millis(100),
+            negative: Mutex::new(NegativeCache::default()),
+            cache_changed: Notify::new(),
+        };
+        let (generation, _) = auto.observe().unwrap();
+        assert!(auto.complete(generation, true).unwrap());
+        let witness = async {
+            // No local CONNECT or SOCKS request is made. Only maintenance
+            // can initiate this connection.
+            let incoming = server.accept().await.unwrap();
+            let _ = incoming.await;
+            loop {
+                {
+                    let cache = auto.negative.lock().unwrap();
+                    if cache.generation != generation.wrapping_add(1) && cache.expires.is_none() {
+                        assert_ne!(cache.generation, generation);
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        timeout(Duration::from_secs(15), async {
+            tokio::select! {
+                result = auto.maintain() => panic!("maintenance exited: {result:?}"),
+                () = witness => {}
+            }
+        })
+        .await
+        .expect("idle profile must recheck its expired negative cache");
     }
 
     #[test]

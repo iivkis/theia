@@ -190,13 +190,51 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
                 crate::diag!(Warn, "server.h3", "request_headers_failed_or_timeout");
                 return;
             };
-            if context.stream_up() {
+            if context.is_descriptor_request(&request) {
+                handle_descriptor(request, stream, &context, peer).await;
+            } else if context.accepts_split(&request) {
                 handle_split_request(request, stream, &context, peer, &pair, binding.as_deref())
                     .await;
             } else {
                 handle_request(request, stream, &context, peer, binding.as_deref()).await;
             }
         });
+    }
+}
+
+async fn handle_descriptor(
+    request: Request<()>,
+    mut stream: Stream,
+    context: &ServerContext,
+    peer: IpAddr,
+) {
+    let (_permit, signed) = match context.authorize_descriptor(&request, peer) {
+        Ok(value) => value,
+        Err(status) => {
+            reject_split(&mut stream, status).await;
+            return;
+        }
+    };
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        stream.recv_data().await.is_ok_and(|data| data.is_none())
+            && stream.recv_trailers().await.is_ok_and(|trailers| trailers.is_none())
+    }).await.unwrap_or(false);
+    if !empty {
+        reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
+        return;
+    }
+    let Ok(response) = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(http::header::CONTENT_LENGTH, signed.len().to_string())
+        .body(()) else { return; };
+    if !matches!(timeout(CLOSE_TIMEOUT, async {
+        stream.send_response(response).await.map_err(|_| ServerError::Io)?;
+        stream.send_data(Bytes::copy_from_slice(signed.as_bytes())).await.map_err(|_| ServerError::Io)?;
+        stream.finish().await.map_err(|_| ServerError::Io)
+    }).await, Ok(Ok(()))) {
+        stream.stop_stream(Code::H3_REQUEST_CANCELLED);
+        stream.stop_sending(Code::H3_REQUEST_CANCELLED);
     }
 }
 
@@ -271,11 +309,16 @@ async fn handle_split_request(
     pair: &SplitPair,
     binding: Option<&crate::channel_binding::Admission>,
 ) {
-    let Some(leg) = crate::split_http::leg(&request) else {
+    let Some(leg) = context.split_leg(&request) else {
         reject_split(&mut stream, StatusCode::NOT_FOUND).await;
         return;
     };
-    let Some(((upload, mut up), (download, mut down))) = pair.join(leg, (request, stream)).await
+    let Some(id) = crate::split_http::pair_id(&request) else {
+        reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
+        return;
+    };
+    let Some(((upload, mut up), (download, mut down))) =
+        pair.join(id, leg, (request, stream)).await
     else {
         return;
     };
@@ -440,18 +483,28 @@ async fn handle_frames(
         state
             .apply(Direction::Receive, &hello)
             .map_err(|_| ServerError::Protocol)?;
+        let Frame::Hello { capabilities, .. } = hello else {
+            return Err(ServerError::Protocol);
+        };
         let ack = Frame::HelloAck {
             version: protocol::VERSION,
-            accepted_capabilities: 0,
+            accepted_capabilities: capabilities & protocol::CAP_PADDING,
         };
         state
             .apply(Direction::Send, &ack)
             .map_err(|_| ServerError::Protocol)?;
         send(tx, &ack).await?;
-        let open = incoming.next(rx).await?.ok_or(ServerError::Protocol)?;
-        state
-            .apply(Direction::Receive, &open)
-            .map_err(|_| ServerError::Protocol)?;
+        let open = loop {
+            let frame = incoming.next(rx).await?.ok_or(ServerError::Protocol)?;
+            state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            if matches!(frame, Frame::Padding(_)) {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            break frame;
+        };
         let Frame::OpenTcp { address, port } = open else {
             return Err(ServerError::Protocol);
         };
@@ -470,8 +523,18 @@ async fn handle_frames(
     // while connecting; a client is not allowed to send DATA before OPEN_OK.
     let dial = tokio::select! {
         biased;
-        next = incoming.next(rx) => {
-            let _ = next?;
+        next = async {
+            loop {
+                match incoming.next(rx).await? {
+                    Some(frame @ Frame::Padding(_)) => {
+                        state.apply(Direction::Receive, &frame).map_err(|_| ServerError::Protocol)?;
+                        tokio::task::yield_now().await;
+                    }
+                    _ => return Err::<(), ServerError>(ServerError::Protocol),
+                }
+            }
+        } => {
+            next?;
             return Err(ServerError::Protocol);
         }
         result = context.dial_target(&address, port) => result,
@@ -526,6 +589,7 @@ async fn relay(
                 .apply(Direction::Receive, &frame)
                 .map_err(|_| ServerError::Protocol)?;
             match frame {
+                Frame::Padding(_) => tokio::task::yield_now().await,
                 Frame::Data(data) => {
                     crate::diag!(
                         Trace,
@@ -551,14 +615,29 @@ async fn relay(
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
-                    activity.fin();
+                    activity.half_closed();
                     break;
                 }
                 _ => return Err(ServerError::Protocol),
             }
         }
         if crate::relay_liveness::receive_tail(
-            incoming.next(rx),
+            async {
+                loop {
+                    let frame = incoming.next(rx).await?;
+                    if let Some(padding @ Frame::Padding(_)) = &frame {
+                        if activity.both_finished() {
+                            return Err(ServerError::Protocol);
+                        }
+                        upload_state
+                            .apply(Direction::Receive, padding)
+                            .map_err(|_| ServerError::Protocol)?;
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    return Ok(frame);
+                }
+            },
             download_finished,
             ServerError::TimedOut,
         )
@@ -591,7 +670,7 @@ async fn relay(
                 .map_err(|_| ServerError::Protocol)?;
             send(tx, &frame).await?;
             if n == 0 {
-                activity.fin();
+                activity.half_closed();
                 let _ = download_done.send(());
                 return Ok::<(), ServerError>(());
             }

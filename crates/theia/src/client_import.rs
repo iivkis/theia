@@ -304,7 +304,7 @@ fn new_private_directory(path: &Path) -> io::Result<()> {
     private_windows::directory(path)
 }
 #[cfg(windows)]
-fn new_private_file(path: &Path) -> io::Result<File> {
+pub(crate) fn new_private_file(path: &Path) -> io::Result<File> {
     private_windows::file(path)
 }
 

@@ -85,18 +85,16 @@ impl ReviewCursor {
                             "отказ/Unknown"
                         },
                     ));
-                    if observation.both_transports_verified() && fresh {
-                        out.push_str("Оба TLS/ALPN наблюдения актуальны. Это не проверка HTTP/3 или REALITY.\n");
+                    if fresh {
+                        out.push_str(transport_review(
+                            observation.h2_verified(),
+                            observation.h3_verified(),
+                        ));
                     }
                 }
             }
-            if !exact
-                || !entry
-                    .result
-                    .as_ref()
-                    .is_ok_and(|r| r.both_transports_verified())
-            {
-                out.push_str("ОТКАЗ: нет двух подтверждённых наблюдений H2/H3.\n");
+            if !exact || !entry.result.as_ref().is_ok_and(|r| r.h2_verified()) {
+                out.push_str("ОТКАЗ: нет обязательного подтверждённого TLS/H2 наблюдения.\n");
             }
         }
         if !exact {
@@ -107,6 +105,17 @@ impl ReviewCursor {
         }
         out.push_str("Apply ЗАБЛОКИРОВАН: security mode, независимый server identity, HTTP/3 semantics и security review не готовы.\nКонфигурация, runtime, ключи и приглашения не изменены.\nEsc/n: к отчёту; y не применяет настройки.");
         out
+    }
+}
+
+// H3 is optional in the target contract. The H2 probe requires X25519,
+// but neither transport observation proves HTTP application semantics,
+// authorization or REALITY readiness.
+fn transport_review(h2: bool, h3: bool) -> &'static str {
+    match (h2, h3) {
+        (true, true) => "Оба TLS/ALPN наблюдения актуальны. Это не проверка HTTP/3 или REALITY.\n",
+        (true, false) => "TLS/H2 подтверждён (TLS 1.3/X25519). H3 не подтверждён; отсутствие H3 само по себе не исключает H2-кандидат.\n",
+        (false, _) => "TLS/H2 не подтверждён; H3 не заменяет обязательную проверку H2.\n",
     }
 }
 
@@ -168,6 +177,14 @@ mod tests {
         assert!(text.contains("устарели/неизвестны"));
         assert!(cursor.close());
         assert!(!cursor.is_open());
+    }
+
+    #[test]
+    fn h3_optional_evidence_does_not_claim_readiness() {
+        assert!(transport_review(true, false).contains("не исключает H2-кандидат"));
+        assert!(transport_review(false, true).contains("не заменяет обязательную"));
+        assert!(transport_review(true, true).contains("не проверка HTTP/3 или REALITY"));
+        assert!(transport_review(false, false).contains("TLS/H2 не подтверждён"));
     }
 
     #[test]

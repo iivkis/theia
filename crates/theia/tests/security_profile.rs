@@ -33,11 +33,16 @@ struct Fixture {
     pin: CertificatePin,
     other_pin: CertificatePin,
     stream_up: bool,
+    silent_h2_hello: Arc<std::sync::atomic::AtomicBool>,
     _servers: JoinSet<Result<(), server::ServerError>>,
 }
 
 impl Fixture {
     async fn start(mode: SecurityMode) -> Self {
+        Self::start_with_silent_h2(mode, false).await
+    }
+
+    async fn start_with_silent_h2(mode: SecurityMode, silent: bool) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
@@ -93,11 +98,49 @@ impl Fixture {
         };
         let context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
         let mut servers = JoinSet::new();
-        servers.spawn(server::serve(
-            tcp,
-            TlsAcceptor::from(Arc::new(tls)),
-            context.clone(),
-        ));
+        let silent_h2_hello = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let witness = silent_h2_hello.clone();
+        let h2_context = context.clone();
+        servers.spawn(async move {
+            let acceptor = TlsAcceptor::from(Arc::new(tls));
+            if silent {
+                // Independently admit stream-one and deliberately hold back
+                // HELLO_ACK. Inspect every received frame until cancellation.
+                // The production listener takes the next TLS connection.
+                let (socket, _) = tcp.accept().await.unwrap();
+                let tls = acceptor.accept(socket).await.unwrap();
+                let mut connection = h2::server::handshake(tls).await.unwrap();
+                let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                assert_eq!(request.uri().path(), "/v1/session");
+                let mut body = request.into_body();
+                let _outgoing = respond
+                    .send_response(
+                        http::Response::builder().status(200).body(()).unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                let observe = async {
+                    let mut decoder = theia::protocol::Decoder::new();
+                    let mut seen = false;
+                    while let Some(Ok(chunk)) = body.data().await {
+                        for frame in decoder.feed(&chunk).unwrap() {
+                            assert!(matches!(frame, theia::protocol::Frame::Hello { .. }));
+                            assert!(!seen);
+                            seen = true;
+                        }
+                        body.flow_control().release_capacity(chunk.len()).unwrap();
+                    }
+                    assert!(seen);
+                    assert_eq!(decoder.pending_len(), 0);
+                };
+                let drive = async {
+                    assert!(!matches!(connection.accept().await, Some(Ok(_))));
+                };
+                tokio::join!(observe, drive);
+                witness.store(true, std::sync::atomic::Ordering::Release);
+            }
+            server::serve(tcp, acceptor, h2_context).await
+        });
         servers.spawn(theia::h3_server::serve(udp, context));
         Self {
             h2,
@@ -106,6 +149,7 @@ impl Fixture {
             pin,
             other_pin,
             stream_up: mode == SecurityMode::PinnedCertStreamUpV1,
+            silent_h2_hello,
             _servers: servers,
         }
     }
@@ -185,6 +229,13 @@ impl Fixture {
                     }
                 },
             );
+            if pin.is_none() {
+                profile.xhttp_mode = Some(if self.stream_up {
+                    config::XhttpMode::StreamUp
+                } else {
+                    config::XhttpMode::StreamOne
+                });
+            }
             let invite = Invitation::public_from_profile(&profile)
                 .unwrap()
                 .encode()
@@ -196,7 +247,11 @@ impl Fixture {
             assert_eq!(received.tls_profile, profile.tls_profile);
             assert_eq!(received.transport, profile.transport);
             let imported_pin = CertificatePin::parse_profile(&received.tls_profile);
-            let stream_up = CertificatePin::is_stream_up_profile(&received.tls_profile);
+            assert_eq!(
+                received.effective_xhttp_mode(),
+                profile.effective_xhttp_mode()
+            );
+            let stream_up = received.effective_xhttp_mode() == config::XhttpMode::StreamUp;
             let token = URL_SAFE_NO_PAD.encode(TOKEN);
             let (mut app, local) = tokio::io::duplex(4096);
             let relay = if received.transport == Transport::H3 {
@@ -372,6 +427,108 @@ async fn h2_h3_stream_up_separate_http_legs_and_identity() {
     .expect("bounded real H2/H3 split transport matrix");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_tls_accepts_both_xhttp_modes_with_identical_grants() {
+    timeout(Duration::from_secs(40), async {
+        let mut plain = Fixture::start(SecurityMode::Plain).await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        plain.transfer(None, &target).await;
+        plain.stream_up = true;
+        plain
+            .errors(
+                None,
+                "localhost",
+                &[0x43; 32],
+                port,
+                ClientError::Unauthorized,
+            )
+            .await;
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
+        plain.transfer(None, &target).await;
+    })
+    .await
+    .expect("own TLS H2/H3 stream-one and stream-up byte-exact matrix");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_tls_h2_auto_retries_silence_only_before_open() {
+    timeout(Duration::from_secs(35), async {
+        let fixture = Fixture::start_with_silent_h2(SecurityMode::Plain, true).await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let client = fixture
+            .h2(None, "localhost", &TOKEN)
+            .with_auto_stream_up(Duration::from_secs(900))
+            .unwrap();
+        let tunnel = client
+            .open(Address::V4([127, 0, 0, 1]), port)
+            .await
+            .unwrap();
+        let (remote, _) = target.accept().await.unwrap();
+        assert!(fixture
+            .silent_h2_hello
+            .load(std::sync::atomic::Ordering::Acquire));
+        drop(tunnel);
+        drop(remote);
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
+    })
+    .await
+    .expect("admitted HELLO silence can retry once; first attempt sends no OPEN");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_tls_auto_h2_h3_rejects_auth_and_accepts_normal_stream_one() {
+    timeout(Duration::from_secs(30), async {
+        let fixture = Fixture::start(SecurityMode::Plain).await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let addr = Address::V4([127, 0, 0, 1]);
+        let ttl = Duration::from_secs(900);
+        let h2 = fixture
+            .h2(None, "localhost", &[0x43; 32])
+            .with_auto_stream_up(ttl)
+            .unwrap();
+        let h3 = fixture
+            .h3(None, "localhost", &[0x43; 32])
+            .with_auto_stream_up(ttl)
+            .unwrap();
+        assert_eq!(
+            h2.open(addr.clone(), port).await.err(),
+            Some(ClientError::Unauthorized)
+        );
+        assert_eq!(
+            h3.open(addr.clone(), port).await.err(),
+            Some(ClientError::Unauthorized)
+        );
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
+        let h2 = fixture
+            .h2(None, "localhost", &TOKEN)
+            .with_auto_stream_up(ttl)
+            .unwrap();
+        let h3 = fixture
+            .h3(None, "localhost", &TOKEN)
+            .with_auto_stream_up(ttl)
+            .unwrap();
+        let tunnel = h2.open(addr.clone(), port).await.unwrap();
+        let (remote, _) = target.accept().await.unwrap();
+        drop(tunnel);
+        drop(remote);
+        let tunnel = h3.open(addr, port).await.unwrap();
+        let (remote, _) = target.accept().await.unwrap();
+        drop(tunnel);
+        drop(remote);
+    })
+    .await
+    .expect("own TLS auto modes preserve H2/H3 auth and OPEN semantics");
+}
+
 // Independent wire witness, not a call to the production proof helper.
 fn raw_pinned_request(proof: Option<&HeaderValue>) -> Request<()> {
     let mut request = Request::post("https://localhost/v1/pinned-session")
@@ -513,4 +670,83 @@ async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
     })
     .await
     .expect("bounded native H3 exporter admission");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pooled_own_tls_h2_h3_keep_parallel_tunnels_independent() {
+    timeout(Duration::from_secs(30), async {
+        let fixture = Fixture::start(SecurityMode::Plain).await;
+        for split in [false, true] {
+            for h3 in [false, true] {
+                let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = target.local_addr().unwrap().port();
+                let address = Address::V4([127, 0, 0, 1]);
+                let token = URL_SAFE_NO_PAD.encode(TOKEN);
+                let (mut left, left_local) = tokio::io::duplex(4096);
+                let (mut right, right_local) = tokio::io::duplex(4096);
+                let (a, b) = if h3 {
+                    let client =
+                        H3Client::new(fixture.h3, "localhost", &token, fixture.roots.clone())
+                            .unwrap()
+                            .with_stream_up(split)
+                            .unwrap()
+                            .with_connection_pool();
+                    let a = client.open(address.clone(), port).await.unwrap();
+                    let b = client.open(address.clone(), port).await.unwrap();
+                    assert!(
+                        a.shares_transport_with(&b),
+                        "both tunnels must use the same verified carrier"
+                    );
+                    (
+                        tokio::spawn(a.relay(left_local)),
+                        tokio::spawn(b.relay(right_local)),
+                    )
+                } else {
+                    let client = H2Client::new(
+                        &fixture.h2.to_string(),
+                        "localhost",
+                        &token,
+                        fixture.roots.clone(),
+                    )
+                    .unwrap()
+                    .with_stream_up(split)
+                    .unwrap()
+                    .with_connection_pool();
+                    let a = client.open(address.clone(), port).await.unwrap();
+                    let b = client.open(address.clone(), port).await.unwrap();
+                    assert!(
+                        a.shares_transport_with(&b),
+                        "both tunnels must use the same verified carrier"
+                    );
+                    (
+                        tokio::spawn(a.relay(left_local)),
+                        tokio::spawn(b.relay(right_local)),
+                    )
+                };
+                let (mut first, _) = target.accept().await.unwrap();
+                let (mut second, _) = target.accept().await.unwrap();
+                left.write_all(b"left").await.unwrap();
+                right.write_all(b"right").await.unwrap();
+                let mut l = [0; 4];
+                let mut r = [0; 5];
+                first.read_exact(&mut l).await.unwrap();
+                second.read_exact(&mut r).await.unwrap();
+                assert_eq!(&l, b"left");
+                assert_eq!(&r, b"right");
+                // Dropping one tunnel must not close the other's HTTP driver.
+                a.abort();
+                let _ = a.await;
+                second.write_all(b"alive").await.unwrap();
+                right.read_exact(&mut r).await.unwrap();
+                assert_eq!(&r, b"alive");
+                right.shutdown().await.unwrap();
+                second.read_to_end(&mut Vec::new()).await.unwrap();
+                second.shutdown().await.unwrap();
+                right.read_to_end(&mut Vec::new()).await.unwrap();
+                b.await.unwrap().unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
 }

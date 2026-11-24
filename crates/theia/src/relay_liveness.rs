@@ -1,7 +1,14 @@
 //! Shared post-OPEN_OK data-plane liveness for H2/H3.
 //! An idle direction is not a stalled tunnel. Only actual forwarded bytes
 //! and successful half-closes refresh the per-tunnel progress deadline.
-use std::{future::Future, sync::Mutex, time::Duration};
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Mutex,
+    },
+    time::Duration,
+};
 use tokio::{
     sync::oneshot,
     time::{sleep_until, timeout, Instant},
@@ -12,12 +19,14 @@ pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) struct Activity {
     last: Mutex<Instant>,
+    half_closes: AtomicU8,
 }
 
 impl Activity {
     pub(crate) fn new() -> Self {
         Self {
             last: Mutex::new(Instant::now()),
+            half_closes: AtomicU8::new(0),
         }
     }
 
@@ -30,6 +39,16 @@ impl Activity {
     pub(crate) fn fin(&self) {
         // Never hold this small synchronous lock across an await.
         *self.last.lock().unwrap_or_else(|error| error.into_inner()) = Instant::now();
+    }
+
+    /// Called once per direction, after its FIN is successfully forwarded.
+    pub(crate) fn half_closed(&self) {
+        self.fin();
+        self.half_closes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn both_finished(&self) -> bool {
+        self.half_closes.load(Ordering::Acquire) >= 2
     }
 
     fn deadline(&self) -> Instant {
@@ -133,5 +152,33 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err("peer error"));
+    }
+}
+
+#[cfg(test)]
+mod padding_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn padding_does_not_refresh_idle() {
+        let activity = Activity::new();
+        let result = activity
+            .run(
+                async {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        // Receiving a padding frame deliberately does not call data/fin.
+                        tokio::task::yield_now().await;
+                    }
+                },
+                std::future::pending::<Result<(), &'static str>>(),
+                "idle",
+            )
+            .await;
+        assert_eq!(result, Err("idle"));
+        activity.half_closed();
+        assert!(!activity.both_finished());
+        activity.half_closed();
+        assert!(activity.both_finished());
     }
 }

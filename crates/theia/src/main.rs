@@ -241,6 +241,11 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
+        Ok(Command::Trust(command)) => theia::descriptor_cli::run(command).map_err(CliError::Trust),
+        Ok(Command::Reference(command)) => theia::reference_cli::run(command)
+            .await
+            .map_err(CliError::Reference),
+        Ok(Command::Reality(command)) => theia::reality_cli::run(command).map_err(CliError::Reality),
         Ok(Command::Help(topic)) => help(topic).map(str::to_owned),
         Ok(Command::Version) => Ok(version().to_owned()),
         Ok(Command::ConfigValidate { config }) => {
@@ -261,6 +266,9 @@ async fn main() {
                 CliError::NonUtf8Argument => "non_utf8_argument",
                 CliError::NotImplemented(_) => "not_implemented",
                 CliError::Config(_) => "config",
+                CliError::Trust(_) => "offline_trust",
+                CliError::Reference(_) => "reference_health",
+                CliError::Reality(_) => "reality_provisioning",
                 CliError::Server(_) => "server",
                 CliError::Management(_) => "management",
                 CliError::Client(_) => "client",

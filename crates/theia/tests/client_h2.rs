@@ -1105,7 +1105,14 @@ async fn auto_falls_back_only_after_udp_silence_and_uses_negative_cache() {
             theia::config::Transport::Auto,
         )
         .await;
+        // The example uses a 1600 ms handshake deadline. A single silent
+        // attempt must not authorize fallback; both deadlines must elapse.
+        let started = std::time::Instant::now();
         assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
+        assert!(
+            started.elapsed() >= Duration::from_millis(3200),
+            "H2 fallback requires two silent QUIC handshake attempts"
+        );
         let first = probes.load(std::sync::atomic::Ordering::SeqCst);
         assert!(first > 0, "auto must actually attempt QUIC before H2");
         assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
