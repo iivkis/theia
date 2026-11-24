@@ -403,3 +403,69 @@ fn persisted_transition_tampering_is_rejected_without_partial_update() {
     assert_error(store.update(&descriptor::sign(&fixture(3), &next).unwrap(), 130), Error::Signature);
     assert_eq!(fs::read(&path).unwrap(), corrupt);
 }
+
+#[test]
+fn bounded_history_requires_reenrollment_instead_of_forgetting_retired_keys() {
+    let temp = Scratch::new();
+    let path = temp.0.join("trust.toml");
+    let keys: Vec<_> = (0..10).map(|_| key()).collect();
+    let mut initial = fixture(1);
+    initial.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&keys[1])));
+    let root = anchor(&initial, &keys[0]);
+    let store = Store::new(&path, root.clone()).unwrap();
+    store.initialize(&descriptor::sign(&initial, &keys[0]).unwrap(), 120).unwrap();
+    for i in 1..=8 {
+        let mut next = fixture(i as u64 + 1);
+        next.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&keys[i + 1])));
+        let signed = descriptor::sign(&next, &keys[i]).unwrap();
+        assert_eq!(store.promote(&signed, i as u64, public(&keys[i]), 120).unwrap(), Change::Advanced);
+    }
+    let saved = fs::read(&path).unwrap();
+    let latest = descriptor::sign(&fixture(10), &keys[9]).unwrap();
+    let reopened = Store::new(&path, root).unwrap();
+    assert_eq!(reopened.load(120).unwrap().descriptor().revision, 9);
+    assert_error(reopened.promote(&latest, 9, public(&keys[9]), 120), Error::ReenrollmentRequired);
+    assert_eq!(fs::read(&path).unwrap(), saved);
+    // Ordinary same-key updates remain possible even at the history ceiling.
+    assert_eq!(reopened.update(&descriptor::sign(&fixture(10), &keys[8]).unwrap(), 120).unwrap(), Change::Advanced);
+}
+
+#[test]
+fn competing_promotion_and_old_key_update_have_one_revision_guard() {
+    use std::{sync::Barrier, thread};
+    let temp = Scratch::new();
+    let path = temp.0.join("trust.toml");
+    let old = key();
+    let successor = key();
+    let mut first = fixture(1);
+    first.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&successor)));
+    let root = anchor(&first, &old);
+    let store = Store::new(&path, root.clone()).unwrap();
+    store.initialize(&descriptor::sign(&first, &old).unwrap(), 120).unwrap();
+    let replacement = descriptor::sign(&fixture(2), &successor).unwrap();
+    let old_update = descriptor::sign(&fixture(3), &old).unwrap();
+    let barrier = Barrier::new(2);
+    let (a, b) = thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            barrier.wait();
+            store.promote(&replacement, 1, public(&successor), 120)
+        });
+        let b = scope.spawn(|| {
+            barrier.wait();
+            store.update(&old_update, 120)
+        });
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_ne!(a.is_ok(), b.is_ok());
+    let reopened = Store::new(&path, root).unwrap();
+    let current = reopened.load(120).unwrap();
+    if a.is_ok() {
+        assert_eq!(current.signer(), public(&successor));
+        assert_eq!(current.descriptor().revision, 2);
+        assert_error(reopened.update(&old_update, 120), Error::Signature);
+    } else {
+        assert_eq!(current.signer(), public(&old));
+        assert_eq!(current.descriptor().revision, 3);
+        assert_error(reopened.promote(&replacement, 1, public(&successor), 120), Error::Rotation);
+    }
+}

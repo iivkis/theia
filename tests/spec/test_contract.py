@@ -499,11 +499,18 @@ class SpecContractTests(unittest.TestCase):
         tests = read("crates/theia/tests/descriptor.rs")
         for term in ("SmartTheia/inbound-descriptor/v1", "UnparsedPublicKey",
                      "deny_unknown_fields", "minimum_revision", "Error::Rollback",
-                     "Error::Equivocation", "guarded_trust_write"):
+                     "Error::Equivocation", "guarded_trust_write",
+                     "struct Transition", "MAX_TRANSITIONS", "ReenrollmentRequired",
+                     "pub fn promote", "snapshot.validate(&self.anchor)"):
             self.assertIn(term, source)
         for term in ("signed_descriptor_binds_every_field_to_independent_anchor",
                      "signed_invalid_fields_and_unsupported_contract_are_refused",
-                     "durable_revision_floor_rejects_rollback_equivocation_and_key_substitution_after_restart"):
+                     "durable_revision_floor_rejects_rollback_equivocation_and_key_substitution_after_restart",
+                     "explicit_rotation_survives_restart_and_retires_previous_signers",
+                     "missed_overlap_requires_independent_enrollment_and_preserves_snapshot",
+                     "persisted_transition_tampering_is_rejected_without_partial_update",
+                     "bounded_history_requires_reenrollment_instead_of_forgetting_retired_keys",
+                     "competing_promotion_and_old_key_update_have_one_revision_guard"):
             self.assertIn(term, tests)
         for path in ("client.rs", "h3_client.rs", "server.rs", "h3_server.rs"):
             self.assertNotIn("descriptor::Store", read("crates/theia/src/" + path))
