@@ -1,6 +1,7 @@
 //! Production H2/H3 data-plane liveness on actual loopback TCP and TLS/QUIC.
-//! Exercise all cases concurrently, including active tunnels past five minutes,
-//! so the regression costs one long interval rather than one per transport.
+//! Short asymmetric/idle cases run in ordinary and instrumented suites.
+//! Real >300s traffic runs once per OS in a mandatory parallel CI job.
+//! Each group executes both transports concurrently using real sockets.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use sha2::{Digest, Sha256};
@@ -229,22 +230,13 @@ impl Fixture {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn production_h2_h3_asymmetric_traffic_half_close_and_idle() {
-    timeout(Duration::from_secs(390), async {
+async fn exercise_matrix(selected: &[Case], limit: Duration) {
+    timeout(limit, async {
         let (fixture, _servers) = Fixture::start().await;
         let fixture = Arc::new(fixture);
         let mut cases = JoinSet::new();
         for transport in [Transport::H2, Transport::H3] {
-            for case in [
-                Case::Upload,
-                Case::Download,
-                Case::UploadAfterRemoteFin,
-                Case::DownloadAfterLocalFin,
-                Case::Idle,
-                Case::LongUpload,
-                Case::LongDownload,
-            ] {
+            for &case in selected {
                 let fixture = fixture.clone();
                 cases.spawn(async move {
                     fixture.exercise(transport, case).await;
@@ -257,4 +249,29 @@ async fn production_h2_h3_asymmetric_traffic_half_close_and_idle() {
     })
     .await
     .expect("bounded concurrent native liveness matrix");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_h2_h3_asymmetric_traffic_half_close_and_idle() {
+    exercise_matrix(
+        &[
+            Case::Upload,
+            Case::Download,
+            Case::UploadAfterRemoteFin,
+            Case::DownloadAfterLocalFin,
+            Case::Idle,
+        ],
+        Duration::from_secs(90),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real wall-clock >300s; mandatory parallel native-liveness CI matrix"]
+async fn production_h2_h3_real_traffic_beyond_300_seconds() {
+    exercise_matrix(
+        &[Case::LongUpload, Case::LongDownload],
+        Duration::from_secs(390),
+    )
+    .await;
 }

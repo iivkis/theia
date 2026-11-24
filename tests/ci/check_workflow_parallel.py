@@ -43,6 +43,7 @@ mandatory = {
     "m0-1-windows-spike",
     "m3-4-btls-spike",
     "m3-4e-btls-production-feature",
+    "native-liveness",
     "coverage-native",
     "coverage-gate",
 }
@@ -58,8 +59,8 @@ for name in ("windows-smoke", "browser-e2e"):
         f"{name} must retain the Rust readiness precondition",
     )
 require(needs("ci-gate") == mandatory, "ci-gate must depend on EVERY required job")
-require(needs("f14-cross-host") == {"specification", "rust-tests", "windows-smoke"},
-        "F-14 must consume verified Linux and Windows CI-built executable artifacts")
+require(needs("f14-cross-host") == {"specification", "browser-e2e"},
+        "F-14 must use native browser builds without waiting for unrelated long tests")
 cross_host = job("f14-cross-host")
 require("runs-on: windows-2025" in cross_host and "wsl-version: 2" in cross_host,
         "F-14 must connect native Windows client to real Linux WSL2 VM")
@@ -69,13 +70,18 @@ require("scripts/f14-cross-os-ci.py" in cross_host
         and "--windows-client" in cross_host and "--windows-test" in cross_host
         and "cargo build" not in cross_host,
         "F-14 must execute prebuilt native Windows harness without duplicate compilation")
-require("Build genuine Linux server for Windows cross-OS F-14 E2E" in job("rust-tests")
-        and "actions/upload-artifact@v4" in job("rust-tests"),
-        "Linux Theia ELF must originate from mandatory Linux native build")
-require("Stage Windows E2E binaries from Cargo JSON artifact paths" in job("windows-smoke")
-        and "cargo build --workspace --locked --bin theia --message-format=json" in job("windows-smoke")
-        and "name: f14-windows-compiled" in job("windows-smoke"),
-        "Windows Theia and test harness must originate from mandatory Windows smoke")
+browser = job("browser-e2e")
+require("Build genuine Linux server for Windows cross-OS F-14 E2E\n        if: runner.os == 'Linux'" in browser
+        and "name: f14-linux-server" in browser
+        and "actions/upload-artifact@v4" in browser,
+        "Linux Theia ELF must originate from mandatory native Linux browser build")
+require("Stage Windows E2E binaries from Cargo JSON artifact paths\n        if: runner.os == 'Windows'" in browser
+        and "cargo build --workspace --locked --bin theia --message-format=json" in browser
+        and "name: f14-windows-compiled" in browser,
+        "Windows Theia and test harness must originate from mandatory native Windows browser build")
+require("name: f14-linux-server" not in job("rust-tests")
+        and "name: f14-windows-compiled" not in job("windows-smoke"),
+        "do not rebuild or upload F-14 binaries after unrelated suites")
 require("python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'" in job("specification"),
         "cheap F-14 WSL guest IP regression must precede expensive Rust builds")
 require("continue-on-error" not in cross_host and "|| true" not in cross_host,
@@ -136,10 +142,14 @@ require(needs("coverage-native") == {"specification"} and
         needs("coverage-gate") == {"specification", "coverage-native"},
         "coverage gate must consume both native jobs")
 for term in ("os: [ubuntu-latest, windows-latest]", "llvm-tools-preview",
-             "cargo llvm-cov --workspace --all-targets --all-features --locked --lcov",
+             "cargo llvm-cov test --workspace --all-targets --all-features --locked --lcov",
              "cargo llvm-cov report --json --include-build-script",
-             "--no-report --lib windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override",
-             "--no-report --test tui_real_terminal compiled_client_proxy_conpty_lifecycle",
+             "--no-report --lib -- windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override --ignored --exact",
+             "--no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact",
+             "cargo llvm-cov clean --profraw-only", 'workspaces: ". -> target/llvm-cov-target"',
+             "cache-targets: true", "cache-workspace-crates: false",
+             "Instrumented real WinINet CAS and recovery failed or did not execute",
+             "Instrumented real ConPTY lifecycle failed or did not execute",
              "THEIA_WINDOWS_PROXY_E2E_ALLOWED", "cargo llvm-cov report --lcov --include-build-script",
              "ci-coverage.py collect", "--llvm-json coverage-segments.json",
              "coverage-raw-failure-", "if: failure()", "coverage.lcov",
@@ -150,6 +160,20 @@ for term in ("coverage-Linux", "coverage-Windows", "ci-coverage.py gate",
     require(term in coverage_gate, "missing combined coverage contract: " + term)
 require("continue-on-error" not in coverage_native + coverage_gate,
         "coverage collection and threshold may not be advisory")
+liveness = job("native-liveness")
+require(needs("native-liveness") == {"specification"}
+        and "os: [ubuntu-latest, windows-latest]" in liveness
+        and "cargo test --workspace --locked --test tunnel_liveness -- production_h2_h3_real_traffic_beyond_300_seconds --ignored --exact" in liveness
+        and "Real long-lived relay test failed or did not execute" in liveness
+        and "continue-on-error" not in liveness,
+        "real long-lived H2/H3 matrix must run once per native OS in parallel and fail closed")
+liveness_source = (ROOT / "crates/theia/tests/tunnel_liveness.rs").read_text(encoding="utf-8")
+require("async fn production_h2_h3_asymmetric_traffic_half_close_and_idle()" in liveness_source
+        and "async fn production_h2_h3_real_traffic_beyond_300_seconds()" in liveness_source
+        and "Case::LongUpload, Case::LongDownload" in liveness_source
+        and "(32, Duration::from_secs(10))" in liveness_source
+        and "if long { 300 } else { 30 }" in liveness_source,
+        "retain real 300-second traffic, short half-close/idle cases and explicit wall-clock assertions")
 require("workflow_dispatch:" not in workflow and "  push:" not in workflow,
         "direct pushes, PR updates and manual dispatch must not start CI")
 require("github.event.pull_request.merge_commit_sha" in job("specification")
