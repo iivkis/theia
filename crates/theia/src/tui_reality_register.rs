@@ -9,6 +9,7 @@ use std::{path::{Path, PathBuf}, sync::mpsc::{self, Receiver, TryRecvError}};
 const SERVER_FIELDS: [&str; 6] = ["Health store", "Каталог комплекта", "Health SHA-256",
     "Identity SHA-256 (независимое подтверждение)", "TCP/UDP bind", "Разрешённые ID через запятую"];
 const CLIENT_FIELDS: [&str; 3] = ["Файл enrollment", "Identity SHA-256 (независимое подтверждение)", "Новый ID профиля"];
+const REENROLL_FIELDS: [&str;2] = ["Новый отдельно импортированный enrollment", "Новый identity SHA-256 из независимого канала"];
 const MAX_FIELD: usize = 1024;
 
 struct Review {
@@ -30,6 +31,7 @@ enum SaveError {
 
 pub(crate) struct RegistrationPanel {
     role: Role,
+    reenroll_id: Option<String>,
     config: PathBuf,
     original: [u8; 32],
     fields: Vec<String>,
@@ -70,11 +72,25 @@ fn build_request(role: Role, fields: &[String]) -> Result<Request, Error> {
     }
 }
 
+fn build_reenroll(id: &str, fields: &[String]) -> Result<Request, Error> {
+    if fields.len() != REENROLL_FIELDS.len() || !config::valid_id(id) {
+        return Err(Error::Format);
+    }
+    Ok(Request::Reenroll(ClientRequest {
+        enrollment: fields[0].as_str().into(), identity_sha256: hash(&fields[1])?, id: id.to_owned(),
+    }))
+}
+
 fn preview(path: &Path, original: [u8;32], request: Request, now: u64) -> Result<Review, Error> {
     let prepared = reality_config::prepare(path, &request, now)?;
     if prepared.source_sha256() != original { return Err(Error::Approval); }
+    let consent = if matches!(&request, Request::Reenroll(_)) {
+        "Y (Shift+Y): подтвердить независимую замену identity; n/Esc: отменить."
+    } else {
+        "y: сохранить; n/Esc: отменить."
+    };
     Ok(Review { request, approval: prepared.approval_sha256(),
-        body: format!("{}\n\nСохранить только TOML? y: сохранить; n/Esc: отменить.\nРаботающие listener/системный proxy не меняются.", prepared.report()) })
+        body: format!("{}\n\nСохранить только TOML? {consent}\nРаботающие listener/системный proxy не меняются.", prepared.report()) })
 }
 
 impl RegistrationPanel {
@@ -84,8 +100,26 @@ impl RegistrationPanel {
         let role = editor.role();
         let mut fields = vec![String::new(); labels(role).len()];
         if role == Role::Server { fields[4] = "0.0.0.0:443".into(); }
-        Ok(Self { role, config, original: editor.saved_sha256(), fields, focus: 0,
+        Ok(Self { role, reenroll_id: None, config, original: editor.saved_sha256(), fields, focus: 0,
             stage: Stage::Input, error: None })
+    }
+
+    pub(crate) fn reenroll(editor: &Editor) -> Result<Self, &'static str> {
+        if editor.role() != Role::Client || !editor.selected_reality() {
+            return Err("Выберите зарегистрированный REALITY-профиль.");
+        }
+        let mut panel = Self::new(editor)?;
+        panel.reenroll_id = Some(editor.selected_record_id().to_owned());
+        panel.fields = vec![String::new(); REENROLL_FIELDS.len()];
+        Ok(panel)
+    }
+
+    fn request(&self) -> Result<Request, Error> {
+        if let Some(id) = &self.reenroll_id {
+            build_reenroll(id, &self.fields)
+        } else {
+            build_request(self.role, &self.fields)
+        }
     }
 
     pub(crate) fn paste(&mut self, text: &str) {
@@ -104,19 +138,11 @@ impl RegistrationPanel {
             Stage::Confirm(_) => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('n') => self.stage = Stage::Input,
-                    KeyCode::Char('y') if key.modifiers.is_empty() => {
-                        let Stage::Confirm(review) = std::mem::replace(&mut self.stage, Stage::Input) else { return false; };
-                        let path = self.config.clone();
-                        let role = self.role;
-                        let (tx, rx) = mpsc::channel();
-                        self.stage = Stage::Saving(rx);
-                        let _worker = std::thread::spawn(move || {
-                            let result = reference_health::unix_now().map_err(|_| Error::Clock)
-                                .and_then(|now| reality_config::apply(&path, &review.request, review.approval, now))
-                                .map_err(SaveError::Refused)
-                                .and_then(|()| Editor::load(role, &path).map_err(|_| SaveError::SavedReloadFailed));
-                            let _ = tx.send(result);
-                        });
+                    KeyCode::Char('y') if self.reenroll_id.is_none() && key.modifiers.is_empty() => {
+                        self.save_confirmed();
+                    }
+                    KeyCode::Char('Y') if self.reenroll_id.is_some() && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) => {
+                        self.save_confirmed();
                     }
                     _ => {}
                 }
@@ -124,13 +150,32 @@ impl RegistrationPanel {
             }
             Stage::Input => {}
         }
+        self.input_key(key)
+    }
+
+    fn save_confirmed(&mut self) {
+        let role = self.role;
+        let Stage::Confirm(review) = std::mem::replace(&mut self.stage, Stage::Input) else { return; };
+        let path = self.config.clone();
+        let (tx, rx) = mpsc::channel();
+        self.stage = Stage::Saving(rx);
+        let _worker = std::thread::spawn(move || {
+            let result = reference_health::unix_now().map_err(|_| Error::Clock)
+                .and_then(|now| reality_config::apply(&path, &review.request, review.approval, now))
+                .map_err(SaveError::Refused)
+                .and_then(|()| Editor::load(role, &path).map_err(|_| SaveError::SavedReloadFailed));
+            let _ = tx.send(result);
+        });
+    }
+
+    fn input_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => return true,
             KeyCode::Tab => self.focus = (self.focus + 1) % self.fields.len(),
             KeyCode::BackTab => self.focus = (self.focus + self.fields.len() - 1) % self.fields.len(),
             KeyCode::Backspace => { self.fields[self.focus].pop(); }
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => self.fields[self.focus].clear(),
-            KeyCode::Enter => match build_request(self.role, &self.fields) {
+            KeyCode::Enter => match self.request() {
                 Ok(request) => {
                     let path = self.config.clone();
                     let original = self.original;
@@ -183,8 +228,12 @@ impl RegistrationPanel {
     pub(crate) fn body(&self) -> String {
         match &self.stage {
             Stage::Input => {
-                let mut out = String::from("Регистрация уже подготовленных материалов. Только сохранение, не запуск.\n");
-                for (i, label) in labels(self.role).iter().enumerate() {
+                let (mut out, labels) = if let Some(id) = &self.reenroll_id {
+                    (format!("Независимый повторный enrollment выбранного профиля {id}. Не штатная ротация. Сначала импортируйте новое приглашение через I.\n"), REENROLL_FIELDS.as_slice())
+                } else {
+                    (String::from("Регистрация уже подготовленных материалов. Только сохранение, не запуск.\n"), labels(self.role))
+                };
+                for (i, label) in labels.iter().enumerate() {
                     // No private keys, bearer or paths need to be rendered.
                     let value = if self.role == Role::Server && i >= 4 || self.role == Role::Client && i == 2 {
                         self.fields[i].as_str()
@@ -206,6 +255,14 @@ impl RegistrationPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reenrollment_request_cannot_change_selected_id() {
+        let fields = vec!["/local/new".into(), "11".repeat(32)];
+        let Request::Reenroll(req) = build_reenroll("selected", &fields).unwrap() else { panic!() };
+        assert_eq!(req.id, "selected");
+        assert!(build_reenroll("selected", &fields[..1]).is_err());
+    }
 
     #[test]
     fn grants_and_hashes_are_required_before_preview() {

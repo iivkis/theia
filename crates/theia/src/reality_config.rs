@@ -414,6 +414,7 @@ mod tests {
         let old_bytes = std::fs::read(&old_trust).unwrap();
         let before_bytes = std::fs::read(&cfg).unwrap();
         assert!(prepare(&cfg, &Request::Reenroll(ClientRequest { identity_sha256: old_pin, ..req.clone() }), expired).is_err());
+        assert!(prepare(&cfg, &Request::Reenroll(ClientRequest { enrollment: old_path.clone(), identity_sha256: old_pin, id: req.id.clone() }), expired).is_err());
         let request = Request::Reenroll(req);
         let preview = prepare(&cfg, &request, expired).unwrap();
         assert!(preview.report().contains("old_valid_now=false"));

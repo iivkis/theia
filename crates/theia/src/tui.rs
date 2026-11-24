@@ -1245,6 +1245,17 @@ impl Interaction {
                 }
                 return false;
             }
+            if editor.role() == Role::Client && key.code == KeyCode::Char('K')
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+                match editor.require_clean_records() {
+                    Ok(()) => match RegistrationPanel::reenroll(editor) {
+                        Ok(panel) => { editor.error = None; self.reality_registration = Some(panel); }
+                        Err(message) => editor.error = Some(message.into()),
+                    },
+                    Err(message) => editor.error = Some(message.into()),
+                }
+                return false;
+            }
             if key.code == KeyCode::Char('M') && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
                 match editor.require_clean_records() {
                     Ok(()) => match RegistrationPanel::new(editor) {
@@ -1714,7 +1725,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     }
     let footer = if model.screen == Screen::Client {
-        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  M: регистрация  V: REALITY status  Ctrl+S: сохранить"
+        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  M: регистрация  K: re-enroll  V: REALITY status  Ctrl+S: сохранить"
     } else {
         "N/D/G/U/E: записи  W: REALITY  M: регистрация  V: REALITY status  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
     };
