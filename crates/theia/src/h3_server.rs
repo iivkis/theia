@@ -190,13 +190,51 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
                 crate::diag!(Warn, "server.h3", "request_headers_failed_or_timeout");
                 return;
             };
-            if context.accepts_split(&request) {
+            if context.is_descriptor_request(&request) {
+                handle_descriptor(request, stream, &context, peer).await;
+            } else if context.accepts_split(&request) {
                 handle_split_request(request, stream, &context, peer, &pair, binding.as_deref())
                     .await;
             } else {
                 handle_request(request, stream, &context, peer, binding.as_deref()).await;
             }
         });
+    }
+}
+
+async fn handle_descriptor(
+    request: Request<()>,
+    mut stream: Stream,
+    context: &ServerContext,
+    peer: IpAddr,
+) {
+    let (_permit, signed) = match context.authorize_descriptor(&request, peer) {
+        Ok(value) => value,
+        Err(status) => {
+            reject_split(&mut stream, status).await;
+            return;
+        }
+    };
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        stream.recv_data().await.is_ok_and(|data| data.is_none())
+            && stream.recv_trailers().await.is_ok_and(|trailers| trailers.is_none())
+    }).await.unwrap_or(false);
+    if !empty {
+        reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
+        return;
+    }
+    let Ok(response) = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(http::header::CONTENT_LENGTH, signed.len().to_string())
+        .body(()) else { return; };
+    if !matches!(timeout(CLOSE_TIMEOUT, async {
+        stream.send_response(response).await.map_err(|_| ServerError::Io)?;
+        stream.send_data(Bytes::copy_from_slice(signed.as_bytes())).await.map_err(|_| ServerError::Io)?;
+        stream.finish().await.map_err(|_| ServerError::Io)
+    }).await, Ok(Ok(()))) {
+        stream.stop_stream(Code::H3_REQUEST_CANCELLED);
+        stream.stop_sending(Code::H3_REQUEST_CANCELLED);
     }
 }
 
@@ -271,7 +309,7 @@ async fn handle_split_request(
     pair: &SplitPair,
     binding: Option<&crate::channel_binding::Admission>,
 ) {
-    let Some(leg) = crate::split_http::leg(&request) else {
+    let Some(leg) = context.split_leg(&request) else {
         reject_split(&mut stream, StatusCode::NOT_FOUND).await;
         return;
     };

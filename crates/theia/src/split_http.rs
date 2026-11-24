@@ -12,6 +12,51 @@ use tokio::{sync::oneshot, time::timeout};
 
 pub(crate) const UPLOAD_PATH: &str = "/v1/stream-up/upload";
 pub(crate) const DOWNLOAD_PATH: &str = "/v1/stream-up/download";
+/// Paths derived from one authenticated descriptor. Never accept an
+/// arbitrary path supplied by a peer or fall back to default routes.
+#[derive(Clone)]
+pub(crate) struct IdentityRoutes {
+    pub(crate) single: String,
+    upload: String,
+    download: String,
+    pub(crate) descriptor: String,
+}
+
+impl IdentityRoutes {
+    pub(crate) fn new(prefix: &str) -> Result<Self, ClientError> {
+        let tail = prefix.strip_prefix("/v1/").ok_or(ClientError::Configuration)?;
+        if tail.is_empty() || tail.len() > 64 || !tail.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+        }) {
+            return Err(ClientError::Configuration);
+        }
+        Ok(Self {
+            single: format!("{prefix}/session"),
+            upload: format!("{prefix}/stream-up/upload"),
+            download: format!("{prefix}/stream-up/download"),
+            descriptor: format!("{prefix}/descriptor"),
+        })
+    }
+
+    pub(crate) fn leg<T>(&self, request: &Request<T>) -> Option<Leg> {
+        leg_at(request, &self.upload, &self.download)
+    }
+
+    pub(crate) fn request(
+        &self,
+        uri: &Uri,
+        leg: Leg,
+        authorization: &HeaderValue,
+        id: u32,
+    ) -> Result<Request<()>, ClientError> {
+        let path = match leg {
+            Leg::Upload => self.upload.as_str(),
+            Leg::Download => self.download.as_str(),
+        };
+        request_at(uri, leg, authorization, id, path)
+    }
+}
+
 const PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 /// A bounded connection lifetime namespace. IDs cannot be recycled, even
 /// after failed or canceled pairs. Rotate the connection before exhaustion.
@@ -130,6 +175,10 @@ pub(crate) enum Leg {
 }
 
 pub(crate) fn leg<T>(request: &Request<T>) -> Option<Leg> {
+    leg_at(request, UPLOAD_PATH, DOWNLOAD_PATH)
+}
+
+fn leg_at<T>(request: &Request<T>, upload: &str, download: &str) -> Option<Leg> {
     if request.uri().query().is_some()
         || request
             .headers()
@@ -145,9 +194,9 @@ pub(crate) fn leg<T>(request: &Request<T>) -> Option<Leg> {
     {
         return None;
     }
-    if request.method() == Method::POST && request.uri().path() == UPLOAD_PATH {
+    if request.method() == Method::POST && request.uri().path() == upload {
         Some(Leg::Upload)
-    } else if request.method() == Method::GET && request.uri().path() == DOWNLOAD_PATH {
+    } else if request.method() == Method::GET && request.uri().path() == download {
         Some(Leg::Download)
     } else {
         None
@@ -160,14 +209,24 @@ pub(crate) fn request(
     authorization: &HeaderValue,
     id: u32,
 ) -> Result<Request<()>, ClientError> {
+    request_at(uri, leg, authorization, id, match leg {
+        Leg::Upload => UPLOAD_PATH,
+        Leg::Download => DOWNLOAD_PATH,
+    })
+}
+
+fn request_at(
+    uri: &Uri,
+    leg: Leg,
+    authorization: &HeaderValue,
+    id: u32,
+    path: &str,
+) -> Result<Request<()>, ClientError> {
     if !(1..=MAX_PAIR_IDS).contains(&id) {
         return Err(ClientError::Configuration);
     }
     let mut parts = uri.clone().into_parts();
-    parts.path_and_query = Some(match leg {
-        Leg::Upload => http::uri::PathAndQuery::from_static(UPLOAD_PATH),
-        Leg::Download => http::uri::PathAndQuery::from_static(DOWNLOAD_PATH),
-    });
+    parts.path_and_query = Some(path.parse().map_err(|_| ClientError::Configuration)?);
     Request::builder()
         .method(match leg {
             Leg::Upload => Method::POST,
@@ -179,6 +238,19 @@ pub(crate) fn request(
         .header(PAIR_HEADER, id.to_string())
         .body(())
         .map_err(|_| ClientError::Configuration)
+}
+
+pub(crate) fn request_for(
+    routes: Option<&IdentityRoutes>,
+    uri: &Uri,
+    leg: Leg,
+    authorization: &HeaderValue,
+    id: u32,
+) -> Result<Request<()>, ClientError> {
+    match routes {
+        Some(routes) => routes.request(uri, leg, authorization, id),
+        None => request(uri, leg, authorization, id),
+    }
 }
 
 pub(crate) fn check_status(status: StatusCode) -> Result<(), ClientError> {

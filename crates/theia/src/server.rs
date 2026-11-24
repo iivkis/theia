@@ -135,6 +135,7 @@ impl AuthFailure {
 pub struct ServerContext {
     pub inbound_id: String,
     security_mode: crate::security_profile::SecurityMode,
+    identity_routes: Option<IdentityRoutePolicy>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
     global_streams: Arc<Semaphore>,
@@ -144,6 +145,22 @@ pub struct ServerContext {
     // Library-only unsupervised contexts continue using fixed semaphores.
     live_quota: Option<Arc<crate::quota::Ledger>>,
     peer_budget: Arc<PeerBudget>,
+}
+
+struct IdentityRoutePolicy {
+    paths: crate::split_http::IdentityRoutes,
+    stream_one: bool,
+    stream_up: bool,
+    not_before: u64,
+    not_after: u64,
+    signed: Arc<str>,
+}
+
+impl IdentityRoutePolicy {
+    fn current(&self) -> bool {
+        crate::reference_health::unix_now()
+            .is_ok_and(|now| now >= self.not_before && now < self.not_after)
+    }
 }
 
 pub struct SessionPermit {
@@ -191,6 +208,7 @@ impl ServerContext {
         Self {
             inbound_id: inbound.id.clone(),
             security_mode: inbound.security_mode,
+            identity_routes: None,
             authorization,
             policy: policy.clone(),
             global_streams,
@@ -199,6 +217,75 @@ impl ServerContext {
             live_quota: None,
             peer_budget,
         }
+    }
+
+    /// Build the identity-authenticated application context from an already
+    /// independently verified document. No public listener is activated here.
+    pub(crate) fn identity_fixture(
+        inbound: &Inbound,
+        users: &[User],
+        policy: &ServerPolicy,
+        value: &crate::descriptor::Verified,
+        signed: Arc<str>,
+    ) -> Result<Self, ServerError> {
+        let d = value.descriptor();
+        if !inbound.security_mode.is_plain() || inbound.id != d.scope.inbound
+            || inbound.allowed_user_ids.is_empty()
+            || value.check_time(crate::reference_health::unix_now().map_err(|_| ServerError::Config)?).is_err()
+        {
+            return Err(ServerError::Config);
+        }
+        let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
+            .map_err(|_| ServerError::Config)?;
+        let mut context = Self::new(inbound, users, policy);
+        context.identity_routes = Some(IdentityRoutePolicy {
+            paths,
+            stream_one: d.stream_one,
+            stream_up: d.stream_up,
+            not_before: d.not_before,
+            not_after: d.not_after,
+            signed,
+        });
+        Ok(context)
+    }
+
+    pub(crate) fn split_leg<T>(&self, request: &Request<T>) -> Option<crate::split_http::Leg> {
+        match &self.identity_routes {
+            Some(routes) if routes.current() && routes.stream_up => routes.paths.leg(request),
+            Some(_) => None,
+            None => crate::split_http::leg(request),
+        }
+    }
+
+    pub(crate) fn is_descriptor_request<T>(&self, request: &Request<T>) -> bool {
+        self.identity_routes.as_ref().is_some_and(|routes| {
+            request.method() == Method::GET && request.uri().path() == routes.paths.descriptor
+        })
+    }
+
+    /// Same grant and quota policy as a tunnel, but never dials a target.
+    /// The caller must verify empty request body and complete TLS first.
+    pub(crate) fn authorize_descriptor<T>(
+        &self,
+        request: &Request<T>,
+        peer: IpAddr,
+    ) -> Result<(SessionPermit, Arc<str>), StatusCode> {
+        let routes = self.identity_routes.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        if !routes.current() || !self.is_descriptor_request(request)
+            || request.uri().query().is_some()
+            || request.headers().contains_key(crate::split_http::PAIR_HEADER)
+        {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        if !self.peer_budget.admit(peer, Instant::now()) {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        if request.headers().get_all(header::AUTHORIZATION).iter().count() != 1 {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let permit = self.authorize(request.headers().get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())).map_err(AuthFailure::status)?;
+        Ok((permit, routes.signed.clone()))
     }
 
     pub(crate) fn connection_slot(&self) -> Option<ConnectionSlot> {
@@ -232,9 +319,14 @@ impl ServerContext {
         if !self.peer_budget.admit(peer, Instant::now()) {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        if self.security_mode.is_stream_up()
+        let single_allowed = match &self.identity_routes {
+            Some(routes) => routes.current() && routes.stream_one
+                && request.uri().path() == routes.paths.single,
+            None => !self.security_mode.is_stream_up()
+                && request.uri().path() == self.security_mode.path(),
+        };
+        if !single_allowed
             || request.method() != Method::POST
-            || request.uri().path() != self.security_mode.path()
             || request.uri().query().is_some()
             || request
                 .headers()
@@ -278,8 +370,12 @@ impl ServerContext {
     }
 
     pub(crate) fn accepts_split<T>(&self, request: &Request<T>) -> bool {
-        self.stream_up()
-            || (self.security_mode.is_plain() && crate::split_http::leg(request).is_some())
+        if self.identity_routes.is_some() {
+            self.split_leg(request).is_some()
+        } else {
+            self.stream_up()
+                || (self.security_mode.is_plain() && self.split_leg(request).is_some())
+        }
     }
 
     pub(crate) fn authorize_split_pair<U, D>(
@@ -293,8 +389,8 @@ impl ServerContext {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
         if !(self.stream_up() || self.security_mode.is_plain())
-            || split_http::leg(upload) != Some(Leg::Upload)
-            || split_http::leg(download) != Some(Leg::Download)
+            || self.split_leg(upload) != Some(Leg::Upload)
+            || self.split_leg(download) != Some(Leg::Download)
             || split_http::pair_id(upload).is_none()
             || split_http::pair_id(upload) != split_http::pair_id(download)
         {
@@ -698,7 +794,9 @@ pub(crate) async fn serve_generation_with_tls(
                         let pair = pair.clone();
                         let binding = binding.clone();
                         handlers.spawn(async move {
-                            let result = if context.accepts_split(&request) {
+                            let result = if context.is_descriptor_request(&request) {
+                                handle_descriptor(request, respond, &context, peer.ip()).await
+                            } else if context.accepts_split(&request) {
                                 handle_split_request(request, respond, &context, peer.ip(), &pair, binding.as_deref()).await
                             } else {
                                 handle_request(request, respond, context, peer.ip(), binding.as_deref()).await
@@ -737,6 +835,48 @@ async fn reject(
         .send_response(response, true)
         .map_err(|_| ServerError::Http2)?;
     Ok(())
+}
+
+async fn handle_descriptor(
+    mut request: Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    context: &ServerContext,
+    peer: IpAddr,
+) -> Result<(), ServerError> {
+    let (_permit, signed) = match context.authorize_descriptor(&request, peer) {
+        Ok(value) => value,
+        Err(status) => return reject(&mut respond, status).await,
+    };
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        request.body_mut().data().await.is_none()
+            && request.body_mut().trailers().await.is_ok_and(|value| value.is_none())
+    }).await.unwrap_or(false);
+    if !empty {
+        return reject(&mut respond, StatusCode::BAD_REQUEST).await;
+    }
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, signed.len().to_string())
+        .body(()).map_err(|_| ServerError::Http2)?;
+    let mut output = respond.send_response(response, false).map_err(|_| ServerError::Http2)?;
+    timeout(CLOSE_TIMEOUT, async {
+        output.reserve_capacity(signed.len());
+        let mut remaining = signed.as_bytes();
+        while !remaining.is_empty() {
+            let credit = std::future::poll_fn(|cx| output.poll_capacity(cx))
+                .await.ok_or(ServerError::Io)?.map_err(|_| ServerError::Io)?;
+            if credit == 0 { continue; }
+            let count = credit.min(remaining.len());
+            output.send_data(Bytes::copy_from_slice(&remaining[..count]), count == remaining.len())
+                .map_err(|_| ServerError::Io)?;
+            remaining = &remaining[count..];
+            if !remaining.is_empty() {
+                output.reserve_capacity(remaining.len());
+            }
+        }
+        Ok(())
+    }).await.map_err(|_| ServerError::Io)?
 }
 
 async fn handle_request(
@@ -800,7 +940,7 @@ async fn handle_split_request(
     pair: &SplitPair,
     binding: Option<&crate::channel_binding::Admission>,
 ) -> Result<(), ServerError> {
-    let Some(leg) = crate::split_http::leg(&request) else {
+    let Some(leg) = context.split_leg(&request) else {
         return reject(&mut respond, StatusCode::NOT_FOUND).await;
     };
     let Some(id) = crate::split_http::pair_id(&request) else {

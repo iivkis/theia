@@ -28,6 +28,8 @@ pub struct H3Client {
     uri: Uri,
     authorization: HeaderValue,
     roots: RootCertStore,
+    identity_quic: Option<quinn::ClientConfig>,
+    identity_routes: Option<crate::split_http::IdentityRoutes>,
     connect_timeout: Duration,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     stream_up: bool,
@@ -63,6 +65,8 @@ impl H3Client {
             uri,
             authorization: bearer_header(token)?,
             roots,
+            identity_quic: None,
+            identity_routes: None,
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
             stream_up: false,
@@ -70,6 +74,75 @@ impl H3Client {
             pool: crate::connection_pool::Pool::default(),
             reuse_connections: false,
         })
+    }
+
+    pub(crate) fn identity_fixture(
+        remote: SocketAddr,
+        token: &str,
+        value: &crate::descriptor::Verified,
+    ) -> Result<Self, ClientError> {
+        let d = value.descriptor();
+        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string()
+            || !value.effective_modes().h3 {
+            return Err(ClientError::Configuration);
+        }
+        let quic = crate::identity_tls::quic_client(&d.scope, value.signer())
+            .map_err(|_| ClientError::Tls)?;
+        let routes = crate::split_http::IdentityRoutes::new(&d.path_prefix)?;
+        let uri = Uri::builder().scheme("https").authority("localhost")
+            .path_and_query(routes.single.as_str()).build().map_err(|_| ClientError::Configuration)?;
+        let mut client = Self {
+            remote,
+            name: "localhost".into(),
+            uri,
+            authorization: bearer_header(token)?,
+            roots: RootCertStore::empty(),
+            identity_quic: Some(quic),
+            identity_routes: Some(routes),
+            connect_timeout: Duration::from_secs(10),
+            certificate_pin: None,
+            stream_up: false,
+            auto_mode: None,
+            pool: crate::connection_pool::Pool::default(),
+            reuse_connections: false,
+        };
+        let modes = value.effective_modes();
+        client = if modes.stream_one && modes.stream_up {
+            client.with_auto_stream_up(Duration::from_secs(900))?
+        } else {
+            client.with_stream_up(modes.stream_up)?
+        };
+        Ok(client)
+    }
+
+    pub(crate) async fn fetch_identity_descriptor(&self) -> Result<String, ClientError> {
+        let routes = self.identity_routes.as_ref().ok_or(ClientError::Configuration)?;
+        timeout(OPEN_TIMEOUT, async {
+            let connection = self.connect_verified(diagnostics::next_id()).await?;
+            let mut sender = connection.sender.lock().map_err(|_| ClientError::Http3)?.clone();
+            let mut parts = self.uri.clone().into_parts();
+            parts.path_and_query = Some(routes.descriptor.parse().map_err(|_| ClientError::Configuration)?);
+            let uri = Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+            let request = Request::get(uri).header(header::AUTHORIZATION, self.authorization.clone())
+                .body(()).map_err(|_| ClientError::Configuration)?;
+            let mut stream = sender.send_request(request).await.map_err(|_| ClientError::Http3)?;
+            stream.finish().await.map_err(|_| ClientError::Http3)?;
+            let response = stream.recv_response().await.map_err(|_| ClientError::Http3)?;
+            crate::split_http::check_status(response.status())?;
+            crate::identity_data::validate_descriptor_headers(response.headers())?;
+            let mut bytes = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.map_err(|_| ClientError::Http3)? {
+                if chunk.remaining() > crate::descriptor::MAX_DOCUMENT - bytes.len() {
+                    return Err(ClientError::Protocol);
+                }
+                let chunk = chunk.copy_to_bytes(chunk.remaining());
+                crate::identity_data::append_descriptor(&mut bytes, &chunk)?;
+            }
+            if stream.recv_trailers().await.map_err(|_| ClientError::Http3)?.is_some() {
+                return Err(ClientError::Protocol);
+            }
+            String::from_utf8(bytes).map_err(|_| ClientError::Protocol)
+        }).await.map_err(|_| ClientError::Timeout)?
     }
 
     /// Reuse verified own-TLS connections within this immutable profile.
@@ -187,7 +260,10 @@ impl H3Client {
         } else {
             SocketAddr::from(([0u16; 8], 0))
         };
-        let endpoint = ObservedEndpoint::new(bind, self.roots.clone()).map_err(quic_error)?;
+        let endpoint = match &self.identity_quic {
+            Some(config) => ObservedEndpoint::with_config(bind, config.clone()),
+            None => ObservedEndpoint::new(bind, self.roots.clone()),
+        }.map_err(quic_error)?;
         // No credential/request data until verified full handshake and BBR.
         let connection = endpoint
             .connect(self.remote, &self.name, self.connect_timeout)
@@ -323,7 +399,7 @@ impl H3Client {
             let mut download = sender
                 .send_request(crate::channel_binding::attach(
                     binding,
-                    split_http::request(&self.uri, Leg::Download, &self.authorization, pair_id)?,
+                    split_http::request_for(self.identity_routes.as_ref(), &self.uri, Leg::Download, &self.authorization, pair_id)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
@@ -331,7 +407,7 @@ impl H3Client {
             let mut upload = sender
                 .send_request(crate::channel_binding::attach(
                     binding,
-                    split_http::request(&self.uri, Leg::Upload, &self.authorization, pair_id)?,
+                    split_http::request_for(self.identity_routes.as_ref(), &self.uri, Leg::Upload, &self.authorization, pair_id)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;

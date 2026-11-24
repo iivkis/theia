@@ -119,6 +119,7 @@ pub struct H2Client {
     connector: H2Tls,
     wire_shape: H2WireShape,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
+    identity_routes: Option<crate::split_http::IdentityRoutes>,
     stream_up: bool,
     auto_mode: Option<crate::split_http::AutoMode>,
     pool: crate::connection_pool::Pool<H2Connection>,
@@ -151,6 +152,67 @@ impl H2Client {
             H2Tls::Rustls(TlsConnector::from(Arc::new(tls))),
             H2WireShape::Standard,
         )
+    }
+
+    pub(crate) fn identity_fixture(
+        remote: std::net::SocketAddr,
+        token: &str,
+        value: &crate::descriptor::Verified,
+    ) -> Result<Self, ClientError> {
+        let d = value.descriptor();
+        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string()
+            || !value.effective_modes().h2 {
+            return Err(ClientError::Configuration);
+        }
+        let tls = crate::identity_tls::client_tls(
+            &d.scope, value.signer(), crate::identity_tls::Branch::H2,
+        ).map_err(|_| ClientError::Tls)?;
+        let mut client = Self::with_connector(
+            &remote.to_string(), "localhost", token,
+            H2Tls::Rustls(TlsConnector::from(Arc::new(tls))), H2WireShape::Standard,
+        )?;
+        let routes = crate::split_http::IdentityRoutes::new(&d.path_prefix)?;
+        client.uri = http::Uri::builder().scheme("https").authority("localhost")
+            .path_and_query(routes.single.as_str()).build().map_err(|_| ClientError::Configuration)?;
+        client.identity_routes = Some(routes);
+        let modes = value.effective_modes();
+        client = if modes.stream_one && modes.stream_up {
+            client.with_auto_stream_up(Duration::from_secs(900))?
+        } else {
+            client.with_stream_up(modes.stream_up)?
+        };
+        Ok(client)
+    }
+
+    /// Authenticated descriptor GET; never send a bearer before the pinned
+    /// identity handshake, never interpret the body as a routing command.
+    pub(crate) async fn fetch_identity_descriptor(&self) -> Result<String, ClientError> {
+        let routes = self.identity_routes.as_ref().ok_or(ClientError::Configuration)?;
+        timeout(OPEN_TIMEOUT, async {
+            let connection = self.connect_verified(diagnostics::next_id()).await?;
+            let sender = connection.sender.lock().map_err(|_| ClientError::Http2)?.clone();
+            let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+            let mut parts = self.uri.clone().into_parts();
+            parts.path_and_query = Some(routes.descriptor.parse().map_err(|_| ClientError::Configuration)?);
+            let uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+            let request = Request::get(uri).header(header::AUTHORIZATION, self.authorization.clone())
+                .body(()).map_err(|_| ClientError::Configuration)?;
+            let (response, _) = sender.send_request(request, true).map_err(|_| ClientError::Http2)?;
+            let response = response.await.map_err(|_| ClientError::Http2)?;
+            crate::split_http::check_status(response.status())?;
+            crate::identity_data::validate_descriptor_headers(response.headers())?;
+            let mut body = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.map_err(|_| ClientError::Http2)?;
+                crate::identity_data::append_descriptor(&mut bytes, &chunk)?;
+                body.flow_control().release_capacity(chunk.len()).map_err(|_| ClientError::Http2)?;
+            }
+            if body.trailers().await.map_err(|_| ClientError::Http2)?.is_some() {
+                return Err(ClientError::Protocol);
+            }
+            String::from_utf8(bytes).map_err(|_| ClientError::Protocol)
+        }).await.map_err(|_| ClientError::Timeout)?
     }
 
     /// Experimental API only: build a separately verified BoringSSL connector
@@ -230,6 +292,7 @@ impl H2Client {
             connector,
             wire_shape,
             certificate_pin: None,
+            identity_routes: None,
             stream_up: false,
             auto_mode: None,
             pool: crate::connection_pool::Pool::default(),
@@ -494,7 +557,8 @@ impl H2Client {
                 .send_request(
                     crate::channel_binding::attach(
                         binding,
-                        split_http::request(
+                        split_http::request_for(
+                            self.identity_routes.as_ref(),
                             &self.uri,
                             Leg::Download,
                             &self.authorization,
@@ -509,7 +573,7 @@ impl H2Client {
                 .send_request(
                     crate::channel_binding::attach(
                         binding,
-                        split_http::request(&self.uri, Leg::Upload, &self.authorization, pair_id)?,
+                        split_http::request_for(self.identity_routes.as_ref(), &self.uri, Leg::Upload, &self.authorization, pair_id)?,
                     )?,
                     false,
                 )
