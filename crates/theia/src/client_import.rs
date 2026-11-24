@@ -3,16 +3,15 @@
 //! A caller must perform strict typed TOML validation and guarded commit.
 use crate::invite::Invitation;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-#[cfg(unix)]
-use std::fs::OpenOptions;
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
 
 const MAX_URI: u64 = 4096;
+const MAX_CA: u64 = 1024 * 1024;
 const RANDOM_BYTES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,25 +39,96 @@ pub fn read_source(raw: &str) -> Result<Invitation, ImportError> {
     if raw.starts_with("theia://") {
         return Invitation::decode(raw).map_err(|_| ImportError::InvalidSource);
     }
-    let path = Path::new(raw);
-    if !path.is_absolute() {
+    let contents = read_local_file(Path::new(raw), MAX_URI)?;
+    let value = std::str::from_utf8(&contents).map_err(|_| ImportError::InvalidSource)?;
+    Invitation::decode(value.trim_end_matches(['\r', '\n'])).map_err(|_| ImportError::InvalidSource)
+}
+
+// Reject ambiguous path forms before touching the filesystem. A drive
+// letter is not proof that a volume is physically local (mapped drives
+// and mounted filesystems are outside this lexical check).
+fn explicit_file_path(path: &Path) -> bool {
+    use std::path::Component;
+
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        let mut parts = path.components();
+        if !matches!(
+            parts.next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        ) {
+            return false;
+        }
+        // Alternate data streams and device syntax are not invitation files.
+        if parts.any(|part| match part {
+            Component::Normal(name) => name.to_string_lossy().contains(':'),
+            _ => false,
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+fn regular_metadata(metadata: &fs::Metadata, limit: u64) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    metadata.is_file() && metadata.len() <= limit
+}
+
+// Check the opened handle as well as the path; do not follow a final
+// symlink/reparse point on supported release platforms. Parent directory
+// replacement, mounted remote filesystems and trust at later runtime use
+// are separate concerns, not solved by this bounded import reader.
+fn read_local_file(path: &Path, limit: u64) -> Result<Zeroizing<Vec<u8>>, ImportError> {
+    if !explicit_file_path(path) {
         return Err(ImportError::InvalidSource);
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| ImportError::InvalidSource)?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_URI {
+    if !regular_metadata(&metadata, limit) {
+        return Err(ImportError::InvalidSource);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|_| ImportError::InvalidSource)?;
+    let metadata = file.metadata().map_err(|_| ImportError::InvalidSource)?;
+    if !regular_metadata(&metadata, limit) {
         return Err(ImportError::InvalidSource);
     }
     let mut contents = Zeroizing::new(Vec::new());
-    File::open(path)
-        .map_err(|_| ImportError::InvalidSource)?
-        .take(MAX_URI + 1)
+    file.take(limit + 1)
         .read_to_end(&mut contents)
         .map_err(|_| ImportError::InvalidSource)?;
-    if contents.len() as u64 > MAX_URI {
+    if contents.len() as u64 > limit {
         return Err(ImportError::InvalidSource);
     }
-    let value = std::str::from_utf8(&contents).map_err(|_| ImportError::InvalidSource)?;
-    Invitation::decode(value.trim_end_matches(['\r', '\n'])).map_err(|_| ImportError::InvalidSource)
+    Ok(contents)
 }
 
 pub fn valid_explicit_reference(raw: &str) -> bool {
@@ -83,27 +153,7 @@ pub fn checked_ca_ref(raw: Option<&str>) -> Result<Option<String>, ImportError> 
     let path = raw
         .strip_prefix("file:")
         .ok_or(ImportError::InvalidSource)?;
-    let path = Path::new(path);
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return Err(ImportError::InvalidSource);
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|_| ImportError::InvalidSource)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
-        return Err(ImportError::InvalidSource);
-    }
-    let mut contents = Vec::new();
-    File::open(path)
-        .map_err(|_| ImportError::InvalidSource)?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut contents)
-        .map_err(|_| ImportError::InvalidSource)?;
-    if contents.len() > 1024 * 1024 {
-        return Err(ImportError::InvalidSource);
-    }
+    let contents = read_local_file(Path::new(path), MAX_CA)?;
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(contents.as_slice())) {
         roots
@@ -356,7 +406,7 @@ mod windows_acl_tests {
         Local(sid)
     }
 
-    fn assert_exact_private_dacl(path: &Path) {
+    pub(super) fn assert_exact_private_dacl(path: &Path) {
         let mut wide = path
             .as_os_str()
             .encode_wide()
@@ -424,5 +474,274 @@ mod windows_acl_tests {
         assert_exact_private_dacl(&credential.file);
         drop(credential);
         fs::remove_dir(&parent).unwrap();
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod storage_tests {
+    use super::*;
+    use std::{process::Command, sync::Barrier, thread};
+
+    const CHILD_PARENT: &str = "THEIA_TEST_PRIVATE_BEARER_CHILD_PARENT";
+    const CHILD_EXIT: i32 = 73;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let mut random = [0u8; 16];
+            rustls::crypto::ring::default_provider()
+                .secure_random
+                .fill(&mut random)
+                .unwrap();
+            let name = format!("theia-storage-test-{}", URL_SAFE_NO_PAD.encode(random));
+            let path = std::env::temp_dir().join(name);
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_private(path: &Path, directory: bool) {
+        assert_eq!(fs::metadata(path).unwrap().is_dir(), directory);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, if directory { 0o700 } else { 0o600 });
+        }
+        #[cfg(windows)]
+        super::windows_acl_tests::assert_exact_private_dacl(path);
+    }
+
+    fn fixture_invite() -> String {
+        let source = include_str!("../../../examples/client.toml");
+        let document = crate::config::parse(source).unwrap();
+        let crate::config::Config::Client(document) = document else {
+            panic!("client");
+        };
+        Invitation::public_from_profile(&document.client.profiles[0])
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
+    #[test]
+    fn explicit_local_import_and_ca_have_bounded_regular_file_contract() {
+        let scratch = Scratch::new();
+        let uri = fixture_invite();
+        let path = scratch.0.join("invite.txt");
+        fs::write(&path, format!("{uri}\r\n")).unwrap();
+        assert!(!read_source(path.to_str().unwrap()).unwrap().has_token());
+        assert!(!read_source(&uri).unwrap().has_token());
+        let ca = scratch.0.join("ca.pem");
+        let names = vec!["edge.example.org".to_owned()];
+        let cert = rcgen::generate_simple_self_signed(names).unwrap();
+        fs::write(&ca, cert.cert.pem()).unwrap();
+        let ca_ref = format!("file:{}", ca.display());
+        let selected = checked_ca_ref(Some(&ca_ref)).unwrap();
+        assert_eq!(selected, Some(ca_ref.clone()));
+        for bytes in [
+            vec![0xff, 0xfe],
+            vec![b'x'; MAX_URI as usize + 1],
+            b"not an invitation".to_vec(),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                read_source(path.to_str().unwrap()).unwrap_err(),
+                ImportError::InvalidSource
+            );
+        }
+        for bytes in [
+            Vec::new(),
+            b"not a certificate".to_vec(),
+            vec![b'x'; MAX_CA as usize + 1],
+        ] {
+            fs::write(&ca, bytes).unwrap();
+            let result = checked_ca_ref(Some(&ca_ref));
+            assert_eq!(result, Err(ImportError::InvalidSource));
+        }
+        assert!(read_source(scratch.0.to_str().unwrap()).is_err());
+        assert!(read_source("relative.txt").is_err());
+        assert!(read_source("https://example.invalid/invite").is_err());
+        let parent_path = scratch.0.join("sub/../invite.txt");
+        assert!(!explicit_file_path(&parent_path));
+        assert!(read_source(parent_path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn bounded_reader_checks_exact_boundary() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("data");
+        fs::write(&path, b"abcd").unwrap();
+        let contents = read_local_file(&path, 4).unwrap();
+        assert_eq!(contents.as_slice(), b"abcd");
+        assert!(read_local_file(&path, 3).is_err());
+        assert!(read_local_file(&scratch.0.join("missing"), 4).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_import_rejects_final_symlinks_for_both_input_types() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = Scratch::new();
+        let invite = scratch.0.join("invite.txt");
+        fs::write(&invite, fixture_invite()).unwrap();
+        let link = scratch.0.join("link.txt");
+        symlink(&invite, &link).unwrap();
+        assert!(read_source(link.to_str().unwrap()).is_err());
+        let ca = scratch.0.join("ca.pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        fs::write(&ca, cert.cert.pem()).unwrap();
+        let ca_link = scratch.0.join("ca-link.pem");
+        symlink(&ca, &ca_link).unwrap();
+        let reference = format!("file:{}", ca_link.display());
+        assert!(checked_ca_ref(Some(&reference)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_remote_device_and_alternate_stream_paths_are_rejected_lexically() {
+        for raw in [
+            r"\\server\share\invite.txt",
+            r"\\?\UNC\server\share\invite.txt",
+            r"\\.\PhysicalDrive0",
+            r"C:\data\invite.txt:stream",
+            r"C:\data\..\invite.txt",
+            r"C:invite.txt",
+        ] {
+            assert!(!explicit_file_path(Path::new(raw)));
+        }
+        assert!(explicit_file_path(Path::new(r"C:\data\invite.txt")));
+        assert!(explicit_file_path(Path::new(r"\\?\C:\data\invite.txt")));
+    }
+
+    #[test]
+    fn private_creation_collisions_preserve_existing_data() {
+        let scratch = Scratch::new();
+        let directory = scratch.0.join("private");
+        new_private_directory(&directory).unwrap();
+        assert!(new_private_directory(&directory).is_err());
+        assert_private(&directory, true);
+
+        let path = directory.join("credential");
+        let mut file = new_private_file(&path).unwrap();
+        file.write_all(b"original fixture").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(new_private_file(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap().as_slice(), b"original fixture");
+        assert_private(&path, false);
+    }
+
+    #[test]
+    fn concurrent_create_new_has_one_winner_and_no_overwrite() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("credential");
+        let barrier = Barrier::new(2);
+        let results = thread::scope(|scope| {
+            let workers = (*b"AB").map(|byte| {
+                let barrier = &barrier;
+                let path = &path;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let Ok(mut file) = new_private_file(path) else {
+                        return None;
+                    };
+                    file.write_all(&[byte]).unwrap();
+                    file.sync_all().unwrap();
+                    Some(byte)
+                })
+            });
+            workers.map(|worker| worker.join().unwrap())
+        });
+        let winners: Vec<_> = results.into_iter().flatten().collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(fs::read(&path).unwrap(), winners);
+        assert_private(&path, false);
+    }
+
+    #[test]
+    fn credential_guard_rolls_back_only_its_own_uncommitted_files() {
+        let scratch = Scratch::new();
+        let config = scratch.0.join("client.toml");
+        let mut kept = PrivateBearer::create(&config, &[0x11; 32]).unwrap();
+        let discarded = PrivateBearer::create(&config, &[0x22; 32]).unwrap();
+        let kept_path = kept.file.clone();
+        let discarded_path = discarded.file.clone();
+        assert_ne!(kept_path, discarded_path);
+        assert_private(&kept.directory, true);
+        assert_private(&kept_path, false);
+        assert_private(&discarded.directory, true);
+        assert_private(&discarded_path, false);
+
+        kept.commit();
+        drop(kept);
+        drop(discarded);
+        assert!(!discarded_path.exists());
+        assert!(!discarded_path.parent().unwrap().exists());
+        assert_eq!(
+            fs::read_to_string(&kept_path).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x11; 32])
+        );
+        assert!(!config.exists());
+    }
+
+    // This exact test is invoked by the parent in a fresh process. Exit
+    // bypasses Rust Drop; ordinary test runs do not enter the fixture.
+    #[test]
+    fn child_exits_before_bearer_commit() {
+        let Some(parent) = std::env::var_os(CHILD_PARENT) else {
+            return;
+        };
+        let path = PathBuf::from(parent).join("client.toml");
+        let _pending = PrivateBearer::create(&path, &[0x33; 32]).unwrap();
+        std::process::exit(CHILD_EXIT);
+    }
+
+    #[test]
+    fn process_exit_before_commit_leaves_only_private_unreferenced_bearer() {
+        let scratch = Scratch::new();
+        let config = scratch.0.join("client.toml");
+        let baseline = include_str!("../../../examples/client.toml");
+        fs::write(&config, baseline).unwrap();
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client_import::storage_tests::child_exits_before_bearer_commit",
+            ])
+            .env(CHILD_PARENT, &scratch.0)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(CHILD_EXIT));
+        assert_eq!(fs::read_to_string(&config).unwrap(), baseline);
+
+        let directories: Vec<_> = fs::read_dir(&scratch.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(directories.len(), 1);
+        let orphan = directories[0].join("token");
+        assert_private(&directories[0], true);
+        assert_private(&orphan, false);
+        assert_eq!(
+            fs::read_to_string(&orphan).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x33; 32])
+        );
+
+        // A separate creation must not adopt or overwrite the orphan.
+        let next = PrivateBearer::create(&config, &[0x44; 32]).unwrap();
+        assert_ne!(next.file, orphan);
+        drop(next);
+        assert!(orphan.exists());
+        assert_eq!(fs::read_to_string(&config).unwrap(), baseline);
     }
 }

@@ -16,6 +16,9 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    process::Command,
+    sync::{Barrier, Mutex},
+    thread,
 };
 
 const MAX_PINS: usize = 2;
@@ -850,4 +853,252 @@ fn independently_anchored_checkpoint_must_still_have_valid_policy() {
         restore(&text, &anchor, EDGE, START),
         Err(Rejection::Key)
     ));
+}
+
+const CHECKPOINT_CHILD_ROOT: &str = "THEIA_TEST_CHECKPOINT_CHILD_ROOT";
+const CHECKPOINT_CHILD_PHASE: &str = "THEIA_TEST_CHECKPOINT_CHILD_PHASE";
+const CHECKPOINT_CHILD_EXIT: i32 = 74;
+
+#[test]
+fn checkpoint_child_exits_at_publication_boundary() {
+    let Some(root) = std::env::var_os(CHECKPOINT_CHILD_ROOT) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let phase = std::env::var(CHECKPOINT_CHILD_PHASE).unwrap();
+    let text = fs::read(root.join("authorized-fixture.toml")).unwrap();
+    let staged = root.join("pending.tmp");
+    match phase.as_str() {
+        "partial" => write_fixture(&staged, &text[..text.len() / 2]),
+        "staged" => write_fixture(&staged, &text),
+        "published" => {
+            write_fixture(&staged, &text);
+            fs::rename(staged, root.join("committed.toml")).unwrap();
+        }
+        _ => panic!("unknown fixture phase"),
+    }
+    std::process::exit(CHECKPOINT_CHILD_EXIT);
+}
+
+#[test]
+fn process_exit_around_checkpoint_publication_never_selects_staging_or_old_state() {
+    let old = keypair();
+    let new = keypair();
+    let old_pin = pin(&old, START, END);
+    let new_pin = pin(&new, ROTATE, END);
+    let mut trust = Trust::new(policy(1, vec![old_pin]), START).unwrap();
+    let previous = encode_checkpoint(&checkpoint(&trust));
+    trust.replace(policy(2, vec![new_pin]), ROTATE).unwrap();
+    let saved = checkpoint(&trust);
+    let text = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &text);
+    drop(trust);
+
+    for phase in ["partial", "staged", "published"] {
+        let dir = Scratch::new();
+        let old_file = dir.0.join("previous.toml");
+        let pending = dir.0.join("pending.tmp");
+        let committed = dir.0.join("committed.toml");
+        let source = dir.0.join("authorized-fixture.toml");
+        write_fixture(&old_file, previous.as_bytes());
+        write_fixture(&source, text.as_bytes());
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "checkpoint_child_exits_at_publication_boundary"])
+            .env(CHECKPOINT_CHILD_ROOT, &dir.0)
+            .env(CHECKPOINT_CHILD_PHASE, phase)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(CHECKPOINT_CHILD_EXIT));
+        assert!(matches!(
+            restore_file(&old_file, &anchor, ROTATE),
+            Err(Rejection::Policy)
+        ));
+        if phase == "published" {
+            assert!(!pending.exists());
+            let mut restored = restore_file(&committed, &anchor, ROTATE).unwrap();
+            assert_eq!(
+                restored.replace(policy(3, vec![old_pin]), ROTATE),
+                Err(Rejection::Key)
+            );
+            let proof = transcript(Branch::H3, ROTATE, 6);
+            assert_eq!(
+                verify(&mut restored, expected(Branch::H3), &new, &proof, ROTATE),
+                Ok(())
+            );
+        } else {
+            assert!(pending.exists());
+            assert!(matches!(
+                restore_file(&committed, &anchor, ROTATE),
+                Err(Rejection::Policy)
+            ));
+            assert!(!committed.exists());
+        }
+    }
+}
+
+#[test]
+fn concurrent_policy_updates_from_same_generation_have_only_one_winner() {
+    let old = keypair();
+    let first = keypair();
+    let second = keypair();
+    let old_pin = pin(&old, START, END);
+    let candidates = [pin(&first, ROTATE, END), pin(&second, ROTATE, END)];
+    let trust = Mutex::new(Trust::new(policy(1, vec![old_pin]), START).unwrap());
+    let barrier = Barrier::new(2);
+    let outcomes = thread::scope(|scope| {
+        let workers = candidates.map(|candidate| {
+            let trust = &trust;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                trust
+                    .lock()
+                    .unwrap()
+                    .replace(policy(2, vec![candidate]), ROTATE)
+            })
+        });
+        workers.map(|worker| worker.join().unwrap())
+    });
+    let mut trust = trust.into_inner().unwrap();
+    assert_eq!(trust.policy.generation, 2);
+    assert_eq!(trust.policy.pins.len(), 1);
+    assert_eq!(trust.retired, vec![old_pin.key]);
+    let winner = if outcomes[0].is_ok() { 0 } else { 1 };
+    assert_eq!(outcomes[winner], Ok(()));
+    assert_eq!(outcomes[1 - winner], Err(Rejection::Generation));
+    assert_eq!(trust.policy.pins[0].key, candidates[winner].key);
+
+    for (index, key) in [&first, &second].into_iter().enumerate() {
+        let proof = transcript(Branch::H2, ROTATE, 5);
+        let outcome = verify(&mut trust, expected(Branch::H2), key, &proof, ROTATE);
+        assert_eq!(
+            outcome,
+            if index == winner {
+                Ok(())
+            } else {
+                Err(Rejection::Key)
+            }
+        );
+    }
+    let proof = transcript(Branch::H2, ROTATE, 6);
+    assert_eq!(
+        verify(&mut trust, expected(Branch::H2), &old, &proof, ROTATE),
+        Err(Rejection::Key)
+    );
+}
+
+#[test]
+fn concurrent_identical_proofs_consume_only_one_replay_slot() {
+    for branch in [Branch::H2, Branch::H3] {
+        let signer = keypair();
+        let public = pin(&signer, START, END).key;
+        let trust = Trust::new(policy(1, vec![pin(&signer, START, END)]), START);
+        let trust = Mutex::new(trust.unwrap());
+        let proof = transcript(branch, START, 1);
+        let signature = signer.sign(&proof.encode());
+        let barrier = Barrier::new(2);
+        let outcomes = thread::scope(|scope| {
+            let workers = [0, 1].map(|_| {
+                let trust = &trust;
+                let proof = &proof;
+                let signature = signature.as_ref();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    trust
+                        .lock()
+                        .unwrap()
+                        .verify(expected(branch), &public, proof, signature, START)
+                })
+            });
+            workers.map(|worker| worker.join().unwrap())
+        });
+        let winner = if outcomes[0].is_ok() { 0 } else { 1 };
+        assert_eq!(outcomes[winner], Ok(()));
+        assert_eq!(outcomes[1 - winner], Err(Rejection::Proof(Failure::Replay)));
+        let mut trust = trust.into_inner().unwrap();
+        for seed in 2..=8 {
+            let fresh = transcript(branch, START, seed);
+            assert_eq!(
+                verify(&mut trust, expected(branch), &signer, &fresh, START),
+                Ok(())
+            );
+        }
+        let excess = transcript(branch, START, 9);
+        assert_eq!(
+            verify(&mut trust, expected(branch), &signer, &excess, START),
+            Err(Rejection::Proof(Failure::Capacity))
+        );
+    }
+}
+
+#[test]
+fn distinct_inbound_pins_and_checkpoint_anchors_are_isolated() {
+    let first = keypair();
+    let second = keypair();
+    let first_pin = pin(&first, START, END);
+    let second_pin = pin(&second, START, END);
+    let other = Scope {
+        inbound: "edge-b",
+        ..EDGE
+    };
+    let left = Trust::new(policy(1, vec![first_pin]), START).unwrap();
+    let right_policy = Policy {
+        scope: other,
+        generation: 1,
+        pins: vec![second_pin],
+    };
+    let right = Trust::new(right_policy, START).unwrap();
+    let left_saved = checkpoint(&left);
+    let right_saved = checkpoint(&right);
+    let left_text = encode_checkpoint(&left_saved);
+    let right_text = encode_checkpoint(&right_saved);
+    let left_anchor = authorize_fixture(&left_saved, &left_text);
+    let right_anchor = authorize_fixture(&right_saved, &right_text);
+    assert!(matches!(
+        restore(&left_text, &right_anchor, other, START),
+        Err(Rejection::Policy)
+    ));
+    assert!(matches!(
+        restore(&left_text, &left_anchor, other, START),
+        Err(Rejection::Scope)
+    ));
+    assert!(matches!(
+        restore(&right_text, &right_anchor, EDGE, START),
+        Err(Rejection::Scope)
+    ));
+    let mut left = restore(&left_text, &left_anchor, EDGE, START).unwrap();
+    let mut right = restore(&right_text, &right_anchor, other, START).unwrap();
+    let branch = Branch::H3;
+    let proof = transcript(branch, START, 1);
+    let mut right_expected = expected(branch);
+    right_expected.scope = other;
+    assert_eq!(
+        verify(&mut right, right_expected, &first, &proof, START),
+        Err(Rejection::Key)
+    );
+    assert_eq!(
+        verify(&mut left, expected(branch), &second, &proof, START),
+        Err(Rejection::Key)
+    );
+    assert_eq!(
+        verify(&mut right, right_expected, &second, &proof, START),
+        Ok(())
+    );
+    assert_eq!(
+        verify(&mut left, expected(branch), &first, &proof, START),
+        Ok(())
+    );
+
+    left.replace(policy(2, vec![]), ROTATE).unwrap();
+    let fresh = transcript(branch, ROTATE, 2);
+    assert_eq!(
+        verify(&mut left, expected(branch), &first, &fresh, ROTATE),
+        Err(Rejection::Key)
+    );
+    assert_eq!(
+        verify(&mut right, right_expected, &second, &fresh, ROTATE),
+        Ok(())
+    );
 }
