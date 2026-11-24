@@ -80,6 +80,11 @@ pub struct ServerSettings {
 #[serde(deny_unknown_fields)]
 pub struct Inbound {
     pub id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::security_profile::SecurityMode::is_plain"
+    )]
+    pub security_mode: crate::security_profile::SecurityMode,
     pub allowed_user_ids: Vec<String>,
     pub quic_listen: String,
     pub h2_listen: String,
@@ -482,6 +487,8 @@ impl ClientDocument {
             )?;
             ensure(
                 profile.tls_profile == "default"
+                    || crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile)
+                        .is_some()
                     || (cfg!(feature = "experimental-btls-h2")
                         && profile.tls_profile == "browser-h2-btls-v1"
                         && profile.transport == Transport::H2),

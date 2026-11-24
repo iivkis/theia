@@ -73,6 +73,8 @@ The pure codec rejects wrong prefix/version, noncanonical/oversized base64, unkn
 
 ## Будущие F-18/F-19 (не реализовано)
 
+Целевое приглашение SmartTheia версионируется независимо от Xray/VLESS, сохраняет собственные identity/security mode и параметры единственного XHTTP на H3/H2. SmartTheia REALITY и SmartTheia XHTTP вдохновлены Xray, но не требуют его URI/key/config формата или wire compatibility (ADR-0086).
+
 REALITY-подобный отдельный security mode и anti-TLS-in-TLS требуют **нового versioned invitation contract** с подтверждённой identity сервера, а не молчаливого расширения theia://v1. Текущий invite v1 разрешает только стандартный TLS с tls_profile=default и строгой проверкой cert/SNI; не принимает неизвестные поля. Новый scanner не экспортирует ключи сервера, bearer или пользовательские URL. См. docs/STEALTH_REALITY.md.
 
 **Additional native storage regression (ADR-0066):** isolated tests exercise the existing private bearer primitives with file/directory collisions, concurrent create-new, guard ownership and abrupt process exit before commit. A pre-commit exit can leave an unreferenced private credential; this test requires unchanged TOML and no automatic adoption. It does not implement orphan cleanup, power-loss recovery or new credential types.

@@ -29,6 +29,8 @@ pub struct H3Client {
     authorization: HeaderValue,
     roots: RootCertStore,
     connect_timeout: Duration,
+    certificate_pin: Option<crate::security_profile::CertificatePin>,
+    stream_up: bool,
 }
 
 impl H3Client {
@@ -59,7 +61,36 @@ impl H3Client {
             authorization: bearer_header(token)?,
             roots,
             connect_timeout: Duration::from_secs(10),
+            certificate_pin: None,
+            stream_up: false,
         })
+    }
+
+    pub fn with_certificate_pin(
+        mut self,
+        pin: Option<crate::security_profile::CertificatePin>,
+    ) -> Result<Self, ClientError> {
+        if pin.is_some() {
+            self.uri = Uri::builder()
+                .scheme("https")
+                .authority(self.name.as_str())
+                .path_and_query(crate::security_profile::PINNED_PATH)
+                .build()
+                .map_err(|_| ClientError::Configuration)?;
+        } else if self.certificate_pin.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        self.certificate_pin = pin;
+        Ok(self)
+    }
+
+    /// An explicit second HTTP stream; cannot weaken the selected identity.
+    pub fn with_stream_up(mut self, enabled: bool) -> Result<Self, ClientError> {
+        if (enabled && self.certificate_pin.is_none()) || (self.stream_up && !enabled) {
+            return Err(ClientError::Configuration);
+        }
+        self.stream_up = enabled;
+        Ok(self)
     }
 
     pub(crate) fn remote(&self) -> SocketAddr {
@@ -118,6 +149,14 @@ impl H3Client {
             .connect(self.remote, &self.name, self.connect_timeout)
             .await
             .map_err(quic_error)?;
+        if let Some(pin) = self.certificate_pin {
+            let chain = connection
+                .peer_identity()
+                .ok_or(ClientError::Tls)?
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .map_err(|_| ClientError::Tls)?;
+            pin.verify(chain.first().ok_or(ClientError::Tls)?.as_ref())?;
+        }
         crate::diag!(
             Trace,
             "client.h3",
@@ -137,19 +176,67 @@ impl H3Client {
             let _keep_sender = keep_sender;
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         }));
-        let request = Request::post(self.uri.clone())
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::AUTHORIZATION, self.authorization.clone())
-            .body(())
-            .map_err(|_| ClientError::Configuration)?;
-        let mut stream = sender
-            .send_request(request)
-            .await
-            .map_err(|_| ClientError::Http3)?;
-        let response = stream
-            .recv_response()
-            .await
-            .map_err(|_| ClientError::Http3)?;
+        let (response, mut tx, mut rx) = if self.stream_up {
+            use crate::split_http::{self, Leg};
+            let mut download = sender
+                .send_request(split_http::request(
+                    &self.uri,
+                    Leg::Download,
+                    &self.authorization,
+                )?)
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            download.finish().await.map_err(|_| ClientError::Http3)?;
+            let mut upload = sender
+                .send_request(split_http::request(
+                    &self.uri,
+                    Leg::Upload,
+                    &self.authorization,
+                )?)
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            let upload_response = upload
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            split_http::check_status(upload_response.status())?;
+            if upload
+                .recv_data()
+                .await
+                .map_err(|_| ClientError::Http3)?
+                .is_some()
+                || upload
+                    .recv_trailers()
+                    .await
+                    .map_err(|_| ClientError::Http3)?
+                    .is_some()
+            {
+                return Err(ClientError::Protocol);
+            }
+            let response = download
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            let (tx, _) = upload.split();
+            let (_, rx) = download.split();
+            (response, tx, rx)
+        } else {
+            let request = Request::post(self.uri.clone())
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .body(())
+                .map_err(|_| ClientError::Configuration)?;
+            let mut stream = sender
+                .send_request(request)
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            let response = stream
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            let (tx, rx) = stream.split();
+            (response, tx, rx)
+        };
         crate::diag!(
             Trace,
             "client.h3",
@@ -165,7 +252,6 @@ impl H3Client {
             other => return Err(ClientError::Rejected(other.as_u16())),
         }
 
-        let (mut tx, mut rx) = stream.split();
         let mut decoder = Incoming::default();
         let mut state = Session::new(Role::Client);
         let hello = Frame::Hello {

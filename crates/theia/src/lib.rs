@@ -32,7 +32,9 @@ pub mod reload_preflight;
 pub mod restart_guard;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
+pub mod security_profile;
 pub mod server;
+mod split_http;
 pub mod tui;
 pub(crate) mod tui_candidate_batch;
 pub(crate) mod tui_candidates;
@@ -40,6 +42,7 @@ pub(crate) mod tui_discovery;
 pub(crate) mod tui_domain;
 pub mod tui_editor;
 pub(crate) mod tui_probe;
+mod tui_reality_review;
 pub(crate) mod tui_runtime;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;

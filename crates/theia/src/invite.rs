@@ -112,6 +112,9 @@ impl Invitation {
             .iter()
             .find(|item| item.id == inbound_id)
             .ok_or(InviteError::Unavailable)?;
+        if !inbound.security_mode.is_plain() {
+            return Err(InviteError::Unavailable);
+        }
         let h2 = inbound
             .h2_listen
             .parse::<SocketAddr>()

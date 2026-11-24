@@ -37,6 +37,14 @@ fn listener_with_pem_bound(
     private: bool,
     listener: TcpListener,
 ) -> (String, RootCertStore, String, ServerTask) {
+    listener_with_pem_bound_mode(private, listener, Default::default())
+}
+
+fn listener_with_pem_bound_mode(
+    private: bool,
+    listener: TcpListener,
+    mode: theia::security_profile::SecurityMode,
+) -> (String, RootCertStore, String, ServerTask) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let pem = cert.cert.pem();
     let der = cert.cert.der().clone();
@@ -59,6 +67,7 @@ fn listener_with_pem_bound(
         quic_listen: "127.0.0.1:0".into(),
         server_name: "localhost".into(),
         tls_cert: "unused-test-fixture".into(),
+        security_mode: mode,
         tls_key: "unused-test-fixture".into(),
     };
     let user = User {
@@ -701,6 +710,7 @@ async fn client_binary_chromium_socks5_over_h3() {
         quic_listen: remote.clone(),
         server_name: "localhost".into(),
         tls_cert: "unused-test-fixture".into(),
+        security_mode: Default::default(),
         tls_key: "unused-test-fixture".into(),
     };
     let user = User {
@@ -1186,6 +1196,7 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
             quic_listen: remote.to_string(),
             server_name: "localhost".into(),
             tls_cert: "unused".into(),
+            security_mode: Default::default(),
             tls_key: "unused".into(),
         };
         let user = User {
@@ -1230,4 +1241,112 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_silence() {
+    use theia::security_profile::{CertificatePin, SecurityMode};
+    timeout(Duration::from_secs(35), async {
+        let mut pair = None;
+        for _ in 0..64 {
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
+                pair = Some((udp, tcp));
+                break;
+            }
+        }
+        let (reserved, tcp) = pair.expect("shared native port");
+        let (endpoint, _roots, pem, server) =
+            listener_with_pem_bound_mode(true, tcp, SecurityMode::PinnedCertV1);
+        let pin = CertificatePin::from_der(
+            rustls_pemfile::certs(&mut pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+        );
+        let profile = pin.profile();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+
+        // Prove the fallback branch is a working pinned H2 endpoint.
+        let blackhole = tokio::spawn(async move {
+            let mut buf = [0; 2048];
+            loop {
+                reserved.recv_from(&mut buf).await.unwrap();
+            }
+        });
+        {
+            let (_dir, _child, http, _) = launch_client_with_profile(
+                endpoint.clone(),
+                pem.clone(),
+                "pinned-auto-silence",
+                theia::config::Transport::Auto,
+                &profile,
+            )
+            .await;
+            assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
+            let (mut socket, _) = target.accept().await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+        blackhole.abort();
+        let _ = blackhole.await;
+
+        // Both certs trusted and same hostname, but only H2 is pinned. The
+        // QUIC handshake must succeed and its wrong pin must be terminal.
+        let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let udp = theia::quic_transport::server_endpoint(
+            endpoint.parse().unwrap(),
+            vec![other.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(other.key_pair.serialize_der()).into(),
+        )
+        .unwrap();
+        // A fully functional H3 endpoint: skipping the pin would cause
+        // a real target dial and HTTP 200, not just a transport timeout.
+        let inbound = Inbound {
+            id: "test".into(),
+            security_mode: SecurityMode::PinnedCertV1,
+            allowed_user_ids: vec!["client".into()],
+            h2_listen: endpoint.clone(),
+            quic_listen: endpoint.clone(),
+            server_name: "localhost".into(),
+            tls_cert: "unused".into(),
+            tls_key: "unused".into(),
+        };
+        let user = User {
+            id: "client".into(),
+            token_sha256: format!("{:x}", Sha256::digest(TOKEN)),
+            disabled: false,
+        };
+        let policy = ServerPolicy {
+            allow_private_ips: true,
+            max_connections_per_user: 8,
+            max_connections_total: 8,
+            connect_timeout_ms: 2000,
+        };
+        let quic = tokio::spawn(theia::h3_server::serve(
+            udp,
+            Arc::new(ServerContext::new(&inbound, &[user], &policy)),
+        ));
+        let combined = format!("{pem}\n{}", other.cert.pem());
+        let (_dir, _child, http, _) = launch_client_with_profile(
+            endpoint,
+            combined,
+            "pinned-auto-wrong-pin",
+            theia::config::Transport::Auto,
+            &profile,
+        )
+        .await;
+        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 502 "));
+        assert!(
+            timeout(Duration::from_millis(250), target.accept())
+                .await
+                .is_err(),
+            "wrong H3 pin must not dial using H2"
+        );
+        quic.abort();
+        server.abort();
+    })
+    .await
+    .expect("bounded binary pinned auto policy");
 }

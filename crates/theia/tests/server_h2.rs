@@ -29,6 +29,7 @@ fn inbound() -> Inbound {
         h2_listen: "127.0.0.1:0".into(),
         server_name: "localhost".into(),
         tls_cert: "file:/tmp/test-cert.pem".into(),
+        security_mode: Default::default(),
         tls_key: "file:/tmp/test-key.pem".into(),
     }
 }

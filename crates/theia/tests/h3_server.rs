@@ -51,6 +51,7 @@ fn fixture_with_roots(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask
         quic_listen: "127.0.0.1:0".into(),
         server_name: "localhost".into(),
         tls_cert: "unused".into(),
+        security_mode: Default::default(),
         tls_key: "unused".into(),
     };
     let users = [

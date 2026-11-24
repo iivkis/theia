@@ -72,25 +72,32 @@ impl DualProbeReport {
     /// Strictly both independently verified on the SAME pinned IP. This is
     /// just a TLS/QUIC transport-level witness; H3 HTTP semantics, browser
     /// fingerprint and REALITY-like server authentication remain unmeasured.
+    pub fn h2_verified(&self) -> bool {
+        self.h2.as_ref().is_ok_and(|h2| {
+            h2.connected_ip == self.address.ip()
+                && h2.evidence.tls13 == Observation::Verified
+                && h2.evidence.trusted_chain == Observation::Verified
+                && h2.evidence.sni_san_match == Observation::Verified
+                && h2.evidence.certificate_current == Observation::Verified
+                && h2.evidence.reachable == Observation::Verified
+                && h2.evidence.alpn_h2 == Observation::Verified
+        })
+    }
+
+    pub fn h3_verified(&self) -> bool {
+        self.h3.as_ref().is_ok_and(|h3| {
+            h3.connected_ip == self.address.ip()
+                && h3.evidence.tls13 == Observation::Verified
+                && h3.evidence.trusted_chain == Observation::Verified
+                && h3.evidence.sni_san_match == Observation::Verified
+                && h3.evidence.certificate_current == Observation::Verified
+                && h3.evidence.reachable == Observation::Verified
+                && h3.evidence.alpn_h3 == Observation::Verified
+        })
+    }
+
     pub fn both_transports_verified(&self) -> bool {
-        matches!(
-            (&self.h2, &self.h3),
-            (Ok(h2), Ok(h3))
-                if h2.connected_ip == self.address.ip()
-                    && h3.connected_ip == self.address.ip()
-                    && h2.evidence.tls13 == Observation::Verified
-                    && h2.evidence.trusted_chain == Observation::Verified
-                    && h2.evidence.sni_san_match == Observation::Verified
-                    && h2.evidence.certificate_current == Observation::Verified
-                    && h2.evidence.reachable == Observation::Verified
-                    && h2.evidence.alpn_h2 == Observation::Verified
-                    && h3.evidence.tls13 == Observation::Verified
-                    && h3.evidence.trusted_chain == Observation::Verified
-                    && h3.evidence.sni_san_match == Observation::Verified
-                    && h3.evidence.certificate_current == Observation::Verified
-                    && h3.evidence.reachable == Observation::Verified
-                    && h3.evidence.alpn_h3 == Observation::Verified
-        )
+        self.h2_verified() && self.h3_verified()
     }
 
     /// Current releases have no cryptographically authenticated REALITY-like
@@ -251,6 +258,28 @@ mod tests {
             format!("{report:?}"),
             "DualProbeReport { h2_verified: true, h3_verified: false }"
         );
+    }
+
+    #[test]
+    fn batch_count_rejects_mismatched_inner_and_outer_socket() {
+        use crate::camouflage_dual_batch::{DualBatchOutcome, DualBatchReport};
+        let ip = "93.184.216.10".parse().unwrap();
+        let address = SocketAddr::new(ip, 443);
+        let mut batch = DualBatchReport {
+            results: vec![DualBatchOutcome {
+                address,
+                result: Ok(DualProbeReport {
+                    address,
+                    h2: Ok(fake_h2(ip)),
+                    h3: Ok(fake_h3(ip)),
+                }),
+            }],
+        };
+        assert_eq!(batch.dual_verified_count(), 1);
+        batch.results[0].address.set_port(444);
+        assert_eq!(batch.dual_verified_count(), 0);
+        batch.results[0].address = SocketAddr::new("93.184.216.11".parse().unwrap(), 443);
+        assert_eq!(batch.dual_verified_count(), 0);
     }
 
     #[test]

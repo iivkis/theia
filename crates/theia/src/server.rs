@@ -131,6 +131,7 @@ impl AuthFailure {
 /// contexts protects aggregate connection and user quotas across inbounds.
 pub struct ServerContext {
     pub inbound_id: String,
+    security_mode: crate::security_profile::SecurityMode,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
     global_streams: Arc<Semaphore>,
@@ -186,6 +187,7 @@ impl ServerContext {
     ) -> Self {
         Self {
             inbound_id: inbound.id.clone(),
+            security_mode: inbound.security_mode,
             authorization,
             policy: policy.clone(),
             global_streams,
@@ -227,8 +229,9 @@ impl ServerContext {
         if !self.peer_budget.admit(peer, Instant::now()) {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        if request.method() != Method::POST
-            || request.uri().path() != "/v1/session"
+        if self.security_mode.is_stream_up()
+            || request.method() != Method::POST
+            || request.uri().path() != self.security_mode.path()
             || request.uri().query().is_some()
             || request
                 .headers()
@@ -258,6 +261,47 @@ impl ServerContext {
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
         self.authorize(auth).map_err(AuthFailure::status)
+    }
+
+    pub(crate) fn stream_up(&self) -> bool {
+        self.security_mode.is_stream_up()
+    }
+
+    pub(crate) fn authorize_split_pair<U, D>(
+        &self,
+        upload: &Request<U>,
+        download: &Request<D>,
+        peer: IpAddr,
+    ) -> Result<SessionPermit, StatusCode> {
+        use crate::split_http::{self, Leg};
+        if !self.peer_budget.admit(peer, Instant::now()) {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        if !self.stream_up()
+            || split_http::leg(upload) != Some(Leg::Upload)
+            || split_http::leg(download) != Some(Leg::Download)
+        {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let up = upload.headers();
+        let down = download.headers();
+        if up.get_all(header::AUTHORIZATION).iter().count() != 1
+            || down.get_all(header::AUTHORIZATION).iter().count() != 1
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let up = up
+            .get(header::AUTHORIZATION)
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let down = down
+            .get(header::AUTHORIZATION)
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        if !bool::from(up.as_bytes().ct_eq(down.as_bytes())) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        // Exactly one authorization snapshot and quota permit for both legs.
+        self.authorize(up.to_str().ok())
+            .map_err(AuthFailure::status)
     }
 
     /// Raw token digest is the SHA-256 of exactly 32 decoded bytes, not the
@@ -593,6 +637,7 @@ pub(crate) async fn serve_generation_with_tls(
                     crate::diag!(Debug, "server.h2", "connection_ready",
                         "connection" = Value::Count(connection_id));
                     let mut handlers = JoinSet::new();
+                    let pair = Arc::new(crate::split_http::Pair::new());
                     loop {
                         let accepted = if handlers.is_empty() {
                             match timeout(AUTH_WINDOW, connection.accept()).await {
@@ -609,8 +654,14 @@ pub(crate) async fn serve_generation_with_tls(
                             break;
                         };
                         let context = context.clone();
+                        let pair = pair.clone();
                         handlers.spawn(async move {
-                            if let Err(error) = handle_request(request, respond, context, peer.ip()).await {
+                            let result = if context.stream_up() {
+                                handle_split_request(request, respond, &context, peer.ip(), &pair).await
+                            } else {
+                                handle_request(request, respond, context, peer.ip()).await
+                            };
+                            if let Err(error) = result {
                                 crate::diag!(Warn, "server.h2", "request_failed",
                                     "reason" = Value::Label(error_kind(error)));
                             }
@@ -678,18 +729,90 @@ async fn handle_request(
         "authorized",
         "session" = Value::Count(session_id)
     );
-    let mut inbound = request.into_body();
+    let inbound = request.into_body();
     let response = Response::builder()
         .status(StatusCode::OK)
         .body(())
         .map_err(|_| ServerError::Http2)?;
     // HTTP 200 acknowledges transport/auth headers, NOT remote TCP OPEN.
-    let mut outgoing = respond
+    let outgoing = respond
         .send_response(response, false)
         .map_err(|_| ServerError::Http2)?;
+    let result = relay_request(inbound, outgoing, &context, session_id).await;
+    drop(permit);
+    result
+}
+
+type SplitPair =
+    crate::split_http::Pair<(Request<h2::RecvStream>, h2::server::SendResponse<Bytes>)>;
+
+async fn handle_split_request(
+    request: Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    context: &ServerContext,
+    peer: IpAddr,
+    pair: &SplitPair,
+) -> Result<(), ServerError> {
+    let Some(leg) = crate::split_http::leg(&request) else {
+        return reject(&mut respond, StatusCode::NOT_FOUND).await;
+    };
+    let Some(((upload, mut up), (mut download, mut down))) =
+        pair.join(leg, (request, respond)).await
+    else {
+        return Ok(());
+    };
+    let permit = match context.authorize_split_pair(&upload, &download, peer) {
+        Ok(permit) => permit,
+        Err(status) => {
+            let _ = reject(&mut up, status).await;
+            return reject(&mut down, status).await;
+        }
+    };
+    // GET has no request body or trailers; never dial until its EOF is proven.
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        download.body_mut().data().await.is_none()
+            && download
+                .body_mut()
+                .trailers()
+                .await
+                .is_ok_and(|value| value.is_none())
+    })
+    .await
+    .unwrap_or(false);
+    if !empty {
+        let _ = reject(&mut up, StatusCode::BAD_REQUEST).await;
+        return reject(&mut down, StatusCode::BAD_REQUEST).await;
+    }
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .map_err(|_| ServerError::Http2)?;
+    // POST response contains only an empty acknowledgement. All downstream
+    // SmartTheia frames travel on the independent GET response.
+    reject(&mut up, StatusCode::OK).await?;
+    let outgoing = down
+        .send_response(response, false)
+        .map_err(|_| ServerError::Http2)?;
+    let result = relay_request(
+        upload.into_body(),
+        outgoing,
+        context,
+        diagnostics::next_id(),
+    )
+    .await;
+    drop(permit);
+    result
+}
+
+async fn relay_request(
+    mut inbound: h2::RecvStream,
+    mut outgoing: h2::SendStream<Bytes>,
+    context: &ServerContext,
+    session_id: u64,
+) -> Result<(), ServerError> {
     let result = timeout(
         Duration::from_secs(300),
-        handle_frames(&mut inbound, &mut outgoing, &context, session_id),
+        handle_frames(&mut inbound, &mut outgoing, context, session_id),
     )
     .await;
     match &result {
@@ -734,7 +857,6 @@ async fn handle_request(
         }
     }
     let _ = outgoing.send_data(Bytes::new(), true);
-    drop(permit);
     Ok(())
 }
 
@@ -1042,6 +1164,25 @@ struct TlsMaterial {
     key: rustls::pki_types::PrivateKeyDer<'static>,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     identity: crate::reload_preflight::IdentityHash,
+}
+
+pub(crate) fn configured_certificate_pin(
+    inbound: &Inbound,
+) -> Result<crate::security_profile::CertificatePin, ServerError> {
+    let material = tls_material(inbound)?;
+    let pin = crate::security_profile::CertificatePin::from_der(
+        material.certs.first().ok_or(ServerError::Config)?.as_ref(),
+    );
+    // Validate the actual cert/key pair with the existing TLS backend.
+    let _ = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|_| ServerError::Tls)?
+    .with_no_client_auth()
+    .with_single_cert(material.certs, material.key)
+    .map_err(|_| ServerError::Tls)?;
+    Ok(pin)
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
@@ -2111,6 +2252,7 @@ mod hardening_tests {
                         quic_listen: "127.0.0.1:9443".into(),
                         server_name: "a.example.org".into(),
                         tls_cert: "file:/tmp/theia-a.crt".into(),
+                        security_mode: Default::default(),
                         tls_key: "file:/tmp/theia-a.key".into(),
                     },
                     Inbound {
@@ -2120,6 +2262,7 @@ mod hardening_tests {
                         quic_listen: "127.0.0.1:9444".into(),
                         server_name: "b.example.org".into(),
                         tls_cert: "file:/tmp/theia-b.crt".into(),
+                        security_mode: Default::default(),
                         tls_key: "file:/tmp/theia-b.key".into(),
                     },
                 ],

@@ -63,7 +63,7 @@ impl DualBatchReport {
             .filter(|item| {
                 item.result
                     .as_ref()
-                    .is_ok_and(|r| r.both_transports_verified())
+                    .is_ok_and(|r| r.address == item.address && r.both_transports_verified())
             })
             .count()
     }

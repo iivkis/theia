@@ -455,6 +455,81 @@ class SpecContractTests(unittest.TestCase):
                       read("crates/theia/tests/h3_server.rs"))
         self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
 
+    def test_pinned_identity_is_additional_and_mode_is_explicit(self):
+        security = read("crates/theia/src/security_profile.rs")
+        self.assertIn("pinned-cert-v1:", security)
+        self.assertIn("ConstantTimeEq", security)
+        for path in ("client.rs", "h3_client.rs"):
+            source = read("crates/theia/src/" + path)
+            self.assertIn("pin.verify(", source)
+            self.assertIn("PINNED_PATH", source)
+            self.assertIn("with_certificate_pin", source)
+        server = read("crates/theia/src/server.rs")
+        self.assertIn("self.security_mode.path()", server)
+        self.assertIn("before.security_mode != after.security_mode",
+                      read("crates/theia/src/reload_preflight.rs"))
+        editor = read("crates/theia/src/tui_editor.rs")
+        self.assertIn("review_pinned_mode", editor)
+        self.assertIn("apply_pinned_mode", editor)
+        self.assertIn("h2_h3_pinned_identity_and_mode_are_fail_closed",
+                      read("crates/theia/tests/security_profile.rs"))
+        self.assertIn("pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_silence",
+                      read("crates/theia/tests/client_h2.rs"))
+
+    def test_smarttheia_native_xhttp_contract(self):
+        spec = read("docs/IMPLEMENTATION_SPEC.md")
+        self.assertIn("SmartTheia XHTTP", spec)
+        self.assertIn("не реализуем полную копию Xray REALITY или Xray XHTTP", spec)
+        self.assertIn("0.6 (проектная)", spec)
+        self.assertIn("не смена протокола или транспорта SmartTheia", spec)
+        self.assertIn("параметров единственного XHTTP", spec)
+        self.assertIn("Xray XHTTP и Xray REALITY — только источники идей", spec)
+        self.assertIn("полное копирование реализации Xray не является целью", spec)
+        self.assertIn("воспроизведение Xray first flight", spec)
+        adr = read("docs/adr/0086-custom-xhttp-and-reality-design-authority.md")
+        self.assertIn("inspiration only", adr)
+        self.assertIn("not a clone", adr)
+        for document in ("AGENTS.md", "README.md", "docs/SMARTTHEIA_PROTOCOL.md", "docs/ARCHITECTURE.md", "docs/STEALTH_REALITY.md", "docs/TUI_UX.md"):
+            with self.subTest(document=document):
+                source = read(document)
+                self.assertIn("Xray XHTTP", source)
+                self.assertIn("Xray REALITY", source)
+                self.assertIn("не копия", source)
+        self.assertIn("единственный транспорт протокола SmartTheia", spec)
+        self.assertIn("Собственный TLS: исключительно ручная настройка", spec)
+        self.assertIn("SmartTheia REALITY: настройка через двухшаговый мастер", spec)
+        self.assertIn("QUIC-first является штатной политикой клиента", spec)
+        self.assertIn("не являются третьим режимом безопасности", spec)
+        adr = read("docs/adr/0085-single-xhttp-inbound-security-choice.md")
+        self.assertIn("one transport", adr)
+        self.assertIn("manual only", adr)
+        split = read("crates/theia/src/split_http.rs")
+        self.assertIn("UPLOAD_PATH", split)
+        self.assertIn("DOWNLOAD_PATH", split)
+        self.assertIn("PAIR_TIMEOUT", split)
+        for path in ("client.rs", "h3_client.rs"):
+            self.assertIn("with_stream_up", read("crates/theia/src/" + path))
+        for path in ("server.rs", "h3_server.rs"):
+            self.assertIn("handle_split_request", read("crates/theia/src/" + path))
+        self.assertIn("h2_h3_stream_up_separate_http_legs_and_identity",
+                      read("crates/theia/tests/security_profile.rs"))
+
+    def test_f18_second_stage_is_read_only_and_shared(self):
+        review = read("crates/theia/src/tui_reality_review.rs")
+        self.assertIn("matches_selection", review)
+        self.assertIn("checked_duration_since", review)
+        self.assertIn("Apply ЗАБЛОКИРОВАН", review)
+        for forbidden in ("probe_dual_batch(", "std::fs", "write_all(", "runtime_apply"):
+            self.assertNotIn(forbidden, review)
+        for path in ("tui_candidate_batch.rs", "tui_domain.rs"):
+            source = read("crates/theia/src/" + path)
+            self.assertIn("ReviewCursor", source)
+            self.assertIn("self.review.body(", source)
+            self.assertIn("pub(crate) fn open_review", source)
+        tui = read("crates/theia/src/tui.rs")
+        self.assertIn("domain.open_review()", tui)
+        self.assertIn("batch.open_review()", tui)
+
     def test_m31_h3_server_reuses_security_boundary(self):
         h2 = read("crates/theia/src/server.rs")
         h3 = read("crates/theia/src/h3_server.rs")

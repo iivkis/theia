@@ -1,0 +1,156 @@
+//! Theia stream-up: two HTTP streams on the same verified transport connection.
+//! This is a SmartTheia carrier, not the Xray XHTTP/VLESS wire protocol.
+use crate::client::ClientError;
+use http::{header, HeaderValue, Method, Request, StatusCode, Uri};
+use std::{sync::Mutex, time::Duration};
+use tokio::{sync::oneshot, time::timeout};
+
+pub(crate) const UPLOAD_PATH: &str = "/v2/stream-up/upload";
+pub(crate) const DOWNLOAD_PATH: &str = "/v2/stream-up/download";
+const PAIR_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Leg {
+    Upload,
+    Download,
+}
+
+pub(crate) fn leg<T>(request: &Request<T>) -> Option<Leg> {
+    if request.uri().query().is_some()
+        || request
+            .headers()
+            .get_all(header::CONTENT_TYPE)
+            .iter()
+            .count()
+            != 1
+        || request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(HeaderValue::as_bytes)
+            != Some(b"application/octet-stream".as_slice())
+    {
+        return None;
+    }
+    if request.method() == Method::POST && request.uri().path() == UPLOAD_PATH {
+        Some(Leg::Upload)
+    } else if request.method() == Method::GET && request.uri().path() == DOWNLOAD_PATH {
+        Some(Leg::Download)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn request(
+    uri: &Uri,
+    leg: Leg,
+    authorization: &HeaderValue,
+) -> Result<Request<()>, ClientError> {
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(match leg {
+        Leg::Upload => http::uri::PathAndQuery::from_static(UPLOAD_PATH),
+        Leg::Download => http::uri::PathAndQuery::from_static(DOWNLOAD_PATH),
+    });
+    Request::builder()
+        .method(match leg {
+            Leg::Upload => Method::POST,
+            Leg::Download => Method::GET,
+        })
+        .uri(Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::AUTHORIZATION, authorization.clone())
+        .body(())
+        .map_err(|_| ClientError::Configuration)
+}
+
+pub(crate) fn check_status(status: StatusCode) -> Result<(), ClientError> {
+    match status {
+        StatusCode::OK => Ok(()),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ClientError::Unauthorized),
+        other => Err(ClientError::Rejected(other.as_u16())),
+    }
+}
+
+enum State<T> {
+    Empty,
+    Waiting(Leg, oneshot::Sender<T>),
+    Used,
+}
+
+/// One pair per connection. A half never enters a global session map, and
+/// the waiting task owns its own stream. No cross-connection association,
+/// unbounded queues or reusable IDs. Same-leg duplication burns the slot.
+pub(crate) struct Pair<T> {
+    state: Mutex<State<T>>,
+}
+
+impl<T> Pair<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(State::Empty),
+        }
+    }
+
+    pub(crate) async fn join(&self, leg: Leg, item: T) -> Option<(T, T)> {
+        let receiver = {
+            let mut state = self.state.lock().ok()?;
+            match std::mem::replace(&mut *state, State::Used) {
+                State::Empty => {
+                    let (tx, rx) = oneshot::channel();
+                    *state = State::Waiting(leg, tx);
+                    rx
+                }
+                State::Waiting(other, tx) if other != leg => {
+                    // The first task will own both streams, or dropping
+                    // the failed send releases the late-arriving stream.
+                    let _ = tx.send(item);
+                    return None;
+                }
+                _ => return None,
+            }
+        };
+        let other = timeout(PAIR_TIMEOUT, receiver).await.ok()?.ok()?;
+        Some(match leg {
+            Leg::Upload => (item, other),
+            Leg::Download => (other, item),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn both_orders_pair_once_and_missing_half_expires() {
+        for first in [Leg::Upload, Leg::Download] {
+            let pair = Pair::new();
+            let second = if first == Leg::Upload {
+                Leg::Download
+            } else {
+                Leg::Upload
+            };
+            let (a, b) = tokio::join!(
+                pair.join(first, first == Leg::Upload),
+                pair.join(second, second == Leg::Upload)
+            );
+            assert_eq!(a, Some((true, false)));
+            assert_eq!(b, None);
+            assert_eq!(pair.join(second, false).await, None);
+        }
+        let pair = Pair::new();
+        assert_eq!(pair.join(Leg::Upload, 1).await, None);
+        assert_eq!(pair.join(Leg::Download, 2).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_or_other_connection_never_pairs() {
+        let pair = Pair::new();
+        let (a, b) = tokio::join!(pair.join(Leg::Upload, 1), pair.join(Leg::Upload, 2));
+        assert_eq!((a, b), (None, None));
+        assert_eq!(pair.join(Leg::Download, 3).await, None);
+        let left = Pair::new();
+        let right = Pair::new();
+        let (a, b) = tokio::join!(left.join(Leg::Upload, 1), right.join(Leg::Download, 2));
+        assert_eq!((a, b), (None, None));
+    }
+}

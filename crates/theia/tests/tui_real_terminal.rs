@@ -188,6 +188,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
                 quic_listen: format!("127.0.0.1:{udp}"),
                 server_name: "localhost".into(),
                 tls_cert: format!("file:{}", cert_path.display()),
+                security_mode: Default::default(),
                 tls_key: format!("file:{}", key_path.display()),
             }],
             users: vec![User {
@@ -436,6 +437,7 @@ async fn compiled_client_proxy_conpty_lifecycle() {
                 quic_listen: format!("127.0.0.1:{udp}"),
                 server_name: "localhost".into(),
                 tls_cert: format!("file:{}", cert_path.display()),
+                security_mode: Default::default(),
                 tls_key: format!("file:{}", key_path.display()),
             }],
             users: vec![User {
