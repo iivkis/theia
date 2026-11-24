@@ -363,6 +363,7 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("matches_selection", review)
         self.assertIn("checked_duration_since", review)
         self.assertIn("Apply ЗАБЛОКИРОВАН", review)
+        self.assertIn("h3_optional_evidence_does_not_claim_readiness", review)
         for forbidden in ("probe_dual_batch(", "std::fs", "write_all(", "runtime_apply"):
             self.assertNotIn(forbidden, review)
         for path in ("tui_candidate_batch.rs", "tui_domain.rs"):
@@ -516,6 +517,12 @@ class SpecContractTests(unittest.TestCase):
             self.assertIn(term, tests)
         for path in ("client.rs", "h3_client.rs", "server.rs", "h3_server.rs"):
             self.assertNotIn("descriptor::Store", read("crates/theia/src/" + path))
+        cli = read("crates/theia/src/descriptor_cli.rs")
+        for term in ("--expected-revision", "--sha256", "--confirm", "runtime UNCHANGED",
+                     "preview_promotion", "update_at"):
+            self.assertIn(term, cli)
+        for term in ("TcpStream", "UdpSocket", "reqwest", "runtime_apply"):
+            self.assertNotIn(term, cli)
 
     def test_retired_local_tls_reality_has_no_production_or_compatibility_path(self):
         self.assertFalse((ROOT / "crates/theia/src/reality_identity.rs").exists())

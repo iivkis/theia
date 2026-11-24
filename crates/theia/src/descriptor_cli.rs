@@ -43,6 +43,9 @@ fn path(raw: &str) -> Result<String, CliError> {
 }
 
 fn public_key(raw: &str) -> Result<[u8; 32], Error> {
+    if raw.len() != 43 {
+        return Err(Error::Format);
+    }
     let decoded = URL_SAFE_NO_PAD.decode(raw).map_err(|_| Error::Format)?;
     let key: [u8; 32] = decoded.try_into().map_err(|_| Error::Format)?;
     if key == [0; 32] || URL_SAFE_NO_PAD.encode(key) != raw {
