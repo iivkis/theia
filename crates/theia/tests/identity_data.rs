@@ -398,3 +398,62 @@ async fn managed_generations_refresh_persistent_revision_without_reusing_old_poo
         server.abort();
     }).await.unwrap();
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_compatible_publication_renewal_preserves_h2_h3_tunnels() {
+    timeout(DEADLINE, async {
+        let tcp = bind().await;
+        let remote = tcp.local_addr().unwrap();
+        let identity = Identity::generate(Scope { inbound: "edge".into(), endpoint: remote.to_string() }).unwrap();
+        let now = reference_health::unix_now().unwrap();
+        let first = value(identity.scope().clone(), true, now);
+        let initial = identity.sign_descriptor(&first).unwrap();
+        let root = anchor(&identity, XhttpMode::StreamOne);
+        let digest = descriptor::verify(&initial, &root).unwrap().payload_sha256();
+        let (inbound, users) = config(remote);
+        let prepared = PreparedFixture::new(tcp, &identity, &initial, &inbound, &users, &policy(true)).unwrap();
+        let control = prepared.control();
+        let server = tokio::spawn(prepared.serve());
+        let scratch = Scratch::new();
+        let mut leases = Vec::new();
+        for branch in [Branch::H2, Branch::H3] {
+            let store = Store::new(&scratch.0.join(format!("live-{branch:?}")), root.clone()).unwrap();
+            store.initialize(&initial, now).unwrap();
+            let client = FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), store.load(now).unwrap(), branch).unwrap();
+            let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tunnel = client.open(Address::V4([127,0,0,1]), target.local_addr().unwrap().port()).await.unwrap();
+            let (socket, _) = target.accept().await.unwrap();
+            let (app, local) = tokio::io::duplex(1024);
+            let task = tokio::spawn(tunnel.relay(local));
+            leases.push((client, store, app, socket, task));
+        }
+        let mut next = first.clone();
+        next.revision = 2;
+        next.not_after += 600;
+        let renewed = identity.sign_descriptor(&next).unwrap();
+        let mut incompatible = next.clone();
+        incompatible.path_prefix = "/v1/changed".into();
+        assert!(control.renew(&identity.sign_descriptor(&incompatible).unwrap(), digest).is_err());
+        let wrong = Identity::generate(identity.scope().clone()).unwrap();
+        assert!(control.renew(&wrong.sign_descriptor(&next).unwrap(), digest).is_err());
+        assert!(control.renew(&renewed, [0;32]).is_err());
+        assert_eq!(control.renew(&renewed, digest).unwrap(), 2);
+        assert!(control.renew(&initial, digest).is_err());
+        for (client, store, mut app, mut socket, task) in leases {
+            assert_eq!(client.refresh(&store).await.unwrap(), descriptor::Change::Advanced);
+            assert_eq!(store.load(reference_health::unix_now().unwrap()).unwrap().descriptor().revision, 2);
+            app.write_all(b"still open").await.unwrap();
+            let mut bytes = [0;10];
+            socket.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"still open");
+            socket.write_all(&bytes).await.unwrap();
+            app.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"still open");
+            app.shutdown().await.unwrap();
+            socket.shutdown().await.unwrap();
+            task.await.unwrap().unwrap();
+        }
+        server.abort();
+    }).await.unwrap();
+}

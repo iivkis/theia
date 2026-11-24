@@ -68,6 +68,16 @@ fn now() -> Result<u64, ClientError> {
     crate::reference_health::unix_now().map_err(|_| ClientError::Configuration)
 }
 
+/// Local fixture controller. It can renew only the original identity's
+/// compatible signed descriptor; it cannot activate another listener.
+pub struct FixtureControl(Arc<ServerContext>);
+
+impl FixtureControl {
+    pub fn renew(&self, document: &str, expected: [u8;32]) -> Result<u64, ServerError> {
+        self.0.renew_identity_fixture(document, expected)
+    }
+}
+
 pub struct PreparedFixture {
     tcp: TcpListener,
     h2: TlsAcceptor,
@@ -137,6 +147,10 @@ impl PreparedFixture {
             h3,
             context,
         })
+    }
+
+    pub fn control(&self) -> FixtureControl {
+        FixtureControl(self.context.clone())
     }
 
     pub async fn serve(self) -> Result<(), ServerError> {

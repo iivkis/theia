@@ -135,7 +135,7 @@ impl AuthFailure {
 pub struct ServerContext {
     pub inbound_id: String,
     security_mode: crate::security_profile::SecurityMode,
-    identity_routes: Option<IdentityRoutePolicy>,
+    identity_routes: Option<RwLock<IdentityRoutePolicy>>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
     global_streams: Arc<Semaphore>,
@@ -154,6 +154,9 @@ struct IdentityRoutePolicy {
     not_before: u64,
     not_after: u64,
     signed: Arc<str>,
+    signer: [u8; 32],
+    descriptor: crate::descriptor::Descriptor,
+    digest: [u8; 32],
 }
 
 impl IdentityRoutePolicy {
@@ -241,28 +244,74 @@ impl ServerContext {
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
         let mut context = Self::new(inbound, users, policy);
-        context.identity_routes = Some(IdentityRoutePolicy {
+        context.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
             paths,
             stream_one: d.stream_one,
             stream_up: d.stream_up,
             not_before: d.not_before,
             not_after: d.not_after,
             signed,
-        });
+            signer: value.signer(),
+            descriptor: d.clone(),
+            digest: value.payload_sha256(),
+        }));
         Ok(context)
+    }
+
+    /// Controlled loopback fixture only. Update a compatible signed
+    /// descriptor on the existing shared authorization/connection budget.
+    /// No transport, routes, reference, grants or key change is permitted.
+    pub(crate) fn renew_identity_fixture(
+        &self, signed: &str, expected: [u8; 32],
+    ) -> Result<u64, ServerError> {
+        let mut routes = self.identity_routes.as_ref().ok_or(ServerError::Config)?
+            .write().map_err(|_| ServerError::Config)?;
+        if routes.digest != expected || !routes.current() {
+            return Err(ServerError::Config);
+        }
+        let previous = &routes.descriptor;
+        let anchor = crate::descriptor::Anchor::new(previous.scope.clone(), routes.signer,
+            previous.revision, crate::descriptor::ClientPolicy {
+                transport: crate::config::Transport::Auto,
+                xhttp_mode: crate::config::XhttpMode::Auto,
+            }).map_err(|_| ServerError::Config)?;
+        let value = crate::descriptor::verify(signed, &anchor).map_err(|_| ServerError::Config)?;
+        let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
+        value.check_time(now).map_err(|_| ServerError::Config)?;
+        let next = value.descriptor();
+        if next.revision <= previous.revision || next.not_before < previous.not_before
+            || next.not_after <= previous.not_after {
+            return Err(ServerError::Config);
+        }
+        let mut compatible = previous.clone();
+        compatible.revision = next.revision;
+        compatible.not_before = next.not_before;
+        compatible.not_after = next.not_after;
+        if &compatible != next {
+            return Err(ServerError::Config);
+        }
+        routes.not_before = next.not_before;
+        routes.not_after = next.not_after;
+        routes.descriptor = next.clone();
+        routes.digest = value.payload_sha256();
+        routes.signed = Arc::from(signed);
+        Ok(next.revision)
     }
 
     pub(crate) fn split_leg<T>(&self, request: &Request<T>) -> Option<crate::split_http::Leg> {
         match &self.identity_routes {
-            Some(routes) if routes.current() && routes.stream_up => routes.paths.leg(request),
-            Some(_) => None,
+            Some(routes) => {
+                let routes = routes.read().ok()?;
+                if routes.current() && routes.stream_up { routes.paths.leg(request) } else { None }
+            }
             None => crate::split_http::leg(request),
         }
     }
 
     pub(crate) fn is_descriptor_request<T>(&self, request: &Request<T>) -> bool {
         self.identity_routes.as_ref().is_some_and(|routes| {
-            request.method() == Method::GET && request.uri().path() == routes.paths.descriptor
+            routes.read().is_ok_and(|routes|
+                request.method() == Method::GET && request.uri().path() == routes.paths.descriptor)
         })
     }
 
@@ -273,9 +322,11 @@ impl ServerContext {
         request: &Request<T>,
         peer: IpAddr,
     ) -> Result<(SessionPermit, Arc<str>), StatusCode> {
-        let routes = self.identity_routes.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        let routes = self.identity_routes.as_ref().ok_or(StatusCode::NOT_FOUND)?
+            .read().map_err(|_| StatusCode::NOT_FOUND)?;
         if !routes.current()
-            || !self.is_descriptor_request(request)
+            || request.method() != Method::GET
+            || request.uri().path() != routes.paths.descriptor
             || request.uri().query().is_some()
             || request
                 .headers()
@@ -339,7 +390,8 @@ impl ServerContext {
         }
         let single_allowed = match &self.identity_routes {
             Some(routes) => {
-                routes.current() && routes.stream_one && request.uri().path() == routes.paths.single
+                routes.read().is_ok_and(|routes|
+                    routes.current() && routes.stream_one && request.uri().path() == routes.paths.single)
             }
             None => {
                 !self.security_mode.is_stream_up()
