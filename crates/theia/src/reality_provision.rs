@@ -105,6 +105,13 @@ pub fn create(
         return Err(Error::Descriptor);
     }
     let raw = toml::to_string(&record).map_err(|_| Error::Format)?;
+    // The receipt is still last: a directory missing its checkpoint is
+    // incomplete, not a candidate which may silently reset the floor.
+    crate::reality_checkpoint::initialize(output, crate::reality_checkpoint::Stamp {
+        manifest: record.manifest_sha256()?, generation: status.generation,
+        publication: record.publication_sha256, health_revision: state.revision(),
+        health: approved.health_sha256,
+    }, now)?;
     bootstrap::create_text(&output.join(MANIFEST), &raw)?;
     Ok(record)
 }
@@ -218,6 +225,11 @@ pub fn inspect_initial(
     let active = captured.select(identity.public_key(), now)?;
     if active.verified().descriptor().scope != record.scope
         || active.verified().payload_sha256() != record.initial_payload_sha256 { return Err(Error::Scope); }
+    crate::reality_checkpoint::verify(directory, crate::reality_checkpoint::Stamp {
+        manifest: record.manifest_sha256()?, generation: status.generation,
+        publication: record.publication_sha256, health_revision: state.revision(),
+        health: record.health_sha256,
+    }, now)?;
     Ok(record)
 }
 

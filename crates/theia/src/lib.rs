@@ -39,6 +39,7 @@ pub mod reality_bootstrap;
 pub mod reality_cli;
 pub mod reality_config;
 pub mod reality_generation;
+mod reality_checkpoint;
 pub mod reality_provision;
 pub mod reality_tcp;
 pub mod reference_cli;

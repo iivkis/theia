@@ -5,6 +5,7 @@
 
 use crate::{
     config::{Config, Inbound},
+    reality_checkpoint::{self, Stamp},
     descriptor::Scope,
     identity_publication::CapturedPublication,
     reality_admission::Secret,
@@ -38,6 +39,15 @@ impl Generation {
         Ok(Self {
             publication, _admission: admission, health_revision: health.revision(),
             health_digest: health.snapshot_sha256().map_err(|_| Error::Health)?,
+        })
+    }
+
+    fn stamp(&self, inbound: &Inbound) -> Result<Stamp, Error> {
+        Ok(Stamp {
+            manifest: inbound.reality.as_ref().ok_or(Error::Format)?.manifest_sha256,
+            generation: self.publication.generation(),
+            publication: self.publication.snapshot_sha256(),
+            health_revision: self.health_revision, health: self.health_digest,
         })
     }
 
@@ -107,6 +117,8 @@ impl Manager {
         let listen: SocketAddr = inbound.h2_listen.parse().map_err(|_| Error::Scope)?;
         let scope = Scope { inbound: inbound.id.clone(), endpoint: format!("{}:{}", inbound.server_name, listen.port()) };
         let first = Arc::new(Generation::load(inbound, &scope, now)?);
+        let binding = inbound.reality.as_ref().ok_or(Error::Format)?;
+        reality_checkpoint::accept(Path::new(&binding.bundle), first.stamp(inbound)?, now)?;
         Ok(Self { inbound: inbound.clone(), scope, slot: Mutex::new(Slot { last: first, last_checked_at: now }) })
     }
 
@@ -117,13 +129,16 @@ impl Manager {
     pub fn refresh(&self, now: u64) -> Result<Lease, Error> {
         let mut slot = self.slot.lock().map_err(|_| Error::Storage)?;
         if now < slot.last_checked_at { return Err(Error::Clock); }
+        // A failed refresh must not make an earlier clock acceptable again.
+        slot.last_checked_at = now;
         let candidate = Generation::load(&self.inbound, &self.scope, now)?;
         slot.last.compare(&candidate)?;
+        let binding = self.inbound.reality.as_ref().ok_or(Error::Format)?;
+        reality_checkpoint::accept(Path::new(&binding.bundle), candidate.stamp(&self.inbound)?, now)?;
         if candidate.publication.snapshot_sha256() != slot.last.publication.snapshot_sha256()
             || candidate.health_digest != slot.last.health_digest {
             slot.last = Arc::new(candidate);
         }
-        slot.last_checked_at = now;
         Ok(Lease(Arc::clone(&slot.last)))
     }
 }
@@ -182,8 +197,19 @@ mod tests {
         let updated = std::fs::read(&path).unwrap();
         std::fs::write(&path, original).unwrap();
         assert!(matches!(manager.refresh(now + 2), Err(Error::Approval)));
+        // The generation floor is independent of the mutable publication;
+        // even a completely new manager must reject this older snapshot.
+        assert!(matches!(Manager::new(&doc, "edge", now + 2), Err(Error::Approval)));
         std::fs::write(&path, updated).unwrap();
         assert_eq!(manager.refresh(now + 2).unwrap().status().revision, 2);
+        let reopened = Manager::new(&doc, "edge", now + 2).unwrap();
+        assert_eq!(reopened.refresh(now + 2).unwrap().status().revision, 2);
+        let floor = bundle.join("generation-floor.toml");
+        let floor_raw = std::fs::read(&floor).unwrap();
+        std::fs::remove_file(&floor).unwrap();
+        assert!(matches!(Manager::new(&doc, "edge", now + 2), Err(Error::Storage)));
+        assert!(matches!(manager.refresh(now + 2), Err(Error::Storage)));
+        crate::reality_bootstrap::create_text(&floor, std::str::from_utf8(&floor_raw).unwrap()).unwrap();
         let secret = bundle.join("admission.key");
         std::fs::remove_file(&secret).unwrap();
         assert!(matches!(manager.refresh(now + 3), Err(Error::Credential)));
