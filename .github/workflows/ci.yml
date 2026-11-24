@@ -1,4 +1,4 @@
-name: CI (tests first)
+name: CI (merged dev)
 
 on:
   pull_request:
@@ -16,7 +16,7 @@ concurrency:
 jobs:
   specification:
     name: specification
-    if: github.event.pull_request.merged == true
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 8
     outputs:
@@ -31,10 +31,14 @@ jobs:
       - name: Verify exact merged main commit
         env:
           MERGED_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           set -euo pipefail
           [[ "$MERGED_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$GITHUB_REF" = refs/heads/main
+          test "$PR_HEAD" = dev
+          test "$PR_HEAD_REPO" = "$GITHUB_REPOSITORY"
           test "$MERGED_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$MERGED_SHA"
       - name: Preflight syntax and F-14 guest network regression before Rust
@@ -53,6 +57,8 @@ jobs:
         run: python3 -m unittest discover -s tests/ci -p 'test_ci_format_repair.py' -v
       - name: Test CI timing evidence validation and comparison
         run: python3 -m unittest discover -s tests/ci -p 'test_ci_timing.py' -v
+      - name: Test coverage evidence parser and threshold
+        run: python3 -m unittest discover -s tests/ci -p 'test_ci_coverage.py' -v
       - name: Require full native CI for every merge
         id: scope
         shell: bash
@@ -93,6 +99,9 @@ jobs:
       THEIA_BBR_RESULTS_PATH: ${{ github.workspace }}/theia-bbr-ubuntu-latest.csv
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -153,6 +162,9 @@ jobs:
       THEIA_BBR_RESULTS_PATH: ${{ github.workspace }}/theia-bbr-windows-latest.csv
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -203,6 +215,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -212,7 +227,7 @@ jobs:
           python-version: '3.12'
       - name: Install pinned CI-only VT screen driver for real Linux PTY
         run: python -m pip install pyte==0.8.2
-      - name: Tests first
+      - name: Native Linux tests
         run: cargo test --workspace --all-targets --locked
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -256,6 +271,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -334,6 +352,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: f14-linux-server
@@ -382,6 +403,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -424,6 +448,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -457,6 +484,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -488,10 +518,96 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+  coverage-native:
+    name: Coverage instrumented (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-coverage
+          cache-targets: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned real-terminal test dependencies
+        run: python -m pip install pyte==0.8.2
+      - name: Install pinned Windows ConPTY test dependency
+        if: runner.os == 'Windows'
+        run: python -m pip install pywinpty==3.0.5
+      - name: Instrument full native workspace tests
+        run: cargo llvm-cov --workspace --all-targets --all-features --locked --lcov --output-path coverage.lcov
+      - name: Normalize exact-SHA native line evidence
+        run: python scripts/ci-coverage.py collect --lcov coverage.lcov --platform "${{ runner.os }}" --sha "${{ github.event.pull_request.merge_commit_sha }}" --output coverage.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ runner.os }}
+          path: coverage.json
+          if-no-files-found: error
+          retention-days: 7
+
+  coverage-gate:
+    name: Production line coverage >= 80%
+    needs: [specification, coverage-native]
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Rust syntax parser for test-only line exclusion
+        run: python -m pip install tree-sitter==0.25.2 tree-sitter-rust==0.24.2
+      - name: Test Rust syntax based exclusion
+        env:
+          THEIA_COVERAGE_SYNTAX_TESTS: "required"
+        run: python -m unittest discover -s tests/ci -p 'test_ci_coverage.py' -v
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-Linux
+          path: coverage-linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-Windows
+          path: coverage-windows
+      - name: Verify complete source inventory and union native line coverage
+        run: python scripts/ci-coverage.py gate --linux coverage-linux/coverage.json --windows coverage-windows/coverage.json --sha "${{ github.event.pull_request.merge_commit_sha }}" --output coverage-summary.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-summary
+          path: coverage-summary.json
+          if-no-files-found: warn
+          retention-days: 7
+
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-4-btls-spike, m3-4e-btls-production-feature]
-    if: ${{ always() && github.event.pull_request.merged == true }}
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-4-btls-spike, m3-4e-btls-production-feature, coverage-native, coverage-gate]
+    if: ${{ always() && github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -505,7 +621,7 @@ jobs:
           import os
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-4-btls-spike", "m3-4e-btls-production-feature"}
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-4-btls-spike", "m3-4e-btls-production-feature", "coverage-native", "coverage-gate"}
           native = os.environ["NATIVE_REQUIRED"]
           if native != "true":
               raise SystemExit("Every merge requires full native CI; fail closed")

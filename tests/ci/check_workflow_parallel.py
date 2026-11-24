@@ -43,6 +43,8 @@ mandatory = {
     "m0-1-windows-spike",
     "m3-4-btls-spike",
     "m3-4e-btls-production-feature",
+    "coverage-native",
+    "coverage-gate",
 }
 
 require(needs("rust-tests") == {"specification"}, "Linux tests must await spec only")
@@ -115,8 +117,30 @@ trigger = re.search(r"(?ms)^on:\n(.*?)(?=^[a-z])", workflow)
 require(trigger is not None and trigger.group(1).strip() ==
         "pull_request:\n    branches: [main]\n    types: [closed]",
         "CI must be triggered only by PR closure targeting main")
-require("if: github.event.pull_request.merged == true" in job("specification"),
-        "unmerged closure must not allocate any native runner")
+dev_merge = "github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository"
+require("if: " + dev_merge in job("specification"),
+        "only same-repository dev merges may allocate native runners")
+require("always() && " + dev_merge in gate,
+        "final gate must share the exact dev merge guard")
+require(workflow.count("actions/checkout@v4") ==
+        workflow.count("ref: ${{ github.event.pull_request.merge_commit_sha }}"),
+        "all checkouts must pin the exact merged commit")
+require("test_ci_coverage.py" in job("specification"),
+        "coverage regression tests must run before native fan-out")
+coverage_native = job("coverage-native")
+coverage_gate = job("coverage-gate")
+require(needs("coverage-native") == {"specification"} and
+        needs("coverage-gate") == {"specification", "coverage-native"},
+        "coverage gate must consume both native jobs")
+for term in ("os: [ubuntu-latest, windows-latest]", "llvm-tools-preview",
+             "cargo llvm-cov --workspace --all-targets --all-features --locked --lcov",
+             "ci-coverage.py collect", "if-no-files-found: error"):
+    require(term in coverage_native, "missing native coverage contract: " + term)
+for term in ("coverage-Linux", "coverage-Windows", "ci-coverage.py gate",
+             "THEIA_COVERAGE_SYNTAX_TESTS"):
+    require(term in coverage_gate, "missing combined coverage contract: " + term)
+require("continue-on-error" not in coverage_native + coverage_gate,
+        "coverage collection and threshold may not be advisory")
 require("workflow_dispatch:" not in workflow and "  push:" not in workflow,
         "direct pushes, PR updates and manual dispatch must not start CI")
 require("github.event.pull_request.merge_commit_sha" in job("specification")
@@ -193,7 +217,7 @@ for name in mandatory - {"specification"}:
             f"{name}: full matrix must run only when native scope is proven required")
     require("needs.specification.outputs.rust_ready == 'true'" in payload,
             f"{name}: Rust precondition must be explicit and fail closed")
-    if name != "f14-cross-host":
+    if name not in {"f14-cross-host", "coverage-gate"}:
         require("actions/download-artifact@v4" not in payload,
                 f"{name}: no repeating CI format artifact downloads")
 require("actions/download-artifact@v4" in job("f14-cross-host"),
