@@ -221,13 +221,7 @@ fn expected(branch: Branch) -> Expected {
 // evidence lives in the separate M3.5a4/a5 network tests.
 fn transcript(branch: Branch, issued_ms: u64, seed: u8) -> Transcript {
     Transcript::new(
-        branch,
-        EDGE.host,
-        EDGE.port,
-        [seed; 32],
-        [2; 32],
-        [3; 32],
-        issued_ms,
+        branch, EDGE.host, EDGE.port, [seed; 32], [2; 32], [3; 32], issued_ms,
     )
     .unwrap()
 }
@@ -381,9 +375,7 @@ fn scope_mode_pin_and_generation_mismatch_never_enable_plain_tls() {
     );
     // Failed updates and proofs must not poison the valid policy or replay.
     assert_eq!(verify(&mut trust, context, &key, &proof, START), Ok(()));
-    trust
-        .replace(policy(4, vec![current_pin]), ROTATE)
-        .unwrap();
+    trust.replace(policy(4, vec![current_pin]), ROTATE).unwrap();
     assert_eq!(
         verify(&mut trust, context, &key, &proof, START),
         Err(Rejection::Clock)
