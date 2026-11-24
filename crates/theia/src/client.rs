@@ -229,12 +229,25 @@ impl H2Client {
     }
 
     /// Opt in to an additional exact leaf certificate identity, retaining PKI.
-    pub fn with_certificate_pin(mut self, pin: Option<crate::security_profile::CertificatePin>) -> Result<Self, ClientError> {
+    pub fn with_certificate_pin(
+        mut self,
+        pin: Option<crate::security_profile::CertificatePin>,
+    ) -> Result<Self, ClientError> {
         if pin.is_some() {
             if !matches!(&self.connector, H2Tls::Rustls(_)) {
                 return Err(ClientError::Configuration);
             }
-            self.uri = http::Uri::builder().scheme("https").authority(self.uri.authority().ok_or(ClientError::Configuration)?.as_str()).path_and_query(crate::security_profile::PINNED_PATH).build().map_err(|_| ClientError::Configuration)?;
+            self.uri = http::Uri::builder()
+                .scheme("https")
+                .authority(
+                    self.uri
+                        .authority()
+                        .ok_or(ClientError::Configuration)?
+                        .as_str(),
+                )
+                .path_and_query(crate::security_profile::PINNED_PATH)
+                .build()
+                .map_err(|_| ClientError::Configuration)?;
         } else if self.certificate_pin.is_some() {
             return Err(ClientError::Configuration);
         }
@@ -291,7 +304,14 @@ impl H2Client {
                     return Err(ClientError::Tls);
                 }
                 if let Some(pin) = self.certificate_pin {
-                    pin.verify(tls.get_ref().1.peer_certificates().and_then(|chain| chain.first()).ok_or(ClientError::Tls)?.as_ref())?;
+                    pin.verify(
+                        tls.get_ref()
+                            .1
+                            .peer_certificates()
+                            .and_then(|chain| chain.first())
+                            .ok_or(ClientError::Tls)?
+                            .as_ref(),
+                    )?;
                 }
                 start_h2(tls, self.wire_shape).await?
             }

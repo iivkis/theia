@@ -570,17 +570,35 @@ impl Editor {
     /// Preview only the operator's saved local identity. The third-party
     /// candidate review cannot authorize this separate configuration change.
     pub(crate) fn review_pinned_mode(&self) -> Result<PinnedModeReview, &'static str> {
-        if self.editing || self.dirty() || self.issued.is_some()
-            || !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source) {
+        if self.editing
+            || self.dirty()
+            || self.issued.is_some()
+            || !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source)
+        {
             return Err("Save/reload clean server config first");
         }
-        let Config::Server(doc) = &self.original else { return Err("Server required"); };
-        if !doc.server.enabled { return Err("Server disabled"); }
-        let inbound = doc.server.inbounds.get(self.selected_record).ok_or("Inbound missing")?;
-        let tcp: std::net::SocketAddr = inbound.h2_listen.parse().map_err(|_| "Invalid TCP bind")?;
-        let udp: std::net::SocketAddr = inbound.quic_listen.parse().map_err(|_| "Invalid UDP bind")?;
-        if tcp.port() != udp.port() || tcp.port() == 0 { return Err("H2/H3 ports must agree"); }
-        let pin = crate::server::configured_certificate_pin(inbound).map_err(|_| "Cannot verify saved certificate/key")?;
+        let Config::Server(doc) = &self.original else {
+            return Err("Server required");
+        };
+        if !doc.server.enabled {
+            return Err("Server disabled");
+        }
+        let inbound = doc
+            .server
+            .inbounds
+            .get(self.selected_record)
+            .ok_or("Inbound missing")?;
+        let tcp: std::net::SocketAddr =
+            inbound.h2_listen.parse().map_err(|_| "Invalid TCP bind")?;
+        let udp: std::net::SocketAddr = inbound
+            .quic_listen
+            .parse()
+            .map_err(|_| "Invalid UDP bind")?;
+        if tcp.port() != udp.port() || tcp.port() == 0 {
+            return Err("H2/H3 ports must agree");
+        }
+        let pin = crate::server::configured_certificate_pin(inbound)
+            .map_err(|_| "Cannot verify saved certificate/key")?;
         Ok(PinnedModeReview {
             source: self.saved_sha256(),
             inbound: inbound.id.clone(),
@@ -590,20 +608,34 @@ impl Editor {
         })
     }
 
-    pub(crate) fn apply_pinned_mode(&mut self, review: &PinnedModeReview) -> Result<(), &'static str> {
+    pub(crate) fn apply_pinned_mode(
+        &mut self,
+        review: &PinnedModeReview,
+    ) -> Result<(), &'static str> {
         let current = self.review_pinned_mode()?;
-        if current.source != review.source || current.inbound != review.inbound
-            || current.name != review.name || current.endpoint != review.endpoint
-            || current.pin != review.pin {
+        if current.source != review.source
+            || current.inbound != review.inbound
+            || current.name != review.name
+            || current.endpoint != review.endpoint
+            || current.pin != review.pin
+        {
             return Err("Configuration or certificate changed; review again");
         }
-        let Config::Server(doc) = &mut self.draft else { return Err("Server required"); };
-        let inbound = doc.server.inbounds.get_mut(self.selected_record).ok_or("Inbound missing")?;
+        let Config::Server(doc) = &mut self.draft else {
+            return Err("Server required");
+        };
+        let inbound = doc
+            .server
+            .inbounds
+            .get_mut(self.selected_record)
+            .ok_or("Inbound missing")?;
         inbound.security_mode = crate::security_profile::SecurityMode::PinnedCertV1;
         if !self.save() {
             // Preserve uncertain-write protection; never assert rollback of a
             // committed file if the guarded writer cannot establish outcome.
-            if !self.write_uncertain { self.draft = self.original.clone(); }
+            if !self.write_uncertain {
+                self.draft = self.original.clone();
+            }
             return Err("Guarded save failed; inspect/reload configuration");
         }
         Ok(())
@@ -1025,7 +1057,8 @@ mod tests {
     #[test]
     fn pinned_mode_review_refuses_drift_and_saves_only_explicit_local_mode() {
         use crate::security_profile::{CertificatePin, SecurityMode};
-        let generated = rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
         let certificate = Temp::write(&generated.cert.pem());
         let key = Temp::write(&generated.key_pair.serialize_pem());
         #[cfg(target_os = "linux")]
@@ -1033,7 +1066,9 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&key.0, fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let Config::Server(mut doc) = config::parse(&server_source()).unwrap() else { panic!("server fixture"); };
+        let Config::Server(mut doc) = config::parse(&server_source()).unwrap() else {
+            panic!("server fixture");
+        };
         doc.server.inbounds[0].tls_cert = format!("file:{}", certificate.0.display());
         doc.server.inbounds[0].tls_key = format!("file:{}", key.0.display());
         let source = Config::Server(doc.clone()).to_toml().unwrap();
@@ -1045,7 +1080,9 @@ mod tests {
         assert_eq!(fs::read_to_string(&file.0).unwrap(), source);
         fs::write(&file.0, format!("{source}\n# external edit")).unwrap();
         assert!(editor.apply_pinned_mode(&review).is_err());
-        assert!(fs::read_to_string(&file.0).unwrap().contains("external edit"));
+        assert!(fs::read_to_string(&file.0)
+            .unwrap()
+            .contains("external edit"));
         fs::write(&file.0, &source).unwrap();
 
         fs::write(&certificate.0, "invalid certificate").unwrap();
@@ -1055,8 +1092,13 @@ mod tests {
 
         editor.apply_pinned_mode(&review).unwrap();
         assert!(!editor.dirty());
-        let Config::Server(saved) = config::read_file(&file.0).unwrap() else { panic!("saved server"); };
-        assert_eq!(saved.server.inbounds[0].security_mode, SecurityMode::PinnedCertV1);
+        let Config::Server(saved) = config::read_file(&file.0).unwrap() else {
+            panic!("saved server");
+        };
+        assert_eq!(
+            saved.server.inbounds[0].security_mode,
+            SecurityMode::PinnedCertV1
+        );
         let mut expected = doc.clone();
         expected.server.inbounds[0].security_mode = SecurityMode::PinnedCertV1;
         assert_eq!(saved, expected);

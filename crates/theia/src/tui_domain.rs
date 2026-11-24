@@ -4,9 +4,7 @@
 //! approved lookup; TCP and UDP each require further disclosure of selected
 //! exact public IPs and affirmative consent, no re-resolution, no Apply.
 use crate::{
-    camouflage_discovery::{
-        CandidateHost, CandidateSource, Transport, POPULAR_HTTPS_DOMAINS,
-    },
+    camouflage_discovery::{CandidateHost, CandidateSource, Transport, POPULAR_HTTPS_DOMAINS},
     camouflage_domain_dns::{resolve_catalogued_domain, DnsConsent, DnsError, MAX_PINNED_IPS},
     camouflage_dual::{CandidateConsent, DualProbeTarget},
     camouflage_dual_batch::{probe_dual_batch, DualBatchError, DualBatchReport, DualBatchTarget},
@@ -181,7 +179,9 @@ impl DomainPanel {
     }
 
     pub(crate) fn ask_confirmation(&mut self) {
-        if self.review.is_open() { return; }
+        if self.review.is_open() {
+            return;
+        }
         match self.state {
             DomainState::Catalog if self.domain().is_some() => {
                 self.state = DomainState::DnsConfirm;
@@ -192,7 +192,9 @@ impl DomainPanel {
     }
 
     pub(crate) fn decline(&mut self) {
-        if self.review.close() { return; }
+        if self.review.close() {
+            return;
+        }
         match self.state {
             DomainState::DnsConfirm => self.state = DomainState::Catalog,
             DomainState::ProbeConfirm => self.state = DomainState::Resolved,
@@ -201,7 +203,9 @@ impl DomainPanel {
     }
 
     pub(crate) fn toggle_current(&mut self) {
-        if self.review.is_open() { return; }
+        if self.review.is_open() {
+            return;
+        }
         if !self.is_resolved() || !self.fresh() {
             return;
         }
@@ -425,7 +429,9 @@ impl DomainPanel {
     }
 
     pub(crate) fn back_or_close(&mut self) -> bool {
-        if self.review.close() { return false; }
+        if self.review.close() {
+            return false;
+        }
         match self.state {
             DomainState::DnsConfirm | DomainState::ProbeConfirm => {
                 self.decline();
@@ -921,11 +927,17 @@ mod tests {
         let started = Instant::now() - Duration::from_secs(61);
         panel.probed_at = Some(started);
         let (tx, rx) = mpsc::channel();
-        panel.state = DomainState::ProbeRunning { result: rx, cancel: None };
-        tx.send(Ok(DualBatchReport { results: vec![DualBatchOutcome {
-            address: SocketAddr::new(ip, 443),
-            result: Err(DualProbeError::NotApproved),
-        }] })).unwrap();
+        panel.state = DomainState::ProbeRunning {
+            result: rx,
+            cancel: None,
+        };
+        tx.send(Ok(DualBatchReport {
+            results: vec![DualBatchOutcome {
+                address: SocketAddr::new(ip, 443),
+                result: Err(DualProbeError::NotApproved),
+            }],
+        }))
+        .unwrap();
         panel.poll();
         assert_eq!(panel.probed_at, Some(started));
         panel.open_review();

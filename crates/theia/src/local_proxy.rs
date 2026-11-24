@@ -104,7 +104,10 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
     let certificate_pin = if profile.tls_profile == "default" {
         None
     } else {
-        Some(crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile).ok_or(ClientError::Configuration)?)
+        Some(
+            crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile)
+                .ok_or(ClientError::Configuration)?,
+        )
     };
     match profile.transport {
         Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)?
@@ -129,12 +132,10 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             if profile.transport == Transport::H3 {
                 return Ok(ProxyClient::H3(h3));
             }
-            let h2 = Arc::new(H2Client::new(
-                &profile.server,
-                &profile.server_name,
-                &token,
-                roots,
-            )?.with_certificate_pin(certificate_pin)?);
+            let h2 = Arc::new(
+                H2Client::new(&profile.server, &profile.server_name, &token, roots)?
+                    .with_certificate_pin(certificate_pin)?,
+            );
             Ok(ProxyClient::Auto(Arc::new(AutoClient {
                 h2,
                 h3,

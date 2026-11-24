@@ -123,7 +123,9 @@ impl CandidateBatchPanel {
     }
 
     pub(crate) fn toggle_current(&mut self) {
-        if self.review.is_open() { return; }
+        if self.review.is_open() {
+            return;
+        }
         if !matches!(self.state, BatchState::Select | BatchState::Complete(_)) {
             return;
         }
@@ -144,7 +146,9 @@ impl CandidateBatchPanel {
 
     /// Enter is a preview, NOT consent. Never open a socket in this method.
     pub(crate) fn ask_confirmation(&mut self) {
-        if self.review.is_open() { return; }
+        if self.review.is_open() {
+            return;
+        }
         if !matches!(self.state, BatchState::Select | BatchState::Complete(_))
             || self.server_name.is_none()
             || self.selected.is_empty()
@@ -155,7 +159,9 @@ impl CandidateBatchPanel {
     }
 
     pub(crate) fn decline(&mut self) {
-        if self.review.close() { return; }
+        if self.review.close() {
+            return;
+        }
         if self.is_confirming() {
             self.state = BatchState::Select;
         }
@@ -269,7 +275,9 @@ impl CandidateBatchPanel {
     }
 
     pub(crate) fn back_or_close(&mut self) -> bool {
-        if self.review.close() { return false; }
+        if self.review.close() {
+            return false;
+        }
         if self.is_confirming() {
             self.decline();
             false
@@ -632,11 +640,17 @@ mod tests {
         let started = Instant::now() - Duration::from_secs(61);
         panel.observed_at = Some(started);
         let (tx, rx) = mpsc::channel();
-        panel.state = BatchState::Running { result: rx, cancel: None };
-        tx.send(Ok(DualBatchReport { results: vec![DualBatchOutcome {
-            address: SocketAddr::new(ip, 443),
-            result: Err(DualProbeError::NotApproved),
-        }] })).unwrap();
+        panel.state = BatchState::Running {
+            result: rx,
+            cancel: None,
+        };
+        tx.send(Ok(DualBatchReport {
+            results: vec![DualBatchOutcome {
+                address: SocketAddr::new(ip, 443),
+                result: Err(DualProbeError::NotApproved),
+            }],
+        }))
+        .unwrap();
         panel.poll();
         assert_eq!(panel.observed_at, Some(started));
         panel.open_review();

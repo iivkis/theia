@@ -3,9 +3,16 @@
 //! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
 //! Explicit runtime and Windows proxy actions are isolated in confirmed panels.
 use crate::{
-    client_import, invite::Invitation, tui_candidate_batch::CandidateBatchPanel,
-    tui_candidates::CandidateReview, tui_discovery::DiscoveryPanel, tui_domain::DomainPanel,
-    tui_editor::{Editor, PinnedModeReview}, tui_probe::ProbePanel, tui_runtime::RuntimePanel, Role,
+    client_import,
+    invite::Invitation,
+    tui_candidate_batch::CandidateBatchPanel,
+    tui_candidates::CandidateReview,
+    tui_discovery::DiscoveryPanel,
+    tui_domain::DomainPanel,
+    tui_editor::{Editor, PinnedModeReview},
+    tui_probe::ProbePanel,
+    tui_runtime::RuntimePanel,
+    Role,
 };
 use crossterm::{
     cursor::{Hide, Show},
@@ -305,7 +312,9 @@ impl Interaction {
     }
 
     fn start_pinned_review(&mut self) {
-        let Some(mut editor) = self.editor.take() else { return; };
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
         let (tx, rx) = mpsc::channel();
         self.pinned_loading = Some(rx);
         let _worker = std::thread::spawn(move || {
@@ -316,12 +325,16 @@ impl Interaction {
     }
 
     fn start_pinned_save(&mut self, review: PinnedModeReview) {
-        let Some(mut editor) = self.editor.take() else { return; };
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
         let (tx, rx) = mpsc::channel();
         self.saving = Some(rx);
         let _worker = std::thread::spawn(move || {
             let result = editor.apply_pinned_mode(&review);
-            if let Err(message) = result { editor.error = Some(message.into()); }
+            if let Err(message) = result {
+                editor.error = Some(message.into());
+            }
             let _ = tx.send((editor, result.is_ok()));
         });
     }
@@ -462,7 +475,11 @@ impl Interaction {
     }
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
-        if key.kind != KeyEventKind::Press || self.saving.is_some() || self.exporting.is_some() || self.pinned_loading.is_some() {
+        if key.kind != KeyEventKind::Press
+            || self.saving.is_some()
+            || self.exporting.is_some()
+            || self.pinned_loading.is_some()
+        {
             return false;
         }
         #[cfg(windows)]
@@ -475,7 +492,7 @@ impl Interaction {
         if let Some(review) = self.pinned_review.take() {
             match key.code {
                 KeyCode::Char('y') => self.start_pinned_save(review),
-                KeyCode::Esc | KeyCode::Char('n') => {},
+                KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.pinned_review = Some(review),
             }
             return false;
@@ -1323,7 +1340,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
         panel(frame, parts[1], runtime.title(), &runtime.body(), true);
     } else if let Some(review) = interaction.and_then(|ui| ui.pinned_review.as_ref()) {
-        panel(frame, parts[1], "H2/H3: дополнительная identity pin (не REALITY)", &review.body(), true);
+        panel(
+            frame,
+            parts[1],
+            "H2/H3: дополнительная identity pin (не REALITY)",
+            &review.body(),
+            true,
+        );
     } else if interaction.is_some_and(|ui| ui.pinned_loading.is_some()) {
         panel(frame, parts[1], "Локальная проверка TLS identity", "Проверяются сохранённый TOML и собственная пара сертификат/ключ. Сеть не используется.", true);
     } else if interaction.is_some_and(|ui| ui.saving.is_some()) {

@@ -1256,8 +1256,15 @@ async fn pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_sil
             }
         }
         let (reserved, tcp) = pair.expect("shared native port");
-        let (endpoint, _roots, pem, server) = listener_with_pem_bound_mode(true, tcp, SecurityMode::PinnedCertV1);
-        let pin = CertificatePin::from_der(rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap().as_ref());
+        let (endpoint, _roots, pem, server) =
+            listener_with_pem_bound_mode(true, tcp, SecurityMode::PinnedCertV1);
+        let pin = CertificatePin::from_der(
+            rustls_pemfile::certs(&mut pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+        );
         let profile = pin.profile();
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
@@ -1265,10 +1272,19 @@ async fn pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_sil
         // Prove the fallback branch is a working pinned H2 endpoint.
         let blackhole = tokio::spawn(async move {
             let mut buf = [0; 2048];
-            loop { reserved.recv_from(&mut buf).await.unwrap(); }
+            loop {
+                reserved.recv_from(&mut buf).await.unwrap();
+            }
         });
         {
-            let (_dir, _child, http, _) = launch_client_with_profile(endpoint.clone(), pem.clone(), "pinned-auto-silence", theia::config::Transport::Auto, &profile).await;
+            let (_dir, _child, http, _) = launch_client_with_profile(
+                endpoint.clone(),
+                pem.clone(),
+                "pinned-auto-silence",
+                theia::config::Transport::Auto,
+                &profile,
+            )
+            .await;
             assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
             let (mut socket, _) = target.accept().await.unwrap();
             socket.shutdown().await.unwrap();
@@ -1280,9 +1296,11 @@ async fn pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_sil
         // QUIC handshake must succeed and its wrong pin must be terminal.
         let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let udp = theia::quic_transport::server_endpoint(
-            endpoint.parse().unwrap(), vec![other.cert.der().clone()],
+            endpoint.parse().unwrap(),
+            vec![other.cert.der().clone()],
             PrivatePkcs8KeyDer::from(other.key_pair.serialize_der()).into(),
-        ).unwrap();
+        )
+        .unwrap();
         // A fully functional H3 endpoint: skipping the pin would cause
         // a real target dial and HTTP 200, not just a transport timeout.
         let inbound = Inbound {
@@ -1311,10 +1329,24 @@ async fn pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_sil
             Arc::new(ServerContext::new(&inbound, &[user], &policy)),
         ));
         let combined = format!("{pem}\n{}", other.cert.pem());
-        let (_dir, _child, http, _) = launch_client_with_profile(endpoint, combined, "pinned-auto-wrong-pin", theia::config::Transport::Auto, &profile).await;
+        let (_dir, _child, http, _) = launch_client_with_profile(
+            endpoint,
+            combined,
+            "pinned-auto-wrong-pin",
+            theia::config::Transport::Auto,
+            &profile,
+        )
+        .await;
         assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 502 "));
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err(), "wrong H3 pin must not dial using H2");
+        assert!(
+            timeout(Duration::from_millis(250), target.accept())
+                .await
+                .is_err(),
+            "wrong H3 pin must not dial using H2"
+        );
         quic.abort();
         server.abort();
-    }).await.expect("bounded binary pinned auto policy");
+    })
+    .await
+    .expect("bounded binary pinned auto policy");
 }

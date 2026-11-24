@@ -50,7 +50,10 @@ impl Fixture {
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![der.clone()], PrivatePkcs8KeyDer::from(key.clone()).into())
+        .with_single_cert(
+            vec![der.clone()],
+            PrivatePkcs8KeyDer::from(key.clone()).into(),
+        )
         .unwrap();
         tls.alpn_protocols = vec![b"h2".to_vec()];
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -59,7 +62,8 @@ impl Fixture {
             "127.0.0.1:0".parse().unwrap(),
             vec![der],
             PrivatePkcs8KeyDer::from(key).into(),
-        ).unwrap();
+        )
+        .unwrap();
         let h3 = udp.local_addr().unwrap();
         let inbound = Inbound {
             id: "test".into(),
@@ -84,25 +88,66 @@ impl Fixture {
         };
         let context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
         let mut servers = JoinSet::new();
-        servers.spawn(server::serve(tcp, TlsAcceptor::from(Arc::new(tls)), context.clone()));
+        servers.spawn(server::serve(
+            tcp,
+            TlsAcceptor::from(Arc::new(tls)),
+            context.clone(),
+        ));
         servers.spawn(theia::h3_server::serve(udp, context));
-        Self { h2, h3, roots, pin, other_pin, _servers: servers }
+        Self {
+            h2,
+            h3,
+            roots,
+            pin,
+            other_pin,
+            _servers: servers,
+        }
     }
 
     fn h2(&self, pin: Option<CertificatePin>, name: &str, token: &[u8; 32]) -> H2Client {
-        H2Client::new(&self.h2.to_string(), name, &URL_SAFE_NO_PAD.encode(token), self.roots.clone()).unwrap()
-            .with_certificate_pin(pin).unwrap()
+        H2Client::new(
+            &self.h2.to_string(),
+            name,
+            &URL_SAFE_NO_PAD.encode(token),
+            self.roots.clone(),
+        )
+        .unwrap()
+        .with_certificate_pin(pin)
+        .unwrap()
     }
 
     fn h3(&self, pin: Option<CertificatePin>, name: &str, token: &[u8; 32]) -> H3Client {
-        H3Client::new(self.h3, name, &URL_SAFE_NO_PAD.encode(token), self.roots.clone()).unwrap()
-            .with_certificate_pin(pin).unwrap()
+        H3Client::new(
+            self.h3,
+            name,
+            &URL_SAFE_NO_PAD.encode(token),
+            self.roots.clone(),
+        )
+        .unwrap()
+        .with_certificate_pin(pin)
+        .unwrap()
     }
 
-    async fn errors(&self, pin: Option<CertificatePin>, name: &str, token: &[u8; 32], port: u16, expected: ClientError) {
+    async fn errors(
+        &self,
+        pin: Option<CertificatePin>,
+        name: &str,
+        token: &[u8; 32],
+        port: u16,
+        expected: ClientError,
+    ) {
         let address = Address::V4([127, 0, 0, 1]);
-        assert_eq!(self.h2(pin, name, token).open(address.clone(), port).await.err(), Some(expected));
-        assert_eq!(self.h3(pin, name, token).open(address, port).await.err(), Some(expected));
+        assert_eq!(
+            self.h2(pin, name, token)
+                .open(address.clone(), port)
+                .await
+                .err(),
+            Some(expected)
+        );
+        assert_eq!(
+            self.h3(pin, name, token).open(address, port).await.err(),
+            Some(expected)
+        );
     }
 
     async fn transfer(&self, pin: Option<CertificatePin>, target: &TcpListener) {
@@ -111,10 +156,18 @@ impl Fixture {
         for h3 in [false, true] {
             let (mut app, local) = tokio::io::duplex(4096);
             let relay = if h3 {
-                let tunnel = self.h3(pin, "localhost", &TOKEN).open(address.clone(), port).await.unwrap();
+                let tunnel = self
+                    .h3(pin, "localhost", &TOKEN)
+                    .open(address.clone(), port)
+                    .await
+                    .unwrap();
                 tokio::spawn(tunnel.relay(local))
             } else {
-                let tunnel = self.h2(pin, "localhost", &TOKEN).open(address.clone(), port).await.unwrap();
+                let tunnel = self
+                    .h2(pin, "localhost", &TOKEN)
+                    .open(address.clone(), port)
+                    .await
+                    .unwrap();
                 tokio::spawn(tunnel.relay(local))
             };
             let (mut remote, _) = target.accept().await.unwrap();
@@ -144,17 +197,55 @@ async fn h2_h3_pinned_identity_and_mode_are_fail_closed() {
 
         // Trusted certificate with wrong pin, wrong hostname with right
         // pin, bad bearer, and both directions of mode mismatch.
-        pinned.errors(Some(pinned.other_pin), "localhost", &TOKEN, port, ClientError::Tls).await;
+        pinned
+            .errors(
+                Some(pinned.other_pin),
+                "localhost",
+                &TOKEN,
+                port,
+                ClientError::Tls,
+            )
+            .await;
         // H3 may categorize an ordinary chain/SAN error as its own
         // transport handshake error; it must not return a usable tunnel.
-        assert!(pinned.h2(Some(pinned.pin), "wrong.example", &TOKEN).open(Address::V4([127,0,0,1]), port).await.is_err());
-        assert!(pinned.h3(Some(pinned.pin), "wrong.example", &TOKEN).open(Address::V4([127,0,0,1]), port).await.is_err());
-        pinned.errors(Some(pinned.pin), "localhost", &[0x43; 32], port, ClientError::Unauthorized).await;
-        pinned.errors(None, "localhost", &TOKEN, port, ClientError::Rejected(404)).await;
-        plain.errors(Some(plain.pin), "localhost", &TOKEN, port, ClientError::Rejected(404)).await;
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        assert!(pinned
+            .h2(Some(pinned.pin), "wrong.example", &TOKEN)
+            .open(Address::V4([127, 0, 0, 1]), port)
+            .await
+            .is_err());
+        assert!(pinned
+            .h3(Some(pinned.pin), "wrong.example", &TOKEN)
+            .open(Address::V4([127, 0, 0, 1]), port)
+            .await
+            .is_err());
+        pinned
+            .errors(
+                Some(pinned.pin),
+                "localhost",
+                &[0x43; 32],
+                port,
+                ClientError::Unauthorized,
+            )
+            .await;
+        pinned
+            .errors(None, "localhost", &TOKEN, port, ClientError::Rejected(404))
+            .await;
+        plain
+            .errors(
+                Some(plain.pin),
+                "localhost",
+                &TOKEN,
+                port,
+                ClientError::Rejected(404),
+            )
+            .await;
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
 
         pinned.transfer(Some(pinned.pin), &target).await;
         plain.transfer(None, &target).await;
-    }).await.expect("bounded H2/H3 identity and mode matrix");
+    })
+    .await
+    .expect("bounded H2/H3 identity and mode matrix");
 }

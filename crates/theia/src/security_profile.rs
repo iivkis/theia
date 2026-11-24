@@ -41,12 +41,22 @@ impl CertificatePin {
 
     pub fn parse_profile(profile: &str) -> Option<Self> {
         let raw = profile.strip_prefix(PROFILE_PREFIX)?.as_bytes();
-        if raw.len() != 64 || !raw.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) {
+        if raw.len() != 64
+            || !raw
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        {
             return None;
         }
         let mut pin = [0; 32];
         for (byte, pair) in pin.iter_mut().zip(raw.chunks_exact(2)) {
-            let value = |n: u8| if n.is_ascii_digit() { n - b'0' } else { n - b'a' + 10 };
+            let value = |n: u8| {
+                if n.is_ascii_digit() {
+                    n - b'0'
+                } else {
+                    n - b'a' + 10
+                }
+            };
             *byte = value(pair[0]) * 16 + value(pair[1]);
         }
         Some(Self(pin))
@@ -76,24 +86,37 @@ mod tests {
 
     #[test]
     fn versioned_profile_config_is_explicit_and_v1_invite_cannot_downgrade() {
-        use crate::{config::{self, Config, Transport}, invite::Invitation};
+        use crate::{
+            config::{self, Config, Transport},
+            invite::Invitation,
+        };
 
         let pin = CertificatePin::from_der(b"fixture");
-        let Config::Client(mut client) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else { panic!("client fixture"); };
+        let Config::Client(mut client) =
+            config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
+            panic!("client fixture");
+        };
         for transport in [Transport::H2, Transport::H3, Transport::Auto] {
             client.client.profiles[0].transport = transport;
             client.client.profiles[0].tls_profile = pin.profile();
             let document = Config::Client(client.clone());
             document.validate().unwrap();
-            assert_eq!(config::parse(&document.to_toml().unwrap()).unwrap(), document);
+            assert_eq!(
+                config::parse(&document.to_toml().unwrap()).unwrap(),
+                document
+            );
             assert!(Invitation::public_from_profile(&client.client.profiles[0]).is_err());
         }
-        client.client.profiles[0].tls_profile = pin.profile().replace("pinned-cert-v1:", "pinned-cert-v2:");
+        client.client.profiles[0].tls_profile =
+            pin.profile().replace("pinned-cert-v1:", "pinned-cert-v2:");
         assert!(Config::Client(client).validate().is_err());
 
         let source = include_str!("../../../examples/server.toml")
             .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"42".repeat(32));
-        let Config::Server(mut server) = config::parse(&source).unwrap() else { panic!("server fixture"); };
+        let Config::Server(mut server) = config::parse(&source).unwrap() else {
+            panic!("server fixture");
+        };
         assert_eq!(server.server.inbounds[0].security_mode, SecurityMode::Plain);
         server.server.inbounds[0].security_mode = SecurityMode::PinnedCertV1;
         let document = Config::Server(server);
@@ -110,7 +133,12 @@ mod tests {
         assert!(CertificatePin::parse_profile(&pin.profile()).is_some_and(|p| p == pin));
         assert!(pin.verify(b"cert").is_ok());
         assert_eq!(pin.verify(b"other"), Err(ClientError::Tls));
-        for value in ["default", "pinned-cert-v2:", "pinned-cert-v1:AB", "pinned-cert-v1:00"] {
+        for value in [
+            "default",
+            "pinned-cert-v2:",
+            "pinned-cert-v1:AB",
+            "pinned-cert-v1:00",
+        ] {
             assert!(CertificatePin::parse_profile(value).is_none());
         }
     }

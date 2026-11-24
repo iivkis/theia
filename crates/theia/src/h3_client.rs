@@ -64,9 +64,17 @@ impl H3Client {
         })
     }
 
-    pub fn with_certificate_pin(mut self, pin: Option<crate::security_profile::CertificatePin>) -> Result<Self, ClientError> {
+    pub fn with_certificate_pin(
+        mut self,
+        pin: Option<crate::security_profile::CertificatePin>,
+    ) -> Result<Self, ClientError> {
         if pin.is_some() {
-            self.uri = Uri::builder().scheme("https").authority(self.name.as_str()).path_and_query(crate::security_profile::PINNED_PATH).build().map_err(|_| ClientError::Configuration)?;
+            self.uri = Uri::builder()
+                .scheme("https")
+                .authority(self.name.as_str())
+                .path_and_query(crate::security_profile::PINNED_PATH)
+                .build()
+                .map_err(|_| ClientError::Configuration)?;
         } else if self.certificate_pin.is_some() {
             return Err(ClientError::Configuration);
         }
@@ -131,8 +139,11 @@ impl H3Client {
             .await
             .map_err(quic_error)?;
         if let Some(pin) = self.certificate_pin {
-            let chain = connection.peer_identity().ok_or(ClientError::Tls)?
-                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().map_err(|_| ClientError::Tls)?;
+            let chain = connection
+                .peer_identity()
+                .ok_or(ClientError::Tls)?
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .map_err(|_| ClientError::Tls)?;
             pin.verify(chain.first().ok_or(ClientError::Tls)?.as_ref())?;
         }
         crate::diag!(

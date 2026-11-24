@@ -28,11 +28,11 @@ pub mod protocol;
 pub mod quic_transport;
 pub(crate) mod quota;
 mod relay_liveness;
-pub mod security_profile;
 pub mod reload_preflight;
 pub mod restart_guard;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
+pub mod security_profile;
 pub mod server;
 pub mod tui;
 pub(crate) mod tui_candidate_batch;
