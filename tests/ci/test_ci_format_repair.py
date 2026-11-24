@@ -87,6 +87,22 @@ class FormatRepairTests(unittest.TestCase):
                         repair.execute("probe")
                 self.assertFalse(output.exists())
 
+    def test_non_rust_formatter_change_cannot_create_commit(self):
+        def formatter(check=False):
+            Path("notes.md").write_text("changed\n")
+
+        with tempfile.TemporaryDirectory() as output_dir, repository() as head:
+            output = Path(output_dir) / "output"
+            with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output), "PR_HEAD_SHA": head}):
+                with patch.object(repair, "format_all", side_effect=formatter):
+                    with self.assertRaises(repair.RepairError):
+                        repair.execute("probe")
+                    self.assertFalse(output.exists())
+                    subprocess.run(["git", "restore", "notes.md"], check=True)
+                    with self.assertRaises(repair.RepairError):
+                        repair.execute("repair")
+                    self.assertEqual(repair.git("rev-parse", "HEAD").strip().decode(), head)
+
     def test_wrong_head_and_empty_repair_refuse(self):
         with repository() as head:
             with patch.object(repair, "format_all"), patch.dict(os.environ, {"PR_HEAD_SHA": "0" * 40}):

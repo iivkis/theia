@@ -162,7 +162,7 @@ require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
 # only a new commit and a fresh CI run may pass. The write job is isolated.
 spec = job("specification")
 repair = job("format-repair")
-require("fetch-depth: 2" in spec,
+require("fetch-depth:" in spec and "'0' || '2'" in spec,
         "PR merge base and previous push commit must be available for scope proof")
 require("steps.scope.outputs.native_required" in spec,
         "specification must publish fail-closed native CI scope")
@@ -173,8 +173,9 @@ require("scripts/ci-format-repair.py probe" in spec
         and "test_ci_format_repair.py" in spec,
         "format preflight and its safety regressions must precede fan-out")
 require("test \"$FORMATTED_SHA\" = \"$GITHUB_SHA\"" in spec
-        and "formatted_sha" in workflow,
-        "automatic dispatch must test the exact requested commit")
+        and "formatted_sha" in workflow
+        and 'git merge-base --is-ancestor "$FORMATTED_BASE_SHA" HEAD' in spec,
+        "automatic dispatch must test the exact requested commit including PR base")
 require(needs("format-repair") == {"specification"}
         and "needs.specification.result == 'failure'" in repair
         and "needs.specification.outputs.format_drift == 'true'" in repair
@@ -190,7 +191,9 @@ require("ref: ${{ github.event.pull_request.head.sha }}" in repair
         and 'git rev-parse HEAD^' in repair
         and 'git push --force-with-lease=' in repair
         and 'gh workflow run ci.yml' in repair
-        and 'formatted_sha=$new_sha' in repair,
+        and 'formatted_sha=$new_sha' in repair
+        and 'formatted_base_sha=$base_sha' in repair
+        and 'git merge-base --is-ancestor "$base_sha" HEAD' in repair,
         "repair must commit only on exact head, lease push and explicitly dispatch new SHA")
 require("ci-formatted-source" not in workflow and "persist-format:" not in workflow,
         "never test a formatter overlay or mutate a green SHA")

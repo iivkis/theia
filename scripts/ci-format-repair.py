@@ -93,15 +93,16 @@ def execute(mode: str) -> int:
     if changes() != paths:
         raise RepairError("Formatting is not idempotent")
     subprocess.run(["git", "add", "-u", "--", "*.rs"], check=True)
-    if git("diff", "--name-only", "-z", "--cached") != b"":
-        subprocess.run([
-            "git", "-c", "core.hooksPath=/dev/null",
-            "-c", "user.name=github-actions[bot]",
-            "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-            "commit", "-m", "style: apply rustfmt before native CI",
-        ], check=True)
-    else:
-        raise RepairError("No staged formatting changes")
+    staged = git("diff", "--name-only", "-z", "--cached")
+    if not staged.endswith(b"\0") or set(staged[:-1].split(b"\0")) != paths:
+        raise RepairError("Staged files differ from verified Rust-only diff")
+    subprocess.run([
+        "git", "-c", "core.hooksPath=/dev/null",
+        "-c", "commit.gpgsign=false",
+        "-c", "user.name=github-actions[bot]",
+        "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+        "commit", "-m", "style: apply rustfmt before native CI",
+    ], check=True)
     if git("rev-parse", "HEAD^").strip().decode() != expected or changes():
         raise RepairError("Repair commit is not a clean direct child")
     print("Rustfmt-only repair commit prepared")
