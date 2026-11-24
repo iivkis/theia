@@ -239,6 +239,16 @@ impl Secret {
         Self::new(*secret)
     }
 
+    /// Private bundle integrity commitment, never shown in CLI/TUI output.
+    /// The input is a full-entropy 256-bit secret, not a password.
+    pub(crate) fn commitment(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"Theia/provision/admission-integrity/v1\0");
+        hash.update(self.0.as_ref());
+        hash.finalize().into()
+    }
+
     fn key(&self) -> Result<LessSafeKey, Error> {
         UnboundKey::new(&aead::CHACHA20_POLY1305, self.0.as_ref())
             .map(LessSafeKey::new)

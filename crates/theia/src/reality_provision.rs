@@ -34,6 +34,7 @@ pub struct Record {
     pub plan_sha256: [u8; 32],
     pub identity_sha256: [u8; 32],
     pub publication_sha256: [u8; 32],
+    admission_commitment: [u8; 32],
 }
 
 pub fn preview(state: &State, now: u64) -> Result<Preview, Error> {
@@ -71,8 +72,8 @@ pub fn create(
         crate::identity_tls::Error::Indeterminate => Error::Indeterminate,
         _ => Error::Storage,
     })?;
-    Secret::generate().map_err(|_| Error::Identity)?
-        .save_new(&scope, &output.join(ADMISSION)).map_err(|error| match error {
+    let secret = Secret::generate().map_err(|_| Error::Identity)?;
+    secret.save_new(&scope, &output.join(ADMISSION)).map_err(|error| match error {
             crate::reality_admission::Error::Indeterminate => Error::Indeterminate,
             _ => Error::Storage,
         })?;
@@ -86,6 +87,7 @@ pub fn create(
         plan_sha256: approved.plan_sha256,
         identity_sha256: bootstrap::fingerprint(identity.public_key()),
         publication_sha256: status.snapshot_sha256,
+        admission_commitment: secret.commitment(),
     };
     if !status.valid_now || status.active_fingerprint != record.identity_sha256
         || status.plan_sha256 != record.plan_sha256 || status.generation != 1
@@ -94,6 +96,66 @@ pub fn create(
     }
     let raw = toml::to_string(&record).map_err(|_| Error::Format)?;
     bootstrap::create_text(&output.join(MANIFEST), &raw)?;
+    Ok(record)
+}
+
+/// Reopen an initial, unmodified provisioning receipt. An independent
+/// identity fingerprint and exact health approval are required, rather
+/// than trusting metadata merely because it resides in the directory.
+/// This is *not* a current-publication loader after refresh or rotation.
+pub fn inspect_initial(
+    state: &State,
+    expected_health: [u8; 32],
+    expected_identity: [u8; 32],
+    directory: &Path,
+    now: u64,
+) -> Result<Record, Error> {
+    use subtle::ConstantTimeEq;
+    if !crate::bounded_input::explicit_file_path(directory) || directory.file_name().is_none() {
+        return Err(Error::Storage);
+    }
+    let metadata = std::fs::symlink_metadata(directory).map_err(|_| Error::Storage)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() { return Err(Error::Storage); }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::Storage);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 { return Err(Error::Storage); }
+    }
+    let raw = bootstrap::read_text(&directory.join(MANIFEST), 8192, true)?;
+    let record: Record = toml::from_str(&raw).map_err(|_| Error::Format)?;
+    if record.schema_version != 1
+        || record.scope.inbound != state.plan().inbound
+        || record.scope.endpoint != state.plan().endpoint
+        || record.plan_sha256 != state.plan().digest().map_err(|_| Error::Health)?
+        || record.health_sha256 != state.snapshot_sha256().map_err(|_| Error::Health)?
+        || record.health_sha256 != expected_health
+        || record.identity_sha256 != expected_identity {
+        return Err(Error::Approval);
+    }
+    let identity = Identity::load(&directory.join(IDENTITY), &record.scope).map_err(|_| Error::Identity)?;
+    if !bool::from(bootstrap::fingerprint(identity.public_key()).ct_eq(&expected_identity)) {
+        return Err(Error::Identity);
+    }
+    let admission = Secret::load(&record.scope, &directory.join(ADMISSION)).map_err(|_| Error::Credential)?;
+    if !bool::from(admission.commitment().ct_eq(&record.admission_commitment)) {
+        return Err(Error::Credential);
+    }
+    let publication = Publication::new(&directory.join(PUBLICATION))?;
+    let status = publication.inspect(now)?;
+    if status.generation != 1 || status.revision != 1 || status.next_fingerprint.is_some()
+        || status.snapshot_sha256 != record.publication_sha256 || status.plan_sha256 != record.plan_sha256 {
+        return Err(Error::Descriptor);
+    }
+    let captured = publication.capture(state, record.publication_sha256, now)?;
+    let active = captured.select(identity.public_key(), now)?;
+    if active.verified().descriptor().scope != record.scope { return Err(Error::Scope); }
     Ok(record)
 }
 
@@ -125,6 +187,16 @@ mod tests {
         let identity = Identity::load(&output.join(IDENTITY), &record.scope).unwrap();
         assert_eq!(bootstrap::fingerprint(identity.public_key()), record.identity_sha256);
         assert!(Secret::load(&record.scope, &output.join(ADMISSION)).is_ok());
+        assert!(inspect_initial(&state, approval.health_sha256, record.identity_sha256, &output, 1060).is_ok());
+        assert!(inspect_initial(&state, approval.health_sha256, [0; 32], &output, 1060).is_err());
+        assert!(inspect_initial(&state, [0; 32], record.identity_sha256, &output, 1060).is_err());
+        let incomplete = parent.join("incomplete");
+        crate::client_import::new_private_directory(&incomplete).unwrap();
+        assert!(inspect_initial(&state, approval.health_sha256, record.identity_sha256, &incomplete, 1060).is_err());
+        let secret_path = output.join(ADMISSION);
+        std::fs::remove_file(&secret_path).unwrap();
+        Secret::generate().unwrap().save_new(&record.scope, &secret_path).unwrap();
+        assert!(matches!(inspect_initial(&state, approval.health_sha256, record.identity_sha256, &output, 1060), Err(Error::Credential)));
         let status = Publication::new(&output.join(PUBLICATION)).unwrap().inspect(1060).unwrap();
         assert_eq!(status.snapshot_sha256, record.publication_sha256);
         let raw = bootstrap::read_text(&output.join(MANIFEST), 8192, true).unwrap();
