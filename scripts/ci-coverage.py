@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PLATFORMS = {"Linux", "Windows"}
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 MIN_PERCENT = 80
+# Verified six-field segment layouts, including LLVM 23.1.5 (Rust 1.100).
+LLVM_EXPORT_VERSIONS = {"2.0.1", "3.1.0"}
 
 
 class EvidenceError(ValueError):
@@ -85,15 +87,21 @@ def llvm_segment_lines(segments: list, max_line: int) -> dict[str, int]:
         raise EvidenceError("Missing LLVM file segments")
     grouped = {}
     previous = (0, 0)
+    previous_has_count = True
     for segment in segments:
         if (not isinstance(segment, list) or len(segment) != 6
                 or any(type(value) is not int for value in segment[:3])
                 or any(type(value) is not bool for value in segment[3:])):
             raise EvidenceError("Malformed LLVM coverage segment")
         line, column, hits, has_count, entry, gap = segment
-        if not 1 <= line <= max_line + 1 or column < 1 or hits < 0 or (line, column) <= previous:
-            raise EvidenceError("Invalid or unordered LLVM coverage segment")
-        previous = (line, column)
+        position = (line, column)
+        # Match LLVM SegmentBuilder's invariant: a skipped zero-length
+        # region can be followed by another segment at the same position.
+        if (not 1 <= line <= max_line + 1 or column < 1 or hits < 0
+                or position < previous or (position == previous and previous_has_count)):
+            raise EvidenceError(f"Invalid or unordered LLVM coverage segment at {line}:{column}")
+        previous = position
+        previous_has_count = has_count
         grouped.setdefault(line, []).append(segment)
     result = {}
     wrapped = None
@@ -114,13 +122,16 @@ def llvm_segment_lines(segments: list, max_line: int) -> dict[str, int]:
 
 
 def read_llvm_export(data: dict, root: Path, expected: dict[str, str]) -> dict:
-    if (not isinstance(data, dict) or data.get("type") != "llvm.coverage.json.export"
-            or not isinstance(data.get("version"), str)
-            or not re.fullmatch(r"2\.\d+\.\d+", data["version"])
-            or not isinstance(data.get("data"), list) or len(data["data"]) != 1
+    if not isinstance(data, dict) or data.get("type") != "llvm.coverage.json.export":
+        raise EvidenceError("Invalid LLVM JSON export type")
+    version = data.get("version")
+    if not isinstance(version, str) or version not in LLVM_EXPORT_VERSIONS:
+        raise EvidenceError(f"Unsupported LLVM JSON export version: {version!r}")
+    print(f"LLVM JSON export version: {version}", flush=True)
+    if (not isinstance(data.get("data"), list) or len(data["data"]) != 1
             or not isinstance(data["data"][0], dict)
             or not isinstance(data["data"][0].get("files"), list)):
-        raise EvidenceError("Unsupported or incomplete LLVM JSON export")
+        raise EvidenceError("Incomplete LLVM JSON file export")
     result = {}
     for record in data["data"][0]["files"]:
         if not isinstance(record, dict) or not isinstance(record.get("filename"), str):
@@ -130,12 +141,18 @@ def read_llvm_export(data: dict, root: Path, expected: dict[str, str]) -> dict:
             continue
         if name in result:
             raise EvidenceError(f"Duplicate LLVM production source: {name}")
-        summary = record.get("summary", {}).get("lines", {})
+        summary = record.get("summary")
+        if not isinstance(summary, dict) or not isinstance(summary.get("lines"), dict):
+            raise EvidenceError(f"Missing LLVM line summary: {name}")
+        summary = summary["lines"]
         lf, lh = summary.get("count"), summary.get("covered")
         if type(lf) is not int or type(lh) is not int or not 0 <= lh <= lf:
             raise EvidenceError(f"Malformed LLVM line summary: {name}")
         length = len((root / name).read_bytes().splitlines())
-        lines = llvm_segment_lines(record.get("segments"), length)
+        try:
+            lines = llvm_segment_lines(record.get("segments"), length)
+        except EvidenceError as error:
+            raise EvidenceError(f"{name}: {error}") from error
         result[name] = (lines, lf, lh)
     if not result:
         raise EvidenceError("Empty LLVM production export")
@@ -188,8 +205,21 @@ def read_lcov(text: str, root: Path, expected: dict[str, str],
                 # LLVM LF/LH are summed per function group. DA is the union
                 # of unique mapped lines in the file. Verify both against the
                 # second export from the exact same instrumented profiles.
-                if llvm.get(source) != (lines, lf, lh):
-                    raise EvidenceError(f"LCOV/LLVM segment or summary mismatch: {source}")
+                if source not in llvm:
+                    raise EvidenceError(f"LCOV source absent from LLVM export: {source}")
+                expected_lines, expected_lf, expected_lh = llvm[source]
+                if (lf, lh) != (expected_lf, expected_lh):
+                    raise EvidenceError(f"LCOV/LLVM summary mismatch: {source}; "
+                                        f"LCOV={lf}/{lh}, LLVM={expected_lf}/{expected_lh}")
+                if lines != expected_lines:
+                    missing = sorted(set(expected_lines) - set(lines), key=int)
+                    extra = sorted(set(lines) - set(expected_lines), key=int)
+                    different = sorted((n for n in lines.keys() & expected_lines.keys()
+                                        if lines[n] != expected_lines[n]), key=int)
+                    raise EvidenceError(f"LCOV/LLVM segment mismatch: {source}; "
+                                        f"missing={missing[:10]} ({len(missing)}), "
+                                        f"extra={extra[:10]} ({len(extra)}), "
+                                        f"hit mismatch={different[:10]} ({len(different)})")
             if source in expected:
                 if source in files:
                     raise EvidenceError(f"Duplicate production source record: {source}")

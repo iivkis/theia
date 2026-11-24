@@ -139,6 +139,7 @@ for term in ("os: [ubuntu-latest, windows-latest]", "llvm-tools-preview",
              "cargo llvm-cov --workspace --all-targets --all-features --locked --lcov",
              "cargo llvm-cov report --json --include-build-script",
              "ci-coverage.py collect", "--llvm-json coverage-segments.json",
+             "coverage-raw-failure-", "if: failure()", "coverage.lcov",
              "if-no-files-found: error"):
     require(term in coverage_native, "missing native coverage contract: " + term)
 for term in ("coverage-Linux", "coverage-Windows", "ci-coverage.py gate",

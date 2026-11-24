@@ -621,6 +621,16 @@ jobs:
           path: coverage.json
           if-no-files-found: error
           retention-days: 7
+      - name: Preserve raw LLVM evidence when coverage collection fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-raw-failure-${{ runner.os }}
+          path: |
+            coverage.lcov
+            coverage-segments.json
+          if-no-files-found: warn
+          retention-days: 3
 
   coverage-gate:
     name: Production line coverage >= 80%
