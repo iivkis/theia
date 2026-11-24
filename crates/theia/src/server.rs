@@ -231,8 +231,19 @@ impl ServerContext {
         value: &crate::descriptor::Verified,
         signed: Arc<str>,
     ) -> Result<Self, ServerError> {
+        if !inbound.security_mode.is_plain() { return Err(ServerError::Config); }
+        Self::identity_context(inbound, users, policy, value, signed)
+    }
+
+    pub(crate) fn identity_context(
+        inbound: &Inbound,
+        users: &[User],
+        policy: &ServerPolicy,
+        value: &crate::descriptor::Verified,
+        signed: Arc<str>,
+    ) -> Result<Self, ServerError> {
         let d = value.descriptor();
-        if !inbound.security_mode.is_plain()
+        if !(inbound.security_mode.is_plain() || inbound.security_mode == crate::security_profile::SecurityMode::SmartReality)
             || inbound.id != d.scope.inbound
             || inbound.allowed_user_ids.is_empty()
             || value
@@ -435,7 +446,7 @@ impl ServerContext {
     }
 
     pub(crate) fn requires_channel_binding(&self) -> bool {
-        !self.security_mode.is_plain()
+        !self.security_mode.is_plain() && self.identity_routes.is_none()
     }
 
     pub(crate) fn stream_up(&self) -> bool {
@@ -460,7 +471,7 @@ impl ServerContext {
         if !self.peer_budget.admit(peer, Instant::now()) {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        if !(self.stream_up() || self.security_mode.is_plain())
+        if !(self.stream_up() || self.security_mode.is_plain() || self.identity_routes.is_some())
             || self.split_leg(upload) != Some(Leg::Upload)
             || self.split_leg(download) != Some(Leg::Download)
             || split_http::pair_id(upload).is_none()
@@ -800,86 +811,7 @@ pub(crate) async fn serve_generation_with_tls(
                     current.clone()
                 };
                 let context = context.clone();
-                connections.spawn(async move {
-                    let _slot = slot;
-                    let tls = match timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(socket)).await {
-                        Ok(Ok(tls)) => tls,
-                        Ok(Err(_)) => {
-                            crate::diag!(Warn, "server.h2", "tls_handshake_failed",
-                                "connection" = Value::Count(connection_id));
-                            return;
-                        }
-                        Err(_) => {
-                            crate::diag!(Warn, "server.h2", "tls_handshake_timeout",
-                                "connection" = Value::Count(connection_id));
-                            return;
-                        }
-                    };
-                    if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-                        crate::diag!(Warn, "server.h2", "alpn_rejected",
-                            "connection" = Value::Count(connection_id));
-                        return;
-                    }
-                    crate::diag!(Trace, "server.h2", "tls_verified",
-                        "connection" = Value::Count(connection_id));
-                    let binding = if context.requires_channel_binding() {
-                        let Ok(key) = tls.get_ref().1.export_keying_material(
-                            [0u8; 32], crate::channel_binding::LABEL,
-                            Some(crate::channel_binding::H2),
-                        ) else {
-                            return;
-                        };
-                        Some(Arc::new(crate::channel_binding::Admission::new(
-                            zeroize::Zeroizing::new(key),
-                        )))
-                    } else {
-                        None
-                    };
-                    let mut builder = h2::server::Builder::new();
-                    builder.max_concurrent_streams(MAX_H2_STREAMS);
-                    builder.max_header_list_size(MAX_HEADER_BYTES);
-                    let Ok(Ok(mut connection)) = timeout(HANDSHAKE_TIMEOUT, builder.handshake(tls)).await else {
-                        crate::diag!(Warn, "server.h2", "h2_handshake_failed_or_timeout",
-                            "connection" = Value::Count(connection_id));
-                        return;
-                    };
-                    crate::diag!(Debug, "server.h2", "connection_ready",
-                        "connection" = Value::Count(connection_id));
-                    let mut handlers = JoinSet::new();
-                    let pair = Arc::new(crate::split_http::Pair::new());
-                    loop {
-                        let accepted = if handlers.is_empty() {
-                            match timeout(AUTH_WINDOW, connection.accept()).await {
-                                Ok(accepted) => accepted,
-                                Err(_) => break,
-                            }
-                        } else {
-                            tokio::select! {
-                                _ = handlers.join_next() => continue,
-                                accepted = connection.accept() => accepted,
-                            }
-                        };
-                        let Some(Ok((request, respond))) = accepted else {
-                            break;
-                        };
-                        let context = context.clone();
-                        let pair = pair.clone();
-                        let binding = binding.clone();
-                        handlers.spawn(async move {
-                            let result = if context.is_descriptor_request(&request) {
-                                handle_descriptor(request, respond, &context, peer.ip()).await
-                            } else if context.accepts_split(&request) {
-                                handle_split_request(request, respond, &context, peer.ip(), &pair, binding.as_deref()).await
-                            } else {
-                                handle_request(request, respond, context, peer.ip(), binding.as_deref()).await
-                            };
-                            if let Err(error) = result {
-                                crate::diag!(Warn, "server.h2", "request_failed",
-                                    "reason" = Value::Label(error_kind(error)));
-                            }
-                        });
-                    }
-                });
+                connections.spawn(serve_h2_socket(socket, tls_acceptor, context, peer, slot, connection_id));
             }
         }
     }
@@ -893,6 +825,93 @@ pub(crate) async fn serve_generation_with_tls(
     })
     .await;
     Ok(())
+}
+
+/// Shared H2 application transport. The upstream admission adapter must
+/// supply the exact original byte stream and selected identity TLS config.
+pub(crate) async fn serve_h2_socket<S>(
+    socket: S, tls_acceptor: TlsAcceptor, context: Arc<ServerContext>,
+    peer: std::net::SocketAddr, slot: ConnectionSlot, connection_id: u64,
+) where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
+    let _slot = slot;
+    let tls = match timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(socket)).await {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(_)) => {
+            crate::diag!(Warn, "server.h2", "tls_handshake_failed",
+                "connection" = Value::Count(connection_id));
+            return;
+        }
+        Err(_) => {
+            crate::diag!(Warn, "server.h2", "tls_handshake_timeout",
+                "connection" = Value::Count(connection_id));
+            return;
+        }
+    };
+    if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+        crate::diag!(Warn, "server.h2", "alpn_rejected",
+            "connection" = Value::Count(connection_id));
+        return;
+    }
+    crate::diag!(Trace, "server.h2", "tls_verified",
+        "connection" = Value::Count(connection_id));
+    let binding = if context.requires_channel_binding() {
+        let Ok(key) = tls.get_ref().1.export_keying_material(
+            [0u8; 32], crate::channel_binding::LABEL,
+            Some(crate::channel_binding::H2),
+        ) else {
+            return;
+        };
+        Some(Arc::new(crate::channel_binding::Admission::new(
+            zeroize::Zeroizing::new(key),
+        )))
+    } else {
+        None
+    };
+    let mut builder = h2::server::Builder::new();
+    builder.max_concurrent_streams(MAX_H2_STREAMS);
+    builder.max_header_list_size(MAX_HEADER_BYTES);
+    let Ok(Ok(mut connection)) = timeout(HANDSHAKE_TIMEOUT, builder.handshake(tls)).await else {
+        crate::diag!(Warn, "server.h2", "h2_handshake_failed_or_timeout",
+            "connection" = Value::Count(connection_id));
+        return;
+    };
+    crate::diag!(Debug, "server.h2", "connection_ready",
+        "connection" = Value::Count(connection_id));
+    let mut handlers = JoinSet::new();
+    let pair = Arc::new(crate::split_http::Pair::new());
+    loop {
+        let accepted = if handlers.is_empty() {
+            match timeout(AUTH_WINDOW, connection.accept()).await {
+                Ok(accepted) => accepted,
+                Err(_) => break,
+            }
+        } else {
+            tokio::select! {
+                _ = handlers.join_next() => continue,
+                accepted = connection.accept() => accepted,
+            }
+        };
+        let Some(Ok((request, respond))) = accepted else {
+            break;
+        };
+        let context = context.clone();
+        let pair = pair.clone();
+        let binding = binding.clone();
+        handlers.spawn(async move {
+            let result = if context.is_descriptor_request(&request) {
+                handle_descriptor(request, respond, &context, peer.ip()).await
+            } else if context.accepts_split(&request) {
+                handle_split_request(request, respond, &context, peer.ip(), &pair, binding.as_deref()).await
+            } else {
+                handle_request(request, respond, context, peer.ip(), binding.as_deref()).await
+            };
+            if let Err(error) = result {
+                crate::diag!(Warn, "server.h2", "request_failed",
+                    "reason" = Value::Label(error_kind(error)));
+            }
+        });
+    }
+
 }
 
 async fn reject(

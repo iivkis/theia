@@ -4,7 +4,12 @@
 #![forbid(unsafe_code)]
 
 use crate::{
+    config::{Config, Inbound, ServerPolicy, User},
+    descriptor::Verified,
+    identity_tls::Branch,
     reality_admission::{self, Context, ReplayGuard, Secret},
+    reality_generation::Manager,
+    server::{self, ServerContext, ServerError},
     reference_health::RelayLease,
 };
 use std::{
@@ -19,8 +24,9 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     sync::Semaphore,
+    task::JoinSet,
     time::{timeout, timeout_at, Instant},
 };
 
@@ -281,6 +287,106 @@ impl RelayGate {
         }
         relay_io(client, upstream, RELAY_BYTES, RELAY_LIFETIME).await
     }
+}
+
+/// Prepared single-generation TCP backend. The construction requires the
+/// exact registered bundle and durable generation floor. It is not wired
+/// to production startup while the independent QUIC relay contract is open.
+/// Both accepted and reference paths are bounded; all sockets are owned
+/// by this task's JoinSet and cancelled on shutdown.
+pub struct PreparedTcp {
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    context: Arc<ServerContext>,
+    lease: crate::reality_generation::Lease,
+    guard: Arc<ReplayGuard>,
+    relay: Arc<RelayGate>,
+    inspection_slots: Arc<Semaphore>,
+}
+
+impl PreparedTcp {
+    pub fn prepare(listener: TcpListener, document: &Config, inbound_id: &str) -> Result<Self, ServerError> {
+        let Config::Server(doc) = document else { return Err(ServerError::Config); };
+        let inbound = doc.server.inbounds.iter().find(|i| i.id == inbound_id).ok_or(ServerError::Config)?;
+        let expected: std::net::SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
+        if listener.local_addr().map_err(|_| ServerError::Io)? != expected { return Err(ServerError::Config); }
+        let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
+        let manager = Manager::new(document, inbound_id, now).map_err(|_| ServerError::Config)?;
+        let lease = manager.refresh(now).map_err(|_| ServerError::Config)?;
+        Self::from_lease(listener, inbound, &doc.server.users, &doc.server.policy, lease, now)
+    }
+
+    fn from_lease(listener: TcpListener, inbound: &Inbound, users: &[User], policy: &ServerPolicy,
+        lease: crate::reality_generation::Lease, now: u64) -> Result<Self, ServerError> {
+        let publication = lease.publication();
+        // Single identity only for this backend candidate: never silently
+        // select the wrong signer during a dual-key overlap.
+        if publication.next().is_some() { return Err(ServerError::Config); }
+        let material = publication.active();
+        let value = material.verified();
+        let reference = active_reference(value)?;
+        let mut tls = material.identity().server_tls(reference, Branch::H2).map_err(|_| ServerError::Tls)?;
+        tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        // Admission is checked exactly once by the TCP first-flight
+        // dispatcher, not again by the TLS callback.
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let context = Arc::new(ServerContext::identity_context(inbound, users, policy, value,
+            Arc::from(material.signed()))?);
+        let guard = Arc::new(ReplayGuard::new(65536, now).map_err(|_| ServerError::Config)?);
+        Ok(Self { listener, acceptor, context, lease, guard,
+            relay: Arc::new(RelayGate::default()), inspection_slots: Arc::new(Semaphore::new(64)) })
+    }
+
+    pub async fn serve(self) -> Result<(), ServerError> {
+        crate::tcp_bbr::select(&self.listener).map_err(|_| ServerError::TcpControllerUnavailable)?;
+        let shared = Arc::new(self);
+        let mut tasks = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
+                result = shared.listener.accept() => {
+                    let (socket, peer) = result.map_err(|_| ServerError::Io)?;
+                    let Ok(slot) = shared.inspection_slots.clone().try_acquire_owned() else { continue; };
+                    if crate::tcp_bbr::select(&socket).is_err() { continue; }
+                    let backend = shared.clone();
+                    tasks.spawn(async move {
+                        let Ok(inspected) = inspect(socket).await else { return; };
+                        let Ok(now) = crate::reference_health::unix_now() else { return; };
+                        let publication = backend.lease.publication();
+                        let material = publication.active();
+                        let value = material.verified();
+                        if value.check_time(now).is_err() { return; }
+                        let Ok(reference) = active_reference(value) else { return; };
+                        let secret = backend.lease.admission();
+                        let admission = Context { scope: &value.descriptor().scope,
+                            identity: value.signer(), reference, branch: Branch::H2 };
+                        let decision = inspected.classify(&backend.guard, &secret, &admission, now);
+                        match decision {
+                            Decision::Admitted(io) => {
+                                let Some(connection) = backend.context.connection_slot() else { return; };
+                                drop(slot);
+                                server::serve_h2_socket(io, backend.acceptor.clone(), backend.context.clone(),
+                                    peer, connection, crate::diagnostics::next_id()).await;
+                            }
+                            Decision::Relay(io) => {
+                                // Keep the bounded inspection slot through
+                                // DNS revalidation and relay construction.
+                                let Ok(lease) = backend.lease.health().relay_lease(value, publication.plan_sha256()).await else { return; };
+                                let _ = backend.relay.relay(io, &lease).await;
+                                drop(slot);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn active_reference(value: &Verified) -> Result<&str, ServerError> {
+    let d = value.descriptor();
+    d.references.get(usize::from(d.active_reference)).map(|r| r.server_name.as_str())
+        .ok_or(ServerError::Config)
 }
 
 #[cfg(test)]

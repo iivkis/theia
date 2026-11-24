@@ -19,7 +19,8 @@ struct Generation {
     publication: CapturedPublication,
     // Keep the protected material owned by this generation; it is never
     // returned by status, debug formatting or this local lifecycle API.
-    _admission: Secret,
+    admission: Arc<Secret>,
+    health: State,
     health_revision: u64,
     health_digest: [u8; 32],
 }
@@ -37,7 +38,7 @@ impl Generation {
         let (publication, admission) = crate::reality_provision::capture_registered(
             Path::new(&binding.bundle), binding, health, scope, now)?;
         Ok(Self {
-            publication, _admission: admission, health_revision: health.revision(),
+            publication, admission: Arc::new(admission), health: health.clone(), health_revision: health.revision(),
             health_digest: health.snapshot_sha256().map_err(|_| Error::Health)?,
         })
     }
@@ -89,6 +90,10 @@ pub struct Status {
 pub struct Lease(Arc<Generation>, u64);
 
 impl Lease {
+    pub(crate) fn publication(&self) -> &CapturedPublication { &self.0.publication }
+    pub(crate) fn admission(&self) -> Arc<Secret> { self.0.admission.clone() }
+    pub(crate) fn health(&self) -> &State { &self.0.health }
+
     pub fn status(&self) -> Status {
         let generation = &self.0;
         let publication = &generation.publication;
