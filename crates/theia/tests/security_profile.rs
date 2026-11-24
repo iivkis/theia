@@ -229,6 +229,13 @@ impl Fixture {
                     }
                 },
             );
+            if pin.is_none() {
+                profile.xhttp_mode = Some(if self.stream_up {
+                    config::XhttpMode::StreamUp
+                } else {
+                    config::XhttpMode::StreamOne
+                });
+            }
             let invite = Invitation::public_from_profile(&profile)
                 .unwrap()
                 .encode()
@@ -240,7 +247,8 @@ impl Fixture {
             assert_eq!(received.tls_profile, profile.tls_profile);
             assert_eq!(received.transport, profile.transport);
             let imported_pin = CertificatePin::parse_profile(&received.tls_profile);
-            let stream_up = CertificatePin::is_stream_up_profile(&received.tls_profile);
+            assert_eq!(received.effective_xhttp_mode(), profile.effective_xhttp_mode());
+            let stream_up = received.effective_xhttp_mode() == config::XhttpMode::StreamUp;
             let token = URL_SAFE_NO_PAD.encode(TOKEN);
             let (mut app, local) = tokio::io::duplex(4096);
             let relay = if received.transport == Transport::H3 {

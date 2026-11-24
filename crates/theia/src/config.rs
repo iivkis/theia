@@ -144,6 +144,20 @@ pub enum XhttpMode {
     StreamOne,
     StreamUp,
 }
+
+impl Profile {
+    /// Own TLS defaults to adaptive XHTTP. Experimental security adapters
+    /// currently have a fixed mode and never silently downgrade.
+    pub fn effective_xhttp_mode(&self) -> XhttpMode {
+        if self.tls_profile == "default" {
+            self.xhttp_mode.unwrap_or(XhttpMode::Auto)
+        } else if crate::security_profile::CertificatePin::is_stream_up_profile(&self.tls_profile) {
+            XhttpMode::StreamUp
+        } else {
+            XhttpMode::StreamOne
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalProxy {
@@ -507,7 +521,7 @@ impl ClientDocument {
             ensure(
                 profile.xhttp_mode.is_none() || profile.tls_profile == "default",
                 format!("{field}.xhttp_mode"),
-                "explicit XHTTP selection requires own TLS; legacy pinned profiles encode their exact mode",
+                "explicit XHTTP selection requires own TLS; experimental profiles have a fixed mode",
             )?;
             ensure(
                 (500..=15_000).contains(&profile.quic_connect_timeout_ms),
@@ -792,12 +806,12 @@ mod tests {
         }
     }
     #[test]
-    fn own_tls_xhttp_mode_is_strict_and_legacy_roundtrips() {
+    fn own_tls_xhttp_mode_defaults_to_auto_and_is_strict() {
         let original = client();
-        let Config::Client(legacy) = parse(&original).unwrap() else {
+        let Config::Client(defaults) = parse(&original).unwrap() else {
             panic!("client");
         };
-        assert_eq!(legacy.client.profiles[0].xhttp_mode, None);
+        assert_eq!(defaults.client.profiles[0].effective_xhttp_mode(), XhttpMode::Auto);
         for (raw, mode) in [
             ("auto", XhttpMode::Auto),
             ("stream-one", XhttpMode::StreamOne),

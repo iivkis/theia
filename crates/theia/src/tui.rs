@@ -1625,9 +1625,9 @@ fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Opt
         ImportFlow::Preview { invitation, ca, public_ref } => (
             "F-14: безопасный предпросмотр подключения",
             format!(
-                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nTLS profile: {}\nTransport: {:?}\nBearer: {}\nCA trust: {}\nPin из приглашения сверяйте по доверенному каналу; это не CA.\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
+                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nTLS profile: {}\nTransport: {:?}\nXHTTP: {:?}\nBearer: {}\nCA trust: {}\nPin из приглашения сверяйте по доверенному каналу; это не CA.\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
                 invitation.id, invitation.endpoint, invitation.server_name,
-                invitation.tls_profile(), invitation.transport,
+                invitation.tls_profile(), invitation.transport, invitation.xhttp_mode(),
                 if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },
                 if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
                 if editor.is_some_and(|e| e.can_refresh_credential(invitation)) { "r: отдельная замена credential существующего профиля; выбранный CA не используется.\n" } else { "" },

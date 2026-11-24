@@ -113,9 +113,9 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 .ok_or(ClientError::Configuration)?,
         )
     };
-    let stream_up = profile.xhttp_mode == Some(XhttpMode::StreamUp)
-        || crate::security_profile::CertificatePin::is_stream_up_profile(&profile.tls_profile);
-    let auto_xhttp = profile.xhttp_mode == Some(XhttpMode::Auto);
+    let mode = profile.effective_xhttp_mode();
+    let stream_up = mode == XhttpMode::StreamUp;
+    let auto_xhttp = mode == XhttpMode::Auto;
     let ttl = Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s));
     match profile.transport {
         Transport::H2 => {

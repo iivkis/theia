@@ -17,12 +17,11 @@ use zeroize::Zeroizing;
 
 const MAX_INPUT: usize = 255;
 
-fn xhttp_value(mode: Option<XhttpMode>) -> String {
+fn xhttp_value(mode: XhttpMode) -> String {
     match mode {
-        None => "legacy",
-        Some(XhttpMode::Auto) => "auto",
-        Some(XhttpMode::StreamOne) => "stream-one",
-        Some(XhttpMode::StreamUp) => "stream-up",
+        XhttpMode::Auto => "auto",
+        XhttpMode::StreamOne => "stream-one",
+        XhttpMode::StreamUp => "stream-up",
     }
     .to_owned()
 }
@@ -236,9 +235,8 @@ impl Editor {
         if profile.server != invite.endpoint
             || profile.server_name != invite.server_name
             || profile.tls_profile != invite.tls_profile()
-            || profile
-                .xhttp_mode
-                .is_some_and(|mode| mode != config::XhttpMode::StreamOne)
+            || (invite.xhttp_mode() != XhttpMode::Auto
+                && profile.effective_xhttp_mode() != invite.xhttp_mode())
             || (invite.transport != Transport::Auto && profile.transport != invite.transport)
         {
             return Err("Invitation does not match saved profile identity and transport");
@@ -793,7 +791,7 @@ impl Editor {
                         Transport::H2 => "h2".to_owned(),
                         Transport::H3 => "h3".to_owned(),
                     },
-                    _ => xhttp_value(profile.xhttp_mode),
+                    _ => xhttp_value(profile.effective_xhttp_mode()),
                 })
                 .unwrap_or_default(),
         }
@@ -832,7 +830,7 @@ impl Editor {
                             Transport::H2 => "h2".to_owned(),
                             Transport::H3 => "h3".to_owned(),
                         },
-                        xhttp_value(p.xhttp_mode),
+                        xhttp_value(p.effective_xhttp_mode()),
                     ]
                 })
                 .unwrap_or_default(),
@@ -951,13 +949,12 @@ impl Editor {
                     }
                     _ => {
                         profile.xhttp_mode = match self.input.as_str() {
-                            "legacy" => None,
                             "auto" => Some(XhttpMode::Auto),
                             "stream-one" => Some(XhttpMode::StreamOne),
                             "stream-up" => Some(XhttpMode::StreamUp),
                             _ => {
                                 self.error = Some(format!(
-                                    "{field}: expected auto, stream-one, stream-up or legacy"
+                                    "{field}: expected auto, stream-one or stream-up"
                                 ));
                                 return false;
                             }
@@ -2290,7 +2287,7 @@ mod tests {
         assert_eq!(saved.client.profiles[1].server_name, "new-work.example.org");
         assert_eq!(saved.client.profiles[1].transport, config::Transport::H2);
         assert_eq!(saved.client.profiles[1].xhttp_mode, Some(XhttpMode::Auto));
-        assert_eq!(saved.client.profiles[0].xhttp_mode, None);
+        assert_eq!(saved.client.profiles[0].effective_xhttp_mode(), XhttpMode::Auto);
         assert_eq!(saved.client.profiles[1].auth_token, "env:THEIA_AUTH_TOKEN");
     }
 
