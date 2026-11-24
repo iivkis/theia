@@ -781,7 +781,6 @@ fn check_reconnect_proof_matrix(
     server_nonce.zeroize();
 }
 
-
 #[test]
 fn retired_local_tls_reality_server_schema_is_rejected() {
     let original = include_str!("../../../examples/server.toml")
@@ -792,7 +791,10 @@ fn retired_local_tls_reality_server_schema_is_rejected() {
         "reality_key = \"file:/tmp/identity.der\"\n",
         "security_mode = \"smart-reality-v1\"\nreality_key = \"file:/tmp/identity.der\"\n",
     ] {
-        let invalid = original.replace("[[server.inbounds]]", &format!("[[server.inbounds]]\n{fields}"));
+        let invalid = original.replace(
+            "[[server.inbounds]]",
+            &format!("[[server.inbounds]]\n{fields}"),
+        );
         assert!(theia::config::parse(&invalid).is_err());
     }
 }

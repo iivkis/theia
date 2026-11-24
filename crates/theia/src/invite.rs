@@ -637,13 +637,25 @@ mod tests {
         };
         let mut profile = doc.client.profiles[0].clone();
         let key = URL_SAFE_NO_PAD.encode([0x42; 32]);
-        let uri = Invitation::public_from_profile(&profile).unwrap().encode().unwrap();
-        let bytes = URL_SAFE_NO_PAD.decode(uri.strip_prefix(PREFIX).unwrap()).unwrap();
+        let uri = Invitation::public_from_profile(&profile)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let bytes = URL_SAFE_NO_PAD
+            .decode(uri.strip_prefix(PREFIX).unwrap())
+            .unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
-        let retired = format!("{}server_public_key = \"{key}\"\n",
-            text.replace("security_mode = \"own-tls\"", "security_mode = \"smart-reality\"")
-                .replace("xhttp_mode = \"stream-one\"", "xhttp_mode = \"stream-up\""));
-        assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(retired))).is_err());
+        let retired = format!(
+            "{}server_public_key = \"{key}\"\n",
+            text.replace(
+                "security_mode = \"own-tls\"",
+                "security_mode = \"smart-reality\""
+            )
+            .replace("xhttp_mode = \"stream-one\"", "xhttp_mode = \"stream-up\"")
+        );
+        assert!(
+            Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(retired))).is_err()
+        );
         profile.tls_profile = format!("smart-reality-v1:{key}");
         for transport in [Transport::H2, Transport::H3, Transport::Auto] {
             profile.transport = transport;
