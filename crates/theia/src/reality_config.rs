@@ -196,6 +196,42 @@ pub fn validate_client(profile: &Profile, now: u64) -> Result<crate::descriptor:
     enrollment.load(now)
 }
 
+/// Read-only status for a saved REALITY record. Distinguish valid trust,
+/// stale/unavailable reference evidence and runtime backend availability.
+pub fn registered_status(path: &Path, id: &str, now: u64) -> Result<String, Error> {
+    path_string(path)?;
+    let document = config::read_file(path).map_err(|_| Error::Format)?;
+    match document {
+        Config::Server(doc) => {
+            let inbound = doc.server.inbounds.iter().find(|i| i.id == id).ok_or(Error::Scope)?;
+            if inbound.security_mode != SecurityMode::SmartReality { return Err(Error::Format); }
+            let binding = inbound.reality.as_ref().ok_or(Error::Format)?;
+            let listen: SocketAddr = inbound.h2_listen.parse().map_err(|_| Error::Scope)?;
+            let scope = crate::descriptor::Scope {
+                inbound: id.to_owned(), endpoint: format!("{}:{}", inbound.server_name, listen.port()),
+            };
+            let state = reference_health::Store::new(Path::new(&binding.health_store)).map_err(|_| Error::Health)?
+                .inspect().map_err(|_| Error::Health)?;
+            let value = crate::reality_provision::inspect_registered(Path::new(&binding.bundle), binding, &state, &scope, now)?;
+            let (health, reserve) = state.active_status(value.descriptor(), now).map_err(|_| Error::Health)?;
+            let signed = value.descriptor();
+            Ok(format!("Saved REALITY inbound; runtime NOT ACTIVATED\ninbound={id}\nendpoint={}\nrevision={}\nidentity_sha256={}\nvalid_now={}\nactive_reference={}\nactive_status={health:?}\nreserve_candidate={}\nlast_checked_at={}\nnext_check_at={}\nh3={}\nbackend_available=false",
+                scope.endpoint, signed.revision, hex(bootstrap::fingerprint(value.signer())),
+                value.check_time(now).is_ok(), signed.references[usize::from(signed.active_reference)].server_name,
+                reserve.map_or("none".into(), |i| i.to_string()), state.last_checked_at(),
+                state.next_active_check_at(signed, now).map_err(|_| Error::Health)?, signed.h3))
+        }
+        Config::Client(doc) => {
+            let profile = doc.client.profiles.iter().find(|p| p.id == id).ok_or(Error::Scope)?;
+            let value = validate_client(profile, now)?;
+            let modes = value.effective_modes();
+            Ok(format!("Saved REALITY profile; runtime NOT ACTIVATED\nprofile={id}\nactive_profile={}\nrevision={}\nidentity_sha256={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nbackend_available=false",
+                doc.client.active_profile == id, value.descriptor().revision, hex(bootstrap::fingerprint(value.signer())),
+                modes.h2, modes.h3, modes.stream_one, modes.stream_up))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +294,16 @@ mod tests {
         assert!(inbound.tls_cert.is_empty() && inbound.tls_key.is_empty());
         assert_eq!(inbound.allowed_user_ids, vec!["device-a"]);
         assert!(prepare(&path, &req, 1000).is_err());
+        let status = registered_status(&path, "reality-edge", 1000).unwrap();
+        assert!(status.contains("backend_available=false"));
+        assert!(status.contains("active_reference=ref.example.org"));
+        // Compatible renewal advances publication without rewriting the
+        // independently pinned initial receipt or the config record.
+        let binding = inbound.reality.as_ref().unwrap();
+        let publication = crate::identity_publication::Publication::new(&Path::new(&binding.bundle).join("publication.toml")).unwrap();
+        let snapshot = publication.inspect(1001).unwrap();
+        publication.refresh(&state, snapshot.snapshot_sha256, 1001).unwrap();
+        assert!(registered_status(&path, "reality-edge", 1001).unwrap().contains("revision=2"));
         let mut mixed = saved;
         mixed.server.inbounds.last_mut().unwrap().tls_cert = "file:/tmp/foreign.pem".into();
         assert!(Config::Server(mixed).validate().is_err());
@@ -292,6 +338,7 @@ mod tests {
         assert_eq!(saved.client.proxy, original.client.proxy);
         let mut new = saved.client.profiles.last().unwrap().clone();
         assert!(validate_client(&new, 1000).is_ok());
+        assert!(registered_status(&path, "reality-client", 1000).unwrap().contains("active_profile=false"));
         new.auth_token = "env:OTHER".into();
         assert!(matches!(validate_client(&new, 1000), Err(Error::Approval)));
         let mut replacement = std::fs::read_to_string(&enrollment).unwrap();

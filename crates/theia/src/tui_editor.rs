@@ -1056,6 +1056,10 @@ impl Editor {
     }
 
     pub fn selection_summary(&self) -> String {
+        if self.selected_reality() {
+            return format!("REALITY {}/{}: {} [сохранённый, backend недоступен]",
+                self.selected_record + 1, self.record_count(), self.selected_record_id());
+        }
         match self.role {
             Role::Server => format!(
                 "Inbound {}/{}: {}",
@@ -1232,7 +1236,20 @@ impl Editor {
         &self.path
     }
 
+    fn selected_reality(&self) -> bool {
+        match &self.draft {
+            Config::Server(doc) => doc.server.inbounds.get(self.selected_record).is_some_and(|i|
+                i.security_mode == crate::security_profile::SecurityMode::SmartReality),
+            Config::Client(doc) => doc.client.profiles.get(self.selected_record).is_some_and(|p|
+                p.tls_profile == "smart-reality"),
+        }
+    }
+
     pub fn begin(&mut self) {
+        if self.selected_reality() {
+            self.error = Some("REALITY: endpoint, bind и policy закреплены при регистрации; требуется отдельное подтверждение доверия, не обычная правка TLS.".into());
+            return;
+        }
         if self.write_uncertain {
             self.error = Some("config: uncertain previous write; reload editor".into());
             return;

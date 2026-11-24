@@ -109,18 +109,7 @@ pub fn create(
     Ok(record)
 }
 
-/// Reopen an initial, unmodified provisioning receipt. An independent
-/// identity fingerprint and exact health approval are required, rather
-/// than trusting metadata merely because it resides in the directory.
-/// This is *not* a current-publication loader after refresh or rotation.
-pub fn inspect_initial(
-    state: &State,
-    expected_health: [u8; 32],
-    expected_identity: [u8; 32],
-    directory: &Path,
-    now: u64,
-) -> Result<Record, Error> {
-    use subtle::ConstantTimeEq;
+fn read_manifest(directory: &Path) -> Result<Record, Error> {
     if !crate::bounded_input::explicit_file_path(directory) || directory.file_name().is_none() {
         return Err(Error::Storage);
     }
@@ -140,6 +129,49 @@ pub fn inspect_initial(
     }
     let raw = bootstrap::read_text(&directory.join(MANIFEST), 8192, true)?;
     let record: Record = toml::from_str(&raw).map_err(|_| Error::Format)?;
+    if record.schema_version != 1 { return Err(Error::Format); }
+    Ok(record)
+}
+
+/// Reopen registered materials after compatible refresh or planned rotation.
+/// The manifest's canonical commitment and independent root are stored in
+/// the ordinary config, outside the mutable publication.
+pub fn inspect_registered(
+    directory: &Path,
+    binding: &crate::config::RealityBinding,
+    state: &State,
+    scope: &Scope,
+    now: u64,
+) -> Result<crate::descriptor::Verified, Error> {
+    use subtle::ConstantTimeEq;
+    let record = read_manifest(directory)?;
+    if &record.scope != scope || record.health_sha256 != binding.initial_health_sha256
+        || record.identity_sha256 != binding.identity_sha256
+        || !bool::from(record.manifest_sha256()?.ct_eq(&binding.manifest_sha256))
+        || record.plan_sha256 != state.plan().digest().map_err(|_| Error::Health)? {
+        return Err(Error::Approval);
+    }
+    let admission = Secret::load(scope, &directory.join(ADMISSION)).map_err(|_| Error::Credential)?;
+    if !bool::from(admission.commitment().ct_eq(&record.admission_commitment)) {
+        return Err(Error::Credential);
+    }
+    Publication::new(&directory.join(PUBLICATION))?.inspect_rooted(scope,
+        binding.identity_sha256, record.initial_payload_sha256, record.plan_sha256, now)
+}
+
+/// Reopen an initial, unmodified provisioning receipt. An independent
+/// identity fingerprint and exact health approval are required, rather
+/// than trusting metadata merely because it resides in the directory.
+/// This is *not* a current-publication loader after refresh or rotation.
+pub fn inspect_initial(
+    state: &State,
+    expected_health: [u8; 32],
+    expected_identity: [u8; 32],
+    directory: &Path,
+    now: u64,
+) -> Result<Record, Error> {
+    use subtle::ConstantTimeEq;
+    let record = read_manifest(directory)?;
     if record.schema_version != 1
         || record.scope.inbound != state.plan().inbound
         || record.scope.endpoint != state.plan().endpoint

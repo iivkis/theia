@@ -10,6 +10,7 @@ use crate::{
 use std::path::Path;
 
 pub const HELP: &str = "REALITY provisioning candidate; runtime UNCHANGED. All paths absolute.\n\
+theia reality registered-status --config PATH --id ID\n\
 theia reality register-server-preview --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID\n\
 theia reality register-server-save --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID --sha256 HEX --confirm\n\
 theia reality register-client-preview --config PATH --profile PATH --identity-sha256 HEX --id ID\n\
@@ -45,6 +46,7 @@ Identity SHA-256 must be obtained independently. Import never changes active pro
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    RegisteredStatus { config: String, id: String },
     RegisterConfig {
         config: String,
         request: reality_config::Request,
@@ -194,6 +196,9 @@ fn registration_approval(kind: &str, tail: &[&str]) -> Result<Option<[u8; 32]>, 
 
 pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
     Ok(match args {
+        ["registered-status", "--config", c, "--id", id] if config::valid_id(id) => Command::RegisteredStatus {
+            config: path(c)?, id: (*id).to_owned(),
+        },
         [kind @ ("register-server-preview" | "register-server-save"), "--config", c, "--health", h, "--bundle", b,
             "--health-sha256", d, "--identity-sha256", i, "--listen", listen, "--grants", grants, tail @ ..] => {
             let listen: std::net::SocketAddr = listen.parse().map_err(|_| CliError::InvalidArguments)?;
@@ -443,6 +448,7 @@ fn publication_status(
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
+        Command::RegisteredStatus { config, id } => reality_config::registered_status(Path::new(&config), &id, now),
         Command::RegisterConfig { config, request, approval } => {
             if let Some(expected) = approval {
                 reality_config::apply(Path::new(&config), &request, expected, now)?;
