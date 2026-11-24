@@ -1700,7 +1700,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     panel(
         frame,
         area,
-        "Редактор TOML (указанный файл, 3 поля)",
+        "Редактор TOML (указанный файл)",
         &message,
         true,
     );

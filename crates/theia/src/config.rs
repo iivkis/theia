@@ -123,6 +123,8 @@ pub struct Profile {
     pub auth_token: String,
     pub tls_profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xhttp_mode: Option<XhttpMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<String>,
     pub transport: Transport,
     pub quic_connect_timeout_ms: u32,
@@ -134,6 +136,13 @@ pub enum Transport {
     Auto,
     H3,
     H2,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XhttpMode {
+    Auto,
+    StreamOne,
+    StreamUp,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -496,6 +505,11 @@ impl ClientDocument {
                 "unsupported TLS/HTTP fingerprint profile for this transport/backend (fail closed)",
             )?;
             ensure(
+                profile.xhttp_mode.is_none() || profile.tls_profile == "default",
+                format!("{field}.xhttp_mode"),
+                "explicit XHTTP selection requires own TLS; legacy pinned profiles encode their exact mode",
+            )?;
+            ensure(
                 (500..=15_000).contains(&profile.quic_connect_timeout_ms),
                 format!("{field}.quic_connect_timeout_ms"),
                 "must be within 500..=15000",
@@ -777,6 +791,43 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn own_tls_xhttp_mode_is_strict_and_legacy_roundtrips() {
+        let original = client();
+        let Config::Client(legacy) = parse(&original).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(legacy.client.profiles[0].xhttp_mode, None);
+        for (raw, mode) in [
+            ("auto", XhttpMode::Auto),
+            ("stream-one", XhttpMode::StreamOne),
+            ("stream-up", XhttpMode::StreamUp),
+        ] {
+            let explicit = original.replacen(
+                "tls_profile = \"default\"",
+                &format!("tls_profile = \"default\"\nxhttp_mode = \"{raw}\""),
+                1,
+            );
+            let accepted = parse(&explicit).unwrap();
+            let Config::Client(doc) = &accepted else {
+                panic!("client");
+            };
+            assert_eq!(doc.client.profiles[0].xhttp_mode, Some(mode));
+            assert_eq!(parse(&accepted.to_toml().unwrap()).unwrap(), accepted);
+            let pinned = explicit.replace(
+                "tls_profile = \"default\"",
+                &format!("tls_profile = \"pinned-cert-v1:{}\"", "42".repeat(32)),
+            );
+            assert!(parse(&pinned).unwrap_err().field.contains("xhttp_mode"));
+        }
+        let invalid = original.replacen(
+            "tls_profile = \"default\"",
+            "tls_profile = \"default\"\nxhttp_mode = \"guess\"",
+            1,
+        );
+        assert!(parse(&invalid).is_err());
+    }
+
     #[test]
     fn rejects_unsafe_client_settings() {
         let original = client();

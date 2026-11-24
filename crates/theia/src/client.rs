@@ -121,6 +121,7 @@ pub struct H2Client {
     wire_shape: H2WireShape,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     stream_up: bool,
+    auto_mode: Option<crate::split_http::AutoMode>,
 }
 
 impl H2Client {
@@ -229,6 +230,7 @@ impl H2Client {
             wire_shape,
             certificate_pin: None,
             stream_up: false,
+            auto_mode: None,
         })
     }
 
@@ -237,6 +239,9 @@ impl H2Client {
         mut self,
         pin: Option<crate::security_profile::CertificatePin>,
     ) -> Result<Self, ClientError> {
+        if pin.is_some() && self.auto_mode.is_some() {
+            return Err(ClientError::Configuration);
+        }
         if pin.is_some() {
             if !matches!(&self.connector, H2Tls::Rustls(_)) {
                 return Err(ClientError::Configuration);
@@ -259,12 +264,29 @@ impl H2Client {
         Ok(self)
     }
 
-    /// An explicit second HTTP stream; cannot weaken the selected identity.
+    /// Explicit XHTTP split mode with the same TLS verification and credentials.
     pub fn with_stream_up(mut self, enabled: bool) -> Result<Self, ClientError> {
-        if (enabled && self.certificate_pin.is_none()) || (self.stream_up && !enabled) {
+        if self.auto_mode.is_some()
+            || (self.stream_up && !enabled)
+            || (enabled && !matches!(&self.connector, H2Tls::Rustls(_)))
+        {
             return Err(ClientError::Configuration);
         }
         self.stream_up = enabled;
+        Ok(self)
+    }
+
+    /// Opt-in auto XHTTP for own TLS on an already resolved, pinned endpoint.
+    pub fn with_auto_stream_up(mut self, ttl: Duration) -> Result<Self, ClientError> {
+        if self.certificate_pin.is_some()
+            || self.stream_up
+            || self.auto_mode.is_some()
+            || !matches!(&self.connector, H2Tls::Rustls(_))
+        {
+            return Err(ClientError::Configuration);
+        }
+        let remote = self.endpoint.parse().map_err(|_| ClientError::Configuration)?;
+        self.auto_mode = Some(crate::split_http::AutoMode::new(remote, ttl));
         Ok(self)
     }
 
@@ -272,6 +294,15 @@ impl H2Client {
     /// encoded verbatim as OPEN_TCP and are never resolved by this client.
     /// A successful return is possible only after a valid OPEN_OK.
     pub async fn open(&self, address: Address, port: u16) -> Result<Tunnel, ClientError> {
+        self.open_preferred(address, port, None).await
+    }
+
+    pub(crate) async fn open_preferred(
+        &self,
+        address: Address,
+        port: u16,
+        preferred: Option<bool>,
+    ) -> Result<Tunnel, ClientError> {
         let operation = diagnostics::next_id();
         crate::diag!(
             Debug,
@@ -281,7 +312,7 @@ impl H2Client {
         );
         let open = Frame::OpenTcp { address, port };
         protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        let result = timeout(OPEN_TIMEOUT, self.open_inner(open, operation))
+        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation, preferred))
             .await
             .map_err(|_| ClientError::Timeout)
             .and_then(|result| result);
@@ -303,7 +334,43 @@ impl H2Client {
         result
     }
 
-    async fn open_inner(&self, open: Frame, operation: u64) -> Result<Tunnel, ClientError> {
+    async fn open_selected(
+        &self,
+        open: Frame,
+        operation: u64,
+        preferred: Option<bool>,
+    ) -> Result<Tunnel, ClientError> {
+        use crate::split_http::HelloOutcome;
+        let mut stage = HelloOutcome::Pending;
+        let Some(mode) = &self.auto_mode else {
+            return self.open_inner(&open, operation, self.stream_up, &mut stage).await;
+        };
+        let ticket = mode.select()?;
+        let stream_up = preferred.unwrap_or(ticket.stream_up);
+        let result = self.open_inner(&open, operation, stream_up, &mut stage).await;
+        if stream_up && stage == HelloOutcome::Acked {
+            mode.remember(ticket)?;
+        }
+        if stream_up || stage != HelloOutcome::Silent || !mode.current(ticket)? {
+            return result;
+        }
+        // The first attempt is fully dropped and never sent OPEN_TCP.
+        crate::diag!(Debug, "client.h2", "xhttp_pre_open_stream_up_retry");
+        let mut stage = HelloOutcome::Pending;
+        let result = self.open_inner(&open, operation, true, &mut stage).await;
+        if stage == HelloOutcome::Acked {
+            mode.remember(ticket)?;
+        }
+        result
+    }
+
+    async fn open_inner(
+        &self,
+        open: &Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &mut crate::split_http::HelloOutcome,
+    ) -> Result<Tunnel, ClientError> {
         let (socket, controller) = crate::tcp_bbr::connect(self.endpoint.as_str())
             .await
             .map_err(|error| match error {
@@ -371,7 +438,7 @@ impl H2Client {
         );
         // Build and send the credential-bearing POST ONLY after the selected
         // backend verified TLS identity and ALPN and established HTTP/2.
-        let (response, mut outgoing) = if self.stream_up {
+        let (response, mut outgoing) = if stream_up {
             use crate::split_http::{self, Leg};
             let (download, _) = sender
                 .send_request(
@@ -444,10 +511,20 @@ impl H2Client {
             .apply(Direction::Send, &hello)
             .map_err(|_| ClientError::Protocol)?;
         send_frame(&mut outgoing, &hello, false).await?;
-        let ack = decoder
-            .next(&mut incoming)
-            .await?
-            .ok_or(ClientError::Protocol)?;
+        let ack = if self.auto_mode.is_some() && !stream_up {
+            match timeout(crate::split_http::HELLO_ACK_TIMEOUT, decoder.next(&mut incoming)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    if !decoder.eof && decoder.decoder.pending_len() == 0 {
+                        *stage = crate::split_http::HelloOutcome::Silent;
+                    }
+                    return Err(ClientError::Timeout);
+                }
+            }
+        } else {
+            decoder.next(&mut incoming).await?
+        }
+        .ok_or(ClientError::Protocol)?;
         state
             .apply(Direction::Receive, &ack)
             .map_err(|_| ClientError::Protocol)?;
@@ -460,10 +537,11 @@ impl H2Client {
         if !matches!(ack, Frame::HelloAck { .. }) {
             return Err(ClientError::Protocol);
         }
+        *stage = crate::split_http::HelloOutcome::Acked;
         state
-            .apply(Direction::Send, &open)
+            .apply(Direction::Send, open)
             .map_err(|_| ClientError::Protocol)?;
-        send_frame(&mut outgoing, &open, false).await?;
+        send_frame(&mut outgoing, open, false).await?;
         let result = decoder
             .next(&mut incoming)
             .await?
@@ -711,6 +789,7 @@ async fn send_frame(
 struct IncomingFrames {
     decoder: Decoder,
     ready: VecDeque<Frame>,
+    eof: bool,
 }
 
 impl IncomingFrames {
@@ -721,6 +800,7 @@ impl IncomingFrames {
             }
             let chunk = incoming.data().await;
             let Some(chunk) = chunk else {
+                self.eof = true;
                 self.decoder.finish().map_err(|_| ClientError::Protocol)?;
                 if incoming
                     .trailers()

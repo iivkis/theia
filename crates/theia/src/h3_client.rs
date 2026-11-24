@@ -31,6 +31,7 @@ pub struct H3Client {
     connect_timeout: Duration,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     stream_up: bool,
+    auto_mode: Option<crate::split_http::AutoMode>,
 }
 
 impl H3Client {
@@ -63,6 +64,7 @@ impl H3Client {
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
             stream_up: false,
+            auto_mode: None,
         })
     }
 
@@ -70,6 +72,9 @@ impl H3Client {
         mut self,
         pin: Option<crate::security_profile::CertificatePin>,
     ) -> Result<Self, ClientError> {
+        if pin.is_some() && self.auto_mode.is_some() {
+            return Err(ClientError::Configuration);
+        }
         if pin.is_some() {
             self.uri = Uri::builder()
                 .scheme("https")
@@ -84,13 +89,29 @@ impl H3Client {
         Ok(self)
     }
 
-    /// An explicit second HTTP stream; cannot weaken the selected identity.
+    /// Explicit XHTTP split mode with the same TLS verification and credentials.
     pub fn with_stream_up(mut self, enabled: bool) -> Result<Self, ClientError> {
-        if (enabled && self.certificate_pin.is_none()) || (self.stream_up && !enabled) {
+        if self.auto_mode.is_some() || (self.stream_up && !enabled) {
             return Err(ClientError::Configuration);
         }
         self.stream_up = enabled;
         Ok(self)
+    }
+
+    /// Opt-in auto XHTTP for own TLS; legacy pinned profiles remain exact.
+    pub fn with_auto_stream_up(mut self, ttl: Duration) -> Result<Self, ClientError> {
+        if self.certificate_pin.is_some() || self.stream_up || self.auto_mode.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        self.auto_mode = Some(crate::split_http::AutoMode::new(self.remote, ttl));
+        Ok(self)
+    }
+
+    pub(crate) fn preferred_stream_up(&self) -> Result<bool, ClientError> {
+        match &self.auto_mode {
+            Some(mode) => Ok(mode.select()?.stream_up),
+            None => Ok(self.stream_up),
+        }
     }
 
     pub(crate) fn remote(&self) -> SocketAddr {
@@ -106,6 +127,15 @@ impl H3Client {
     }
 
     pub async fn open(&self, address: Address, port: u16) -> Result<H3Tunnel, ClientError> {
+        self.open_preferred(address, port, None).await
+    }
+
+    pub(crate) async fn open_preferred(
+        &self,
+        address: Address,
+        port: u16,
+        preferred: Option<bool>,
+    ) -> Result<H3Tunnel, ClientError> {
         let operation = diagnostics::next_id();
         crate::diag!(
             Debug,
@@ -115,7 +145,7 @@ impl H3Client {
         );
         let open = Frame::OpenTcp { address, port };
         protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        let result = timeout(OPEN_TIMEOUT, self.open_inner(open, operation))
+        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation, preferred))
             .await
             .map_err(|_| ClientError::Timeout)
             .and_then(|result| result);
@@ -170,7 +200,48 @@ impl H3Client {
         self.verified_connection().await.map(|_| ())
     }
 
-    async fn open_inner(&self, open: Frame, operation: u64) -> Result<H3Tunnel, ClientError> {
+    async fn open_selected(
+        &self,
+        open: Frame,
+        operation: u64,
+        preferred: Option<bool>,
+    ) -> Result<H3Tunnel, ClientError> {
+        use crate::split_http::HelloOutcome;
+        let mut stage = HelloOutcome::Pending;
+        let Some(mode) = &self.auto_mode else {
+            return self.open_inner(&open, operation, self.stream_up, &mut stage).await;
+        };
+        let ticket = mode.select()?;
+        let stream_up = preferred.unwrap_or(ticket.stream_up);
+        let result = self.open_inner(&open, operation, stream_up, &mut stage).await;
+        if stream_up && stage == HelloOutcome::Acked {
+            mode.remember(ticket)?;
+        }
+        if stream_up || stage != HelloOutcome::Silent || !mode.current(ticket)? {
+            return result;
+        }
+        // The first attempt is fully dropped and never sent OPEN_TCP.
+        crate::diag!(Debug, "client.h3", "xhttp_pre_open_stream_up_retry");
+        let mut stage = HelloOutcome::Pending;
+        let result = self.open_inner(&open, operation, true, &mut stage).await;
+        if stage == HelloOutcome::Acked {
+            mode.remember(ticket)?;
+        }
+        // The original H3 attempt already completed HTTP admission.
+        // UDP silence in the second attempt must not authorize H2 fallback.
+        match result {
+            Err(ClientError::QuicUnreachable) => Err(ClientError::Timeout),
+            other => other,
+        }
+    }
+
+    async fn open_inner(
+        &self,
+        open: &Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &mut crate::split_http::HelloOutcome,
+    ) -> Result<H3Tunnel, ClientError> {
         let (endpoint, connection) = self.verified_connection().await?;
         let binding = if self.certificate_pin.is_some() {
             let mut key = zeroize::Zeroizing::new([0u8; 32]);
@@ -204,7 +275,7 @@ impl H3Client {
             let _keep_sender = keep_sender;
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         }));
-        let (response, mut tx, mut rx) = if self.stream_up {
+        let (response, mut tx, mut rx) = if stream_up {
             use crate::split_http::{self, Leg};
             let mut download = sender
                 .send_request(crate::channel_binding::attach(
@@ -288,7 +359,20 @@ impl H3Client {
             .apply(Direction::Send, &hello)
             .map_err(|_| ClientError::Protocol)?;
         send(&mut tx, &hello).await?;
-        let ack = decoder.next(&mut rx).await?.ok_or(ClientError::Protocol)?;
+        let ack = if self.auto_mode.is_some() && !stream_up {
+            match timeout(crate::split_http::HELLO_ACK_TIMEOUT, decoder.next(&mut rx)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    if !decoder.eof && decoder.decoder.pending_len() == 0 {
+                        *stage = crate::split_http::HelloOutcome::Silent;
+                    }
+                    return Err(ClientError::Timeout);
+                }
+            }
+        } else {
+            decoder.next(&mut rx).await?
+        }
+        .ok_or(ClientError::Protocol)?;
         state
             .apply(Direction::Receive, &ack)
             .map_err(|_| ClientError::Protocol)?;
@@ -301,10 +385,11 @@ impl H3Client {
         if !matches!(ack, Frame::HelloAck { .. }) {
             return Err(ClientError::Protocol);
         }
+        *stage = crate::split_http::HelloOutcome::Acked;
         state
-            .apply(Direction::Send, &open)
+            .apply(Direction::Send, open)
             .map_err(|_| ClientError::Protocol)?;
-        send(&mut tx, &open).await?;
+        send(&mut tx, open).await?;
         let answer = decoder.next(&mut rx).await?.ok_or(ClientError::Protocol)?;
         state
             .apply(Direction::Receive, &answer)
@@ -499,6 +584,7 @@ impl H3Tunnel {
 struct Incoming {
     decoder: Decoder,
     ready: VecDeque<Frame>,
+    eof: bool,
 }
 
 impl Incoming {
@@ -512,6 +598,7 @@ impl Incoming {
             }
             let data = stream.recv_data().await.map_err(|_| ClientError::Http3)?;
             let Some(mut data) = data else {
+                self.eof = true;
                 self.decoder.finish().map_err(|_| ClientError::Protocol)?;
                 let trailers = timeout(IO_TIMEOUT, stream.recv_trailers())
                     .await

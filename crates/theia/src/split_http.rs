@@ -2,12 +2,104 @@
 //! This is a SmartTheia carrier, not the Xray XHTTP/VLESS wire protocol.
 use crate::client::ClientError;
 use http::{header, HeaderValue, Method, Request, StatusCode, Uri};
-use std::{sync::Mutex, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 use tokio::{sync::oneshot, time::timeout};
 
 pub(crate) const UPLOAD_PATH: &str = "/v2/stream-up/upload";
 pub(crate) const DOWNLOAD_PATH: &str = "/v2/stream-up/download";
 const PAIR_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Only an admitted stream-one with no response frame bytes may be retried.
+/// This state is never set by an HTTP, TLS, protocol, OPEN or write error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum HelloOutcome {
+    #[default]
+    Pending,
+    Silent,
+    Acked,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ModeTicket {
+    generation: u64,
+    pub(crate) stream_up: bool,
+}
+
+#[derive(Default)]
+struct ModeCache {
+    route: Option<SocketAddr>,
+    generation: u64,
+    expires: Option<Instant>,
+}
+
+impl ModeCache {
+    fn observe(&mut self, route: Option<SocketAddr>, now: Instant) -> ModeTicket {
+        if route.is_none()
+            || route != self.route
+            || self.expires.is_some_and(|expires| now >= expires)
+        {
+            self.route = route;
+            self.generation = self.generation.wrapping_add(1);
+            self.expires = None;
+        }
+        ModeTicket {
+            generation: self.generation,
+            stream_up: self.expires.is_some(),
+        }
+    }
+
+    fn current(&self, ticket: ModeTicket) -> bool {
+        self.route.is_some() && self.generation == ticket.generation
+    }
+
+    fn remember(&mut self, ticket: ModeTicket, now: Instant, ttl: Duration) {
+        if self.current(ticket) && self.expires.is_none() && !ttl.is_zero() {
+            self.expires = now.checked_add(ttl);
+        }
+    }
+}
+
+/// One bounded mode decision per immutable client profile and carrier.
+/// It is scoped to its pinned endpoint and observed OS source route.
+pub(crate) struct AutoMode {
+    remote: SocketAddr,
+    ttl: Duration,
+    cache: Mutex<ModeCache>,
+}
+
+impl AutoMode {
+    pub(crate) fn new(remote: SocketAddr, ttl: Duration) -> Self {
+        Self {
+            remote,
+            ttl,
+            cache: Mutex::new(ModeCache::default()),
+        }
+    }
+
+    pub(crate) fn select(&self) -> Result<ModeTicket, ClientError> {
+        let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
+        Ok(cache.observe(crate::local_proxy::route_source(self.remote), Instant::now()))
+    }
+
+    pub(crate) fn current(&self, ticket: ModeTicket) -> Result<bool, ClientError> {
+        let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
+        cache.observe(crate::local_proxy::route_source(self.remote), Instant::now());
+        Ok(cache.current(ticket))
+    }
+
+    pub(crate) fn remember(&self, ticket: ModeTicket) -> Result<(), ClientError> {
+        let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
+        let now = Instant::now();
+        cache.observe(crate::local_proxy::route_source(self.remote), now);
+        cache.remember(ticket, now, self.ttl);
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Leg {
@@ -152,5 +244,37 @@ mod tests {
         let right = Pair::new();
         let (a, b) = tokio::join!(left.join(Leg::Upload, 1), right.join(Leg::Download, 2));
         assert_eq!((a, b), (None, None));
+    }
+}
+
+#[cfg(test)]
+mod auto_tests {
+    use super::*;
+
+    #[test]
+    fn mode_cache_expires_and_rejects_stale_or_unknown_routes() {
+        let a = Some("192.0.2.1:0".parse().unwrap());
+        let b = Some("198.51.100.1:0".parse().unwrap());
+        let now = Instant::now();
+        let ttl = Duration::from_secs(30);
+        let mut cache = ModeCache::default();
+        let ticket = cache.observe(a, now);
+        assert!(!ticket.stream_up);
+        cache.remember(ticket, now, ttl);
+        assert!(cache.observe(a, now).stream_up);
+        cache.remember(ticket, now + Duration::from_secs(20), ttl);
+        assert!(!cache.observe(a, now + ttl).stream_up);
+        cache.remember(ticket, now + ttl, ttl);
+        assert!(!cache.observe(a, now + ttl).stream_up);
+        let ticket = cache.observe(a, now + ttl);
+        assert!(cache.current(ticket));
+        cache.observe(b, now + ttl);
+        assert!(!cache.current(ticket));
+        cache.remember(ticket, now + ttl, ttl);
+        assert!(!cache.observe(b, now + ttl).stream_up);
+        let unknown = cache.observe(None, now + ttl);
+        assert!(!cache.current(unknown));
+        cache.remember(unknown, now + ttl, ttl);
+        assert!(!cache.observe(None, now + ttl).stream_up);
     }
 }

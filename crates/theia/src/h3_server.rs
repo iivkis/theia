@@ -190,7 +190,7 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
                 crate::diag!(Warn, "server.h3", "request_headers_failed_or_timeout");
                 return;
             };
-            if context.stream_up() {
+            if context.accepts_split(&request) {
                 handle_split_request(request, stream, &context, peer, &pair, binding.as_deref())
                     .await;
             } else {

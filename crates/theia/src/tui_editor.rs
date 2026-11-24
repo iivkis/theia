@@ -5,7 +5,7 @@
 //! through the existing strict validator and atomic store.
 use crate::{
     client_import::{self, PrivateBearer},
-    config::{self, Config, Transport, User},
+    config::{self, Config, Transport, User, XhttpMode},
     invite::Invitation,
     Role,
 };
@@ -16,6 +16,16 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 const MAX_INPUT: usize = 255;
+
+fn xhttp_value(mode: Option<XhttpMode>) -> String {
+    match mode {
+        None => "legacy",
+        Some(XhttpMode::Auto) => "auto",
+        Some(XhttpMode::StreamOne) => "stream-one",
+        Some(XhttpMode::StreamUp) => "stream-up",
+    }
+    .to_owned()
+}
 
 pub(crate) struct PinnedModeReview {
     source: [u8; 32],
@@ -226,6 +236,7 @@ impl Editor {
         if profile.server != invite.endpoint
             || profile.server_name != invite.server_name
             || profile.tls_profile != invite.tls_profile()
+            || profile.xhttp_mode.is_some_and(|mode| mode != config::XhttpMode::StreamOne)
             || (invite.transport != Transport::Auto && profile.transport != invite.transport)
         {
             return Err("Invitation does not match saved profile identity and transport");
@@ -706,7 +717,10 @@ impl Editor {
     }
 
     pub fn field_count(&self) -> usize {
-        3
+        match self.role {
+            Role::Server => 3,
+            Role::Client => 4,
+        }
     }
 
     /// Record and field focus never change the typed configuration.
@@ -742,7 +756,7 @@ impl Editor {
     pub fn field_name(&self) -> String {
         let suffix = match self.role {
             Role::Server => ["server_name", "h2_listen", "quic_listen"][self.selected_field],
-            Role::Client => ["server", "server_name", "transport"][self.selected_field],
+            Role::Client => ["server", "server_name", "transport", "xhttp_mode"][self.selected_field],
         };
         let records = match self.role {
             Role::Server => "server.inbounds",
@@ -770,30 +784,31 @@ impl Editor {
                 .map(|profile| match self.selected_field {
                     0 => profile.server.clone(),
                     1 => profile.server_name.clone(),
-                    _ => match profile.transport {
+                    2 => match profile.transport {
                         Transport::Auto => "auto".to_owned(),
                         Transport::H2 => "h2".to_owned(),
                         Transport::H3 => "h3".to_owned(),
                     },
+                    _ => xhttp_value(profile.xhttp_mode),
                 })
                 .unwrap_or_default(),
         }
     }
 
-    /// Render only the three explicitly whitelisted non-secret fields.
+    /// Render only the explicitly whitelisted non-secret fields.
     /// Never include token refs, TLS key refs, grants, or config file paths.
     pub fn fields_overview(&self) -> String {
-        let labels = match self.role {
-            Role::Server => ["TLS DNS", "H2 TCP", "H3 UDP"],
-            Role::Client => ["Endpoint", "TLS SNI", "Transport"],
+        let labels: &[&str] = match self.role {
+            Role::Server => &["TLS DNS", "H2 TCP", "H3 UDP"],
+            Role::Client => &["Endpoint", "TLS SNI", "Transport", "XHTTP"],
         };
-        let values: [String; 3] = match &self.draft {
+        let values: Vec<String> = match &self.draft {
             Config::Server(doc) => doc
                 .server
                 .inbounds
                 .get(self.selected_record)
                 .map(|inbound| {
-                    [
+                    vec![
                         inbound.server_name.clone(),
                         inbound.h2_listen.clone(),
                         inbound.quic_listen.clone(),
@@ -805,7 +820,7 @@ impl Editor {
                 .profiles
                 .get(self.selected_record)
                 .map(|p| {
-                    [
+                    vec![
                         p.server.clone(),
                         p.server_name.clone(),
                         match p.transport {
@@ -813,6 +828,7 @@ impl Editor {
                             Transport::H2 => "h2".to_owned(),
                             Transport::H3 => "h3".to_owned(),
                         },
+                        xhttp_value(p.xhttp_mode),
                     ]
                 })
                 .unwrap_or_default(),
@@ -918,13 +934,27 @@ impl Editor {
                 match self.selected_field {
                     0 => profile.server.clone_from(&self.input),
                     1 => profile.server_name.clone_from(&self.input),
-                    _ => {
+                    2 => {
                         profile.transport = match self.input.as_str() {
                             "auto" => Transport::Auto,
                             "h2" => Transport::H2,
                             "h3" => Transport::H3,
                             _ => {
                                 self.error = Some(format!("{field}: expected auto, h2 or h3"));
+                                return false;
+                            }
+                        };
+                    }
+                    _ => {
+                        profile.xhttp_mode = match self.input.as_str() {
+                            "legacy" => None,
+                            "auto" => Some(XhttpMode::Auto),
+                            "stream-one" => Some(XhttpMode::StreamOne),
+                            "stream-up" => Some(XhttpMode::StreamUp),
+                            _ => {
+                                self.error = Some(format!(
+                                    "{field}: expected auto, stream-one, stream-up or legacy"
+                                ));
                                 return false;
                             }
                         };
@@ -2240,6 +2270,12 @@ mod tests {
         editor.input = "h2".into();
         assert!(editor.accept());
         assert_eq!(editor.field_value(), "h2");
+        editor.select_field(true);
+        assert_eq!(editor.field_name(), "client.profiles[1].xhttp_mode");
+        editor.begin();
+        editor.input = "auto".into();
+        assert!(editor.accept());
+        assert_eq!(editor.field_value(), "auto");
         assert!(editor.save());
         let Config::Client(saved) = config::read_file(&temp.0).unwrap() else {
             panic!("client");
@@ -2249,6 +2285,8 @@ mod tests {
         assert_eq!(saved.client.profiles[1].server, "new-work.example.org:8443");
         assert_eq!(saved.client.profiles[1].server_name, "new-work.example.org");
         assert_eq!(saved.client.profiles[1].transport, config::Transport::H2);
+        assert_eq!(saved.client.profiles[1].xhttp_mode, Some(XhttpMode::Auto));
+        assert_eq!(saved.client.profiles[0].xhttp_mode, None);
         assert_eq!(saved.client.profiles[1].auth_token, "env:THEIA_AUTH_TOKEN");
     }
 
@@ -2284,6 +2322,8 @@ mod tests {
         client.select_field(true);
         assert_eq!(client.field_name(), "client.profiles[0].server_name");
         client.select_field(true);
+        client.select_field(true);
+        assert_eq!(client.field_name(), "client.profiles[0].xhttp_mode");
         client.select_field(true);
         assert_eq!(client.field_name(), "client.profiles[0].server");
     }

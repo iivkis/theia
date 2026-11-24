@@ -2,7 +2,7 @@
 //! No system proxy changes, destination DNS lookups or live tunnel migration.
 use crate::{
     client::{error_kind, ClientError, H2Client, Tunnel},
-    config::{self, Config, Profile, Transport},
+    config::{self, Config, Profile, Transport, XhttpMode},
     diagnostics::{self, Value},
     h3_client::{H3Client, H3Tunnel},
     protocol::{self, Address, ErrorCode, Frame},
@@ -82,6 +82,9 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
     // F-13: runtime selection must match strict typed TOML validation even
     // if a direct library caller bypasses document parsing. Never downgrade
     // a named browser-style profile to rustls or apply it to QUIC/H3/auto.
+    if profile.xhttp_mode.is_some() && profile.tls_profile != "default" {
+        return Err(ClientError::Configuration);
+    }
     if profile.tls_profile == "browser-h2-btls-v1" {
         if profile.transport != Transport::H2 {
             return Err(ClientError::Configuration);
@@ -110,50 +113,73 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 .ok_or(ClientError::Configuration)?,
         )
     };
-    let stream_up =
-        crate::security_profile::CertificatePin::is_stream_up_profile(&profile.tls_profile);
+    let stream_up = profile.xhttp_mode == Some(XhttpMode::StreamUp)
+        || crate::security_profile::CertificatePin::is_stream_up_profile(&profile.tls_profile);
+    let auto_xhttp = profile.xhttp_mode == Some(XhttpMode::Auto);
+    let ttl = Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s));
     match profile.transport {
-        Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)?
-            .with_certificate_pin(certificate_pin)?
-            .with_stream_up(stream_up)
-            .map(Arc::new)
-            .map(ProxyClient::H2),
+        Transport::H2 => {
+            let endpoint = if auto_xhttp {
+                resolve_server(profile).await?.to_string()
+            } else {
+                profile.server.clone()
+            };
+            let client = H2Client::new(&endpoint, &profile.server_name, &token, roots)?
+                .with_certificate_pin(certificate_pin)?
+                .with_stream_up(stream_up)?;
+            let client = if auto_xhttp {
+                client.with_auto_stream_up(ttl)?
+            } else {
+                client
+            };
+            Ok(ProxyClient::H2(Arc::new(client)))
+        }
         Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
-            let remote = timeout(NEGOTIATE_TIMEOUT, tokio::net::lookup_host(&profile.server))
-                .await
-                .map_err(|_| ClientError::Timeout)?
-                .map_err(|_| ClientError::Io)?
-                .next()
-                .ok_or(ClientError::Io)?;
-            let h3 = Arc::new(
-                H3Client::new(remote, &profile.server_name, &token, roots.clone())?
-                    .with_certificate_pin(certificate_pin)?
-                    .with_stream_up(stream_up)?
-                    .with_connect_timeout(Duration::from_millis(u64::from(
-                        profile.quic_connect_timeout_ms,
-                    )))?,
-            );
+            let remote = resolve_server(profile).await?;
+            let h3 = H3Client::new(remote, &profile.server_name, &token, roots.clone())?
+                .with_certificate_pin(certificate_pin)?
+                .with_stream_up(stream_up)?
+                .with_connect_timeout(Duration::from_millis(u64::from(
+                    profile.quic_connect_timeout_ms,
+                )))?;
+            let h3 = Arc::new(if auto_xhttp {
+                h3.with_auto_stream_up(ttl)?
+            } else {
+                h3
+            });
             if profile.transport == Transport::H3 {
                 return Ok(ProxyClient::H3(h3));
             }
             // Both carriers use the same resolved endpoint. Do not resolve
             // the hostname again during fallback; retain the configured SNI,
             // trust anchors, certificate pin and authorization unchanged.
-            let h2 = Arc::new(
-                H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
-                    .with_certificate_pin(certificate_pin)?
-                    .with_stream_up(stream_up)?,
-            );
+            let h2 = H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
+                .with_certificate_pin(certificate_pin)?
+                .with_stream_up(stream_up)?;
+            let h2 = Arc::new(if auto_xhttp {
+                h2.with_auto_stream_up(ttl)?
+            } else {
+                h2
+            });
             Ok(ProxyClient::Auto(Arc::new(AutoClient {
                 h2,
                 h3,
-                ttl: Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s)),
+                ttl,
                 negative: Mutex::new(NegativeCache::default()),
                 cache_changed: Notify::new(),
             })))
         }
     }
+}
+
+async fn resolve_server(profile: &Profile) -> Result<SocketAddr, ClientError> {
+    timeout(NEGOTIATE_TIMEOUT, tokio::net::lookup_host(&profile.server))
+        .await
+        .map_err(|_| ClientError::Timeout)?
+        .map_err(|_| ClientError::Io)?
+        .next()
+        .ok_or(ClientError::Io)
 }
 
 #[derive(Clone)]
@@ -167,7 +193,7 @@ enum ProxyClient {
 /// this temporary socket sends no application datagram and performs no DNS.
 /// Preserve IPv6 scope, discard the ephemeral local port. A failed observation
 /// must never authorize reuse of an earlier negative cache entry.
-fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
+pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
     let bind = if remote.is_ipv4() {
         SocketAddr::from(([0, 0, 0, 0], 0))
     } else {
@@ -369,9 +395,16 @@ impl AutoClient {
             "generation" = Value::Count(generation),
             "negative_cache_hit" = Value::Flag(cached)
         );
+        // Keep the actual initial XHTTP mode across a fresh H3-to-H2
+        // fallback. Cached H2-only requests may use their own carrier cache.
+        let preferred = if cached {
+            None
+        } else {
+            Some(self.h3.preferred_stream_up()?)
+        };
         if !cached {
             for attempt in 0..AUTO_QUIC_ATTEMPTS {
-                match self.h3.open(address.clone(), port).await {
+                match self.h3.open_preferred(address.clone(), port, preferred).await {
                     Ok(tunnel) => {
                         self.complete(generation, false)?;
                         crate::diag!(
@@ -433,7 +466,7 @@ impl AutoClient {
             eprintln!("transport=h2 reason=quic_negative_cache");
         }
         self.h2
-            .open(address, port)
+            .open_preferred(address, port, preferred)
             .await
             .map(Box::new)
             .map(ProxyTunnel::H2)

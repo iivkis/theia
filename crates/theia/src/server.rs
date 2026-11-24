@@ -274,6 +274,11 @@ impl ServerContext {
         self.security_mode.is_stream_up()
     }
 
+    pub(crate) fn accepts_split<T>(&self, request: &Request<T>) -> bool {
+        self.stream_up()
+            || (self.security_mode.is_plain() && crate::split_http::leg(request).is_some())
+    }
+
     pub(crate) fn authorize_split_pair<U, D>(
         &self,
         upload: &Request<U>,
@@ -284,7 +289,7 @@ impl ServerContext {
         if !self.peer_budget.admit(peer, Instant::now()) {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        if !self.stream_up()
+        if !(self.stream_up() || self.security_mode.is_plain())
             || split_http::leg(upload) != Some(Leg::Upload)
             || split_http::leg(download) != Some(Leg::Download)
         {
@@ -688,7 +693,7 @@ pub(crate) async fn serve_generation_with_tls(
                         let pair = pair.clone();
                         let binding = binding.clone();
                         handlers.spawn(async move {
-                            let result = if context.stream_up() {
+                            let result = if context.accepts_split(&request) {
                                 handle_split_request(request, respond, &context, peer.ip(), &pair, binding.as_deref()).await
                             } else {
                                 handle_request(request, respond, context, peer.ip(), binding.as_deref()).await

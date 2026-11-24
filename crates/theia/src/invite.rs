@@ -100,6 +100,12 @@ impl Drop for Wire {
 impl Invitation {
     /// Safe token-free export of an exact supported profile.
     pub fn public_from_profile(profile: &Profile) -> Result<Self, InviteError> {
+        // Invitation v1 encodes own TLS stream-one explicitly. Until a new
+        // invitation contract is agreed, never export an auto/split profile
+        // as a weaker or different exact mode.
+        if profile.xhttp_mode.is_some_and(|mode| mode != crate::config::XhttpMode::StreamOne) {
+            return Err(InviteError::Invalid);
+        }
         let invite = Self {
             id: profile.id.clone(),
             endpoint: profile.server.clone(),
@@ -351,6 +357,7 @@ impl Invitation {
             server_name: self.server_name.clone(),
             auth_token: secret_ref.into(),
             tls_profile: self.tls_profile.clone(),
+            xhttp_mode: None,
             tls_ca,
             transport: self.transport,
             quic_connect_timeout_ms: 1600,
@@ -379,6 +386,7 @@ impl Invitation {
             server_name: self.server_name.clone(),
             auth_token,
             tls_profile: self.tls_profile.clone(),
+            xhttp_mode: None,
             tls_ca,
             transport: self.transport,
             quic_connect_timeout_ms: 1600,
@@ -455,6 +463,30 @@ mod tests {
         assert!(invite
             .to_profile("env:THEIA_AUTH_TOKEN", Some("file:relative.pem".into()))
             .is_err());
+    }
+
+    #[test]
+    fn v1_export_refuses_unrepresentable_own_tls_xhttp_modes() {
+        let Config::Client(doc) =
+            crate::config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
+            panic!("client");
+        };
+        let mut profile = doc.client.profiles[0].clone();
+        for mode in [crate::config::XhttpMode::Auto, crate::config::XhttpMode::StreamUp] {
+            profile.xhttp_mode = Some(mode);
+            assert_eq!(
+                Invitation::public_from_profile(&profile).unwrap_err(),
+                InviteError::Invalid
+            );
+        }
+        profile.xhttp_mode = Some(crate::config::XhttpMode::StreamOne);
+        let invite = Invitation::public_from_profile(&profile).unwrap();
+        let decoded = Invitation::decode(&invite.encode().unwrap()).unwrap();
+        assert_eq!(
+            decoded.to_profile("env:TOKEN", None).unwrap().xhttp_mode,
+            None
+        );
     }
 
     #[test]
