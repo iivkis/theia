@@ -349,7 +349,10 @@ impl H3Tunnel {
                 decoder.next(rx),
                 upload_finished,
                 ClientError::Timeout,
-            ).await?.is_some() {
+            )
+            .await?
+            .is_some()
+            {
                 return Err(ClientError::Protocol);
             }
             Ok::<(), ClientError>(())

@@ -778,7 +778,12 @@ impl IncomingFrames {
             let block = incoming.data().await;
             let Some(block) = block else {
                 self.decoder.finish().map_err(|_| ServerError::Protocol)?;
-                if incoming.trailers().await.map_err(|_| ServerError::Http2)?.is_some() {
+                if incoming
+                    .trailers()
+                    .await
+                    .map_err(|_| ServerError::Http2)?
+                    .is_some()
+                {
                     return Err(ServerError::Protocol);
                 }
                 return Ok(None);
@@ -945,7 +950,8 @@ async fn relay_tcp(
             decoder.next(incoming),
             download_finished,
             ServerError::TimedOut,
-        ).await?;
+        )
+        .await?;
         if tail.is_some() {
             return Err(ServerError::Protocol);
         }
@@ -992,10 +998,17 @@ async fn relay_tcp(
 
     // An error can cancel send_frame halfway through an H2 window. Reset
     // the stream instead of appending an ABORT to a partially written frame.
-    activity.run(upload, download, ServerError::TimedOut).await.map_err(|error| {
-        // Preserve timeout diagnostics; other errors can interrupt an H2 frame.
-        if matches!(error, ServerError::TimedOut) { error } else { ServerError::Http2 }
-    })?;
+    activity
+        .run(upload, download, ServerError::TimedOut)
+        .await
+        .map_err(|error| {
+            // Preserve timeout diagnostics; other errors can interrupt an H2 frame.
+            if matches!(error, ServerError::TimedOut) {
+                error
+            } else {
+                ServerError::Http2
+            }
+        })?;
     state
         .apply(Direction::Receive, &Frame::Fin)
         .map_err(|_| ServerError::Protocol)?;

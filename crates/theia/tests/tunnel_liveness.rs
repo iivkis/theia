@@ -56,7 +56,10 @@ impl Fixture {
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![der.clone()], PrivatePkcs8KeyDer::from(key.clone()).into())
+        .with_single_cert(
+            vec![der.clone()],
+            PrivatePkcs8KeyDer::from(key.clone()).into(),
+        )
         .unwrap();
         tls.alpn_protocols = vec![b"h2".to_vec()];
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -65,7 +68,8 @@ impl Fixture {
             "127.0.0.1:0".parse().unwrap(),
             vec![der],
             PrivatePkcs8KeyDer::from(key).into(),
-        ).unwrap();
+        )
+        .unwrap();
         let h3 = udp.local_addr().unwrap();
         let inbound = Inbound {
             id: "test".into(),
@@ -89,7 +93,11 @@ impl Fixture {
         };
         let context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
         let mut servers = JoinSet::new();
-        servers.spawn(server::serve(tcp, TlsAcceptor::from(Arc::new(tls)), context.clone()));
+        servers.spawn(server::serve(
+            tcp,
+            TlsAcceptor::from(Arc::new(tls)),
+            context.clone(),
+        ));
         servers.spawn(theia::h3_server::serve(udp, context));
         (Self { h2, h3, roots }, servers)
     }
@@ -102,12 +110,19 @@ impl Fixture {
         let (mut app, local) = tokio::io::duplex(4096);
         let relay = match transport {
             Transport::H2 => {
-                let client = H2Client::new(&self.h2.to_string(), "localhost", &token, self.roots.clone()).unwrap();
+                let client = H2Client::new(
+                    &self.h2.to_string(),
+                    "localhost",
+                    &token,
+                    self.roots.clone(),
+                )
+                .unwrap();
                 let tunnel = client.open(address, port).await.unwrap();
                 tokio::spawn(tunnel.relay(local))
             }
             Transport::H3 => {
-                let client = H3Client::new(self.h3, "localhost", &token, self.roots.clone()).unwrap();
+                let client =
+                    H3Client::new(self.h3, "localhost", &token, self.roots.clone()).unwrap();
                 let tunnel = client.open(address, port).await.unwrap();
                 tokio::spawn(tunnel.relay(local))
             }
@@ -115,15 +130,33 @@ impl Fixture {
         let (mut remote, _) = target.accept().await.unwrap();
         if matches!(case, Case::Idle) {
             let started = Instant::now();
-            let result = timeout(Duration::from_secs(40), relay).await
-                .expect("fully idle tunnel must terminate").unwrap();
-            assert!(matches!(result, Err(ClientError::Timeout | ClientError::Protocol | ClientError::Http2 | ClientError::Http3 | ClientError::Io)), "{transport:?}: {result:?}");
-            assert!(started.elapsed() >= Duration::from_secs(20), "{transport:?}: premature idle failure");
+            let result = timeout(Duration::from_secs(40), relay)
+                .await
+                .expect("fully idle tunnel must terminate")
+                .unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(ClientError::Timeout
+                        | ClientError::Protocol
+                        | ClientError::Http2
+                        | ClientError::Http3
+                        | ClientError::Io)
+                ),
+                "{transport:?}: {result:?}"
+            );
+            assert!(
+                started.elapsed() >= Duration::from_secs(20),
+                "{transport:?}: premature idle failure"
+            );
             return;
         }
 
         let upload = matches!(case, Case::Upload | Case::UploadAfterRemoteFin);
-        let early_fin = matches!(case, Case::UploadAfterRemoteFin | Case::DownloadAfterLocalFin);
+        let early_fin = matches!(
+            case,
+            Case::UploadAfterRemoteFin | Case::DownloadAfterLocalFin
+        );
         if early_fin {
             let mut empty = Vec::new();
             if upload {
@@ -153,7 +186,9 @@ impl Fixture {
                     remote.write_all(&payload).await.unwrap();
                     app.read_exact(&mut received).await.unwrap();
                 }
-            }).await.unwrap_or_else(|_| panic!("{transport:?}/{case:?}: stalled at block {index}"));
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{transport:?}/{case:?}: stalled at block {index}"));
             assert_eq!(received, payload);
         }
         assert!(started.elapsed() > Duration::from_secs(30));
@@ -189,13 +224,23 @@ async fn production_h2_h3_asymmetric_traffic_half_close_and_idle() {
         let fixture = Arc::new(fixture);
         let mut cases = JoinSet::new();
         for transport in [Transport::H2, Transport::H3] {
-            for case in [Case::Upload, Case::Download, Case::UploadAfterRemoteFin, Case::DownloadAfterLocalFin, Case::Idle] {
+            for case in [
+                Case::Upload,
+                Case::Download,
+                Case::UploadAfterRemoteFin,
+                Case::DownloadAfterLocalFin,
+                Case::Idle,
+            ] {
                 let fixture = fixture.clone();
-                cases.spawn(async move { fixture.exercise(transport, case).await; });
+                cases.spawn(async move {
+                    fixture.exercise(transport, case).await;
+                });
             }
         }
         while let Some(result) = cases.join_next().await {
             result.unwrap();
         }
-    }).await.expect("bounded concurrent native liveness matrix");
+    })
+    .await
+    .expect("bounded concurrent native liveness matrix");
 }

@@ -529,7 +529,10 @@ impl Tunnel {
                 decoder.next(incoming),
                 upload_finished,
                 ClientError::Timeout,
-            ).await?.is_some() {
+            )
+            .await?
+            .is_some()
+            {
                 return Err(ClientError::Protocol);
             }
             Ok::<(), ClientError>(())
@@ -602,7 +605,12 @@ impl IncomingFrames {
             let chunk = incoming.data().await;
             let Some(chunk) = chunk else {
                 self.decoder.finish().map_err(|_| ClientError::Protocol)?;
-                if incoming.trailers().await.map_err(|_| ClientError::Http2)?.is_some() {
+                if incoming
+                    .trailers()
+                    .await
+                    .map_err(|_| ClientError::Http2)?
+                    .is_some()
+                {
                     return Err(ClientError::Protocol);
                 }
                 return Ok(None);

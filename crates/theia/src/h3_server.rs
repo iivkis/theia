@@ -460,7 +460,9 @@ async fn relay(
             incoming.next(rx),
             download_finished,
             ServerError::TimedOut,
-        ).await?.is_some()
+        )
+        .await?
+        .is_some()
         {
             return Err(ServerError::Protocol);
         }
@@ -495,7 +497,9 @@ async fn relay(
             activity.data(n);
         }
     };
-    activity.run(upload, download, ServerError::TimedOut).await?;
+    activity
+        .run(upload, download, ServerError::TimedOut)
+        .await?;
     state
         .apply(Direction::Receive, &Frame::Fin)
         .map_err(|_| ServerError::Protocol)?;

@@ -845,5 +845,7 @@ async fn h2_request_trailers_after_fin_reset_the_stream() {
         }
         driver.abort();
         server.abort();
-    }).await.expect("bounded trailer rejection");
+    })
+    .await
+    .expect("bounded trailer rejection");
 }

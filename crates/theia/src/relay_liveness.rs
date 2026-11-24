@@ -87,8 +87,12 @@ mod tests {
         activity.data(1);
         tokio::time::advance(Duration::from_secs(20)).await;
         activity.data(0);
-        assert!(timeout(Duration::from_secs(9), activity.idle()).await.is_err());
-        assert!(timeout(Duration::from_secs(2), activity.idle()).await.is_ok());
+        assert!(timeout(Duration::from_secs(9), activity.idle())
+            .await
+            .is_err());
+        assert!(timeout(Duration::from_secs(2), activity.idle())
+            .await
+            .is_ok());
     }
 
     #[tokio::test(start_paused = true)]
@@ -96,37 +100,38 @@ mod tests {
         let activity = Activity::new();
         tokio::time::advance(Duration::from_secs(20)).await;
         activity.fin();
-        assert!(timeout(Duration::from_secs(20), activity.idle()).await.is_err());
+        assert!(timeout(Duration::from_secs(20), activity.idle())
+            .await
+            .is_err());
 
         let (done, finished) = oneshot::channel();
         let tail = async {
             tokio::time::sleep(Duration::from_secs(20)).await;
             Ok::<(), &'static str>(())
         };
-        let (result, ()) = tokio::join!(
-            receive_tail(tail, finished, "close timeout"),
-            async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                done.send(()).unwrap();
-            }
-        );
+        let (result, ()) = tokio::join!(receive_tail(tail, finished, "close timeout"), async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            done.send(()).unwrap();
+        });
         assert_eq!(result, Err("close timeout"));
     }
 
     #[tokio::test(start_paused = true)]
     async fn stalled_direction_does_not_override_other_direction_progress() {
         let activity = Activity::new();
-        let result = activity.run(
-            std::future::pending::<Result<(), &'static str>>(),
-            async {
-                for _ in 0..5 {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    activity.data(1);
-                }
-                Err("peer error")
-            },
-            "idle",
-        ).await;
+        let result = activity
+            .run(
+                std::future::pending::<Result<(), &'static str>>(),
+                async {
+                    for _ in 0..5 {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        activity.data(1);
+                    }
+                    Err("peer error")
+                },
+                "idle",
+            )
+            .await;
         assert_eq!(result, Err("peer error"));
     }
 }
