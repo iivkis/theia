@@ -59,6 +59,7 @@ pub(crate) mod tui_domain;
 pub mod tui_editor;
 pub(crate) mod tui_probe;
 mod tui_reality_review;
+mod tui_reality_provision;
 pub(crate) mod tui_runtime;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;

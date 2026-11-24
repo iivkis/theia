@@ -11,6 +11,7 @@ use crate::{
     tui_domain::DomainPanel,
     tui_editor::{Editor, PinnedModeReview, RecordAction, RecordReview},
     tui_probe::ProbePanel,
+    tui_reality_provision::ProvisionPanel,
     tui_runtime::RuntimePanel,
     Role,
 };
@@ -306,6 +307,7 @@ struct Interaction {
     candidate_batch: Option<CandidateBatchPanel>,
     domain: Option<DomainPanel>,
     probe: Option<ProbePanel>,
+    reality_provision: Option<ProvisionPanel>,
     runtime: Option<RuntimePanel>,
     pinned_review: Option<PinnedModeReview>,
     pinned_loading: Option<mpsc::Receiver<PinnedReviewResult>>,
@@ -330,6 +332,7 @@ impl Interaction {
             candidate_batch: None,
             domain: None,
             probe: None,
+            reality_provision: None,
             runtime: None,
             pinned_review: None,
             pinned_loading: None,
@@ -426,6 +429,10 @@ impl Interaction {
     }
 
     fn paste_record_field(&mut self, text: &str) {
+        if let Some(panel) = self.reality_provision.as_mut() {
+            panel.paste(text);
+            return;
+        }
         if let Some(RecordFlow::Input { fields, focus, .. }) = self.records.as_mut() {
             let input = text.trim_end_matches(['\r', '\n']);
             if !input.chars().any(char::is_control)
@@ -541,6 +548,10 @@ impl Interaction {
             if proxy.key(key) {
                 self.system_proxy = None;
             }
+            return false;
+        }
+        if let Some(panel) = self.reality_provision.as_mut() {
+            if panel.key(key) { self.reality_provision = None; }
             return false;
         }
         if let Some(review) = self.pinned_review.take() {
@@ -702,6 +713,10 @@ impl Interaction {
             return false;
         }
         let Some(editor) = self.editor.as_mut() else {
+            if model.screen == Screen::Server && key.code == KeyCode::Char('W') {
+                self.reality_provision = Some(ProvisionPanel::new());
+                return false;
+            }
             if model.screen == Screen::Server && key.code == KeyCode::Char('R') {
                 self.runtime = Some(RuntimePanel::open_restart());
                 return false;
@@ -1282,6 +1297,15 @@ impl Interaction {
                 self.start_pinned_review(key.code == KeyCode::Char('X'));
                 return false;
             }
+            if editor.role() == Role::Server && key.code == KeyCode::Char('W') {
+                if editor.dirty() {
+                    editor.error = Some("Сохраните или отмените черновик перед подготовкой REALITY.".into());
+                } else {
+                    editor.error = None;
+                    self.reality_provision = Some(ProvisionPanel::new());
+                }
+                return false;
+            }
             if editor.role() == Role::Server && key.code == KeyCode::Char('p') {
                 if editor.dirty() {
                     editor.error =
@@ -1501,7 +1525,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         ),
     }
-    if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
+    if let Some(provision) = interaction.and_then(|ui| ui.reality_provision.as_ref()) {
+        panel(frame, parts[1], "F-18: подготовка REALITY", &provision.body(), true);
+    } else if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
         panel(frame, parts[1], runtime.title(), &runtime.body(), true);
     } else if let Some(review) = interaction.and_then(|ui| ui.pinned_review.as_ref()) {
         panel(
@@ -1618,7 +1644,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     let footer = if model.screen == Screen::Client {
         "N/D/A/E: профили  p: Windows proxy  i: импорт  Ctrl+S: сохранить"
     } else {
-        "N/D/G/U/E: записи  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
+        "N/D/G/U/E: записи  W: REALITY  j/k: выбор  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
     };
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
@@ -1930,6 +1956,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(batch) = interaction.candidate_batch.as_mut() {
             batch.poll();
+        }
+        if let Some(provision) = interaction.reality_provision.as_mut() {
+            provision.poll();
         }
         if let Some(domain) = interaction.domain.as_mut() {
             domain.poll();
