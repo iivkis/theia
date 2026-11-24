@@ -360,7 +360,7 @@ mod tests {
         let current = state.snapshot().unwrap();
         assert!(state.still_current(&current,2));
         let mut rotation = quota.clone();
-        rotation.server.inbounds[0].tls_cert = "file:rotated-cert.pem".into();
+        rotation.server.inbounds[0].tls_cert = "file:/tmp/rotated-cert.pem".into();
         let (rebased,stage) = current.live.prepare_tls_rebase(&rotation,2).unwrap();
         let called = std::cell::Cell::new(false);
         assert_eq!(state.commit_tls_rotation(&current,2,make_view(&rotation,rebased),stage,|| called.set(true)),Ok(3));
