@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Fail-closed rustfmt preflight and one-commit repair on an exact PR head.
+"""Fail-closed Rustfmt-only repair and exact-source verification.
 
-No credentials or network access. Only a later, separately scoped CI step
-can push the verified child. A syntax/tool failure is not repairable drift.
+No credentials or network access. Only the subsequent trusted post-merge
+publication step may push the verified child. A syntax/tool failure is not
+repairable drift. Legacy probe/repair modes remain offline testable.
 """
 from __future__ import annotations
 
@@ -69,13 +70,51 @@ def format_all(check=False) -> None:
         subprocess.run([*command, *(["--", "--check"] if check else [])], check=True)
 
 
+def exact_sha(name: str) -> str:
+    value = os.environ[name]
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise RepairError("Invalid exact source SHA")
+    return value
+
+
+def verify_merged(merged: str, tested: str) -> None:
+    """The accepted SHA is the merge itself or its Rust-only direct child."""
+    if git("rev-parse", "HEAD").strip().decode() != tested or changes():
+        raise RepairError("Tested SHA is not the clean checkout")
+    if tested == merged:
+        return
+    if git("show", "-s", "--format=%P", tested).strip().decode() != merged:
+        raise RepairError("Formatted SHA is not a single-parent child of the merge")
+    raw = git("diff", "--raw", "-z", "--no-renames", merged, tested)
+    names = git("diff", "--name-status", "-z", "--no-renames", merged, tested)
+    if not names.endswith(b"\0"):
+        raise RepairError("Empty or malformed format commit")
+    fields = names[:-1].split(b"\0")
+    if len(fields) % 2 or any(kind != b"M" for kind in fields[::2]):
+        raise RepairError("Format commit adds, removes or renames paths")
+    status = b"".join(b" M " + path + b"\0" for path in fields[1::2])
+    if not changed_rust_paths(status, raw):
+        raise RepairError("Expected a nonempty Rust-only format commit")
+
+
+def output_sha(tested: str) -> None:
+    with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+        output.write(f"tested_sha={tested}\n")
+
+
 def execute(mode: str) -> int:
+    if mode == "verify-merged":
+        verify_merged(exact_sha("MERGED_SHA"), exact_sha("TESTED_SHA"))
+        return 0
     if changes():
         raise RepairError("Expected clean checkout before formatting")
-    if mode == "repair":
-        expected = os.environ["PR_HEAD_SHA"]
-        if not re.fullmatch(r"[0-9a-f]{40}", expected) or git("rev-parse", "HEAD").strip().decode() != expected:
-            raise RepairError("PR head changed")
+    expected = None
+    if mode in {"repair", "prepare-merged"}:
+        expected = exact_sha("MERGED_SHA" if mode == "prepare-merged" else "PR_HEAD_SHA")
+        if git("rev-parse", "HEAD").strip().decode() != expected:
+            raise RepairError("Source head changed")
+        if mode == "prepare-merged" and os.environ.get("GITHUB_SHA") != expected:
+            raise RepairError("Not the exact merged event SHA")
     format_all()
     paths = changes()
     if mode == "probe":
@@ -88,6 +127,9 @@ def execute(mode: str) -> int:
         print(f"::error::Rustfmt changed {len(paths)} file(s); native CI must test the repaired SHA")
         return 1
     if not paths:
+        if mode == "prepare-merged":
+            output_sha(expected)
+            return 0
         raise RepairError("PR head is already formatted; merge-tree drift requires branch sync")
     format_all(check=True)
     if changes() != paths:
@@ -101,17 +143,22 @@ def execute(mode: str) -> int:
         "-c", "commit.gpgsign=false",
         "-c", "user.name=github-actions[bot]",
         "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-        "commit", "-m", "style: apply rustfmt before native CI",
+        "commit", "-m", "style: apply rustfmt after merge" if mode == "prepare-merged"
+        else "style: apply rustfmt before native CI",
     ], check=True)
     if git("rev-parse", "HEAD^").strip().decode() != expected or changes():
         raise RepairError("Repair commit is not a clean direct child")
+    if mode == "prepare-merged":
+        tested = git("rev-parse", "HEAD").strip().decode()
+        verify_merged(expected, tested)
+        output_sha(tested)
     print("Rustfmt-only repair commit prepared")
     return 0
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("probe", "repair"))
+    parser.add_argument("mode", choices=("probe", "repair", "prepare-merged", "verify-merged"))
     try:
         sys.exit(execute(parser.parse_args().mode))
     except (RepairError, subprocess.CalledProcessError, OSError, KeyError) as error:

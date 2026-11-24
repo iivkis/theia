@@ -103,6 +103,41 @@ class FormatRepairTests(unittest.TestCase):
                         repair.execute("repair")
                     self.assertEqual(repair.git("rev-parse", "HEAD").strip().decode(), head)
 
+    def test_merged_format_publishes_exact_child_or_original_sha(self):
+        def formatter(check=False):
+            if not check:
+                Path("fixture.rs").write_text("fn main() {\n}\n")
+
+        with tempfile.TemporaryDirectory() as output_dir, repository() as merged:
+            output = Path(output_dir) / "output"
+            env = {"GITHUB_OUTPUT": str(output), "MERGED_SHA": merged, "GITHUB_SHA": merged}
+            with patch.dict(os.environ, env):
+                with patch.object(repair, "format_all"):
+                    self.assertEqual(repair.execute("prepare-merged"), 0)
+                    self.assertEqual(output.read_text(), f"tested_sha={merged}\n")
+                output.unlink()
+                with patch.object(repair, "format_all", side_effect=formatter):
+                    self.assertEqual(repair.execute("prepare-merged"), 0)
+                tested = repair.git("rev-parse", "HEAD").strip().decode()
+                self.assertNotEqual(tested, merged)
+                self.assertEqual(output.read_text(), f"tested_sha={tested}\n")
+                repair.verify_merged(merged, tested)
+                with self.assertRaises(repair.RepairError):
+                    repair.verify_merged(merged, merged)
+
+    def test_merged_format_rejects_wrong_event_and_non_rust_child(self):
+        with repository() as merged:
+            with patch.dict(os.environ, {"MERGED_SHA": merged, "GITHUB_SHA": "0" * 40}):
+                with patch.object(repair, "format_all") as formatter:
+                    with self.assertRaises(repair.RepairError):
+                        repair.execute("prepare-merged")
+                    formatter.assert_not_called()
+            Path("notes.md").write_text("unsafe change\n")
+            subprocess.run(["git", "commit", "-qam", "non-format child"], check=True)
+            tested = repair.git("rev-parse", "HEAD").strip().decode()
+            with self.assertRaises(repair.RepairError):
+                repair.verify_merged(merged, tested)
+
     def test_wrong_head_and_empty_repair_refuse(self):
         with repository() as head:
             with patch.object(repair, "format_all"), patch.dict(os.environ, {"PR_HEAD_SHA": "0" * 40}):

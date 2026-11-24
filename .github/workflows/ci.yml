@@ -18,8 +18,13 @@ jobs:
     name: specification
     if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
+    # Only this trusted same-repository post-merge job may publish
+    # a verified Rustfmt-only direct child. Native jobs stay read-only.
+    permissions:
+      contents: write
     outputs:
+      tested_sha: ${{ steps.publish-format.outputs.tested_sha }}
       rust_ready: ${{ steps.detect.outputs.rust_ready }}
       native_required: ${{ steps.scope.outputs.native_required }}
     steps:
@@ -82,10 +87,59 @@ jobs:
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
         with:
           components: rustfmt
-      - name: Reject formatting drift before expensive native builds
+      - name: Prepare verified Rustfmt-only child of merged main
         id: format
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
-        run: python3 scripts/ci-format-repair.py probe
+        env:
+          MERGED_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: python3 scripts/ci-format-repair.py prepare-merged
+      - name: Publish exact formatted source once (no additional CI trigger)
+        id: publish-format
+        if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
+        env:
+          MERGED_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          DEV_SHA: ${{ github.event.pull_request.head.sha }}
+          FORMATTED_SHA: ${{ steps.format.outputs.tested_sha }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sha in "$MERGED_SHA" "$DEV_SHA" "$FORMATTED_SHA"; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          done
+          test "$(git rev-parse HEAD)" = "$FORMATTED_SHA"
+          TESTED_SHA="$FORMATTED_SHA" python3 scripts/ci-format-repair.py verify-merged
+          if [[ "$FORMATTED_SHA" != "$MERGED_SHA" ]]; then
+            auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            echo "::add-mask::$auth"
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+            export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+            git fetch --no-tags --depth=2 origin refs/heads/main
+            tip="$(git rev-parse FETCH_HEAD)"
+            if [[ "$tip" == "$MERGED_SHA" ]]; then
+              dev="$(git ls-remote --exit-code origin refs/heads/dev | cut -f1)"
+              if [[ "$dev" == "$DEV_SHA" ]] && git merge-base --is-ancestor "$DEV_SHA" "$FORMATTED_SHA"; then
+                # Atomically sync dev only if it has no subsequent work.
+                git push --atomic origin "$FORMATTED_SHA:refs/heads/main" "$FORMATTED_SHA:refs/heads/dev"
+              else
+                git push origin "$FORMATTED_SHA:refs/heads/main"
+                echo "::notice::dev advanced or is not an ancestor; left unchanged"
+              fi
+            elif [[ "$(git show -s --format=%P "$tip")" == "$MERGED_SHA" ]] && \
+                 [[ "$(git rev-parse "$tip^{tree}")" == "$(git rev-parse "$FORMATTED_SHA^{tree}")" ]]; then
+              # Rerun: reuse the already-published identical child.
+              FORMATTED_SHA="$tip"
+              git checkout --detach "$FORMATTED_SHA"
+            else
+              echo "::error::main advanced; refuse to rewrite a newer integration"
+              exit 1
+            fi
+            unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GH_TOKEN auth
+          fi
+          TESTED_SHA="$FORMATTED_SHA" python3 scripts/ci-format-repair.py verify-merged
+          echo "tested_sha=$FORMATTED_SHA" >> "$GITHUB_OUTPUT"
+          printf 'Merged SHA: %s\nTested source SHA: %s\n' "$MERGED_SHA" "$FORMATTED_SHA" >> "$GITHUB_STEP_SUMMARY"
 
   m0-1-api-spike:
     name: m0-1-api-spike (Linux)
@@ -100,7 +154,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -163,7 +217,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -216,7 +270,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -272,7 +326,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -353,7 +407,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
@@ -404,7 +458,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -449,7 +503,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -485,7 +539,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -535,7 +589,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -558,7 +612,7 @@ jobs:
       - name: Instrument full native workspace tests
         run: cargo llvm-cov --workspace --all-targets --all-features --locked --lcov --include-build-script --output-path coverage.lcov
       - name: Normalize exact-SHA native line evidence
-        run: python scripts/ci-coverage.py collect --lcov coverage.lcov --platform "${{ runner.os }}" --sha "${{ github.event.pull_request.merge_commit_sha }}" --output coverage.json
+        run: python scripts/ci-coverage.py collect --lcov coverage.lcov --platform "${{ runner.os }}" --sha "${{ needs.specification.outputs.tested_sha }}" --output coverage.json
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-${{ runner.os }}
@@ -575,7 +629,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -595,7 +649,7 @@ jobs:
           name: coverage-Windows
           path: coverage-windows
       - name: Verify complete source inventory and union native line coverage
-        run: python scripts/ci-coverage.py gate --linux coverage-linux/coverage.json --windows coverage-windows/coverage.json --sha "${{ github.event.pull_request.merge_commit_sha }}" --output coverage-summary.json
+        run: python scripts/ci-coverage.py gate --linux coverage-linux/coverage.json --windows coverage-windows/coverage.json --sha "${{ needs.specification.outputs.tested_sha }}" --output coverage-summary.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -615,10 +669,13 @@ jobs:
         env:
           JOB_RESULTS: ${{ toJSON(needs) }}
           NATIVE_REQUIRED: ${{ needs.specification.outputs.native_required }}
+          MERGED_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          TESTED_SHA: ${{ needs.specification.outputs.tested_sha }}
         run: |
           python3 - <<'PY'
           import json
           import os
+          import re
 
           results = json.loads(os.environ["JOB_RESULTS"])
           expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-4-btls-spike", "m3-4e-btls-production-feature", "coverage-native", "coverage-gate"}
@@ -628,6 +685,13 @@ jobs:
           failed = [name for name in sorted(expected) if results.get(name, {}).get("result") != "success"]
           if failed:
               raise SystemExit("CI results violate required scope: " + ", ".join(failed))
-          print("Merged main commit: native CI passed.")
+          merged = os.environ["MERGED_SHA"]
+          tested = os.environ["TESTED_SHA"]
+          if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (merged, tested)):
+              raise SystemExit("Missing exact source provenance")
+          message = f"Merge {merged}: native CI passed on exact source {tested}"
+          print(message)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write(message + "\n")
           PY
 

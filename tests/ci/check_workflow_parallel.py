@@ -122,9 +122,12 @@ require("if: " + dev_merge in job("specification"),
         "only same-repository dev merges may allocate native runners")
 require("always() && " + dev_merge in gate,
         "final gate must share the exact dev merge guard")
-require(workflow.count("actions/checkout@v4") ==
-        workflow.count("ref: ${{ github.event.pull_request.merge_commit_sha }}"),
-        "all checkouts must pin the exact merged commit")
+require(workflow.count("ref: ${{ github.event.pull_request.merge_commit_sha }}") == 1
+        and workflow.count("actions/checkout@v4") ==
+        1 + workflow.count("ref: ${{ needs.specification.outputs.tested_sha }}"),
+        "only specification checks out merge; all native jobs pin the exact published SHA")
+require(workflow.count('--sha "${{ needs.specification.outputs.tested_sha }}"') == 2,
+        "both coverage producers and gate must use the tested SHA")
 require("test_ci_coverage.py" in job("specification"),
         "coverage regression tests must run before native fan-out")
 coverage_native = job("coverage-native")
@@ -191,20 +194,28 @@ require("  m3-3-bbr-comparison:" not in workflow,
 require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
 
 
-# Formatting remains fail-closed; no automatic branch rewrite or dispatch.
+# One trusted post-merge Rustfmt-only publication; native jobs stay read-only.
 spec = job("specification")
 require("fetch-depth: 2" in spec, "merged commit checkout must be bounded")
 require("steps.scope.outputs.native_required" in spec
         and 'echo "native_required=true"' in spec
         and "test_ci_scope.py" in spec,
         "every merged commit must take the full native path")
-require("scripts/ci-format-repair.py probe" in spec
+require("scripts/ci-format-repair.py prepare-merged" in spec
+        and spec.count("scripts/ci-format-repair.py verify-merged") == 2
         and "test_ci_format_repair.py" in spec,
-        "format preflight and its safety regressions must precede fan-out")
-require("\n  format-repair:\n" not in workflow
-        and "gh workflow run" not in workflow
-        and "git push" not in workflow,
-        "post-merge CI must never rewrite or dispatch another commit")
+        "verified post-merge formatting and its safety regressions must precede fan-out")
+require("tested_sha: ${{ steps.publish-format.outputs.tested_sha }}" in spec
+        and 'echo "tested_sha=$FORMATTED_SHA"' in spec
+        and 'git push --atomic origin "$FORMATTED_SHA:refs/heads/main" "$FORMATTED_SHA:refs/heads/dev"' in spec
+        and 'git push origin "$FORMATTED_SHA:refs/heads/main"' in spec
+        and '[[ "$tip" == "$MERGED_SHA" ]]' in spec
+        and '[[ "$dev" == "$DEV_SHA" ]]' in spec
+        and "git merge-base --is-ancestor" in spec,
+        "format publication must be bound to the merge and only fast-forward unchanged dev")
+require("gh workflow run" not in workflow and "--force" not in spec
+        and "git push" not in "".join(job(name) for name in mandatory - {"specification"}),
+        "never dispatch another CI or force-push; publication only in specification")
 require("ci-formatted-source" not in workflow and "persist-format:" not in workflow,
         "never test a formatter overlay or mutate a green SHA")
 for name in mandatory - {"specification"}:
@@ -227,8 +238,12 @@ require("NATIVE_REQUIRED: ${{ needs.specification.outputs.native_required }}" in
         "final gate must use exactly the preflight's scope")
 require('native != "true"' in gate,
         "unknown or skipped native scope must fail closed")
-require("contents: write" not in workflow and "actions: write" not in workflow,
-        "post-merge CI must not have repository or dispatch write permissions")
+require(workflow.count("contents: write") == 1 and "contents: write" in spec
+        and "actions: write" not in workflow and "contents: read" in workflow,
+        "only trusted specification may publish a Rustfmt-only child; no dispatch permission")
+require("TESTED_SHA: ${{ needs.specification.outputs.tested_sha }}" in gate
+        and "native CI passed on exact source" in gate,
+        "final gate must report the exact tested source SHA")
 
 require("actions/setup-go" not in workflow and "THEIA_UTLS" not in workflow
         and "utls_reference" not in workflow and "gofmt " not in workflow,
