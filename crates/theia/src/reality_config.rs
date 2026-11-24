@@ -111,6 +111,7 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
                     bundle: path_string(&r.bundle)?,
                     initial_health_sha256: r.health_sha256,
                     identity_sha256: r.identity_sha256,
+                    manifest_sha256: record.manifest_sha256()?,
                 }),
                 allowed_user_ids: r.grants.clone(),
                 h2_listen: r.listen.to_string(),

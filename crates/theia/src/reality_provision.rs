@@ -34,7 +34,15 @@ pub struct Record {
     pub plan_sha256: [u8; 32],
     pub identity_sha256: [u8; 32],
     pub publication_sha256: [u8; 32],
+    pub initial_payload_sha256: [u8; 32],
     admission_commitment: [u8; 32],
+}
+
+impl Record {
+    pub(crate) fn manifest_sha256(&self) -> Result<[u8; 32], Error> {
+        let raw = toml::to_string(self).map_err(|_| Error::Format)?;
+        Ok(bootstrap::digest(&raw))
+    }
 }
 
 pub fn preview(state: &State, now: u64) -> Result<Preview, Error> {
@@ -80,6 +88,7 @@ pub fn create(
     let publication = Publication::new(&output.join(PUBLICATION))?;
     publication.initialize(state, &output.join(IDENTITY), now)?;
     let status = publication.inspect(now)?;
+    let initial = publication.inspect_descriptor(status.snapshot_sha256, now)?;
     let record = Record {
         schema_version: 1,
         scope,
@@ -87,6 +96,7 @@ pub fn create(
         plan_sha256: approved.plan_sha256,
         identity_sha256: bootstrap::fingerprint(identity.public_key()),
         publication_sha256: status.snapshot_sha256,
+        initial_payload_sha256: initial.payload_sha256(),
         admission_commitment: secret.commitment(),
     };
     if !status.valid_now || status.active_fingerprint != record.identity_sha256
@@ -155,7 +165,8 @@ pub fn inspect_initial(
     }
     let captured = publication.capture(state, record.publication_sha256, now)?;
     let active = captured.select(identity.public_key(), now)?;
-    if active.verified().descriptor().scope != record.scope { return Err(Error::Scope); }
+    if active.verified().descriptor().scope != record.scope
+        || active.verified().payload_sha256() != record.initial_payload_sha256 { return Err(Error::Scope); }
     Ok(record)
 }
 

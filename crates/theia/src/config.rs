@@ -106,11 +106,13 @@ pub struct RealityBinding {
     pub bundle: String,
     pub initial_health_sha256: [u8; 32],
     pub identity_sha256: [u8; 32],
+    pub manifest_sha256: [u8; 32],
 }
 impl RealityBinding {
     fn valid(&self) -> bool {
         self.initial_health_sha256 != [0; 32]
             && self.identity_sha256 != [0; 32]
+            && self.manifest_sha256 != [0; 32]
             && self.health_store != self.bundle
             && [&self.health_store, &self.bundle].into_iter().all(|p|
                 crate::bounded_input::explicit_file_path(Path::new(p)) && !p.chars().any(char::is_control))

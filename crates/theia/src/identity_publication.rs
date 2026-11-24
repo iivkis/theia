@@ -34,6 +34,18 @@ struct Pending {
     successor: String,
 }
 
+/// Retain both signed documents after old key retirement. A list of old
+/// key names alone is not proof of an authorized identity transition.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedRotation {
+    started_at: u64,
+    ends_at: u64,
+    retired_at: u64,
+    announcement: String,
+    successor: String,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -43,9 +55,12 @@ struct Record {
     clock_floor: u64,
     // Exact approved plan, including IP pins and declared server addresses.
     plan_sha256: [u8; 32],
+    root_public: String,
+    initial_document: String,
     active_key: String,
     active_document: String,
     retired: Vec<String>,
+    transitions: Vec<CompletedRotation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending: Option<Pending>,
 }
@@ -69,9 +84,22 @@ fn public_key(identity: &Identity) -> String {
 }
 
 fn verified(identity: &Identity, signed: &str, minimum: u64) -> Result<Verified, Error> {
+    verify_public(identity.scope(), identity.public_key(), signed, minimum)
+}
+
+fn decode_public(raw: &str) -> Result<[u8; 32], Error> {
+    let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| Error::Format)?;
+    let public: [u8; 32] = bytes.try_into().map_err(|_| Error::Format)?;
+    if public == [0; 32] || URL_SAFE_NO_PAD.encode(public) != raw {
+        return Err(Error::Format);
+    }
+    Ok(public)
+}
+
+fn verify_public(scope: &Scope, public: [u8; 32], signed: &str, minimum: u64) -> Result<Verified, Error> {
     let anchor = Anchor::new(
-        identity.scope().clone(),
-        identity.public_key(),
+        scope.clone(),
+        public,
         minimum,
         bootstrap::auto_policy(),
     )
@@ -83,7 +111,69 @@ fn key_at(path: &str, scope: &Scope) -> Result<Identity, Error> {
     Identity::load(file(path)?, scope).map_err(|_| Error::Identity)
 }
 
+fn check_rotation_pair(announcement: &Verified, successor: &Verified, started: u64, ends: u64) -> Result<(), Error> {
+    announcement.check_time(started).map_err(|_| Error::Descriptor)?;
+    successor.check_time(started).map_err(|_| Error::Descriptor)?;
+    let a = announcement.descriptor();
+    let b = successor.descriptor();
+    if b.revision != a.revision.checked_add(1).ok_or(Error::Descriptor)?
+        || a.next_identity.as_deref() != Some(URL_SAFE_NO_PAD.encode(successor.signer()).as_str())
+        || b.next_identity.is_some()
+        || ends != started.checked_add(OVERLAP).ok_or(Error::Clock)?
+        || a.not_after != ends || a.not_before != started
+        || b.not_before != started || b.not_after <= ends
+        || a.scope != b.scope || a.active_reference != b.active_reference
+        || a.references != b.references || a.h3 != b.h3
+        || a.stream_one != b.stream_one || a.stream_up != b.stream_up
+        || a.path_prefix != b.path_prefix || a.padding != b.padding || a.rotation != b.rotation {
+        return Err(Error::Descriptor);
+    }
+    Ok(())
+}
+
 impl Record {
+    /// Verify the whole completed server rotation lineage without reading
+    /// retired private keys. Retirement occurs after overlap; verify the
+    /// signed pair at its original start, and the successor at retirement.
+    fn lineage(&self) -> Result<([u8;32], Verified, Verified), Error> {
+        if self.transitions.len() != self.retired.len() || self.transitions.len() > 64 {
+            return Err(Error::Format);
+        }
+        let root = decode_public(&self.root_public)?;
+        let initial = verify_public(&self.scope, root, &self.initial_document, 1)?;
+        if initial.descriptor().revision != 1 || initial.descriptor().next_identity.is_some() {
+            return Err(Error::Descriptor);
+        }
+        let mut floor = verify_public(&self.scope, root, &self.initial_document, 1)?;
+        let mut clock = floor.descriptor().not_before;
+        let mut seen = std::collections::HashSet::from([root]);
+        for (transition, retired) in self.transitions.iter().zip(&self.retired) {
+            if transition.started_at < clock || transition.retired_at < transition.ends_at
+                || transition.retired_at > self.clock_floor || decode_public(retired)? != floor.signer() {
+                return Err(Error::Clock);
+            }
+            let announcement = verify_public(&self.scope, floor.signer(), &transition.announcement,
+                floor.descriptor().revision)?;
+            if floor.compare(&announcement).map_err(|_| Error::Descriptor)? != descriptor::Change::Advanced {
+                return Err(Error::Descriptor);
+            }
+            let next_key = decode_public(announcement.descriptor().next_identity.as_deref().ok_or(Error::Identity)?)?;
+            if !seen.insert(next_key) { return Err(Error::Identity); }
+            let minimum = announcement.descriptor().revision.checked_add(1).ok_or(Error::Descriptor)?;
+            let successor = verify_public(&self.scope, next_key, &transition.successor, minimum)?;
+            check_rotation_pair(&announcement, &successor, transition.started_at, transition.ends_at)?;
+            successor.check_time(transition.retired_at).map_err(|_| Error::Descriptor)?;
+            floor = successor;
+            clock = transition.retired_at;
+        }
+        let current = verify_public(&self.scope, floor.signer(), &self.active_document, floor.descriptor().revision)?;
+        floor.compare(&current).map_err(|_| Error::Descriptor)?;
+        if self.clock_floor < clock || self.generation != current.descriptor().revision {
+            return Err(Error::Descriptor);
+        }
+        Ok((root, initial, current))
+    }
+
     fn validate(&self) -> Result<Checked, Error> {
         if self.schema_version != 1
             || self.generation == 0
@@ -108,7 +198,8 @@ impl Record {
         if self.retired.contains(&public_key(&active)) {
             return Err(Error::Identity);
         }
-        let current = verified(&active, &self.active_document, 1)?;
+        let (_, _, current) = self.lineage()?;
+        if current.signer() != active.public_key() { return Err(Error::Identity); }
         current
             .check_time(self.clock_floor)
             .map_err(|_| Error::Descriptor)?;
@@ -138,34 +229,7 @@ impl Record {
                 .checked_add(1)
                 .ok_or(Error::Descriptor)?;
             let successor = verified(&successor_key, &pending.successor, minimum)?;
-            current
-                .check_time(pending.started_at)
-                .map_err(|_| Error::Descriptor)?;
-            successor
-                .check_time(pending.started_at)
-                .map_err(|_| Error::Descriptor)?;
-            let a = current.descriptor();
-            let b = successor.descriptor();
-            // The next document must change only the signing identity,
-            // revision and validity. No route/transport/grant change rides
-            // along with key rotation.
-            if b.revision != minimum
-                || b.next_identity.is_some()
-                || a.not_after != pending.ends_at
-                || a.not_before != pending.started_at
-                || b.not_before != pending.started_at
-                || b.not_after <= pending.ends_at
-                || a.active_reference != b.active_reference
-                || a.references != b.references
-                || a.h3 != b.h3
-                || a.stream_one != b.stream_one
-                || a.stream_up != b.stream_up
-                || a.path_prefix != b.path_prefix
-                || a.padding != b.padding
-                || a.rotation != b.rotation
-            {
-                return Err(Error::Descriptor);
-            }
+            check_rotation_pair(&current, &successor, pending.started_at, pending.ends_at)?;
             Some((successor_key, successor))
         } else {
             if current.descriptor().next_identity.is_some() {
@@ -212,6 +276,7 @@ pub struct CapturedPublication {
     generation: u64,
     snapshot_sha256: [u8; 32],
     plan_sha256: [u8; 32],
+    captured_at: u64,
     active: PublishedIdentity,
     next: Option<PublishedIdentity>,
 }
@@ -236,6 +301,7 @@ impl CapturedPublication {
     /// Selection uses the exact independently authenticated public identity.
     /// Old admission cannot select the next signer, or vice versa.
     pub fn select(&self, public: [u8; 32], now: u64) -> Result<&PublishedIdentity, Error> {
+        if now < self.captured_at { return Err(Error::Clock); }
         let selected = if self.active.identity.public_key() == public {
             &self.active
         } else {
@@ -299,9 +365,12 @@ impl Publication {
                 generation: 1,
                 clock_floor: now,
                 plan_sha256: state.plan().digest().map_err(|_| Error::Health)?,
+                root_public: public_key(&identity),
+                initial_document: active_document.clone(),
                 active_key: key_file,
                 active_document,
                 retired: Vec::new(),
+                transitions: Vec::new(),
                 pending: None,
             },
             None,
@@ -339,6 +408,23 @@ impl Publication {
         Ok(checked.current)
     }
 
+    /// Reopen the current signed publication only when its complete
+    /// lineage matches the independently pinned initial receipt. The
+    /// returned status is local and does not authorize activation.
+    pub fn inspect_rooted(
+        &self, scope: &Scope, expected_root: [u8; 32], expected_initial: [u8; 32],
+        expected_plan: [u8; 32], now: u64,
+    ) -> Result<Verified, Error> {
+        let (_, record, checked) = self.snapshot()?;
+        record.check_clock(now)?;
+        let (root, initial, _) = record.lineage()?;
+        if &record.scope != scope || bootstrap::fingerprint(root) != expected_root
+            || initial.payload_sha256() != expected_initial || record.plan_sha256 != expected_plan {
+            return Err(Error::Approval);
+        }
+        Ok(checked.current)
+    }
+
     /// Capture both signing generations from the same verified file
     /// snapshot, matching a separately approved health inventory. Failed
     /// refresh never silently substitutes an arbitrary key or reference.
@@ -369,6 +455,7 @@ impl Publication {
             generation: record.generation,
             snapshot_sha256: expected_snapshot,
             plan_sha256: record.plan_sha256,
+            captured_at: now,
             active: PublishedIdentity {
                 identity: checked.active, verified: checked.current, signed: record.active_document
             },
@@ -576,6 +663,10 @@ impl Publication {
         }
         next.check_time(now).map_err(|_| Error::Descriptor)?;
         record.retired.push(public_key(&checked.active));
+        record.transitions.push(CompletedRotation {
+            started_at: pending.started_at, ends_at: pending.ends_at, retired_at: now,
+            announcement: pending.announcement, successor: pending.successor.clone(),
+        });
         record.active_key = pending.key_file;
         record.active_document = pending.successor;
         record.advance(now)?;
@@ -769,6 +860,9 @@ mod tests {
         assert!(publication.initialize(&state, &old_key, now).is_err());
         let start = publication.inspect(now).unwrap();
         let initial = publication.documents(now).unwrap().0;
+        let initial_anchor = Anchor::new(scope.clone(), active.public_key(), 1, bootstrap::auto_policy()).unwrap();
+        let initial_digest = descriptor::verify(&initial, &initial_anchor).unwrap().payload_sha256();
+        assert!(publication.inspect_rooted(&scope, bootstrap::fingerprint(active.public_key()), initial_digest, start.plan_sha256, now).is_ok());
         let mut substituted = state.plan().clone();
         substituted.references[0].address = "93.184.216.3:443".parse().unwrap();
         let substituted = reference_health::State::new(
@@ -823,7 +917,7 @@ mod tests {
         // A separate client already enrolled at revision one can consume
         // the old-signed announcement and explicitly promote to the next.
         let anchor = Anchor::new(
-            scope,
+            scope.clone(),
             active.public_key(),
             1,
             ClientPolicy {
@@ -853,6 +947,15 @@ mod tests {
         assert_eq!(final_state.active_fingerprint, fingerprint);
         assert_eq!(final_state.next_fingerprint, None);
         assert!(old_key.exists() && next_key.exists());
+        assert_eq!(publication.inspect_rooted(&scope, bootstrap::fingerprint(active.public_key()), initial_digest, start.plan_sha256, ends).unwrap().signer(), next.public_key());
+        assert!(publication.inspect_rooted(&scope, fingerprint, initial_digest, start.plan_sha256, ends).is_err());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut forged: Record = toml::from_str(&raw).unwrap();
+        forged.transitions.clear();
+        std::fs::write(&path, toml::to_string(&forged).unwrap()).unwrap();
+        assert!(publication.inspect(ends).is_err());
+        std::fs::write(&path, &raw).unwrap();
+        assert!(publication.inspect(ends).is_ok());
         assert!(publication
             .begin_rotation(
                 &old_key,
