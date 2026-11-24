@@ -345,7 +345,7 @@ impl AsyncUdpSocket for LocalSocket {
 
 /// Actual UDP composition for a single prepared generation. No wildcard
 /// reference destinations, caller-supplied routing addresses, or detached
-/// workers. The normal server startup does not yet activate this candidate.
+/// workers. The normal REALITY startup shares its captured generation.
 pub struct PreparedQuic {
     socket: Arc<UdpSocket>,
     endpoint: Endpoint,
@@ -365,6 +365,14 @@ impl PreparedQuic {
         let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
         let manager = Manager::new(document, inbound_id, now).map_err(|_| ServerError::Config)?;
         let generation = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
+        let material = generation.publication().active();
+        let context = Arc::new(ServerContext::identity_context(inbound, &doc.server.users,
+            &doc.server.policy, material.verified(), Arc::from(material.signed()))?);
+        Self::from_shared(socket, generation, context, now)
+    }
+
+    pub(crate) fn from_shared(socket: UdpSocket, generation: Arc<Lease>,
+        context: Arc<ServerContext>, now: u64) -> Result<Self, ServerError> {
         let publication = generation.publication();
         if publication.next().is_some() { return Err(ServerError::Config); }
         let material = publication.active();
@@ -381,8 +389,6 @@ impl PreparedQuic {
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         server.transport_config(crate::quic_transport::transport_config());
         server.migration(false);
-        let context = Arc::new(ServerContext::identity_context(inbound, &doc.server.users,
-            &doc.server.policy, value, Arc::from(material.signed()))?);
         let socket = Arc::new(socket);
         let (local, rx) = mpsc::channel(SESSIONS * 2);
         let local_cids = Arc::new(LocalCidKey::fresh()?);

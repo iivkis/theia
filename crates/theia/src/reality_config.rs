@@ -223,7 +223,7 @@ pub fn apply(path: &Path, request: &Request, expected: [u8; 32], now: u64) -> Re
 /// Validate the immutable enrollment pinned by the shared config before
 /// interpreting mutable trust history. A copied/replaced profile, changed
 /// bearer ref or independently edited mode must not silently take effect.
-fn pinned_client(profile: &Profile) -> Result<bootstrap::Profile, Error> {
+pub(crate) fn pinned_client(profile: &Profile) -> Result<bootstrap::Profile, Error> {
     if profile.tls_profile != "smart-reality" || profile.tls_ca.is_some() {
         return Err(Error::Format);
     }
@@ -279,7 +279,7 @@ fn status_document(document: &Config, id: &str, now: u64) -> Result<String, Erro
             let value = crate::reality_provision::inspect_registered(Path::new(&binding.bundle), binding, &state, &scope, now)?;
             let (health, reserve) = state.active_status(value.descriptor(), now).map_err(|_| Error::Health)?;
             let signed = value.descriptor();
-            Ok(format!("Saved REALITY inbound; runtime NOT ACTIVATED\ninbound={id}\nendpoint={}\nrevision={}\nidentity_sha256={}\nvalid_now={}\nactive_reference={}\nactive_status={health:?}\nreserve_candidate={}\nlast_checked_at={}\nnext_check_at={}\nh3={}\nbackend_available=false",
+            Ok(format!("Saved REALITY inbound; live state not inspected\ninbound={id}\nendpoint={}\nrevision={}\nidentity_sha256={}\nvalid_now={}\nactive_reference={}\nactive_status={health:?}\nreserve_candidate={}\nlast_checked_at={}\nnext_check_at={}\nh3={}\nbackend_available=true",
                 scope.endpoint, signed.revision, hex(bootstrap::fingerprint(value.signer())),
                 value.check_time(now).is_ok(), signed.references[usize::from(signed.active_reference)].server_name,
                 reserve.map_or("none".into(), |i| i.to_string()), state.last_checked_at(),
@@ -291,9 +291,9 @@ fn status_document(document: &Config, id: &str, now: u64) -> Result<String, Erro
             let value = enrollment.store()?.inspect(now).map_err(|_| Error::Descriptor)?;
             let modes = value.effective_modes();
             let valid = value.check_time(now).is_ok();
-            Ok(format!("Saved REALITY profile; runtime NOT ACTIVATED\nprofile={id}\nactive_profile={}\nrevision={}\nidentity_sha256={}\nvalid_now={valid}\nrequired_action={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nbackend_available=false",
+            Ok(format!("Saved REALITY profile; live state not inspected\nprofile={id}\nactive_profile={}\nrevision={}\nidentity_sha256={}\nvalid_now={valid}\nrequired_action={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nbackend_available=true",
                 doc.client.active_profile == id, value.descriptor().revision, hex(bootstrap::fingerprint(value.signer())),
-                if valid { "backend-unavailable" } else { "authenticated-offline-recovery" },
+                if valid { "ready-for-startup-preflight" } else { "authenticated-offline-recovery" },
                 modes.h2, modes.h3, modes.stream_one, modes.stream_up))
         }
     }
@@ -365,7 +365,7 @@ mod tests {
         let saved_digest: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
         assert_eq!(status_expected(&path, saved_digest, "reality-edge", 1000).unwrap(), status);
         assert_eq!(status_expected(&path, [0;32], "reality-edge", 1000), Err(Error::Approval));
-        assert!(status.contains("backend_available=false"));
+        assert!(status.contains("backend_available=true"));
         assert!(status.contains("active_reference=ref.example.org"));
         // Compatible renewal advances publication without rewriting the
         // independently pinned initial receipt or the config record.

@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    config::{Config, Inbound, ServerPolicy, User},
+    config::Config,
     descriptor::Verified,
     identity_tls::Branch,
     reality_admission::{self, Context, ReplayGuard, Secret},
@@ -290,15 +290,15 @@ impl RelayGate {
 }
 
 /// Prepared single-generation TCP backend. The construction requires the
-/// exact registered bundle and durable generation floor. It is not wired
-/// to production startup while the independent QUIC relay contract is open.
+/// exact registered bundle and durable generation floor. Startup can share
+/// one immutable lease and application context with the QUIC backend.
 /// Both accepted and reference paths are bounded; all sockets are owned
 /// by this task's JoinSet and cancelled on shutdown.
 pub struct PreparedTcp {
     listener: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
     context: Arc<ServerContext>,
-    lease: crate::reality_generation::Lease,
+    lease: Arc<crate::reality_generation::Lease>,
     guard: Arc<ReplayGuard>,
     relay: Arc<RelayGate>,
     inspection_slots: Arc<Semaphore>,
@@ -312,12 +312,15 @@ impl PreparedTcp {
         if listener.local_addr().map_err(|_| ServerError::Io)? != expected { return Err(ServerError::Config); }
         let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
         let manager = Manager::new(document, inbound_id, now).map_err(|_| ServerError::Config)?;
-        let lease = manager.refresh(now).map_err(|_| ServerError::Config)?;
-        Self::from_lease(listener, inbound, &doc.server.users, &doc.server.policy, lease, now)
+        let lease = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
+        let material = lease.publication().active();
+        let context = Arc::new(ServerContext::identity_context(inbound, &doc.server.users,
+            &doc.server.policy, material.verified(), Arc::from(material.signed()))?);
+        Self::from_shared(listener, lease, context, now)
     }
 
-    fn from_lease(listener: TcpListener, inbound: &Inbound, users: &[User], policy: &ServerPolicy,
-        lease: crate::reality_generation::Lease, now: u64) -> Result<Self, ServerError> {
+    pub(crate) fn from_shared(listener: TcpListener, lease: Arc<crate::reality_generation::Lease>,
+        context: Arc<ServerContext>, now: u64) -> Result<Self, ServerError> {
         let publication = lease.publication();
         // Single identity only for this backend candidate: never silently
         // select the wrong signer during a dual-key overlap.
@@ -330,8 +333,6 @@ impl PreparedTcp {
         // Admission is checked exactly once by the TCP first-flight
         // dispatcher, not again by the TLS callback.
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-        let context = Arc::new(ServerContext::identity_context(inbound, users, policy, value,
-            Arc::from(material.signed()))?);
         let guard = Arc::new(ReplayGuard::new(65536, now).map_err(|_| ServerError::Config)?);
         Ok(Self { listener, acceptor, context, lease, guard,
             relay: Arc::new(RelayGate::default()), inspection_slots: Arc::new(Semaphore::new(64)) })

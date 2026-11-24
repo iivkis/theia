@@ -54,11 +54,21 @@ fn load_file(
         .map_err(|_| ClientError::Configuration)
 }
 
+fn read_token(profile: &Profile) -> Result<zeroize::Zeroizing<String>, ClientError> {
+    let token = if let Some(name) = profile.auth_token.strip_prefix("env:") {
+        zeroize::Zeroizing::new(std::env::var(name).map_err(|_| ClientError::Configuration)?)
+    } else {
+        let bytes = load_file(&profile.auth_token, 43, true)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?;
+        zeroize::Zeroizing::new(text.to_owned())
+    };
+    if token.len() != 43 { return Err(ClientError::Configuration); }
+    Ok(token)
+}
+
 async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
     if profile.tls_profile == "smart-reality" || profile.reality_profile.is_some() {
-        // The current carrier does not implement the external admission contract.
-        // Fail before any credential read, connection or system proxy change.
-        return Err(ClientError::Configuration);
+        return RealityClient::prepare(profile).await.map(Arc::new).map(ProxyClient::Reality);
     }
     let cert = load_file(
         profile
@@ -74,14 +84,8 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             .add(cert.map_err(|_| ClientError::Configuration)?)
             .map_err(|_| ClientError::Configuration)?;
     }
-    let token = if let Some(name) = profile.auth_token.strip_prefix("env:") {
-        zeroize::Zeroizing::new(std::env::var(name).map_err(|_| ClientError::Configuration)?)
-    } else {
-        let bytes = load_file(&profile.auth_token, 43, true)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?;
-        zeroize::Zeroizing::new(text.to_owned())
-    };
-    if token.len() != 43 || roots.is_empty() {
+    let token = read_token(profile)?;
+    if roots.is_empty() {
         return Err(ClientError::Configuration);
     }
     // F-13: runtime selection must match strict typed TOML validation even
@@ -194,6 +198,133 @@ enum ProxyClient {
     H2(Arc<H2Client>),
     H3(Arc<H3Client>),
     Auto(Arc<AutoClient>),
+    Reality(Arc<RealityClient>),
+}
+
+
+/// A pinned endpoint and trust-store generation for the production proxy.
+/// New logical tunnels re-read the persistent trust floor. A changed
+/// descriptor creates new carrier pools and an independent fallback cache;
+/// established tunnels retain their own transport leases.
+enum RealityCarrier {
+    H2(Arc<H2Client>),
+    H3(Arc<H3Client>),
+    Auto(Arc<AutoClient>),
+}
+struct RealityGeneration {
+    value: crate::descriptor::Verified,
+    carrier: RealityCarrier,
+}
+struct RealityClient {
+    profile: Profile,
+    remote: SocketAddr,
+    current: tokio::sync::Mutex<Arc<RealityGeneration>>,
+    changed: Notify,
+}
+impl RealityClient {
+    fn now() -> Result<u64, ClientError> {
+        crate::reference_health::unix_now().map_err(|_| ClientError::Tls)
+    }
+    async fn prepare(profile: &Profile) -> Result<Self, ClientError> {
+        // No DNS/credential use before the enrollment and independent trust
+        // anchor have been checked.
+        let enrollment = crate::reality_config::pinned_client(profile).map_err(|_| ClientError::Configuration)?;
+        let value = enrollment.load(Self::now()?).map_err(|_| ClientError::Tls)?;
+        let remote = resolve_server(profile).await?;
+        let first = Self::build(profile, remote, &enrollment, value)?;
+        Ok(Self { profile: profile.clone(), remote, current: tokio::sync::Mutex::new(Arc::new(first)),
+            changed: Notify::new() })
+    }
+    fn build(profile: &Profile, remote: SocketAddr, enrollment: &crate::reality_bootstrap::Profile,
+        value: crate::descriptor::Verified) -> Result<RealityGeneration, ClientError> {
+        if value.descriptor().scope.endpoint != profile.server { return Err(ClientError::Configuration); }
+        let secret = Arc::new(enrollment.admission().map_err(|_| ClientError::Tls)?);
+        let token = read_token(profile)?;
+        let modes = value.effective_modes();
+        let ttl = Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s));
+        let timeout = Duration::from_millis(u64::from(profile.quic_connect_timeout_ms));
+        let h2 = if modes.h2 {
+            Some(Arc::new(H2Client::admitted_runtime(remote, &token, &value, secret.clone())?
+                .with_connection_pool()))
+        } else { None };
+        let h3 = if modes.h3 {
+            Some(Arc::new(H3Client::admitted_runtime(remote, &token, &value, secret)?
+                .with_connect_timeout(timeout)?.with_connection_pool()))
+        } else { None };
+        let carrier = match (h2,h3) {
+            (Some(h2),Some(h3)) => RealityCarrier::Auto(Arc::new(AutoClient {
+                h2, h3, ttl, negative: Mutex::new(NegativeCache::default()), cache_changed: Notify::new(),
+            })),
+            (Some(h2),None) => RealityCarrier::H2(h2),
+            (None,Some(h3)) => RealityCarrier::H3(h3),
+            _ => return Err(ClientError::Configuration),
+        };
+        Ok(RealityGeneration { value, carrier })
+    }
+    async fn generation(&self) -> Result<Arc<RealityGeneration>, ClientError> {
+        let mut slot = self.current.lock().await;
+        let enrollment = crate::reality_config::pinned_client(&self.profile).map_err(|_| ClientError::Configuration)?;
+        let value = enrollment.load(Self::now()?).map_err(|_| ClientError::Tls)?;
+        let old = &slot.value;
+        if old.descriptor().scope != value.descriptor().scope
+            || value.descriptor().revision < old.descriptor().revision { return Err(ClientError::Tls); }
+        if old.signer() == value.signer() {
+            if old.compare(&value).map_err(|_| ClientError::Tls)? == crate::descriptor::Change::Unchanged {
+                return Ok(slot.clone());
+            }
+        } else if value.descriptor().revision <= old.descriptor().revision {
+            return Err(ClientError::Tls);
+        }
+        let next = Arc::new(Self::build(&self.profile, self.remote, &enrollment, value)?);
+        *slot = next.clone();
+        self.changed.notify_one();
+        Ok(next)
+    }
+    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+        let generation = self.generation().await?;
+        match &generation.carrier {
+            RealityCarrier::H2(h2) => h2.open(address, port).await.map(Box::new).map(ProxyTunnel::H2),
+            RealityCarrier::H3(h3) => h3.open(address, port).await.map(Box::new).map(ProxyTunnel::H3),
+            RealityCarrier::Auto(auto) => auto.open(address, port).await,
+        }
+    }
+    async fn refresh(&self, generation: &RealityGeneration) -> Result<(), ClientError> {
+        let enrollment = crate::reality_config::pinned_client(&self.profile).map_err(|_| ClientError::Configuration)?;
+        let store = enrollment.store().map_err(|_| ClientError::Tls)?;
+        let signed = match &generation.carrier {
+            RealityCarrier::H2(h2) => h2.fetch_identity_descriptor().await?,
+            RealityCarrier::H3(h3) => h3.fetch_identity_descriptor().await?,
+            // Descriptor refresh must preserve identity; use the permitted
+            // H2 carrier, never a CA-verified or arbitrary discovery request.
+            RealityCarrier::Auto(auto) => auto.h2.fetch_identity_descriptor().await?,
+        };
+        store.update_matching(&signed, &generation.value, Self::now()?).map_err(|_| ClientError::Tls)?;
+        Ok(())
+    }
+    async fn maintain(&self) -> Result<(), ClientError> {
+        loop {
+            let generation = match self.generation().await {
+                Ok(value) => value,
+                Err(_) => { tokio::time::sleep(Duration::from_secs(30)).await; continue; }
+            };
+            let background = async {
+                match &generation.carrier {
+                    RealityCarrier::Auto(auto) => auto.maintain().await,
+                    _ => std::future::pending::<Result<(),ClientError>>().await,
+                }
+            };
+            tokio::select! {
+                _ = self.changed.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    // No stale update can overwrite a new store revision;
+                    // update_matching performs a full CAS. Failure never
+                    // authorizes use of an expired/rolled-back generation.
+                    let _ = self.refresh(&generation).await;
+                }
+                result = background => return result,
+            }
+        }
+    }
 }
 
 /// The OS chooses the UDP source address for the pinned server. Connecting
@@ -503,6 +634,7 @@ impl ProxyClient {
                 .map(Box::new)
                 .map(ProxyTunnel::H3),
             Self::Auto(client) => client.open(address, port).await,
+            Self::Reality(client) => client.open(address, port).await,
         }
     }
 }
@@ -696,6 +828,7 @@ async fn serve_proxy(
     let maintenance = async {
         match &client {
             ProxyClient::Auto(auto) => auto.maintain().await,
+            ProxyClient::Reality(reality) => reality.maintain().await,
             _ => std::future::pending::<Result<(), ClientError>>().await,
         }
     };

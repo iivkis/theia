@@ -100,6 +100,19 @@ impl H3Client {
         Self::identity_carrier(remote, name, token, value, quic)
     }
 
+    pub(crate) fn admitted_runtime(
+        remote: SocketAddr, token: &str, value: &crate::descriptor::Verified,
+        secret: Arc<crate::reality_admission::Secret>,
+    ) -> Result<Self, ClientError> {
+        let d = value.descriptor();
+        if remote.port() == 0 || remote.ip().is_unspecified() || !value.effective_modes().h3 {
+            return Err(ClientError::Configuration);
+        }
+        let name = &d.references.get(usize::from(d.active_reference)).ok_or(ClientError::Configuration)?.server_name;
+        let quic = crate::identity_tls::admitted_quic_client(value, secret).map_err(|_| ClientError::Tls)?;
+        Self::identity_carrier(remote, name, token, value, quic)
+    }
+
     fn identity_carrier(
         remote: SocketAddr, name: &str, token: &str, value: &crate::descriptor::Verified,
         quic: quinn::ClientConfig,

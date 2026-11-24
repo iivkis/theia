@@ -178,6 +178,19 @@ impl H2Client {
         Self::identity_carrier(remote, name, token, value, tls)
     }
 
+    pub(crate) fn admitted_runtime(
+        remote: std::net::SocketAddr, token: &str, value: &crate::descriptor::Verified,
+        secret: Arc<crate::reality_admission::Secret>,
+    ) -> Result<Self, ClientError> {
+        let d = value.descriptor();
+        if remote.port() == 0 || remote.ip().is_unspecified() || !value.effective_modes().h2 {
+            return Err(ClientError::Configuration);
+        }
+        let name = &d.references.get(usize::from(d.active_reference)).ok_or(ClientError::Configuration)?.server_name;
+        let tls = crate::identity_tls::admitted_client_tls(value, crate::identity_tls::Branch::H2, secret).map_err(|_| ClientError::Tls)?;
+        Self::identity_carrier(remote, name, token, value, tls)
+    }
+
     fn identity_carrier(
         remote: std::net::SocketAddr, name: &str, token: &str, value: &crate::descriptor::Verified,
         tls: rustls::ClientConfig,

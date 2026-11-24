@@ -242,6 +242,11 @@ impl ServerContext {
         value: &crate::descriptor::Verified,
         signed: Arc<str>,
     ) -> Result<Self, ServerError> {
+        Self::new(inbound, users, policy).with_identity(inbound, value, signed)
+    }
+
+    fn with_identity(mut self, inbound: &Inbound, value: &crate::descriptor::Verified,
+        signed: Arc<str>) -> Result<Self, ServerError> {
         let d = value.descriptor();
         if !(inbound.security_mode.is_plain() || inbound.security_mode == crate::security_profile::SecurityMode::SmartReality)
             || inbound.id != d.scope.inbound
@@ -254,8 +259,7 @@ impl ServerContext {
         }
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
-        let mut context = Self::new(inbound, users, policy);
-        context.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
+        self.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
             paths,
             stream_one: d.stream_one,
             stream_up: d.stream_up,
@@ -266,7 +270,7 @@ impl ServerContext {
             descriptor: d.clone(),
             digest: value.payload_sha256(),
         }));
-        Ok(context)
+        Ok(self)
     }
 
     /// Controlled loopback fixture only. Update a compatible signed
@@ -1673,6 +1677,9 @@ pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
         "config_valid",
         "inbounds" = Value::Count(document.server.inbounds.len() as u64)
     );
+    if has_reality(&document) {
+        return run_reality_document(document).await;
+    }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         run_supervised_file(document, config_path).await
@@ -2359,6 +2366,107 @@ async fn run_supervised_file(
     }
 }
 
+
+fn has_reality(document: &ServerDocument) -> bool {
+    document.server.inbounds.iter().any(|i|
+        i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some())
+}
+
+/// Prepare every inbound before accepting any traffic. REALITY material is
+/// captured once for both transports, and every inbound shares accounting.
+/// The current REALITY generation is immutable; ordinary own-TLS hot
+/// replacement cannot mutate it. Management is status-only in this mode.
+async fn run_reality_document(document: ServerDocument) -> Result<(), ServerError> {
+    let config = Config::Server(document.clone());
+    config.validate().map_err(|_| ServerError::Config)?;
+    if !document.server.enabled { return Err(ServerError::Config); }
+    let live = Arc::new(LiveAuthorization::new(document.clone()).map_err(|_| ServerError::Config)?);
+    let policy = &document.server.policy;
+    let global = Arc::new(Semaphore::new(policy.max_connections_total as usize));
+    let connections = Arc::new(Semaphore::new(policy.max_connections_total as usize));
+    let peers = Arc::new(PeerBudget::default());
+    let users = Arc::new(document.server.users.iter().map(|user|
+        (user.id.clone(), Arc::new(Semaphore::new(policy.max_connections_per_user as usize))))
+        .collect::<HashMap<_,_>>());
+    enum Ready {
+        Plain(TcpListener, TlsAcceptor, quinn::Endpoint, Arc<ServerContext>),
+        Reality(crate::reality_tcp::PreparedTcp, Option<crate::reality_quic::PreparedQuic>,
+            Option<tokio::net::UdpSocket>),
+    }
+    let mut ready = Vec::with_capacity(document.server.inbounds.len());
+    for inbound in &document.server.inbounds {
+        let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
+        let udp_addr: SocketAddr = inbound.quic_listen.parse().map_err(|_| ServerError::Config)?;
+        let listener = crate::tcp_bbr::bind(tcp_addr).map_err(|error| match error {
+            crate::tcp_bbr::Error::Network => ServerError::Io,
+            crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
+        })?;
+        let context = ServerContext::with_limits(inbound, policy, live.shared(), global.clone(),
+            users.clone(), connections.clone(), peers.clone());
+        if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
+            let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
+            let manager = crate::reality_generation::Manager::new(&config, &inbound.id, now)
+                .map_err(|_| ServerError::Config)?;
+            let generation = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
+            let publication = generation.publication();
+            if publication.next().is_some() { return Err(ServerError::Config); }
+            let material = publication.active();
+            let value = material.verified();
+            let h3 = value.descriptor().h3;
+            let context = Arc::new(context.with_identity(inbound, value, Arc::from(material.signed()))?);
+            let tcp = crate::reality_tcp::PreparedTcp::from_shared(listener, generation.clone(),
+                context.clone(), now)?;
+            let udp = tokio::net::UdpSocket::bind(udp_addr).await.map_err(|_| ServerError::Io)?;
+            let (quic, silent) = if h3 {
+                (Some(crate::reality_quic::PreparedQuic::from_shared(udp, generation,
+                    context, now)?), None)
+            } else {
+                // Keep the approved UDP port reserved; no H3 advertisement,
+                // no TLS response and no speculative reference forwarding.
+                (None, Some(udp))
+            };
+            ready.push(Ready::Reality(tcp, quic, silent));
+        } else {
+            let material = tls_material(inbound)?;
+            let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
+            let endpoint = crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
+                .map_err(|_| ServerError::Tls)?;
+            ready.push(Ready::Plain(listener, acceptor, endpoint, Arc::new(context)));
+        }
+    }
+    // Status-only IPC. No reload/rollback request can pass through an
+    // own-TLS preflight and accidentally replace a REALITY generation.
+    #[cfg(target_os = "linux")]
+    let management = crate::management::StatusServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?;
+    #[cfg(target_os = "windows")]
+    let management = crate::windows_control::WindowsServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?;
+    let mut tasks = JoinSet::new();
+    let mut silent_sockets = Vec::new();
+    for item in ready {
+        match item {
+            Ready::Plain(listener, acceptor, endpoint, context) => {
+                tasks.spawn(serve(listener, acceptor, context.clone()));
+                tasks.spawn(crate::h3_server::serve(endpoint, context));
+            }
+            Ready::Reality(tcp, quic, silent) => {
+                tasks.spawn(tcp.serve());
+                if let Some(quic) = quic { tasks.spawn(quic.serve()); }
+                if let Some(socket) = silent { silent_sockets.push(socket); }
+            }
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if let Some(management) = management {
+        tasks.spawn(async move { management.serve().await.map_err(|_| ServerError::Io) });
+    }
+    let result = match tasks.join_next().await {
+        Some(Ok(result)) => result,
+        _ => Err(ServerError::Io),
+    };
+    drop(silent_sockets);
+    result
+}
+
 pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
     run_document_with_config(document, None).await
 }
@@ -2369,8 +2477,10 @@ async fn run_document_with_config(
 ) -> Result<(), ServerError> {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = config_path;
-    if !document.server.enabled || document.server.inbounds.iter().any(|i|
-        i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
+    if has_reality(&document) {
+        return run_reality_document(document).await;
+    }
+    if !document.server.enabled {
         return Err(ServerError::Config);
     }
     // One shared authorization snapshot for every H2/H3 inbound.
