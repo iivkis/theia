@@ -509,3 +509,122 @@ async fn real_tls_h2_channel_supports_independent_pinned_ed25519_identity_proof(
     .await
     .expect("research-only independent TLS exporter identity proof bounded by deadline");
 }
+
+/// Two actual verified QUIC connections to the same listener must not share
+/// exporter-bound proofs, even when the research replay cache is recreated.
+/// This checks channel binding, not persistent or distributed replay storage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h3_identity_proof_is_bound_to_live_connection_after_cache_reset() {
+    use f18_identity_lab::{Branch, Failure, ReplayWindow, Transcript};
+    use ring::{
+        rand::{SecureRandom, SystemRandom},
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+
+    timeout(DEADLINE, async {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let signer = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pinned: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let server = server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![der.clone()],
+            key.into(),
+        )
+        .unwrap();
+        let remote = server.local_addr().unwrap();
+
+        let mut exporters = [[0u8; 32]; 2];
+        for exporter in &mut exporters {
+            // A fresh endpoint deliberately avoids session-ticket reuse.
+            let mut roots = RootCertStore::empty();
+            roots.add(der.clone()).unwrap();
+            let client = client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let (mut server_exporter, ()) = tokio::join!(
+                async {
+                    let incoming = server.accept().await.unwrap();
+                    let connection = accept_quic(incoming).await.unwrap();
+                    let mut derived = [0u8; 32];
+                    connection
+                        .export_keying_material(&mut derived, EXPORTER_LABEL, CONTEXT)
+                        .unwrap();
+                    done_rx.await.unwrap();
+                    connection.close(0u32.into(), b"finished");
+                    derived
+                },
+                async {
+                    let connection = connect_quic(&client, remote, "localhost").await.unwrap();
+                    connection
+                        .export_keying_material(exporter, EXPORTER_LABEL, CONTEXT)
+                        .unwrap();
+                    done_tx.send(()).unwrap();
+                }
+            );
+            assert!(*exporter == server_exporter, "peer exporter mismatch");
+            server_exporter.zeroize();
+            client.close(0u32.into(), b"done");
+        }
+        assert!(
+            exporters[0] != exporters[1],
+            "independent verified sessions must have distinct exporters"
+        );
+
+        let mut client_nonce = [0u8; 32];
+        let mut server_nonce = [0u8; 32];
+        rng.fill(&mut client_nonce).unwrap();
+        rng.fill(&mut server_nonce).unwrap();
+        let mut original = Transcript::new(
+            Branch::H3,
+            "localhost",
+            remote.port(),
+            client_nonce,
+            server_nonce,
+            exporters[0],
+            10_000,
+        )
+        .unwrap();
+        let original_signature = signer.sign(&original.encode());
+        let mut seen = ReplayWindow::new(1).unwrap();
+        assert_eq!(
+            seen.accept(&pinned, &original, original_signature.as_ref(), 10_000),
+            Ok(())
+        );
+        assert_eq!(
+            seen.accept(&pinned, &original, original_signature.as_ref(), 10_001),
+            Err(Failure::Replay)
+        );
+
+        // Keep every other signed field identical to isolate the channel
+        // binding. The verifier uses the new connection's local exporter,
+        // not a value supplied by an untrusted peer.
+        let mut rebound = original.clone();
+        rebound.exporter = exporters[1];
+        let mut reset = ReplayWindow::new(1).unwrap();
+        assert_eq!(
+            reset.accept(&pinned, &rebound, original_signature.as_ref(), 10_001),
+            Err(Failure::InvalidProof)
+        );
+        // An invalid proof must not consume the sole replay-cache slot.
+        let new_signature = signer.sign(&rebound.encode());
+        assert_eq!(
+            reset.accept(&pinned, &rebound, new_signature.as_ref(), 10_001),
+            Ok(())
+        );
+        assert_eq!(
+            reset.accept(&pinned, &rebound, new_signature.as_ref(), 10_002),
+            Err(Failure::Replay)
+        );
+        original.exporter.zeroize();
+        rebound.exporter.zeroize();
+        exporters.zeroize();
+        client_nonce.zeroize();
+        server_nonce.zeroize();
+        server.close(0u32.into(), b"done");
+    })
+    .await
+    .expect("research-only reconnect proof completed within deadline");
+}
