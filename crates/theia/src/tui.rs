@@ -277,7 +277,7 @@ impl RecordFlow {
                     };
                     body.push_str(&format!("{marker} {label}: {shown}\n"));
                 }
-                body.push_str("\nTab/Shift+Tab: поле; Enter: preview; Esc: отменить.\nВ скрытые поля вводите только ссылки, не секреты.");
+                body.push_str("\nTab/Shift+Tab: поле; Ctrl+U: очистить; Enter: preview; Esc: отменить.\nВ скрытые поля вводите только ссылки, не секреты.");
                 body
             }
         }
@@ -413,6 +413,17 @@ impl Interaction {
             let saved = editor.refresh_credential(&invitation).is_ok();
             let _ = tx.send((editor, saved));
         });
+    }
+
+    fn paste_record_field(&mut self, text: &str) {
+        if let Some(RecordFlow::Input { fields, focus, .. }) = self.records.as_mut() {
+            let input = text.trim_end_matches(['\r', '\n']);
+            if !input.chars().any(char::is_control)
+                && fields[*focus].len().saturating_add(input.len()) <= 1024
+            {
+                fields[*focus].push_str(input);
+            }
+        }
     }
 
     /// Bracketed-paste source text stays in memory and is never rendered.
@@ -703,7 +714,12 @@ impl Interaction {
                         },
                         KeyCode::Tab => focus = (focus + 1) % fields.len(),
                         KeyCode::BackTab => focus = (focus + fields.len() - 1) % fields.len(),
-                        KeyCode::Backspace => { fields[focus].pop(); }
+                        KeyCode::Backspace => {
+                            fields[focus].pop();
+                        }
+                        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                            fields[focus].clear();
+                        }
                         KeyCode::Char(ch)
                             if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                                 && !ch.is_control()
@@ -1464,8 +1480,15 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     } else if let Some(flow) = interaction.and_then(|ui| ui.records.as_ref()) {
         let mut body = flow.body();
-        if let Some(error) = interaction.and_then(|ui| ui.editor.as_ref()).and_then(|editor| editor.error.as_deref()) {
-            body.push_str(&format!("\n\n{error}"));
+        if let Some(editor) = interaction.and_then(|ui| ui.editor.as_ref()) {
+            if let Some(error) = editor.error.as_deref() {
+                body.push_str(&format!("\n\n{error}"));
+            }
+            if let RecordFlow::Input { action, .. } = flow {
+                if let Some(catalog) = editor.record_user_catalog(*action) {
+                    body.push_str(&format!("\n\n{catalog}"));
+                }
+            }
         }
         panel(frame, parts[1], "Управление записями TOML", &body, true);
     } else if let Some(flow) = interaction.and_then(|ui| ui.issuance.as_ref()) {
@@ -1877,7 +1900,10 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
                         return Ok(());
                     }
                 }
-                Event::Paste(text) => interaction.paste_import_source(&text),
+                Event::Paste(text) => {
+                    interaction.paste_record_field(&text);
+                    interaction.paste_import_source(&text);
+                }
                 _ => {}
             }
         }
@@ -2263,6 +2289,57 @@ mod tests {
             .map(|line| line.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn record_modal_masks_references_and_requires_separate_save_confirmation() {
+        use crate::config::{self, Config};
+        use std::{fs, thread, time::Instant};
+
+        let path = std::env::temp_dir().join(format!(
+            "theia-record-lifecycle-ui-{}.toml",
+            std::process::id()
+        ));
+        let original = include_str!("../../../examples/client.toml");
+        fs::write(&path, original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+
+        ui.update(&mut model, press(KeyCode::Char('E')));
+        assert!(matches!(ui.records, Some(RecordFlow::Input { .. })));
+        ui.paste_record_field("file:/private/ca.pem");
+        ui.update(&mut model, press(KeyCode::Tab));
+        ui.paste_record_field("env:PRIVATE_CREDENTIAL");
+        let rendered = rendered_interaction(120, 40, &model, &ui);
+        assert!(rendered.contains("скрыто"));
+        assert!(!rendered.contains("PRIVATE_CREDENTIAL"));
+        assert!(!rendered.contains("/private/ca.pem"));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.records, Some(RecordFlow::Confirm(_))));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.records.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        ui.update(&mut model, press(KeyCode::Char('E')));
+        ui.paste_record_field("file:/private/ca.pem");
+        ui.update(&mut model, press(KeyCode::Tab));
+        ui.paste_record_field("env:PRIVATE_CREDENTIAL");
+        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        let until = Instant::now() + Duration::from_secs(5);
+        while ui.saving.is_some() && Instant::now() < until {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ui.saving.is_none());
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        let Config::Client(doc) = config::read_file(&path).unwrap() else {
+            panic!("client fixture");
+        };
+        assert_eq!(doc.client.profiles[0].auth_token, "env:PRIVATE_CREDENTIAL");
+        assert_eq!(doc.client.profiles[0].tls_ca.as_deref(), Some("file:/private/ca.pem"));
+        fs::remove_file(&path).unwrap();
+        let _ = fs::remove_file(config::lock_path(&path).unwrap());
     }
 
     #[test]

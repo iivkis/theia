@@ -683,6 +683,31 @@ impl Editor {
         Ok(())
     }
 
+    pub(crate) fn record_user_catalog(&self, action: RecordAction) -> Option<String> {
+        if !matches!(
+            action,
+            RecordAction::NewInbound | RecordAction::SetGrants | RecordAction::DeleteUser
+        ) {
+            return None;
+        }
+        let Config::Server(doc) = &self.original else {
+            return None;
+        };
+        let users = doc
+            .server
+            .users
+            .iter()
+            .map(|user| {
+                if user.disabled {
+                    format!("{} (отключён)", user.id)
+                } else {
+                    user.id.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        Some(format!("Каталог пользователей: {}", users.join(", ")))
+    }
+
     pub(crate) fn record_fields(
         &self,
         action: RecordAction,
@@ -1456,6 +1481,74 @@ mod tests {
             panic!("server fixture");
         };
         assert_eq!(doc.server.users.len(), 1);
+    }
+
+    #[test]
+    fn record_grants_and_user_deletion_are_independent_confirmed_changes() {
+        let Config::Server(mut doc) = config::parse(&two_inbounds()).unwrap() else {
+            panic!("server fixture");
+        };
+        doc.server.users.push(User {
+            id: "other".into(),
+            token_sha256: format!("{:x}", Sha256::digest([0x43; 32])),
+            disabled: false,
+        });
+        let fixture = Temp::write(&Config::Server(doc).to_toml().unwrap());
+        let mut editor = Editor::load(Role::Server, &fixture.0).unwrap();
+        assert!(editor.record_fields(RecordAction::NewProfile).is_err());
+        let catalog = editor.record_user_catalog(RecordAction::SetGrants).unwrap();
+        assert!(catalog.contains("other"));
+        assert!(!catalog.contains(&format!("{:x}", Sha256::digest([0x43; 32]))));
+        let review = editor
+            .review_record(RecordAction::SetGrants, &["other".into()])
+            .unwrap();
+        editor.select_record(true);
+        assert!(editor.stage_record(review).is_err());
+        assert!(!editor.dirty());
+        for _ in 0..2 {
+            let review = editor
+                .review_record(RecordAction::SetGrants, &["other".into()])
+                .unwrap();
+            editor.stage_record(review).unwrap();
+            assert!(editor.save());
+            editor.select_record(true);
+        }
+        let review = editor
+            .review_record(RecordAction::DeleteUser, &["device-a".into()])
+            .unwrap();
+        editor.stage_record(review).unwrap();
+        assert!(editor.save());
+        let Config::Server(doc) = config::read_file(&fixture.0).unwrap() else {
+            panic!("server fixture");
+        };
+        assert_eq!(doc.server.users.len(), 1);
+        assert_eq!(doc.server.users[0].id, "other");
+        assert!(doc.server.inbounds.iter().all(|i| i.allowed_user_ids == ["other"]));
+    }
+
+    #[test]
+    fn record_trust_edit_requires_explicit_refs_and_preserves_other_fields() {
+        let fixture = Temp::write(&two_profiles());
+        let mut editor = Editor::load(Role::Client, &fixture.0).unwrap();
+        let before = config::read_file(&fixture.0).unwrap();
+        assert!(editor
+            .review_record(RecordAction::EditTrust, &["".into(), "env:NEW".into()])
+            .is_err());
+        assert!(editor
+            .review_record(RecordAction::EditTrust, &["file:/new/ca.pem".into(), "literal-token".into()])
+            .is_err());
+        let review = editor
+            .review_record(RecordAction::EditTrust, &["file:/new/ca.pem".into(), "env:NEW".into()])
+            .unwrap();
+        assert!(!review.body().contains("env:NEW"));
+        editor.stage_record(review).unwrap();
+        assert!(editor.save());
+        let Config::Client(mut expected) = before else {
+            panic!("client fixture");
+        };
+        expected.client.profiles[0].tls_ca = Some("file:/new/ca.pem".into());
+        expected.client.profiles[0].auth_token = "env:NEW".into();
+        assert_eq!(config::read_file(&fixture.0).unwrap(), Config::Client(expected));
     }
 
     fn uncertain_failure() -> config::WriteFailure {
