@@ -45,6 +45,7 @@ pub struct Prepared {
 
 impl Prepared {
     pub fn approval_sha256(&self) -> [u8; 32] { self.approval_sha256 }
+    pub(crate) fn source_sha256(&self) -> [u8; 32] { Sha256::digest(&self.original).into() }
     pub fn report(&self) -> &str { &self.report }
     pub fn candidate(&self) -> &Config { &self.candidate }
 }

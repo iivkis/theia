@@ -673,7 +673,7 @@ impl Editor {
         }
     }
 
-    fn require_clean_records(&self) -> Result<(), &'static str> {
+    pub(crate) fn require_clean_records(&self) -> Result<(), &'static str> {
         if self.editing || self.dirty() || self.issued.is_some() {
             return Err("Сначала завершите или отмените редактирование и выдачу.");
         }
@@ -1228,7 +1228,6 @@ impl Editor {
         Sha256::digest(&self.source).into()
     }
 
-    #[cfg(windows)]
     pub(crate) fn saved_path(&self) -> &Path {
         &self.path
     }
