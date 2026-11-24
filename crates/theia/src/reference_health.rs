@@ -553,6 +553,10 @@ impl State {
         self.revision
     }
 
+    pub fn last_checked_at(&self) -> u64 {
+        self.last_checked_at
+    }
+
     /// Evidence digest binds the exact approved pins, check timestamp,
     /// revision and observed transport status for a guarded preview.
     pub fn snapshot_sha256(&self) -> Result<[u8; 32], Error> {

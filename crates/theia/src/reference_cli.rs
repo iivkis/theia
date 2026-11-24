@@ -13,6 +13,8 @@ theia reference enroll --plan PATH --store PATH --sha256 HEX --confirm\n\
 theia reference inspect --store PATH\n\
 theia reference recheck --store PATH --expected-revision N --plan-sha256 HEX --confirm\n\
 theia reference monitor --store PATH --plan-sha256 HEX --confirm\n\
+theia reference publication-status --store PATH --publication PATH --plan-sha256 HEX\n\
+theia reference publication-monitor --store PATH --publication PATH --plan-sha256 HEX --confirm-refresh\n\
 Plan TOML: schema_version=1, inbound, endpoint, own_ips=[all known public/NAT and local server IPs], [[references]] server_name, address (exact public IP:443). Primary first, at most two reserves.\n\
 Preview binds exact plan bytes; inspect displays canonical plan SHA for rechecks. Confirm permission for each target, inbound endpoint DNS, reference DNS, and H2/H3 HEAD /. Checks never follow redirects or send credentials. Monitor checks at a jittered 12h interval until Ctrl+C. No automatic reference switch, runtime Apply, or trust changes.";
 
@@ -24,12 +26,15 @@ pub enum Action {
     Inspect,
     Recheck(u64, [u8; 32]),
     Monitor([u8; 32]),
+    PublicationStatus([u8; 32]),
+    PublicationMonitor([u8; 32]),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command {
     plan: Option<String>,
     store: Option<String>,
+    publication: Option<String>,
     action: Action,
 }
 
@@ -45,6 +50,17 @@ fn hash(raw: &str) -> Result<[u8; 32], CliError> {
 }
 
 pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
+    if let [kind @ ("publication-status" | "publication-monitor"), "--store", s, "--publication", p, "--plan-sha256", h, rest @ ..] = args {
+        let action = match (*kind, rest) {
+            ("publication-status", []) => Action::PublicationStatus(hash(h)?),
+            ("publication-monitor", ["--confirm-refresh"]) => Action::PublicationMonitor(hash(h)?),
+            _ => return Err(CliError::InvalidArguments),
+        };
+        let store = path(s)?;
+        let publication = path(p)?;
+        if store == publication { return Err(CliError::InvalidArguments); }
+        return Ok(Command { plan: None, store: Some(store), publication: Some(publication), action });
+    }
     let (plan, store, action) = match args {
         ["preview", "--plan", p] => (Some(*p), None, Action::Preview),
         ["check", "--plan", p, "--sha256", h, "--confirm"] => {
@@ -67,6 +83,7 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
     Ok(Command {
         plan: plan.map(path).transpose()?,
         store: store.map(path).transpose()?,
+        publication: None,
         action,
     })
 }
@@ -171,6 +188,15 @@ pub async fn run(command: Command) -> Result<String, Error> {
             state_report(&get_store()?.recheck(revision, expected).await?)
         }
         Action::Monitor(expected) => monitor(get_store()?, expected).await,
+        Action::PublicationStatus(expected) | Action::PublicationMonitor(expected) => {
+            let path = command.publication.as_deref().ok_or(Error::Format)?;
+            let publication = crate::identity_publication::Publication::new(Path::new(path)).map_err(|_| Error::Storage)?;
+            if matches!(command.action, Action::PublicationStatus(_)) {
+                crate::reference_maintenance::inspect(get_store()?, &publication, expected, health::unix_now()?).map(|value| value.report())
+            } else {
+                crate::reference_maintenance::monitor(get_store()?, &publication, expected).await
+            }
+        }
     }
 }
 
@@ -222,6 +248,24 @@ mod tests {
             "--confirm"
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn publication_monitor_requires_separate_explicit_refresh_consent() {
+        let dir = std::env::temp_dir();
+        let store = dir.join("state.toml");
+        let publication = dir.join("publication.toml");
+        let digest = "01".repeat(32);
+        let args = ["publication-monitor", "--store", store.to_str().unwrap(), "--publication", publication.to_str().unwrap(), "--plan-sha256", &digest];
+        assert!(parse(&args).is_err());
+        let mut confirmed = args.to_vec();
+        confirmed.push("--confirm-refresh");
+        assert!(parse(&confirmed).is_ok());
+        confirmed[4] = store.to_str().unwrap();
+        assert!(parse(&confirmed).is_err());
+        let mut status = args;
+        status[0] = "publication-status";
+        assert!(parse(&status).is_ok());
     }
 
     #[tokio::test]
