@@ -1119,7 +1119,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = format!("Software\\TheiaProxyPolicyTest-{}-{stamp}", std::process::id());
+        let path = format!(
+            "Software\\TheiaProxyPolicyTest-{}-{stamp}",
+            std::process::id()
+        );
         struct Cleanup(String);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -1150,9 +1153,21 @@ mod tests {
         assert_eq!(require_per_user_scope_at(HKEY_CURRENT_USER, &path), Ok(()));
         for (kind, bytes, expected) in [
             (REG_DWORD, 1u32.to_le_bytes(), Ok(())),
-            (REG_DWORD, 0u32.to_le_bytes(), Err(ProxyError::PolicyManaged)),
-            (REG_DWORD, 2u32.to_le_bytes(), Err(ProxyError::PolicyManaged)),
-            (REG_BINARY, 1u32.to_le_bytes(), Err(ProxyError::PolicyManaged)),
+            (
+                REG_DWORD,
+                0u32.to_le_bytes(),
+                Err(ProxyError::PolicyManaged),
+            ),
+            (
+                REG_DWORD,
+                2u32.to_le_bytes(),
+                Err(ProxyError::PolicyManaged),
+            ),
+            (
+                REG_BINARY,
+                1u32.to_le_bytes(),
+                Err(ProxyError::PolicyManaged),
+            ),
         ] {
             assert_eq!(
                 unsafe {
@@ -1167,7 +1182,10 @@ mod tests {
                 },
                 0
             );
-            assert_eq!(require_per_user_scope_at(HKEY_CURRENT_USER, &path), expected);
+            assert_eq!(
+                require_per_user_scope_at(HKEY_CURRENT_USER, &path),
+                expected
+            );
         }
         assert_eq!(
             unsafe { RegDeleteValueW(key.0, wide(SCOPE_POLICY_VALUE).as_ptr()) },
