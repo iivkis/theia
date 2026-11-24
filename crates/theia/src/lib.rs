@@ -34,6 +34,7 @@ pub mod management;
 pub mod protocol;
 pub mod quic_transport;
 pub(crate) mod quota;
+pub mod reality_admission;
 pub mod reality_bootstrap;
 pub mod reality_cli;
 pub mod reference_cli;
