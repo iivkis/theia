@@ -111,3 +111,11 @@ Production-path H2/H3 identity proof before bearer, explicit separate Ed25519 ke
 ### ADR-0090 — BBR-first with CUBIC fallback
 
 Linux TCP_CONGESTION selection before connect/listen and real socket readback; CUBIC when BBR is unavailable. Windows native TCP continues with its OS-managed controller and CUBIC deployment preference. H3 retains available Quinn BBR. Keep full native and cross-host CI; measure actual H2/H3 performance separately. No user setting or global edits.
+
+### ADR-0091 — F-18 independent native acceptance slice
+
+Extend the existing mandatory cross-host fixture with a fourth, independent-key inbound. Generate standard Ed25519 DER on Linux, transfer only the public identities. Verify real Windows invitation import and byte-exact CONNECT/SOCKS5 relay on H2/H3/auto, wrong public key, bearer, trust and mode refusal. Add independent raw wire signature and one-response witnesses plus exact material fingerprint at local guarded save. No new CI job or dependency. Review packet documents open third-party candidate Apply, HTTP application evidence and independent audit; F-19 remains separate.
+
+### ADR-0092 — local REALITY provisioning
+
+G stages a protected fresh Ed25519 DER key for the selected enabled saved own inbound; preview uses the manual local validator, y saves with full material and source revalidation, n/Esc drops the staged key. Refuse automatic rotation of an existing REALITY profile. Keep independent candidate/active-probing and audit gates open. No new dependencies or jobs.

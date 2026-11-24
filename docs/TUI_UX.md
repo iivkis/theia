@@ -253,3 +253,11 @@ ADR-0087: the sole replacement theia://v1/ invitation explicitly represents Smar
 ### Independent own-key review (ADR-0089)
 
 On a clean saved server inbound, Y opens hidden input for an operator-provisioned absolute `file:` Ed25519 PKCS#8 DER key reference. Enter validates own TLS cert/key, name and separate identity key; preview displays public key/profile and never the key path or private bytes. y revalidates the original saved snapshot and identities before guarded save; n/Esc cancels. Existing restart/Apply is separate. No candidate is allowed to supply the local private key or silently change the local TLS identity. The external candidate review remains read-only until its independent security/evidence requirements are satisfied.
+
+### ADR-0091 local REALITY review
+
+Y still requires an explicit own key file and saved local inbound. The reviewed snapshot now binds exact certificate/chain PEM, TLS key PEM and independent Ed25519 DER bytes, not merely the leaf/public key. Both H2 and H3 TLS builders validate the same captured bytes; y re-reads and refuses any material drift before guarded TOML save. Runtime activation remains a separate explicit operation. Third-party candidate report is not a trusted local identity; no automatic configuration or activation from a TLS/ALPN observation.
+
+### ADR-0092 local provisioning wizard
+
+G: stage a new independent key for the selected saved own inbound. Review displays the validated inbound, endpoint, SNI and public identity only; y commits the same guarded local validator as Y, n/Esc cancels. No existing REALITY key is automatically rotated. On uncertain save, preserve the staged private key and require inspection. External candidate reports are not local key ownership; Apply remains blocked in their read-only view.

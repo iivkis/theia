@@ -178,6 +178,40 @@ mod tests {
     }
 
     #[test]
+    fn independent_identity_required_before_admission_and_issued_once() {
+        use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
+        let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = crate::reality_identity::Signer::from_der(der.as_ref()).unwrap();
+        let key = Zeroizing::new([4; 32]);
+        let upload = attach(Some(&key), request("POST", "/upload", "Bearer fixture")).unwrap();
+        let download = attach(Some(&key), request("GET", "/download", "Bearer fixture")).unwrap();
+        let binding = Admission::new(key.clone()).requiring_identity(true);
+        assert!(!binding.admit(&[&upload, &download]));
+        assert!(Admission::new(key.clone())
+            .identity_response(&signer)
+            .is_none());
+        let (one, two) = std::thread::scope(|scope| {
+            let one = scope.spawn(|| binding.identity_response(&signer));
+            let two = scope.spawn(|| binding.identity_response(&signer));
+            (one.join().unwrap(), two.join().unwrap())
+        });
+        let proof = match (one, two) {
+            (Some(proof), None) | (None, Some(proof)) => proof,
+            _ => panic!("one proof per connection"),
+        };
+        assert!(signer.public().verify(&key, &proof).is_ok());
+        assert!(binding.admit(&[&upload, &download]));
+        assert!(!binding.admit(&[&upload, &download]));
+        assert!(binding.identity_response(&signer).is_none());
+        let fresh = Admission::new(Zeroizing::new([5; 32])).requiring_identity(true);
+        assert!(!fresh.admit(&[&upload, &download]));
+        assert!(signer
+            .public()
+            .verify(&Zeroizing::new([5; 32]), &proof)
+            .is_err());
+    }
+
+    #[test]
     fn pair_proofs_are_independent_and_one_admission_wins_concurrent_race() {
         let key = Zeroizing::new([3; 32]);
         let upload = attach(Some(&key), request("POST", "/upload", "Bearer fixture")).unwrap();

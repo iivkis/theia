@@ -1299,7 +1299,7 @@ pub(crate) fn configured_certificate_pin(
 pub(crate) fn configured_reality_identity(
     inbound: &Inbound,
 ) -> Result<crate::reality_identity::PublicIdentity, ServerError> {
-    configured_reality_review(inbound).map(|(public, _)| public)
+    configured_reality_review(inbound).map(|(public, _, _)| public)
 }
 
 pub(crate) fn configured_reality_review(
@@ -1308,10 +1308,26 @@ pub(crate) fn configured_reality_review(
     (
         crate::reality_identity::PublicIdentity,
         crate::security_profile::CertificatePin,
+        [u8; 32],
     ),
     ServerError,
 > {
-    let material = tls_material(inbound)?;
+    let cert_bytes = pem_data(&inbound.tls_cert, false)?;
+    let key_bytes = pem_data(&inbound.tls_key, true)?;
+    let reality_bytes = crate::reality_identity::read_key(inbound.reality_key.as_deref())?
+        .ok_or(ServerError::Config)?;
+    let material = tls_material_from_bytes(inbound, &cert_bytes, &key_bytes, Some(&reality_bytes))?;
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(b"theia-reality-local-review-v1\0");
+    for chunk in [
+        cert_bytes.as_slice(),
+        key_bytes.as_slice(),
+        reality_bytes.as_slice(),
+    ] {
+        fingerprint.update((chunk.len() as u64).to_be_bytes());
+        fingerprint.update(chunk);
+    }
+    let fingerprint = fingerprint.finalize().into();
     let public = material
         .reality_signer
         .as_ref()
@@ -1319,8 +1335,10 @@ pub(crate) fn configured_reality_review(
         .public();
     let leaf = material.certs.first().ok_or(ServerError::Config)?;
     let pin = crate::security_profile::CertificatePin::from_der(leaf.as_ref());
-    let _ = tls_acceptor(material.certs, material.key)?;
-    Ok((public, pin))
+    let _ = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
+    let _ = crate::quic_transport::server_config(material.certs, material.key)
+        .map_err(|_| ServerError::Tls)?;
+    Ok((public, pin, fingerprint))
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {

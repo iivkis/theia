@@ -614,3 +614,157 @@ async fn reality_independent_identity_h2_h3_and_wrong_key_refusal() {
     .await
     .expect("bounded independent identity H2/H3 matrix");
 }
+
+// Independent wire verification of the actual Ed25519 proof. The witness
+// does not call the production identity request or verification helpers.
+fn check_identity_wire(identity: PublicIdentity, exporter: &[u8; 32], header: &HeaderValue) {
+    let key = URL_SAFE_NO_PAD.decode(identity.encoded()).unwrap();
+    let signature = URL_SAFE_NO_PAD.decode(header.as_bytes()).unwrap();
+    assert_eq!(signature.len(), 64);
+    let mut transcript = b"SmartTheia/REALITY/server-identity/v1\0".to_vec();
+    transcript.extend_from_slice(exporter);
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+        .verify(&transcript, &signature)
+        .unwrap();
+}
+
+fn raw_identity_request(path: &str) -> Request<()> {
+    Request::get(format!("https://localhost{path}"))
+        .body(())
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn independent_wire_identity_h2_h3_signature_scope_and_one_response() {
+    timeout(Duration::from_secs(30), async {
+        let fixture = Fixture::start(SecurityMode::SmartRealityV1).await;
+        let identity = fixture.identity.unwrap();
+        let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(fixture.roots.clone())
+        .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let mut witnesses = Vec::new();
+        for _ in 0..2 {
+            let tcp = tokio::net::TcpStream::connect(fixture.h2).await.unwrap();
+            let tls = connector
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                    tcp,
+                )
+                .await
+                .unwrap();
+            let key = tls
+                .get_ref()
+                .1
+                .export_keying_material(
+                    [0; 32],
+                    b"EXPORTER-SmartTheia-XHTTP-Admission-v1",
+                    Some(b"h2"),
+                )
+                .unwrap();
+            let (mut sender, connection) = h2::client::handshake(tls).await.unwrap();
+            let driver = tokio::spawn(connection);
+            for (path, expected) in [
+                ("/v1/identity?x=1", StatusCode::NOT_FOUND),
+                ("/v1/identity", StatusCode::OK),
+                ("/v1/identity", StatusCode::UNAUTHORIZED),
+            ] {
+                sender = sender.ready().await.unwrap();
+                let (response, _) = sender
+                    .send_request(raw_identity_request(path), true)
+                    .unwrap();
+                let mut response = response.await.unwrap();
+                assert_eq!(response.status(), expected);
+                if expected == StatusCode::OK {
+                    let header = response.headers()["theia-server-identity"].clone();
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get_all("theia-server-identity")
+                            .iter()
+                            .count(),
+                        1
+                    );
+                    check_identity_wire(identity, &key, &header);
+                    assert!(response.body_mut().data().await.is_none());
+                    assert!(response.body_mut().trailers().await.unwrap().is_none());
+                    witnesses.push((key, header));
+                } else {
+                    assert!(!response.headers().contains_key("theia-server-identity"));
+                }
+            }
+            driver.abort();
+        }
+        let endpoint = theia::quic_transport::client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.roots.clone(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let connection = theia::quic_transport::connect(&endpoint, fixture.h3, "localhost")
+                .await
+                .unwrap();
+            let mut key = [0; 32];
+            connection
+                .export_keying_material(&mut key, b"EXPORTER-SmartTheia-XHTTP-Admission-v1", b"h3")
+                .unwrap();
+            let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move {
+                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            });
+            for (path, expected) in [
+                ("/v1/identity?x=1", StatusCode::NOT_FOUND),
+                ("/v1/identity", StatusCode::OK),
+                ("/v1/identity", StatusCode::UNAUTHORIZED),
+            ] {
+                let mut stream: h3::client::RequestStream<_, Bytes> = sender
+                    .send_request(raw_identity_request(path))
+                    .await
+                    .unwrap();
+                stream.finish().await.unwrap();
+                let response = stream.recv_response().await.unwrap();
+                assert_eq!(response.status(), expected);
+                if expected == StatusCode::OK {
+                    let header = response.headers()["theia-server-identity"].clone();
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get_all("theia-server-identity")
+                            .iter()
+                            .count(),
+                        1
+                    );
+                    check_identity_wire(identity, &key, &header);
+                    assert!(stream.recv_data().await.unwrap().is_none());
+                    assert!(stream.recv_trailers().await.unwrap().is_none());
+                    witnesses.push((key, header));
+                } else {
+                    assert!(!response.headers().contains_key("theia-server-identity"));
+                }
+            }
+            task.abort();
+        }
+        // The four independently negotiated H2/H3 exporters must never
+        // authenticate another connection's proof, even for the same signer.
+        let public = URL_SAFE_NO_PAD.decode(identity.encoded()).unwrap();
+        let verifier = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public);
+        for (i, (exporter, _)) in witnesses.iter().enumerate() {
+            let mut transcript = b"SmartTheia/REALITY/server-identity/v1\0".to_vec();
+            transcript.extend_from_slice(exporter);
+            for (j, (_, header)) in witnesses.iter().enumerate() {
+                let signature = URL_SAFE_NO_PAD.decode(header.as_bytes()).unwrap();
+                assert_eq!(verifier.verify(&transcript, &signature).is_ok(), i == j);
+            }
+        }
+        assert_eq!(witnesses.len(), 4);
+    })
+    .await
+    .expect("bounded independent H2/H3 signature wire matrix");
+}

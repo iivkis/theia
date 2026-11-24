@@ -184,3 +184,7 @@ For an explicitly selected own inbound, add `security_mode = "smart-reality-v1"`
 ### ADR-0090 — BBR-first / CUBIC fallback
 
 Встроенная политика, без TOML/CLI/env/TUI/invite переключателя. Linux H2 выбирает TCP_CONGESTION=bbr, при отказе — cubic, проверяет контроллер. H3 использует Quinn BBR. Windows H2 использует нативный TCP stack (CUBIC — штатное предпочтение клиентских Windows); без per-socket readback фактический алгоритм не объявляется проверенным. Не менять глобальные TCP templates/sysctl. Отсутствие BBR2 не блокирует H2.
+
+### ADR-0092 generated local identity
+
+In the server TUI, select a saved own enabled inbound with an existing TLS certificate/chain and key. G stages a fresh independent Ed25519 PKCS#8 DER in a randomly named private directory adjacent to the config; y explicitly saves the validated reality_key file reference. n/Esc cancels and removes the staged file. On uncertain write retain the file and reload/inspect; after abrupt process exit an unreferenced private file may remain. Y is the manual path, including explicit rotation. No runtime activation or DNS/remote probing is performed by G.

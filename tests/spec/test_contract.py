@@ -656,6 +656,31 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("reality_key", read("crates/theia/src/reload_preflight.rs"))
         self.assertIn("active probing", read("docs/adr/0089-independent-ed25519-xhttp-identity.md"))
 
+    def test_f18_independent_native_acceptance_contract(self):
+        guest = read("scripts/f14-wsl-server.py")
+        host = read("scripts/f14-cross-os-ci.py")
+        cross = read("crates/theia/tests/f14_cross_host.rs")
+        self.assertIn("independent_identity", guest)
+        self.assertIn('security_mode = "smart-reality-v1"', guest)
+        self.assertIn("reality-public.txt", host)
+        self.assertNotIn('"reality.der"', host)
+        self.assertIn("reality_client_scenario(&fixture, transport)", cross)
+        self.assertIn("THEIA_F18_XHOST_WRONG_PUBLIC", cross)
+        self.assertIn("independent_wire_identity_h2_h3_signature_scope_and_one_response",
+                      read("crates/theia/tests/security_profile.rs"))
+        self.assertIn("material_fingerprint", read("crates/theia/src/tui_editor.rs"))
+        self.assertIn("theia-reality-local-review-v1", read("crates/theia/src/server.rs"))
+
+    def test_f18_generated_local_identity_uses_guarded_manual_validator(self):
+        editor = read("crates/theia/src/tui_editor.rs")
+        storage = read("crates/theia/src/client_import.rs")
+        self.assertIn("review_generated_reality_mode", editor)
+        self.assertIn("self.review_reality_mode(&reference)?", editor)
+        self.assertIn("generated_reality_key_preview_cancel_drift_and_commit", editor)
+        self.assertIn("generated_reality_storage_is_private_distinct_and_guarded", storage)
+        self.assertIn('Self::create_payload(config_path, "reality", "identity.der"', storage)
+        self.assertIn("start_generated_reality_review", read("crates/theia/src/tui.rs"))
+
     def test_m35a_test_only_feasibility_never_claims_security_mode(self):
         spec = read("docs/STEALTH_REALITY.md")
         adr = read("docs/adr/0021-m3-5a-rustls-quic-auth-feasibility.md")

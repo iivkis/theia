@@ -88,3 +88,11 @@ Existing mandatory workspace tests cover independent Ed25519 signatures and stri
 ### ADR-0090 BBR-first acceptance
 
 Keep existing H3 BBR assertion. Linux test verifies listener and both TCP peers, transfers bytes, accepts CUBIC and rejects Reno when selectable. Missing kernel BBR is permitted via verified CUBIC. Windows native test transfers bytes using OS-managed TCP without claiming verified per-socket BBR/CUBIC. Keep Windows and cross-host jobs; no test skip or new job. Comparable performance measurements remain mandatory.
+
+### ADR-0091 F-18 independent native acceptance
+
+No new CI job. Extend the existing F-14 Linux VM/native Windows job to a fourth inbound, separate standard Ed25519 PKCS#8 DER generated on Linux, only canonical public identities copied to Windows, replacement v1 import and byte-exact real CONNECT/SOCKS5 with H2/H3/auto; wrong key, wrong CA, wrong bearer and pinned-mode mismatch negatives. Raw independent H2/H3 proof witness verifies signature and exact one response, and rejects signatures across four connection exporters. Local review drift test also changes certificate encoding without changing the leaf. Full exact-head CI required; no performance or independent-review claim.
+
+### ADR-0092 provisioning acceptance
+
+Native tests verify generated Ed25519 DER with distinct public keys, Linux 0700/0600 and Windows owner+SYSTEM DACL, no overwrite, cancellation cleanup, exact file drift rejection, guarded commit, invitation export and refusal to automatically rotate an existing REALITY key. The existing Auto denial test retries only local TCP connect refusal/reset before sending CONNECT; remote denial and no-target-dial assertions remain unchanged. Keep all mandatory jobs, no new job.
