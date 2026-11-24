@@ -42,6 +42,8 @@ pub mod reality_generation;
 mod reality_checkpoint;
 pub mod reality_provision;
 pub mod reality_tcp;
+pub mod reality_quic;
+mod reality_quic_wire;
 pub mod reference_cli;
 pub mod reference_health;
 pub mod reference_maintenance;
