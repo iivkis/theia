@@ -120,56 +120,46 @@ require("cargo clippy --workspace --all-targets --all-features -- -D warnings" i
         "mandatory Clippy warnings-as-errors must run")
 require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
 
-# Every OS/job variant runs against the *same* read-only formatting artifact.
-# Rustfmt and gofmt execute once before any expensive build/test starts.
+# The specification is now the ONLY formatting gate.  Every native job
+# tests the checked-out commit byte-for-byte, with no format overlay, post-green
+# bot push, or extra untested SHA. Syntax/format errors abort before the matrix.
 spec = job("specification")
-require("python3 tests/ci/test_format_artifact.py" in spec,
-        "format artifact source/path isolation tests must run before fan-out")
-require("cargo fmt --all" in spec
-        and "cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all" in spec
-        and "cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all" in spec,
-        "all Rust workspaces must be autoformatted first")
-require("gofmt -w" in spec and "scripts/ci-format.py" in spec,
-        "Go helpers must be formatted and the bounded artifact packaged")
-require("name: ci-formatted-source" in spec and "actions/upload-artifact@v4" in spec,
-        "specification must publish the canonical source artifact")
-for name in mandatory - {"specification", "f14-cross-host"}:
+require("fetch-depth: 2" in spec,
+        "PR merge base and previous push commit must be available for scope proof")
+require("steps.scope.outputs.native_required" in spec,
+        "specification must publish fail-closed native CI scope")
+require("scripts/ci-scope.py --base" in spec
+        and "test_ci_scope.py" in spec,
+        "scope detector and its negative-history tests must run before any skip")
+require("cargo fmt --all -- --check" in spec
+        and "cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check" in spec
+        and "cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all -- --check" in spec,
+        "all Rust workspaces must be checked BEFORE native CI fan-out")
+require("gofmt -l" in spec and "git diff --exit-code" in spec,
+        "Go formatting and unmodified source tree are required")
+require("gofmt -w" not in spec and "ci-formatted-source" not in workflow
+        and "persist-format:" not in workflow,
+        "never change PR SHA after successful CI or upload/download formatter overlays")
+for name in mandatory - {"specification"}:
     payload = job(name)
-    require("actions/download-artifact@v4" in payload
-            and "name: ci-formatted-source" in payload
-            and "Use canonical formatted sources for all tests" in payload,
-            f"{name} must apply the shared formatting artifact")
-    require(payload.index("Use canonical formatted sources for all tests")
-            < payload.index("cargo test") if "cargo test" in payload else True,
-            f"{name} must autoformat BEFORE compiling/running tests")
-require("persist-format" not in mandatory,
-        "autoformat persistence must never replace a required test job")
-persist = job("persist-format")
-require(needs("persist-format") == {"ci-gate"},
-        "source persistence must wait for the full green CI gate")
-require("needs.ci-gate.result == 'success'" in persist,
-        "failed tests must not permit autoformat commits")
-require("github.event_name == 'pull_request'" in persist
-        and "github.event.pull_request.head.repo.full_name == github.repository" in persist,
-        "no privileged writes for forks or untrusted events")
-require("ref: ${{ github.event.pull_request.head.sha }}" in persist
-        and 'test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"' in persist,
-        "never persist formatting against a stale or guessed PR head")
-require("actions/download-artifact@v4" in persist
-        and "name: ci-formatted-source" in persist,
-        "persistence must download the same artifact used by test jobs")
-require("python3 scripts/ci-format.py" in persist
-        and 'cmp "$RUNNER_TEMP/ci-formatted-source/ci-formatted-source.tar"' in persist,
-        "post-green commit must byte-verify against exactly the tested source archive")
-require('git push origin "HEAD:refs/heads/$HEAD_REF"' in persist,
-        "post-green formatting must use race-safe fast-forward push")
-require("gh workflow run" not in persist
-        and "actions: write" not in persist,
-        "autoformat must NOT request redundant full CI reruns or extra Actions permissions")
-require("contents: write" in persist,
-        "isolated post-green job needs scoped write permission to save formatting")
-require("contents: read" in workflow.split("jobs:", 1)[0],
-        "normal test jobs must remain read-only")
+    require("needs.specification.outputs.native_required == 'true'" in payload,
+            f"{name}: full matrix must run only when native scope is proven required")
+    require("needs.specification.outputs.rust_ready == 'true'" in payload,
+            f"{name}: Rust precondition must be explicit and fail closed")
+    if name != "f14-cross-host":
+        require("actions/download-artifact@v4" not in payload,
+                f"{name}: no repeating CI format artifact downloads")
+require("actions/download-artifact@v4" in job("f14-cross-host"),
+        "cross-host still MUST use authenticated native OS binaries")
+gate = job("ci-gate")
+require("NATIVE_REQUIRED: ${{ needs.specification.outputs.native_required }}" in gate,
+        "final gate must use exactly the preflight's scope")
+require('native not in {"true", "false"}' in gate,
+        "unset native scope must fail closed")
+require('("success" if name == "specification" else "skipped")' in gate,
+        "docs-only path must require a successful spec and skipped native matrix")
+require("contents: write" not in workflow,
+        "normal CI must never receive repository contents write permission")
 
 require((ROOT / "spikes/m0_1/utls_reference/go.sum").is_file(),
         "pinned uTLS Go module dependency lock must exist")
