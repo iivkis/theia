@@ -10,6 +10,8 @@ use crate::{
 use std::path::Path;
 
 pub const HELP: &str = "REALITY provisioning candidate; runtime UNCHANGED. All paths absolute.\n\
+theia reality admission-new --inbound ID --endpoint HOST:PORT --key PATH --confirm\n\
+theia reality admission-check --inbound ID --endpoint HOST:PORT --key PATH\n\
 theia reality identity-new --inbound ID --endpoint HOST:PORT --key PATH --confirm\n\
 theia reality descriptor-new --health PATH --key PATH --output PATH --confirm\n\
 theia reality descriptor-refresh --health PATH --key PATH --previous PATH --output PATH --sha256 HEX --confirm\n\
@@ -36,6 +38,12 @@ Identity SHA-256 must be obtained independently. Import never changes active pro
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    Admission {
+        inbound: String,
+        endpoint: String,
+        key: String,
+        create: bool,
+    },
     Identity {
         inbound: String,
         endpoint: String,
@@ -162,6 +170,16 @@ fn hex(bytes: [u8; 32]) -> String {
 
 pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
     Ok(match args {
+        ["admission-new", "--inbound", i, "--endpoint", e, "--key", k, "--confirm"]
+            if config::valid_id(i) && config::valid_remote(e) =>
+        {
+            Command::Admission { inbound: (*i).into(), endpoint: (*e).into(), key: path(k)?, create: true }
+        }
+        ["admission-check", "--inbound", i, "--endpoint", e, "--key", k]
+            if config::valid_id(i) && config::valid_remote(e) =>
+        {
+            Command::Admission { inbound: (*i).into(), endpoint: (*e).into(), key: path(k)?, create: false }
+        }
         ["identity-new", "--inbound", i, "--endpoint", e, "--key", k, "--confirm"]
             if config::valid_id(i) && config::valid_remote(e) =>
         {
@@ -367,6 +385,20 @@ fn publication_status(
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
+        Command::Admission { inbound, endpoint, key, create } => {
+            let scope = Scope { inbound, endpoint };
+            if create {
+                let secret = crate::reality_admission::Secret::generate().map_err(|_| Error::Identity)?;
+                secret.save_new(&scope, Path::new(&key)).map_err(|error| match error {
+                    crate::reality_admission::Error::Indeterminate => Error::Indeterminate,
+                    _ => Error::Storage,
+                })?;
+                Ok("Private admission material saved; runtime UNCHANGED. Transfer only through a protected channel.".into())
+            } else {
+                crate::reality_admission::Secret::load(&scope, Path::new(&key)).map_err(|_| Error::Identity)?;
+                Ok("Private admission material matches inbound scope; runtime UNCHANGED".into())
+            }
+        }
         Command::PromotionPreview { profile, descriptor } => {
             let profile = Profile::read(Path::new(&profile))?;
             let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;

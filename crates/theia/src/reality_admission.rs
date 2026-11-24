@@ -5,12 +5,14 @@
 #![forbid(unsafe_code)]
 
 use crate::{config, descriptor::Scope, identity_tls::Branch};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
 };
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     sync::Mutex,
 };
 use zeroize::Zeroizing;
@@ -30,6 +32,8 @@ pub enum Error {
     Clock,
     Replay,
     Capacity,
+    Storage,
+    Indeterminate,
 }
 
 struct Cursor<'a>(&'a [u8]);
@@ -186,6 +190,55 @@ impl Secret {
         }
         Ok(Self(Zeroizing::new(bytes)))
     }
+    /// The same independent inbound secret is used for both transport
+    /// branches and both signers during planned overlap. It is not a TLS
+    /// private key or bearer. Never put it in a public descriptor or logs.
+    pub fn save_new(&self, scope: &Scope, path: &Path) -> Result<(), Error> {
+        if !config::valid_id(&scope.inbound) || !config::valid_remote(&scope.endpoint)
+            || !crate::bounded_input::explicit_file_path(path) {
+            return Err(Error::Scope);
+        }
+        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(self.0.as_ref()));
+        let raw = Zeroizing::new(format!("THEIA-ADMISSION-V1\n{}\n{}\n{}\n",
+            scope.inbound, scope.endpoint, encoded.as_str()));
+        config::guarded_trust_write(path, &raw, None).map_err(|error| match error {
+            config::WriteFailure::BeforeReplace(_) => Error::Storage,
+            config::WriteFailure::AfterReplace(_) => Error::Indeterminate,
+        })
+    }
+
+    pub fn load(scope: &Scope, path: &Path) -> Result<Self, Error> {
+        if !config::valid_id(&scope.inbound) || !config::valid_remote(&scope.endpoint)
+            || !crate::bounded_input::explicit_file_path(path) {
+            return Err(Error::Scope);
+        }
+        let raw = crate::bounded_input::read(path, 4096, true, true).map_err(|_| Error::Storage)?;
+        let text = std::str::from_utf8(&raw).map_err(|_| Error::Format)?;
+        let mut lines = text.split('\n');
+        if lines.next() != Some("THEIA-ADMISSION-V1")
+            || lines.next() != Some(scope.inbound.as_str())
+            || lines.next() != Some(scope.endpoint.as_str()) {
+            return Err(Error::Scope);
+        }
+        let encoded = lines.next().ok_or(Error::Format)?;
+        if encoded.len() != 43 || lines.next() != Some("") || lines.next().is_some() {
+            return Err(Error::Format);
+        }
+        let mut secret = Zeroizing::new([0; 32]);
+        // Base64 may require a slightly larger output buffer for decode_slice.
+        let mut decoded = Zeroizing::new([0; 33]);
+        let count = URL_SAFE_NO_PAD.decode_slice(encoded, decoded.as_mut()).map_err(|_| Error::Format)?;
+        if count != 32 {
+            return Err(Error::Format);
+        }
+        secret.copy_from_slice(&decoded[..count]);
+        let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(secret.as_ref()));
+        if canonical.as_str() != encoded {
+            return Err(Error::Format);
+        }
+        Self::new(*secret)
+    }
+
     fn key(&self) -> Result<LessSafeKey, Error> {
         UnboundKey::new(&aead::CHACHA20_POLY1305, self.0.as_ref())
             .map(LessSafeKey::new)
@@ -383,6 +436,38 @@ mod tests {
             endpoint: "edge.example.org:443".into(),
         }
     }
+    #[test]
+    fn scope_bound_admission_material_is_create_only_and_private() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("theia-admission-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(dir.clone());
+        let path = dir.join("admission.key");
+        let scope = scope();
+        let secret = Secret::generate().unwrap();
+        secret.save_new(&scope, &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(Secret::generate().unwrap().save_new(&scope, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let wrong = Scope { inbound: "other".into(), endpoint: scope.endpoint.clone() };
+        assert!(Secret::load(&wrong, &path).is_err());
+        let restored = Secret::load(&scope, &path).unwrap();
+        let context = Context { scope: &scope, identity: [3; 32], reference: "ref.example.org", branch: Branch::H3 };
+        let mut message = hello(context.reference, context.branch);
+        seal(&restored, &context, &mut message, 2000).unwrap();
+        let guard = ReplayGuard::new(4, 1000).unwrap();
+        guard.admit(&secret, &context, &message, 2000).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(Secret::load(&scope, &path).is_err());
+        }
+    }
+
     #[test]
     fn admission_is_scope_branch_and_exact_hello_bound_and_one_use() {
         let scope = scope();

@@ -205,6 +205,48 @@ impl Record {
     }
 }
 
+/// Immutable verified publication material. Preparing it reads the exact
+/// owner-approved record and keys once. No network listener or grant changes
+/// occur; caller must still enforce transport admission and fresh DNS pins.
+pub struct CapturedPublication {
+    generation: u64,
+    snapshot_sha256: [u8; 32],
+    plan_sha256: [u8; 32],
+    active: PublishedIdentity,
+    next: Option<PublishedIdentity>,
+}
+
+pub struct PublishedIdentity {
+    identity: Identity,
+    verified: Verified,
+    signed: String,
+}
+
+impl PublishedIdentity {
+    pub fn identity(&self) -> &Identity { &self.identity }
+    pub fn verified(&self) -> &Verified { &self.verified }
+    pub fn signed(&self) -> &str { &self.signed }
+}
+
+impl CapturedPublication {
+    pub fn generation(&self) -> u64 { self.generation }
+    pub fn snapshot_sha256(&self) -> [u8; 32] { self.snapshot_sha256 }
+    pub fn plan_sha256(&self) -> [u8; 32] { self.plan_sha256 }
+
+    /// Selection uses the exact independently authenticated public identity.
+    /// Old admission cannot select the next signer, or vice versa.
+    pub fn select(&self, public: [u8; 32], now: u64) -> Result<&PublishedIdentity, Error> {
+        let selected = if self.active.identity.public_key() == public {
+            &self.active
+        } else {
+            self.next.as_ref().filter(|entry| entry.identity.public_key() == public)
+                .ok_or(Error::Identity)?
+        };
+        selected.verified.check_time(now).map_err(|_| Error::Descriptor)?;
+        Ok(selected)
+    }
+}
+
 pub struct Publication {
     path: PathBuf,
 }
@@ -284,6 +326,43 @@ impl Publication {
                 .as_ref()
                 .map(|(key, _)| bootstrap::fingerprint(key.public_key())),
             overlap_ends_at: record.pending.as_ref().map(|pending| pending.ends_at),
+        })
+    }
+
+    /// Capture both signing generations from the same verified file
+    /// snapshot, matching a separately approved health inventory. Failed
+    /// refresh never silently substitutes an arbitrary key or reference.
+    pub fn capture(
+        &self,
+        state: &reference_health::State,
+        expected_snapshot: [u8; 32],
+        now: u64,
+    ) -> Result<CapturedPublication, Error> {
+        let (raw, record, checked) = self.snapshot()?;
+        record.check_clock(now)?;
+        if bootstrap::digest(&raw) != expected_snapshot
+            || state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256 {
+            return Err(Error::Approval);
+        }
+        checked.current.check_time(now).map_err(|_| Error::Descriptor)?;
+        state.validate_active(checked.current.descriptor(), now).map_err(|_| Error::Health)?;
+        let next = match (checked.next, record.pending) {
+            (Some((identity, verified)), Some(pending)) => {
+                verified.check_time(now).map_err(|_| Error::Descriptor)?;
+                state.validate_active(verified.descriptor(), now).map_err(|_| Error::Health)?;
+                Some(PublishedIdentity { identity, verified, signed: pending.successor })
+            }
+            (None, None) => None,
+            _ => return Err(Error::Descriptor),
+        };
+        Ok(CapturedPublication {
+            generation: record.generation,
+            snapshot_sha256: expected_snapshot,
+            plan_sha256: record.plan_sha256,
+            active: PublishedIdentity {
+                identity: checked.active, verified: checked.current, signed: record.active_document
+            },
+            next,
         })
     }
 
@@ -715,6 +794,20 @@ mod tests {
         assert_eq!(overlap.next_fingerprint, Some(fingerprint));
         let (announcement, successor) = publication.documents(now + 1).unwrap();
         let successor = successor.unwrap();
+        assert!(publication.capture(&state, start.snapshot_sha256, now + 1).is_err());
+        assert!(publication.capture(&substituted, overlap.snapshot_sha256, now + 1).is_err());
+        let captured = publication.capture(&state, overlap.snapshot_sha256, now + 1).unwrap();
+        assert_eq!(captured.generation(), overlap.generation);
+        assert_eq!(captured.snapshot_sha256(), overlap.snapshot_sha256);
+        assert_eq!(captured.plan_sha256(), overlap.plan_sha256);
+        let old_material = captured.select(active.public_key(), now + 1).unwrap();
+        let new_material = captured.select(next.public_key(), now + 1).unwrap();
+        assert_eq!(old_material.signed(), announcement);
+        assert_eq!(new_material.signed(), successor);
+        assert_eq!(old_material.identity().public_key(), old_material.verified().signer());
+        assert_eq!(new_material.identity().public_key(), new_material.verified().signer());
+        assert!(captured.select([0; 32], now + 1).is_err());
+        assert!(captured.select(active.public_key(), overlap.overlap_ends_at.unwrap()).is_err());
 
         // A separate client already enrolled at revision one can consume
         // the old-signed announcement and explicitly promote to the next.
