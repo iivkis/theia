@@ -22,12 +22,7 @@ use ring::{
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use std::{net::SocketAddr, time::Duration};
 use theia::quic_transport::{accept, client_endpoint, connect, server_endpoint};
-use tokio::{
-    net::UdpSocket,
-    sync::oneshot,
-    task::JoinHandle,
-    time::timeout,
-};
+use tokio::{net::UdpSocket, sync::oneshot, task::JoinHandle, time::timeout};
 use zeroize::Zeroize;
 
 const DEADLINE: Duration = Duration::from_secs(24);
@@ -130,12 +125,12 @@ fn exposed_quic_initial_parser_rejects_truncated_and_noncanonical_packet_shapes(
     assert!(parse_initial(&sample[..1199]).is_none());
 
     for (at, replacement) in [
-        (0, 0x40), // short header
-        (0, 0xd0), // 0-RTT, not Initial
-        (0, 0xe0), // Handshake, not Initial
-        (4, 0x02), // unexpected QUIC version
-        (5, 21),   // destination CID longer than RFC allows
-        (14, 21),  // source CID longer than RFC allows
+        (0, 0x40),  // short header
+        (0, 0xd0),  // 0-RTT, not Initial
+        (0, 0xe0),  // Handshake, not Initial
+        (4, 0x02),  // unexpected QUIC version
+        (5, 21),    // destination CID longer than RFC allows
+        (14, 21),   // source CID longer than RFC allows
         (23, 0xff), // unsupported enormous token length
         (24, 0xff), // unsupported enormous packet length
     ] {
@@ -154,7 +149,11 @@ fn exposed_quic_initial_parser_rejects_truncated_and_noncanonical_packet_shapes(
 /// untrusted target resolution, pcap, persistent raw CID bytes or logs.
 async fn udp_witness(
     server_address: SocketAddr,
-) -> (SocketAddr, oneshot::Receiver<Option<InitialShape>>, JoinHandle<()>) {
+) -> (
+    SocketAddr,
+    oneshot::Receiver<Option<InitialShape>>,
+    JoinHandle<()>,
+) {
     let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = front.local_addr().unwrap();
@@ -214,7 +213,12 @@ fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let der = cert.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let server = server_endpoint("127.0.0.1:0".parse().unwrap(), vec![der.clone()], key.into()).unwrap();
+    let server = server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        vec![der.clone()],
+        key.into(),
+    )
+    .unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(der).unwrap();
     let client = client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
@@ -243,16 +247,21 @@ async fn live_quic_initial_h3_data_and_exporter_pinned_identity_are_distinct_evi
             connection
                 .export_keying_material(&mut exporter, EXPORTER_LABEL, EXPORTER_CONTEXT)
                 .unwrap();
-            let mut http3 = h3::server::Connection::new(h3_quinn::Connection::new(connection.clone()))
-                .await
-                .unwrap();
+            let mut http3 =
+                h3::server::Connection::new(h3_quinn::Connection::new(connection.clone()))
+                    .await
+                    .unwrap();
             let resolver = http3.accept().await.unwrap().unwrap();
             let (request, mut stream) = resolver.resolve_request().await.unwrap();
             assert_eq!(request.method(), http::Method::POST);
             assert_eq!(request.uri().path(), "/f18/research-only");
             let mut challenge = Vec::with_capacity(32);
             while challenge.len() < 32 {
-                let mut data = stream.recv_data().await.unwrap().expect("bounded client challenge");
+                let mut data = stream
+                    .recv_data()
+                    .await
+                    .unwrap()
+                    .expect("bounded client challenge");
                 let chunk_len = data.remaining();
                 assert!(chunk_len > 0 && chunk_len <= 32 - challenge.len());
                 challenge.extend_from_slice(&data.copy_to_bytes(chunk_len));
@@ -307,7 +316,10 @@ async fn live_quic_initial_h3_data_and_exporter_pinned_identity_are_distinct_evi
             )
             .await
             .unwrap();
-        request.send_data(Bytes::copy_from_slice(&client_nonce)).await.unwrap();
+        request
+            .send_data(Bytes::copy_from_slice(&client_nonce))
+            .await
+            .unwrap();
         request.finish().await.unwrap();
         assert_eq!(request.recv_response().await.unwrap().status(), 200);
         let mut reply = Vec::with_capacity(96);
@@ -351,9 +363,15 @@ async fn live_quic_initial_h3_data_and_exporter_pinned_identity_are_distinct_evi
             Err(Failure::Replay)
         );
 
-        let initial = first_datagram.await.unwrap().expect("first UDP datagram must be QUIC v1 Initial");
+        let initial = first_datagram
+            .await
+            .unwrap()
+            .expect("first UDP datagram must be QUIC v1 Initial");
         assert_eq!(initial.version, 1);
-        assert_eq!(initial.token_len, 0, "fresh unresumed client must not invent retry token");
+        assert_eq!(
+            initial.token_len, 0,
+            "fresh unresumed client must not invent retry token"
+        );
         assert!(initial.datagram_len >= 1200);
         assert!(initial.packet_len <= initial.datagram_len);
         // No assertion that a real browser has the same CID sizes, extensions,
