@@ -611,6 +611,18 @@ jobs:
         run: python -m pip install pywinpty==3.0.5
       - name: Instrument full native workspace tests
         run: cargo llvm-cov --workspace --all-targets --all-features --locked --lcov --include-build-script --output-path coverage.lcov
+      - name: Instrument real disposable Windows proxy and ConPTY lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          THEIA_WINDOWS_PROXY_E2E_ALLOWED: "yes"
+        run: |
+          cargo llvm-cov --workspace --all-features --locked --no-report --lib windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Instrumented real WinINet CAS and recovery failed' }
+          cargo llvm-cov --workspace --all-features --locked --no-report --test tui_real_terminal compiled_client_proxy_conpty_lifecycle -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Instrumented real ConPTY lifecycle failed' }
+          cargo llvm-cov report --lcov --include-build-script --output-path coverage.lcov
+          if ($LASTEXITCODE -ne 0) { throw 'Combined native LCOV export failed' }
       - name: Export independent LLVM file segments from the same profiles
         run: cargo llvm-cov report --json --include-build-script --output-path coverage-segments.json
       - name: Normalize exact-SHA native line evidence

@@ -488,4 +488,101 @@ mod tests {
         );
         fs::remove_dir_all(directory).unwrap();
     }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn bound_preflight_rejects_stale_documents_and_tls_drift_and_probes_real_ports() {
+        use crate::restart_guard::{RestartError, RestartVerdict};
+        use std::{fs, net::{TcpListener, UdpSocket}};
+        let directory = std::env::temp_dir().join(format!("theia-bound-preflight-{}-{:?}", std::process::id(), std::thread::current().id()));
+        fs::create_dir_all(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(directory.clone());
+        let cert = directory.join("cert.pem");
+        let key = directory.join("key.pem");
+        let config_path = directory.join("server.toml");
+        let mut active = document();
+        let generated = rcgen::generate_simple_self_signed(vec![active.server.inbounds[0].server_name.clone()]).unwrap();
+        let cert_pem = generated.cert.pem();
+        let key_pem = generated.key_pair.serialize_pem();
+        fs::write(&cert, &cert_pem).unwrap();
+        fs::write(&key, &key_pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        active.server.inbounds[0].tls_cert = format!("file:{}", cert.display());
+        active.server.inbounds[0].tls_key = format!("file:{}", key.display());
+        let tcp_active = TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp_active = UdpSocket::bind("127.0.0.1:0").unwrap();
+        active.server.inbounds[0].h2_listen = tcp_active.local_addr().unwrap().to_string();
+        active.server.inbounds[0].quic_listen = udp_active.local_addr().unwrap().to_string();
+        let snapshot = ReloadPreflight::new(config_path.clone(), active.clone(), vec![IdentityHash::from_pem(cert_pem.as_bytes(),key_pem.as_bytes())]);
+        let write = |doc: &ServerDocument| -> [u8;32] {
+            let raw = Config::Server(doc.clone()).to_toml().unwrap();
+            fs::write(&config_path,&raw).unwrap();
+            Sha256::digest(raw.as_bytes()).into()
+        };
+        let digest = write(&active);
+        assert_eq!(snapshot.load_candidate_bound(digest).unwrap(),active);
+        assert!(snapshot.load_candidate_bound([0;32]).is_err());
+        assert_eq!(snapshot.check_restart_file(),Ok(RestartVerdict::AuthorizationOnly));
+        assert_eq!(snapshot.check_quota_file(),Err(RestartError::InvalidConfig));
+        let mut candidate = active.clone();
+        candidate.server.policy.max_connections_total += 1;
+        let digest = write(&candidate);
+        assert_eq!(snapshot.load_quota_candidate_bound(digest).unwrap(),candidate);
+        assert_eq!(snapshot.check_quota_file(),Ok(()));
+        assert!(snapshot.load_candidate_bound(digest).is_err());
+        assert!(snapshot.load_quota_candidate_bound([0;32]).is_err());
+        assert!(!crate::restart_guard::same_shared_limits(&active,&candidate));
+        fs::write(&key,b"changed key bytes").unwrap();
+        assert_eq!(snapshot.check_quota_file(),Err(RestartError::InvalidTlsIdentity));
+        assert!(matches!(snapshot.load_quota_candidate_bound(digest),Err(RestartError::InvalidTlsIdentity)));
+        fs::write(&key,&key_pem).unwrap();
+        let held = snapshot.restart_probe_lock.lock().unwrap();
+        assert_eq!(snapshot.check_quota_file(),Err(RestartError::ProbeBusy));
+        drop(held);
+
+        let rotated = rcgen::generate_simple_self_signed(vec![active.server.inbounds[0].server_name.clone()]).unwrap();
+        fs::write(&cert,rotated.cert.pem()).unwrap();
+        fs::write(&key,rotated.key_pair.serialize_pem()).unwrap();
+        write(&active);
+        assert_eq!(snapshot.check_restart_file(),Ok(RestartVerdict::SamePortTlsReady));
+        fs::write(&cert,&cert_pem).unwrap();
+        fs::write(&key,&key_pem).unwrap();
+
+        candidate = active.clone();
+        let fresh_tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fresh_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        candidate.server.inbounds[0].h2_listen = fresh_tcp.local_addr().unwrap().to_string();
+        candidate.server.inbounds[0].quic_listen = fresh_udp.local_addr().unwrap().to_string();
+        assert!(crate::restart_guard::same_shared_limits(&active,&candidate));
+        let digest = write(&candidate);
+        assert_eq!(snapshot.load_restart_candidate_bound(digest).unwrap(),candidate);
+        assert_eq!(snapshot.check_restart_file(),Err(RestartError::PortUnavailable));
+        drop(fresh_tcp);
+        assert_eq!(snapshot.check_restart_file(),Err(RestartError::PortUnavailable));
+        drop(fresh_udp);
+        assert_eq!(snapshot.check_restart_file(),Ok(RestartVerdict::FreshPortsBindable));
+        // The successful probe is advisory: both fresh ports are released.
+        let tcp = TcpListener::bind(&candidate.server.inbounds[0].h2_listen).unwrap();
+        let udp = UdpSocket::bind(&candidate.server.inbounds[0].quic_listen).unwrap();
+        drop((tcp,udp));
+        candidate.server.inbounds[0].h2_listen = active.server.inbounds[0].h2_listen.clone();
+        write(&candidate);
+        assert_eq!(snapshot.check_restart_file(),Ok(RestartVerdict::RequiresMaintenance));
+        assert!(tcp_active.local_addr().is_ok());
+        assert!(udp_active.local_addr().is_ok());
+        fs::write(&cert,b"not a PEM certificate").unwrap();
+        assert_eq!(snapshot.check_restart_file(),Err(RestartError::InvalidTlsIdentity));
+        fs::write(&config_path,b"invalid TOML").unwrap();
+        let digest: [u8;32] = Sha256::digest(b"invalid TOML").into();
+        assert!(snapshot.load_candidate_bound(digest).is_err());
+        assert!(snapshot.load_restart_candidate_bound(digest).is_err());
+        assert_eq!(snapshot.check_restart_file(),Err(RestartError::InvalidConfig));
+    }
+
 }
