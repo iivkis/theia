@@ -26,11 +26,13 @@
 
 Реальный production H3 listener отдельно проверяется на **активное зондирование**: доверенный TLS peer без bearer может получить `HTTP 401` на `POST /v1/session`, с неверным bearer тоже получает `401`; с корректным bearer виден `HTTP 200` **до OPEN_OK**. Это безопасная авторизация обычного Theia v1 без неавторизованного relay, но **не** скрытый REALITY-like режим. F-18 остаётся **P0 blocked**: до production необходимы независимый crypto review, pre-auth anti-probing state machine, modified first-flight backend feasibility, настоящий браузерный H2/H3 reference, versioned schema/invite и end-to-end fail-closed security.
 
-## M3.5a4 — проверка H3 channel binding после reconnect (CI-only)
+## M3.5a4 — H2/H3 channel binding после reconnect и negative matrix (CI-only)
 
-Новый регрессионный тест `h3_identity_proof_is_bound_to_live_connection_after_cache_reset` в `crates/theia/tests/reality_security_feasibility.rs` устанавливает два независимых loopback QUIC/TLS1.3 соединения с тем же проверенным сервером. На каждом соединении exporter клиента совпадает с exporter сервера; между соединениями значения должны различаться. Test-only Ed25519 proof первого соединения отклоняется на втором даже после создания пустого replay-cache, если verifier использует локальный exporter нового соединения. Повтор в прежнем кэше также отклоняется, а корректная подпись нового transcript принимается после невалидной попытки при capacity=1.
+Два native regression tests в `crates/theia/tests/reality_security_feasibility.rs` устанавливают по два независимых loopback verified TLS1.3/TCP (ALPN h2) и QUIC/TLS1.3 (ALPN h3) соединения с тем же сервером. Fresh client config/endpoint исключает намеренное переиспользование tickets. На каждом соединении exporter клиента совпадает с exporter сервера; между соединениями значения должны различаться.
 
-Проверка изолирует channel binding, намеренно сохраняя остальные поля transcript. Это не wire proof exchange, не проверка TLS resumption/0-RTT, не persistent/distributed replay cache, не anti-probing и не production REALITY mode. H2 reconnect требует отдельного сетевого теста. Не меняются TLS verifier, TOML/invite v1, runtime, proxy или grants. Приёмка: exact-head native Linux/Windows CI и `ci-gate`; до успешного CI результат не подтверждён.
+Оба транспорта используют одну research-only Ed25519/replay матрицу: предыдущая подпись отклоняется после создания пустого replay-cache с exporter новой сессии, даже при неизменных остальных полях; неправильный pin, другой transport, укороченная подпись, future/expired timestamp также отвергаются без заполнения cache. Проверяются успешный proof, повтор, заполненный cache без вытеснения live entry, rollback времени и освобождение слота на точной границе истечения. Это проверка test-only примитивов, не production lifecycle или wire exchange.
+
+Не меняются TLS verifier, TOML/invite v1, runtime, proxy или grants. Не доказаны TLS resumption/0-RTT, persistent/distributed replay, anti-probing, browser fingerprint или REALITY mode. Приёмка: exact-head native Linux/Windows CI и `ci-gate`; до успешного CI результат не подтверждён.
 
 ## M3.5b1 — чистый offline planner кандидатов (реализован частично)
 

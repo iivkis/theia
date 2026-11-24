@@ -515,17 +515,7 @@ async fn real_tls_h2_channel_supports_independent_pinned_ed25519_identity_proof(
 /// This checks channel binding, not persistent or distributed replay storage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h3_identity_proof_is_bound_to_live_connection_after_cache_reset() {
-    use f18_identity_lab::{Branch, Failure, ReplayWindow, Transcript};
-    use ring::{
-        rand::{SecureRandom, SystemRandom},
-        signature::{Ed25519KeyPair, KeyPair},
-    };
-
     timeout(DEADLINE, async {
-        let rng = SystemRandom::new();
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        let signer = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let pinned: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
         let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
         let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
@@ -568,63 +558,199 @@ async fn h3_identity_proof_is_bound_to_live_connection_after_cache_reset() {
             server_exporter.zeroize();
             client.close(0u32.into(), b"done");
         }
-        assert!(
-            exporters[0] != exporters[1],
-            "independent verified sessions must have distinct exporters"
-        );
-
-        let mut client_nonce = [0u8; 32];
-        let mut server_nonce = [0u8; 32];
-        rng.fill(&mut client_nonce).unwrap();
-        rng.fill(&mut server_nonce).unwrap();
-        let mut original = Transcript::new(
-            Branch::H3,
-            "localhost",
-            remote.port(),
-            client_nonce,
-            server_nonce,
-            exporters[0],
-            10_000,
-        )
-        .unwrap();
-        let original_signature = signer.sign(&original.encode());
-        let mut seen = ReplayWindow::new(1).unwrap();
-        assert_eq!(
-            seen.accept(&pinned, &original, original_signature.as_ref(), 10_000),
-            Ok(())
-        );
-        assert_eq!(
-            seen.accept(&pinned, &original, original_signature.as_ref(), 10_001),
-            Err(Failure::Replay)
-        );
-
-        // Keep every other signed field identical to isolate the channel
-        // binding. The verifier uses the new connection's local exporter,
-        // not a value supplied by an untrusted peer.
-        let mut rebound = original.clone();
-        rebound.exporter = exporters[1];
-        let mut reset = ReplayWindow::new(1).unwrap();
-        assert_eq!(
-            reset.accept(&pinned, &rebound, original_signature.as_ref(), 10_001),
-            Err(Failure::InvalidProof)
-        );
-        // An invalid proof must not consume the sole replay-cache slot.
-        let new_signature = signer.sign(&rebound.encode());
-        assert_eq!(
-            reset.accept(&pinned, &rebound, new_signature.as_ref(), 10_001),
-            Ok(())
-        );
-        assert_eq!(
-            reset.accept(&pinned, &rebound, new_signature.as_ref(), 10_002),
-            Err(Failure::Replay)
-        );
-        original.exporter.zeroize();
-        rebound.exporter.zeroize();
+        check_reconnect_proof_matrix(f18_identity_lab::Branch::H3, remote.port(), exporters);
         exporters.zeroize();
-        client_nonce.zeroize();
-        server_nonce.zeroize();
         server.close(0u32.into(), b"done");
     })
     .await
     .expect("research-only reconnect proof completed within deadline");
+}
+
+/// Fresh TCP/TLS connections to one verified listener exercise the same
+/// proof rejection matrix as QUIC, without enabling a new wire protocol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_identity_proof_is_bound_to_live_connection_after_cache_reset() {
+    timeout(DEADLINE, async {
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![der.clone()],
+            PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        )
+        .unwrap();
+        server_tls.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(server_tls));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let mut exporters = [[0u8; 32]; 2];
+        for exporter in &mut exporters {
+            // Build a fresh client configuration to avoid ticket reuse.
+            let mut roots = RootCertStore::empty();
+            roots.add(der.clone()).unwrap();
+            let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            client_tls.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = TlsConnector::from(Arc::new(client_tls));
+
+            let (mut server_exporter, ()) = tokio::join!(
+                async {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let tls = acceptor.accept(socket).await.unwrap();
+                    let conn = tls.get_ref().1;
+                    assert_eq!(conn.alpn_protocol(), Some(&b"h2"[..]));
+                    conn.export_keying_material([0u8; 32], EXPORTER_LABEL, Some(CONTEXT))
+                        .unwrap()
+                },
+                async {
+                    let socket = TcpStream::connect(remote).await.unwrap();
+                    let tls = connector
+                        .connect(ServerName::try_from("localhost").unwrap(), socket)
+                        .await
+                        .unwrap();
+                    let conn = tls.get_ref().1;
+                    assert_eq!(conn.alpn_protocol(), Some(&b"h2"[..]));
+                    *exporter = conn
+                        .export_keying_material([0u8; 32], EXPORTER_LABEL, Some(CONTEXT))
+                        .unwrap();
+                }
+            );
+            assert!(*exporter == server_exporter, "peer exporter mismatch");
+            server_exporter.zeroize();
+        }
+        check_reconnect_proof_matrix(f18_identity_lab::Branch::H2, remote.port(), exporters);
+        exporters.zeroize();
+    })
+    .await
+    .expect("research-only TCP reconnect proof completed within deadline");
+}
+
+fn check_reconnect_proof_matrix(
+    branch: f18_identity_lab::Branch,
+    port: u16,
+    mut exporters: [[u8; 32]; 2],
+) {
+    use f18_identity_lab::{Branch, Failure, ReplayWindow, Transcript, WINDOW_MS};
+    use ring::{
+        rand::{SecureRandom, SystemRandom},
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let signer = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let pinned: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
+    let other_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let other_signer = Ed25519KeyPair::from_pkcs8(other_pkcs8.as_ref()).unwrap();
+    let other_pin: [u8; 32] = other_signer.public_key().as_ref().try_into().unwrap();
+
+    assert!(
+        exporters[0] != exporters[1],
+        "independent verified sessions must have distinct exporters"
+    );
+
+    let mut client_nonce = [0u8; 32];
+    let mut server_nonce = [0u8; 32];
+    rng.fill(&mut client_nonce).unwrap();
+    rng.fill(&mut server_nonce).unwrap();
+    let mut original = Transcript::new(
+        branch,
+        "localhost",
+        port,
+        client_nonce,
+        server_nonce,
+        exporters[0],
+        10_000,
+    )
+    .unwrap();
+    let original_signature = signer.sign(&original.encode());
+    let mut seen = ReplayWindow::new(1).unwrap();
+    assert_eq!(
+        seen.accept(&pinned, &original, original_signature.as_ref(), 10_000),
+        Ok(())
+    );
+    assert_eq!(
+        seen.accept(&pinned, &original, original_signature.as_ref(), 10_001),
+        Err(Failure::Replay)
+    );
+
+    // Keep every other signed field identical to isolate the channel
+    // binding. The verifier uses the new connection's local exporter,
+    // not a value supplied by an untrusted peer.
+    let mut rebound = original.clone();
+    rebound.exporter = exporters[1];
+    let mut reset = ReplayWindow::new(1).unwrap();
+    assert_eq!(
+        reset.accept(&pinned, &rebound, original_signature.as_ref(), 10_001),
+        Err(Failure::InvalidProof)
+    );
+    let new_signature = signer.sign(&rebound.encode());
+    let expires_at = 10_000 + WINDOW_MS;
+    // Invalid key, branch, signature length and time must also leave
+    // the single replay slot free for the genuine proof.
+    assert_eq!(
+        reset.accept(&other_pin, &rebound, new_signature.as_ref(), 10_001),
+        Err(Failure::InvalidProof)
+    );
+    assert_eq!(
+        reset.accept(&pinned, &rebound, &new_signature.as_ref()[..63], 10_001),
+        Err(Failure::InvalidProof)
+    );
+    let mut wrong_branch = rebound.clone();
+    wrong_branch.branch = match branch {
+        Branch::H2 => Branch::H3,
+        Branch::H3 => Branch::H2,
+    };
+    assert_eq!(
+        reset.accept(&pinned, &wrong_branch, new_signature.as_ref(), 10_001),
+        Err(Failure::InvalidProof)
+    );
+    wrong_branch.exporter.zeroize();
+    assert_eq!(
+        reset.accept(&pinned, &rebound, new_signature.as_ref(), 7_999),
+        Err(Failure::Future)
+    );
+    assert_eq!(
+        reset.accept(&pinned, &rebound, new_signature.as_ref(), expires_at),
+        Err(Failure::Expired)
+    );
+    // An invalid proof must not consume the sole replay-cache slot.
+    assert_eq!(
+        reset.accept(&pinned, &rebound, new_signature.as_ref(), 10_001),
+        Ok(())
+    );
+    assert_eq!(
+        reset.accept(&pinned, &rebound, new_signature.as_ref(), 10_002),
+        Err(Failure::Replay)
+    );
+    assert_eq!(
+        reset.accept(&pinned, &original, original_signature.as_ref(), 10_002),
+        Err(Failure::Capacity)
+    );
+    assert_eq!(
+        reset.accept(&pinned, &rebound, new_signature.as_ref(), 10_000),
+        Err(Failure::ClockRollback)
+    );
+    // At the exact expiry boundary, the old entry is no longer live.
+    rebound.issued_ms = expires_at;
+    let fresh_signature = signer.sign(&rebound.encode());
+    assert_eq!(
+        reset.accept(&pinned, &rebound, fresh_signature.as_ref(), expires_at),
+        Ok(())
+    );
+    original.exporter.zeroize();
+    rebound.exporter.zeroize();
+    exporters.zeroize();
+    client_nonce.zeroize();
+    server_nonce.zeroize();
 }
