@@ -548,6 +548,22 @@ impl Interaction {
             return false;
         }
         if let Some(domain) = self.domain.as_mut() {
+            if domain.is_manual_input() {
+                match key.code {
+                    KeyCode::Esc => {
+                        domain.back_or_close();
+                    }
+                    KeyCode::Enter => domain.ask_confirmation(),
+                    KeyCode::Backspace => domain.manual_backspace(),
+                    KeyCode::Char(ch)
+                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        domain.manual_insert(ch);
+                    }
+                    _ => {}
+                }
+                return false;
+            }
             match key.code {
                 KeyCode::Esc => {
                     if domain.back_or_close() {
@@ -559,6 +575,7 @@ impl Interaction {
                 KeyCode::Char(' ') => domain.toggle_current(),
                 KeyCode::Enter => domain.ask_confirmation(),
                 KeyCode::Char('a') => domain.open_review(),
+                KeyCode::Char('m') if key.modifiers.is_empty() => domain.begin_manual(),
                 KeyCode::Char('y') if domain.is_dns_confirming() => {
                     domain.confirm_dns_and_start();
                 }

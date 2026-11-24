@@ -29,13 +29,23 @@ impl fmt::Debug for DualProbeTarget {
 /// One reviewed source. The source is not a blanket network permission:
 /// every actual IP/port additionally needs an exact ProbeApproval. The domain
 /// variant never does DNS and binds both SNI and the pinned socket address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CandidateConsent {
     PlannedIp,
     PinnedDomain {
         domain: &'static str,
         pinned_ip: IpAddr,
     },
+    ManualDomain {
+        domain: String,
+        pinned_ip: IpAddr,
+    },
+}
+
+impl fmt::Debug for CandidateConsent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CandidateConsent(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,19 +171,35 @@ pub fn validate_dual_target(
             }) {
                 return Err(DualProbeError::UnplannedDomain);
             }
-            if target.request.server_name != domain {
-                return Err(DualProbeError::DomainNameMismatch);
-            }
-            if address.ip() != pinned_ip {
-                return Err(DualProbeError::DomainAddressMismatch);
-            }
-            if known_server_address(preview, pinned_ip) {
-                return Err(DualProbeError::SelfReference);
-            }
+            validate_domain_pin(preview, target, domain, pinned_ip)?;
+        }
+        CandidateConsent::ManualDomain { domain, pinned_ip } => {
+            use crate::camouflage_domain_dns::{validate_manual_dns_request, DnsConsent};
+            validate_manual_dns_request(&domain, DnsConsent::Approved)
+                .map_err(|_| DualProbeError::InvalidServerName)?;
+            validate_domain_pin(preview, target, &domain, pinned_ip)?;
         }
     }
     if target.roots.is_empty() {
         return Err(DualProbeError::NoTrustAnchors);
+    }
+    Ok(())
+}
+
+fn validate_domain_pin(
+    preview: &DiscoveryPreview,
+    target: &DualProbeTarget,
+    domain: &str,
+    pinned_ip: IpAddr,
+) -> Result<(), DualProbeError> {
+    if target.request.server_name != domain {
+        return Err(DualProbeError::DomainNameMismatch);
+    }
+    if target.request.address.ip() != pinned_ip {
+        return Err(DualProbeError::DomainAddressMismatch);
+    }
+    if known_server_address(preview, pinned_ip) {
+        return Err(DualProbeError::SelfReference);
     }
     Ok(())
 }
@@ -323,7 +349,7 @@ mod tests {
             Err(DualProbeError::UnplannedAddress)
         );
         assert_eq!(
-            validate_dual_target(&preview, &candidate, approved),
+            validate_dual_target(&preview, &candidate, approved.clone()),
             Err(DualProbeError::NoTrustAnchors)
         );
         assert_eq!(
@@ -351,7 +377,7 @@ mod tests {
         let mut wrong_name = candidate.clone();
         wrong_name.request.server_name = "github.com".to_owned();
         assert_eq!(
-            validate_dual_target(&preview, &wrong_name, approved),
+            validate_dual_target(&preview, &wrong_name, approved.clone()),
             Err(DualProbeError::DomainNameMismatch)
         );
         let mut denied = candidate;
@@ -359,6 +385,52 @@ mod tests {
         assert_eq!(
             validate_dual_target(&preview, &denied, approved),
             Err(DualProbeError::NotApproved)
+        );
+    }
+
+    #[test]
+    fn manual_domain_pin_uses_the_same_scope_and_trust_guards() {
+        use crate::camouflage_interfaces::NativeInterfaces;
+        use crate::camouflage_workflow::{build_preview, PreviewScope};
+
+        let preview = build_preview(
+            &NativeInterfaces::default(),
+            None,
+            PreviewScope::PassiveOnly,
+        );
+        let ip = "93.184.216.10".parse().unwrap();
+        let mut candidate = DualProbeTarget {
+            request: ProbeRequest {
+                address: SocketAddr::new(ip, 443),
+                server_name: "manual.example".into(),
+                deadline: Duration::from_secs(1),
+            },
+            roots: RootCertStore::empty(),
+            approval: ProbeApproval::public_https_ip(ip),
+        };
+        let consent = CandidateConsent::ManualDomain {
+            domain: "manual.example".into(),
+            pinned_ip: ip,
+        };
+        assert_eq!(
+            validate_dual_target(&preview, &candidate, consent.clone()),
+            Err(DualProbeError::NoTrustAnchors)
+        );
+        candidate.request.server_name = "other.example".into();
+        assert_eq!(
+            validate_dual_target(&preview, &candidate, consent.clone()),
+            Err(DualProbeError::DomainNameMismatch)
+        );
+        candidate.request.server_name = "manual.example".into();
+        candidate.request.address.set_ip("93.184.216.11".parse().unwrap());
+        assert_eq!(
+            validate_dual_target(&preview, &candidate, consent.clone()),
+            Err(DualProbeError::NotApproved)
+        );
+        candidate.approval = ProbeApproval::public_https_ip(candidate.request.address.ip());
+        assert_eq!(
+            validate_dual_target(&preview, &candidate, consent),
+            Err(DualProbeError::DomainAddressMismatch)
         );
     }
 

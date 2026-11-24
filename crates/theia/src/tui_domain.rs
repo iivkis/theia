@@ -5,7 +5,10 @@
 //! exact public IPs and affirmative consent, no re-resolution, no Apply.
 use crate::{
     camouflage_discovery::{CandidateHost, CandidateSource, Transport, POPULAR_HTTPS_DOMAINS},
-    camouflage_domain_dns::{resolve_catalogued_domain, DnsConsent, DnsError, MAX_PINNED_IPS},
+    camouflage_domain_dns::{
+        resolve_catalogued_domain, resolve_manual_domain, validate_manual_dns_request,
+        DnsConsent, DnsError, MAX_PINNED_IPS,
+    },
     camouflage_dual::{known_server_address, CandidateConsent, DualProbeTarget},
     camouflage_dual_batch::{probe_dual_batch, DualBatchError, DualBatchReport, DualBatchTarget},
     camouflage_probe::{ProbeApproval, ProbeRequest},
@@ -47,6 +50,7 @@ fn dns_pin_fresh_at(completed_at: Instant, now: Instant) -> bool {
 
 enum DomainState {
     Catalog,
+    ManualInput,
     DnsConfirm,
     DnsRunning {
         result: Receiver<Result<DnsObservation, DnsError>>,
@@ -66,6 +70,9 @@ pub(crate) struct DomainPanel {
     preview: DiscoveryPreview,
     domains: Vec<&'static str>,
     domain_index: usize,
+    manual: Option<String>,
+    manual_input: String,
+    manual_error: bool,
     addresses: Vec<IpAddr>,
     selected: Vec<IpAddr>,
     address_index: usize,
@@ -91,6 +98,9 @@ impl DomainPanel {
             preview,
             domains,
             domain_index: 0,
+            manual: None,
+            manual_input: String::new(),
+            manual_error: false,
             addresses: Vec::new(),
             selected: Vec::new(),
             address_index: 0,
@@ -101,8 +111,49 @@ impl DomainPanel {
         }
     }
 
-    pub(crate) fn domain(&self) -> Option<&'static str> {
-        self.domains.get(self.domain_index).copied()
+    pub(crate) fn domain(&self) -> Option<&str> {
+        self.manual
+            .as_deref()
+            .or_else(|| self.domains.get(self.domain_index).copied())
+    }
+
+    pub(crate) fn begin_manual(&mut self) {
+        if matches!(self.state, DomainState::Catalog) {
+            self.reset_pins();
+            self.manual = None;
+            self.manual_input.clear();
+            self.manual_error = false;
+            self.state = DomainState::ManualInput;
+        }
+    }
+
+    pub(crate) fn is_manual_input(&self) -> bool {
+        matches!(self.state, DomainState::ManualInput)
+    }
+
+    pub(crate) fn manual_insert(&mut self, ch: char) {
+        if self.is_manual_input()
+            && ch.is_ascii_graphic()
+            && self.manual_input.len() < 253
+        {
+            self.manual_input.push(ch);
+            self.manual_error = false;
+        }
+    }
+
+    pub(crate) fn manual_backspace(&mut self) {
+        if self.is_manual_input() {
+            self.manual_input.pop();
+            self.manual_error = false;
+        }
+    }
+
+    fn return_to_catalog(&mut self) {
+        self.reset_pins();
+        self.manual = None;
+        self.manual_input.clear();
+        self.manual_error = false;
+        self.state = DomainState::Catalog;
     }
 
     pub(crate) fn selected_count(&self) -> usize {
@@ -183,6 +234,14 @@ impl DomainPanel {
             return;
         }
         match self.state {
+            DomainState::ManualInput => {
+                if validate_manual_dns_request(&self.manual_input, DnsConsent::Approved).is_ok() {
+                    self.manual = Some(self.manual_input.clone());
+                    self.state = DomainState::DnsConfirm;
+                } else {
+                    self.manual_error = true;
+                }
+            }
             DomainState::Catalog if self.domain().is_some() => {
                 self.state = DomainState::DnsConfirm;
             }
@@ -196,7 +255,14 @@ impl DomainPanel {
             return;
         }
         match self.state {
-            DomainState::DnsConfirm => self.state = DomainState::Catalog,
+            DomainState::DnsConfirm => {
+                if self.manual.is_some() {
+                    self.manual = None;
+                    self.state = DomainState::ManualInput;
+                } else {
+                    self.state = DomainState::Catalog;
+                }
+            }
             DomainState::ProbeConfirm => self.state = DomainState::Resolved,
             _ => {}
         }
@@ -231,9 +297,14 @@ impl DomainPanel {
         if !self.is_dns_confirming() {
             return;
         }
-        let Some(domain) = self.domain() else {
-            self.state = DomainState::Catalog;
+        let Some(domain) = self.domain().map(str::to_owned) else {
+            self.return_to_catalog();
             return;
+        };
+        let catalogued = if self.manual.is_none() {
+            self.domains.get(self.domain_index).copied()
+        } else {
+            None
         };
         self.reset_pins();
         let (tx, rx) = mpsc::channel();
@@ -250,7 +321,12 @@ impl DomainPanel {
                         tokio::select! {
                             biased;
                             _ = cancel_rx => None,
-                            reply = resolve_catalogued_domain(domain, DnsConsent::Approved) => {
+                            reply = async {
+                                match catalogued {
+                                    Some(name) => resolve_catalogued_domain(name, DnsConsent::Approved).await,
+                                    None => resolve_manual_domain(&domain, DnsConsent::Approved).await,
+                                }
+                            } => {
                                 Some(reply.map(|addresses| DnsObservation {
                                     addresses,
                                     completed_at: Instant::now(),
@@ -283,9 +359,14 @@ impl DomainPanel {
             self.state = DomainState::Resolved;
             return;
         }
-        let Some(domain) = self.domain() else {
-            self.state = DomainState::Catalog;
+        let Some(domain) = self.domain().map(str::to_owned) else {
+            self.return_to_catalog();
             return;
+        };
+        let catalogued = if self.manual.is_none() {
+            self.domains.get(self.domain_index).copied()
+        } else {
+            None
         };
         let addresses = self.selected.clone();
         let preview = self.preview.clone();
@@ -330,9 +411,15 @@ impl DomainPanel {
                                 roots: roots.clone(),
                                 approval: ProbeApproval::public_https_ip(ip),
                             },
-                            consent: CandidateConsent::PinnedDomain {
-                                domain,
-                                pinned_ip: ip,
+                            consent: match catalogued {
+                                Some(name) => CandidateConsent::PinnedDomain {
+                                    domain: name,
+                                    pinned_ip: ip,
+                                },
+                                None => CandidateConsent::ManualDomain {
+                                    domain: domain.clone(),
+                                    pinned_ip: ip,
+                                },
                             },
                         })
                         .collect();
@@ -442,9 +529,11 @@ impl DomainPanel {
                 self.decline();
                 false
             }
-            DomainState::Resolved | DomainState::DnsFailed(_) | DomainState::Complete(_) => {
-                self.reset_pins();
-                self.state = DomainState::Catalog;
+            DomainState::ManualInput
+            | DomainState::Resolved
+            | DomainState::DnsFailed(_)
+            | DomainState::Complete(_) => {
+                self.return_to_catalog();
                 false
             }
             DomainState::Catalog => true,
@@ -459,8 +548,18 @@ impl DomainPanel {
         let mut out = String::from(
             "F-18: домены из 14 seed-каталога; DNS и TLS только с двумя согласиями\n\n",
         );
+        if self.is_manual_input() {
+            out.push_str(&format!(
+                "Ручной TLS-референс: {}\nТолько одно DNS-имя нижнего регистра, без URL, IP или порта.\nEnter: показать согласие; Esc: отменить. DNS ещё НЕ выполнялся.",
+                self.manual_input
+            ));
+            if self.manual_error {
+                out.push_str("\nНекорректное DNS-имя.");
+            }
+            return out;
+        }
         let Some(domain) = self.domain() else {
-            out.push_str("Нет доменов каталога. Запросы не выполняются. Esc: назад");
+            out.push_str("Нет доменов каталога. Запросы не выполняются. m: ручной ввод; Esc: назад");
             return out;
         };
         if self.is_running() {
@@ -480,9 +579,10 @@ impl DomainPanel {
                     out.push_str(&format!("{cursor} {name}\n"));
                 }
                 out.push_str(
-                    "\nDNS ещё НЕ выполнялся. Наличие домена в каталоге не означает разрешения на сканирование.\nj/k: выбрать домен  Enter: запросить согласие на один DNS A/AAAA\nEsc: назад",
+                    "\nDNS ещё НЕ выполнялся. Наличие домена в каталоге не означает разрешения на сканирование.\nj/k: выбрать домен  Enter: запросить согласие на один DNS A/AAAA\nm: ручной ввод имени  Esc: назад",
                 );
             }
+            DomainState::ManualInput => unreachable!("rendered above"),
             DomainState::DnsConfirm => out.push_str(&format!(
                 "СОГЛАСИЕ: DNS-запрос A/AAAA только для {domain}.\nВаш DNS-resolver увидит это имя. Запрос может уйти сторонним DNS-серверам.\nОдна попытка, до 5с, максимум 64 адреса; приватные/опасные ответы отклоняются целиком.\nОтветы показываются для отдельного выбора, ни один TLS/QUIC не запускается.\nНаличие домена в каталоге НЕ подтверждает право активного сканирования.\n\ny: разрешить DNS-запрос  n: отказаться  Esc: назад",
             )),
@@ -493,6 +593,7 @@ impl DomainPanel {
                 let explanation = match error {
                     DnsError::NotApproved => "не получено разрешение",
                     DnsError::NotCatalogued => "имя отсутствует в каталоге",
+                    DnsError::InvalidDomain => "некорректное ручное DNS-имя",
                     DnsError::TimedOut => "таймаут DNS",
                     DnsError::StaleObservation => "устаревший DNS-ответ, требуется новое согласие",
                     DnsError::LookupFailed => "DNS-запрос не выполнен",
@@ -553,7 +654,7 @@ impl DomainPanel {
                     DomainUiError::Batch(DualBatchError::Empty) => "пустой список",
                     DomainUiError::Batch(DualBatchError::TooManyTargets) => "слишком много IP",
                     DomainUiError::Batch(DualBatchError::DuplicateTarget) => "дублирующаяся цель",
-                    DomainUiError::Batch(DualBatchError::Target(_)) => "цель не в каталоге или не одобрена",
+                    DomainUiError::Batch(DualBatchError::Target(_)) => "цель не соответствует согласованному имени/IP или не одобрена",
                     DomainUiError::Batch(DualBatchError::TaskFailed) => "ошибка задачи",
                     DomainUiError::Batch(DualBatchError::BatchTimedOut) => "таймаут 20с",
                 };
@@ -657,6 +758,35 @@ mod tests {
         assert!(panel.body().contains("14"));
         assert!(panel.body().contains("DNS ещё НЕ выполнялся"));
         assert!(!panel.body().contains("H2+H3: ОБА"));
+    }
+
+    #[test]
+    fn manual_domain_input_is_offline_until_separate_dns_confirmation() {
+        let mut panel = panel();
+        panel.begin_manual();
+        assert!(panel.is_manual_input());
+        for ch in "https://bad.example".chars() {
+            panel.manual_insert(ch);
+        }
+        panel.ask_confirmation();
+        assert!(panel.is_manual_input());
+        assert!(panel.body().contains("Некорректное DNS-имя"));
+        panel.confirm_dns_and_start();
+        assert!(!panel.is_running());
+        assert!(!panel.back_or_close());
+        panel.begin_manual();
+        for ch in "manual.example".chars() {
+            panel.manual_insert(ch);
+        }
+        panel.ask_confirmation();
+        assert!(panel.is_dns_confirming());
+        assert_eq!(panel.domain(), Some("manual.example"));
+        assert_eq!(panel.selected_count(), 0);
+        assert!(!panel.is_running());
+        panel.decline();
+        assert!(panel.is_manual_input());
+        assert!(!panel.back_or_close());
+        assert_eq!(panel.domain(), Some("google.com"));
     }
 
     #[test]
