@@ -46,6 +46,86 @@ impl PinnedModeReview {
     }
 }
 
+/// Configuration-only record lifecycle; no network, secret creation or runtime Apply.
+#[derive(Clone, Copy)]
+pub(crate) enum RecordAction {
+    NewInbound,
+    NewProfile,
+    DeleteRecord,
+    ActivateProfile,
+    SetGrants,
+    DeleteUser,
+    EditTls,
+    EditTrust,
+}
+
+impl RecordAction {
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::NewInbound => "Создать inbound (собственный TLS)",
+            Self::NewProfile => "Создать клиентский профиль (собственный TLS)",
+            Self::DeleteRecord => "Удалить выбранную запись",
+            Self::ActivateProfile => "Выбрать активный профиль",
+            Self::SetGrants => "Заменить список grants",
+            Self::DeleteUser => "Удалить пользователя без grants",
+            Self::EditTls => "Изменить ссылки cert/key",
+            Self::EditTrust => "Изменить CA и ссылку credential",
+        }
+    }
+
+    pub(crate) fn fields(self) -> &'static [(&'static str, bool)] {
+        match self {
+            Self::NewInbound => &[
+                ("ID", false),
+                ("TCP/UDP bind", false),
+                ("TLS SNI", false),
+                ("cert (file:)", true),
+                ("key (file:)", true),
+                ("Grants (ID через запятую)", false),
+            ],
+            Self::NewProfile => &[
+                ("ID", false),
+                ("Endpoint", false),
+                ("TLS SNI", false),
+                ("CA (file:)", true),
+                ("Credential (env:/file:)", true),
+            ],
+            Self::SetGrants => &[("Grants (ID через запятую)", false)],
+            Self::DeleteUser => &[("ID пользователя", false)],
+            Self::EditTls => &[("cert (file:)", true), ("key (file:)", true)],
+            Self::EditTrust => &[("CA (file:)", true), ("Credential (env:/file:)", true)],
+            Self::DeleteRecord | Self::ActivateProfile => &[],
+        }
+    }
+}
+
+pub(crate) struct RecordReview {
+    source: [u8; 32],
+    selected: String,
+    candidate: Config,
+    next_selection: usize,
+    body: String,
+}
+
+impl RecordReview {
+    pub(crate) fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+fn generated_id(prefix: &str) -> Result<String, &'static str> {
+    let mut random = [0u8; 8];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut random)
+        .map_err(|_| "Secure random generator unavailable")?;
+    Ok(format!("{prefix}-{:016x}", u64::from_be_bytes(random)))
+}
+
+fn parse_grants(raw: &str) -> Vec<String> {
+    raw.split(',').map(str::trim).map(str::to_owned).collect()
+}
+
 pub struct Editor {
     role: Role,
     path: PathBuf,
@@ -593,6 +673,218 @@ impl Editor {
         }
     }
 
+    fn require_clean_records(&self) -> Result<(), &'static str> {
+        if self.editing || self.dirty() || self.issued.is_some() {
+            return Err("Сначала завершите или отмените редактирование и выдачу.");
+        }
+        if !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source) {
+            return Err("Файл изменился; откройте редактор заново.");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_fields(
+        &self,
+        action: RecordAction,
+    ) -> Result<Vec<String>, &'static str> {
+        self.require_clean_records()?;
+        match (&self.original, action) {
+            (Config::Server(_), RecordAction::NewInbound) => Ok(vec![
+                generated_id("inbound")?,
+                "0.0.0.0:443".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ]),
+            (Config::Client(_), RecordAction::NewProfile) => Ok(vec![
+                generated_id("profile")?,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ]),
+            (_, RecordAction::DeleteRecord)
+            | (Config::Client(_), RecordAction::ActivateProfile) => Ok(vec![]),
+            (Config::Server(doc), RecordAction::SetGrants) => {
+                let inbound = doc.server.inbounds.get(self.selected_record).ok_or("Inbound missing")?;
+                Ok(vec![inbound.allowed_user_ids.join(",")])
+            }
+            (Config::Server(_), RecordAction::DeleteUser) => Ok(vec![String::new()]),
+            (Config::Server(doc), RecordAction::EditTls) => {
+                let inbound = doc.server.inbounds.get(self.selected_record).ok_or("Inbound missing")?;
+                if !inbound.security_mode.is_plain() {
+                    return Err("Для pinned identity требуется отдельная процедура доверия.");
+                }
+                Ok(vec![String::new(), String::new()])
+            }
+            (Config::Client(doc), RecordAction::EditTrust) => {
+                let profile = doc.client.profiles.get(self.selected_record).ok_or("Profile missing")?;
+                if profile.tls_profile != "default" {
+                    return Err("Для pinned identity требуется отдельная процедура доверия.");
+                }
+                Ok(vec![String::new(), String::new()])
+            }
+            _ => Err("Операция недоступна в этой роли."),
+        }
+    }
+
+    pub(crate) fn review_record(
+        &self,
+        action: RecordAction,
+        fields: &[String],
+    ) -> Result<RecordReview, &'static str> {
+        self.require_clean_records()?;
+        if fields.len() != action.fields().len()
+            || fields.iter().any(|v| v.len() > 1024 || v.chars().any(char::is_control))
+        {
+            return Err("Неверное количество или размер полей.");
+        }
+        let mut candidate = self.original.clone();
+        let mut next_selection = self.selected_record;
+        let selected = self.selected_record_id().to_owned();
+        let detail = match (&mut candidate, action) {
+            (Config::Server(doc), RecordAction::NewInbound) => {
+                let grants = parse_grants(&fields[5]);
+                let bind: std::net::SocketAddr = fields[1].parse().map_err(|_| "Неверный bind.")?;
+                if bind.port() == 0 {
+                    return Err("Порт должен быть ненулевым.");
+                }
+                doc.server.inbounds.push(config::Inbound {
+                    id: fields[0].clone(),
+                    security_mode: Default::default(),
+                    allowed_user_ids: grants.clone(),
+                    quic_listen: fields[1].clone(),
+                    h2_listen: fields[1].clone(),
+                    server_name: fields[2].clone(),
+                    tls_cert: fields[3].clone(),
+                    tls_key: fields[4].clone(),
+                });
+                next_selection = doc.server.inbounds.len() - 1;
+                format!(
+                    "ID: {}\nBind TCP/UDP: {}\nSNI: {}\nGrants: {}\nCert/key: введены скрытые ссылки",
+                    fields[0], fields[1], fields[2], grants.join(", ")
+                )
+            }
+            (Config::Client(doc), RecordAction::NewProfile) => {
+                if fields[3].is_empty() {
+                    return Err("Требуется явная доверенная CA.");
+                }
+                doc.client.profiles.push(config::Profile {
+                    id: fields[0].clone(),
+                    server: fields[1].clone(),
+                    server_name: fields[2].clone(),
+                    auth_token: fields[4].clone(),
+                    tls_profile: "default".into(),
+                    xhttp_mode: Some(XhttpMode::Auto),
+                    tls_ca: Some(fields[3].clone()),
+                    transport: Transport::Auto,
+                    quic_connect_timeout_ms: 1600,
+                    quic_negative_cache_ttl_s: 900,
+                });
+                next_selection = doc.client.profiles.len() - 1;
+                format!(
+                    "ID: {}\nEndpoint: {}\nSNI: {}\nH2/H3 и XHTTP: auto\nCA/credential: скрытые ссылки\nАктивный профиль не меняется.",
+                    fields[0], fields[1], fields[2]
+                )
+            }
+            (Config::Server(doc), RecordAction::DeleteRecord) => {
+                if doc.server.inbounds.len() <= 1 {
+                    return Err("Нельзя удалить последний inbound в текущей схеме.");
+                }
+                if self.selected_record >= doc.server.inbounds.len() {
+                    return Err("Inbound missing");
+                }
+                let removed = doc.server.inbounds.remove(self.selected_record);
+                next_selection = next_selection.min(doc.server.inbounds.len() - 1);
+                format!("Удалить inbound {} и его grants. Пользователи и файлы ключей сохраняются.", removed.id)
+            }
+            (Config::Client(doc), RecordAction::DeleteRecord) => {
+                if doc.client.active_profile == selected {
+                    return Err("Сначала явно выберите другой активный профиль.");
+                }
+                if self.selected_record >= doc.client.profiles.len() {
+                    return Err("Profile missing");
+                }
+                doc.client.profiles.remove(self.selected_record);
+                next_selection = next_selection.min(doc.client.profiles.len() - 1);
+                format!("Удалить профиль {selected}. Файлы CA и credential сохраняются.")
+            }
+            (Config::Client(doc), RecordAction::ActivateProfile) => {
+                if doc.client.active_profile == selected {
+                    return Err("Профиль уже активен в TOML.");
+                }
+                let previous = std::mem::replace(&mut doc.client.active_profile, selected.clone());
+                format!("Активный профиль в TOML: {previous} → {selected}. Runtime не переключается.")
+            }
+            (Config::Server(doc), RecordAction::SetGrants) => {
+                let inbound = doc.server.inbounds.get_mut(self.selected_record).ok_or("Inbound missing")?;
+                let grants = parse_grants(&fields[0]);
+                let old = inbound.allowed_user_ids.join(", ");
+                inbound.allowed_user_ids = grants;
+                format!(
+                    "Inbound {selected}\nБыло: {old}\nБудет: {}\nНе меняет существующие туннели.",
+                    inbound.allowed_user_ids.join(", ")
+                )
+            }
+            (Config::Server(doc), RecordAction::DeleteUser) => {
+                let id = &fields[0];
+                if doc.server.inbounds.iter().any(|i| i.allowed_user_ids.contains(id)) {
+                    return Err("Сначала удалите grants пользователя во всех inbound.");
+                }
+                let index = doc.server.users.iter().position(|u| &u.id == id).ok_or("Пользователь не найден.")?;
+                doc.server.users.remove(index);
+                format!("Удалить пользователя {id}. Файлы credential не удаляются.")
+            }
+            (Config::Server(doc), RecordAction::EditTls) => {
+                let inbound = doc.server.inbounds.get_mut(self.selected_record).ok_or("Inbound missing")?;
+                if !inbound.security_mode.is_plain() {
+                    return Err("Для pinned identity требуется отдельная процедура доверия.");
+                }
+                inbound.tls_cert.clone_from(&fields[0]);
+                inbound.tls_key.clone_from(&fields[1]);
+                format!("Inbound {selected}: заменить обе скрытые ссылки cert/key. Не TLS rotation.")
+            }
+            (Config::Client(doc), RecordAction::EditTrust) => {
+                let profile = doc.client.profiles.get_mut(self.selected_record).ok_or("Profile missing")?;
+                if profile.tls_profile != "default" || fields[0].is_empty() {
+                    return Err("Требуется own-TLS и явная доверенная CA.");
+                }
+                profile.tls_ca = Some(fields[0].clone());
+                profile.auth_token.clone_from(&fields[1]);
+                format!("Профиль {selected}: явно заменить скрытые ссылки CA и credential.")
+            }
+            _ => return Err("Операция недоступна в этой роли."),
+        };
+        candidate.validate().map_err(|_| "Конфигурация не прошла строгую проверку; проверьте ID, ссылки, grants и bind.")?;
+        if candidate == self.original {
+            return Err("Изменений нет.");
+        }
+        Ok(RecordReview {
+            source: self.saved_sha256(),
+            selected,
+            candidate,
+            next_selection,
+            body: format!(
+                "{}\n{detail}\n\nТолько сохранение TOML, без запуска, Apply и удаления файлов.\ny: подтвердить; n/Esc: отменить",
+                action.title()
+            ),
+        })
+    }
+
+    pub(crate) fn stage_record(&mut self, review: RecordReview) -> Result<(), &'static str> {
+        self.require_clean_records()?;
+        if review.source != self.saved_sha256() || review.selected != self.selected_record_id() {
+            return Err("Выбранная запись или исходный файл изменились; повторите preview.");
+        }
+        self.draft = review.candidate;
+        self.selected_record = review.next_selection;
+        self.selected_field = 0;
+        self.error = None;
+        self.notice = "Подтверждено. Требуется guarded save; runtime не изменён.";
+        Ok(())
+    }
+
     /// Preview only the operator's saved local identity. The third-party
     /// candidate review cannot authorize this separate configuration change.
     pub(crate) fn review_pinned_mode(
@@ -979,6 +1271,8 @@ impl Editor {
 
     pub fn discard(&mut self) {
         self.draft = self.original.clone();
+        self.selected_record = self.selected_record.min(self.record_count().saturating_sub(1));
+        self.selected_field = 0;
         self.clear_issued();
         self.cancel();
         self.notice = "Изменения отменены.";
@@ -1099,6 +1393,69 @@ mod tests {
         second.server_name = "work.example.org".into();
         doc.client.profiles.push(second);
         Config::Client(doc).to_toml().unwrap()
+    }
+
+    #[test]
+    fn record_lifecycle_client_create_activate_delete_and_conflict() {
+        let fixture = Temp::write(&two_profiles());
+        let mut editor = Editor::load(Role::Client, &fixture.0).unwrap();
+        let fields = vec![
+            "extra".into(), "extra.example.org:443".into(), "extra.example.org".into(),
+            "file:/tmp/ca.pem".into(), "env:EXTRA_TOKEN".into(),
+        ];
+        let preview = editor.review_record(RecordAction::NewProfile, &fields).unwrap();
+        assert!(!preview.body().contains("EXTRA_TOKEN"));
+        assert!(!preview.body().contains("/tmp/ca.pem"));
+        assert!(!editor.dirty());
+        editor.stage_record(preview).unwrap();
+        assert!(editor.dirty());
+        assert_eq!(editor.selected_record_id(), "extra");
+        assert!(!editor.selected_record_is_active());
+        assert!(editor.save());
+        let preview = editor.review_record(RecordAction::ActivateProfile, &[]).unwrap();
+        editor.stage_record(preview).unwrap();
+        assert!(editor.save());
+        assert!(editor.selected_record_is_active());
+        assert!(editor.review_record(RecordAction::DeleteRecord, &[]).is_err());
+        editor.select_record(true);
+        let preview = editor.review_record(RecordAction::DeleteRecord, &[]).unwrap();
+        let before = fs::read_to_string(&fixture.0).unwrap();
+        fs::write(&fixture.0, format!("{before}\n# external edit\n")).unwrap();
+        assert!(editor.stage_record(preview).is_err());
+        assert!(!editor.dirty());
+    }
+
+    #[test]
+    fn record_lifecycle_server_validates_grants_and_preserves_references() {
+        let fixture = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &fixture.0).unwrap();
+        let mut fields = vec![
+            "extra".into(), "0.0.0.0:9443".into(), "extra.example.org".into(),
+            "file:/tmp/cert.pem".into(), "file:/tmp/key.pem".into(), "unknown".into(),
+        ];
+        assert!(editor.review_record(RecordAction::NewInbound, &fields).is_err());
+        fields[5] = "device-a".into();
+        let preview = editor.review_record(RecordAction::NewInbound, &fields).unwrap();
+        assert!(!preview.body().contains("/tmp/key.pem"));
+        editor.stage_record(preview).unwrap();
+        assert!(editor.save());
+        assert_eq!(editor.record_count(), 3);
+        assert!(editor.review_record(RecordAction::DeleteUser, &["device-a".into()]).is_err());
+        assert!(editor.review_record(RecordAction::SetGrants, &["device-a,device-a".into()]).is_err());
+        let preview = editor.review_record(RecordAction::DeleteRecord, &[]).unwrap();
+        editor.stage_record(preview).unwrap();
+        editor.discard();
+        assert_eq!(editor.record_count(), 3);
+        assert!(!editor.dirty());
+        editor.select_record(true);
+        let preview = editor.review_record(RecordAction::DeleteRecord, &[]).unwrap();
+        editor.stage_record(preview).unwrap();
+        assert!(editor.save());
+        assert_eq!(editor.record_count(), 2);
+        let Config::Server(doc) = config::read_file(&fixture.0).unwrap() else {
+            panic!("server fixture");
+        };
+        assert_eq!(doc.server.users.len(), 1);
     }
 
     fn uncertain_failure() -> config::WriteFailure {

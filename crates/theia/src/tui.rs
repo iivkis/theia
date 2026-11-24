@@ -9,7 +9,7 @@ use crate::{
     tui_candidates::CandidateReview,
     tui_discovery::DiscoveryPanel,
     tui_domain::DomainPanel,
-    tui_editor::{Editor, PinnedModeReview},
+    tui_editor::{Editor, PinnedModeReview, RecordAction, RecordReview},
     tui_probe::ProbePanel,
     tui_runtime::RuntimePanel,
     Role,
@@ -253,12 +253,44 @@ enum DisableFlow {
 type ExportResult = (Editor, Result<PathBuf, &'static str>);
 type PinnedReviewResult = (Editor, Result<PinnedModeReview, &'static str>);
 
+enum RecordFlow {
+    Input {
+        action: RecordAction,
+        fields: Vec<String>,
+        focus: usize,
+    },
+    Confirm(RecordReview),
+}
+
+impl RecordFlow {
+    fn body(&self) -> String {
+        match self {
+            Self::Confirm(review) => review.body().to_owned(),
+            Self::Input { action, fields, focus } => {
+                let mut body = format!("{}\n", action.title());
+                for (index, ((label, hidden), value)) in action.fields().iter().zip(fields).enumerate() {
+                    let marker = if index == *focus { '>' } else { ' ' };
+                    let shown = if *hidden {
+                        if value.is_empty() { "[пусто]" } else { "[скрыто]" }
+                    } else {
+                        value.as_str()
+                    };
+                    body.push_str(&format!("{marker} {label}: {shown}\n"));
+                }
+                body.push_str("\nTab/Shift+Tab: поле; Enter: preview; Esc: отменить.\nВ скрытые поля вводите только ссылки, не секреты.");
+                body
+            }
+        }
+    }
+}
+
 struct Interaction {
     editor: Option<Editor>,
     issuance: Option<IssueFlow>,
     issue_kind: IssueKind,
     revocation: Option<DisableFlow>,
     importing: Option<ImportFlow>,
+    records: Option<RecordFlow>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
     candidate_batch: Option<CandidateBatchPanel>,
@@ -282,6 +314,7 @@ impl Interaction {
             issue_kind: IssueKind::NewUser,
             revocation: None,
             importing: None,
+            records: None,
             discovery: None,
             candidates: None,
             candidate_batch: None,
@@ -645,6 +678,46 @@ impl Interaction {
             }
             return model.update(key);
         };
+        if let Some(flow) = self.records.take() {
+            match flow {
+                RecordFlow::Confirm(review) => match key.code {
+                    KeyCode::Char('y') if key.modifiers.is_empty() => {
+                        match editor.stage_record(review) {
+                            Ok(()) => self.start_save(),
+                            Err(message) => editor.error = Some(message.into()),
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {}
+                    _ => self.records = Some(RecordFlow::Confirm(review)),
+                },
+                RecordFlow::Input { action, mut fields, mut focus } => {
+                    match key.code {
+                        KeyCode::Esc => return false,
+                        KeyCode::Enter => match editor.review_record(action, &fields) {
+                            Ok(review) => {
+                                editor.error = None;
+                                self.records = Some(RecordFlow::Confirm(review));
+                                return false;
+                            }
+                            Err(message) => editor.error = Some(message.into()),
+                        },
+                        KeyCode::Tab => focus = (focus + 1) % fields.len(),
+                        KeyCode::BackTab => focus = (focus + fields.len() - 1) % fields.len(),
+                        KeyCode::Backspace => { fields[focus].pop(); }
+                        KeyCode::Char(ch)
+                            if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                                && !ch.is_control()
+                                && fields[focus].len() + ch.len_utf8() <= 1024 =>
+                        {
+                            fields[focus].push(ch);
+                        }
+                        _ => {}
+                    }
+                    self.records = Some(RecordFlow::Input { action, fields, focus });
+                }
+            }
+            return false;
+        }
         if let Some(flow) = self.issuance.take() {
             match flow {
                 IssueFlow::Input(mut id) => match key.code {
@@ -1058,6 +1131,38 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            let record_action = if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                match (editor.role(), key.code) {
+                    (Role::Server, KeyCode::Char('N')) => Some(RecordAction::NewInbound),
+                    (Role::Client, KeyCode::Char('N')) => Some(RecordAction::NewProfile),
+                    (_, KeyCode::Char('D')) => Some(RecordAction::DeleteRecord),
+                    (Role::Client, KeyCode::Char('A')) => Some(RecordAction::ActivateProfile),
+                    (Role::Server, KeyCode::Char('G')) => Some(RecordAction::SetGrants),
+                    (Role::Server, KeyCode::Char('U')) => Some(RecordAction::DeleteUser),
+                    (Role::Server, KeyCode::Char('E')) => Some(RecordAction::EditTls),
+                    (Role::Client, KeyCode::Char('E')) => Some(RecordAction::EditTrust),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(action) = record_action {
+                match editor.record_fields(action) {
+                    Ok(fields) if fields.is_empty() => match editor.review_record(action, &fields) {
+                        Ok(review) => {
+                            editor.error = None;
+                            self.records = Some(RecordFlow::Confirm(review));
+                        }
+                        Err(message) => editor.error = Some(message.into()),
+                    },
+                    Ok(fields) => {
+                        editor.error = None;
+                        self.records = Some(RecordFlow::Input { action, fields, focus: 0 });
+                    }
+                    Err(message) => editor.error = Some(message.into()),
+                }
+                return false;
+            }
             if editor.role() == Role::Client
                 && key.code == KeyCode::Char('p')
                 && key.modifiers.is_empty()
@@ -1357,6 +1462,12 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             "Проверка изменений и атомарная запись TOML выполняются.\nRuntime не перезагружается.\nДождитесь результата операции.",
             true,
         );
+    } else if let Some(flow) = interaction.and_then(|ui| ui.records.as_ref()) {
+        let mut body = flow.body();
+        if let Some(error) = interaction.and_then(|ui| ui.editor.as_ref()).and_then(|editor| editor.error.as_deref()) {
+            body.push_str(&format!("\n\n{error}"));
+        }
+        panel(frame, parts[1], "Управление записями TOML", &body, true);
     } else if let Some(flow) = interaction.and_then(|ui| ui.issuance.as_ref()) {
         draw_issuance(
             frame,
@@ -1439,9 +1550,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     }
     let footer = if model.screen == Screen::Client {
-        "p: Windows proxy  i: импорт  l: ссылка  Ctrl+S: сохранить"
+        "N/D/A/E: профили  p: Windows proxy  i: импорт  Ctrl+S: сохранить"
     } else {
-        "j/k: запись  Tab: поле  Enter/e: ввод  l: ссылка  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить  p: сеть"
+        "N/D/G/U/E: записи  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
     };
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
@@ -1684,7 +1795,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (URI/локальный файл, скрытый ввод). Ctrl+S только сохраняет; runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (URI/локальный файл, скрытый ввод). N: создать запись; D: удалить; A: активировать профиль; G: grants; U: удалить пользователя; E: TLS/CA и credential. Ctrl+S только сохраняет; runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
