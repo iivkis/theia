@@ -109,7 +109,8 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 .ok_or(ClientError::Configuration)?,
         )
     };
-    let stream_up = crate::security_profile::CertificatePin::is_stream_up_profile(&profile.tls_profile);
+    let stream_up =
+        crate::security_profile::CertificatePin::is_stream_up_profile(&profile.tls_profile);
     match profile.transport {
         Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)?
             .with_certificate_pin(certificate_pin)?

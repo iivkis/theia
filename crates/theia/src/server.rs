@@ -290,13 +290,18 @@ impl ServerContext {
         {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        let up = up.get(header::AUTHORIZATION).ok_or(StatusCode::UNAUTHORIZED)?;
-        let down = down.get(header::AUTHORIZATION).ok_or(StatusCode::UNAUTHORIZED)?;
+        let up = up
+            .get(header::AUTHORIZATION)
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let down = down
+            .get(header::AUTHORIZATION)
+            .ok_or(StatusCode::UNAUTHORIZED)?;
         if !bool::from(up.as_bytes().ct_eq(down.as_bytes())) {
             return Err(StatusCode::UNAUTHORIZED);
         }
         // Exactly one authorization snapshot and quota permit for both legs.
-        self.authorize(up.to_str().ok()).map_err(AuthFailure::status)
+        self.authorize(up.to_str().ok())
+            .map_err(AuthFailure::status)
     }
 
     /// Raw token digest is the SHA-256 of exactly 32 decoded bytes, not the
@@ -738,7 +743,8 @@ async fn handle_request(
     result
 }
 
-type SplitPair = crate::split_http::Pair<(Request<h2::RecvStream>, h2::server::SendResponse<Bytes>)>;
+type SplitPair =
+    crate::split_http::Pair<(Request<h2::RecvStream>, h2::server::SendResponse<Bytes>)>;
 
 async fn handle_split_request(
     request: Request<h2::RecvStream>,
@@ -750,7 +756,9 @@ async fn handle_split_request(
     let Some(leg) = crate::split_http::leg(&request) else {
         return reject(&mut respond, StatusCode::NOT_FOUND).await;
     };
-    let Some(((upload, mut up), (mut download, mut down))) = pair.join(leg, (request, respond)).await else {
+    let Some(((upload, mut up), (mut download, mut down))) =
+        pair.join(leg, (request, respond)).await
+    else {
         return Ok(());
     };
     let permit = match context.authorize_split_pair(&upload, &download, peer) {
@@ -763,18 +771,35 @@ async fn handle_split_request(
     // GET has no request body or trailers; never dial until its EOF is proven.
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         download.body_mut().data().await.is_none()
-            && download.body_mut().trailers().await.is_ok_and(|value| value.is_none())
-    }).await.unwrap_or(false);
+            && download
+                .body_mut()
+                .trailers()
+                .await
+                .is_ok_and(|value| value.is_none())
+    })
+    .await
+    .unwrap_or(false);
     if !empty {
         let _ = reject(&mut up, StatusCode::BAD_REQUEST).await;
         return reject(&mut down, StatusCode::BAD_REQUEST).await;
     }
-    let response = Response::builder().status(StatusCode::OK).body(()).map_err(|_| ServerError::Http2)?;
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .map_err(|_| ServerError::Http2)?;
     // POST response contains only an empty acknowledgement. All downstream
     // SmartTheia frames travel on the independent GET response.
     reject(&mut up, StatusCode::OK).await?;
-    let outgoing = down.send_response(response, false).map_err(|_| ServerError::Http2)?;
-    let result = relay_request(upload.into_body(), outgoing, context, diagnostics::next_id()).await;
+    let outgoing = down
+        .send_response(response, false)
+        .map_err(|_| ServerError::Http2)?;
+    let result = relay_request(
+        upload.into_body(),
+        outgoing,
+        context,
+        diagnostics::next_id(),
+    )
+    .await;
     drop(permit);
     result
 }

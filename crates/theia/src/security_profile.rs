@@ -47,8 +47,10 @@ impl CertificatePin {
     }
 
     pub fn parse_profile(profile: &str) -> Option<Self> {
-        let raw = profile.strip_prefix(PROFILE_PREFIX)
-            .or_else(|| profile.strip_prefix(SPLIT_PROFILE_PREFIX))?.as_bytes();
+        let raw = profile
+            .strip_prefix(PROFILE_PREFIX)
+            .or_else(|| profile.strip_prefix(SPLIT_PROFILE_PREFIX))?
+            .as_bytes();
         if raw.len() != 64
             || !raw
                 .iter()
@@ -75,7 +77,8 @@ impl CertificatePin {
     }
 
     pub fn stream_up_profile(self) -> String {
-        self.profile().replacen(PROFILE_PREFIX, SPLIT_PROFILE_PREFIX, 1)
+        self.profile()
+            .replacen(PROFILE_PREFIX, SPLIT_PROFILE_PREFIX, 1)
     }
 
     pub fn profile(self) -> String {
@@ -145,13 +148,18 @@ mod tests {
 
     #[test]
     fn stream_up_profile_is_explicit_and_not_an_invitation_v1() {
-        use crate::{config::{self, Config, Transport}, invite::Invitation};
+        use crate::{
+            config::{self, Config, Transport},
+            invite::Invitation,
+        };
         let pin = CertificatePin::from_der(b"fixture");
         let profile = pin.stream_up_profile();
         assert!(CertificatePin::is_stream_up_profile(&profile));
         assert!(!CertificatePin::is_stream_up_profile(&pin.profile()));
         assert!(CertificatePin::parse_profile(&profile).is_some_and(|value| value == pin));
-        let Config::Client(mut client) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+        let Config::Client(mut client) =
+            config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
             panic!("client fixture");
         };
         for transport in [Transport::H2, Transport::H3, Transport::Auto] {

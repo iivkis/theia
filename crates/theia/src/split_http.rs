@@ -17,8 +17,16 @@ pub(crate) enum Leg {
 
 pub(crate) fn leg<T>(request: &Request<T>) -> Option<Leg> {
     if request.uri().query().is_some()
-        || request.headers().get_all(header::CONTENT_TYPE).iter().count() != 1
-        || request.headers().get(header::CONTENT_TYPE).map(HeaderValue::as_bytes)
+        || request
+            .headers()
+            .get_all(header::CONTENT_TYPE)
+            .iter()
+            .count()
+            != 1
+        || request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(HeaderValue::as_bytes)
             != Some(b"application/octet-stream".as_slice())
     {
         return None;
@@ -32,14 +40,21 @@ pub(crate) fn leg<T>(request: &Request<T>) -> Option<Leg> {
     }
 }
 
-pub(crate) fn request(uri: &Uri, leg: Leg, authorization: &HeaderValue) -> Result<Request<()>, ClientError> {
+pub(crate) fn request(
+    uri: &Uri,
+    leg: Leg,
+    authorization: &HeaderValue,
+) -> Result<Request<()>, ClientError> {
     let mut parts = uri.clone().into_parts();
     parts.path_and_query = Some(match leg {
         Leg::Upload => http::uri::PathAndQuery::from_static(UPLOAD_PATH),
         Leg::Download => http::uri::PathAndQuery::from_static(DOWNLOAD_PATH),
     });
     Request::builder()
-        .method(match leg { Leg::Upload => Method::POST, Leg::Download => Method::GET })
+        .method(match leg {
+            Leg::Upload => Method::POST,
+            Leg::Download => Method::GET,
+        })
         .uri(Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::AUTHORIZATION, authorization.clone())
@@ -70,7 +85,9 @@ pub(crate) struct Pair<T> {
 
 impl<T> Pair<T> {
     pub(crate) fn new() -> Self {
-        Self { state: Mutex::new(State::Empty) }
+        Self {
+            state: Mutex::new(State::Empty),
+        }
     }
 
     pub(crate) async fn join(&self, leg: Leg, item: T) -> Option<(T, T)> {
@@ -107,8 +124,15 @@ mod tests {
     async fn both_orders_pair_once_and_missing_half_expires() {
         for first in [Leg::Upload, Leg::Download] {
             let pair = Pair::new();
-            let second = if first == Leg::Upload { Leg::Download } else { Leg::Upload };
-            let (a, b) = tokio::join!(pair.join(first, first == Leg::Upload), pair.join(second, second == Leg::Upload));
+            let second = if first == Leg::Upload {
+                Leg::Download
+            } else {
+                Leg::Upload
+            };
+            let (a, b) = tokio::join!(
+                pair.join(first, first == Leg::Upload),
+                pair.join(second, second == Leg::Upload)
+            );
             assert_eq!(a, Some((true, false)));
             assert_eq!(b, None);
             assert_eq!(pair.join(second, false).await, None);
@@ -122,11 +146,11 @@ mod tests {
     async fn duplicate_or_other_connection_never_pairs() {
         let pair = Pair::new();
         let (a, b) = tokio::join!(pair.join(Leg::Upload, 1), pair.join(Leg::Upload, 2));
-        assert_eq!((a,b), (None,None));
+        assert_eq!((a, b), (None, None));
         assert_eq!(pair.join(Leg::Download, 3).await, None);
         let left = Pair::new();
         let right = Pair::new();
-        let (a,b) = tokio::join!(left.join(Leg::Upload, 1), right.join(Leg::Download, 2));
-        assert_eq!((a,b), (None,None));
+        let (a, b) = tokio::join!(left.join(Leg::Upload, 1), right.join(Leg::Download, 2));
+        assert_eq!((a, b), (None, None));
     }
 }

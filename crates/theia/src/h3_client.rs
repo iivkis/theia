@@ -178,20 +178,45 @@ impl H3Client {
         }));
         let (response, mut tx, mut rx) = if self.stream_up {
             use crate::split_http::{self, Leg};
-            let mut download = sender.send_request(
-                split_http::request(&self.uri, Leg::Download, &self.authorization)?,
-            ).await.map_err(|_| ClientError::Http3)?;
+            let mut download = sender
+                .send_request(split_http::request(
+                    &self.uri,
+                    Leg::Download,
+                    &self.authorization,
+                )?)
+                .await
+                .map_err(|_| ClientError::Http3)?;
             download.finish().await.map_err(|_| ClientError::Http3)?;
-            let mut upload = sender.send_request(
-                split_http::request(&self.uri, Leg::Upload, &self.authorization)?,
-            ).await.map_err(|_| ClientError::Http3)?;
-            let upload_response = upload.recv_response().await.map_err(|_| ClientError::Http3)?;
+            let mut upload = sender
+                .send_request(split_http::request(
+                    &self.uri,
+                    Leg::Upload,
+                    &self.authorization,
+                )?)
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            let upload_response = upload
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
             split_http::check_status(upload_response.status())?;
-            if upload.recv_data().await.map_err(|_| ClientError::Http3)?.is_some()
-                || upload.recv_trailers().await.map_err(|_| ClientError::Http3)?.is_some() {
+            if upload
+                .recv_data()
+                .await
+                .map_err(|_| ClientError::Http3)?
+                .is_some()
+                || upload
+                    .recv_trailers()
+                    .await
+                    .map_err(|_| ClientError::Http3)?
+                    .is_some()
+            {
                 return Err(ClientError::Protocol);
             }
-            let response = download.recv_response().await.map_err(|_| ClientError::Http3)?;
+            let response = download
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
             let (tx, _) = upload.split();
             let (_, rx) = download.split();
             (response, tx, rx)
@@ -201,8 +226,14 @@ impl H3Client {
                 .header(header::AUTHORIZATION, self.authorization.clone())
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
-            let mut stream = sender.send_request(request).await.map_err(|_| ClientError::Http3)?;
-            let response = stream.recv_response().await.map_err(|_| ClientError::Http3)?;
+            let mut stream = sender
+                .send_request(request)
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            let response = stream
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
             let (tx, rx) = stream.split();
             (response, tx, rx)
         };

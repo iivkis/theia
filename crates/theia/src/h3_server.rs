@@ -251,7 +251,8 @@ async fn handle_split_request(
         reject_split(&mut stream, StatusCode::NOT_FOUND).await;
         return;
     };
-    let Some(((upload, mut up), (download, mut down))) = pair.join(leg, (request, stream)).await else {
+    let Some(((upload, mut up), (download, mut down))) = pair.join(leg, (request, stream)).await
+    else {
         return;
     };
     let permit = match context.authorize_split_pair(&upload, &download, peer) {
@@ -264,18 +265,27 @@ async fn handle_split_request(
     };
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         down.recv_data().await.is_ok_and(|value| value.is_none())
-            && down.recv_trailers().await.is_ok_and(|value| value.is_none())
-    }).await.unwrap_or(false);
+            && down
+                .recv_trailers()
+                .await
+                .is_ok_and(|value| value.is_none())
+    })
+    .await
+    .unwrap_or(false);
     if !empty {
         reject_split(&mut up, StatusCode::BAD_REQUEST).await;
         reject_split(&mut down, StatusCode::BAD_REQUEST).await;
         return;
     }
-    if !matches!(timeout(CLOSE_TIMEOUT, async {
-        respond(&mut up, StatusCode::OK).await?;
-        up.finish().await.map_err(|_| ServerError::Io)?;
-        respond(&mut down, StatusCode::OK).await
-    }).await, Ok(Ok(()))) {
+    if !matches!(
+        timeout(CLOSE_TIMEOUT, async {
+            respond(&mut up, StatusCode::OK).await?;
+            up.finish().await.map_err(|_| ServerError::Io)?;
+            respond(&mut down, StatusCode::OK).await
+        })
+        .await,
+        Ok(Ok(()))
+    ) {
         up.stop_stream(Code::H3_REQUEST_CANCELLED);
         up.stop_sending(Code::H3_REQUEST_CANCELLED);
         down.stop_stream(Code::H3_REQUEST_CANCELLED);

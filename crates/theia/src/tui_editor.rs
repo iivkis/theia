@@ -575,7 +575,10 @@ impl Editor {
 
     /// Preview only the operator's saved local identity. The third-party
     /// candidate review cannot authorize this separate configuration change.
-    pub(crate) fn review_pinned_mode(&self, stream_up: bool) -> Result<PinnedModeReview, &'static str> {
+    pub(crate) fn review_pinned_mode(
+        &self,
+        stream_up: bool,
+    ) -> Result<PinnedModeReview, &'static str> {
         if self.editing
             || self.dirty()
             || self.issued.is_some()
@@ -611,7 +614,11 @@ impl Editor {
             name: inbound.server_name.clone(),
             endpoint: format!("{}:{}", inbound.server_name, tcp.port()),
             pin,
-            mode: if stream_up { crate::security_profile::SecurityMode::PinnedCertStreamUpV1 } else { crate::security_profile::SecurityMode::PinnedCertV1 },
+            mode: if stream_up {
+                crate::security_profile::SecurityMode::PinnedCertStreamUpV1
+            } else {
+                crate::security_profile::SecurityMode::PinnedCertV1
+            },
         })
     }
 
@@ -1119,7 +1126,10 @@ mod tests {
         let Config::Server(saved) = config::read_file(&file.0).unwrap() else {
             panic!("saved server");
         };
-        assert_eq!(saved.server.inbounds[0].security_mode, SecurityMode::PinnedCertStreamUpV1);
+        assert_eq!(
+            saved.server.inbounds[0].security_mode,
+            SecurityMode::PinnedCertStreamUpV1
+        );
         assert!(editor.public_share().is_err());
     }
 

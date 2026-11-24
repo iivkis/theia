@@ -33,8 +33,8 @@ pub mod restart_guard;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
 pub mod security_profile;
-mod split_http;
 pub mod server;
+mod split_http;
 pub mod tui;
 pub(crate) mod tui_candidate_batch;
 pub(crate) mod tui_candidates;

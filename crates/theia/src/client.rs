@@ -345,17 +345,29 @@ impl H2Client {
         // backend verified TLS identity and ALPN and established HTTP/2.
         let (response, mut outgoing) = if self.stream_up {
             use crate::split_http::{self, Leg};
-            let (download, _) = sender.send_request(
-                split_http::request(&self.uri, Leg::Download, &self.authorization)?, true,
-            ).map_err(|_| ClientError::Http2)?;
+            let (download, _) = sender
+                .send_request(
+                    split_http::request(&self.uri, Leg::Download, &self.authorization)?,
+                    true,
+                )
+                .map_err(|_| ClientError::Http2)?;
             let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
-            let (upload, tx) = sender.send_request(
-                split_http::request(&self.uri, Leg::Upload, &self.authorization)?, false,
-            ).map_err(|_| ClientError::Http2)?;
+            let (upload, tx) = sender
+                .send_request(
+                    split_http::request(&self.uri, Leg::Upload, &self.authorization)?,
+                    false,
+                )
+                .map_err(|_| ClientError::Http2)?;
             let upload = upload.await.map_err(|_| ClientError::Http2)?;
             split_http::check_status(upload.status())?;
             let mut empty = upload.into_body();
-            if empty.data().await.is_some() || empty.trailers().await.map_err(|_| ClientError::Http2)?.is_some() {
+            if empty.data().await.is_some()
+                || empty
+                    .trailers()
+                    .await
+                    .map_err(|_| ClientError::Http2)?
+                    .is_some()
+            {
                 return Err(ClientError::Protocol);
             }
             (download.await.map_err(|_| ClientError::Http2)?, tx)
@@ -365,7 +377,9 @@ impl H2Client {
                 .header(header::AUTHORIZATION, self.authorization.clone())
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
-            let (response, tx) = sender.send_request(request, false).map_err(|_| ClientError::Http2)?;
+            let (response, tx) = sender
+                .send_request(request, false)
+                .map_err(|_| ClientError::Http2)?;
             (response.await.map_err(|_| ClientError::Http2)?, tx)
         };
         crate::diag!(

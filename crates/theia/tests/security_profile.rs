@@ -266,17 +266,52 @@ async fn h2_h3_stream_up_separate_http_legs_and_identity() {
         let split = Fixture::start(SecurityMode::PinnedCertStreamUpV1).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
-        split.errors(Some(split.other_pin), "localhost", &TOKEN, port, ClientError::Tls).await;
-        split.errors(Some(split.pin), "localhost", &[0x43; 32], port, ClientError::Unauthorized).await;
+        split
+            .errors(
+                Some(split.other_pin),
+                "localhost",
+                &TOKEN,
+                port,
+                ClientError::Tls,
+            )
+            .await;
+        split
+            .errors(
+                Some(split.pin),
+                "localhost",
+                &[0x43; 32],
+                port,
+                ClientError::Unauthorized,
+            )
+            .await;
         let address = Address::V4([127, 0, 0, 1]);
         let token = URL_SAFE_NO_PAD.encode(TOKEN);
-        let legacy = H2Client::new(&split.h2.to_string(), "localhost", &token, split.roots.clone())
-            .unwrap().with_certificate_pin(Some(split.pin)).unwrap();
-        assert_eq!(legacy.open(address.clone(), port).await.err(), Some(ClientError::Rejected(404)));
+        let legacy = H2Client::new(
+            &split.h2.to_string(),
+            "localhost",
+            &token,
+            split.roots.clone(),
+        )
+        .unwrap()
+        .with_certificate_pin(Some(split.pin))
+        .unwrap();
+        assert_eq!(
+            legacy.open(address.clone(), port).await.err(),
+            Some(ClientError::Rejected(404))
+        );
         let legacy = H3Client::new(split.h3, "localhost", &token, split.roots.clone())
-            .unwrap().with_certificate_pin(Some(split.pin)).unwrap();
-        assert_eq!(legacy.open(address, port).await.err(), Some(ClientError::Rejected(404)));
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+            .unwrap()
+            .with_certificate_pin(Some(split.pin))
+            .unwrap();
+        assert_eq!(
+            legacy.open(address, port).await.err(),
+            Some(ClientError::Rejected(404))
+        );
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
         split.transfer(Some(split.pin), &target).await;
-    }).await.expect("bounded real H2/H3 split transport matrix");
+    })
+    .await
+    .expect("bounded real H2/H3 split transport matrix");
 }
