@@ -99,6 +99,12 @@ require("windows-cross-sid-ci.ps1" in windows,
         "the second-SID test must actually run in CI")
 require("pywinpty==3.0.5 pyte==0.8.2" in windows,
         "the ConPTY/VT test dependencies must be pinned")
+require('CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in windows
+        and 'CARGO_PROFILE_TEST_DEBUG: "line-tables-only"' in windows,
+        "Windows test/dev binaries must retain diagnostic line numbers with bounded debug info")
+require("CARGO_PROFILE_RELEASE_DEBUG" not in windows,
+        "release profile must remain unchanged by the test-only optimization")
+
 require("Real Windows live Theia H2 fingerprint vs pinned Go uTLS" in windows
         and "cargo test --workspace --locked --test fingerprint_h2" in windows,
         "Windows fingerprint must reuse the previously compiled root workspace")
