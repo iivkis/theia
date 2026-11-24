@@ -1,6 +1,6 @@
 # ADR-0069: F-14 M4.4e — protected one-time invitation file export
 
-**Status:** prepared, pending native CI.
+**Status:** accepted in PR #107 after CI run 45392909341 passed all 13 jobs.
 
 ## Decision
 

@@ -9,7 +9,7 @@ use crate::{
 };
 use rustls::RootCertStore;
 use std::{
-    io::{BufReader, Read},
+    io::BufReader,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     path::Path,
     sync::{Arc, Mutex},
@@ -41,35 +41,16 @@ const HTTP_FAILED: &[u8] =
 const HTTP_TIMEOUT: &[u8] =
     b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
-fn load_file(reference: &str, limit: usize, secret: bool) -> Result<Vec<u8>, ClientError> {
-    let path = Path::new(
-        reference
-            .strip_prefix("file:")
-            .ok_or(ClientError::Configuration)?,
-    );
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| ClientError::Configuration)?;
-    if !metadata.file_type().is_file() || metadata.len() > limit as u64 {
-        return Err(ClientError::Configuration);
-    }
-    #[cfg(unix)]
-    if secret {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(ClientError::Configuration);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = secret;
-    let mut data = Vec::new();
-    std::fs::File::open(path)
-        .map_err(|_| ClientError::Configuration)?
-        .take((limit + 1) as u64)
-        .read_to_end(&mut data)
-        .map_err(|_| ClientError::Configuration)?;
-    if data.len() > limit {
-        return Err(ClientError::Configuration);
-    }
-    Ok(data)
+fn load_file(
+    reference: &str,
+    limit: usize,
+    secret: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, ClientError> {
+    let path = reference
+        .strip_prefix("file:")
+        .ok_or(ClientError::Configuration)?;
+    crate::bounded_input::read(Path::new(path), limit as u64, true, secret)
+        .map_err(|_| ClientError::Configuration)
 }
 
 async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
@@ -88,11 +69,15 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             .map_err(|_| ClientError::Configuration)?;
     }
     let token = if let Some(name) = profile.auth_token.strip_prefix("env:") {
-        std::env::var(name).map_err(|_| ClientError::Configuration)?
+        zeroize::Zeroizing::new(std::env::var(name).map_err(|_| ClientError::Configuration)?)
     } else {
-        let token = load_file(&profile.auth_token, 43, true)?;
-        String::from_utf8(token).map_err(|_| ClientError::Configuration)?
+        let bytes = load_file(&profile.auth_token, 43, true)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?;
+        zeroize::Zeroizing::new(text.to_owned())
     };
+    if token.len() != 43 || roots.is_empty() {
+        return Err(ClientError::Configuration);
+    }
     // F-13: runtime selection must match strict typed TOML validation even
     // if a direct library caller bypasses document parsing. Never downgrade
     // a named browser-style profile to rustls or apply it to QUIC/H3/auto.
@@ -779,6 +764,22 @@ async fn handle(
 #[cfg(test)]
 mod selector_tests {
     use super::*;
+
+    #[test]
+    fn runtime_file_reference_refuses_non_native_or_oversized_input() {
+        use std::fs;
+
+        let name = format!("theia-runtime-input-{}", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        fs::write(&path, [b'x'; 44]).unwrap();
+        let reference = format!("file:{}", path.display());
+        assert!(load_file(&reference, 43, true).is_err());
+        assert!(load_file("file:relative-token", 43, true).is_err());
+        assert!(load_file("https://example.invalid/ca", CA_LIMIT, false).is_err());
+        #[cfg(windows)]
+        assert!(load_file(r"file:\\server\share\token", 43, true).is_err());
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn negative_cache_expires_and_zero_ttl_disables_it() {

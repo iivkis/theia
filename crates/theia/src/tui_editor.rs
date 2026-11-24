@@ -106,7 +106,7 @@ impl Editor {
             .map_err(|_| "Explicit TLS CA reference is invalid or unreadable")?;
         // Only a NEW secret is ever written. A secretless public invitation
         // demands a separately supplied env: reference, never a default.
-        let mut secret = if let Some(bytes) = invite.token_bytes() {
+        let secret = if let Some(bytes) = invite.token_bytes() {
             let token = Zeroizing::new(bytes);
             Some(
                 PrivateBearer::create(&self.path, &token)
@@ -140,6 +140,26 @@ impl Editor {
         candidate
             .validate()
             .map_err(|_| "Imported profile did not pass full document validation")?;
+        self.commit_credential_candidate(candidate, secret, write)?;
+        let Config::Client(updated) = &self.draft else {
+            return Err("Client config required");
+        };
+        self.selected_record = updated.client.profiles.len() - 1;
+        self.error = None;
+        self.notice = if has_trust {
+            "Профиль импортирован. TLS trust выбран, но соединение НЕ проверено и НЕ запущено."
+        } else {
+            "Профиль импортирован БЕЗ CA; запуск заблокирован до отдельного TLS trust."
+        };
+        Ok(())
+    }
+
+    fn commit_credential_candidate(
+        &mut self,
+        candidate: Config,
+        mut secret: Option<PrivateBearer>,
+        write: impl FnOnce(&Path, &Config, &[u8]) -> Result<Vec<u8>, config::WriteFailure>,
+    ) -> Result<(), &'static str> {
         self.draft = candidate;
         if !self.save_with(write) {
             let uncertain = self.write_uncertain;
@@ -155,22 +175,83 @@ impl Editor {
                 self.notice = "Состояние записи неизвестно: откройте редактор заново.";
                 Err("TOML replacement may have completed; reload before using")
             } else {
-                Err("Imported profile was not saved; guarded rollback completed")
+                Err("Profile was not saved; guarded rollback completed")
             };
         }
         if let Some(saved) = secret.as_mut() {
             saved.commit();
         }
-        let Config::Client(updated) = &self.draft else {
+        Ok(())
+    }
+
+    /// A credential-only replacement is separate from ordinary import.
+    /// It must not change the saved endpoint, TLS identity, trust or transport.
+    fn refresh_target(&self, invite: &Invitation) -> Result<usize, &'static str> {
+        if self.role != Role::Client || self.editing || self.dirty() || self.issued.is_some() {
+            return Err("Finish or discard all changes before credential replacement");
+        }
+        if !invite.has_token() {
+            return Err("Credential replacement requires a confidential invitation");
+        }
+        let Config::Client(document) = &self.draft else {
             return Err("Client config required");
         };
-        self.selected_record = updated.client.profiles.len() - 1;
-        self.error = None;
-        self.notice = if has_trust {
-            "Профиль импортирован. TLS trust выбран, но соединение НЕ проверено и НЕ запущено."
-        } else {
-            "Профиль импортирован БЕЗ CA; запуск заблокирован до отдельного TLS trust."
+        let index = document
+            .client
+            .profiles
+            .iter()
+            .position(|profile| profile.id == invite.id)
+            .ok_or("Existing profile required")?;
+        let profile = &document.client.profiles[index];
+        if profile.server != invite.endpoint
+            || profile.server_name != invite.server_name
+            || profile.tls_profile != "default"
+            || (invite.transport != Transport::Auto && profile.transport != invite.transport)
+        {
+            return Err("Invitation does not match saved profile identity and transport");
+        }
+        Ok(index)
+    }
+
+    pub(crate) fn can_refresh_credential(&self, invite: &Invitation) -> bool {
+        self.refresh_target(invite).is_ok()
+    }
+
+    pub fn refresh_credential(&mut self, invite: &Invitation) -> Result<(), &'static str> {
+        let result = self.refresh_credential_with(invite, config::guarded_write);
+        if let Err(message) = result {
+            self.error = Some(message.to_owned());
+        }
+        result
+    }
+
+    fn refresh_credential_with(
+        &mut self,
+        invite: &Invitation,
+        write: impl FnOnce(&Path, &Config, &[u8]) -> Result<Vec<u8>, config::WriteFailure>,
+    ) -> Result<(), &'static str> {
+        let index = self.refresh_target(invite)?;
+        let bytes = invite
+            .token_bytes()
+            .ok_or("Confidential invitation required")?;
+        let token = Zeroizing::new(bytes);
+        let secret = PrivateBearer::create(&self.path, &token)
+            .map_err(|_| "Cannot create protected bearer credential")?;
+        let reference = secret
+            .reference()
+            .map_err(|_| "Cannot build protected bearer reference")?;
+        let mut candidate = self.draft.clone();
+        let Config::Client(document) = &mut candidate else {
+            return Err("Client config required");
         };
+        document.client.profiles[index].auth_token = reference;
+        candidate
+            .validate()
+            .map_err(|_| "Updated profile did not pass full document validation")?;
+        self.commit_credential_candidate(candidate, Some(secret), write)?;
+        self.selected_record = index;
+        self.error = None;
+        self.notice = "Credential сохранён. Старый файл не удалён; runtime не обновлён.";
         Ok(())
     }
 
@@ -247,14 +328,24 @@ impl Editor {
     /// is revealed once only after a guarded durable save; it is not live
     /// until a separate explicit revisioned auth-only CAS Apply.
     pub fn rotate_user(&mut self, user_id: &str) -> Result<(), &'static str> {
-        let result = self.try_rotate_user(user_id);
+        let result = self.try_rotate_user(user_id, false);
         if let Err(message) = result {
             self.error = Some(message.to_owned());
         }
         result
     }
 
-    fn try_rotate_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+    /// Explicit recovery of a disabled account always issues a fresh bearer.
+    /// Preserve every existing grant; never revive the previous digest.
+    pub fn reenable_user(&mut self, user_id: &str) -> Result<(), &'static str> {
+        let result = self.try_rotate_user(user_id, true);
+        if let Err(message) = result {
+            self.error = Some(message.to_owned());
+        }
+        result
+    }
+
+    fn try_rotate_user(&mut self, user_id: &str, reenable: bool) -> Result<(), &'static str> {
         if self.role != Role::Server || self.editing || self.dirty() || self.issued.is_some() {
             return Err("Finish or discard edits and pending issuance first");
         }
@@ -270,8 +361,12 @@ impl Editor {
         let Some(user) = doc.server.users.iter().find(|user| user.id == user_id) else {
             return Err("User does not exist");
         };
-        if user.disabled {
-            return Err("Disabled users require a separate explicit re-enable flow");
+        if user.disabled != reenable {
+            return Err(if reenable {
+                "Only a disabled user can be re-enabled"
+            } else {
+                "Disabled users require a separate explicit re-enable flow"
+            });
         }
         let previous_digest = user.token_sha256.clone();
         let inbound_id = inbound.id.clone();
@@ -300,6 +395,7 @@ impl Editor {
             return Err("User does not exist");
         };
         user.token_sha256 = digest;
+        user.disabled = false;
         candidate
             .validate()
             .map_err(|_| "Rotated user did not pass configuration validation")?;
@@ -309,7 +405,11 @@ impl Editor {
         self.issued = Some(invitation);
         self.issued_ready = false;
         self.error = None;
-        self.notice = "Токен заменён в черновике. Сохранение не обновляет runtime.";
+        self.notice = if reenable {
+            "Пользователь восстановлен с новым токеном в черновике. Runtime не обновлён."
+        } else {
+            "Токен заменён в черновике. Сохранение не обновляет runtime."
+        };
         Ok(())
     }
 
@@ -376,7 +476,12 @@ impl Editor {
             return None;
         }
         self.issued_ready = false;
-        self.issued.take()
+        let invite = self.issued.take()?;
+        if !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source) {
+            self.error = Some("Saved configuration changed; issuance refused".into());
+            return None;
+        }
+        Some(invite)
     }
 
     /// Consume the confirmed one-time offer, without rendering the URI.
@@ -387,9 +492,6 @@ impl Editor {
             return Err("Server issuance required");
         }
         let invite = self.take_issued().ok_or("No saved invitation available")?;
-        if !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source) {
-            return Err("Saved configuration changed; export refused");
-        }
         client_import::export_invitation_file(&self.path, &invite)
             .map_err(|_| "Protected export failed; issue or rotate again")
     }
@@ -1041,6 +1143,19 @@ mod tests {
     }
 
     #[test]
+    fn stale_saved_issuance_cannot_be_revealed_directly() {
+        let server = Temp::write(&server_source());
+        let mut issuer = Editor::load(Role::Server, &server.0).unwrap();
+        issuer.issue_user("reveal-device").unwrap();
+        assert!(issuer.save());
+        let current = fs::read_to_string(&server.0).unwrap();
+        fs::write(&server.0, format!("# changed externally\n{current}")).unwrap();
+        assert!(issuer.take_issued().is_none());
+        assert!(!issuer.issued_ready());
+        assert!(issuer.export_issued_file().is_err());
+    }
+
+    #[test]
     fn stale_saved_issuance_cannot_be_exported_or_revealed_after_refusal() {
         let server = Temp::write(&server_source());
         let mut issuer = Editor::load(Role::Server, &server.0).unwrap();
@@ -1051,6 +1166,143 @@ mod tests {
         assert!(issuer.export_issued_file().is_err());
         assert!(issuer.take_issued().is_none());
         assert!(issuer.export_issued_file().is_err());
+    }
+
+    fn refresh_fixture(token: [u8; 32]) -> Invitation {
+        let source = include_str!("../../../examples/server.toml").replace(
+            "REPLACE_WITH_64_LOWERCASE_HEX",
+            &format!("{:x}", Sha256::digest(token)),
+        );
+        let server = config::parse(&source).unwrap();
+        Invitation::issued_from_server(&server, "public", "device-a", &token).unwrap()
+    }
+
+    fn saved_secret(config: &Config) -> PathBuf {
+        let Config::Client(doc) = config else {
+            panic!("client");
+        };
+        let reference = &doc.client.profiles[1].auth_token;
+        PathBuf::from(reference.strip_prefix("file:").unwrap())
+    }
+
+    fn remove_fixture_secret(path: &Path) {
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn credential_replacement_changes_only_reference_and_preserves_old_file() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let temp = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        let initial = refresh_fixture([0x42; 32]);
+        editor.import_invitation(&initial, None, None).unwrap();
+        let mut before = config::read_file(&temp.0).unwrap();
+        let Config::Client(doc) = &mut before else {
+            panic!("client");
+        };
+        // Simulate operator-selected existing transport and trust reference.
+        doc.client.profiles[1].transport = Transport::H2;
+        let trust = "file:/existing-ca.pem".to_owned();
+        doc.client.profiles[1].tls_ca = Some(trust);
+        doc.client.active_profile = "public".into();
+        config::atomic_write(&temp.0, &before).unwrap();
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        let old = saved_secret(&before);
+        let replacement = refresh_fixture([0x43; 32]);
+        assert!(editor.can_refresh_credential(&replacement));
+        assert!(editor.import_invitation(&replacement, None, None).is_err());
+        editor.refresh_credential(&replacement).unwrap();
+        let after = config::read_file(&temp.0).unwrap();
+        let new = saved_secret(&after);
+        assert_ne!(old, new);
+        assert_eq!(
+            fs::read_to_string(&old).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x42; 32])
+        );
+        assert_eq!(
+            fs::read_to_string(&new).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x43; 32])
+        );
+        let Config::Client(doc) = &mut before else {
+            panic!("client");
+        };
+        doc.client.profiles[1].auth_token = format!("file:{}", new.display());
+        assert_eq!(after, before);
+        remove_fixture_secret(&old);
+        remove_fixture_secret(&new);
+    }
+
+    #[test]
+    fn credential_replacement_refuses_wrong_identity_public_and_stale_documents() {
+        let temp = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        let initial = refresh_fixture([0x42; 32]);
+        assert!(editor.refresh_credential(&initial).is_err());
+        editor.import_invitation(&initial, None, None).unwrap();
+        let before = fs::read(&temp.0).unwrap();
+        let old = saved_secret(&config::read_file(&temp.0).unwrap());
+        let server = config::parse(&server_source()).unwrap();
+        let public = Invitation::public_from_server(&server, "public").unwrap();
+        assert!(editor.refresh_credential(&public).is_err());
+        let mut wrong = refresh_fixture([0x43; 32]);
+        wrong.server_name = "other.example.org".into();
+        assert!(editor.refresh_credential(&wrong).is_err());
+        wrong.server_name = initial.server_name.clone();
+        wrong.endpoint = "other.example.org:443".into();
+        assert!(editor.refresh_credential(&wrong).is_err());
+        wrong.endpoint = initial.endpoint.clone();
+        wrong.transport = Transport::H3;
+        assert!(editor.refresh_credential(&wrong).is_err());
+        assert_eq!(fs::read(&temp.0).unwrap(), before);
+        let mut changed = before;
+        changed.extend_from_slice(b"\n# external edit\n");
+        fs::write(&temp.0, &changed).unwrap();
+        assert!(editor.refresh_credential(&initial).is_err());
+        assert_eq!(fs::read(&temp.0).unwrap(), changed);
+        assert!(old.is_file());
+        remove_fixture_secret(&old);
+    }
+
+    #[test]
+    fn credential_replacement_rolls_back_or_retains_only_new_file_at_commit_boundary() {
+        let temp = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        editor
+            .import_invitation(&refresh_fixture([0x42; 32]), None, None)
+            .unwrap();
+        let initial = config::read_file(&temp.0).unwrap();
+        let old = saved_secret(&initial);
+        let replacement = refresh_fixture([0x43; 32]);
+        let mut discarded = None;
+        let result = editor.refresh_credential_with(&replacement, |_, doc, _| {
+            discarded = Some(saved_secret(doc));
+            Err(config::WriteFailure::BeforeReplace(config::ConfigError {
+                field: "config".into(),
+                reason: "injected pre-replacement refusal",
+            }))
+        });
+        assert!(result.is_err());
+        assert!(!editor.dirty());
+        assert!(!discarded.unwrap().exists());
+        assert_eq!(config::read_file(&temp.0).unwrap(), initial);
+        assert!(old.is_file());
+
+        let result = editor.refresh_credential_with(&replacement, |path, doc, expected| {
+            config::guarded_write(path, doc, expected)?;
+            Err(uncertain_failure())
+        });
+        assert!(result.is_err());
+        assert!(editor.dirty());
+        assert!(!editor.save());
+        assert!(editor.refresh_credential(&replacement).is_err());
+        let new = saved_secret(&config::read_file(&temp.0).unwrap());
+        assert_ne!(old, new);
+        assert!(old.is_file());
+        assert!(new.is_file());
+        remove_fixture_secret(&old);
+        remove_fixture_secret(&new);
     }
 
     #[test]
@@ -1418,6 +1670,64 @@ mod tests {
         let mut client_editor = Editor::load(Role::Client, &client.0).unwrap();
         assert!(client_editor.rotate_user("device-a").is_err());
         assert!(!client_editor.dirty());
+    }
+
+    #[test]
+    fn reenable_requires_disabled_granted_user_and_fresh_bearer() {
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(editor.reenable_user("device-a").is_err());
+        assert!(editor.reenable_user("missing").is_err());
+        assert!(!editor.dirty());
+        editor.disable_user("device-a").unwrap();
+        assert!(editor.save());
+        let Config::Server(before) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert!(before.server.users[0].disabled);
+        assert!(editor.rotate_user("device-a").is_err());
+        editor.reenable_user("device-a").unwrap();
+        assert!(editor.take_issued().is_none());
+        assert!(editor.dirty());
+        assert!(editor.save());
+        let invite = editor.take_issued().unwrap();
+        let token = Zeroizing::new(invite.token_bytes().unwrap());
+        assert!(*token != [0x42; 32]);
+        let Config::Server(after) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
+        assert!(!after.server.users[0].disabled);
+        assert_eq!(before.server.inbounds, after.server.inbounds);
+        assert_eq!(
+            after.server.users[0].token_sha256,
+            format!("{:x}", Sha256::digest(*token))
+        );
+        assert_ne!(
+            before.server.users[0].token_sha256,
+            after.server.users[0].token_sha256
+        );
+        assert!(editor.take_issued().is_none());
+        assert!(editor.reenable_user("device-a").is_err());
+    }
+
+    #[test]
+    fn reenable_conflict_and_discard_never_release_token() {
+        let temp = Temp::write(&two_inbounds());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.disable_user("device-a").unwrap();
+        assert!(editor.save());
+        let disabled = fs::read_to_string(&temp.0).unwrap();
+        editor.reenable_user("device-a").unwrap();
+        editor.discard();
+        assert!(editor.take_issued().is_none());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), disabled);
+        editor.reenable_user("device-a").unwrap();
+        let external = format!("# changed externally\n{disabled}");
+        fs::write(&temp.0, &external).unwrap();
+        assert!(!editor.save());
+        assert!(editor.take_issued().is_none());
+        editor.discard();
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), external);
     }
 
     #[test]

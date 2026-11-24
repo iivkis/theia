@@ -5,7 +5,7 @@ use std::{
     collections::HashSet,
     fmt,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -192,17 +192,8 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
 }
 
 pub fn read_file(path: &Path) -> Result<Config, ConfigError> {
-    let file = fs::File::open(path)
-        .map_err(|_| ConfigError::new("config", "cannot open configuration file"))?;
-    let mut buf = Vec::new();
-    file.take((MAX_BYTES + 1) as u64)
-        .read_to_end(&mut buf)
-        .map_err(|_| ConfigError::new("config", "cannot read configuration file"))?;
-    ensure(
-        buf.len() <= MAX_BYTES,
-        "document",
-        "configuration exceeds 1 MiB",
-    )?;
+    let buf = crate::bounded_input::read(path, MAX_BYTES as u64, false, false)
+        .map_err(|_| ConfigError::new("config", "cannot read bounded configuration file"))?;
     let text = std::str::from_utf8(&buf)
         .map_err(|_| ConfigError::new("document", "configuration is not UTF-8"))?;
     parse(text)
@@ -560,58 +551,10 @@ impl WriteFailure {
     }
 }
 
-fn regular_file(meta: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
-    }
-    meta.is_file()
-}
-
-fn no_follow(options: &mut OpenOptions) {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    let _ = options;
-}
-
 pub(crate) fn editor_bytes(path: &Path) -> Result<Vec<u8>, ConfigError> {
-    let invalid = || ConfigError::new("config", "missing or unsafe configuration file");
-    let metadata = fs::symlink_metadata(path).map_err(|_| invalid())?;
-    if !regular_file(&metadata) || metadata.len() > MAX_BYTES as u64 {
-        return Err(invalid());
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    no_follow(&mut options);
-    let file = options.open(path).map_err(|_| invalid())?;
-    let metadata = file.metadata().map_err(|_| invalid())?;
-    if !regular_file(&metadata) || metadata.len() > MAX_BYTES as u64 {
-        return Err(invalid());
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| invalid())?;
-    ensure(
-        bytes.len() <= MAX_BYTES,
-        "document",
-        "configuration exceeds 1 MiB",
-    )?;
-    Ok(bytes)
+    let mut bytes = crate::bounded_input::read(path, MAX_BYTES as u64, false, false)
+        .map_err(|_| ConfigError::new("config", "missing or unsafe configuration file"))?;
+    Ok(std::mem::take(&mut *bytes))
 }
 
 fn require_unchanged(path: &Path, expected: &[u8]) -> Check {
@@ -641,7 +584,7 @@ fn editor_lock(path: &Path) -> Result<fs::File, ConfigError> {
     let error = || ConfigError::new("config", "editor lock busy or unsafe; retry");
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
-    no_follow(&mut options);
+    crate::bounded_input::no_follow(&mut options);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -649,7 +592,7 @@ fn editor_lock(path: &Path) -> Result<fs::File, ConfigError> {
     }
     let file = options.open(path).map_err(|_| error())?;
     let meta = file.metadata().map_err(|_| error())?;
-    if !regular_file(&meta) || meta.len() != 0 {
+    if !crate::bounded_input::regular_file(&meta) || meta.len() != 0 {
         return Err(error());
     }
     file.try_lock().map_err(|_| error())?;
@@ -1145,6 +1088,17 @@ tls_key = "file:/etc/theia/tls/privkey.pem"
         ));
         assert_eq!(fs::read(&path).unwrap(), initial);
         assert_eq!(fs::read(&foreign).unwrap().as_slice(), b"do not touch");
+    }
+
+    #[test]
+    fn typed_file_reader_rejects_oversized_and_nonregular_documents() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("client.toml");
+        fs::write(&path, client()).unwrap();
+        assert_eq!(read_file(&path).unwrap(), parse(&client()).unwrap());
+        assert!(read_file(&scratch.0).is_err());
+        fs::write(&path, vec![b'x'; MAX_BYTES + 1]).unwrap();
+        assert!(read_file(&path).is_err());
     }
 
     #[test]

@@ -157,16 +157,8 @@ impl ReloadPreflight {
         &self,
         expected_sha256: [u8; 32],
     ) -> Result<ServerDocument, ReloadCheckError> {
-        use std::io::Read;
-        let file =
-            std::fs::File::open(&self.config_path).map_err(|_| ReloadCheckError::InvalidConfig)?;
-        let mut contents = zeroize::Zeroizing::new(Vec::new());
-        file.take(1024 * 1024 + 1)
-            .read_to_end(&mut contents)
+        let contents = crate::bounded_input::read(&self.config_path, 1024 * 1024, false, false)
             .map_err(|_| ReloadCheckError::InvalidConfig)?;
-        if contents.len() > 1024 * 1024 {
-            return Err(ReloadCheckError::InvalidConfig);
-        }
         let observed: [u8; 32] = Sha256::digest(contents.as_slice()).into();
         if observed != expected_sha256 {
             return Err(ReloadCheckError::InvalidConfig);
@@ -186,16 +178,8 @@ impl ReloadPreflight {
         &self,
         expected_sha256: [u8; 32],
     ) -> Result<ServerDocument, crate::restart_guard::RestartError> {
-        use std::io::Read;
-        let file = std::fs::File::open(&self.config_path)
+        let contents = crate::bounded_input::read(&self.config_path, 1024 * 1024, false, false)
             .map_err(|_| crate::restart_guard::RestartError::InvalidConfig)?;
-        let mut contents = zeroize::Zeroizing::new(Vec::new());
-        file.take(1024 * 1024 + 1)
-            .read_to_end(&mut contents)
-            .map_err(|_| crate::restart_guard::RestartError::InvalidConfig)?;
-        if contents.len() > 1024 * 1024 {
-            return Err(crate::restart_guard::RestartError::InvalidConfig);
-        }
         let observed: [u8; 32] = Sha256::digest(contents.as_slice()).into();
         if observed != expected_sha256 {
             return Err(crate::restart_guard::RestartError::InvalidConfig);
