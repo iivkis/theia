@@ -570,12 +570,19 @@ impl Store {
     }
 
     pub fn preview_update(&self, document: &str, now: u64) -> Result<(u64, Verified), Error> {
-        let (_, _, history, previous) = self.snapshot()?;
+        let (_, previous, next) = self.preview_update_bound(document, now)?;
+        Ok((previous.descriptor.revision, next))
+    }
+
+    /// The entire trust history, including accepted timestamps and the
+    /// old signed payload, is bound to the offline confirmation.
+    pub fn preview_update_bound(&self, document: &str, now: u64) -> Result<([u8;32], Verified, Verified), Error> {
+        let (raw, _, history, previous) = self.snapshot()?;
         history.check_clock(now)?;
         let next = history.verify_current(document)?;
         next.check_time(now)?;
         previous.compare(&next)?;
-        Ok((previous.descriptor.revision, next))
+        Ok((Sha256::digest(raw.as_bytes()).into(), previous, next))
     }
 
     /// Bind an explicit trust transition to the complete current persistent
@@ -628,7 +635,7 @@ impl Store {
     /// Ordinary updates cannot change identity. Read/verify old and new,
     /// then CAS the entire signed snapshot, including the immutable history.
     pub fn update(&self, document: &str, now: u64) -> Result<Change, Error> {
-        self.update_inner(document, None, None, now)
+        self.update_inner(document, None, None, None, now)
     }
 
     /// Guarded offline operator update; the revision check is inside the
@@ -639,7 +646,7 @@ impl Store {
         expected_revision: u64,
         now: u64,
     ) -> Result<Change, Error> {
-        self.update_inner(document, Some(expected_revision), None, now)
+        self.update_inner(document, Some(expected_revision), None, None, now)
     }
 
     /// Bind an authenticated download to the exact descriptor used for its
@@ -650,7 +657,15 @@ impl Store {
         expected: &Verified,
         now: u64,
     ) -> Result<Change, Error> {
-        self.update_inner(document, Some(expected.descriptor.revision), Some(expected), now)
+        self.update_inner(document, Some(expected.descriptor.revision), Some(expected), None, now)
+    }
+
+    /// Offline recovery can replace an expired document, but never a
+    /// different trust snapshot from the one the operator confirmed.
+    pub fn update_bound(
+        &self, document: &str, expected_revision: u64, expected_snapshot: [u8;32], now: u64,
+    ) -> Result<Change, Error> {
+        self.update_inner(document, Some(expected_revision), None, Some(expected_snapshot), now)
     }
 
     fn update_inner(
@@ -658,9 +673,14 @@ impl Store {
         document: &str,
         expected_revision: Option<u64>,
         expected: Option<&Verified>,
+        expected_snapshot: Option<[u8;32]>,
         now: u64,
     ) -> Result<Change, Error> {
         let (old, mut snapshot, history, previous) = self.snapshot()?;
+        let digest: [u8;32] = Sha256::digest(old.as_bytes()).into();
+        if expected_snapshot.is_some_and(|expected| expected != digest) {
+            return Err(Error::Rollback);
+        }
         if expected_revision.is_some_and(|rev| rev != previous.descriptor.revision) {
             return Err(Error::Rollback);
         }

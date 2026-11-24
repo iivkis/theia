@@ -32,7 +32,7 @@ theia reality inspect --profile PATH\n\
 theia reality promotion-preview --profile PATH --descriptor PATH\n\
 theia reality promotion-apply --profile PATH --descriptor PATH --expected-revision N --snapshot-sha256 HEX --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality recovery-preview --profile PATH --descriptor PATH\n\
-theia reality recovery-apply --profile PATH --descriptor PATH --expected-revision N --sha256 HEX --identity-sha256 HEX --confirm\n\
+theia reality recovery-apply --profile PATH --descriptor PATH --expected-revision N --snapshot-sha256 HEX --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality publish-new --health PATH --key PATH --publication PATH --confirm\n\
 theia reality publish-status --publication PATH\n\
 theia reality publish-refresh --health PATH --publication PATH --sha256 HEX --confirm\n\
@@ -125,6 +125,7 @@ pub enum Command {
         profile: String,
         descriptor: String,
         revision: u64,
+        snapshot: [u8;32],
         digest: [u8; 32],
         identity: [u8; 32],
     },
@@ -333,11 +334,12 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
             profile: path(p)?,
             descriptor: path(d)?,
         },
-        ["recovery-apply", "--profile", p, "--descriptor", d, "--expected-revision", r, "--sha256", h, "--identity-sha256", i, "--confirm"] => {
+        ["recovery-apply", "--profile", p, "--descriptor", d, "--expected-revision", r, "--snapshot-sha256", s, "--sha256", h, "--identity-sha256", i, "--confirm"] => {
             Command::RecoveryApply {
                 profile: path(p)?,
                 descriptor: path(d)?,
                 revision: crate::expected_revision(r)?,
+                snapshot: hash(s)?,
                 digest: hash(h)?,
                 identity: hash(i)?,
             }
@@ -513,13 +515,14 @@ pub fn run(command: Command) -> Result<String, Error> {
                 false,
             )?;
             let preview = profile.preview_recovery(&raw, now)?;
-            Ok(format!("Offline recovery preview; runtime UNCHANGED\nexpected_revision={}\nnext_revision={}\ncurrent_expired={}\nreference_changed={}\ndocument_sha256={}\nidentity_sha256={}\nConfirm the fingerprint independently. This cannot recover a compromised or retired identity.",
-                preview.expected_revision, preview.next_revision, preview.current_expired, preview.reference_changed, hex(preview.document_sha256), hex(preview.identity_sha256)))
+            Ok(format!("Offline recovery preview; runtime UNCHANGED\nexpected_revision={}\nnext_revision={}\ncurrent_expired={}\nreference_changed={}\nsnapshot_sha256={}\ndocument_sha256={}\nidentity_sha256={}\nConfirm the fingerprint independently. This cannot recover a compromised or retired identity.",
+                preview.expected_revision, preview.next_revision, preview.current_expired, preview.reference_changed, hex(preview.snapshot_sha256), hex(preview.document_sha256), hex(preview.identity_sha256)))
         }
         Command::RecoveryApply {
             profile,
             descriptor,
             revision,
+            snapshot,
             digest,
             identity,
         } => {
@@ -532,6 +535,7 @@ pub fn run(command: Command) -> Result<String, Error> {
             profile.recover(
                 &raw,
                 bootstrap::RecoveryApproval {
+                    snapshot_sha256: snapshot,
                     expected_revision: revision,
                     document_sha256: digest,
                     identity_sha256: identity,

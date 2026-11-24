@@ -520,18 +520,16 @@ impl Profile {
     /// The persisted current signer (not the original enrollment key after
     /// promotion) is authoritative. No network, credential or profile writes.
     pub fn preview_recovery(&self, signed: &str, now: u64) -> Result<RecoveryPreview, Error> {
-        let store = self.store()?;
-        let current = store.inspect(now).map_err(|_| Error::Descriptor)?;
-        let (revision, next) = store
-            .preview_update(signed, now)
-            .map_err(|_| Error::Descriptor)?;
-        if revision != current.descriptor().revision
-            || current.signer() != next.signer()
-            || next.descriptor().revision <= revision
+        self.admission()?;
+        let (snapshot_sha256, current, next) = self.store()?
+            .preview_update_bound(signed, now).map_err(|_| Error::Descriptor)?;
+        let revision = current.descriptor().revision;
+        if current.signer() != next.signer() || next.descriptor().revision <= revision
         {
             return Err(Error::Descriptor);
         }
         Ok(RecoveryPreview {
+            snapshot_sha256,
             expected_revision: revision,
             next_revision: next.descriptor().revision,
             identity_sha256: fingerprint(next.signer()),
@@ -548,13 +546,14 @@ impl Profile {
     pub fn recover(&self, signed: &str, approval: RecoveryApproval, now: u64) -> Result<(), Error> {
         let preview = self.preview_recovery(signed, now)?;
         if preview.expected_revision != approval.expected_revision
+            || !bool::from(preview.snapshot_sha256.ct_eq(&approval.snapshot_sha256))
             || !bool::from(preview.document_sha256.ct_eq(&approval.document_sha256))
             || !bool::from(preview.identity_sha256.ct_eq(&approval.identity_sha256))
         {
             return Err(Error::Approval);
         }
         self.store()?
-            .update_at(signed, approval.expected_revision, now)
+            .update_bound(signed, approval.expected_revision, approval.snapshot_sha256, now)
             .map_err(|error| match error {
                 descriptor::Error::Indeterminate => Error::Indeterminate,
                 _ => Error::Descriptor,
@@ -660,6 +659,7 @@ pub struct PromotionApproval {
 /// Redacted offline recovery preview. All values are public trust metadata.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecoveryPreview {
+    pub snapshot_sha256: [u8;32],
     pub expected_revision: u64,
     pub next_revision: u64,
     pub identity_sha256: [u8; 32],
@@ -670,6 +670,7 @@ pub struct RecoveryPreview {
 
 #[derive(Clone, Copy)]
 pub struct RecoveryApproval {
+    pub snapshot_sha256: [u8;32],
     pub expected_revision: u64,
     pub document_sha256: [u8; 32],
     pub identity_sha256: [u8; 32],
@@ -1054,6 +1055,7 @@ mod tests {
         assert!(preview.current_expired);
         assert_eq!(preview.next_revision, 6);
         let approval = RecoveryApproval {
+            snapshot_sha256: preview.snapshot_sha256,
             expected_revision: 1,
             document_sha256: digest(&updated),
             identity_sha256: fingerprint(identity.public_key()),
@@ -1078,6 +1080,12 @@ mod tests {
                 later
             )
             .is_err());
+        assert!(profile.recover(&updated, RecoveryApproval { snapshot_sha256: [0;32], ..approval }, later).is_err());
+        // Even a valid equal-revision snapshot with a changed acceptance
+        // timestamp must require a fresh operator preview.
+        profile.store().unwrap().update(&raw, NOW + 1).unwrap();
+        assert!(profile.recover(&updated, approval, later).is_err());
+        let approval = RecoveryApproval { snapshot_sha256: profile.preview_recovery(&updated, later).unwrap().snapshot_sha256, ..approval };
         let stranger = Identity::generate(identity.scope().clone()).unwrap();
         assert!(profile
             .preview_recovery(&stranger.sign_descriptor(&next).unwrap(), later)
