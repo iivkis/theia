@@ -8,6 +8,8 @@ import argparse
 import codecs
 import os
 import re
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -243,14 +245,167 @@ def drive(binary, config, scenario, expected):
             tty.close(expect_success=False)
 
 
+def proxy_status(binary, expected):
+    result = subprocess.run(
+        [binary, "client", "proxy", "--status"], capture_output=True,
+        text=True, timeout=7, check=False,
+    )
+    assert result.returncode == 0, "compiled WinINet status failed"
+    assert expected in result.stdout, "unexpected journal state: " + expected
+
+
+def read_exact(sock, count):
+    data = bytearray()
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        assert chunk, "unexpected tunnel EOF"
+        data.extend(chunk)
+    return bytes(data)
+
+
+def test_tunnels(http_port, socks_port, echo_port):
+    marker = b"theia-conpty-real-open-ok"
+    with socket.create_connection(("127.0.0.1", http_port), timeout=5) as sock:
+        sock.sendall(
+            f"CONNECT 127.0.0.1:{echo_port} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{echo_port}\r\n\r\n".encode("ascii")
+        )
+        header = bytearray()
+        while not header.endswith(b"\r\n\r\n"):
+            assert len(header) < 8192, "oversized CONNECT response"
+            header.extend(read_exact(sock, 1))
+        assert header.startswith(b"HTTP/1.1 200 "), "CONNECT did not reach OPEN_OK"
+        sock.sendall(marker)
+        assert read_exact(sock, len(marker)) == marker
+    with socket.create_connection(("127.0.0.1", socks_port), timeout=5) as sock:
+        sock.sendall(b"\x05\x01\x00")
+        assert read_exact(sock, 2) == b"\x05\x00"
+        sock.sendall(b"\x05\x01\x00\x01\x7f\x00\x00\x01" + struct.pack("!H", echo_port))
+        prefix = read_exact(sock, 4)
+        assert prefix[:3] == b"\x05\x00\x00", "SOCKS did not reach OPEN_OK"
+        if prefix[3] == 1:
+            read_exact(sock, 6)
+        elif prefix[3] == 4:
+            read_exact(sock, 18)
+        elif prefix[3] == 3:
+            read_exact(sock, read_exact(sock, 1)[0] + 2)
+        else:
+            raise AssertionError("invalid SOCKS address")
+        sock.sendall(marker)
+        assert read_exact(sock, len(marker)) == marker
+
+
+def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
+    assert os.name == "nt", "native Windows ConPTY required"
+    assert os.environ.get("THEIA_WINDOWS_PROXY_E2E_ALLOWED") == "yes"
+    command = [binary, "tui", "--role", "client", "--config", config]
+
+    def open_panel():
+        tty = Terminal(command)
+        try:
+            tty.wait("Редактор TOML")
+            tty.send("p")
+            tty.wait("Состояние прочитано")
+            return tty
+        except BaseException:
+            tty.close(expect_success=False)
+            raise
+
+    def review(tty, key, message):
+        tty.send(key)
+        tty.wait(message)
+        tty.wait("y: подтвердить")
+
+    def confirm(tty, message):
+        tty.send("y")
+        tty.wait(message)
+        tty.wait("s: local start")
+
+    def local_start(tty):
+        review(tty, "s", "Запустить только локальные")
+        confirm(tty, "Оба локальных listener привязаны")
+        proxy_status(binary, "NoJournal")
+        test_tunnels(http_port, socks_port, echo_port)
+
+    def apply(tty):
+        review(tty, "a", "Сохранить снимок")
+        proxy_status(binary, "NoJournal")
+        confirm(tty, "WinINet применён")
+        proxy_status(binary, "PendingOwned")
+
+    proxy_status(binary, "NoJournal")
+    tty = open_panel()
+    try:
+        tty.send("y")
+        proxy_status(binary, "NoJournal")
+        local_start(tty)
+        review(tty, "a", "Сохранить снимок")
+        tty.send("n")
+        tty.wait("Отменено")
+        proxy_status(binary, "NoJournal")
+        apply(tty)
+        test_tunnels(http_port, socks_port, echo_port)
+        review(tty, "r", "Восстановить только собственные")
+        confirm(tty, "Восстановление WinINet: Restored")
+        proxy_status(binary, "NoJournal")
+        test_tunnels(http_port, socks_port, echo_port)
+        apply(tty)
+        review(tty, "x", "Остановить локальный клиент?")
+        confirm(tty, "Локальный клиент остановлен")
+        proxy_status(binary, "NoJournal")
+        tty.send("\x1b")
+        tty.wait("Редактор TOML")
+        tty.send("q")
+        tty.close()
+    finally:
+        if tty.alive():
+            tty.close(expect_success=False)
+
+    # A killed compiled TUI (not a unit-test surrogate) leaves the journal.
+    tty = open_panel()
+    try:
+        local_start(tty)
+        apply(tty)
+    finally:
+        tty.close(expect_success=False)
+    proxy_status(binary, "PendingOwned")
+
+    tty = open_panel()
+    try:
+        review(tty, "c", "Восстановить проверенный журнал")
+        proxy_status(binary, "PendingOwned")
+        tty.send("n")
+        tty.wait("Отменено")
+        proxy_status(binary, "PendingOwned")
+        review(tty, "c", "Восстановить проверенный журнал")
+        confirm(tty, "Восстановление журнала: Restored")
+        proxy_status(binary, "NoJournal")
+        tty.send("\x1b")
+        tty.wait("Редактор TOML")
+        tty.send("q")
+        tty.close()
+    finally:
+        if tty.alive():
+            tty.close(expect_success=False)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--scenario", choices=("apply", "reject", "dirty", "readonly", "client"), required=True)
+    parser.add_argument("--scenario", choices=("apply", "reject", "dirty", "readonly", "client", "client-proxy"), required=True)
     parser.add_argument("--revision", type=int, required=True)
+    parser.add_argument("--http-port", type=int)
+    parser.add_argument("--socks-port", type=int)
+    parser.add_argument("--echo-port", type=int)
     args = parser.parse_args()
-    drive(args.binary, args.config, args.scenario, args.revision)
+    if args.scenario == "client-proxy":
+        assert all(port and 0 < port < 65536 for port in
+                   (args.http_port, args.socks_port, args.echo_port))
+        drive_client_proxy(args.binary, args.config, args.http_port,
+                           args.socks_port, args.echo_port)
+    else:
+        drive(args.binary, args.config, args.scenario, args.revision)
     print("REAL_TUI_PTY_E2E_OK: " + args.scenario)
 
 
