@@ -920,42 +920,31 @@ async fn relay_request(
     context: &ServerContext,
     session_id: u64,
 ) -> Result<(), ServerError> {
-    let result = timeout(
-        Duration::from_secs(300),
-        handle_frames(&mut inbound, &mut outgoing, context, session_id),
-    )
-    .await;
+    // Handshake, dial, writes and inactivity have their own deadlines.
+    // Do not expire an otherwise progressing TCP tunnel by session age.
+    let result = handle_frames(&mut inbound, &mut outgoing, context, session_id).await;
     match &result {
-        Ok(Ok(())) => crate::diag!(
+        Ok(()) => crate::diag!(
             Info,
             "server.h2",
             "request_completed",
             "session" = Value::Count(session_id)
         ),
-        Ok(Err(error)) => crate::diag!(
+        Err(error) => crate::diag!(
             Warn,
             "server.h2",
             "request_relay_failed",
             "session" = Value::Count(session_id),
             "reason" = Value::Label(error_kind(*error))
         ),
-        Err(_) => crate::diag!(
-            Warn,
-            "server.h2",
-            "request_timeout",
-            "session" = Value::Count(session_id)
-        ),
     }
     // A timeout or transport failure can interrupt an already partially
     // written frame. Reset rather than appending an ABORT to corrupt bytes.
-    if matches!(
-        result,
-        Err(_) | Ok(Err(ServerError::TimedOut | ServerError::Http2))
-    ) {
+    if matches!(result, Err(ServerError::TimedOut | ServerError::Http2)) {
         outgoing.send_reset(h2::Reason::CANCEL);
         return Ok(());
     }
-    if !matches!(result, Ok(Ok(()))) {
+    if result.is_err() {
         let sent = timeout(
             CLOSE_TIMEOUT,
             send_frame(&mut outgoing, &Frame::Abort(ErrorCode::ProtocolError)),
@@ -1103,14 +1092,18 @@ async fn handle_frames(
             state
                 .apply(Direction::Send, &failure)
                 .map_err(|_| ServerError::Protocol)?;
-            send_frame(outgoing, &failure).await?;
+            timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &failure))
+                .await
+                .map_err(|_| ServerError::TimedOut)??;
             return Ok(());
         }
     };
     state
         .apply(Direction::Send, &Frame::OpenOk)
         .map_err(|_| ServerError::Protocol)?;
-    send_frame(outgoing, &Frame::OpenOk).await?;
+    timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &Frame::OpenOk))
+        .await
+        .map_err(|_| ServerError::TimedOut)??;
     crate::diag!(
         Debug,
         "server.h2",

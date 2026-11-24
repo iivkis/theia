@@ -1,6 +1,6 @@
 //! Production H2/H3 data-plane liveness on actual loopback TCP and TLS/QUIC.
-//! Exercise all cases concurrently so crossing the real 30s idle boundary
-//! costs one interval, not one interval per transport/direction.
+//! Exercise all cases concurrently, including active tunnels past five minutes,
+//! so the regression costs one long interval rather than one per transport.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use sha2::{Digest, Sha256};
@@ -35,6 +35,8 @@ enum Case {
     UploadAfterRemoteFin,
     DownloadAfterLocalFin,
     Idle,
+    LongUpload,
+    LongDownload,
 }
 
 struct Fixture {
@@ -154,7 +156,10 @@ impl Fixture {
             return;
         }
 
-        let upload = matches!(case, Case::Upload | Case::UploadAfterRemoteFin);
+        let upload = matches!(
+            case,
+            Case::Upload | Case::UploadAfterRemoteFin | Case::LongUpload
+        );
         let early_fin = matches!(
             case,
             Case::UploadAfterRemoteFin | Case::DownloadAfterLocalFin
@@ -172,11 +177,17 @@ impl Fixture {
         }
 
         let started = Instant::now();
-        // Seven exact 4096-byte payloads across 33 seconds. Keep the other
-        // direction silent (or already half-closed) for the entire interval.
-        for index in 0..7u8 {
+        // Keep the opposite direction silent (or already half-closed).
+        // Long cases cross the retired 300s cap with actual byte progress.
+        let long = matches!(case, Case::LongUpload | Case::LongDownload);
+        let (blocks, interval) = if long {
+            (32, Duration::from_secs(10))
+        } else {
+            (7, Duration::from_millis(5500))
+        };
+        for index in 0..blocks as u8 {
             if index != 0 {
-                sleep(Duration::from_millis(5500)).await;
+                sleep(interval).await;
             }
             let payload = [index; 4096];
             let mut received = [0; 4096];
@@ -193,7 +204,7 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("{transport:?}/{case:?}: stalled at block {index}"));
             assert_eq!(received, payload);
         }
-        assert!(started.elapsed() > Duration::from_secs(30));
+        assert!(started.elapsed() > Duration::from_secs(if long { 300 } else { 30 }));
         if upload {
             app.shutdown().await.unwrap();
             let mut end = Vec::new();
@@ -221,7 +232,7 @@ impl Fixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_h2_h3_asymmetric_traffic_half_close_and_idle() {
-    timeout(Duration::from_secs(75), async {
+    timeout(Duration::from_secs(390), async {
         let (fixture, _servers) = Fixture::start().await;
         let fixture = Arc::new(fixture);
         let mut cases = JoinSet::new();
@@ -232,6 +243,8 @@ async fn production_h2_h3_asymmetric_traffic_half_close_and_idle() {
                 Case::UploadAfterRemoteFin,
                 Case::DownloadAfterLocalFin,
                 Case::Idle,
+                Case::LongUpload,
+                Case::LongDownload,
             ] {
                 let fixture = fixture.clone();
                 cases.spawn(async move {
