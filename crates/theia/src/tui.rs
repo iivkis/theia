@@ -1775,7 +1775,8 @@ mod tests {
 
     #[test]
     fn client_proxy_shortcut_refuses_dirty_or_unconfigured_editor() {
-        let path = std::env::temp_dir().join(format!("theia-tui-proxy-{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("theia-tui-proxy-{}.toml", std::process::id()));
         std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
         let editor = Editor::load(Role::Client, &path).unwrap();
         let mut ui = Interaction::new(Some(editor));

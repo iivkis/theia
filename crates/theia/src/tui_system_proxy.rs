@@ -78,7 +78,9 @@ impl Worker {
     fn unchanged(&self) -> Result<(), String> {
         saved_client_bytes(&self.path, self.digest)
             .map(|_| ())
-            .map_err(|_| "TOML изменён или недоступен; остановите клиент и перезагрузите редактор.".into())
+            .map_err(|_| {
+                "TOML изменён или недоступен; остановите клиент и перезагрузите редактор.".into()
+            })
     }
 
     fn view(&self) -> View {
@@ -113,7 +115,8 @@ impl Worker {
         let (pending, message) = match action {
             Action::Start if self.local.is_none() && self.lease.is_none() => {
                 self.unchanged()?;
-                (Pending::Start, "Запустить только локальные HTTP CONNECT/SOCKS5 listeners? WinINet не меняется.".into())
+                let message = "Запустить только локальные HTTP CONNECT/SOCKS5 listeners? WinINet не меняется.";
+                (Pending::Start, message.into())
             }
             Action::Apply if self.lease.is_none() => {
                 let local = self
@@ -132,14 +135,17 @@ impl Worker {
                 (Pending::Apply(review), message)
             }
             Action::Restore if self.lease.is_some() => {
-                (Pending::Restore, "Восстановить только собственные параметры WinINet? Локальные listeners останутся.".into())
+                let message = "Восстановить только собственные параметры WinINet? Локальные listeners останутся.";
+                (Pending::Restore, message.into())
             }
             Action::Recover if self.lease.is_none() => {
                 let review = native::review_recovery().map_err(|error| error.to_string())?;
-                (Pending::Recover(review), "Восстановить проверенный журнал? Чужие изменения и активный владелец блокируют операцию.".into())
+                let message = "Восстановить проверенный журнал? Чужие изменения и активный владелец блокируют операцию.";
+                (Pending::Recover(review), message.into())
             }
             Action::Stop if self.local.is_some() => {
-                (Pending::Stop, "Остановить локальный клиент? Сначала будет выполнено условное восстановление WinINet, если есть собственный lease.".into())
+                let message = "Остановить локальный клиент? Сначала будет выполнено условное восстановление WinINet, если есть собственный lease.";
+                (Pending::Stop, message.into())
             }
             _ => return Err("Действие недоступно в текущем состоянии.".into()),
         };
@@ -231,7 +237,8 @@ impl Worker {
         };
         Event {
             view: self.view(),
-            message: result.unwrap_or_else(|error| format!("Отказ/ошибка: {error}. Проверьте статус.")),
+            message: result
+                .unwrap_or_else(|error| format!("Отказ/ошибка: {error}. Проверьте статус.")),
             review,
         }
     }
@@ -352,7 +359,9 @@ impl Panel {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.unavailable = true;
                     self.phase = Phase::Idle;
-                    self.message = "Worker недоступен; состояние неизвестно. Проверьте client proxy --status.".into();
+                    self.message =
+                        "Worker недоступен; состояние неизвестно. Проверьте client proxy --status."
+                            .into();
                     break;
                 }
             }
@@ -415,7 +424,7 @@ impl Panel {
         };
         format!(
             "WinINet: {status}\nLocal: {} | manual: {}\nTransport/OPEN_OK: не проверялись\n{}\n{controls}",
-            if self.unavailable {
+            if self.unavailable || self.phase == Phase::Busy {
                 "неизвестно"
             } else if self.view.running {
                 "слушает"
@@ -486,7 +495,8 @@ pub(crate) mod tests {
             confirm(panel);
         }
 
-        let directory = std::env::temp_dir().join(format!("theia-proxy-tui-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("theia-proxy-tui-{}", std::process::id()));
         fs::create_dir(&directory).unwrap();
         let path = directory.join("client.toml");
         let ca_path = directory.join("ca.pem");
@@ -511,7 +521,7 @@ pub(crate) mod tests {
         doc.client.proxy.http_listen = http.to_string();
         doc.client.proxy.socks5_listen = socks.to_string();
         doc.client.proxy.system_proxy = config::SystemProxy::Manual;
-        let source = toml::to_string(&doc).unwrap();
+        let source = Config::Client(doc.clone()).to_toml().unwrap();
         fs::write(&path, &source).unwrap();
         let digest = Sha256::digest(source.as_bytes()).into();
         let mut panel = Panel::open(path.clone(), digest).unwrap();
@@ -575,7 +585,7 @@ pub(crate) mod tests {
 
         // Off permits a local client but must never grant WinINet consent.
         doc.client.proxy.system_proxy = config::SystemProxy::Off;
-        let off = toml::to_string(&doc).unwrap();
+        let off = Config::Client(doc).to_toml().unwrap();
         fs::write(&path, &off).unwrap();
         let mut panel = Panel::open(path, Sha256::digest(off.as_bytes()).into()).unwrap();
         wait(&mut panel);

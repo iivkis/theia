@@ -152,11 +152,16 @@ impl Journal {
         }
         self.before.validate()?;
         self.applied.validate()?;
-        if self.applied.flags != (PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY)
-            || !self.applied.server.starts_with("http=")
-            || !self.applied.server.contains(";https=")
-            || self.applied.auto_url != self.before.auto_url
-        {
+        let bind: SocketAddr = self
+            .applied
+            .server
+            .strip_prefix("http=")
+            .and_then(|value| value.split_once(";https="))
+            .and_then(|(http, https)| (http == https).then_some(http))
+            .and_then(|value| value.parse().ok())
+            .ok_or(ProxyError::Journal)?;
+        let expected = self.before.for_loopback(bind).map_err(|_| ProxyError::Journal)?;
+        if expected != self.applied || self.before == self.applied {
             return Err(ProxyError::Journal);
         }
         Ok(())
@@ -940,6 +945,16 @@ mod tests {
             applied,
         };
         journal.validate().unwrap();
+        let valid = journal.applied.clone();
+        journal.applied.server = "http=192.0.2.1:7890;https=192.0.2.1:7890".into();
+        assert_eq!(journal.validate(), Err(ProxyError::Journal));
+        journal.applied = valid.clone();
+        journal.applied.bypass.push_str(";foreign.invalid");
+        assert_eq!(journal.validate(), Err(ProxyError::Journal));
+        journal.applied = valid.clone();
+        journal.applied.server = "http=127.0.0.1:7890;https=127.0.0.1:7891".into();
+        assert_eq!(journal.validate(), Err(ProxyError::Journal));
+        journal.applied = valid;
         journal.version = 2;
         assert_eq!(journal.validate(), Err(ProxyError::Journal));
         journal.version = 1;
