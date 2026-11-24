@@ -453,13 +453,12 @@ impl Tunnel {
         let decoder = &mut self.decoder;
         let mut upload_state = self.state.clone();
         let mut download_state = self.state.clone();
+        let activity = crate::relay_liveness::Activity::new();
+        let (upload_done, upload_finished) = tokio::sync::oneshot::channel();
         let upload = async {
             let mut buffer = [0; 4096];
             loop {
-                let size = timeout(IO_TIMEOUT, read.read(&mut buffer))
-                    .await
-                    .map_err(|_| ClientError::Timeout)?
-                    .map_err(|_| ClientError::Io)?;
+                let size = read.read(&mut buffer).await.map_err(|_| ClientError::Io)?;
                 let frame = if size == 0 {
                     Frame::Fin
                 } else {
@@ -480,8 +479,11 @@ impl Tunnel {
                     .await
                     .map_err(|_| ClientError::Timeout)??;
                 if size == 0 {
+                    activity.fin();
+                    let _ = upload_done.send(());
                     return Ok::<(), ClientError>(());
                 }
+                activity.data(size);
             }
         };
         let download = async {
@@ -503,6 +505,7 @@ impl Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
+                        activity.data(data.len());
                     }
                     Frame::Fin => {
                         crate::diag!(
@@ -515,18 +518,26 @@ impl Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
+                        activity.fin();
                         break;
                     }
                     Frame::Abort(code) => return Err(ClientError::Open(code)),
                     _ => return Err(ClientError::Protocol),
                 }
             }
-            if decoder.next(incoming).await?.is_some() {
+            if crate::relay_liveness::receive_tail(
+                decoder.next(incoming),
+                upload_finished,
+                ClientError::Timeout,
+            )
+            .await?
+            .is_some()
+            {
                 return Err(ClientError::Protocol);
             }
             Ok::<(), ClientError>(())
         };
-        if let Err(error) = tokio::try_join!(upload, download) {
+        if let Err(error) = activity.run(upload, download, ClientError::Timeout).await {
             crate::diag!(
                 Warn,
                 "client.h2",
@@ -591,11 +602,17 @@ impl IncomingFrames {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
             }
-            let chunk = timeout(IO_TIMEOUT, incoming.data())
-                .await
-                .map_err(|_| ClientError::Timeout)?;
+            let chunk = incoming.data().await;
             let Some(chunk) = chunk else {
                 self.decoder.finish().map_err(|_| ClientError::Protocol)?;
+                if incoming
+                    .trailers()
+                    .await
+                    .map_err(|_| ClientError::Http2)?
+                    .is_some()
+                {
+                    return Err(ClientError::Protocol);
+                }
                 return Ok(None);
             };
             let chunk = chunk.map_err(|_| ClientError::Http2)?;

@@ -463,7 +463,8 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("context.dial_target", h2)
         self.assertIn("context.dial_target", h3)
         self.assertIn("Frame::OpenOk", h3)
-        self.assertIn("tokio::try_join!(upload, download)", h3)
+        self.assertIn(".run(upload, download, ServerError::TimedOut)", h3)
+        self.assertIn("tokio::try_join!(upload, download)", read("crates/theia/src/relay_liveness.rs"))
         tests = read("crates/theia/tests/h3_server.rs")
         self.assertIn("authenticated_h3_server_relays_tcp_before_request_fin_and_after_half_close", tests)
         self.assertIn("h3_rejects_missing_wrong_and_ungranted_bearers_and_denied_tcp", tests)
@@ -473,10 +474,27 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("ObservedEndpoint::new", client)
         self.assertIn("bearer_header(token)?", client)
         self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
-        self.assertIn("tokio::try_join!(upload, download)", client)
+        self.assertIn(".run(upload, download, ClientError::Timeout)", client)
+        self.assertIn("tokio::try_join!(upload, download)", read("crates/theia/src/relay_liveness.rs"))
         tests = read("crates/theia/tests/h3_server.rs")
         self.assertIn("production_h3_client_and_server_relay_exact_bytes", tests)
         self.assertIn("production_h3_client_rejects_tls_bearer_and_acl_failures", tests)
+
+    def test_shared_h2_h3_relay_liveness_contract(self):
+        for adapter in ("client", "h3_client", "server", "h3_server"):
+            source = read(f"crates/theia/src/{adapter}.rs")
+            with self.subTest(adapter=adapter):
+                self.assertIn("relay_liveness::Activity::new()", source)
+                self.assertIn("activity.data(", source)
+                self.assertIn("activity.fin()", source)
+                self.assertIn("relay_liveness::receive_tail(", source)
+        tests = read("crates/theia/tests/tunnel_liveness.rs")
+        self.assertIn("production_h2_h3_asymmetric_traffic_half_close_and_idle", tests)
+        for case in ("Upload", "Download", "UploadAfterRemoteFin",
+                     "DownloadAfterLocalFin", "Idle"):
+            self.assertIn(f"Case::{case}", tests)
+        self.assertIn("h2_request_trailers_after_fin_reset_the_stream",
+                      read("crates/theia/tests/server_h2.rs"))
 
     def test_m31_explicit_h3_cli_wiring(self):
         proxy = read("crates/theia/src/local_proxy.rs")

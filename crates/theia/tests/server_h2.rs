@@ -814,3 +814,38 @@ async fn eight_h2_tunnels_survive_one_stream_reset() {
     .await
     .expect("eight independent live H2 streams");
 }
+
+// H3 already refuses HTTP trailers. H2 must not interpret a trailing header
+// block after SmartTheia FIN as a clean end of the byte stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_request_trailers_after_fin_reset_the_stream() {
+    timeout(Duration::from_secs(10), async {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let (acceptor, connector) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, acceptor, Arc::new(context(true))));
+        let (mut sender, driver) = client(address, connector).await;
+        let (mut tx, mut rx, _, _) = open_tunnel(&mut sender, port).await;
+        let (mut remote, _) = target.accept().await.unwrap();
+        send(&mut tx, &Frame::Fin, false).await;
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-unexpected", http::HeaderValue::from_static("1"));
+        tx.send_trailers(trailers).unwrap();
+        // The server may have emitted response DATA/FIN before it sees
+        // the invalid trailers, but must never complete with clean EOF.
+        remote.shutdown().await.unwrap();
+        loop {
+            match rx.data().await {
+                Some(Ok(chunk)) => rx.flow_control().release_capacity(chunk.len()).unwrap(),
+                Some(Err(_)) => break,
+                None => panic!("H2 request trailers were accepted as clean EOF"),
+            }
+        }
+        driver.abort();
+        server.abort();
+    })
+    .await
+    .expect("bounded trailer rejection");
+}

@@ -1,6 +1,6 @@
 # SmartTheia v1: wire и transport контракт
 
-**Версия:** 1 (pure frame codec и FSM в `crates/theia/src/protocol.rs`; M2.1 добавляет реальный TLS1.3/HTTP2 server inbound с bearer auth, policy и TCP dial, но **без** H3, полноценного локального клиента и QUIC fallback). **Область:** прикладной протокол проксирования поверх аутентифицированных TLS/QUIC HTTP-streams. Не собственный аналог TLS или QUIC.
+**Версия:** 1 (pure frame codec и FSM в `crates/theia/src/protocol.rs`; production H2/H3 client/server и ограниченный QUIC-first fallback реализованы). **Область:** прикладной протокол проксирования поверх аутентифицированных TLS/QUIC HTTP-streams. Не собственный аналог TLS или QUIC.
 
 ## 1. Transport embedding
 
@@ -61,6 +61,7 @@ server:  validate HTTP/auth → HELLO → HELLO_ACK → OPEN_TCP
 - Не вводить `stream_id` и сложную очередность при v1: один HTTP-stream равен одному upstream TCP-соединению.
 - **Proxy success gate:** локальный HTTP CONNECT получает `200 Connection Established`, SOCKS5 получает `REP=0x00` **только** после `OPEN_OK`. `OPEN_ERROR` конвертируется в HTTP 403/502/504 или подходящий SOCKS5 REP; локальное соединение не обозначается как работающее до успешного dial. Отказы TLS/auth/HELLO/OPEN не должны подтверждать локальному приложению соединение.
 - HTTP/2 и HTTP/3 request/response body могут оставаться открытыми одновременно; `FIN` в SmartTheia означает half-close передаваемого направления, а не автоматическое закрытие обоих HTTP-направлений. После `FIN` нельзя передать `DATA` в том же направлении. Код адаптера обязан доказать управление flow control и отменой.
+- После OPEN_OK inactivity относится ко всему туннелю: 30 секунд без успешно переданных непустых TCP DATA или FIN. Тишина в одном направлении не прерывает передачу в другом. Пустые DATA не продлевают idle. Записи/flow-credit и handshake сохраняют отдельные дедлайны; после обоих FIN проверяется HTTP EOF без trailers в пределах 2 секунд. Серверный абсолютный лимит 300 секунд пока сохранён. ADR-0081; нативная приёмка нового блока требуется.
 - Состояния UI: `local_proxy_listening` (локальные listeners готовы), `transport_authenticated` (HTTP Bearer + HELLO_ACK), `tunnel_open` (получен OPEN_OK). Одно состояние не подменяет другое.
 
 ### Codes v1

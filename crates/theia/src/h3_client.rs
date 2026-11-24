@@ -271,13 +271,12 @@ impl H3Tunnel {
         let decoder = &mut self.decoder;
         let mut upload_state = self.state.clone();
         let mut download_state = self.state.clone();
+        let activity = crate::relay_liveness::Activity::new();
+        let (upload_done, upload_finished) = tokio::sync::oneshot::channel();
         let upload = async {
             let mut buffer = [0; 4096];
             loop {
-                let n = timeout(IO_TIMEOUT, read.read(&mut buffer))
-                    .await
-                    .map_err(|_| ClientError::Timeout)?
-                    .map_err(|_| ClientError::Io)?;
+                let n = read.read(&mut buffer).await.map_err(|_| ClientError::Io)?;
                 let frame = if n == 0 {
                     Frame::Fin
                 } else {
@@ -300,8 +299,11 @@ impl H3Tunnel {
                         .await
                         .map_err(|_| ClientError::Timeout)?
                         .map_err(|_| ClientError::Http3)?;
+                    activity.fin();
+                    let _ = upload_done.send(());
                     return Ok::<(), ClientError>(());
                 }
+                activity.data(n);
             }
         };
         let download = async {
@@ -323,6 +325,7 @@ impl H3Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
+                        activity.data(data.len());
                     }
                     Frame::Fin => {
                         crate::diag!(
@@ -335,18 +338,26 @@ impl H3Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
+                        activity.fin();
                         break;
                     }
                     Frame::Abort(code) => return Err(ClientError::Open(code)),
                     _ => return Err(ClientError::Protocol),
                 }
             }
-            if decoder.next(rx).await?.is_some() {
+            if crate::relay_liveness::receive_tail(
+                decoder.next(rx),
+                upload_finished,
+                ClientError::Timeout,
+            )
+            .await?
+            .is_some()
+            {
                 return Err(ClientError::Protocol);
             }
             Ok::<(), ClientError>(())
         };
-        if let Err(error) = tokio::try_join!(upload, download) {
+        if let Err(error) = activity.run(upload, download, ClientError::Timeout).await {
             crate::diag!(
                 Warn,
                 "client.h3",
@@ -387,10 +398,7 @@ impl Incoming {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
             }
-            let data = timeout(IO_TIMEOUT, stream.recv_data())
-                .await
-                .map_err(|_| ClientError::Timeout)?
-                .map_err(|_| ClientError::Http3)?;
+            let data = stream.recv_data().await.map_err(|_| ClientError::Http3)?;
             let Some(mut data) = data else {
                 self.decoder.finish().map_err(|_| ClientError::Protocol)?;
                 let trailers = timeout(IO_TIMEOUT, stream.recv_trailers())
