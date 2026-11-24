@@ -10,14 +10,11 @@ use crate::{
     Role,
 };
 use sha2::{Digest, Sha256};
-use std::{
-    fs::{self, File},
-    io::Read,
-    path::{Path, PathBuf},
-};
+#[cfg(test)]
+use std::fs;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-const MAX_DOCUMENT: u64 = 1024 * 1024;
 const MAX_INPUT: usize = 255;
 
 pub struct Editor {
@@ -28,6 +25,7 @@ pub struct Editor {
     draft: Config,
     issued: Option<Invitation>,
     issued_ready: bool,
+    write_uncertain: bool,
     selected_record: usize,
     selected_field: usize,
     pub input: String,
@@ -38,12 +36,7 @@ pub struct Editor {
 
 impl Editor {
     pub fn load(role: Role, path: &Path) -> Result<Self, &'static str> {
-        // Refuse symlinked paths rather than modifying the referenced file.
-        let metadata = fs::symlink_metadata(path).map_err(|_| "cannot inspect config file")?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err("configuration must be an existing regular file");
-        }
-        let source = read_bounded(path).map_err(|_| "cannot read config file")?;
+        let source = config::editor_bytes(path).map_err(|_| "cannot read config file")?;
         let utf8 = std::str::from_utf8(&source).map_err(|_| "configuration is not UTF-8")?;
         let parsed = config::parse(utf8).map_err(|_| "configuration failed validation")?;
         if !role_matches(role, &parsed) {
@@ -66,6 +59,7 @@ impl Editor {
             draft: parsed,
             issued: None,
             issued_ready: false,
+            write_uncertain: false,
             selected_record,
             selected_field: 0,
             input: String::new(),
@@ -85,7 +79,7 @@ impl Editor {
         ca_ref: Option<&str>,
         public_ref: Option<&str>,
     ) -> Result<(), &'static str> {
-        let result = self.try_import_invitation(invite, ca_ref, public_ref);
+        let result = self.try_import_invitation(invite, ca_ref, public_ref, config::guarded_write);
         if let Err(message) = result {
             self.error = Some(message.to_owned());
         }
@@ -97,6 +91,7 @@ impl Editor {
         invite: &Invitation,
         ca_ref: Option<&str>,
         public_ref: Option<&str>,
+        write: impl FnOnce(&Path, &Config, &[u8]) -> Result<Vec<u8>, config::WriteFailure>,
     ) -> Result<(), &'static str> {
         if self.role != Role::Client || self.editing || self.dirty() || self.issued.is_some() {
             return Err("Finish or discard all changes before importing");
@@ -145,27 +140,23 @@ impl Editor {
         candidate
             .validate()
             .map_err(|_| "Imported profile did not pass full document validation")?;
-        let bytes = candidate
-            .to_toml()
-            .map_err(|_| "Imported profile could not be serialized")?
-            .into_bytes();
         self.draft = candidate;
-        if !self.save() {
-            // fsync(parent) can fail *after* atomic rename. Inspect the exact
-            // serialized bytes; if the new document is present, KEEP the
-            // credential instead of creating a broken TOML file reference.
-            if read_bounded(&self.path).is_ok_and(|on_disk| on_disk == bytes) {
+        if !self.save_with(write) {
+            let uncertain = self.write_uncertain;
+            if uncertain {
+                // Do not delete a credential if replacement may have occurred,
+                // even when the file cannot be read back or was edited again.
                 if let Some(saved) = secret.as_mut() {
                     saved.commit();
                 }
-                self.source = bytes;
-                self.original = self.draft.clone();
-                self.notice =
-                    "Точное состояние записи неизвестно: проверьте файл, не подключайтесь.";
-                return Err("TOML replacement may have completed; verify before using");
             }
             self.discard();
-            return Err("Imported profile was not saved; guarded rollback completed");
+            return if uncertain {
+                self.notice = "Состояние записи неизвестно: откройте редактор заново.";
+                Err("TOML replacement may have completed; reload before using")
+            } else {
+                Err("Imported profile was not saved; guarded rollback completed")
+            };
         }
         if let Some(saved) = secret.as_mut() {
             saved.commit();
@@ -590,7 +581,7 @@ impl Editor {
     }
 
     pub fn dirty(&self) -> bool {
-        self.draft != self.original
+        self.write_uncertain || self.draft != self.original
     }
 
     /// An exact digest of the bytes last loaded or durably saved by this
@@ -697,6 +688,17 @@ impl Editor {
 
     /// Refuse externally modified files and failed validation; never apply/reload.
     pub fn save(&mut self) -> bool {
+        self.save_with(config::guarded_write)
+    }
+
+    fn save_with(
+        &mut self,
+        write: impl FnOnce(&Path, &Config, &[u8]) -> Result<Vec<u8>, config::WriteFailure>,
+    ) -> bool {
+        if self.write_uncertain {
+            self.error = Some("config: uncertain previous write; reload editor".into());
+            return false;
+        }
         if self.editing {
             self.error = Some("Завершите редактирование поля клавишей Enter.".into());
             return false;
@@ -710,36 +712,20 @@ impl Editor {
             self.error = Some(error.to_string());
             return false;
         }
-        let metadata = match fs::symlink_metadata(&self.path) {
-            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta,
-            _ => {
-                self.error = Some("config: file missing or not regular".into());
-                return false;
-            }
-        };
-        if metadata.len() > MAX_DOCUMENT {
-            self.error = Some("config: file exceeds size limit".into());
-            return false;
-        }
-        let unchanged = read_bounded(&self.path)
-            .map(|bytes| bytes == self.source)
-            .unwrap_or(false);
-        if !unchanged {
-            self.error = Some("config: file changed externally; reload before saving".into());
-            return false;
-        }
-        let serialized = match self.draft.to_toml() {
-            Ok(data) => data,
-            Err(error) => {
+        match write(&self.path, &self.draft, &self.source) {
+            Ok(bytes) => self.source = bytes,
+            Err(config::WriteFailure::BeforeReplace(error)) => {
                 self.error = Some(error.to_string());
                 return false;
             }
-        };
-        if let Err(error) = config::atomic_write(&self.path, &self.draft) {
-            self.error = Some(error.to_string());
-            return false;
+            Err(config::WriteFailure::AfterReplace(error)) => {
+                self.write_uncertain = true;
+                self.clear_issued();
+                self.error = Some(error.to_string());
+                self.notice = "Состояние записи неизвестно: откройте редактор заново.";
+                return false;
+            }
         }
-        self.source = serialized.into_bytes();
         self.original = self.draft.clone();
         self.error = None;
         self.notice = "Сохранено в TOML; runtime ещё не обновлён.";
@@ -753,20 +739,6 @@ fn role_matches(role: Role, doc: &Config) -> bool {
         (role, doc),
         (Role::Server, Config::Server(_)) | (Role::Client, Config::Client(_))
     )
-}
-
-fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut data = Vec::new();
-    File::open(path)?
-        .take(MAX_DOCUMENT + 1)
-        .read_to_end(&mut data)?;
-    if data.len() as u64 > MAX_DOCUMENT {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "configuration too large",
-        ));
-    }
-    Ok(data)
 }
 
 #[cfg(test)]
@@ -792,6 +764,9 @@ mod tests {
     impl Drop for Temp {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
+            if let Ok(lock) = config::lock_path(&self.0) {
+                let _ = fs::remove_file(lock);
+            }
         }
     }
 
@@ -826,6 +801,132 @@ mod tests {
         second.server_name = "work.example.org".into();
         doc.client.profiles.push(second);
         Config::Client(doc).to_toml().unwrap()
+    }
+
+    fn uncertain_failure() -> config::WriteFailure {
+        config::WriteFailure::AfterReplace(config::ConfigError {
+            field: "config".into(),
+            reason: "injected directory sync failure",
+        })
+    }
+
+    #[test]
+    fn uncertain_server_save_suppresses_issuance_and_requires_reopen() {
+        let temp = Temp::write(&server_source());
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.issue_user("new-device").unwrap();
+        assert!(!editor.save_with(|path, candidate, expected| {
+            config::guarded_write(path, candidate, expected)?;
+            Err(uncertain_failure())
+        }));
+        assert!(editor.dirty());
+        assert!(!editor.issued_ready());
+        assert!(editor.take_issued().is_none());
+        assert!(fs::read_to_string(&temp.0).unwrap().contains("new-device"));
+        editor.discard();
+        assert!(editor.dirty());
+        assert!(!editor.save());
+        assert!(editor.issue_user("another").is_err());
+        let mut reopened = Editor::load(Role::Server, &temp.0).unwrap();
+        assert!(!reopened.dirty());
+        assert!(reopened.take_issued().is_none());
+        assert!(reopened.issue_user("new-device").is_err());
+    }
+
+    #[test]
+    fn uncertain_client_import_retains_potentially_referenced_secret() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let server = config::parse(&server_source()).unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let temp = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+
+        let result = editor.try_import_invitation(&invite, None, None, |path, doc, expected| {
+            config::guarded_write(path, doc, expected)?;
+            Err(uncertain_failure())
+        });
+        assert!(result.is_err());
+        assert!(editor.dirty());
+        assert!(!editor.save());
+        assert!(editor.import_invitation(&invite, None, None).is_err());
+
+        let Config::Client(doc) = config::read_file(&temp.0).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(doc.client.active_profile, "home");
+        assert_eq!(doc.client.profiles.len(), 2);
+        let reference = &doc.client.profiles[1].auth_token;
+        let secret = Path::new(reference.strip_prefix("file:").unwrap());
+        assert_eq!(
+            fs::read_to_string(secret).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x42; 32])
+        );
+        let mut reopened = Editor::load(Role::Client, &temp.0).unwrap();
+        assert!(!reopened.dirty());
+        assert!(reopened.import_invitation(&invite, None, None).is_err());
+        fs::remove_file(secret).unwrap();
+        fs::remove_dir(secret.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn uncertain_import_retains_secret_even_when_readback_is_unavailable() {
+        let server = config::parse(&server_source()).unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let temp = Temp::write(include_str!("../../../examples/client.toml"));
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        let mut retained = None;
+
+        let result = editor.try_import_invitation(&invite, None, None, |path, doc, expected| {
+            config::guarded_write(path, doc, expected)?;
+            let Config::Client(doc) = doc else {
+                panic!("client");
+            };
+            let reference = &doc.client.profiles[1].auth_token;
+            retained = Some(PathBuf::from(reference.strip_prefix("file:").unwrap()));
+            fs::remove_file(path).unwrap();
+            Err(uncertain_failure())
+        });
+        assert!(result.is_err());
+        assert!(editor.dirty());
+        let retained = retained.unwrap();
+        assert!(retained.is_file());
+        assert!(!temp.0.exists());
+        fs::remove_file(&retained).unwrap();
+        fs::remove_dir(retained.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pre_replace_import_refusal_rolls_back_only_new_credential() {
+        let server = config::parse(&server_source()).unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let initial = include_str!("../../../examples/client.toml");
+        let temp = Temp::write(initial);
+        let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
+        let mut discarded = None;
+
+        let result = editor.try_import_invitation(&invite, None, None, |_, doc, _| {
+            let Config::Client(doc) = doc else {
+                panic!("client");
+            };
+            let reference = &doc.client.profiles[1].auth_token;
+            let secret = PathBuf::from(reference.strip_prefix("file:").unwrap());
+            assert!(secret.is_file());
+            discarded = Some(secret);
+            Err(config::WriteFailure::BeforeReplace(config::ConfigError {
+                field: "config".into(),
+                reason: "injected pre-replacement refusal",
+            }))
+        });
+        assert!(result.is_err());
+        assert!(!editor.dirty());
+        let discarded = discarded.unwrap();
+        assert!(!discarded.exists());
+        assert!(!discarded.parent().unwrap().exists());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), initial);
     }
 
     #[test]

@@ -537,11 +537,173 @@ impl ClientDocument {
     }
 }
 
-/// Validate and atomically replace a TOML file. On failure before rename, the
-/// previous file remains intact. No live runtime reload is attempted here.
-/// Callers must supply a trusted destination directory (no untrusted symlinks).
+/// Distinguish refusal before replacement from uncertain durability after
+/// replacement. A credential referenced by a possibly published document must
+/// not be deleted by rollback.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WriteFailure {
+    BeforeReplace(ConfigError),
+    AfterReplace(ConfigError),
+}
+
+impl From<ConfigError> for WriteFailure {
+    fn from(error: ConfigError) -> Self {
+        Self::BeforeReplace(error)
+    }
+}
+
+impl WriteFailure {
+    fn into_error(self) -> ConfigError {
+        match self {
+            Self::BeforeReplace(error) | Self::AfterReplace(error) => error,
+        }
+    }
+}
+
+fn regular_file(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    meta.is_file()
+}
+
+fn no_follow(options: &mut OpenOptions) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let _ = options;
+}
+
+pub(crate) fn editor_bytes(path: &Path) -> Result<Vec<u8>, ConfigError> {
+    let invalid = || ConfigError::new("config", "missing or unsafe configuration file");
+    let metadata = fs::symlink_metadata(path).map_err(|_| invalid())?;
+    if !regular_file(&metadata) || metadata.len() > MAX_BYTES as u64 {
+        return Err(invalid());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    no_follow(&mut options);
+    let file = options.open(path).map_err(|_| invalid())?;
+    let metadata = file.metadata().map_err(|_| invalid())?;
+    if !regular_file(&metadata) || metadata.len() > MAX_BYTES as u64 {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    ensure(
+        bytes.len() <= MAX_BYTES,
+        "document",
+        "configuration exceeds 1 MiB",
+    )?;
+    Ok(bytes)
+}
+
+fn require_unchanged(path: &Path, expected: &[u8]) -> Check {
+    ensure(
+        editor_bytes(path).is_ok_and(|bytes| bytes == expected),
+        "config",
+        "file changed externally; reload before saving",
+    )
+}
+
+// Stable sidecar inode: never unlink it on unlock. OS handle closure releases
+// the advisory lock even if a cooperating editor exits without unwinding.
+// All callers must use a trusted directory; this is not a lock against
+// arbitrary external writers or hostile path replacement.
+pub(crate) fn lock_path(path: &Path) -> Result<PathBuf, ConfigError> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| ConfigError::new("config", "destination file name is missing"))?;
+    let mut lock = std::ffi::OsString::from(".");
+    lock.push(name);
+    lock.push(".theia.lock");
+    Ok(path.with_file_name(lock))
+}
+
+fn editor_lock(path: &Path) -> Result<fs::File, ConfigError> {
+    let path = lock_path(path)?;
+    let error = || ConfigError::new("config", "editor lock busy or unsafe; retry");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    no_follow(&mut options);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(|_| error())?;
+    let meta = file.metadata().map_err(|_| error())?;
+    if !regular_file(&meta) || meta.len() != 0 {
+        return Err(error());
+    }
+    file.try_lock().map_err(|_| error())?;
+    Ok(file)
+}
+
+/// Validate and atomically replace a TOML file, without an editor revision.
+/// Callers must supply a trusted destination directory.
 pub fn atomic_write(path: &Path, config: &Config) -> Result<(), ConfigError> {
     let data = config.to_toml()?;
+    atomic_write_bytes(path, &data, None, sync_directory).map_err(WriteFailure::into_error)
+}
+
+/// Cooperating editor writes are serialized across threads and processes.
+/// Check the original bytes under the lock and again just before rename.
+pub(crate) fn guarded_write(
+    path: &Path,
+    config: &Config,
+    expected: &[u8],
+) -> Result<Vec<u8>, WriteFailure> {
+    guarded_write_with_sync(path, config, expected, sync_directory)
+}
+
+fn guarded_write_with_sync(
+    path: &Path,
+    config: &Config,
+    expected: &[u8],
+    sync_parent: impl FnOnce(&Path) -> Check,
+) -> Result<Vec<u8>, WriteFailure> {
+    let data = config.to_toml()?;
+    let _lock = editor_lock(path)?;
+    require_unchanged(path, expected)?;
+    atomic_write_bytes(path, &data, Some(expected), sync_parent)?;
+    Ok(data.into_bytes())
+}
+
+fn sync_directory(parent: &Path) -> Check {
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| ConfigError::new("config", "cannot sync directory"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
+}
+
+fn atomic_write_bytes(
+    path: &Path,
+    data: &str,
+    expected: Option<&[u8]>,
+    sync_parent: impl FnOnce(&Path) -> Check,
+) -> Result<(), WriteFailure> {
     ensure(
         data.len() <= MAX_BYTES,
         "document",
@@ -575,31 +737,26 @@ pub fn atomic_write(path: &Path, config: &Config) -> Result<(), ConfigError> {
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => {
-                return Err(ConfigError::new(
-                    "config",
-                    "cannot create temporary config file",
-                ))
+                return Err(
+                    ConfigError::new("config", "cannot create temporary config file").into(),
+                );
             }
         }
     }
     let (temp, mut file) =
         pending.ok_or_else(|| ConfigError::new("config", "cannot allocate temporary file"))?;
-    let result = (|| {
+    let result = (|| -> Result<(), WriteFailure> {
         file.write_all(data.as_bytes())
             .map_err(|_| ConfigError::new("config", "cannot write temporary file"))?;
         file.sync_all()
             .map_err(|_| ConfigError::new("config", "cannot sync temporary file"))?;
         drop(file);
+        if let Some(expected) = expected {
+            require_unchanged(path, expected)?;
+        }
         fs::rename(&temp, path)
             .map_err(|_| ConfigError::new("config", "cannot atomically replace configuration"))?;
-        #[cfg(unix)]
-        {
-            if let Ok(directory) = fs::File::open(parent) {
-                directory
-                    .sync_all()
-                    .map_err(|_| ConfigError::new("config", "cannot sync directory"))?;
-            }
-        }
+        sync_parent(parent).map_err(WriteFailure::AfterReplace)?;
         Ok(())
     })();
     if result.is_err() {
@@ -814,6 +971,182 @@ tls_key = "file:/etc/theia/tls/privkey.pem"
             .field
             .contains("h2_listen"));
     }
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "theia-config-guard-{}-{}",
+                std::process::id(),
+                TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn changed_client(port: u16) -> Config {
+        let mut config = parse(&client()).unwrap();
+        let Config::Client(doc) = &mut config else {
+            panic!("client");
+        };
+        doc.client.proxy.http_listen = format!("127.0.0.1:{port}");
+        config
+    }
+
+    #[test]
+    fn guarded_writes_reject_stale_or_busy_without_touching_bytes() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("client.toml");
+        let other = scratch.0.join("other.toml");
+        let initial = client().into_bytes();
+        fs::write(&path, &initial).unwrap();
+        fs::write(&other, &initial).unwrap();
+        let held = editor_lock(&path).unwrap();
+        let candidate = changed_client(7900);
+
+        assert!(matches!(
+            guarded_write(&path, &candidate, &initial),
+            Err(WriteFailure::BeforeReplace(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), initial);
+        assert!(guarded_write(&other, &candidate, &initial).is_ok());
+        drop(held);
+        let saved = guarded_write(&path, &candidate, &initial).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        assert_eq!(read_file(&path).unwrap(), candidate);
+        assert!(matches!(
+            guarded_write(&path, &changed_client(7901), &initial),
+            Err(WriteFailure::BeforeReplace(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        assert_eq!(fs::metadata(lock_path(&path).unwrap()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn concurrent_guarded_writers_have_a_single_winner() {
+        use std::{sync::Barrier, thread};
+
+        let scratch = Scratch::new();
+        let path = scratch.0.join("client.toml");
+        let initial = client().into_bytes();
+        fs::write(&path, &initial).unwrap();
+        let barrier = Barrier::new(2);
+        let results = thread::scope(|scope| {
+            let handles = [7900, 7901].map(|port| {
+                let barrier = &barrier;
+                let path = &path;
+                let initial = &initial;
+                scope.spawn(move || {
+                    let candidate = changed_client(port);
+                    barrier.wait();
+                    guarded_write(path, &candidate, initial)
+                })
+            });
+            handles.map(|handle| handle.join().unwrap())
+        });
+        let winner = if results[0].is_ok() { 0 } else { 1 };
+        assert!(matches!(
+            &results[1 - winner],
+            Err(WriteFailure::BeforeReplace(_))
+        ));
+        let saved = results[winner].as_ref().unwrap();
+        assert_eq!(fs::read(&path).unwrap().as_slice(), saved.as_slice());
+        let expected = changed_client([7900, 7901][winner]);
+        assert_eq!(read_file(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn injected_post_replace_sync_failure_is_not_rollback() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("client.toml");
+        let initial = client().into_bytes();
+        fs::write(&path, &initial).unwrap();
+        let candidate = changed_client(7900);
+        let result = guarded_write_with_sync(&path, &candidate, &initial, |_| {
+            Err(ConfigError::new(
+                "config",
+                "injected directory sync failure",
+            ))
+        });
+        assert!(matches!(result, Err(WriteFailure::AfterReplace(_))));
+        assert_eq!(read_file(&path).unwrap(), candidate);
+        assert!(matches!(
+            guarded_write(&path, &changed_client(7901), &initial),
+            Err(WriteFailure::BeforeReplace(_))
+        ));
+        let current = editor_bytes(&path).unwrap();
+        assert!(guarded_write(&path, &changed_client(7901), &current).is_ok());
+    }
+
+    const LOCK_CHILD: &str = "THEIA_TEST_EDITOR_LOCK_CHILD_PATH";
+    const LOCK_BUSY: i32 = 75;
+    const LOCK_ACQUIRED: i32 = 76;
+
+    #[test]
+    fn child_attempts_editor_lock() {
+        let Some(path) = std::env::var_os(LOCK_CHILD) else {
+            return;
+        };
+        match editor_lock(Path::new(&path)) {
+            Ok(_held) => std::process::exit(LOCK_ACQUIRED),
+            Err(_) => std::process::exit(LOCK_BUSY),
+        }
+    }
+
+    #[test]
+    fn editor_lock_is_shared_across_processes_and_released_on_exit() {
+        use std::process::Command;
+
+        let scratch = Scratch::new();
+        let path = scratch.0.join("client.toml");
+        let attempt = || {
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::child_attempts_editor_lock"])
+                .env(LOCK_CHILD, &path)
+                .status()
+                .unwrap()
+                .code()
+        };
+        let held = editor_lock(&path).unwrap();
+        assert_eq!(attempt(), Some(LOCK_BUSY));
+        drop(held);
+        assert_eq!(attempt(), Some(LOCK_ACQUIRED));
+        assert!(editor_lock(&path).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn editor_rejects_symlinked_document_and_lock() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = Scratch::new();
+        let original = scratch.0.join("original.toml");
+        let path = scratch.0.join("client.toml");
+        let initial = client().into_bytes();
+        fs::write(&original, &initial).unwrap();
+        symlink(&original, &path).unwrap();
+        assert!(editor_bytes(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, &initial).unwrap();
+
+        let foreign = scratch.0.join("foreign");
+        fs::write(&foreign, b"do not touch").unwrap();
+        symlink(&foreign, lock_path(&path).unwrap()).unwrap();
+        assert!(matches!(
+            guarded_write(&path, &changed_client(7900), &initial),
+            Err(WriteFailure::BeforeReplace(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), initial);
+        assert_eq!(fs::read(&foreign).unwrap().as_slice(), b"do not touch");
+    }
+
     #[test]
     fn atomic_store_roundtrip_and_invalid_update_preserves_old_file() {
         let path = std::env::temp_dir().join(format!(

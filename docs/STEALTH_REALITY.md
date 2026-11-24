@@ -56,6 +56,16 @@
 
 Дополнительно изолированный файловый regression test выполняет create_new/write/sync, публикацию через rename в отсутствующий путь, повторное чтение с ограничением размера и отказ при отсутствующем, старом, частичном, повреждённом либо oversized файле без fallback. Это **не** доказательство защищённого долговременного хранения: внешний доверенный anchor моделируется в тестах, atomic replacement/ACL, конкурентный доступ и power-loss/crash consistency не реализованы, replay-cache не сериализуется. Нужны новый verified TLS channel после restart и отдельное доказательство durable replay при необходимости. Runtime/TOML/invite v1 неизменны. Native CI обязателен.
 
+## M3.5a9 — native storage regressions и process-exit recovery
+
+[ADR-0066](adr/0066-f18-m3-5a9-storage-recovery-regressions.md) объединяет проверку существующего F-14 private bearer storage (Linux 0700/0600, Windows user+SYSTEM DACL, create_new collision/concurrency, rollback только собственных файлов) и test-only checkpoint process-exit matrix. Отдельный процесс завершает работу без Drop на фазах partial/staged/published; recovery использует только явно выбранный committed snapshot и независимый fixture anchor, не ищет старые или временные файлы. Отдельно подтверждается, что незакоммиченный bearer после выхода процесса остаётся приватным и не добавляется в TOML автоматически.
+
+Это не реализация F-18 persistent key store и не power-loss/atomic replacement или полноценное orphan recovery. Existing F-14 primitives не обобщены на server identity secrets. Нет новых runtime API, TOML/invite fields или сетевых изменений. Native CI обязателен.
+
+## M3.5a10 — конкурентные обновления и изоляция локальной модели
+
+В одном CI-блоке с M3.5a9 добавлены native regression tests для test-only модели: две конкурентные замены одного поколения под Mutex дают ровно одного победителя; повтор одного proof в двух потоках расходует ровно один replay slot; разные inbound с одинаковыми DNS/port и разными pin/anchor отвергают перекрёстную подстановку, сохраняют отдельный replay state и независимый deny-all. См. ADR-0066. Это модель сериализации в одном процессе, не доказательство межпроцессного CAS или безопасного повторного использования одного ключа несколькими inbound. Независимый аудит и production persistence остаются открыты. Этот же CI-блок укрепляет существующий F-14 bounded local invitation/CA reader (ADR-0067); новые F-18 форматы и runtime не вводятся.
+
 ## M3.5b1 — чистый offline planner кандидатов (реализован частично)
 
 Файл `crates/theia/src/camouflage_discovery.rs`, integration tests `crates/theia/tests/camouflage_discovery.rs`, ADR-0022. Код в текущем *едином* Rust binary (library module) без новых зависимостей, не имеет ни socket/DNS/HTTP/TLS вызовов, ни CLI/TUI команды:
