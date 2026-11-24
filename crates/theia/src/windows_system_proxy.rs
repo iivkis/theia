@@ -608,10 +608,7 @@ fn recover_locked() -> Result<Recovery, ProxyError> {
     restore_journal(&journal, None)
 }
 
-fn restore_journal(
-    journal: &Journal,
-    expected: Option<&Snapshot>,
-) -> Result<Recovery, ProxyError> {
+fn restore_journal(journal: &Journal, expected: Option<&Snapshot>) -> Result<Recovery, ProxyError> {
     let current = query()?;
     if expected.is_some_and(|expected| expected != &current) {
         return Err(ProxyError::Conflict);
@@ -1005,20 +1002,27 @@ mod tests {
         drop(proxy);
         // Real crash subprocess regression: a fresh process recovers a
         // previous instance that exited *without* Rust destructors.
-        let self_executable = std::env::current_exe().unwrap();
-        let result = std::process::Command::new(self_executable)
-            .arg("windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override")
-            .arg("--exact")
-            .arg("--ignored")
-            .env("THEIA_PROXY_CRASH_CHILD", "yes")
-            .status()
-            .unwrap();
-        assert_eq!(
-            result.code(),
-            Some(73),
-            "child must simulate hard exit after apply"
-        );
-        assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
+        let crash = || {
+            let self_executable = std::env::current_exe().unwrap();
+            let result = std::process::Command::new(self_executable)
+                .arg("windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override")
+                .arg("--exact")
+                .arg("--ignored")
+                .env("THEIA_PROXY_CRASH_CHILD", "yes")
+                .status()
+                .unwrap();
+            assert_eq!(
+                result.code(),
+                Some(73),
+                "child must simulate hard exit after apply"
+            );
+            assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
+        };
+        crash();
+        assert_eq!(recover_explicit(), Ok(Recovery::Restored));
+        assert_eq!(query().unwrap(), original);
+        assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
+        crash();
         let review = review_recovery().unwrap();
         let applied = query().unwrap();
         let mut changed = applied.clone();
@@ -1033,10 +1037,13 @@ mod tests {
         assert_eq!(query().unwrap(), original);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
 
-        crate::tui_system_proxy::tests::native_lifecycle(|| {
-            assert_eq!(query().unwrap(), original);
-            assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
-        });
+        crate::tui_system_proxy::tests::native_lifecycle(
+            || {
+                assert_eq!(query().unwrap(), original);
+                assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
+            },
+            crash,
+        );
 
         // No test leaves the disposable CI user's WinINet settings modified.
         assert_eq!(query().unwrap(), original);

@@ -1,6 +1,6 @@
 # ADR-0056: F-07 Windows user WinINet proxy, scoped ownership and conditional crash recovery
 
-**Date:** 2026-11-24. **State:** implementation proposed; native CI pending.
+**Date:** 2026-11-24. **State:** historical CLI contract; merged in PR #82 after native CI. ADR-0077 proposes the separate TUI lifecycle.
 
 ## Decision
 

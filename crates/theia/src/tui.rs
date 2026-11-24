@@ -997,7 +997,8 @@ impl Interaction {
                 && key.modifiers.is_empty()
             {
                 if editor.dirty() {
-                    editor.error = Some("Сохраните или отмените черновик перед запуском.".into());
+                    editor.error =
+                        Some("Сохраните или отмените черновик перед запуском.".into());
                 } else {
                     #[cfg(windows)]
                     match crate::tui_system_proxy::Panel::open(
@@ -1350,7 +1351,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     #[cfg(windows)]
     if let Some(proxy) = interaction.and_then(|ui| ui.system_proxy.as_ref()) {
-        panel(frame, parts[1], "F-07: системный прокси Windows", &proxy.body(), true);
+        panel(
+            frame,
+            parts[1],
+            "F-07: системный прокси Windows",
+            &proxy.body(),
+            true,
+        );
     }
     let footer = if model.screen == Screen::Client {
         "p: Windows proxy  i: импорт  l: ссылка  Ctrl+S: сохранить"
@@ -1764,6 +1771,38 @@ mod tests {
         assert!(client.runtime.is_none());
         fs::remove_file(path).unwrap();
         fs::remove_file(client_path).unwrap();
+    }
+
+    #[test]
+    fn client_proxy_shortcut_refuses_dirty_or_unconfigured_editor() {
+        let path = std::env::temp_dir().join(format!("theia-tui-proxy-{}.toml", std::process::id()));
+        std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let editor = Editor::load(Role::Client, &path).unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Enter));
+        let editor = ui.editor.as_mut().unwrap();
+        editor.input = "other.example.org:443".into();
+        assert!(editor.accept());
+        assert!(editor.dirty());
+        ui.update(&mut model, press(KeyCode::Char('p')));
+        assert!(ui.editor.as_ref().unwrap().error.is_some());
+        #[cfg(windows)]
+        assert!(ui.system_proxy.is_none());
+        #[cfg(not(windows))]
+        {
+            ui.editor.as_mut().unwrap().discard();
+            ui.update(&mut model, press(KeyCode::Char('p')));
+            assert_eq!(
+                ui.editor.as_ref().unwrap().error.as_deref(),
+                Some("Системный прокси: только Windows.")
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+        let mut ui = Interaction::new(None);
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        #[cfg(windows)]
+        assert!(ui.system_proxy.is_none());
     }
 
     #[test]

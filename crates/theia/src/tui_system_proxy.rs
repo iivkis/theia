@@ -8,12 +8,7 @@ use crate::{
     },
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::{
-    net::SocketAddr,
-    path::PathBuf,
-    sync::mpsc,
-    thread,
-};
+use std::{net::SocketAddr, path::PathBuf, sync::mpsc, thread};
 use tokio::{sync::mpsc as async_mpsc, task::JoinHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,13 +116,18 @@ impl Worker {
                 (Pending::Start, "Запустить только локальные HTTP CONNECT/SOCKS5 listeners? WinINet не меняется.".into())
             }
             Action::Apply if self.lease.is_none() => {
-                let local = self.local.as_ref().filter(|local| local.manual && !local.task.is_finished())
+                let local = self
+                    .local
+                    .as_ref()
+                    .filter(|local| local.manual && !local.task.is_finished())
                     .ok_or("Сначала запустите локальный клиент с system_proxy=manual.")?;
                 self.unchanged()?;
-                let review = native::review_apply(local.address).map_err(|error| error.to_string())?;
+                let review =
+                    native::review_apply(local.address).map_err(|error| error.to_string())?;
                 let message = format!(
                     "{} Адрес назначения: {}. Сохранить снимок и изменить WinINet текущего пользователя?",
-                    review.description(), local.address
+                    review.description(),
+                    local.address
                 );
                 (Pending::Apply(review), message)
             }
@@ -157,11 +157,18 @@ impl Worker {
                 let address = prepared.http_address().map_err(|error| error.to_string())?;
                 let manual = prepared.manual;
                 let task = tokio::spawn(prepared.serve());
-                self.local = Some(Local { address, manual, task });
+                self.local = Some(Local {
+                    address,
+                    manual,
+                    task,
+                });
                 Ok("Оба локальных listener привязаны; удалённый транспорт не проверен.".into())
             }
             Pending::Apply(review) => {
-                let local = self.local.as_ref().filter(|local| local.manual && !local.task.is_finished())
+                let local = self
+                    .local
+                    .as_ref()
+                    .filter(|local| local.manual && !local.task.is_finished())
                     .ok_or("Локальный клиент не готов.")?;
                 self.unchanged()?;
                 let lease = OwnedProxy::apply_reviewed(local.address, review)
@@ -191,7 +198,10 @@ impl Worker {
         // Restore before releasing listeners. On a refusal preserve the
         // recovery journal; never force the old settings over foreign state.
         let restored = if let Some(mut lease) = self.lease.take() {
-            lease.restore().map(|_| ()).map_err(|error| error.to_string())
+            lease
+                .restore()
+                .map(|_| ())
+                .map_err(|error| error.to_string())
         } else {
             Ok(())
         };
@@ -293,7 +303,10 @@ impl Panel {
         let thread = thread::Builder::new()
             .name("theia-tui-proxy".into())
             .spawn(move || {
-                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     runtime.block_on(run(Worker::new(path, digest), receiver, events));
                 }
             })
@@ -312,7 +325,11 @@ impl Panel {
     }
 
     fn send(&mut self, command: Command) {
-        if self.commands.as_ref().is_some_and(|sender| sender.try_send(command).is_ok()) {
+        if self
+            .commands
+            .as_ref()
+            .is_some_and(|sender| sender.try_send(command).is_ok())
+        {
             self.phase = Phase::Busy;
         } else {
             self.message = "Команда не подтверждена; проверьте состояние.".into();
@@ -325,7 +342,11 @@ impl Panel {
                 Ok(event) => {
                     self.view = event.view;
                     self.message = event.message;
-                    self.phase = if event.review { Phase::Confirm } else { Phase::Idle };
+                    self.phase = if event.review {
+                        Phase::Confirm
+                    } else {
+                        Phase::Idle
+                    };
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -394,7 +415,13 @@ impl Panel {
         };
         format!(
             "WinINet: {status}\nLocal: {} | manual: {}\nTransport/OPEN_OK: не проверялись\n{}\n{controls}",
-            if self.unavailable { "неизвестно" } else if self.view.running { "слушает" } else { "не запущен" },
+            if self.unavailable {
+                "неизвестно"
+            } else if self.view.running {
+                "слушает"
+            } else {
+                "не запущен"
+            },
             if self.view.manual { "да" } else { "нет" },
             self.message
         )
@@ -420,10 +447,17 @@ pub(crate) mod tests {
 
     // Run serially inside the existing opt-in disposable WinINet test, never
     // as a parallel ordinary unit test against the developer's OS settings.
-    pub(crate) fn native_lifecycle(assert_original: impl Fn()) {
-        use crate::{client_import::PrivateBearer, config::{self, Config}};
+    pub(crate) fn native_lifecycle(assert_original: impl Fn(), crash: impl Fn()) {
+        use crate::{
+            client_import::PrivateBearer,
+            config::{self, Config},
+        };
         use sha2::{Digest, Sha256};
-        use std::{fs, net::{TcpListener, TcpStream}, time::{Duration, Instant}};
+        use std::{
+            fs,
+            net::{TcpListener, TcpStream},
+            time::{Duration, Instant},
+        };
 
         fn wait(panel: &mut Panel) {
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -553,6 +587,14 @@ pub(crate) mod tests {
         assert!(!panel.view.owned);
         assert_original();
         action(&mut panel, 'x');
+        crash();
+        assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
+        review(&mut panel, 'c');
+        panel.key(key('n'));
+        wait(&mut panel);
+        assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
+        action(&mut panel, 'c');
+        assert_original();
         drop(panel);
         drop(bearer);
         fs::remove_dir_all(directory).unwrap();
@@ -578,17 +620,35 @@ pub(crate) mod tests {
         assert_eq!(receiver.try_recv(), Ok(Command::Review(Action::Apply)));
         panel.key(key('y'));
         assert!(receiver.try_recv().is_err());
-        events.send(Event { view: View::default(), message: "review".into(), review: true }).unwrap();
+        events
+            .send(Event {
+                view: View::default(),
+                message: "review".into(),
+                review: true,
+            })
+            .unwrap();
         panel.poll();
         panel.key(key('n'));
         assert_eq!(receiver.try_recv(), Ok(Command::Cancel));
-        events.send(Event { view: View::default(), message: "cancel".into(), review: false }).unwrap();
+        events
+            .send(Event {
+                view: View::default(),
+                message: "cancel".into(),
+                review: false,
+            })
+            .unwrap();
         panel.poll();
         panel.key(key('y'));
         assert!(receiver.try_recv().is_err());
         panel.key(key('c'));
         assert_eq!(receiver.try_recv(), Ok(Command::Review(Action::Recover)));
-        events.send(Event { view: View::default(), message: "review".into(), review: true }).unwrap();
+        events
+            .send(Event {
+                view: View::default(),
+                message: "review".into(),
+                review: true,
+            })
+            .unwrap();
         panel.poll();
         panel.key(key('y'));
         assert_eq!(receiver.try_recv(), Ok(Command::Confirm));
