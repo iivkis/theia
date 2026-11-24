@@ -494,7 +494,10 @@ async fn real_tls_h2_channel_supports_independent_pinned_ed25519_identity_proof(
         )
         .unwrap();
         let mut seen = ReplayWindow::new(8).unwrap();
-        assert_eq!(seen.accept(&pinned, &transcript, &signature, 10_000), Ok(()));
+        assert_eq!(
+            seen.accept(&pinned, &transcript, &signature, 10_000),
+            Ok(())
+        );
         assert_eq!(
             seen.accept(&pinned, &transcript, &signature, 10_001),
             Err(f18_identity_lab::Failure::Replay)

@@ -131,7 +131,9 @@ fn any_changed_transport_endpoint_nonce_exporter_or_freshness_invalidates_proof(
     let h3 = fixture(Branch::H3);
     let signature = key.sign(&h3.encode());
     assert_eq!(
-        ReplayWindow::new(8).unwrap().accept(&pin, &h3, signature.as_ref(), 10_000),
+        ReplayWindow::new(8)
+            .unwrap()
+            .accept(&pin, &h3, signature.as_ref(), 10_000),
         Ok(())
     );
 }
@@ -228,28 +230,52 @@ fn noncanonical_names_zero_entropy_and_bad_ports_are_rejected() {
     }
     assert_eq!(
         Transcript::new(
-            Branch::H2, "edge.example.org", 0, nonce(), nonce(), nonce(), 10_000,
+            Branch::H2,
+            "edge.example.org",
+            0,
+            nonce(),
+            nonce(),
+            nonce(),
+            10_000,
         )
         .err(),
         Some(Failure::InvalidTranscript)
     );
     assert_eq!(
         Transcript::new(
-            Branch::H2, "edge.example.org", 443, [0u8; 32], nonce(), nonce(), 10_000,
+            Branch::H2,
+            "edge.example.org",
+            443,
+            [0u8; 32],
+            nonce(),
+            nonce(),
+            10_000,
         )
         .err(),
         Some(Failure::InvalidTranscript)
     );
     assert_eq!(
         Transcript::new(
-            Branch::H2, "edge.example.org", 443, nonce(), [0u8; 32], nonce(), 10_000,
+            Branch::H2,
+            "edge.example.org",
+            443,
+            nonce(),
+            [0u8; 32],
+            nonce(),
+            10_000,
         )
         .err(),
         Some(Failure::InvalidTranscript)
     );
     assert_eq!(
         Transcript::new(
-            Branch::H2, "edge.example.org", 443, nonce(), nonce(), [0u8; 32], 10_000,
+            Branch::H2,
+            "edge.example.org",
+            443,
+            nonce(),
+            nonce(),
+            [0u8; 32],
+            10_000,
         )
         .err(),
         Some(Failure::InvalidTranscript)

@@ -90,9 +90,9 @@ impl Transcript {
                 && !label.is_empty()
                 && label[0] != b'-'
                 && label[label.len() - 1] != b'-'
-                && label.iter().all(|&byte| {
-                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                })
+                && label
+                    .iter()
+                    .all(|&byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         })
     }
 
