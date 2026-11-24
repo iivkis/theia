@@ -137,7 +137,7 @@ fn hello_shape(handshake: &[u8]) -> Option<HelloShape> {
                 answer.tls13 = versions.chunks_exact(2).any(|v| v == [0x03, 0x04]);
             }
             57 => answer.quic_transport_parameters = !payload.is_empty(),
-            0x4469 | 17513 => answer.alps_present = true,
+            0x4469 => answer.alps_present = true,
             _ => {}
         }
         answer.grease_extension |= is_grease(kind);
@@ -261,8 +261,10 @@ async fn true_wire_initial_exposes_tls13_sni_h3_alpn_and_quic_params_without_ser
         roots.add(der.clone()).unwrap();
         let client = client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
 
-        // Same crypto provider as the live server; keys depend only on CID
-        // and QUIC version, not on its private key or the trusted CA.
+        // Same crypto provider, but an INDEPENDENT certificate and key:
+        // successful decrypt proves Initial keys are publicly derivable and
+        // DO NOT require the live server's private key or trusted CA.
+        let independent = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let mut crypto_tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -270,8 +272,8 @@ async fn true_wire_initial_exposes_tls13_sni_h3_alpn_and_quic_params_without_ser
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
-            vec![der],
-            PrivatePkcs8KeyDer::from(key_bytes).into(),
+            vec![independent.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(independent.key_pair.serialize_der()).into(),
         )
         .unwrap();
         crypto_tls.alpn_protocols = vec![b"h3".to_vec()];
@@ -311,8 +313,10 @@ async fn true_wire_initial_exposes_tls13_sni_h3_alpn_and_quic_params_without_ser
                 }
             }
         });
+        let (service_done_tx, service_done_rx) = oneshot::channel::<()>();
         let service = tokio::spawn(async move {
             let conn = accept(server.accept().await.unwrap()).await.unwrap();
+            let _ = service_done_rx.await;
             conn.close(0u32.into(), b"research-only");
         });
         let connection = connect(&client, witness_addr, "localhost")
@@ -344,6 +348,7 @@ async fn true_wire_initial_exposes_tls13_sni_h3_alpn_and_quic_params_without_ser
         datagram.zeroize();
         plaintext.zeroize();
         connection.close(0u32.into(), b"done");
+        let _ = service_done_tx.send(());
         service.await.unwrap();
         relay.abort();
         client.close(0u32.into(), b"done");
