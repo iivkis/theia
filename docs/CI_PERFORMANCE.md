@@ -184,3 +184,27 @@ guaranteed speedup on every subsequent commit.
 The main Windows smoke and cross-host still validated the same real OS
 security and tunnel behavior. Manual `workflow_dispatch` retains
 explicit verification of release compilation on both platforms.
+
+## Eliminate seven duplicate formatting runs after the centralized preflight
+
+The `specification` job already checks Rustfmt for **root, isolated M0.1,
+and isolated M3.4 workspaces** and checks Go formatting for **all tracked Go
+source files**. It also explicitly checks that its format validation has not
+modified the SHA-pinned source tree. On non-Markdown code PRs this must
+succeed **before** the Linux/Windows/Go/BoringSSL matrix fans out.
+
+Previously seven extra formatter executions happened later despite that
+successful fail-fast check:
+
+- Linux root `rust-tests`: one `cargo fmt`
+- Linux isolated M0.1 spike: one `cargo fmt` and one `gofmt -l`
+- BoringSSL isolated M3.4 spike: one `cargo fmt` on **each** OS
+- Experimental production BoringSSL feature job: one `cargo fmt` on **each** OS
+
+Those redundant formatter invocations are removed. The `specification`
+checks stay mandatory and fail-closed; **no** tests, security acceptance,
+feature-specific Clippy, Go uTLS comparisons, or native binaries are skipped.
+The CI graph regression test asserts the central format commands remain
+present and that no native job re-adds them. This is modest runner-minute
+hygiene rather than a claim of significant end-to-end wall-clock speedup;
+real measurements must be compared after CI passes on the exact PR SHA.
