@@ -176,9 +176,17 @@ mod tests {
             Err(DnsError::NotApproved)
         );
         for bad in [
-            "", "localhost", "127.0.0.1", "https://example.org", "*.example.org",
-            "example.org:443", "Example.org", "example.org.", "host.local",
-            "host.localhost", "a..example.org",
+            "",
+            "localhost",
+            "127.0.0.1",
+            "https://example.org",
+            "*.example.org",
+            "example.org:443",
+            "Example.org",
+            "example.org.",
+            "host.local",
+            "host.localhost",
+            "a..example.org",
         ] {
             assert_eq!(
                 resolve_manual_domain(bad, DnsConsent::Approved).await,

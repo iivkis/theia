@@ -94,7 +94,10 @@ fn scope_of(state: &reference_health::State) -> Scope {
 }
 
 pub(crate) fn auto_policy() -> ClientPolicy {
-    ClientPolicy { transport: Transport::Auto, xhttp_mode: XhttpMode::Auto }
+    ClientPolicy {
+        transport: Transport::Auto,
+        xhttp_mode: XhttpMode::Auto,
+    }
 }
 
 fn verify(
@@ -105,8 +108,8 @@ fn verify(
     policy: ClientPolicy,
     now: u64,
 ) -> Result<Verified, Error> {
-    let anchor = Anchor::new(scope.clone(), public, minimum, policy)
-        .map_err(|_| Error::Descriptor)?;
+    let anchor =
+        Anchor::new(scope.clone(), public, minimum, policy).map_err(|_| Error::Descriptor)?;
     let value = descriptor::verify(signed, &anchor).map_err(|_| Error::Descriptor)?;
     value.check_time(now).map_err(|_| Error::Descriptor)?;
     Ok(value)
@@ -126,7 +129,9 @@ pub fn initial_descriptor(
     }
     let references = state.eligible_references(now).map_err(|_| Error::Health)?;
     let mut random = [0u8; 16];
-    SystemRandom::new().fill(&mut random).map_err(|_| Error::Identity)?;
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| Error::Identity)?;
     let value = Descriptor {
         schema_version: 1,
         wire_version: 1,
@@ -155,7 +160,9 @@ pub fn initial_descriptor(
         },
         references,
     };
-    identity.sign_descriptor(&value).map_err(|_| Error::Descriptor)
+    identity
+        .sign_descriptor(&value)
+        .map_err(|_| Error::Descriptor)
 }
 
 /// Refresh expiry/revision of the exact previous signed descriptor without
@@ -171,12 +178,20 @@ pub fn validate_publication(
     if identity.scope() != &scope_of(state) {
         return Err(Error::Scope);
     }
-    let value = verify(signed, identity.scope(), identity.public_key(), 1, auto_policy(), now)?;
+    let value = verify(
+        signed,
+        identity.scope(),
+        identity.public_key(),
+        1,
+        auto_policy(),
+        now,
+    )?;
     let offered = &value.descriptor().references;
     let fresh = state.eligible_references(now).map_err(|_| Error::Health)?;
     if fresh.len() != offered.len()
         || fresh.iter().zip(offered).any(|(current, signed)| {
-            current.server_name != signed.server_name || current.port != signed.port
+            current.server_name != signed.server_name
+                || current.port != signed.port
                 || (signed.h3 && !current.h3)
         })
     {
@@ -204,10 +219,14 @@ pub fn refresh_descriptor(
     }
     let references = state.eligible_references(now).map_err(|_| Error::Health)?;
     if references.len() != next.references.len()
-        || references.iter().zip(&next.references).any(|(fresh, prior)| {
-            fresh.server_name != prior.server_name || fresh.port != prior.port
-                || (prior.h3 && !fresh.h3)
-        })
+        || references
+            .iter()
+            .zip(&next.references)
+            .any(|(fresh, prior)| {
+                fresh.server_name != prior.server_name
+                    || fresh.port != prior.port
+                    || (prior.h3 && !fresh.h3)
+            })
     {
         return Err(Error::Health);
     }
@@ -215,7 +234,9 @@ pub fn refresh_descriptor(
     next.revision = next.revision.checked_add(1).ok_or(Error::Descriptor)?;
     next.not_before = now;
     next.not_after = now.checked_add(VALIDITY).ok_or(Error::Clock)?;
-    identity.sign_descriptor(&next).map_err(|_| Error::Descriptor)
+    identity
+        .sign_descriptor(&next)
+        .map_err(|_| Error::Descriptor)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -252,12 +273,15 @@ pub struct Invitation {
 }
 
 impl Invitation {
-    pub fn public(
-        identity: &Identity,
-        signed: &str,
-        now: u64,
-    ) -> Result<Self, Error> {
-        let value = verify(signed, identity.scope(), identity.public_key(), 1, auto_policy(), now)?;
+    pub fn public(identity: &Identity, signed: &str, now: u64) -> Result<Self, Error> {
+        let value = verify(
+            signed,
+            identity.scope(),
+            identity.public_key(),
+            1,
+            auto_policy(),
+            now,
+        )?;
         Ok(Self {
             scope: identity.scope().clone(),
             public: identity.public_key(),
@@ -277,12 +301,17 @@ impl Invitation {
         bearer: &[u8; 32],
         now: u64,
     ) -> Result<Self, Error> {
-        config::Config::Server(document.clone()).validate().map_err(|_| Error::Grant)?;
+        config::Config::Server(document.clone())
+            .validate()
+            .map_err(|_| Error::Grant)?;
         let mut invitation = Self::public(identity, signed, now)?;
         if !document.server.enabled {
             return Err(Error::Grant);
         }
-        let inbound = document.server.inbounds.iter()
+        let inbound = document
+            .server
+            .inbounds
+            .iter()
             .find(|item| item.id == invitation.scope.inbound)
             .ok_or(Error::Grant)?;
         let h2: std::net::SocketAddr = inbound.h2_listen.parse().map_err(|_| Error::Scope)?;
@@ -292,7 +321,10 @@ impl Invitation {
         {
             return Err(Error::Scope);
         }
-        let user = document.server.users.iter()
+        let user = document
+            .server
+            .users
+            .iter()
             .find(|user| user.id == user_id && !user.disabled)
             .ok_or(Error::Grant)?;
         if !inbound.allowed_user_ids.iter().any(|id| id == user_id) {
@@ -316,7 +348,10 @@ impl Invitation {
             public_key: URL_SAFE_NO_PAD.encode(self.public),
             minimum_revision: self.revision,
             descriptor: self.signed.clone(),
-            token: self.bearer.as_ref().map(|value| URL_SAFE_NO_PAD.encode(&value[..])),
+            token: self
+                .bearer
+                .as_ref()
+                .map(|value| URL_SAFE_NO_PAD.encode(&value[..])),
         }
     }
 
@@ -345,18 +380,35 @@ impl Invitation {
         }
         let text = std::str::from_utf8(&raw).map_err(|_| Error::Format)?;
         let wire: Wire = toml::from_str(text).map_err(|_| Error::Format)?;
-        if wire.version != 1 || wire.carrier != "smarttheia-xhttp" || wire.security_mode != "smart-reality"
+        if wire.version != 1
+            || wire.carrier != "smarttheia-xhttp"
+            || wire.security_mode != "smart-reality"
             || Zeroizing::new(toml::to_string(&wire).map_err(|_| Error::Format)?).as_str() != text
         {
             return Err(Error::Format);
         }
         let public = key(&wire.public_key)?;
-        let scope = Scope { inbound: wire.inbound.clone(), endpoint: wire.endpoint.clone() };
-        let value = verify(&wire.descriptor, &scope, public, wire.minimum_revision, auto_policy(), now)?;
+        let scope = Scope {
+            inbound: wire.inbound.clone(),
+            endpoint: wire.endpoint.clone(),
+        };
+        let value = verify(
+            &wire.descriptor,
+            &scope,
+            public,
+            wire.minimum_revision,
+            auto_policy(),
+            now,
+        )?;
         if value.descriptor().revision != wire.minimum_revision {
             return Err(Error::Descriptor);
         }
-        let bearer = wire.token.as_deref().map(token).transpose()?.map(Zeroizing::new);
+        let bearer = wire
+            .token
+            .as_deref()
+            .map(token)
+            .transpose()?
+            .map(Zeroizing::new);
         Ok(Self {
             scope,
             public,
@@ -371,7 +423,14 @@ impl Invitation {
     }
 
     pub fn preview(&self, now: u64) -> Result<String, Error> {
-        let value = verify(&self.signed, &self.scope, self.public, self.revision, auto_policy(), now)?;
+        let value = verify(
+            &self.signed,
+            &self.scope,
+            self.public,
+            self.revision,
+            auto_policy(),
+            now,
+        )?;
         let d = value.descriptor();
         Ok(format!(
             "UNTRUSTED invitation; verify fingerprint independently; runtime UNCHANGED\ninbound={}\nendpoint={}\nidentity_sha256={:x}\nrevision={}\nreference={}\nh3={}\ncontains_token={}",
@@ -385,12 +444,25 @@ impl Invitation {
         ))
     }
 
-    fn confirmed(&self, expected: [u8; 32], policy: ClientPolicy, now: u64) -> Result<Anchor, Error> {
+    fn confirmed(
+        &self,
+        expected: [u8; 32],
+        policy: ClientPolicy,
+        now: u64,
+    ) -> Result<Anchor, Error> {
         if !bool::from(self.fingerprint().ct_eq(&expected)) {
             return Err(Error::Approval);
         }
-        verify(&self.signed, &self.scope, self.public, self.revision, policy, now)?;
-        Anchor::new(self.scope.clone(), self.public, self.revision, policy).map_err(|_| Error::Descriptor)
+        verify(
+            &self.signed,
+            &self.scope,
+            self.public,
+            self.revision,
+            policy,
+            now,
+        )?;
+        Anchor::new(self.scope.clone(), self.public, self.revision, policy)
+            .map_err(|_| Error::Descriptor)
     }
 }
 
@@ -413,17 +485,25 @@ pub struct Profile {
 
 impl Profile {
     fn anchor(&self) -> Result<Anchor, Error> {
-        if self.schema_version != 1 || !config::valid_secret_ref(&self.auth_token)
+        if self.schema_version != 1
+            || !config::valid_secret_ref(&self.auth_token)
             || !crate::bounded_input::explicit_file_path(Path::new(&self.trust_store))
         {
             return Err(Error::Format);
         }
         Anchor::new(
-            Scope { inbound: self.inbound.clone(), endpoint: self.endpoint.clone() },
+            Scope {
+                inbound: self.inbound.clone(),
+                endpoint: self.endpoint.clone(),
+            },
             key(&self.public_key)?,
             self.minimum_revision,
-            ClientPolicy { transport: self.transport, xhttp_mode: self.xhttp_mode },
-        ).map_err(|_| Error::Descriptor)
+            ClientPolicy {
+                transport: self.transport,
+                xhttp_mode: self.xhttp_mode,
+            },
+        )
+        .map_err(|_| Error::Descriptor)
     }
 
     pub fn read(path: &Path) -> Result<Self, Error> {
@@ -437,7 +517,9 @@ impl Profile {
 
     pub fn load(&self, now: u64) -> Result<Verified, Error> {
         descriptor::Store::new(Path::new(&self.trust_store), self.anchor()?)
-            .map_err(|_| Error::Storage)?.load(now).map_err(|_| Error::Descriptor)
+            .map_err(|_| Error::Storage)?
+            .load(now)
+            .map_err(|_| Error::Descriptor)
     }
 
     pub fn store(&self) -> Result<descriptor::Store, Error> {
@@ -508,10 +590,12 @@ pub fn import(
         return Err(Error::Format);
     }
     let store = descriptor::Store::new(trust_path, anchor).map_err(|_| Error::Storage)?;
-    store.initialize(&invitation.signed, now).map_err(|error| match error {
-        descriptor::Error::Indeterminate => Error::Indeterminate,
-        _ => Error::Storage,
-    })?;
+    store
+        .initialize(&invitation.signed, now)
+        .map_err(|error| match error {
+            descriptor::Error::Indeterminate => Error::Indeterminate,
+            _ => Error::Storage,
+        })?;
     // A trust file can remain orphaned if the final publication fails.
     // Never remove a path which might be observed/replaced by another process.
     match config::guarded_trust_write(profile_path, &raw, None) {
@@ -532,9 +616,13 @@ pub fn import(
 }
 
 pub fn read_text(path: &Path, max: usize, private: bool) -> Result<Zeroizing<String>, Error> {
-    let bytes = crate::bounded_input::read(path, max as u64, true, private)
-        .map_err(|_| Error::Storage)?;
-    Ok(Zeroizing::new(std::str::from_utf8(&bytes).map_err(|_| Error::Format)?.to_owned()))
+    let bytes =
+        crate::bounded_input::read(path, max as u64, true, private).map_err(|_| Error::Storage)?;
+    Ok(Zeroizing::new(
+        std::str::from_utf8(&bytes)
+            .map_err(|_| Error::Format)?
+            .to_owned(),
+    ))
 }
 
 pub fn create_text(path: &Path, raw: &str) -> Result<(), Error> {
@@ -572,9 +660,13 @@ mod tests {
         };
         let state = reference_health::State::new(
             plan,
-            vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }],
+            vec![reference_health::Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
             NOW,
-        ).unwrap();
+        )
+        .unwrap();
         let identity = Identity::generate(scope_of(&state)).unwrap();
         (state, identity)
     }
@@ -584,14 +676,18 @@ mod tests {
         fn new() -> Self {
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "theia-bootstrap-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)
+                "theia-bootstrap-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir(&dir).unwrap();
             Self(dir)
         }
     }
     impl Drop for Scratch {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -603,10 +699,19 @@ mod tests {
         let received = Invitation::decode(&uri, NOW).unwrap();
         assert_eq!(received.fingerprint(), fingerprint(identity.public_key()));
         assert!(received.confirmed([0; 32], auto_policy(), NOW).is_err());
-        received.confirmed(invite.fingerprint(), auto_policy(), NOW).unwrap();
-        assert!(received.confirmed(invite.fingerprint(), ClientPolicy {
-            transport: Transport::H3, xhttp_mode: XhttpMode::Auto,
-        }, NOW).is_err());
+        received
+            .confirmed(invite.fingerprint(), auto_policy(), NOW)
+            .unwrap();
+        assert!(received
+            .confirmed(
+                invite.fingerprint(),
+                ClientPolicy {
+                    transport: Transport::H3,
+                    xhttp_mode: XhttpMode::Auto,
+                },
+                NOW
+            )
+            .is_err());
         assert!(Invitation::decode(&format!("{uri}="), NOW).is_err());
         assert!(Invitation::decode(&uri, NOW + VALIDITY).is_err());
         let wire = received.wire();
@@ -621,15 +726,33 @@ mod tests {
         let (state, identity) = fixture();
         let raw = initial_descriptor(&state, &identity, NOW).unwrap();
         let next = refresh_descriptor(&state, &identity, &raw, NOW + 1).unwrap();
-        let old = verify(&raw, identity.scope(), identity.public_key(), 1, auto_policy(), NOW).unwrap();
-        let fresh = verify(&next, identity.scope(), identity.public_key(), 1, auto_policy(), NOW + 1).unwrap();
+        let old = verify(
+            &raw,
+            identity.scope(),
+            identity.public_key(),
+            1,
+            auto_policy(),
+            NOW,
+        )
+        .unwrap();
+        let fresh = verify(
+            &next,
+            identity.scope(),
+            identity.public_key(),
+            1,
+            auto_policy(),
+            NOW + 1,
+        )
+        .unwrap();
         assert_eq!(fresh.descriptor().revision, 2);
         assert_eq!(fresh.descriptor().path_prefix, old.descriptor().path_prefix);
         assert!(fresh.descriptor().references == old.descriptor().references);
         assert!(refresh_descriptor(&state, &identity, &raw, NOW).is_err());
         let other = Identity::generate(identity.scope().clone()).unwrap();
         assert!(refresh_descriptor(&state, &other, &raw, NOW + 1).is_err());
-        let failed = state.record(vec![reference_health::Evidence::default()], NOW + 1).unwrap();
+        let failed = state
+            .record(vec![reference_health::Evidence::default()], NOW + 1)
+            .unwrap();
         assert!(refresh_descriptor(&failed, &identity, &raw, NOW + 2).is_err());
     }
 
@@ -637,26 +760,87 @@ mod tests {
     fn import_publishes_last_and_preserves_existing_profile() {
         let (state, identity) = fixture();
         let raw = initial_descriptor(&state, &identity, NOW).unwrap();
-        let uri = Invitation::public(&identity, &raw, NOW).unwrap().encode().unwrap();
+        let uri = Invitation::public(&identity, &raw, NOW)
+            .unwrap()
+            .encode()
+            .unwrap();
         let scratch = Scratch::new();
         let profile = scratch.0.join("profile.toml");
         let trust = scratch.0.join("trust.toml");
         let expected = digest(&uri);
         let pin = fingerprint(identity.public_key());
-        assert_eq!(import(&uri, expected, [0; 32], &profile, &trust, Some("env:TEST_TOKEN"), auto_policy(), NOW), Err(Error::Approval));
+        assert_eq!(
+            import(
+                &uri,
+                expected,
+                [0; 32],
+                &profile,
+                &trust,
+                Some("env:TEST_TOKEN"),
+                auto_policy(),
+                NOW
+            ),
+            Err(Error::Approval)
+        );
         assert!(!profile.exists() && !trust.exists());
-        assert_eq!(import(&uri, expected, pin, &profile, &trust, None, auto_policy(), NOW), Err(Error::Credential));
+        assert_eq!(
+            import(
+                &uri,
+                expected,
+                pin,
+                &profile,
+                &trust,
+                None,
+                auto_policy(),
+                NOW
+            ),
+            Err(Error::Credential)
+        );
         assert!(!profile.exists() && !trust.exists());
-        import(&uri, expected, pin, &profile, &trust, Some("env:TEST_TOKEN"), auto_policy(), NOW).unwrap();
+        import(
+            &uri,
+            expected,
+            pin,
+            &profile,
+            &trust,
+            Some("env:TEST_TOKEN"),
+            auto_policy(),
+            NOW,
+        )
+        .unwrap();
         let before = std::fs::read(&profile).unwrap();
         let loaded = Profile::read(&profile).unwrap();
         assert_eq!(loaded.credential_reference(), "env:TEST_TOKEN");
         assert_eq!(loaded.load(NOW).unwrap().signer(), identity.public_key());
-        assert_eq!(import(&uri, expected, pin, &profile, &trust, Some("env:OTHER"), auto_policy(), NOW), Err(Error::Storage));
+        assert_eq!(
+            import(
+                &uri,
+                expected,
+                pin,
+                &profile,
+                &trust,
+                Some("env:OTHER"),
+                auto_policy(),
+                NOW
+            ),
+            Err(Error::Storage)
+        );
         assert_eq!(std::fs::read(&profile).unwrap(), before);
         let next = refresh_descriptor(&state, &identity, &raw, NOW + 1).unwrap();
-        loaded.store().unwrap().update_at(&next, 1, NOW + 1).unwrap();
-        assert_eq!(Profile::read(&profile).unwrap().load(NOW + 1).unwrap().descriptor().revision, 2);
+        loaded
+            .store()
+            .unwrap()
+            .update_at(&next, 1, NOW + 1)
+            .unwrap();
+        assert_eq!(
+            Profile::read(&profile)
+                .unwrap()
+                .load(NOW + 1)
+                .unwrap()
+                .descriptor()
+                .revision,
+            2
+        );
     }
 
     #[test]
@@ -665,21 +849,47 @@ mod tests {
         let raw = initial_descriptor(&state, &identity, NOW).unwrap();
         let credential = [42u8; 32];
         let source = include_str!("../../../examples/server.toml")
-            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &format!("{:x}", Sha256::digest(credential)))
+            .replace(
+                "REPLACE_WITH_64_LOWERCASE_HEX",
+                &format!("{:x}", Sha256::digest(credential)),
+            )
             .replace("id = \"public\"", "id = \"edge\"");
-        let config::Config::Server(mut server) = config::parse(&source).unwrap() else { panic!() };
-        let invite = Invitation::issued(&identity, &raw, &server, "device-a", &credential, NOW).unwrap();
-        assert!(!invite.preview(NOW).unwrap().contains(&URL_SAFE_NO_PAD.encode(credential)));
+        let config::Config::Server(mut server) = config::parse(&source).unwrap() else {
+            panic!()
+        };
+        let invite =
+            Invitation::issued(&identity, &raw, &server, "device-a", &credential, NOW).unwrap();
+        assert!(!invite
+            .preview(NOW)
+            .unwrap()
+            .contains(&URL_SAFE_NO_PAD.encode(credential)));
         let uri = invite.encode().unwrap();
         let scratch = Scratch::new();
         let profile = scratch.0.join("profile.toml");
         let trust = scratch.0.join("trust.toml");
-        import(&uri, digest(&uri), invite.fingerprint(), &profile, &trust, None, auto_policy(), NOW).unwrap();
+        import(
+            &uri,
+            digest(&uri),
+            invite.fingerprint(),
+            &profile,
+            &trust,
+            None,
+            auto_policy(),
+            NOW,
+        )
+        .unwrap();
         let loaded = Profile::read(&profile).unwrap();
         let path = loaded.credential_reference().strip_prefix("file:").unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), URL_SAFE_NO_PAD.encode(credential));
-        assert!(!std::fs::read_to_string(&profile).unwrap().contains(&URL_SAFE_NO_PAD.encode(credential)));
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            URL_SAFE_NO_PAD.encode(credential)
+        );
+        assert!(!std::fs::read_to_string(&profile)
+            .unwrap()
+            .contains(&URL_SAFE_NO_PAD.encode(credential)));
         server.server.users[0].disabled = true;
-        assert!(Invitation::issued(&identity, &raw, &server, "device-a", &credential, NOW).is_err());
+        assert!(
+            Invitation::issued(&identity, &raw, &server, "device-a", &credential, NOW).is_err()
+        );
     }
 }

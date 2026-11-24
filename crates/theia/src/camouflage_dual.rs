@@ -422,7 +422,10 @@ mod tests {
             Err(DualProbeError::DomainNameMismatch)
         );
         candidate.request.server_name = "manual.example".into();
-        candidate.request.address.set_ip("93.184.216.11".parse().unwrap());
+        candidate
+            .request
+            .address
+            .set_ip("93.184.216.11".parse().unwrap());
         assert_eq!(
             validate_dual_target(&preview, &candidate, consent.clone()),
             Err(DualProbeError::NotApproved)

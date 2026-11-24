@@ -109,10 +109,7 @@ impl Plan {
         let endpoint_host = self.endpoint.rsplit_once(':').ok_or(Error::Format)?.0;
         let mut addresses = HashSet::new();
         for ip in &self.own_ips {
-            if ip.is_unspecified()
-                || ip.is_multicast()
-                || !addresses.insert(normalize(*ip))
-            {
+            if ip.is_unspecified() || ip.is_multicast() || !addresses.insert(normalize(*ip)) {
                 return Err(Error::Format);
             }
         }
@@ -154,7 +151,10 @@ impl Plan {
     /// Explicit preview only; public names and addresses are not credentials.
     pub fn preview(&self) -> Result<String, Error> {
         self.validate()?;
-        let mut out = format!("Reference plan; no network, no runtime Apply\ninbound={}\nendpoint={}", self.inbound, self.endpoint);
+        let mut out = format!(
+            "Reference plan; no network, no runtime Apply\ninbound={}\nendpoint={}",
+            self.inbound, self.endpoint
+        );
         for (index, target) in self.references.iter().enumerate() {
             out.push_str(&format!(
                 "\nreference[{index}]={} {}",
@@ -196,8 +196,8 @@ fn own_addresses(plan: &Plan) -> Result<HashSet<IpAddr>, Error> {
     #[cfg(target_os = "linux")]
     let own = {
         let mut own = own;
-        let interfaces = crate::camouflage_interfaces::collect_assigned_interfaces()
-            .map_err(|_| Error::Dns)?;
+        let interfaces =
+            crate::camouflage_interfaces::collect_assigned_interfaces().map_err(|_| Error::Dns)?;
         own.extend(
             interfaces
                 .interfaces
@@ -211,20 +211,21 @@ fn own_addresses(plan: &Plan) -> Result<HashSet<IpAddr>, Error> {
 
 /// Inspect every DNS answer before allowing the pinned IP. In contrast to
 /// the display-limited wizard list, a self address anywhere poisons the set.
-fn vet_pin(
-    answers: &[SocketAddr],
-    target: &Target,
-    own: &HashSet<IpAddr>,
-) -> Result<(), Error> {
+fn vet_pin(answers: &[SocketAddr], target: &Target, own: &HashSet<IpAddr>) -> Result<(), Error> {
     if answers.is_empty() || answers.len() > MAX_DNS_ANSWERS {
         return Err(Error::Dns);
     }
-    if answers.iter().any(|address| own.contains(&normalize(address.ip()))) {
+    if answers
+        .iter()
+        .any(|address| own.contains(&normalize(address.ip())))
+    {
         return Err(Error::SelfReference);
     }
-    if answers.iter().any(|address| {
-        address.port() != target.address.port() || !public_address(address.ip())
-    }) || !answers.contains(&target.address) {
+    if answers
+        .iter()
+        .any(|address| address.port() != target.address.port() || !public_address(address.ip()))
+        || !answers.contains(&target.address)
+    {
         return Err(Error::Dns);
     }
     Ok(())
@@ -255,7 +256,11 @@ async fn extend_endpoint_addresses(
         if count == 0 {
             return Err(Error::Dns);
         }
-        if plan.references.iter().any(|target| own.contains(&normalize(target.address.ip()))) {
+        if plan
+            .references
+            .iter()
+            .any(|target| own.contains(&normalize(target.address.ip())))
+        {
             return Err(Error::SelfReference);
         }
         Ok(own)
@@ -286,7 +291,11 @@ async fn fresh_dns(target: &Target, own: &HashSet<IpAddr>) -> Result<(), Error> 
 fn head(target: &Target) -> Option<Request<()>> {
     Request::builder()
         .method(Method::HEAD)
-        .uri(format!("https://{}:{}/", target.server_name, target.address.port()))
+        .uri(format!(
+            "https://{}:{}/",
+            target.server_name,
+            target.address.port()
+        ))
         .body(())
         .ok()
 }
@@ -302,7 +311,9 @@ impl Drop for Driver {
 /// No arbitrary path, redirect, authentication or application payload.
 async fn h2_head(target: &Target, roots: RootCertStore) -> Option<u16> {
     let mut provider = rustls::crypto::ring::default_provider();
-    provider.kx_groups.retain(|group| group.name() == rustls::NamedGroup::X25519);
+    provider
+        .kx_groups
+        .retain(|group| group.name() == rustls::NamedGroup::X25519);
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .ok()?
@@ -316,7 +327,10 @@ async fn h2_head(target: &Target, roots: RootCertStore) -> Option<u16> {
     if tcp.peer_addr().ok()? != target.address {
         return None;
     }
-    let tls = TlsConnector::from(Arc::new(tls)).connect(name, tcp).await.ok()?;
+    let tls = TlsConnector::from(Arc::new(tls))
+        .connect(name, tcp)
+        .await
+        .ok()?;
     if tls.get_ref().1.alpn_protocol() != Some(&b"h2"[..])
         || tls.get_ref().1.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
     {
@@ -343,7 +357,10 @@ async fn h3_head(target: &Target, roots: RootCertStore) -> Option<u16> {
         SocketAddr::from(([0u16; 8], 0))
     };
     let endpoint = ObservedEndpoint::new(bind, roots).ok()?;
-    let connection = endpoint.connect(target.address, &target.server_name, ATTEMPT).await.ok()?;
+    let connection = endpoint
+        .connect(target.address, &target.server_name, ATTEMPT)
+        .await
+        .ok()?;
     if connection.remote_address() != target.address {
         return None;
     }
@@ -399,11 +416,7 @@ fn stable(first: Option<u16>, second: Option<u16>) -> Option<u16> {
     first.filter(|status| Some(*status) == second && accepted_status(*status))
 }
 
-async fn check_target(
-    target: &Target,
-    roots: &RootCertStore,
-    own: &HashSet<IpAddr>,
-) -> Evidence {
+async fn check_target(target: &Target, roots: &RootCertStore, own: &HashSet<IpAddr>) -> Evidence {
     let mut rounds = [Evidence::default(); 2];
     for round in &mut rounds {
         // Fresh DNS before each pair, but all TCP/UDP connects use the
@@ -441,7 +454,11 @@ pub async fn check(plan: &Plan, approved: [u8; 32]) -> Result<Vec<Evidence>, Err
         roots
     };
     let own = own_addresses(plan)?;
-    if plan.references.iter().any(|target| own.contains(&normalize(target.address.ip()))) {
+    if plan
+        .references
+        .iter()
+        .any(|target| own.contains(&normalize(target.address.ip())))
+    {
         return Err(Error::SelfReference);
     }
     // Also resolve the operator-declared endpoint when it is a DNS name.
@@ -497,7 +514,13 @@ impl State {
             plan,
             revision: 1,
             last_checked_at: now,
-            health: evidence.into_iter().map(|evidence| Health { evidence, failures: 0 }).collect(),
+            health: evidence
+                .into_iter()
+                .map(|evidence| Health {
+                    evidence,
+                    failures: 0,
+                })
+                .collect(),
         };
         state.validate()?;
         Ok(state)
@@ -510,8 +533,7 @@ impl State {
             || self.last_checked_at == 0
             || self.health.len() != self.plan.references.len()
             || self.health.iter().any(|entry| {
-                !entry.evidence.valid()
-                    || (entry.failures == 0) != entry.evidence.eligible()
+                !entry.evidence.valid() || (entry.failures == 0) != entry.evidence.eligible()
             })
         {
             return Err(Error::Format);
@@ -529,20 +551,27 @@ impl State {
 
     /// A fresh, all-eligible inventory for descriptor provisioning. Does not
     /// authorize a switch, expand approved targets or activate a listener.
-    pub fn eligible_references(&self, now: u64) -> Result<Vec<crate::descriptor::Reference>, Error> {
+    pub fn eligible_references(
+        &self,
+        now: u64,
+    ) -> Result<Vec<crate::descriptor::Reference>, Error> {
         self.validate()?;
         if self.status(now)?.0 != PrimaryStatus::Healthy
             || !self.health.iter().all(|entry| entry.evidence.eligible())
         {
             return Err(Error::NotEligible);
         }
-        Ok(self.plan.references.iter().zip(&self.health).map(|(target, entry)| {
-            crate::descriptor::Reference {
+        Ok(self
+            .plan
+            .references
+            .iter()
+            .zip(&self.health)
+            .map(|(target, entry)| crate::descriptor::Reference {
                 server_name: target.server_name.clone(),
                 port: target.address.port(),
                 h3: entry.evidence.h3(),
-            }
-        }).collect())
+            })
+            .collect())
     }
 
     pub fn next_check_at(&self) -> Result<u64, Error> {
@@ -552,7 +581,9 @@ impl State {
         let bytes: [u8; 32] = hash.finalize().into();
         let offset = u64::from_be_bytes(bytes[..8].try_into().map_err(|_| Error::Format)?)
             % (2 * JITTER + 1);
-        self.last_checked_at.checked_add(INTERVAL - JITTER + offset).ok_or(Error::Clock)
+        self.last_checked_at
+            .checked_add(INTERVAL - JITTER + offset)
+            .ok_or(Error::Clock)
     }
 
     pub fn record(&self, evidence: Vec<Evidence>, now: u64) -> Result<Self, Error> {
@@ -592,7 +623,11 @@ impl State {
         if primary.failures < FAILURE_THRESHOLD {
             return Ok((PrimaryStatus::Suspect, None));
         }
-        let reserve = self.health.iter().enumerate().skip(1)
+        let reserve = self
+            .health
+            .iter()
+            .enumerate()
+            .skip(1)
             .filter(|(_, entry)| entry.evidence.eligible())
             .max_by_key(|(index, entry)| (entry.evidence.score(), std::cmp::Reverse(*index)))
             .map(|(index, _)| index);
@@ -614,7 +649,10 @@ impl State {
         for (index, entry) in self.health.iter().enumerate() {
             result.push_str(&format!(
                 "\nreference[{index}]: h2={} h3={} score={} consecutive_failures={}",
-                entry.evidence.eligible(), entry.evidence.h3(), entry.evidence.score(), entry.failures
+                entry.evidence.eligible(),
+                entry.evidence.h3(),
+                entry.evidence.score(),
+                entry.failures
             ));
         }
         if let Some(index) = reserve {
@@ -641,7 +679,9 @@ impl Store {
         if !crate::bounded_input::explicit_file_path(path) {
             return Err(Error::Storage);
         }
-        Ok(Self { path: path.to_owned() })
+        Ok(Self {
+            path: path.to_owned(),
+        })
     }
 
     fn snapshot(&self) -> Result<(Vec<u8>, State), Error> {
@@ -719,7 +759,10 @@ mod tests {
     }
 
     fn good(h3: bool) -> Evidence {
-        Evidence { h2_status: Some(200), h3_status: h3.then_some(200) }
+        Evidence {
+            h2_status: Some(200),
+            h3_status: h3.then_some(200),
+        }
     }
 
     #[test]
@@ -746,9 +789,26 @@ mod tests {
         let target = &plan.references[0];
         let own = plan.own_ips.iter().copied().collect();
         assert_eq!(vet_pin(&[target.address], target, &own), Ok(()));
-        assert_eq!(vet_pin(&[plan.references[1].address], target, &own), Err(Error::Dns));
-        assert_eq!(vet_pin(&[target.address, "10.0.0.1:443".parse().unwrap()], target, &own), Err(Error::Dns));
-        assert_eq!(vet_pin(&[target.address, "93.184.216.1:443".parse().unwrap()], target, &own), Err(Error::SelfReference));
+        assert_eq!(
+            vet_pin(&[plan.references[1].address], target, &own),
+            Err(Error::Dns)
+        );
+        assert_eq!(
+            vet_pin(
+                &[target.address, "10.0.0.1:443".parse().unwrap()],
+                target,
+                &own
+            ),
+            Err(Error::Dns)
+        );
+        assert_eq!(
+            vet_pin(
+                &[target.address, "93.184.216.1:443".parse().unwrap()],
+                target,
+                &own
+            ),
+            Err(Error::SelfReference)
+        );
         let mut many = vec![target.address; 9];
         many.push("93.184.216.1:443".parse().unwrap());
         assert_eq!(vet_pin(&many, target, &own), Err(Error::SelfReference));
@@ -762,7 +822,10 @@ mod tests {
         assert_eq!(stable(Some(403), Some(403)), None);
         assert_eq!(good(false).score(), 80);
         assert_eq!(good(true).score(), 100);
-        let h3_only = Evidence { h2_status: None, h3_status: Some(200) };
+        let h3_only = Evidence {
+            h2_status: None,
+            h3_status: Some(200),
+        };
         assert!(!h3_only.eligible());
         assert_eq!(h3_only.score(), 0);
     }
@@ -795,13 +858,20 @@ mod tests {
     #[test]
     fn initial_inventory_requires_all_approved_targets_eligible() {
         assert!(matches!(
-            State::new(plan(), vec![good(true), good(false), Evidence::default()], 100),
+            State::new(
+                plan(),
+                vec![good(true), good(false), Evidence::default()],
+                100
+            ),
             Err(Error::NotEligible)
         ));
         let state = State::new(plan(), vec![good(false); 3], 100).unwrap();
         let scheduled = state.next_check_at().unwrap();
         assert!((100 + INTERVAL - JITTER..=100 + INTERVAL + JITTER).contains(&scheduled));
-        assert!(matches!(state.record(vec![good(false); 3], 100), Err(Error::Clock)));
+        assert!(matches!(
+            state.record(vec![good(false); 3], 100),
+            Err(Error::Clock)
+        ));
     }
 
     #[tokio::test]
@@ -842,8 +912,14 @@ mod tests {
         let restored = reopened.inspect().unwrap();
         assert_eq!(restored.revision(), 1);
         let approved = restored.plan().digest().unwrap();
-        assert!(matches!(reopened.recheck(2, approved).await, Err(Error::Conflict)));
-        assert!(matches!(reopened.recheck(1, [0; 32]).await, Err(Error::Approval)));
+        assert!(matches!(
+            reopened.recheck(2, approved).await,
+            Err(Error::Conflict)
+        ));
+        assert!(matches!(
+            reopened.recheck(1, [0; 32]).await,
+            Err(Error::Approval)
+        ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
@@ -889,14 +965,19 @@ mod tests {
             while let Some(Ok((request, mut response))) = h2.accept().await {
                 let (parts, _) = request.into_parts();
                 assert_head(&Request::from_parts(parts, ()));
-                response.send_response(
-                    http::Response::builder().status(h2_status).body(()).unwrap(),
-                    true,
-                ).unwrap();
+                response
+                    .send_response(
+                        http::Response::builder()
+                            .status(h2_status)
+                            .body(())
+                            .unwrap(),
+                        true,
+                    )
+                    .unwrap();
             }
         }));
-        let endpoint = crate::quic_transport::server_endpoint(address, vec![cert], key.into())
-            .unwrap();
+        let endpoint =
+            crate::quic_transport::server_endpoint(address, vec![cert], key.into()).unwrap();
         let udp = Driver(tokio::spawn(async move {
             let incoming = endpoint.accept().await.unwrap();
             let Ok(connection) = crate::quic_transport::accept(incoming).await else {
@@ -913,12 +994,27 @@ mod tests {
                     break;
                 };
                 assert_head(&request);
-                stream.send_response(http::Response::builder().status(h3_status).body(()).unwrap())
-                    .await.unwrap();
+                stream
+                    .send_response(
+                        http::Response::builder()
+                            .status(h3_status)
+                            .body(())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
                 stream.finish().await.unwrap();
             }
         }));
-        (Target { server_name: "reference.example.org".into(), address }, roots, tcp, udp)
+        (
+            Target {
+                server_name: "reference.example.org".into(),
+                address,
+            },
+            roots,
+            tcp,
+            udp,
+        )
     }
 
     // Private fixture bypasses only the public-IP/DNS gate, not PKI or ALPN.
@@ -945,8 +1041,8 @@ mod tests {
         assert_eq!(h2.unwrap(), None);
         assert_eq!(h3.unwrap(), None);
         let (target, _, _tcp, _udp) = application_fixture(200, 200).await;
-        let other = rcgen::generate_simple_self_signed(vec!["reference.example.org".into()])
-            .unwrap();
+        let other =
+            rcgen::generate_simple_self_signed(vec!["reference.example.org".into()]).unwrap();
         let mut wrong = RootCertStore::empty();
         wrong.add(other.cert.der().clone()).unwrap();
         let (h2, h3) = tokio::join!(

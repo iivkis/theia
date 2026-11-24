@@ -54,9 +54,11 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
             (Some(*p), Some(*s), Action::Enroll(hash(h)?))
         }
         ["inspect", "--store", s] => (None, Some(*s), Action::Inspect),
-        ["recheck", "--store", s, "--expected-revision", r, "--plan-sha256", h, "--confirm"] => {
-            (None, Some(*s), Action::Recheck(crate::expected_revision(r)?, hash(h)?))
-        }
+        ["recheck", "--store", s, "--expected-revision", r, "--plan-sha256", h, "--confirm"] => (
+            None,
+            Some(*s),
+            Action::Recheck(crate::expected_revision(r)?, hash(h)?),
+        ),
         ["monitor", "--store", s, "--plan-sha256", h, "--confirm"] => {
             (None, Some(*s), Action::Monitor(hash(h)?))
         }
@@ -125,13 +127,21 @@ async fn monitor(store: &Store, approved: [u8; 32]) -> Result<String, Error> {
 
 pub async fn run(command: Command) -> Result<String, Error> {
     let plan = command.plan.as_deref().map(read_plan).transpose()?;
-    let store = command.store.as_deref().map(|p| Store::new(Path::new(p))).transpose()?;
+    let store = command
+        .store
+        .as_deref()
+        .map(|p| Store::new(Path::new(p)))
+        .transpose()?;
     let get_plan = || plan.as_ref().ok_or(Error::Format);
     let get_store = || store.as_ref().ok_or(Error::Format);
     match command.action {
         Action::Preview => {
             let (plan, digest) = get_plan()?;
-            Ok(format!("{}\ndocument_sha256={}", plan.preview()?, hex(digest)))
+            Ok(format!(
+                "{}\ndocument_sha256={}",
+                plan.preview()?,
+                hex(digest)
+            ))
         }
         Action::Check(expected) | Action::Enroll(expected) => {
             let (plan, actual) = get_plan()?;
@@ -148,7 +158,9 @@ pub async fn run(command: Command) -> Result<String, Error> {
                 for (index, entry) in evidence.iter().enumerate() {
                     result.push_str(&format!(
                         "\nreference[{index}]: h2={} h3={} score={}",
-                        entry.eligible(), entry.h3(), entry.score()
+                        entry.eligible(),
+                        entry.h3(),
+                        entry.score()
                     ));
                 }
                 Ok(result)
@@ -178,9 +190,37 @@ mod tests {
         assert!(parse(&["inspect", "--store", s]).is_ok());
         assert!(parse(&["check", "--plan", p, "--sha256", &digest]).is_err());
         assert!(parse(&["check", "--plan", p, "--sha256", &digest, "--confirm"]).is_ok());
-        assert!(parse(&["enroll", "--plan", p, "--store", s, "--sha256", &digest, "--confirm"]).is_ok());
-        assert!(parse(&["recheck", "--store", s, "--expected-revision", "0", "--plan-sha256", &digest, "--confirm"]).is_err());
+        assert!(parse(&[
+            "enroll",
+            "--plan",
+            p,
+            "--store",
+            s,
+            "--sha256",
+            &digest,
+            "--confirm"
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "recheck",
+            "--store",
+            s,
+            "--expected-revision",
+            "0",
+            "--plan-sha256",
+            &digest,
+            "--confirm"
+        ])
+        .is_err());
         assert!(parse(&["monitor", "--store", s, "--plan-sha256", &digest]).is_err());
-        assert!(parse(&["monitor", "--store", s, "--plan-sha256", &digest, "--confirm"]).is_ok());
+        assert!(parse(&[
+            "monitor",
+            "--store",
+            s,
+            "--plan-sha256",
+            &digest,
+            "--confirm"
+        ])
+        .is_ok());
     }
 }

@@ -82,15 +82,21 @@ impl H3Client {
         value: &crate::descriptor::Verified,
     ) -> Result<Self, ClientError> {
         let d = value.descriptor();
-        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string()
-            || !value.effective_modes().h3 {
+        if !remote.ip().is_loopback()
+            || d.scope.endpoint != remote.to_string()
+            || !value.effective_modes().h3
+        {
             return Err(ClientError::Configuration);
         }
         let quic = crate::identity_tls::quic_client(&d.scope, value.signer())
             .map_err(|_| ClientError::Tls)?;
         let routes = crate::split_http::IdentityRoutes::new(&d.path_prefix)?;
-        let uri = Uri::builder().scheme("https").authority("localhost")
-            .path_and_query(routes.single.as_str()).build().map_err(|_| ClientError::Configuration)?;
+        let uri = Uri::builder()
+            .scheme("https")
+            .authority("localhost")
+            .path_and_query(routes.single.as_str())
+            .build()
+            .map_err(|_| ClientError::Configuration)?;
         let mut client = Self {
             remote,
             name: "localhost".into(),
@@ -116,18 +122,38 @@ impl H3Client {
     }
 
     pub(crate) async fn fetch_identity_descriptor(&self) -> Result<String, ClientError> {
-        let routes = self.identity_routes.as_ref().ok_or(ClientError::Configuration)?;
+        let routes = self
+            .identity_routes
+            .as_ref()
+            .ok_or(ClientError::Configuration)?;
         timeout(OPEN_TIMEOUT, async {
             let connection = self.connect_verified(diagnostics::next_id()).await?;
-            let mut sender = connection.sender.lock().map_err(|_| ClientError::Http3)?.clone();
+            let mut sender = connection
+                .sender
+                .lock()
+                .map_err(|_| ClientError::Http3)?
+                .clone();
             let mut parts = self.uri.clone().into_parts();
-            parts.path_and_query = Some(routes.descriptor.parse().map_err(|_| ClientError::Configuration)?);
+            parts.path_and_query = Some(
+                routes
+                    .descriptor
+                    .parse()
+                    .map_err(|_| ClientError::Configuration)?,
+            );
             let uri = Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
-            let request = Request::get(uri).header(header::AUTHORIZATION, self.authorization.clone())
-                .body(()).map_err(|_| ClientError::Configuration)?;
-            let mut stream = sender.send_request(request).await.map_err(|_| ClientError::Http3)?;
+            let request = Request::get(uri)
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .body(())
+                .map_err(|_| ClientError::Configuration)?;
+            let mut stream = sender
+                .send_request(request)
+                .await
+                .map_err(|_| ClientError::Http3)?;
             stream.finish().await.map_err(|_| ClientError::Http3)?;
-            let response = stream.recv_response().await.map_err(|_| ClientError::Http3)?;
+            let response = stream
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
             crate::split_http::check_status(response.status())?;
             let expected = crate::identity_data::validate_descriptor_headers(response.headers())?;
             let mut bytes = Vec::new();
@@ -138,11 +164,18 @@ impl H3Client {
                 let chunk = chunk.copy_to_bytes(chunk.remaining());
                 crate::identity_data::append_descriptor(&mut bytes, &chunk, expected)?;
             }
-            if stream.recv_trailers().await.map_err(|_| ClientError::Http3)?.is_some() {
+            if stream
+                .recv_trailers()
+                .await
+                .map_err(|_| ClientError::Http3)?
+                .is_some()
+            {
                 return Err(ClientError::Protocol);
             }
             crate::identity_data::finish_descriptor(bytes, expected)
-        }).await.map_err(|_| ClientError::Timeout)?
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
     }
 
     /// Reuse verified own-TLS connections within this immutable profile.
@@ -263,7 +296,8 @@ impl H3Client {
         let endpoint = match &self.identity_quic {
             Some(config) => ObservedEndpoint::with_config(bind, config.clone()),
             None => ObservedEndpoint::new(bind, self.roots.clone()),
-        }.map_err(quic_error)?;
+        }
+        .map_err(quic_error)?;
         // No credential/request data until verified full handshake and BBR.
         let connection = endpoint
             .connect(self.remote, &self.name, self.connect_timeout)
@@ -399,7 +433,13 @@ impl H3Client {
             let mut download = sender
                 .send_request(crate::channel_binding::attach(
                     binding,
-                    split_http::request_for(self.identity_routes.as_ref(), &self.uri, Leg::Download, &self.authorization, pair_id)?,
+                    split_http::request_for(
+                        self.identity_routes.as_ref(),
+                        &self.uri,
+                        Leg::Download,
+                        &self.authorization,
+                        pair_id,
+                    )?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
@@ -407,7 +447,13 @@ impl H3Client {
             let mut upload = sender
                 .send_request(crate::channel_binding::attach(
                     binding,
-                    split_http::request_for(self.identity_routes.as_ref(), &self.uri, Leg::Upload, &self.authorization, pair_id)?,
+                    split_http::request_for(
+                        self.identity_routes.as_ref(),
+                        &self.uri,
+                        Leg::Upload,
+                        &self.authorization,
+                        pair_id,
+                    )?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;

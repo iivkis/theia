@@ -12,8 +12,8 @@ use std::{
 use theia::{
     config::{Transport, XhttpMode},
     descriptor::{
-        self, Anchor, Change, ClientPolicy, Descriptor, Error, Padding, Reference, Rotation,
-        Scope, SecurityMode, Store,
+        self, Anchor, Change, ClientPolicy, Descriptor, Error, Padding, Reference, Rotation, Scope,
+        SecurityMode, Store,
     },
 };
 
@@ -211,10 +211,7 @@ fn valid_signature_does_not_make_noncanonical_envelope_acceptable() {
         descriptor::verify(&format!("# extra envelope text\n{raw}"), &a),
         Error::Format,
     );
-    assert_error(
-        descriptor::verify(&format!("{raw}\n"), &a),
-        Error::Format,
-    );
+    assert_error(descriptor::verify(&format!("{raw}\n"), &a), Error::Format);
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -904,7 +901,9 @@ fn incompatible_successor_cannot_bypass_local_policy_during_rotation() {
     };
     let anchor = policy_anchor(&first, &root, policy);
     let store = Store::new(&path, anchor.clone()).unwrap();
-    store.initialize(&descriptor::sign(&first, &root).unwrap(), 120).unwrap();
+    store
+        .initialize(&descriptor::sign(&first, &root).unwrap(), 120)
+        .unwrap();
     let before = fs::read(&path).unwrap();
     let mut next = fixture(2);
     next.h3 = false;

@@ -217,8 +217,13 @@ async fn handle_descriptor(
     };
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         stream.recv_data().await.is_ok_and(|data| data.is_none())
-            && stream.recv_trailers().await.is_ok_and(|trailers| trailers.is_none())
-    }).await.unwrap_or(false);
+            && stream
+                .recv_trailers()
+                .await
+                .is_ok_and(|trailers| trailers.is_none())
+    })
+    .await
+    .unwrap_or(false);
     if !empty {
         reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
         return;
@@ -227,12 +232,25 @@ async fn handle_descriptor(
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, "application/octet-stream")
         .header(http::header::CONTENT_LENGTH, signed.len().to_string())
-        .body(()) else { return; };
-    if !matches!(timeout(CLOSE_TIMEOUT, async {
-        stream.send_response(response).await.map_err(|_| ServerError::Io)?;
-        stream.send_data(Bytes::copy_from_slice(signed.as_bytes())).await.map_err(|_| ServerError::Io)?;
-        stream.finish().await.map_err(|_| ServerError::Io)
-    }).await, Ok(Ok(()))) {
+        .body(())
+    else {
+        return;
+    };
+    if !matches!(
+        timeout(CLOSE_TIMEOUT, async {
+            stream
+                .send_response(response)
+                .await
+                .map_err(|_| ServerError::Io)?;
+            stream
+                .send_data(Bytes::copy_from_slice(signed.as_bytes()))
+                .await
+                .map_err(|_| ServerError::Io)?;
+            stream.finish().await.map_err(|_| ServerError::Io)
+        })
+        .await,
+        Ok(Ok(()))
+    ) {
         stream.stop_stream(Code::H3_REQUEST_CANCELLED);
         stream.stop_sending(Code::H3_REQUEST_CANCELLED);
     }

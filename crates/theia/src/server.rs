@@ -229,9 +229,12 @@ impl ServerContext {
         signed: Arc<str>,
     ) -> Result<Self, ServerError> {
         let d = value.descriptor();
-        if !inbound.security_mode.is_plain() || inbound.id != d.scope.inbound
+        if !inbound.security_mode.is_plain()
+            || inbound.id != d.scope.inbound
             || inbound.allowed_user_ids.is_empty()
-            || value.check_time(crate::reference_health::unix_now().map_err(|_| ServerError::Config)?).is_err()
+            || value
+                .check_time(crate::reference_health::unix_now().map_err(|_| ServerError::Config)?)
+                .is_err()
         {
             return Err(ServerError::Config);
         }
@@ -271,20 +274,35 @@ impl ServerContext {
         peer: IpAddr,
     ) -> Result<(SessionPermit, Arc<str>), StatusCode> {
         let routes = self.identity_routes.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-        if !routes.current() || !self.is_descriptor_request(request)
+        if !routes.current()
+            || !self.is_descriptor_request(request)
             || request.uri().query().is_some()
-            || request.headers().contains_key(crate::split_http::PAIR_HEADER)
+            || request
+                .headers()
+                .contains_key(crate::split_http::PAIR_HEADER)
         {
             return Err(StatusCode::NOT_FOUND);
         }
         if !self.peer_budget.admit(peer, Instant::now()) {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        if request.headers().get_all(header::AUTHORIZATION).iter().count() != 1 {
+        if request
+            .headers()
+            .get_all(header::AUTHORIZATION)
+            .iter()
+            .count()
+            != 1
+        {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        let permit = self.authorize(request.headers().get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())).map_err(AuthFailure::status)?;
+        let permit = self
+            .authorize(
+                request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+            )
+            .map_err(AuthFailure::status)?;
         Ok((permit, routes.signed.clone()))
     }
 
@@ -320,10 +338,13 @@ impl ServerContext {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
         let single_allowed = match &self.identity_routes {
-            Some(routes) => routes.current() && routes.stream_one
-                && request.uri().path() == routes.paths.single,
-            None => !self.security_mode.is_stream_up()
-                && request.uri().path() == self.security_mode.path(),
+            Some(routes) => {
+                routes.current() && routes.stream_one && request.uri().path() == routes.paths.single
+            }
+            None => {
+                !self.security_mode.is_stream_up()
+                    && request.uri().path() == self.security_mode.path()
+            }
         };
         if !single_allowed
             || request.method() != Method::POST
@@ -373,8 +394,7 @@ impl ServerContext {
         if self.identity_routes.is_some() {
             self.split_leg(request).is_some()
         } else {
-            self.stream_up()
-                || (self.security_mode.is_plain() && self.split_leg(request).is_some())
+            self.stream_up() || (self.security_mode.is_plain() && self.split_leg(request).is_some())
         }
     }
 
@@ -849,8 +869,14 @@ async fn handle_descriptor(
     };
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         request.body_mut().data().await.is_none()
-            && request.body_mut().trailers().await.is_ok_and(|value| value.is_none())
-    }).await.unwrap_or(false);
+            && request
+                .body_mut()
+                .trailers()
+                .await
+                .is_ok_and(|value| value.is_none())
+    })
+    .await
+    .unwrap_or(false);
     if !empty {
         return reject(&mut respond, StatusCode::BAD_REQUEST).await;
     }
@@ -858,17 +884,28 @@ async fn handle_descriptor(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, signed.len().to_string())
-        .body(()).map_err(|_| ServerError::Http2)?;
-    let mut output = respond.send_response(response, false).map_err(|_| ServerError::Http2)?;
+        .body(())
+        .map_err(|_| ServerError::Http2)?;
+    let mut output = respond
+        .send_response(response, false)
+        .map_err(|_| ServerError::Http2)?;
     timeout(CLOSE_TIMEOUT, async {
         output.reserve_capacity(signed.len());
         let mut remaining = signed.as_bytes();
         while !remaining.is_empty() {
             let credit = std::future::poll_fn(|cx| output.poll_capacity(cx))
-                .await.ok_or(ServerError::Io)?.map_err(|_| ServerError::Io)?;
-            if credit == 0 { continue; }
+                .await
+                .ok_or(ServerError::Io)?
+                .map_err(|_| ServerError::Io)?;
+            if credit == 0 {
+                continue;
+            }
             let count = credit.min(remaining.len());
-            output.send_data(Bytes::copy_from_slice(&remaining[..count]), count == remaining.len())
+            output
+                .send_data(
+                    Bytes::copy_from_slice(&remaining[..count]),
+                    count == remaining.len(),
+                )
                 .map_err(|_| ServerError::Io)?;
             remaining = &remaining[count..];
             if !remaining.is_empty() {
@@ -876,7 +913,9 @@ async fn handle_descriptor(
             }
         }
         Ok(())
-    }).await.map_err(|_| ServerError::Io)?
+    })
+    .await
+    .map_err(|_| ServerError::Io)?
 }
 
 async fn handle_request(

@@ -64,8 +64,13 @@ fn public_key(identity: &Identity) -> String {
 }
 
 fn verified(identity: &Identity, signed: &str, minimum: u64) -> Result<Verified, Error> {
-    let anchor = Anchor::new(identity.scope().clone(), identity.public_key(), minimum, bootstrap::auto_policy())
-        .map_err(|_| Error::Descriptor)?;
+    let anchor = Anchor::new(
+        identity.scope().clone(),
+        identity.public_key(),
+        minimum,
+        bootstrap::auto_policy(),
+    )
+    .map_err(|_| Error::Descriptor)?;
     descriptor::verify(signed, &anchor).map_err(|_| Error::Descriptor)
 }
 
@@ -75,7 +80,9 @@ fn key_at(path: &str, scope: &Scope) -> Result<Identity, Error> {
 
 impl Record {
     fn validate(&self) -> Result<Checked, Error> {
-        if self.schema_version != 1 || self.generation == 0 || self.clock_floor == 0
+        if self.schema_version != 1
+            || self.generation == 0
+            || self.clock_floor == 0
             || self.retired.len() > 64
         {
             return Err(Error::Format);
@@ -83,8 +90,10 @@ impl Record {
         let mut retired = std::collections::HashSet::new();
         for raw in &self.retired {
             let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| Error::Format)?;
-            if bytes.len() != 32 || bytes.iter().all(|byte| *byte == 0)
-                || URL_SAFE_NO_PAD.encode(&bytes) != *raw || !retired.insert(raw)
+            if bytes.len() != 32
+                || bytes.iter().all(|byte| *byte == 0)
+                || URL_SAFE_NO_PAD.encode(&bytes) != *raw
+                || !retired.insert(raw)
             {
                 return Err(Error::Format);
             }
@@ -94,37 +103,60 @@ impl Record {
             return Err(Error::Identity);
         }
         let current = verified(&active, &self.active_document, 1)?;
-        current.check_time(self.clock_floor).map_err(|_| Error::Descriptor)?;
+        current
+            .check_time(self.clock_floor)
+            .map_err(|_| Error::Descriptor)?;
         let next = if let Some(pending) = &self.pending {
             if pending.key_file == self.active_key
                 || pending.started_at > self.clock_floor
-                || pending.ends_at != pending.started_at.checked_add(OVERLAP).ok_or(Error::Clock)?
+                || pending.ends_at
+                    != pending
+                        .started_at
+                        .checked_add(OVERLAP)
+                        .ok_or(Error::Clock)?
                 || self.active_document != pending.announcement
             {
                 return Err(Error::Format);
             }
             let successor_key = key_at(&pending.key_file, &self.scope)?;
             let encoded = public_key(&successor_key);
-            if self.retired.contains(&encoded) || active.public_key() == successor_key.public_key()
+            if self.retired.contains(&encoded)
+                || active.public_key() == successor_key.public_key()
                 || current.descriptor().next_identity.as_deref() != Some(encoded.as_str())
             {
                 return Err(Error::Identity);
             }
-            let minimum = current.descriptor().revision.checked_add(1).ok_or(Error::Descriptor)?;
+            let minimum = current
+                .descriptor()
+                .revision
+                .checked_add(1)
+                .ok_or(Error::Descriptor)?;
             let successor = verified(&successor_key, &pending.successor, minimum)?;
-            current.check_time(pending.started_at).map_err(|_| Error::Descriptor)?;
-            successor.check_time(pending.started_at).map_err(|_| Error::Descriptor)?;
+            current
+                .check_time(pending.started_at)
+                .map_err(|_| Error::Descriptor)?;
+            successor
+                .check_time(pending.started_at)
+                .map_err(|_| Error::Descriptor)?;
             let a = current.descriptor();
             let b = successor.descriptor();
             // The next document must change only the signing identity,
             // revision and validity. No route/transport/grant change rides
             // along with key rotation.
-            if b.revision != minimum || b.next_identity.is_some()
-                || a.not_after != pending.ends_at || a.not_before != pending.started_at
-                || b.not_before != pending.started_at || b.not_after <= pending.ends_at
-                || a.active_reference != b.active_reference || a.references != b.references
-                || a.h3 != b.h3 || a.stream_one != b.stream_one || a.stream_up != b.stream_up
-                || a.path_prefix != b.path_prefix || a.padding != b.padding || a.rotation != b.rotation
+            if b.revision != minimum
+                || b.next_identity.is_some()
+                || a.not_after != pending.ends_at
+                || a.not_before != pending.started_at
+                || b.not_before != pending.started_at
+                || b.not_after <= pending.ends_at
+                || a.active_reference != b.active_reference
+                || a.references != b.references
+                || a.h3 != b.h3
+                || a.stream_one != b.stream_one
+                || a.stream_up != b.stream_up
+                || a.path_prefix != b.path_prefix
+                || a.padding != b.padding
+                || a.rotation != b.rotation
             {
                 return Err(Error::Descriptor);
             }
@@ -135,7 +167,11 @@ impl Record {
             }
             None
         };
-        Ok(Checked { active, current, next })
+        Ok(Checked {
+            active,
+            current,
+            next,
+        })
     }
 
     fn encode(&self) -> Result<String, Error> {
@@ -172,7 +208,9 @@ impl Publication {
         if !crate::bounded_input::explicit_file_path(path) {
             return Err(Error::Storage);
         }
-        Ok(Self { path: path.to_owned() })
+        Ok(Self {
+            path: path.to_owned(),
+        })
     }
 
     fn snapshot(&self) -> Result<(String, Record, Checked), Error> {
@@ -183,11 +221,12 @@ impl Publication {
     }
 
     fn write(&self, record: &Record, old: Option<&str>) -> Result<(), Error> {
-        config::guarded_trust_write(&self.path, &record.encode()?, old.map(str::as_bytes))
-            .map_err(|error| match error {
+        config::guarded_trust_write(&self.path, &record.encode()?, old.map(str::as_bytes)).map_err(
+            |error| match error {
                 WriteFailure::BeforeReplace(_) => Error::Storage,
                 WriteFailure::AfterReplace(_) => Error::Indeterminate,
-            })
+            },
+        )
     }
 
     /// Single create-only publication, preventing two revision-one candidates
@@ -205,10 +244,19 @@ impl Publication {
         let key_file = key_path.to_str().ok_or(Error::Storage)?.to_owned();
         let identity = key_at(&key_file, &scope)?;
         let active_document = bootstrap::initial_descriptor(state, &identity, now)?;
-        self.write(&Record {
-            schema_version: 1, scope, generation: 1, clock_floor: now,
-            active_key: key_file, active_document, retired: Vec::new(), pending: None,
-        }, None)
+        self.write(
+            &Record {
+                schema_version: 1,
+                scope,
+                generation: 1,
+                clock_floor: now,
+                active_key: key_file,
+                active_document,
+                retired: Vec::new(),
+                pending: None,
+            },
+            None,
+        )
     }
 
     /// Public output only. Revision and exact snapshot digest are a CAS
@@ -222,7 +270,10 @@ impl Publication {
             revision: checked.current.descriptor().revision,
             active_fingerprint: bootstrap::fingerprint(checked.active.public_key()),
             valid_now: checked.current.check_time(now).is_ok(),
-            next_fingerprint: checked.next.as_ref().map(|(key, _)| bootstrap::fingerprint(key.public_key())),
+            next_fingerprint: checked
+                .next
+                .as_ref()
+                .map(|(key, _)| bootstrap::fingerprint(key.public_key())),
             overlap_ends_at: record.pending.as_ref().map(|pending| pending.ends_at),
         })
     }
@@ -230,20 +281,32 @@ impl Publication {
     pub fn documents(&self, now: u64) -> Result<(String, Option<String>), Error> {
         let (_, record, checked) = self.snapshot()?;
         record.check_clock(now)?;
-        checked.current.check_time(now).map_err(|_| Error::Descriptor)?;
+        checked
+            .current
+            .check_time(now)
+            .map_err(|_| Error::Descriptor)?;
         if let Some((_, next)) = &checked.next {
             next.check_time(now).map_err(|_| Error::Descriptor)?;
         }
-        Ok((record.active_document, record.pending.map(|pending| pending.successor)))
+        Ok((
+            record.active_document,
+            record.pending.map(|pending| pending.successor),
+        ))
     }
 
-    pub fn refresh(&self, state: &reference_health::State, expected: [u8; 32], now: u64) -> Result<(), Error> {
+    pub fn refresh(
+        &self,
+        state: &reference_health::State,
+        expected: [u8; 32],
+        now: u64,
+    ) -> Result<(), Error> {
         let (old, mut record, checked) = self.snapshot()?;
         if bootstrap::digest(&old) != expected || record.pending.is_some() {
             return Err(Error::Approval);
         }
         record.check_clock(now)?;
-        record.active_document = bootstrap::refresh_descriptor(state, &checked.active, &record.active_document, now)?;
+        record.active_document =
+            bootstrap::refresh_descriptor(state, &checked.active, &record.active_document, now)?;
         record.advance(now)?;
         self.write(&record, Some(&old))
     }
@@ -260,13 +323,17 @@ impl Publication {
         now: u64,
     ) -> Result<(), Error> {
         let (old, mut record, checked) = self.snapshot()?;
-        if bootstrap::digest(&old) != expected || record.pending.is_some()
+        if bootstrap::digest(&old) != expected
+            || record.pending.is_some()
             || record.retired.len() >= 64
         {
             return Err(Error::Approval);
         }
         record.check_clock(now)?;
-        checked.current.check_time(now).map_err(|_| Error::Descriptor)?;
+        checked
+            .current
+            .check_time(now)
+            .map_err(|_| Error::Descriptor)?;
         let key_file = successor_path.to_str().ok_or(Error::Storage)?.to_owned();
         let next = key_at(&key_file, &record.scope)?;
         let encoded = public_key(&next);
@@ -278,20 +345,31 @@ impl Publication {
         }
         let ends_at = now.checked_add(OVERLAP).ok_or(Error::Clock)?;
         let mut announcement = checked.current.descriptor().clone();
-        announcement.revision = announcement.revision.checked_add(1).ok_or(Error::Descriptor)?;
+        announcement.revision = announcement
+            .revision
+            .checked_add(1)
+            .ok_or(Error::Descriptor)?;
         announcement.not_before = now;
         announcement.not_after = ends_at;
         announcement.next_identity = Some(encoded);
-        let signed_announcement = checked.active.sign_descriptor(&announcement).map_err(|_| Error::Descriptor)?;
+        let signed_announcement = checked
+            .active
+            .sign_descriptor(&announcement)
+            .map_err(|_| Error::Descriptor)?;
         let mut successor = announcement.clone();
         successor.revision = successor.revision.checked_add(1).ok_or(Error::Descriptor)?;
         successor.not_after = ends_at.checked_add(VALIDITY).ok_or(Error::Clock)?;
         successor.next_identity = None;
-        let signed_successor = next.sign_descriptor(&successor).map_err(|_| Error::Descriptor)?;
+        let signed_successor = next
+            .sign_descriptor(&successor)
+            .map_err(|_| Error::Descriptor)?;
         record.active_document = signed_announcement.clone();
         record.pending = Some(Pending {
-            key_file, started_at: now, ends_at,
-            announcement: signed_announcement, successor: signed_successor,
+            key_file,
+            started_at: now,
+            ends_at,
+            announcement: signed_announcement,
+            successor: signed_successor,
         });
         record.advance(now)?;
         self.write(&record, Some(&old))
@@ -300,7 +378,12 @@ impl Publication {
     /// Explicitly retire the previous signer only after the entire overlap.
     /// Offline clients which missed it must use independent re-enrollment.
     /// A revoked or compromised key is never used to authorize recovery.
-    pub fn promote(&self, expected: [u8; 32], expected_next: [u8; 32], now: u64) -> Result<(), Error> {
+    pub fn promote(
+        &self,
+        expected: [u8; 32],
+        expected_next: [u8; 32],
+        now: u64,
+    ) -> Result<(), Error> {
         let (old, mut record, checked) = self.snapshot()?;
         if bootstrap::digest(&old) != expected {
             return Err(Error::Approval);
@@ -341,13 +424,19 @@ mod tests {
     impl Scratch {
         fn new() -> Self {
             static SEQ: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!("theia-publication-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+            let path = std::env::temp_dir().join(format!(
+                "theia-publication-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir(&path).unwrap();
             Self(path)
         }
     }
     impl Drop for Scratch {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -364,8 +453,19 @@ mod tests {
                 address: "93.184.216.2:443".parse().unwrap(),
             }],
         };
-        let state = reference_health::State::new(plan, vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }], now).unwrap();
-        let scope = Scope { inbound: state.plan().inbound.clone(), endpoint: state.plan().endpoint.clone() };
+        let state = reference_health::State::new(
+            plan,
+            vec![reference_health::Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
+            now,
+        )
+        .unwrap();
+        let scope = Scope {
+            inbound: state.plan().inbound.clone(),
+            endpoint: state.plan().endpoint.clone(),
+        };
         let active = Identity::generate(scope.clone()).unwrap();
         let next = Identity::generate(scope.clone()).unwrap();
         let old_key = dir.0.join("old.key");
@@ -379,9 +479,15 @@ mod tests {
         let start = publication.inspect(now).unwrap();
         let initial = publication.documents(now).unwrap().0;
         let fingerprint = bootstrap::fingerprint(next.public_key());
-        assert!(publication.begin_rotation(&next_key, [0; 32], fingerprint, now + 1).is_err());
-        assert!(publication.begin_rotation(&next_key, start.snapshot_sha256, [0; 32], now + 1).is_err());
-        publication.begin_rotation(&next_key, start.snapshot_sha256, fingerprint, now + 1).unwrap();
+        assert!(publication
+            .begin_rotation(&next_key, [0; 32], fingerprint, now + 1)
+            .is_err());
+        assert!(publication
+            .begin_rotation(&next_key, start.snapshot_sha256, [0; 32], now + 1)
+            .is_err());
+        publication
+            .begin_rotation(&next_key, start.snapshot_sha256, fingerprint, now + 1)
+            .unwrap();
         let publication = Publication::new(&path).unwrap();
         let overlap = publication.inspect(now + 1).unwrap();
         assert_eq!(overlap.revision, 2);
@@ -391,24 +497,44 @@ mod tests {
 
         // A separate client already enrolled at revision one can consume
         // the old-signed announcement and explicitly promote to the next.
-        let anchor = Anchor::new(scope, active.public_key(), 1,
-            ClientPolicy { transport: Transport::Auto, xhttp_mode: XhttpMode::Auto }).unwrap();
+        let anchor = Anchor::new(
+            scope,
+            active.public_key(),
+            1,
+            ClientPolicy {
+                transport: Transport::Auto,
+                xhttp_mode: XhttpMode::Auto,
+            },
+        )
+        .unwrap();
         let client_path = dir.0.join("client.toml");
         let store = descriptor::Store::new(&client_path, anchor).unwrap();
         store.initialize(&initial, now).unwrap();
         store.update_at(&announcement, 1, now + 1).unwrap();
-        store.promote(&successor, 2, next.public_key(), now + 1).unwrap();
+        store
+            .promote(&successor, 2, next.public_key(), now + 1)
+            .unwrap();
         assert_eq!(store.load(now + 1).unwrap().signer(), next.public_key());
 
         let ends = overlap.overlap_ends_at.unwrap();
-        assert!(publication.promote(overlap.snapshot_sha256, fingerprint, ends - 1).is_err());
-        publication.promote(overlap.snapshot_sha256, fingerprint, ends).unwrap();
+        assert!(publication
+            .promote(overlap.snapshot_sha256, fingerprint, ends - 1)
+            .is_err());
+        publication
+            .promote(overlap.snapshot_sha256, fingerprint, ends)
+            .unwrap();
         let final_state = publication.inspect(ends).unwrap();
         assert_eq!(final_state.revision, 3);
         assert_eq!(final_state.active_fingerprint, fingerprint);
         assert_eq!(final_state.next_fingerprint, None);
         assert!(old_key.exists() && next_key.exists());
-        assert!(publication.begin_rotation(&old_key, final_state.snapshot_sha256,
-            bootstrap::fingerprint(active.public_key()), ends + 1).is_err());
+        assert!(publication
+            .begin_rotation(
+                &old_key,
+                final_state.snapshot_sha256,
+                bootstrap::fingerprint(active.public_key()),
+                ends + 1
+            )
+            .is_err());
     }
 }

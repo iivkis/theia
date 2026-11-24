@@ -4,17 +4,29 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
-use std::{net::SocketAddr, path::PathBuf, sync::atomic::{AtomicU64, Ordering}, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use theia::{
     client::ClientError,
     config::{Inbound, ServerPolicy, Transport, User, XhttpMode},
-    descriptor::{self, Anchor, ClientPolicy, Descriptor, Padding, Reference, Rotation, Scope, SecurityMode, Store},
+    descriptor::{
+        self, Anchor, ClientPolicy, Descriptor, Padding, Reference, Rotation, Scope, SecurityMode,
+        Store,
+    },
     identity_data::{FixtureClient, PreparedFixture},
     identity_tls::{Branch, Identity},
     protocol::{Address, ErrorCode},
     reference_health,
 };
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::timeout,
+};
 
 const TOKEN: [u8; 32] = [42; 32];
 const OTHER: [u8; 32] = [43; 32];
@@ -41,8 +53,16 @@ fn config(remote: SocketAddr) -> (Inbound, Vec<User>) {
         tls_key: "unused".into(),
     };
     let users = vec![
-        User { id: "allowed".into(), token_sha256: format!("{:x}", Sha256::digest(TOKEN)), disabled: false },
-        User { id: "other".into(), token_sha256: format!("{:x}", Sha256::digest(OTHER)), disabled: false },
+        User {
+            id: "allowed".into(),
+            token_sha256: format!("{:x}", Sha256::digest(TOKEN)),
+            disabled: false,
+        },
+        User {
+            id: "other".into(),
+            token_sha256: format!("{:x}", Sha256::digest(OTHER)),
+            disabled: false,
+        },
     ];
     (inbound, users)
 }
@@ -62,28 +82,56 @@ fn value(scope: Scope, h3: bool, now: u64) -> Descriptor {
         path_prefix: "/v1/fixture-prefix".into(),
         next_identity: None,
         scope,
-        padding: Padding { header_min: 0, header_max: 128, frame_min: 0, frame_max: 512 },
-        rotation: Rotation { lifetime_min_s: 10, lifetime_max_s: 60, volume_min_bytes: 1024, volume_max_bytes: 4096 },
-        references: vec![Reference { server_name: "reference.example.org".into(), port: 443, h3 }],
+        padding: Padding {
+            header_min: 0,
+            header_max: 128,
+            frame_min: 0,
+            frame_max: 512,
+        },
+        rotation: Rotation {
+            lifetime_min_s: 10,
+            lifetime_max_s: 60,
+            volume_min_bytes: 1024,
+            volume_max_bytes: 4096,
+        },
+        references: vec![Reference {
+            server_name: "reference.example.org".into(),
+            port: 443,
+            h3,
+        }],
     }
 }
 
 fn anchor(identity: &Identity, mode: XhttpMode) -> Anchor {
-    Anchor::new(identity.scope().clone(), identity.public_key(), 1,
-        ClientPolicy { transport: Transport::Auto, xhttp_mode: mode }).unwrap()
+    Anchor::new(
+        identity.scope().clone(),
+        identity.public_key(),
+        1,
+        ClientPolicy {
+            transport: Transport::Auto,
+            xhttp_mode: mode,
+        },
+    )
+    .unwrap()
 }
 
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("theia-identity-data-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "theia-identity-data-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir(&dir).unwrap();
         Self(dir)
     }
 }
 impl Drop for Scratch {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 async fn bind() -> TcpListener {
@@ -103,7 +151,10 @@ async fn independent_identity_relay_and_descriptor_update_on_h2_and_h3() {
     timeout(DEADLINE, async {
         let tcp = bind().await;
         let remote = tcp.local_addr().unwrap();
-        let scope = Scope { inbound: "edge".into(), endpoint: remote.to_string() };
+        let scope = Scope {
+            inbound: "edge".into(),
+            endpoint: remote.to_string(),
+        };
         let identity = Identity::generate(scope.clone()).unwrap();
         let now = reference_health::unix_now().unwrap();
         let first = value(scope, true, now);
@@ -112,7 +163,9 @@ async fn independent_identity_relay_and_descriptor_update_on_h2_and_h3() {
         second.revision = 2;
         let second_raw = identity.sign_descriptor(&second).unwrap();
         let (inbound, users) = config(remote);
-        let server = PreparedFixture::new(tcp, &identity, &second_raw, &inbound, &users, &policy(true)).unwrap();
+        let server =
+            PreparedFixture::new(tcp, &identity, &second_raw, &inbound, &users, &policy(true))
+                .unwrap();
         let server = tokio::spawn(server.serve());
         let scratch = Scratch::new();
         for (branch, mode) in [
@@ -123,7 +176,9 @@ async fn independent_identity_relay_and_descriptor_update_on_h2_and_h3() {
         ] {
             let anchor = anchor(&identity, mode);
             let verified = descriptor::verify(&first_raw, &anchor).unwrap();
-            let client = FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), verified, branch).unwrap();
+            let client =
+                FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), verified, branch)
+                    .unwrap();
             let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = target.local_addr().unwrap().port();
             let echo = tokio::spawn(async move {
@@ -133,7 +188,10 @@ async fn independent_identity_relay_and_descriptor_update_on_h2_and_h3() {
                 socket.write_all(&bytes).await.unwrap();
                 socket.shutdown().await.unwrap();
             });
-            let tunnel = client.open(Address::Dns("localhost".into()), port).await.unwrap();
+            let tunnel = client
+                .open(Address::Dns("localhost".into()), port)
+                .await
+                .unwrap();
             let (mut app, local) = tokio::io::duplex(4096);
             let relay = tokio::spawn(tunnel.relay(local));
             let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
@@ -148,15 +206,27 @@ async fn independent_identity_relay_and_descriptor_update_on_h2_and_h3() {
             let path = scratch.0.join(format!("{branch:?}-{mode:?}.toml"));
             let store = Store::new(&path, anchor.clone()).unwrap();
             store.initialize(&first_raw, now).unwrap();
-            assert_eq!(client.refresh(&store).await.unwrap(), descriptor::Change::Advanced);
+            assert_eq!(
+                client.refresh(&store).await.unwrap(),
+                descriptor::Change::Advanced
+            );
             let reopened = Store::new(&path, anchor).unwrap();
-            assert_eq!(reopened.load(reference_health::unix_now().unwrap()).unwrap().descriptor().revision, 2);
+            assert_eq!(
+                reopened
+                    .load(reference_health::unix_now().unwrap())
+                    .unwrap()
+                    .descriptor()
+                    .revision,
+                2
+            );
             // A client holding the old immutable snapshot cannot overwrite a
             // newer snapshot. It must reopen the verified store first.
             assert!(client.refresh(&reopened).await.is_err());
         }
         server.abort();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -164,7 +234,10 @@ async fn wrong_identity_wrong_grant_and_wrong_route_never_dial_target() {
     timeout(DEADLINE, async {
         let tcp = bind().await;
         let remote = tcp.local_addr().unwrap();
-        let scope = Scope { inbound: "edge".into(), endpoint: remote.to_string() };
+        let scope = Scope {
+            inbound: "edge".into(),
+            endpoint: remote.to_string(),
+        };
         let identity = Identity::generate(scope.clone()).unwrap();
         let unrelated = Identity::generate(scope.clone()).unwrap();
         let now = reference_health::unix_now().unwrap();
@@ -174,7 +247,8 @@ async fn wrong_identity_wrong_grant_and_wrong_route_never_dial_target() {
         descriptor.path_prefix = "/v1/different-prefix".into();
         let bad_route_raw = identity.sign_descriptor(&descriptor).unwrap();
         let (inbound, users) = config(remote);
-        let server = PreparedFixture::new(tcp, &identity, &raw, &inbound, &users, &policy(true)).unwrap();
+        let server =
+            PreparedFixture::new(tcp, &identity, &raw, &inbound, &users, &policy(true)).unwrap();
         let server = tokio::spawn(server.serve());
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
@@ -183,18 +257,36 @@ async fn wrong_identity_wrong_grant_and_wrong_route_never_dial_target() {
             let valid_anchor = anchor(&identity, XhttpMode::StreamOne);
             let wrong_anchor = anchor(&unrelated, XhttpMode::StreamOne);
             let wrong = descriptor::verify(&bad_key_raw, &wrong_anchor).unwrap();
-            let client = FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), wrong, branch).unwrap();
-            assert!(matches!(client.open(addr.clone(), port).await, Err(ClientError::Tls)));
+            let client =
+                FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), wrong, branch).unwrap();
+            assert!(matches!(
+                client.open(addr.clone(), port).await,
+                Err(ClientError::Tls)
+            ));
             let wrong_grant = descriptor::verify(&raw, &valid_anchor).unwrap();
-            let client = FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(OTHER), wrong_grant, branch).unwrap();
-            assert!(matches!(client.open(addr.clone(), port).await, Err(ClientError::Unauthorized)));
+            let client =
+                FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(OTHER), wrong_grant, branch)
+                    .unwrap();
+            assert!(matches!(
+                client.open(addr.clone(), port).await,
+                Err(ClientError::Unauthorized)
+            ));
             let wrong_route = descriptor::verify(&bad_route_raw, &valid_anchor).unwrap();
-            let client = FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), wrong_route, branch).unwrap();
-            assert!(matches!(client.open(addr.clone(), port).await, Err(ClientError::Rejected(404))));
+            let client =
+                FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), wrong_route, branch)
+                    .unwrap();
+            assert!(matches!(
+                client.open(addr.clone(), port).await,
+                Err(ClientError::Rejected(404))
+            ));
         }
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
         server.abort();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -202,22 +294,42 @@ async fn h2_only_descriptor_refuses_h3_and_private_target_acl_remains_effective(
     timeout(DEADLINE, async {
         let tcp = bind().await;
         let remote = tcp.local_addr().unwrap();
-        let scope = Scope { inbound: "edge".into(), endpoint: remote.to_string() };
+        let scope = Scope {
+            inbound: "edge".into(),
+            endpoint: remote.to_string(),
+        };
         let identity = Identity::generate(scope.clone()).unwrap();
         let now = reference_health::unix_now().unwrap();
         let d = value(scope, false, now);
         let raw = identity.sign_descriptor(&d).unwrap();
         let anchor = anchor(&identity, XhttpMode::StreamOne);
         let verified = descriptor::verify(&raw, &anchor).unwrap();
-        assert!(FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), verified, Branch::H3).is_err());
+        assert!(
+            FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), verified, Branch::H3)
+                .is_err()
+        );
         let (inbound, users) = config(remote);
-        let server = PreparedFixture::new(tcp, &identity, &raw, &inbound, &users, &policy(false)).unwrap();
+        let server =
+            PreparedFixture::new(tcp, &identity, &raw, &inbound, &users, &policy(false)).unwrap();
         let server = tokio::spawn(server.serve());
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
-        let client = FixtureClient::new(remote, &URL_SAFE_NO_PAD.encode(TOKEN), descriptor::verify(&raw, &anchor).unwrap(), Branch::H2).unwrap();
-        assert!(matches!(client.open(Address::Dns("localhost".into()), port).await, Err(ClientError::Open(ErrorCode::PolicyDenied))));
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        let client = FixtureClient::new(
+            remote,
+            &URL_SAFE_NO_PAD.encode(TOKEN),
+            descriptor::verify(&raw, &anchor).unwrap(),
+            Branch::H2,
+        )
+        .unwrap();
+        assert!(matches!(
+            client.open(Address::Dns("localhost".into()), port).await,
+            Err(ClientError::Open(ErrorCode::PolicyDenied))
+        ));
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
         server.abort();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

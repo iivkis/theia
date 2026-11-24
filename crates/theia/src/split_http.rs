@@ -24,10 +24,15 @@ pub(crate) struct IdentityRoutes {
 
 impl IdentityRoutes {
     pub(crate) fn new(prefix: &str) -> Result<Self, ClientError> {
-        let tail = prefix.strip_prefix("/v1/").ok_or(ClientError::Configuration)?;
-        if tail.is_empty() || tail.len() > 64 || !tail.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
-        }) {
+        let tail = prefix
+            .strip_prefix("/v1/")
+            .ok_or(ClientError::Configuration)?;
+        if tail.is_empty()
+            || tail.len() > 64
+            || !tail
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
             return Err(ClientError::Configuration);
         }
         Ok(Self {
@@ -209,10 +214,16 @@ pub(crate) fn request(
     authorization: &HeaderValue,
     id: u32,
 ) -> Result<Request<()>, ClientError> {
-    request_at(uri, leg, authorization, id, match leg {
-        Leg::Upload => UPLOAD_PATH,
-        Leg::Download => DOWNLOAD_PATH,
-    })
+    request_at(
+        uri,
+        leg,
+        authorization,
+        id,
+        match leg {
+            Leg::Upload => UPLOAD_PATH,
+            Leg::Download => DOWNLOAD_PATH,
+        },
+    )
 }
 
 fn request_at(

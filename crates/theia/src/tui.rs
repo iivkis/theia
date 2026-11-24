@@ -266,12 +266,22 @@ impl RecordFlow {
     fn body(&self) -> String {
         match self {
             Self::Confirm(review) => review.body().to_owned(),
-            Self::Input { action, fields, focus } => {
+            Self::Input {
+                action,
+                fields,
+                focus,
+            } => {
                 let mut body = format!("{}\n", action.title());
-                for (index, ((label, hidden), value)) in action.fields().iter().zip(fields).enumerate() {
+                for (index, ((label, hidden), value)) in
+                    action.fields().iter().zip(fields).enumerate()
+                {
                     let marker = if index == *focus { '>' } else { ' ' };
                     let shown = if *hidden {
-                        if value.is_empty() { "[пусто]" } else { "[скрыто]" }
+                        if value.is_empty() {
+                            "[пусто]"
+                        } else {
+                            "[скрыто]"
+                        }
                     } else {
                         value.as_str()
                     };
@@ -718,7 +728,11 @@ impl Interaction {
                     KeyCode::Esc | KeyCode::Char('n') => {}
                     _ => self.records = Some(RecordFlow::Confirm(review)),
                 },
-                RecordFlow::Input { action, mut fields, mut focus } => {
+                RecordFlow::Input {
+                    action,
+                    mut fields,
+                    mut focus,
+                } => {
                     match key.code {
                         KeyCode::Esc => return false,
                         KeyCode::Enter => match editor.review_record(action, &fields) {
@@ -738,7 +752,8 @@ impl Interaction {
                             fields[focus].clear();
                         }
                         KeyCode::Char(ch)
-                            if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                            if (key.modifiers.is_empty()
+                                || key.modifiers == KeyModifiers::SHIFT)
                                 && !ch.is_control()
                                 && fields[focus].len() + ch.len_utf8() <= 1024 =>
                         {
@@ -746,7 +761,11 @@ impl Interaction {
                         }
                         _ => {}
                     }
-                    self.records = Some(RecordFlow::Input { action, fields, focus });
+                    self.records = Some(RecordFlow::Input {
+                        action,
+                        fields,
+                        focus,
+                    });
                 }
             }
             return false;
@@ -1164,7 +1183,8 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
-            let record_action = if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+            let record_action = if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT
+            {
                 match (editor.role(), key.code) {
                     (Role::Server, KeyCode::Char('N')) => Some(RecordAction::NewInbound),
                     (Role::Client, KeyCode::Char('N')) => Some(RecordAction::NewProfile),
@@ -1181,16 +1201,22 @@ impl Interaction {
             };
             if let Some(action) = record_action {
                 match editor.record_fields(action) {
-                    Ok(fields) if fields.is_empty() => match editor.review_record(action, &fields) {
-                        Ok(review) => {
-                            editor.error = None;
-                            self.records = Some(RecordFlow::Confirm(review));
+                    Ok(fields) if fields.is_empty() => {
+                        match editor.review_record(action, &fields) {
+                            Ok(review) => {
+                                editor.error = None;
+                                self.records = Some(RecordFlow::Confirm(review));
+                            }
+                            Err(message) => editor.error = Some(message.into()),
                         }
-                        Err(message) => editor.error = Some(message.into()),
-                    },
+                    }
                     Ok(fields) => {
                         editor.error = None;
-                        self.records = Some(RecordFlow::Input { action, fields, focus: 0 });
+                        self.records = Some(RecordFlow::Input {
+                            action,
+                            fields,
+                            focus: 0,
+                        });
                     }
                     Err(message) => editor.error = Some(message.into()),
                 }
@@ -2354,7 +2380,10 @@ mod tests {
             panic!("client fixture");
         };
         assert_eq!(doc.client.profiles[0].auth_token, "env:PRIVATE_CREDENTIAL");
-        assert_eq!(doc.client.profiles[0].tls_ca.as_deref(), Some("file:/private/ca.pem"));
+        assert_eq!(
+            doc.client.profiles[0].tls_ca.as_deref(),
+            Some("file:/private/ca.pem")
+        );
         fs::remove_file(&path).unwrap();
         let _ = fs::remove_file(config::lock_path(&path).unwrap());
     }

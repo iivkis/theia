@@ -140,10 +140,10 @@ pub async fn probe_tls_h2(
         return Err(ProbeError::TlsRejected);
     }
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| ProbeError::TlsRejected)?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| ProbeError::TlsRejected)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     tls.alpn_protocols = vec![b"h2".to_vec()];
     tls.enable_early_data = false;
     let connector = TlsConnector::from(Arc::new(tls));

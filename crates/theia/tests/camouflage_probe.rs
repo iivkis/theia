@@ -35,11 +35,11 @@ async fn fixture_with_group(alpn: &[u8], group: rustls::NamedGroup) -> Fixture {
     provider.kx_groups.retain(|item| item.name() == group);
     assert!(!provider.kx_groups.is_empty());
     let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(vec![cert.clone()], key.into())
-    .unwrap();
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key.into())
+        .unwrap();
     cfg.alpn_protocols = vec![alpn.to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(cfg));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

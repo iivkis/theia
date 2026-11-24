@@ -6,8 +6,8 @@
 use crate::{
     camouflage_discovery::{CandidateHost, CandidateSource, Transport, POPULAR_HTTPS_DOMAINS},
     camouflage_domain_dns::{
-        resolve_catalogued_domain, resolve_manual_domain, validate_manual_dns_request,
-        DnsConsent, DnsError, MAX_PINNED_IPS,
+        resolve_catalogued_domain, resolve_manual_domain, validate_manual_dns_request, DnsConsent,
+        DnsError, MAX_PINNED_IPS,
     },
     camouflage_dual::{known_server_address, CandidateConsent, DualProbeTarget},
     camouflage_dual_batch::{probe_dual_batch, DualBatchError, DualBatchReport, DualBatchTarget},
@@ -132,10 +132,7 @@ impl DomainPanel {
     }
 
     pub(crate) fn manual_insert(&mut self, ch: char) {
-        if self.is_manual_input()
-            && ch.is_ascii_graphic()
-            && self.manual_input.len() < 253
-        {
+        if self.is_manual_input() && ch.is_ascii_graphic() && self.manual_input.len() < 253 {
             self.manual_input.push(ch);
             self.manual_error = false;
         }
@@ -474,9 +471,11 @@ impl DomainPanel {
                 if observation.addresses.is_empty() {
                     self.reset_pins();
                     self.state = DomainState::DnsFailed(DnsError::NoPublicAddresses);
-                } else if observation.addresses.iter().any(|ip| {
-                    known_server_address(&self.preview, *ip)
-                }) {
+                } else if observation
+                    .addresses
+                    .iter()
+                    .any(|ip| known_server_address(&self.preview, *ip))
+                {
                     self.reset_pins();
                     self.state = DomainState::DnsFailed(DnsError::UnsafeAddress);
                 } else if !dns_pin_fresh_at(observation.completed_at, Instant::now()) {
@@ -559,7 +558,9 @@ impl DomainPanel {
             return out;
         }
         let Some(domain) = self.domain() else {
-            out.push_str("Нет доменов каталога. Запросы не выполняются. m: ручной ввод; Esc: назад");
+            out.push_str(
+                "Нет доменов каталога. Запросы не выполняются. m: ручной ввод; Esc: назад",
+            );
             return out;
         };
         if self.is_running() {

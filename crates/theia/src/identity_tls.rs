@@ -12,7 +12,10 @@ use crate::{
     descriptor::{self, Descriptor, Scope},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose, PKCS_ED25519};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyUsagePurpose, PKCS_ED25519,
+};
 use ring::{
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair as _},
@@ -90,7 +93,10 @@ fn issuer_name(scope: &Scope, branch: Branch) -> Result<String, Error> {
     hash.update(scope.endpoint.as_bytes());
     hash.update([0]);
     hash.update(branch.alpn());
-    Ok(format!("{CA_NAME_PREFIX}{}", URL_SAFE_NO_PAD.encode(hash.finalize())))
+    Ok(format!(
+        "{CA_NAME_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(hash.finalize())
+    ))
 }
 
 /// The fixed single-CN DistinguishedName has a bounded, canonical DER
@@ -101,7 +107,19 @@ fn subject_value(name: &str) -> Result<Vec<u8>, Error> {
         return Err(Error::Scope);
     }
     let len = u8::try_from(name.len()).map_err(|_| Error::Scope)?;
-    let mut bytes = vec![0x31, len + 9, 0x30, len + 7, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, len];
+    let mut bytes = vec![
+        0x31,
+        len + 9,
+        0x30,
+        len + 7,
+        0x06,
+        0x03,
+        0x55,
+        0x04,
+        0x03,
+        0x0c,
+        len,
+    ];
     bytes.extend_from_slice(name.as_bytes());
     Ok(bytes)
 }
@@ -149,15 +167,24 @@ impl Identity {
             return Err(Error::Scope);
         }
         let pair = Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| Error::Key)?;
-        let public = pair.public_key().as_ref().try_into().map_err(|_| Error::Key)?;
-        Ok(Self { scope, pkcs8, public })
+        let public = pair
+            .public_key()
+            .as_ref()
+            .try_into()
+            .map_err(|_| Error::Key)?;
+        Ok(Self {
+            scope,
+            pkcs8,
+            public,
+        })
     }
 
     pub fn generate(scope: Scope) -> Result<Self, Error> {
         if !valid_scope(&scope) {
             return Err(Error::Scope);
         }
-        let generated = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).map_err(|_| Error::Key)?;
+        let generated =
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).map_err(|_| Error::Key)?;
         Self::from_key(scope, Zeroizing::new(generated.as_ref().to_vec()))
     }
 
@@ -229,7 +256,9 @@ impl Identity {
         // reconstructible anchor, refusing any encoding drift.
         let expected = pinned_roots(&self.scope, self.public, branch)?;
         let mut actual = RootCertStore::empty();
-        actual.add(cert.der().clone()).map_err(|_| Error::Certificate)?;
+        actual
+            .add(cert.der().clone())
+            .map_err(|_| Error::Certificate)?;
         let expected = &expected.roots[0];
         let actual = &actual.roots[0];
         if expected.subject.as_ref() != actual.subject.as_ref()
@@ -254,15 +283,23 @@ impl Identity {
             return Err(Error::Scope);
         }
         let (issuer, issuer_key) = self.issuer(branch)?;
-        let leaf_key = rcgen::KeyPair::generate_for(&PKCS_ED25519).map_err(|_| Error::Certificate)?;
-        let mut params = CertificateParams::new(vec![name.to_owned()]).map_err(|_| Error::Certificate)?;
+        let leaf_key =
+            rcgen::KeyPair::generate_for(&PKCS_ED25519).map_err(|_| Error::Certificate)?;
+        let mut params =
+            CertificateParams::new(vec![name.to_owned()]).map_err(|_| Error::Certificate)?;
         params.distinguished_name = dn("Theia TLS v1".to_owned());
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.not_before = now.checked_sub(Duration::seconds(CLOCK_SKEW)).ok_or(Error::Clock)?;
-        params.not_after = now.checked_add(Duration::seconds(LEAF_LIFETIME)).ok_or(Error::Clock)?;
-        let cert = params.signed_by(&leaf_key, &issuer, &issuer_key).map_err(|_| Error::Certificate)?;
+        params.not_before = now
+            .checked_sub(Duration::seconds(CLOCK_SKEW))
+            .ok_or(Error::Clock)?;
+        params.not_after = now
+            .checked_add(Duration::seconds(LEAF_LIFETIME))
+            .ok_or(Error::Clock)?;
+        let cert = params
+            .signed_by(&leaf_key, &issuer, &issuer_key)
+            .map_err(|_| Error::Certificate)?;
         let key = PrivatePkcs8KeyDer::from(leaf_key.serialize_der());
         Ok((cert.der().clone(), key.into()))
     }
@@ -278,14 +315,13 @@ impl Identity {
         now: OffsetDateTime,
     ) -> Result<ServerConfig, Error> {
         let (leaf, key) = self.leaf(name, branch, now)?;
-        let mut config = ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| Error::Tls)?
-        .with_no_client_auth()
-        .with_single_cert(vec![leaf], key)
-        .map_err(|_| Error::Tls)?;
+        let mut config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .map_err(|_| Error::Tls)?
+                .with_no_client_auth()
+                .with_single_cert(vec![leaf], key)
+                .map_err(|_| Error::Tls)?;
         config.alpn_protocols = vec![branch.alpn().to_vec()];
         config.max_early_data_size = 0;
         config.send_tls13_tickets = 0;
@@ -294,7 +330,8 @@ impl Identity {
 
     pub fn quic_server(&self, name: &str) -> Result<quinn::ServerConfig, Error> {
         let tls = self.server_tls(name, Branch::H3)?;
-        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|_| Error::Tls)?;
+        let crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|_| Error::Tls)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         config.transport_config(crate::quic_transport::transport_config());
         config.migration(false);
@@ -305,13 +342,12 @@ impl Identity {
 /// Independent trust, reconstructed only from the enrolled key and scope.
 /// Do not append public/system roots or accept a root from the peer.
 pub fn client_tls(scope: &Scope, public: [u8; 32], branch: Branch) -> Result<ClientConfig, Error> {
-    let mut config = ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| Error::Tls)?
-    .with_root_certificates(pinned_roots(scope, public, branch)?)
-    .with_no_client_auth();
+    let mut config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| Error::Tls)?
+            .with_root_certificates(pinned_roots(scope, public, branch)?)
+            .with_no_client_auth();
     config.alpn_protocols = vec![branch.alpn().to_vec()];
     config.enable_early_data = false;
     config.resumption = rustls::client::Resumption::disabled();
@@ -338,7 +374,10 @@ mod tests {
     use super::*;
     use rustls::pki_types::ServerName;
     use std::time::Duration as StdDuration;
-    use tokio::{net::{TcpListener, TcpStream}, time::timeout};
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        time::timeout,
+    };
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     fn scope() -> Scope {
@@ -359,15 +398,14 @@ mod tests {
         let mut foreign = scope();
         foreign.inbound = "other".into();
         let other = pinned_roots(&foreign, identity.public_key(), Branch::H2).unwrap();
-        assert_ne!(h2.roots[0].subject.as_ref(), other.roots[0].subject.as_ref());
+        assert_ne!(
+            h2.roots[0].subject.as_ref(),
+            other.roots[0].subject.as_ref()
+        );
         assert!(client_tls(&scope(), [0; 32], Branch::H2).is_err());
     }
 
-    async fn tcp_attempt(
-        server: ServerConfig,
-        client: ClientConfig,
-        name: &'static str,
-    ) -> bool {
+    async fn tcp_attempt(server: ServerConfig, client: ClientConfig, name: &'static str) -> bool {
         timeout(StdDuration::from_secs(5), async {
             let acceptor = TlsAcceptor::from(Arc::new(server));
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -378,10 +416,15 @@ mod tests {
             });
             let connector = TlsConnector::from(Arc::new(client));
             let tcp = TcpStream::connect(address).await.unwrap();
-            let result = connector.connect(ServerName::try_from(name).unwrap(), tcp).await;
+            let result = connector
+                .connect(ServerName::try_from(name).unwrap(), tcp)
+                .await;
             let success = result.is_ok();
             if let Ok(stream) = &result {
-                assert_eq!(stream.get_ref().1.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
+                assert_eq!(
+                    stream.get_ref().1.protocol_version(),
+                    Some(rustls::ProtocolVersion::TLSv1_3)
+                );
                 assert_eq!(stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
             }
             assert_eq!(worker.await.unwrap(), success);
@@ -400,19 +443,38 @@ mod tests {
         let client = || client_tls(&scope(), public, Branch::H2).unwrap();
         assert!(tcp_attempt(server(), client(), name).await);
         let other = Identity::generate(scope()).unwrap();
-        assert!(!tcp_attempt(server(), client_tls(&scope(), other.public_key(), Branch::H2).unwrap(), name).await);
+        assert!(
+            !tcp_attempt(
+                server(),
+                client_tls(&scope(), other.public_key(), Branch::H2).unwrap(),
+                name
+            )
+            .await
+        );
         let mut foreign = scope();
         foreign.inbound = "different".into();
-        assert!(!tcp_attempt(server(), client_tls(&foreign, public, Branch::H2).unwrap(), name).await);
+        assert!(
+            !tcp_attempt(
+                server(),
+                client_tls(&foreign, public, Branch::H2).unwrap(),
+                name
+            )
+            .await
+        );
         assert!(!tcp_attempt(server(), client(), "wrong.example.org").await);
         let expired = OffsetDateTime::now_utc() - Duration::seconds(LEAF_LIFETIME + 600);
         let old_server = identity.server_tls_at(name, Branch::H2, expired).unwrap();
         assert!(!tcp_attempt(old_server, client(), name).await);
-        let h3_leaf = identity.leaf(name, Branch::H3, OffsetDateTime::now_utc()).unwrap();
-        let mut wrong_branch = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![h3_leaf.0], h3_leaf.1).unwrap();
+        let h3_leaf = identity
+            .leaf(name, Branch::H3, OffsetDateTime::now_utc())
+            .unwrap();
+        let mut wrong_branch =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![h3_leaf.0], h3_leaf.1)
+                .unwrap();
         wrong_branch.alpn_protocols = vec![b"h2".to_vec()];
         assert!(!tcp_attempt(wrong_branch, client(), name).await);
     }
@@ -425,7 +487,8 @@ mod tests {
             let endpoint = quinn::Endpoint::server(
                 identity.quic_server("edge.example.org").unwrap(),
                 "127.0.0.1:0".parse().unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             let remote = endpoint.local_addr().unwrap();
             let worker = tokio::spawn(async move {
                 let incoming = endpoint.accept().await.unwrap();
@@ -434,14 +497,17 @@ mod tests {
             });
             let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
             client.set_default_client_config(quic_client(&scope(), identity.public_key()).unwrap());
-            let connection = crate::quic_transport::connect(&client, remote, "edge.example.org").await.unwrap();
+            let connection = crate::quic_transport::connect(&client, remote, "edge.example.org")
+                .await
+                .unwrap();
             connection.close(0u32.into(), b"test done");
             worker.await.unwrap();
 
             let endpoint = quinn::Endpoint::server(
                 identity.quic_server("edge.example.org").unwrap(),
                 "127.0.0.1:0".parse().unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             let remote = endpoint.local_addr().unwrap();
             let worker = tokio::spawn(async move {
                 let incoming = endpoint.accept().await.unwrap();
@@ -449,16 +515,26 @@ mod tests {
             });
             let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
             client.set_default_client_config(quic_client(&scope(), wrong.public_key()).unwrap());
-            assert!(crate::quic_transport::connect(&client, remote, "edge.example.org").await.is_err());
+            assert!(
+                crate::quic_transport::connect(&client, remote, "edge.example.org")
+                    .await
+                    .is_err()
+            );
             worker.await.unwrap();
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
     fn identity_key_is_create_only_and_bound_to_scope_across_restart() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("theia-identity-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "theia-identity-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("identity");
         let identity = Identity::generate(scope()).unwrap();
