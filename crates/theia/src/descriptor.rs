@@ -497,6 +497,29 @@ impl Store {
         Ok((raw.to_owned(), snapshot, history, verified))
     }
 
+    /// Authenticated local snapshot for offline review. Expiration does
+    /// not erase the revision floor; callers must display validity separately.
+    pub fn inspect(&self, now: u64) -> Result<Verified, Error> {
+        let (_, _, history, verified) = self.snapshot()?;
+        history.check_clock(now)?;
+        Ok(verified)
+    }
+
+    pub fn preview_update(&self, document: &str, now: u64) -> Result<(u64, Verified), Error> {
+        let (_, _, history, previous) = self.snapshot()?;
+        history.check_clock(now)?;
+        let next = history.verify_current(document)?;
+        next.check_time(now)?;
+        previous.compare(&next)?;
+        Ok((previous.descriptor.revision, next))
+    }
+
+    pub fn preview_promotion(&self, document: &str, expected_key: [u8; 32], now: u64) -> Result<(u64, Verified), Error> {
+        let (_, _, mut history, previous) = self.snapshot()?;
+        let next = history.advance(&previous, document, expected_key, now)?;
+        Ok((previous.descriptor.revision, next))
+    }
+
     pub fn load(&self, now: u64) -> Result<Verified, Error> {
         let (_, _, history, verified) = self.snapshot()?;
         history.check_clock(now)?;
@@ -520,7 +543,20 @@ impl Store {
     /// Ordinary updates cannot change identity. Read/verify old and new,
     /// then CAS the entire signed snapshot, including the immutable history.
     pub fn update(&self, document: &str, now: u64) -> Result<Change, Error> {
+        self.update_inner(document, None, now)
+    }
+
+    /// Guarded offline operator update; the revision check is inside the
+    /// same snapshot read that supplies the atomic CAS expected bytes.
+    pub fn update_at(&self, document: &str, expected_revision: u64, now: u64) -> Result<Change, Error> {
+        self.update_inner(document, Some(expected_revision), now)
+    }
+
+    fn update_inner(&self, document: &str, expected_revision: Option<u64>, now: u64) -> Result<Change, Error> {
         let (old, mut snapshot, history, previous) = self.snapshot()?;
+        if expected_revision.is_some_and(|rev| rev != previous.descriptor.revision) {
+            return Err(Error::Rollback);
+        }
         history.check_clock(now)?;
         let next = history.verify_current(document)?;
         next.check_time(now)?;

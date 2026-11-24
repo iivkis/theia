@@ -241,6 +241,7 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
+        Ok(Command::Trust(command)) => theia::descriptor_cli::run(command).map_err(CliError::Trust),
         Ok(Command::Help(topic)) => help(topic).map(str::to_owned),
         Ok(Command::Version) => Ok(version().to_owned()),
         Ok(Command::ConfigValidate { config }) => {
@@ -261,6 +262,7 @@ async fn main() {
                 CliError::NonUtf8Argument => "non_utf8_argument",
                 CliError::NotImplemented(_) => "not_implemented",
                 CliError::Config(_) => "config",
+                CliError::Trust(_) => "offline_trust",
                 CliError::Server(_) => "server",
                 CliError::Management(_) => "management",
                 CliError::Client(_) => "client",

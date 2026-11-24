@@ -542,3 +542,74 @@ fn competing_promotion_and_old_key_update_have_one_revision_guard() {
         );
     }
 }
+
+#[test]
+fn offline_cli_requires_exact_preview_digest_and_guarded_revision() {
+    use sha2::{Digest, Sha256};
+    use std::{process::Command, time::{SystemTime, UNIX_EPOCH}};
+    let scratch = Scratch::new();
+    let root = key();
+    let successor = key();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let mut first = fixture(1);
+    first.not_before = now - 1;
+    first.not_after = now + 3600;
+    first.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&successor)));
+    let anchor_path = scratch.0.join("anchor.toml");
+    let store = scratch.0.join("store.toml");
+    let document = scratch.0.join("descriptor.toml");
+    let anchor_text = format!("schema_version = 1\ninbound = \"edge\"\nendpoint = \"edge.example.org:443\"\npublic_key = \"{}\"\nminimum_revision = 1\n", URL_SAFE_NO_PAD.encode(public(&root)));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    use std::io::Write;
+    options.open(&anchor_path).unwrap().write_all(anchor_text.as_bytes()).unwrap();
+    let raw = descriptor::sign(&first, &root).unwrap();
+    fs::write(&document, &raw).unwrap();
+    let a = anchor_path.to_str().unwrap();
+    let s = store.to_str().unwrap();
+    let d = document.to_str().unwrap();
+    let invoke = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_theia")).args(args).output().unwrap();
+    let hash = |raw: &str| format!("{:x}", Sha256::digest(raw.as_bytes()));
+    let preview = invoke(&["trust", "verify", "--anchor", a, "--document", d]);
+    assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
+    assert!(String::from_utf8_lossy(&preview.stdout).contains(&hash(&raw)));
+    assert!(!store.exists());
+    let bad_hash = "00".repeat(32);
+    assert!(!invoke(&["trust", "enroll", "--anchor", a, "--store", s, "--document", d, "--sha256", &bad_hash, "--confirm"]).status.success());
+    assert!(!store.exists());
+    assert!(!invoke(&["trust", "enroll", "--anchor", a, "--store", s, "--document", d, "--sha256", &hash(&raw)]).status.success());
+    assert!(invoke(&["trust", "enroll", "--anchor", a, "--store", s, "--document", d, "--sha256", &hash(&raw), "--confirm"]).status.success());
+    let mut second = first.clone();
+    second.revision = 2;
+    let update = descriptor::sign(&second, &root).unwrap();
+    fs::write(&document, &update).unwrap();
+    let before = fs::read(&store).unwrap();
+    let preview = invoke(&["trust", "preview-update", "--anchor", a, "--store", s, "--document", d]);
+    assert!(preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("expected_revision=1"));
+    assert_eq!(fs::read(&store).unwrap(), before);
+    assert!(!invoke(&["trust", "update", "--anchor", a, "--store", s, "--document", d, "--expected-revision", "2", "--sha256", &hash(&update), "--confirm"]).status.success());
+    assert_eq!(fs::read(&store).unwrap(), before);
+    assert!(invoke(&["trust", "update", "--anchor", a, "--store", s, "--document", d, "--expected-revision", "1", "--sha256", &hash(&update), "--confirm"]).status.success());
+    let mut third = first;
+    third.revision = 3;
+    third.next_identity = None;
+    let rotation = descriptor::sign(&third, &successor).unwrap();
+    fs::write(&document, &rotation).unwrap();
+    let next = URL_SAFE_NO_PAD.encode(public(&successor));
+    let preview = invoke(&["trust", "preview-rotation", "--anchor", a, "--store", s, "--document", d, "--next-key", &next]);
+    assert!(preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("expected_revision=2"));
+    assert!(invoke(&["trust", "rotate", "--anchor", a, "--store", s, "--document", d, "--next-key", &next, "--expected-revision", "2", "--sha256", &hash(&rotation), "--confirm"]).status.success());
+    let inspected = invoke(&["trust", "inspect", "--anchor", a, "--store", s]);
+    assert!(inspected.status.success());
+    let text = String::from_utf8_lossy(&inspected.stdout);
+    assert!(text.contains("revision=3"));
+    assert!(text.contains("runtime UNCHANGED"));
+    assert!(!text.contains("edge.example.org"));
+}
