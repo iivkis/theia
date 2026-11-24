@@ -137,7 +137,11 @@ impl H3Client {
         result
     }
 
-    async fn open_inner(&self, open: Frame, operation: u64) -> Result<H3Tunnel, ClientError> {
+    /// A full authenticated transport handshake, shared by tunnel opens and
+    /// idle-cache rechecks. No HTTP request or bearer is sent here.
+    async fn verified_connection(
+        &self,
+    ) -> Result<(ObservedEndpoint, quinn::Connection), ClientError> {
         let bind = if self.remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
         } else {
@@ -157,6 +161,17 @@ impl H3Client {
                 .map_err(|_| ClientError::Tls)?;
             pin.verify(chain.first().ok_or(ClientError::Tls)?.as_ref())?;
         }
+        Ok((endpoint, connection))
+    }
+
+    /// Check only the configured peer, PKI, ALPN, optional pin and BBR.
+    /// Dropping the endpoint closes this probe; it never opens a tunnel.
+    pub(crate) async fn probe(&self) -> Result<(), ClientError> {
+        self.verified_connection().await.map(|_| ())
+    }
+
+    async fn open_inner(&self, open: Frame, operation: u64) -> Result<H3Tunnel, ClientError> {
+        let (endpoint, connection) = self.verified_connection().await?;
         let binding = if self.certificate_pin.is_some() {
             let mut key = zeroize::Zeroizing::new([0u8; 32]);
             connection
@@ -529,4 +544,67 @@ async fn send<S: quic::SendStream<Bytes>>(
         .await
         .map_err(|_| ClientError::Timeout)?
         .map_err(|_| ClientError::Http3)
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::security_profile::CertificatePin;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    async fn check_no_application_streams(server: &quinn::Endpoint) {
+        let incoming = server.accept().await.unwrap();
+        // A credential-free probe may close immediately after the verified
+        // client handshake, before the server confirms its final flight.
+        if let Ok(connection) = incoming.await {
+            assert!(!matches!(
+                timeout(Duration::from_millis(250), connection.accept_bi()).await,
+                Ok(Ok(_))
+            ));
+            assert!(!matches!(
+                timeout(Duration::from_millis(250), connection.accept_uni()).await,
+                Ok(Ok(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn background_probe_preserves_pki_hostname_and_pin() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let server = crate::quic_transport::server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![der.clone()],
+            key.into(),
+        )
+        .unwrap();
+        let remote = server.local_addr().unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let mut wrong_roots = RootCertStore::empty();
+        wrong_roots.add(other.cert.der().clone()).unwrap();
+        let token = URL_SAFE_NO_PAD.encode([0x42u8; 32]);
+        let pin = CertificatePin::from_der(der.as_ref());
+        let wrong_pin = CertificatePin::from_der(other.cert.der().as_ref());
+        let cases = [
+            ("localhost", roots.clone(), pin, Ok(())),
+            ("localhost", roots.clone(), wrong_pin, Err(ClientError::Tls)),
+            ("localhost", wrong_roots, pin, Err(ClientError::Tls)),
+            ("wrong.invalid", roots, pin, Err(ClientError::Tls)),
+        ];
+        for (name, roots, pin, expected) in cases {
+            let client = H3Client::new(remote, name, &token, roots)
+                .unwrap()
+                .with_certificate_pin(Some(pin))
+                .unwrap();
+            let (result, ()) = timeout(Duration::from_secs(15), async {
+                tokio::join!(client.probe(), check_no_application_streams(&server))
+            })
+            .await
+            .expect("bounded native handshake probe");
+            assert_eq!(result, expected);
+        }
+    }
 }

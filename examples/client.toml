@@ -13,7 +13,7 @@ auth_token = "env:THEIA_AUTH_TOKEN"
 tls_profile = "default"
 # Explicit CA bundle for explicit H2/H3 runtime (optional for structural validation).
 # tls_ca = "file:/absolute/path/to/ca-bundle.pem"
-# Auto tries QUIC first; only a no-response UDP handshake permits H2 fallback.
+# Auto tries QUIC first; two silent UDP handshakes permit H2 fallback.
 transport = "auto"
 quic_connect_timeout_ms = 1600
 quic_negative_cache_ttl_s = 900
