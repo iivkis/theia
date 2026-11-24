@@ -13,6 +13,7 @@ use theia::{
     h3_client::H3Client,
     invite::Invitation,
     protocol::Address,
+    reality_identity::PublicIdentity,
     security_profile::{CertificatePin, SecurityMode},
     server::{self, ServerContext},
 };
@@ -33,6 +34,7 @@ struct Fixture {
     pin: CertificatePin,
     other_pin: CertificatePin,
     stream_up: bool,
+    identity: Option<PublicIdentity>,
     _servers: JoinSet<Result<(), server::ServerError>>,
 }
 
@@ -70,9 +72,46 @@ impl Fixture {
         )
         .unwrap();
         let h3 = udp.local_addr().unwrap();
+        let (identity, reality_key, key_path) = if mode.is_reality() {
+            use ring::{
+                rand::SystemRandom,
+                signature::{Ed25519KeyPair, KeyPair},
+            };
+            use std::io::Write;
+            let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+            let pair = Ed25519KeyPair::from_pkcs8(der.as_ref()).unwrap();
+            let profile = format!(
+                "smart-reality-v1:{}",
+                URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
+            );
+            let identity = PublicIdentity::parse_profile(&profile).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "theia-reality-{}-{}.der",
+                std::process::id(),
+                URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path).unwrap();
+            file.write_all(der.as_ref()).unwrap();
+            drop(file);
+            (
+                Some(identity),
+                Some(format!("file:{}", path.display())),
+                Some(path),
+            )
+        } else {
+            (None, None, None)
+        };
         let inbound = Inbound {
             id: "test".into(),
             security_mode: mode,
+            reality_key,
             allowed_user_ids: vec!["client".into()],
             h2_listen: h2.to_string(),
             quic_listen: h3.to_string(),
@@ -92,6 +131,9 @@ impl Fixture {
             connect_timeout_ms: 2000,
         };
         let context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
+        if let Some(path) = key_path {
+            std::fs::remove_file(path).unwrap();
+        }
         let mut servers = JoinSet::new();
         servers.spawn(server::serve(
             tcp,
@@ -105,7 +147,8 @@ impl Fixture {
             roots,
             pin,
             other_pin,
-            stream_up: mode == SecurityMode::PinnedCertStreamUpV1,
+            stream_up: mode == SecurityMode::PinnedCertStreamUpV1 || mode.is_reality(),
+            identity,
             _servers: servers,
         }
     }
@@ -185,6 +228,9 @@ impl Fixture {
                     }
                 },
             );
+            if let Some(identity) = self.identity {
+                profile.tls_profile = identity.profile();
+            }
             let invite = Invitation::public_from_profile(&profile)
                 .unwrap()
                 .encode()
@@ -196,7 +242,9 @@ impl Fixture {
             assert_eq!(received.tls_profile, profile.tls_profile);
             assert_eq!(received.transport, profile.transport);
             let imported_pin = CertificatePin::parse_profile(&received.tls_profile);
-            let stream_up = CertificatePin::is_stream_up_profile(&received.tls_profile);
+            let identity = PublicIdentity::parse_profile(&received.tls_profile);
+            let stream_up =
+                identity.is_some() || CertificatePin::is_stream_up_profile(&received.tls_profile);
             let token = URL_SAFE_NO_PAD.encode(TOKEN);
             let (mut app, local) = tokio::io::duplex(4096);
             let relay = if received.transport == Transport::H3 {
@@ -208,6 +256,8 @@ impl Fixture {
                 )
                 .unwrap()
                 .with_certificate_pin(imported_pin)
+                .unwrap()
+                .with_server_identity(identity)
                 .unwrap()
                 .with_stream_up(stream_up)
                 .unwrap()
@@ -224,6 +274,8 @@ impl Fixture {
                 )
                 .unwrap()
                 .with_certificate_pin(imported_pin)
+                .unwrap()
+                .with_server_identity(identity)
                 .unwrap()
                 .with_stream_up(stream_up)
                 .unwrap()
@@ -513,4 +565,52 @@ async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
     })
     .await
     .expect("bounded native H3 exporter admission");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reality_independent_identity_h2_h3_and_wrong_key_refusal() {
+    timeout(Duration::from_secs(40), async {
+        let fixture = Fixture::start(SecurityMode::SmartRealityV1).await;
+        let other = Fixture::start(SecurityMode::SmartRealityV1).await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let address = Address::V4([127, 0, 0, 1]);
+        let token = URL_SAFE_NO_PAD.encode(TOKEN);
+        let wrong = other.identity.unwrap();
+        assert_ne!(Some(wrong), fixture.identity);
+        let h2 = H2Client::new(
+            &fixture.h2.to_string(),
+            "localhost",
+            &token,
+            fixture.roots.clone(),
+        )
+        .unwrap()
+        .with_server_identity(Some(wrong))
+        .unwrap();
+        let h3 = H3Client::new(fixture.h3, "localhost", &token, fixture.roots.clone())
+            .unwrap()
+            .with_server_identity(Some(wrong))
+            .unwrap();
+        assert_eq!(
+            h2.open(address.clone(), port).await.err(),
+            Some(ClientError::Tls)
+        );
+        assert_eq!(
+            h3.open(address.clone(), port).await.err(),
+            Some(ClientError::Tls)
+        );
+
+        // The ordinary pinned stream-up client must not silently enter the
+        // independent-identity mode even with valid PKI, pin and bearer.
+        let h2 = fixture.h2(Some(fixture.pin), "localhost", &TOKEN);
+        let h3 = fixture.h3(Some(fixture.pin), "localhost", &TOKEN);
+        assert!(h2.open(address.clone(), port).await.is_err());
+        assert!(h3.open(address, port).await.is_err());
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
+        fixture.transfer(None, &target).await;
+    })
+    .await
+    .expect("bounded independent identity H2/H3 matrix");
 }

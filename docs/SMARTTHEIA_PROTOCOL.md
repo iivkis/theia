@@ -138,3 +138,11 @@ Explicit `security_mode = "pinned-cert-stream-up-v1"` requires two requests on t
 ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. The invitation is out-of-band; existing network frame and HTTP route contracts are unchanged.
 
 ADR-0088: both pinned XHTTP profiles require theia-channel-proof per HTTP request, including both stream-up legs. Exact TLS exporter/HMAC encoding and one-admission-per-connection rule are normative in ADR-0088. Missing/wrong/duplicate/replayed proof is refused before HTTP success and OPEN. Own TLS is unchanged; no compatibility path for old pinned HTTP requests.
+
+### Independent identity before bearer (ADR-0089)
+
+For smart-reality-v1 only, the TLS1.3-verified client issues one empty GET /v1/identity before any Authorization. The response has status 200, no body or trailers, exactly one theia-server-identity header carrying a canonical base64url Ed25519 signature over the fixed domain plus the connection-specific ADR-0088 exporter. See ADR-0089 for exact encoding and bounds. Require separate provisioned server public key and strict verification. The existing stream-up pair is only admitted after identity issuance and both bound leg proofs. A valid identity proof is not OPEN_OK. No fallback on identity rejection. No hidden-first-flight or active-probing claim.
+
+### BBR-first congestion control (ADR-0090)
+
+Prefer BBR for each carrier and CUBIC when unavailable. Linux H2 selects and verifies BBR or CUBIC; Quinn H3 retains BBR on both platforms. Windows H2 uses native TCP with CUBIC as the standard client deployment preference, not an asserted per-socket value. No user setting, negotiation or global TCP changes. Network-only QUIC fallback and security checks remain unchanged. Local application/target TCP sockets are outside this policy.

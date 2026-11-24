@@ -168,7 +168,9 @@ pub(crate) fn probe_captured(
     let mut tcp_probes = Vec::with_capacity(next_tcp.len());
     let mut udp_probes = Vec::with_capacity(next_udp.len());
     for addr in next_tcp {
-        tcp_probes.push(TcpListener::bind(addr).map_err(|_| RestartError::PortUnavailable)?);
+        let listener = TcpListener::bind(addr).map_err(|_| RestartError::PortUnavailable)?;
+        crate::tcp_bbr::select(&listener).map_err(|_| RestartError::PortUnavailable)?;
+        tcp_probes.push(listener);
     }
     for addr in next_udp {
         udp_probes.push(UdpSocket::bind(addr).map_err(|_| RestartError::PortUnavailable)?);
@@ -184,6 +186,17 @@ pub(crate) fn probe_captured(
 /// A PEM file changed in place also qualifies when identity digests drift.
 pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocument) -> bool {
     if active.server.inbounds.len() != candidate.server.inbounds.len() {
+        return false;
+    }
+    // REALITY's separate signer belongs to a captured generation, not the
+    // old TLS-only swap/rollback slot. Require fresh ports or explicit restart.
+    if active
+        .server
+        .inbounds
+        .iter()
+        .chain(&candidate.server.inbounds)
+        .any(|inbound| inbound.security_mode.is_reality())
+    {
         return false;
     }
     let mut normalized = candidate.clone();

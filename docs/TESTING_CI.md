@@ -80,3 +80,11 @@ ADR-0087: the sole replacement theia://v1/ invitation explicitly represents Smar
 ### ADR-0088 channel binding acceptance
 
 Mandatory existing workspace tests cover pure proof mutation/race and independent raw real TLS/H2 and QUIC/H3 same/fresh connection replay refusal. Existing full relay and cross-host pinned tests exercise the new adapter. No job or dependency version changes; exact-head CI required.
+
+### ADR-0089 independent identity acceptance
+
+Existing mandatory workspace tests cover independent Ed25519 signatures and strict v1 profile encoding, actual H2/H3 loopback identity + stream-up, wrong identity and old-mode refusal, no target dial, byte-exact full-duplex relay, guarded editor and key drift. Existing cross-host, browser, security and resource jobs are preserved. This is not a new cross-host independent-key or active-probing/F-19 benchmark result.
+
+### ADR-0090 BBR-first acceptance
+
+Keep existing H3 BBR assertion. Linux test verifies listener and both TCP peers, transfers bytes, accepts CUBIC and rejects Reno when selectable. Missing kernel BBR is permitted via verified CUBIC. Windows native test transfers bytes using OS-managed TCP without claiming verified per-socket BBR/CUBIC. Keep Windows and cross-host jobs; no test skip or new job. Comparable performance measurements remain mandatory.

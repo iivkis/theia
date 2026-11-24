@@ -285,6 +285,7 @@ mod tests {
                     server_name: "a.example.org".into(),
                     tls_cert: "file:/tmp/cert".into(),
                     security_mode: Default::default(),
+                    reality_key: None,
                     tls_key: "file:/tmp/key".into(),
                 }],
                 users: vec![User {

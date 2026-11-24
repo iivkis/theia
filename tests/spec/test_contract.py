@@ -627,6 +627,35 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("no relative performance ranking", checker)
 
 
+    def test_bbr_first_cubic_fallback_policy(self):
+        tcp = read("crates/theia/src/tcp_bbr.rs")
+        self.assertIn("libc::TCP_CONGESTION", tcp)
+        self.assertIn("preferred_controller_on_listener_and_both_tcp_peers", tcp)
+        self.assertIn("Controller::Cubic", tcp)
+        self.assertIn("os_managed_unverified", tcp)
+        self.assertIn("crate::tcp_bbr::connect", read("crates/theia/src/client.rs"))
+        server = read("crates/theia/src/server.rs")
+        self.assertIn("crate::tcp_bbr::bind", server)
+        self.assertIn("crate::tcp_bbr::select(&socket)", server)
+        self.assertIn("BbrConfig::default()", read("crates/theia/src/quic_transport.rs"))
+        self.assertIn("not configurable", read("docs/adr/0090-mandatory-bbr-for-h2-and-h3.md"))
+
+    def test_reality_identity_before_bearer_and_no_new_invitation_version(self):
+        identity = read("crates/theia/src/reality_identity.rs")
+        self.assertIn("signature::ED25519", identity)
+        self.assertIn("from_pkcs8_maybe_unchecked", identity)
+        self.assertIn("theia-server-identity", identity)
+        for name in ("client.rs", "h3_client.rs"):
+            client = read("crates/theia/src/" + name)
+            self.assertLess(client.index("identity.verify(key, &response)?"), client.index("let (response, mut"))
+        for name in ("server.rs", "h3_server.rs"):
+            self.assertIn("handle_identity_request", read("crates/theia/src/" + name))
+        invite = read("crates/theia/src/invite.rs")
+        self.assertIn("server_public_key: Option<String>", invite)
+        self.assertNotIn("PREFIX_V2", invite)
+        self.assertIn("reality_key", read("crates/theia/src/reload_preflight.rs"))
+        self.assertIn("active probing", read("docs/adr/0089-independent-ed25519-xhttp-identity.md"))
+
     def test_m35a_test_only_feasibility_never_claims_security_mode(self):
         spec = read("docs/STEALTH_REALITY.md")
         adr = read("docs/adr/0021-m3-5a-rustls-quic-auth-feasibility.md")
