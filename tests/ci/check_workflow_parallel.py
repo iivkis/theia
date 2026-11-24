@@ -55,7 +55,7 @@ for name in ("windows-smoke", "browser-e2e"):
         "needs.specification.outputs.rust_ready == 'true'" in job(name),
         f"{name} must retain the Rust readiness precondition",
     )
-require(needs("ci-gate") == mandatory | {"format-repair"}, "ci-gate must depend on EVERY required job and repair outcome")
+require(needs("ci-gate") == mandatory, "ci-gate must depend on EVERY required job")
 require(needs("f14-cross-host") == {"specification", "rust-tests", "windows-smoke"},
         "F-14 must consume verified Linux and Windows CI-built executable artifacts")
 cross_host = job("f14-cross-host")
@@ -80,7 +80,8 @@ require("continue-on-error" not in cross_host and "|| true" not in cross_host,
         "F-14 cross-OS acceptance cannot be made optional")
 
 gate = job("ci-gate")
-require("always()" in gate, "ci-gate must execute even when mandatory jobs fail")
+require("always() && github.event.pull_request.merged == true" in gate,
+        "ci-gate must execute even on failure, but only for merged PRs")
 require('results.get(name, {}).get("result") != "success"' in gate,
         "ci-gate must reject failed/skipped/cancelled prerequisites")
 # Keep the gate's internal expected set aligned with actual dependencies.
@@ -108,22 +109,30 @@ require('CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in windows
 require("CARGO_PROFILE_RELEASE_DEBUG" not in windows,
         "release profile must remain unchanged by the test-only optimization")
 
-# Optimized release artifacts are neither published nor used by any acceptance
-# job. Keep the costly compilation available when explicitly requested, never
-# silently run it on every main push/PR or remove the manual safety check.
-require("  workflow_dispatch:" in workflow,
-        "manual CI entrypoint must remain available for release compilation")
+# Only a closed PR targeting main can trigger this workflow. Closing without
+# merging creates at most an all-skipped run: no runner is allocated.
+trigger = re.search(r"(?ms)^on:\n(.*?)(?=^[a-z])", workflow)
+require(trigger is not None and trigger.group(1).strip() ==
+        "pull_request:\n    branches: [main]\n    types: [closed]",
+        "CI must be triggered only by PR closure targeting main")
+require("if: github.event.pull_request.merged == true" in job("specification"),
+        "unmerged closure must not allocate any native runner")
+require("workflow_dispatch:" not in workflow and "  push:" not in workflow,
+        "direct pushes, PR updates and manual dispatch must not start CI")
+require("github.event.pull_request.merge_commit_sha" in job("specification")
+        and 'test "$MERGED_SHA" = "$GITHUB_SHA"' in job("specification")
+        and 'test "$(git rev-parse HEAD)" = "$MERGED_SHA"' in job("specification"),
+        "CI must verify the exact merged commit, not a later main tip")
+# Optional release-profile builds remain available in the same merge run.
 for os, payload in (("Linux", job("rust-tests")), ("Windows", windows)):
     require(re.search(
-        rf"(?m)^      - name: Manual release compilation \({os}\)\n"
-        r"        if: github.event_name == 'workflow_dispatch' && inputs.formatted_sha == ''\n"
+        rf"(?m)^      - name: Requested release compilation \({os}\)\n"
+        r"        if: contains\(github.event.pull_request.labels.\*\.name, 'release-build'\)\n"
         r"        run: cargo build --workspace --release --locked$",
         payload,
-    ) is not None, f"{os}: optimized release build must be manual and unmodified")
-    require("github.ref == 'refs/heads/main'" not in payload,
-            f"{os}: do not rebuild an unused release binary on each main push")
+    ) is not None, f"{os}: optimized release build must stay available on a labelled merge")
 require(workflow.count("run: cargo build --workspace --release --locked") == 2,
-        "only the two explicitly requested release compilations may exist")
+        "only the two labelled release compilations may exist")
 
 require("python3 -m compileall -q scripts tests" in job("specification"),
         "cheap Python preflight must execute before Rust tests")
@@ -158,47 +167,22 @@ require("  m3-3-bbr-comparison:" not in workflow,
 require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
 
 
-# Formatting is checked before native fan-out. A dirty tree is NEVER tested;
-# only a new commit and a fresh CI run may pass. The write job is isolated.
+# Formatting remains fail-closed; no automatic branch rewrite or dispatch.
 spec = job("specification")
-repair = job("format-repair")
-require("fetch-depth:" in spec and "'0' || '2'" in spec,
-        "PR merge base and previous push commit must be available for scope proof")
-require("steps.scope.outputs.native_required" in spec,
-        "specification must publish fail-closed native CI scope")
-require("scripts/ci-scope.py --base" in spec and "test_ci_scope.py" in spec,
-        "scope detector and negative-history tests must run before any skip")
+require("fetch-depth: 2" in spec, "merged commit checkout must be bounded")
+require("steps.scope.outputs.native_required" in spec
+        and 'echo "native_required=true"' in spec
+        and "test_ci_scope.py" in spec,
+        "every merged commit must take the full native path")
 require("scripts/ci-format-repair.py probe" in spec
-        and "steps.format.outputs.format_drift" in spec
         and "test_ci_format_repair.py" in spec,
         "format preflight and its safety regressions must precede fan-out")
-require("test \"$FORMATTED_SHA\" = \"$GITHUB_SHA\"" in spec
-        and "formatted_sha" in workflow
-        and 'git merge-base --is-ancestor "$FORMATTED_BASE_SHA" HEAD' in spec,
-        "automatic dispatch must test the exact requested commit including PR base")
-require(needs("format-repair") == {"specification"}
-        and "needs.specification.result == 'failure'" in repair
-        and "needs.specification.outputs.format_drift == 'true'" in repair
-        and "github.event_name == 'pull_request'" in repair
-        and "github.event.pull_request.head.repo.full_name == github.repository" in repair
-        and "github.event.pull_request.head.ref != 'main'" in repair
-        and "github.event.pull_request.head.ref != github.event.repository.default_branch" in repair
-        and "github.event.pull_request.head.ref != github.event.pull_request.base.ref" in repair,
-        "repair only a failed format probe on trusted non-base PR head")
-require("ref: ${{ github.event.pull_request.head.sha }}" in repair
-        and "persist-credentials: false" in repair
-        and "scripts/ci-format-repair.py repair" in repair
-        and 'git rev-parse HEAD^' in repair
-        and 'git push --force-with-lease=' in repair
-        and 'gh workflow run ci.yml' in repair
-        and 'formatted_sha=$new_sha' in repair
-        and 'formatted_base_sha=$base_sha' in repair
-        and 'git merge-base --is-ancestor "$base_sha" HEAD' in repair,
-        "repair must commit only on exact head, lease push and explicitly dispatch new SHA")
+require("\n  format-repair:\n" not in workflow
+        and "gh workflow run" not in workflow
+        and "git push" not in workflow,
+        "post-merge CI must never rewrite or dispatch another commit")
 require("ci-formatted-source" not in workflow and "persist-format:" not in workflow,
         "never test a formatter overlay or mutate a green SHA")
-require('results.get("format-repair", {}).get("result") != "skipped"' in gate,
-        "old repair run cannot pass ci-gate")
 for name in mandatory - {"specification"}:
     payload = job(name)
     require("cargo fmt " not in payload,
@@ -217,13 +201,10 @@ require("actions/download-artifact@v4" in job("f14-cross-host"),
 gate = job("ci-gate")
 require("NATIVE_REQUIRED: ${{ needs.specification.outputs.native_required }}" in gate,
         "final gate must use exactly the preflight's scope")
-require('native not in {"true", "false"}' in gate,
-        "unset native scope must fail closed")
-require('("success" if name == "specification" else "skipped")' in gate,
-        "docs-only path must require a successful spec and skipped native matrix")
-require(workflow.count("contents: write") == 1 and "contents: write" in repair
-        and workflow.count("actions: write") == 1 and "actions: write" in repair,
-        "only the guarded repair job may write or dispatch")
+require('native != "true"' in gate,
+        "unknown or skipped native scope must fail closed")
+require("contents: write" not in workflow and "actions: write" not in workflow,
+        "post-merge CI must not have repository or dispatch write permissions")
 
 require("actions/setup-go" not in workflow and "THEIA_UTLS" not in workflow
         and "utls_reference" not in workflow and "gofmt " not in workflow,
@@ -242,7 +223,9 @@ require("actual_chromium_h2_settings_and_pseudo_order_reference" in job("browser
         "real browser H2 reference remains mandatory")
 
 require(
-    "concurrency:" in workflow and "cancel-in-progress: true" in workflow,
-    "outdated PR runs must still be cancelled",
+    "concurrency:" in workflow
+    and "ci-main-merge-${{ github.event.pull_request.merge_commit_sha || github.run_id }}" in workflow
+    and "cancel-in-progress: false" in workflow,
+    "different merged commits must never cancel one another",
 )
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")
