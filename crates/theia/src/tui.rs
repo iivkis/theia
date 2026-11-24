@@ -1,7 +1,7 @@
 //! M4.1: keyboard-first terminal landing and bounded config editor.
 //!
 //! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
-//! No service reload, network or OS proxy effect.
+//! Explicit runtime and Windows proxy actions are isolated in confirmed panels.
 use crate::{
     client_import, invite::Invitation, tui_candidate_batch::CandidateBatchPanel,
     tui_candidates::CandidateReview, tui_discovery::DiscoveryPanel, tui_domain::DomainPanel,
@@ -257,6 +257,8 @@ struct Interaction {
     domain: Option<DomainPanel>,
     probe: Option<ProbePanel>,
     runtime: Option<RuntimePanel>,
+    #[cfg(windows)]
+    system_proxy: Option<crate::tui_system_proxy::Panel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
     exporting: Option<mpsc::Receiver<ExportResult>>,
@@ -276,6 +278,8 @@ impl Interaction {
             domain: None,
             probe: None,
             runtime: None,
+            #[cfg(windows)]
+            system_proxy: None,
             pending: None,
             saving: None,
             exporting: None,
@@ -420,6 +424,13 @@ impl Interaction {
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press || self.saving.is_some() || self.exporting.is_some() {
+            return false;
+        }
+        #[cfg(windows)]
+        if let Some(proxy) = self.system_proxy.as_mut() {
+            if proxy.key(key) {
+                self.system_proxy = None;
+            }
             return false;
         }
         if let Some(runtime) = self.runtime.as_mut() {
@@ -981,6 +992,31 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            if editor.role() == Role::Client
+                && key.code == KeyCode::Char('p')
+                && key.modifiers.is_empty()
+            {
+                if editor.dirty() {
+                    editor.error = Some("Сохраните или отмените черновик перед запуском.".into());
+                } else {
+                    #[cfg(windows)]
+                    match crate::tui_system_proxy::Panel::open(
+                        editor.saved_path().to_owned(),
+                        editor.saved_sha256(),
+                    ) {
+                        Ok(panel) => {
+                            self.system_proxy = Some(panel);
+                            editor.error = None;
+                        }
+                        Err(message) => editor.error = Some(message.into()),
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        editor.error = Some("Системный прокси: только Windows.".into());
+                    }
+                }
+                return false;
+            }
             // An editable draft is never silently sent to the server.
             // Ctrl+R requires an explicit saved source and then a second 'y'.
             let apply_shortcut =
@@ -1227,7 +1263,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer. В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Сетевые IP/DNS исследования и системный прокси не меняются.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
             true,
         ),
     }
@@ -1312,11 +1348,23 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         );
     }
+    #[cfg(windows)]
+    if let Some(proxy) = interaction.and_then(|ui| ui.system_proxy.as_ref()) {
+        panel(
+            frame,
+            parts[1],
+            "F-07: системный прокси Windows",
+            &proxy.body(),
+            true,
+        );
+    }
+    let footer = if model.screen == Screen::Client {
+        "p: Windows proxy  i: импорт  l: ссылка  Ctrl+S: сохранить"
+    } else {
+        "j/k: запись  Tab: поле  Enter/e: ввод  l: ссылка  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить  p: сеть"
+    };
     frame.render_widget(
-        Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  i: импорт  l: публичная ссылка  u: новый  t: ротация  x: отключить  b: восстановить  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить",
-        )
-        .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         parts[2],
     );
 }
@@ -1613,6 +1661,10 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         if let Some(runtime) = interaction.runtime.as_mut() {
             runtime.poll();
         }
+        #[cfg(windows)]
+        if let Some(proxy) = interaction.system_proxy.as_mut() {
+            proxy.poll();
+        }
         if let Some(discovery) = interaction.discovery.as_mut() {
             discovery.poll();
         }
@@ -1717,6 +1769,39 @@ mod tests {
         assert!(client.runtime.is_none());
         fs::remove_file(path).unwrap();
         fs::remove_file(client_path).unwrap();
+    }
+
+    #[test]
+    fn client_proxy_shortcut_refuses_dirty_or_unconfigured_editor() {
+        let path =
+            std::env::temp_dir().join(format!("theia-tui-proxy-{}.toml", std::process::id()));
+        std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let editor = Editor::load(Role::Client, &path).unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Enter));
+        let editor = ui.editor.as_mut().unwrap();
+        editor.input = "other.example.org:443".into();
+        assert!(editor.accept());
+        assert!(editor.dirty());
+        ui.update(&mut model, press(KeyCode::Char('p')));
+        assert!(ui.editor.as_ref().unwrap().error.is_some());
+        #[cfg(windows)]
+        assert!(ui.system_proxy.is_none());
+        #[cfg(not(windows))]
+        {
+            ui.editor.as_mut().unwrap().discard();
+            ui.update(&mut model, press(KeyCode::Char('p')));
+            assert_eq!(
+                ui.editor.as_ref().unwrap().error.as_deref(),
+                Some("Системный прокси: только Windows.")
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+        let mut ui = Interaction::new(None);
+        assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
+        #[cfg(windows)]
+        assert!(ui.system_proxy.is_none());
     }
 
     #[test]

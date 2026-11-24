@@ -366,33 +366,7 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     else {
         return Err(ClientError::Configuration);
     };
-    let profile = document
-        .client
-        .profiles
-        .iter()
-        .find(|p| p.id == document.client.active_profile)
-        .ok_or(ClientError::Configuration)?;
-    crate::diag!(
-        Debug,
-        "client.proxy",
-        "config_valid",
-        "profiles" = Value::Count(document.client.profiles.len() as u64)
-    );
-    let client = load_client(profile).await?;
-    crate::diag!(Info, "client.proxy", "transport_preflight_passed");
-    // All startup validation and both binds must succeed before accepting.
-    let http = TcpListener::bind(&document.client.proxy.http_listen)
-        .await
-        .map_err(|_| ClientError::Io)?;
-    let socks = TcpListener::bind(&document.client.proxy.socks5_listen)
-        .await
-        .map_err(|_| ClientError::Io)?;
-    crate::diag!(
-        Info,
-        "client.proxy",
-        "listeners_bound",
-        "count" = Value::Count(2)
-    );
+    let (http, socks, client) = prepare_proxy(&document).await?;
     #[cfg(windows)]
     if enable_system_proxy {
         // A config declaration is insufficient by itself: this branch
@@ -420,6 +394,96 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
         return Err(ClientError::SystemProxy);
     }
     serve_proxy(http, socks, client).await
+}
+
+/// Shared startup preflight: never changes the OS proxy or claims an
+/// authenticated remote tunnel merely because the listeners bind.
+async fn prepare_proxy(
+    document: &config::ClientDocument,
+) -> Result<(TcpListener, TcpListener, ProxyClient), ClientError> {
+    let profile = document
+        .client
+        .profiles
+        .iter()
+        .find(|p| p.id == document.client.active_profile)
+        .ok_or(ClientError::Configuration)?;
+    crate::diag!(
+        Debug,
+        "client.proxy",
+        "config_valid",
+        "profiles" = Value::Count(document.client.profiles.len() as u64)
+    );
+    let client = load_client(profile).await?;
+    crate::diag!(Info, "client.proxy", "transport_preflight_passed");
+    // All startup validation and both binds must succeed before accepting.
+    let http = TcpListener::bind(&document.client.proxy.http_listen)
+        .await
+        .map_err(|_| ClientError::Io)?;
+    let socks = TcpListener::bind(&document.client.proxy.socks5_listen)
+        .await
+        .map_err(|_| ClientError::Io)?;
+    crate::diag!(
+        Info,
+        "client.proxy",
+        "listeners_bound",
+        "count" = Value::Count(2)
+    );
+    Ok((http, socks, client))
+}
+
+/// A Windows TUI starts the local client independently of OS proxy consent.
+/// The exact saved TOML is parsed once; subsequent activation must still
+/// match that editor revision. No credential or source text leaves this API.
+#[cfg(windows)]
+pub(crate) struct PreparedLocalProxy {
+    http: TcpListener,
+    socks: TcpListener,
+    client: ProxyClient,
+    pub(crate) manual: bool,
+}
+
+#[cfg(windows)]
+impl PreparedLocalProxy {
+    pub(crate) async fn start(path: &Path, expected: [u8; 32]) -> Result<Self, ClientError> {
+        let bytes = saved_client_bytes(path, expected)?;
+        let source = std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?;
+        let Config::Client(document) =
+            config::parse(source).map_err(|_| ClientError::Configuration)?
+        else {
+            return Err(ClientError::Configuration);
+        };
+        let (http, socks, client) = prepare_proxy(&document).await?;
+        Ok(Self {
+            http,
+            socks,
+            client,
+            manual: document.client.proxy.system_proxy == config::SystemProxy::Manual,
+        })
+    }
+
+    pub(crate) fn http_address(&self) -> Result<SocketAddr, ClientError> {
+        self.http.local_addr().map_err(|_| ClientError::Io)
+    }
+
+    pub(crate) async fn serve(self) -> Result<(), ClientError> {
+        serve_proxy(self.http, self.socks, self.client).await
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn saved_client_bytes(
+    path: &Path,
+    expected: [u8; 32],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, ClientError> {
+    use sha2::{Digest, Sha256};
+    let bytes = zeroize::Zeroizing::new(
+        config::editor_bytes(path).map_err(|_| ClientError::Configuration)?,
+    );
+    let actual: [u8; 32] = Sha256::digest(bytes.as_slice()).into();
+    if actual != expected {
+        return Err(ClientError::Configuration);
+    }
+    Ok(bytes)
 }
 
 pub async fn serve(

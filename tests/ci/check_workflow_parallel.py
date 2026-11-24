@@ -98,6 +98,10 @@ require("windows-cross-sid-ci.ps1" in windows,
         "the second-SID test must actually run in CI")
 require("pywinpty==3.0.5 pyte==0.8.2" in windows,
         "the ConPTY/VT test dependencies must be pinned")
+require("THEIA_WINDOWS_PROXY_E2E_ALLOWED" in windows
+        and "native_wininet_cas_recovery_and_foreign_override" in windows
+        and "compiled_client_proxy_conpty_lifecycle -- --ignored --exact" in windows,
+        "F-07 native and compiled ConPTY lifecycle must both run on disposable Windows")
 require('CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in windows
         and 'CARGO_PROFILE_TEST_DEBUG: "line-tables-only"' in windows,
         "Windows test/dev binaries must retain diagnostic line numbers with bounded debug info")

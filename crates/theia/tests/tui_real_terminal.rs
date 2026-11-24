@@ -392,3 +392,164 @@ impl Drop for TempDir {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "disposable Windows CI only: actual ConPTY changes per-user WinINet"]
+async fn compiled_client_proxy_conpty_lifecycle() {
+    use theia::client_import::PrivateBearer;
+    use tokio::net::TcpListener as AsyncListener;
+
+    assert_eq!(
+        std::env::var("THEIA_WINDOWS_PROXY_E2E_ALLOWED").as_deref(),
+        Ok("yes")
+    );
+    let base =
+        std::env::temp_dir().join(format!("theia-client-proxy-conpty-{}", std::process::id()));
+    fs::create_dir(&base).unwrap();
+    let _cleanup = TempDir(base.clone());
+    let cert_path = base.join("cert.pem");
+    let key_path = base.join("key.pem");
+    let server_file = base.join("server.toml");
+    let client_file = base.join("client.toml");
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    fs::write(&cert_path, generated.cert.pem()).unwrap();
+    fs::write(
+        &key_path,
+        format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            STANDARD.encode(generated.key_pair.serialize_der())
+        ),
+    )
+    .unwrap();
+
+    let tcp = free_port(true);
+    let udp = free_port(false);
+    let server = ServerDocument {
+        schema_version: 1,
+        server: ServerSettings {
+            enabled: true,
+            inbounds: vec![Inbound {
+                id: "edge".into(),
+                allowed_user_ids: vec!["device-a".into()],
+                h2_listen: format!("127.0.0.1:{tcp}"),
+                quic_listen: format!("127.0.0.1:{udp}"),
+                server_name: "localhost".into(),
+                tls_cert: format!("file:{}", cert_path.display()),
+                tls_key: format!("file:{}", key_path.display()),
+            }],
+            users: vec![User {
+                id: "device-a".into(),
+                token_sha256: digest(42),
+                disabled: false,
+            }],
+            policy: ServerPolicy {
+                allow_private_ips: true,
+                max_connections_per_user: 5,
+                max_connections_total: 12,
+                connect_timeout_ms: 1500,
+            },
+        },
+        management: Management {
+            ipc: "auto".into(),
+            log_level: "info".into(),
+        },
+        ui: Ui {
+            language: "ru".into(),
+        },
+    };
+    save(&server_file, &server);
+    let binary = env!("CARGO_BIN_EXE_theia");
+    let pipe = format!("proxyconpty{}", std::process::id());
+    let mut running = Running(
+        Command::new(binary)
+            .args(["server", "run", "--config"])
+            .arg(&server_file)
+            .env("THEIA_CONTROL_PIPE", &pipe)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    timeout(Duration::from_secs(12), async {
+        loop {
+            if cli_status(binary, "THEIA_CONTROL_PIPE", &pipe, 1) {
+                break;
+            }
+            assert!(running.0.try_wait().unwrap().is_none());
+            sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let echo = AsyncListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(async move {
+        while let Ok((socket, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = socket.into_split();
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+
+    let bearer = PrivateBearer::create(&client_file, &[42; 32]).unwrap();
+    let Config::Client(mut client) =
+        theia::config::parse(include_str!("../../../examples/client.toml")).unwrap()
+    else {
+        panic!("client template");
+    };
+    let profile = &mut client.client.profiles[0];
+    profile.server = format!("127.0.0.1:{tcp}");
+    profile.server_name = "localhost".into();
+    profile.transport = theia::config::Transport::H2;
+    profile.tls_ca = Some(format!("file:{}", cert_path.display()));
+    profile.auth_token = bearer.reference().unwrap();
+    let first = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = first.local_addr().unwrap().port();
+    let socks_port = second.local_addr().unwrap().port();
+    client.client.proxy.http_listen = format!("127.0.0.1:{http_port}");
+    client.client.proxy.socks5_listen = format!("127.0.0.1:{socks_port}");
+    client.client.proxy.system_proxy = theia::config::SystemProxy::Manual;
+    fs::write(&client_file, Config::Client(client).to_toml().unwrap()).unwrap();
+    drop(first);
+    drop(second);
+
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tui-real-terminal-e2e.py");
+    let output = timeout(
+        Duration::from_secs(150),
+        tokio::task::spawn_blocking(move || {
+            Command::new("python")
+                .arg(script)
+                .arg("--binary")
+                .arg(binary)
+                .arg("--config")
+                .arg(client_file)
+                .args(["--scenario", "client-proxy", "--revision", "1"])
+                .arg("--http-port")
+                .arg(http_port.to_string())
+                .arg("--socks-port")
+                .arg(socks_port.to_string())
+                .arg("--echo-port")
+                .arg(echo_port.to_string())
+                .output()
+        }),
+    )
+    .await
+    .expect("compiled client ConPTY timed out")
+    .unwrap()
+    .unwrap();
+    echo_task.abort();
+    assert!(
+        output.status.success(),
+        "client ConPTY failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("REAL_TUI_PTY_E2E_OK: client-proxy"));
+    drop(running);
+    drop(bearer);
+}

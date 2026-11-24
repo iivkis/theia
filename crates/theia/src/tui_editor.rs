@@ -738,6 +738,11 @@ impl Editor {
         Sha256::digest(&self.source).into()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn saved_path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn begin(&mut self) {
         if self.write_uncertain {
             self.error = Some("config: uncertain previous write; reload editor".into());
