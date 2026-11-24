@@ -1501,6 +1501,9 @@ impl CapturedTls {
     /// IDs in document order. This prevents a reordered pair or ambiguous
     /// PEM concatenation from sharing an operator approval fingerprint.
     pub(crate) fn capture(document: &ServerDocument) -> Result<Self, ServerError> {
+        if document.server.inbounds.iter().any(|i| i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
+            return Err(ServerError::Config);
+        }
         let mut hash = Sha256::new();
         hash.update(b"theia-tls-pem-snapshot-v1\0");
         hash.update((document.server.inbounds.len() as u64).to_be_bytes());

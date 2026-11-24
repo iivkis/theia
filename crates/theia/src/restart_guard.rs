@@ -72,7 +72,8 @@ pub(crate) fn probe(
     Config::Server(candidate.clone())
         .validate()
         .map_err(|_| RestartError::InvalidConfig)?;
-    if !candidate.server.enabled {
+    if !candidate.server.enabled || candidate.server.inbounds.iter().any(|i|
+        i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
         return Err(RestartError::InvalidConfig);
     }
     // Advisory readiness is NOT a reservation, pin, or Apply. However it
@@ -94,7 +95,8 @@ pub(crate) fn probe_captured(
     Config::Server(candidate.clone())
         .validate()
         .map_err(|_| RestartError::InvalidConfig)?;
-    if !candidate.server.enabled {
+    if !candidate.server.enabled || candidate.server.inbounds.iter().any(|i|
+        i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
         return Err(RestartError::InvalidConfig);
     }
     let candidate_identities = captured.identities();

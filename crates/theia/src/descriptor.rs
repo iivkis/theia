@@ -291,6 +291,9 @@ impl Verified {
     pub fn signer(&self) -> [u8; 32] {
         self.signer
     }
+    pub fn payload_sha256(&self) -> [u8; 32] {
+        self.digest
+    }
     pub fn effective_modes(&self) -> EffectiveModes {
         self.effective_modes
     }

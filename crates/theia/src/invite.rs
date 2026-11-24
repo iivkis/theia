@@ -95,7 +95,8 @@ impl Drop for Wire {
 impl Invitation {
     /// Safe token-free export of an exact supported profile.
     pub fn public_from_profile(profile: &Profile) -> Result<Self, InviteError> {
-        if profile.xhttp_mode.is_some() && profile.tls_profile != "default" {
+        if profile.reality_profile.is_some() || profile.tls_profile == "smart-reality"
+            || (profile.xhttp_mode.is_some() && profile.tls_profile != "default") {
             return Err(InviteError::Invalid);
         }
         let invite = Self {

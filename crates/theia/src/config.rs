@@ -147,7 +147,7 @@ pub struct Profile {
     pub auth_token: String,
     pub tls_profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reality_profile: Option<String>,
+    pub reality_profile: Option<RealityClientBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xhttp_mode: Option<XhttpMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +156,23 @@ pub struct Profile {
     pub quic_connect_timeout_ms: u32,
     pub quic_negative_cache_ttl_s: u32,
 }
+/// The imported root is immutable even as the separate signed trust
+/// history advances. Pin the exact enrollment bytes and independent root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealityClientBinding {
+    pub enrollment: String,
+    pub enrollment_sha256: [u8; 32],
+    pub identity_sha256: [u8; 32],
+}
+impl RealityClientBinding {
+    fn valid(&self) -> bool {
+        self.enrollment_sha256 != [0; 32] && self.identity_sha256 != [0; 32]
+            && crate::bounded_input::explicit_file_path(Path::new(&self.enrollment))
+            && !self.enrollment.chars().any(char::is_control)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
@@ -428,11 +445,6 @@ impl ServerDocument {
                     "duplicate user grant",
                 )?;
             }
-            ensure(
-                valid_dns(&inbound.server_name),
-                format!("{field}.server_name"),
-                "invalid DNS name",
-            )?;
             let udp = listen(&inbound.quic_listen, &format!("{field}.quic_listen"))?;
             let tcp = listen(&inbound.h2_listen, &format!("{field}.h2_listen"))?;
             if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
@@ -442,9 +454,13 @@ impl ServerDocument {
                     format!("{field}.tls_cert"), "own-TLS material prohibited in REALITY")?;
                 ensure(tcp == udp, format!("{field}.quic_listen"),
                     "REALITY requires one TCP/UDP listen address and port")?;
+                ensure(valid_remote(&format!("{}:{}", inbound.server_name, tcp.port())),
+                    format!("{field}.server_name"), "REALITY endpoint host is invalid")?;
             } else {
                 ensure(inbound.reality.is_none(), format!("{field}.reality"),
                     "REALITY material prohibited in own TLS")?;
+                ensure(valid_dns(&inbound.server_name), format!("{field}.server_name"),
+                    "invalid DNS name")?;
                 ensure(valid_file_ref(&inbound.tls_cert), format!("{field}.tls_cert"),
                     "expected absolute file: reference")?;
                 ensure(valid_file_ref(&inbound.tls_key), format!("{field}.tls_key"),
@@ -522,11 +538,6 @@ impl ClientDocument {
                 "invalid host:port or [IPv6]:port",
             )?;
             ensure(
-                valid_dns(&profile.server_name),
-                format!("{field}.server_name"),
-                "invalid TLS server name",
-            )?;
-            ensure(
                 valid_secret_ref(&profile.auth_token),
                 format!("{field}.auth_token"),
                 "expected env:NAME or absolute file: reference",
@@ -540,14 +551,17 @@ impl ClientDocument {
                 "expected absolute file: reference to PEM CA bundle",
             )?;
             if profile.tls_profile == "smart-reality" {
-                ensure(profile.reality_profile.as_ref().is_some_and(|p|
-                    crate::bounded_input::explicit_file_path(Path::new(p)) && !p.chars().any(char::is_control)),
-                    format!("{field}.reality_profile"), "absolute private REALITY enrollment required")?;
+                ensure(profile.reality_profile.as_ref().is_some_and(RealityClientBinding::valid),
+                    format!("{field}.reality_profile"), "pinned private REALITY enrollment required")?;
+                ensure(profile.server.rsplit_once(':').is_some_and(|(host, _)| host == profile.server_name),
+                    format!("{field}.server_name"), "REALITY server_name is the endpoint host, not reference SNI")?;
                 ensure(profile.tls_ca.is_none(), format!("{field}.tls_ca"),
                     "own-TLS CA prohibited in REALITY")?;
             } else {
                 ensure(profile.reality_profile.is_none(), format!("{field}.reality_profile"),
                     "REALITY enrollment prohibited in own TLS")?;
+                ensure(valid_dns(&profile.server_name), format!("{field}.server_name"),
+                    "invalid TLS server name")?;
                 ensure(
                     profile.tls_profile == "default"
                         || crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile).is_some()

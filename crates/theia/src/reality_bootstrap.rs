@@ -492,13 +492,15 @@ impl Profile {
     }
 
     pub fn read(path: &Path) -> Result<Self, Error> {
-        let raw = crate::bounded_input::read(path, MAX_PROFILE as u64, true, true)
-            .map_err(|_| Error::Storage)?;
-        let profile: Self = toml::from_str(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
-            .map_err(|_| Error::Format)?;
+        Self::read_snapshot(path).map(|(profile, _)| profile)
+    }
+
+    pub(crate) fn read_snapshot(path: &Path) -> Result<(Self, [u8; 32]), Error> {
+        let raw = read_text(path, MAX_PROFILE, true)?;
+        let profile: Self = toml::from_str(&raw).map_err(|_| Error::Format)?;
         profile.anchor()?;
         profile.admission()?;
-        Ok(profile)
+        Ok((profile, digest(&raw)))
     }
 
     pub fn load(&self, now: u64) -> Result<Verified, Error> {
