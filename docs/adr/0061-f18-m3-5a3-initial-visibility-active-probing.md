@@ -41,3 +41,13 @@
 Не переименовывать обычный strict TLS + post-handshake signature в REALITY, не выключать CA/SAN и не включать опасный fallback. Нельзя считать F-18 завершённым на основании этих экспериментов.
 
 Ссылки: [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html), [RFC 9001 §5.2](https://www.rfc-editor.org/rfc/rfc9001.html#section-5.2), [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html), [Quinn crypto API](https://docs.rs/quinn/0.11.12/quinn/crypto/index.html), ADR-0020/0021/0059/0060.
+
+
+## Формальные release-blocking checkpoints следующего среза
+
+1. **Identity before distinguishable service response:** новый versioned mode должен отказаться отдавать endpoint-specific H2/H3 HTTP status до проверки отдельного pinned server-key proof, bounded policy для недоверенного peer и утверждённого client authentication. Нужны реальные отрицательные сетевые тесты malformed/version/expired key/replay/probing, в том числе state reset и reconnect.
+2. **Outer first-flight:** зафиксированные ClientHello и QUIC Initial от **скомпилированного бинарника** сравниваются с разрешённым кандидатным браузерным эталоном отдельно для TCP/H2 и UDP/H3: GREASE, ALPS, QUIC transport parameters, initial size/timing и H2/H3 SETTINGS. Совпадение одних TLS extensions не является прохождением fingerprint gate.
+3. **No insecure shortcut:** обычные `theia://v1`, TOML v1 и strict CA/SAN/ALPN остаются прежними, неизвестный mode отвергается, фальшивый pin не замещается TOFU; никакой автоматической деградации на insecure verifier / basic TLS при ошибке нового режима.
+4. **Review + runtime evidence:** crypto/security review отдельно от разработчика, версия протокола, key lifecycle/rotation/revocation, защита от resource exhaustion и native Linux/Windows H2/H3 cross-host E2E с провалом при отказе identity — обязательны перед M3.5c.
+
+Пока не выполнены **все** пункты, статус F-18 остаётся P0 blocked, даже если CI показывает успешное восстановление Initial ClientHello и реальный auth 401.
