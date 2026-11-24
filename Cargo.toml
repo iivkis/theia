@@ -3,4 +3,7 @@ resolver = "2"
 members = ["crates/theia"]
 default-members = ["crates/theia"]
 # The transport feasibility spike retains its own dependencies and lockfile.
-exclude = ["spikes/m0_1", "spikes/m3_4"]
+exclude = ["spikes/m0_1", "spikes/m3_4", "vendor/rustls"]
+
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }
