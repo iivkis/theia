@@ -3,6 +3,7 @@
 use crate::client::ClientError;
 use http::{header, HeaderValue, Method, Request, StatusCode, Uri};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::Mutex,
     time::{Duration, Instant},
@@ -12,6 +13,21 @@ use tokio::{sync::oneshot, time::timeout};
 pub(crate) const UPLOAD_PATH: &str = "/v1/stream-up/upload";
 pub(crate) const DOWNLOAD_PATH: &str = "/v1/stream-up/download";
 const PAIR_TIMEOUT: Duration = Duration::from_secs(10);
+/// A bounded connection lifetime namespace. IDs cannot be recycled, even
+/// after failed or canceled pairs. Rotate the connection before exhaustion.
+pub(crate) const MAX_PAIR_IDS: u32 = 1024;
+const MAX_PENDING_PAIRS: usize = 16;
+pub(crate) const PAIR_HEADER: &str = "theia-pair-id";
+
+pub(crate) fn pair_id<T>(request: &Request<T>) -> Option<u32> {
+    let headers = request.headers();
+    if headers.get_all(PAIR_HEADER).iter().count() != 1 {
+        return None;
+    }
+    let raw = headers.get(PAIR_HEADER)?.to_str().ok()?;
+    let id = raw.parse::<u32>().ok()?;
+    (id > 0 && id <= MAX_PAIR_IDS && raw == id.to_string()).then_some(id)
+}
 pub(crate) const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Only an admitted stream-one with no response frame bytes may be retried.
@@ -142,7 +158,11 @@ pub(crate) fn request(
     uri: &Uri,
     leg: Leg,
     authorization: &HeaderValue,
+    id: u32,
 ) -> Result<Request<()>, ClientError> {
+    if !(1..=MAX_PAIR_IDS).contains(&id) {
+        return Err(ClientError::Configuration);
+    }
     let mut parts = uri.clone().into_parts();
     parts.path_and_query = Some(match leg {
         Leg::Upload => http::uri::PathAndQuery::from_static(UPLOAD_PATH),
@@ -156,6 +176,7 @@ pub(crate) fn request(
         .uri(Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::AUTHORIZATION, authorization.clone())
+        .header(PAIR_HEADER, id.to_string())
         .body(())
         .map_err(|_| ClientError::Configuration)
 }
@@ -169,43 +190,66 @@ pub(crate) fn check_status(status: StatusCode) -> Result<(), ClientError> {
 }
 
 enum State<T> {
-    Empty,
     Waiting(Leg, oneshot::Sender<T>),
     Used,
 }
 
-/// One pair per connection. A half never enters a global session map, and
-/// the waiting task owns its own stream. No cross-connection association,
-/// unbounded queues or reusable IDs. Same-leg duplication burns the slot.
+/// Registry owned by exactly one verified HTTP connection. The first task
+/// owns its leg; the second transfers ownership once. Used IDs remain
+/// tombstones in a strictly bounded namespace, preventing late-leg reuse.
 pub(crate) struct Pair<T> {
-    state: Mutex<State<T>>,
+    state: Mutex<HashMap<u32, State<T>>>,
+}
+
+/// Cancellation and timeout both burn the ID and drop the waiting sender.
+struct Waiting<'a, T> {
+    pair: &'a Pair<T>,
+    id: u32,
+}
+
+impl<T> Drop for Waiting<'_, T> {
+    fn drop(&mut self) {
+        if let Ok(mut states) = self.pair.state.lock() {
+            if let Some(state) = states.get_mut(&self.id) {
+                *state = State::Used;
+            }
+        }
+    }
 }
 
 impl<T> Pair<T> {
     pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(State::Empty),
+            state: Mutex::new(HashMap::new()),
         }
     }
 
-    pub(crate) async fn join(&self, leg: Leg, item: T) -> Option<(T, T)> {
+    pub(crate) async fn join(&self, id: u32, leg: Leg, item: T) -> Option<(T, T)> {
+        if !(1..=MAX_PAIR_IDS).contains(&id) {
+            return None;
+        }
         let receiver = {
-            let mut state = self.state.lock().ok()?;
-            match std::mem::replace(&mut *state, State::Used) {
-                State::Empty => {
-                    let (tx, rx) = oneshot::channel();
-                    *state = State::Waiting(leg, tx);
-                    rx
+            let mut states = self.state.lock().ok()?;
+            if let Some(state) = states.get_mut(&id) {
+                if let State::Waiting(other, tx) = std::mem::replace(state, State::Used) {
+                    if other != leg {
+                        let _ = tx.send(item);
+                    }
                 }
-                State::Waiting(other, tx) if other != leg => {
-                    // The first task will own both streams, or dropping
-                    // the failed send releases the late-arriving stream.
-                    let _ = tx.send(item);
-                    return None;
-                }
-                _ => return None,
+                return None;
             }
+            if states.values().filter(|state| matches!(state, State::Waiting(..))).count()
+                >= MAX_PENDING_PAIRS
+            {
+                // Burn rejected IDs too, so a late leg cannot be reassociated.
+                states.insert(id, State::Used);
+                return None;
+            }
+            let (tx, rx) = oneshot::channel();
+            states.insert(id, State::Waiting(leg, tx));
+            rx
         };
+        let _waiting = Waiting { pair: self, id };
         let other = timeout(PAIR_TIMEOUT, receiver).await.ok()?.ok()?;
         Some(match leg {
             Leg::Upload => (item, other),
@@ -246,27 +290,60 @@ mod tests {
                 Leg::Upload
             };
             let (a, b) = tokio::join!(
-                pair.join(first, first == Leg::Upload),
-                pair.join(second, second == Leg::Upload)
+                pair.join(1, first, first == Leg::Upload),
+                pair.join(1, second, second == Leg::Upload)
             );
             assert_eq!(a, Some((true, false)));
             assert_eq!(b, None);
-            assert_eq!(pair.join(second, false).await, None);
+            assert_eq!(pair.join(1, second, false).await, None);
         }
         let pair = Pair::new();
-        assert_eq!(pair.join(Leg::Upload, 1).await, None);
-        assert_eq!(pair.join(Leg::Download, 2).await, None);
+        assert_eq!(pair.join(1, Leg::Upload, 1).await, None);
+        assert_eq!(pair.join(1, Leg::Download, 2).await, None);
+    }
+
+    #[test]
+    fn pair_id_is_canonical_and_single() {
+        for (value, expected) in [("1", Some(1)), ("1024", Some(1024)), ("0", None), ("01", None), ("+1", None), ("1025", None)] {
+            let mut req = Request::builder().header(PAIR_HEADER, value).body(()).unwrap();
+            assert_eq!(pair_id(&req), expected);
+            req.headers_mut().append(PAIR_HEADER, HeaderValue::from_static("1"));
+            assert_eq!(pair_id(&req), None);
+        }
+        assert_eq!(pair_id(&Request::new(())), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn independent_pairs_and_cancelled_ids_cannot_reassociate() {
+        let pair = Pair::new();
+        let (a, b, c, d) = tokio::join!(
+            pair.join(1, Leg::Upload, 10),
+            pair.join(2, Leg::Download, 21),
+            pair.join(2, Leg::Upload, 20),
+            pair.join(1, Leg::Download, 11),
+        );
+        assert_eq!((a, b, c, d), (Some((10, 11)), Some((20, 21)), None, None));
+        let mut pending = Box::pin(pair.join(3, Leg::Upload, 30));
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("unpaired leg must wait"),
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(pending);
+        assert_eq!(pair.join(3, Leg::Download, 31).await, None);
+        assert_eq!(pair.join(1, Leg::Upload, 99).await, None);
+        assert_eq!(pair.join(MAX_PAIR_IDS + 1, Leg::Upload, 99).await, None);
     }
 
     #[tokio::test(start_paused = true)]
     async fn duplicate_or_other_connection_never_pairs() {
         let pair = Pair::new();
-        let (a, b) = tokio::join!(pair.join(Leg::Upload, 1), pair.join(Leg::Upload, 2));
+        let (a, b) = tokio::join!(pair.join(1, Leg::Upload, 1), pair.join(1, Leg::Upload, 2));
         assert_eq!((a, b), (None, None));
-        assert_eq!(pair.join(Leg::Download, 3).await, None);
+        assert_eq!(pair.join(1, Leg::Download, 3).await, None);
         let left = Pair::new();
         let right = Pair::new();
-        let (a, b) = tokio::join!(left.join(Leg::Upload, 1), right.join(Leg::Download, 2));
+        let (a, b) = tokio::join!(left.join(1, Leg::Upload, 1), right.join(1, Leg::Download, 2));
         assert_eq!((a, b), (None, None));
     }
 }

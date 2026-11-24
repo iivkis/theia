@@ -451,7 +451,7 @@ impl H2Client {
                 .send_request(
                     crate::channel_binding::attach(
                         binding.as_ref(),
-                        split_http::request(&self.uri, Leg::Download, &self.authorization)?,
+                        split_http::request(&self.uri, Leg::Download, &self.authorization, 1)?,
                     )?,
                     true,
                 )
@@ -461,7 +461,7 @@ impl H2Client {
                 .send_request(
                     crate::channel_binding::attach(
                         binding.as_ref(),
-                        split_http::request(&self.uri, Leg::Upload, &self.authorization)?,
+                        split_http::request(&self.uri, Leg::Upload, &self.authorization, 1)?,
                     )?,
                     false,
                 )

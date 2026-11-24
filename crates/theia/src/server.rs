@@ -292,6 +292,8 @@ impl ServerContext {
         if !(self.stream_up() || self.security_mode.is_plain())
             || split_http::leg(upload) != Some(Leg::Upload)
             || split_http::leg(download) != Some(Leg::Download)
+            || split_http::pair_id(upload).is_none()
+            || split_http::pair_id(upload) != split_http::pair_id(download)
         {
             return Err(StatusCode::NOT_FOUND);
         }
@@ -798,8 +800,11 @@ async fn handle_split_request(
     let Some(leg) = crate::split_http::leg(&request) else {
         return reject(&mut respond, StatusCode::NOT_FOUND).await;
     };
+    let Some(id) = crate::split_http::pair_id(&request) else {
+        return reject(&mut respond, StatusCode::BAD_REQUEST).await;
+    };
     let Some(((upload, mut up), (mut download, mut down))) =
-        pair.join(leg, (request, respond)).await
+        pair.join(id, leg, (request, respond)).await
     else {
         return Ok(());
     };

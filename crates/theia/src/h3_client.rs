@@ -284,7 +284,7 @@ impl H3Client {
             let mut download = sender
                 .send_request(crate::channel_binding::attach(
                     binding.as_ref(),
-                    split_http::request(&self.uri, Leg::Download, &self.authorization)?,
+                    split_http::request(&self.uri, Leg::Download, &self.authorization, 1)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
@@ -292,7 +292,7 @@ impl H3Client {
             let mut upload = sender
                 .send_request(crate::channel_binding::attach(
                     binding.as_ref(),
-                    split_http::request(&self.uri, Leg::Upload, &self.authorization)?,
+                    split_http::request(&self.uri, Leg::Upload, &self.authorization, 1)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;

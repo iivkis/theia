@@ -275,7 +275,11 @@ async fn handle_split_request(
         reject_split(&mut stream, StatusCode::NOT_FOUND).await;
         return;
     };
-    let Some(((upload, mut up), (download, mut down))) = pair.join(leg, (request, stream)).await
+    let Some(id) = crate::split_http::pair_id(&request) else {
+        reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
+        return;
+    };
+    let Some(((upload, mut up), (download, mut down))) = pair.join(id, leg, (request, stream)).await
     else {
         return;
     };
