@@ -129,9 +129,15 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
     let peer = guard.0.remote_address().ip();
     let binding = if context.requires_channel_binding() {
         let mut key = zeroize::Zeroizing::new([0u8; 32]);
-        if guard.0.export_keying_material(
-            &mut key[..], crate::channel_binding::LABEL, crate::channel_binding::H3,
-        ).is_err() {
+        if guard
+            .0
+            .export_keying_material(
+                &mut key[..],
+                crate::channel_binding::LABEL,
+                crate::channel_binding::H3,
+            )
+            .is_err()
+        {
             return;
         }
         Some(Arc::new(crate::channel_binding::Admission::new(key)))
@@ -186,7 +192,8 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
                 return;
             };
             if context.stream_up() {
-                handle_split_request(request, stream, &context, peer, &pair, binding.as_deref()).await;
+                handle_split_request(request, stream, &context, peer, &pair, binding.as_deref())
+                    .await;
             } else {
                 handle_request(request, stream, &context, peer, binding.as_deref()).await;
             }

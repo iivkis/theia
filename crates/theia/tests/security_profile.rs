@@ -376,11 +376,16 @@ async fn h2_h3_stream_up_separate_http_legs_and_identity() {
 fn raw_pinned_request(proof: Option<&HeaderValue>) -> Request<()> {
     let mut request = Request::post("https://localhost/v1/pinned-session")
         .header("content-type", "application/octet-stream")
-        .header("authorization", format!("Bearer {}", URL_SAFE_NO_PAD.encode(TOKEN)))
+        .header(
+            "authorization",
+            format!("Bearer {}", URL_SAFE_NO_PAD.encode(TOKEN)),
+        )
         .body(())
         .unwrap();
     if let Some(proof) = proof {
-        request.headers_mut().insert("theia-channel-proof", proof.clone());
+        request
+            .headers_mut()
+            .insert("theia-channel-proof", proof.clone());
     }
     request
 }
@@ -419,12 +424,23 @@ async fn h2_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
         let mut old = None;
         for _ in 0..2 {
             let socket = tokio::net::TcpStream::connect(fixture.h2).await.unwrap();
-            let tls = connector.connect(
-                rustls::pki_types::ServerName::try_from("localhost").unwrap(), socket,
-            ).await.unwrap();
-            let key = zeroize::Zeroizing::new(tls.get_ref().1.export_keying_material(
-                [0u8; 32], b"EXPORTER-SmartTheia-XHTTP-Admission-v1", Some(b"h2"),
-            ).unwrap());
+            let tls = connector
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                    socket,
+                )
+                .await
+                .unwrap();
+            let key = zeroize::Zeroizing::new(
+                tls.get_ref()
+                    .1
+                    .export_keying_material(
+                        [0u8; 32],
+                        b"EXPORTER-SmartTheia-XHTTP-Admission-v1",
+                        Some(b"h2"),
+                    )
+                    .unwrap(),
+            );
             let current = witness(&key);
             let (mut sender, connection) = h2::client::handshake(tls).await.unwrap();
             let driver = tokio::spawn(connection);
@@ -435,13 +451,17 @@ async fn h2_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
                 (Some(&current), StatusCode::UNAUTHORIZED),
             ] {
                 sender = sender.ready().await.unwrap();
-                let (response, _body) = sender.send_request(raw_pinned_request(proof), true).unwrap();
+                let (response, _body) = sender
+                    .send_request(raw_pinned_request(proof), true)
+                    .unwrap();
                 assert_eq!(response.await.unwrap().status(), expected);
             }
             old = Some(current);
             driver.abort();
         }
-    }).await.expect("bounded native H2 exporter admission");
+    })
+    .await
+    .expect("bounded native H2 exporter admission");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -449,20 +469,27 @@ async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
     timeout(Duration::from_secs(20), async {
         let fixture = Fixture::start(SecurityMode::PinnedCertV1).await;
         let endpoint = theia::quic_transport::client_endpoint(
-            "127.0.0.1:0".parse().unwrap(), fixture.roots.clone(),
-        ).unwrap();
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.roots.clone(),
+        )
+        .unwrap();
         let mut old = None;
         for _ in 0..2 {
             let connection = theia::quic_transport::connect(&endpoint, fixture.h3, "localhost")
-                .await.unwrap();
+                .await
+                .unwrap();
             let mut key = zeroize::Zeroizing::new([0u8; 32]);
-            connection.export_keying_material(
-                &mut key[..], b"EXPORTER-SmartTheia-XHTTP-Admission-v1", b"h3",
-            ).unwrap();
+            connection
+                .export_keying_material(
+                    &mut key[..],
+                    b"EXPORTER-SmartTheia-XHTTP-Admission-v1",
+                    b"h3",
+                )
+                .unwrap();
             let current = witness(&key);
-            let (mut driver, mut sender) = h3::client::new(
-                h3_quinn::Connection::new(connection),
-            ).await.unwrap();
+            let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
             let driver_task = tokio::spawn(async move {
                 let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
             });
@@ -472,8 +499,10 @@ async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
                 (Some(&current), StatusCode::OK),
                 (Some(&current), StatusCode::UNAUTHORIZED),
             ] {
-                let mut stream: h3::client::RequestStream<_, Bytes> =
-                    sender.send_request(raw_pinned_request(proof)).await.unwrap();
+                let mut stream: h3::client::RequestStream<_, Bytes> = sender
+                    .send_request(raw_pinned_request(proof))
+                    .await
+                    .unwrap();
                 // Receiving headers requires no HELLO or OPEN; 200 is only
                 // admission. The test never requests an external target.
                 assert_eq!(stream.recv_response().await.unwrap().status(), expected);
@@ -481,5 +510,7 @@ async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
             old = Some(current);
             driver_task.abort();
         }
-    }).await.expect("bounded native H3 exporter admission");
+    })
+    .await
+    .expect("bounded native H3 exporter admission");
 }

@@ -159,9 +159,13 @@ impl H3Client {
         }
         let binding = if self.certificate_pin.is_some() {
             let mut key = zeroize::Zeroizing::new([0u8; 32]);
-            connection.export_keying_material(
-                &mut key[..], crate::channel_binding::LABEL, crate::channel_binding::H3,
-            ).map_err(|_| ClientError::Tls)?;
+            connection
+                .export_keying_material(
+                    &mut key[..],
+                    crate::channel_binding::LABEL,
+                    crate::channel_binding::H3,
+                )
+                .map_err(|_| ClientError::Tls)?;
             Some(key)
         } else {
             None

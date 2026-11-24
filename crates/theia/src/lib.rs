@@ -12,6 +12,7 @@ pub mod camouflage_h3_probe;
 pub mod camouflage_interfaces;
 pub mod camouflage_probe;
 pub mod camouflage_workflow;
+mod channel_binding;
 pub mod client;
 pub mod client_import;
 pub mod config;
@@ -32,7 +33,6 @@ pub mod reload_preflight;
 pub mod restart_guard;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
-mod channel_binding;
 pub mod security_profile;
 pub mod server;
 mod split_http;

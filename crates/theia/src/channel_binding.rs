@@ -17,7 +17,13 @@ const HEADER: &str = "theia-channel-proof";
 pub(crate) type Key = Zeroizing<[u8; 32]>;
 
 fn proof<T>(key: &Key, request: &Request<T>) -> Option<HeaderValue> {
-    if request.headers().get_all(header::AUTHORIZATION).iter().count() != 1 {
+    if request
+        .headers()
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .count()
+        != 1
+    {
         return None;
     }
     let authorization = request.headers().get(header::AUTHORIZATION)?;
@@ -97,7 +103,9 @@ impl Admission {
 pub(crate) fn admit<T>(binding: Option<&Admission>, requests: &[&Request<T>]) -> bool {
     match binding {
         Some(binding) => binding.admit(requests),
-        None => requests.iter().all(|request| !request.headers().contains_key(HEADER)),
+        None => requests
+            .iter()
+            .all(|request| !request.headers().contains_key(HEADER)),
     }
 }
 
@@ -130,11 +138,15 @@ mod tests {
             ("POST", "/a", "Bearer other"),
         ] {
             let mut changed = request(method, path, bearer);
-            changed.headers_mut().insert(HEADER, signed.headers()[HEADER].clone());
+            changed
+                .headers_mut()
+                .insert(HEADER, signed.headers()[HEADER].clone());
             assert!(!server.admit(&[&changed]));
         }
         let mut duplicate = attach(Some(&key), request("POST", "/a", "Bearer fixture")).unwrap();
-        duplicate.headers_mut().append(HEADER, signed.headers()[HEADER].clone());
+        duplicate
+            .headers_mut()
+            .append(HEADER, signed.headers()[HEADER].clone());
         assert!(!server.admit(&[&duplicate]));
         assert!(server.admit(&[&signed]));
         assert!(!server.admit(&[&signed]));

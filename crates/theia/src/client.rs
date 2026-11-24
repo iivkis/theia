@@ -326,10 +326,14 @@ impl H2Client {
                 }
                 let binding = if self.certificate_pin.is_some() {
                     Some(zeroize::Zeroizing::new(
-                        tls.get_ref().1.export_keying_material(
-                            [0u8; 32], crate::channel_binding::LABEL,
-                            Some(crate::channel_binding::H2),
-                        ).map_err(|_| ClientError::Tls)?,
+                        tls.get_ref()
+                            .1
+                            .export_keying_material(
+                                [0u8; 32],
+                                crate::channel_binding::LABEL,
+                                Some(crate::channel_binding::H2),
+                            )
+                            .map_err(|_| ClientError::Tls)?,
                     ))
                 } else {
                     None
@@ -396,7 +400,10 @@ impl H2Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let (response, tx) = sender
-                .send_request(crate::channel_binding::attach(binding.as_ref(), request)?, false)
+                .send_request(
+                    crate::channel_binding::attach(binding.as_ref(), request)?,
+                    false,
+                )
                 .map_err(|_| ClientError::Http2)?;
             (response.await.map_err(|_| ClientError::Http2)?, tx)
         };
