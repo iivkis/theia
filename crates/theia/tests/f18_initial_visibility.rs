@@ -12,7 +12,7 @@ use quinn::{
     ConnectionId,
 };
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use theia::quic_transport::{accept, client_endpoint, connect, server_endpoint};
 use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
 use zeroize::Zeroize;
@@ -134,7 +134,7 @@ fn hello_shape(handshake: &[u8]) -> Option<HelloShape> {
                 if p != payload.len() || versions_len % 2 != 0 {
                     return None;
                 }
-                answer.tls13 = versions.chunks_exact(2).any(|v| v == [0x03, 0x04]);
+                answer.tls13 = versions.as_chunks::<2>().0.contains(&[0x03, 0x04]);
             }
             57 => answer.quic_transport_parameters = !payload.is_empty(),
             0x4469 | 0x44cd => answer.alps_present = true,
