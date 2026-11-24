@@ -457,3 +457,105 @@ async fn live_compatible_publication_renewal_preserves_h2_h3_tunnels() {
         server.abort();
     }).await.unwrap();
 }
+
+
+// Actual TLS and QUIC handshakes using the same callback that produces the
+// final transcript bytes. Controlled reference DNS names are used as SNI
+// only; no third-party DNS resolution or reference network access occurs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_admission_callbacks_complete_full_tls_and_quic_before_application_data() {
+    use std::sync::Arc;
+    use theia::{identity_tls, reality_admission::{ReplayGuard, Secret}};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use rustls::pki_types::ServerName;
+
+    timeout(DEADLINE, async {
+        let tcp = bind().await;
+        let remote = tcp.local_addr().unwrap();
+        let scope = Scope { inbound: "edge".into(), endpoint: remote.to_string() };
+        let identity = Identity::generate(scope.clone()).unwrap();
+        let now = reference_health::unix_now().unwrap();
+        let d = value(scope.clone(), true, now);
+        let signed = identity.sign_descriptor(&d).unwrap();
+        let v = descriptor::verify(&signed, &anchor(&identity, XhttpMode::StreamOne)).unwrap();
+        let name = d.references[0].server_name.as_str();
+        let secret = Arc::new(Secret::generate().unwrap());
+        let wrong = Arc::new(Secret::generate().unwrap());
+        // Explicitly old startup time for this controlled test; production
+        // restart retains the guard's conservative acceptance window.
+        let guard = Arc::new(ReplayGuard::new(32, now - 121).unwrap());
+
+        let acceptor = TlsAcceptor::from(Arc::new(identity_tls::checked_server_tls(
+            &identity, &v, Branch::H2, secret.clone(), guard.clone()).unwrap()));
+        let server = tokio::spawn(async move {
+            for expected in [false, false, true] {
+                let (stream, _) = tcp.accept().await.unwrap();
+                let handshake = acceptor.accept(stream).await;
+                assert_eq!(handshake.is_ok(), expected);
+                if let Ok(mut tls) = handshake {
+                    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+                    let mut data = [0;4];
+                    tls.read_exact(&mut data).await.unwrap();
+                    assert_eq!(&data, b"ping");
+                    tls.write_all(b"pong").await.unwrap();
+                    tls.shutdown().await.unwrap();
+                }
+            }
+        });
+        let plain = identity_tls::client_tls(&scope, identity.public_key(), Branch::H2).unwrap();
+        let bad = identity_tls::admitted_client_tls(&v, Branch::H2, wrong.clone()).unwrap();
+        let good = identity_tls::admitted_client_tls(&v, Branch::H2, secret.clone()).unwrap();
+        for (tls, expected) in [(plain, false), (bad, false), (good, true)] {
+            let socket = tokio::net::TcpStream::connect(remote).await.unwrap();
+            let result = TlsConnector::from(Arc::new(tls))
+                .connect(ServerName::try_from(name.to_owned()).unwrap(), socket).await;
+            assert_eq!(result.is_ok(), expected);
+            if let Ok(mut stream) = result {
+                stream.write_all(b"ping").await.unwrap();
+                let mut data = [0;4];
+                stream.read_exact(&mut data).await.unwrap();
+                assert_eq!(&data, b"pong");
+            }
+        }
+        server.await.unwrap();
+
+        let server = quinn::Endpoint::server(identity_tls::checked_quic_server(
+            &identity, &v, secret.clone(), guard.clone()).unwrap(), remote).unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let cases = [
+            (identity_tls::quic_client(&scope, identity.public_key()).unwrap(), false),
+            (identity_tls::admitted_quic_client(&v, wrong).unwrap(), false),
+            (identity_tls::admitted_quic_client(&v, secret).unwrap(), true),
+        ];
+        let server_task = tokio::spawn(async move {
+            for expected in [false, false, true] {
+                let attempt = server.accept().await.unwrap().await;
+                assert_eq!(attempt.is_ok(), expected);
+                if let Ok(conn) = attempt {
+                    let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
+                    let mut data = [0;4];
+                    rx.read_exact(&mut data).await.unwrap();
+                    assert_eq!(&data, b"ping");
+                    tx.write_all(b"pong").await.unwrap();
+                    tx.finish().unwrap();
+                    tx.stopped().await.unwrap();
+                }
+            }
+        });
+        for (config, expected) in cases {
+            client.set_default_client_config(config);
+            let result = client.connect(remote, name).unwrap().await;
+            assert_eq!(result.is_ok(), expected);
+            if let Ok(conn) = result {
+                let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+                tx.write_all(b"ping").await.unwrap();
+                tx.finish().unwrap();
+                let mut data = [0;4];
+                rx.read_exact(&mut data).await.unwrap();
+                assert_eq!(&data, b"pong");
+                assert_eq!(rx.read_to_end(16).await.unwrap(), Vec::<u8>::new());
+            }
+        }
+        server_task.await.unwrap();
+    }).await.unwrap();
+}
