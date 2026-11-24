@@ -1,6 +1,6 @@
-### M4.3 F-07: Windows system proxy safety boundary (CLI opt-in; TUI apply not yet wired)
+### M4.3 F-07: Windows system proxy lifecycle (TUI proposed; native CI pending)
 
-The current client TUI does **not** enable WinINet. Editing TOML \`system_proxy = "manual"\` is not an action. A separate Windows client process \`theia client run --config FILE --system-proxy --confirm\` explicitly opts into applying the current-user WinINet default LAN HTTP(S) proxy, **only after** both loopback listener binds and independent TLS/credential checks. A durable protected HKCU recovery journal and user-SID mutex guard ownership. Normal Ctrl+C conditionally restores; hard-kill requires another explicit \`client proxy --recover --confirm\` and refuses if Windows settings differ from the owned snapshot. No user-friendly TUI Apply/Restore yet; full M4.3 acceptance remains open. See ADR-0056.
+Windows client TUI with explicit `--role client --config FILE` and a clean saved editor: `p` opens a read-only status panel. `s` then `y` starts only the local HTTP CONNECT/SOCKS5 listeners, after strict TLS and credential preflight on the exact saved TOML. `a` reviews a redacted current WinINet snapshot and the actual loopback address; a separate `y` applies only with `system_proxy = "manual"`, unchanged TOML, a live local client and a matching snapshot. `r` then `y` restores the owned proxy without stopping listeners; `x` then `y` restores first and stops the local client. `c` then `y` requests recovery of the exact reviewed journal and OS snapshot only when no owner holds the SID mutex. `v` refreshes status without writes. `n`/Esc cancels a review; a bare `y` does nothing. Esc with a running client opens stop review instead of silently hiding it. Errors retain the durable journal and never force foreign-state overwrite. No proxy address/PAC content or credentials are printed from the old snapshot. Local bind is not authorized transport or OPEN_OK. Linux, server role and dirty drafts cannot invoke this panel's native actions. Recovery without a configured editor remains available through the existing CLI. See ADR-0056 and ADR-0077. Full policy/VPN and upgrade acceptance remains open.
 
 # TUI / UX specification (ratatui)
 
@@ -160,7 +160,7 @@ TLS-in-TLS в расширенных настройках: будущий пер
 
 **Клиент: подключиться:** client → Profiles → Import link/file либо Add manually → preview endpoint/TLS/transport и предупреждение о секретном приглашении → отдельная проверка CA/credential storage → Validate → Save → выбрать активный профиль → Start local proxy («Слушает»). При первом реальном HTTP CONNECT или SOCKS5 запросе дожидаться OPEN_OK и только затем показывать «Туннель открыт». Диагностика произвольного внешнего адреса требует выбранной пользователем цели; не посылать неожиданный probe в сторонний сервис.
 
-**Windows proxy:** client → System proxy → Activate → просмотр предыдущих настроек → confirm → snapshot → apply → уведомление. Disconnect/crash recovery по контракту конфигурации.
+**Windows proxy:** client → `p` → `s`/`y` (local listeners only) → `a`/`y` (redacted snapshot review and conditional apply). `r`/`y` restores; `x`/`y` restores and stops; `c`/`y` recovers an abandoned journal. Native CI pending.
 
 ## 5. Архитектура TUI и тесты
 

@@ -1352,10 +1352,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     if let Some(proxy) = interaction.and_then(|ui| ui.system_proxy.as_ref()) {
         panel(frame, parts[1], "F-07: системный прокси Windows", &proxy.body(), true);
     }
+    let footer = if model.screen == Screen::Client {
+        "p: Windows proxy  i: импорт  l: ссылка  Ctrl+S: сохранить"
+    } else {
+        "j/k: запись  Tab: поле  Enter/e: ввод  l: ссылка  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить  p: сеть"
+    };
     frame.render_widget(
-        Paragraph::new(
-            "j/k: запись  Tab: поле  Enter/e: ввод  i: импорт  l: публичная ссылка  u: новый  t: ротация  x: отключить  b: восстановить  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить  p: сеть / прокси Windows",
-        )
+        Paragraph::new(footer)
         .block(Block::default().borders(Borders::ALL)),
         parts[2],
     );

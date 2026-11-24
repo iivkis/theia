@@ -1033,6 +1033,11 @@ mod tests {
         assert_eq!(query().unwrap(), original);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
 
+        crate::tui_system_proxy::tests::native_lifecycle(|| {
+            assert_eq!(query().unwrap(), original);
+            assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
+        });
+
         // No test leaves the disposable CI user's WinINet settings modified.
         assert_eq!(query().unwrap(), original);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);

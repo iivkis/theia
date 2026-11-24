@@ -411,11 +411,152 @@ impl Drop for Panel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn key(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    // Run serially inside the existing opt-in disposable WinINet test, never
+    // as a parallel ordinary unit test against the developer's OS settings.
+    pub(crate) fn native_lifecycle(assert_original: impl Fn()) {
+        use crate::{client_import::PrivateBearer, config::{self, Config}};
+        use sha2::{Digest, Sha256};
+        use std::{fs, net::{TcpListener, TcpStream}, time::{Duration, Instant}};
+
+        fn wait(panel: &mut Panel) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while panel.phase == Phase::Busy {
+                assert!(Instant::now() < deadline, "proxy worker timeout");
+                thread::sleep(Duration::from_millis(10));
+                panel.poll();
+            }
+            assert!(!panel.unavailable);
+        }
+
+        fn review(panel: &mut Panel, action: char) {
+            panel.key(key(action));
+            wait(panel);
+            assert!(panel.phase == Phase::Confirm, "{}", panel.message);
+        }
+
+        fn confirm(panel: &mut Panel) {
+            panel.key(key('y'));
+            wait(panel);
+            assert!(panel.phase == Phase::Idle);
+        }
+
+        fn action(panel: &mut Panel, ch: char) {
+            review(panel, ch);
+            confirm(panel);
+        }
+
+        let directory = std::env::temp_dir().join(format!("theia-proxy-tui-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("client.toml");
+        let ca_path = directory.join("ca.pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        fs::write(&ca_path, cert.cert.pem()).unwrap();
+        let bearer = PrivateBearer::create(&path, &[42; 32]).unwrap();
+        let Config::Client(mut doc) =
+            config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
+            panic!("client fixture required");
+        };
+        let profile = &mut doc.client.profiles[0];
+        profile.server = "127.0.0.1:443".into();
+        profile.server_name = "localhost".into();
+        profile.transport = config::Transport::H2;
+        profile.tls_ca = Some(format!("file:{}", ca_path.display()));
+        profile.auth_token = bearer.reference().unwrap();
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let http = first.local_addr().unwrap();
+        let socks = second.local_addr().unwrap();
+        doc.client.proxy.http_listen = http.to_string();
+        doc.client.proxy.socks5_listen = socks.to_string();
+        doc.client.proxy.system_proxy = config::SystemProxy::Manual;
+        let source = toml::to_string(&doc).unwrap();
+        fs::write(&path, &source).unwrap();
+        let digest = Sha256::digest(source.as_bytes()).into();
+        let mut panel = Panel::open(path.clone(), digest).unwrap();
+        wait(&mut panel);
+        assert_original();
+        panel.key(key('a'));
+        wait(&mut panel);
+        assert!(panel.phase == Phase::Idle);
+        assert_original();
+
+        // Failed second bind must release the first and never touch WinINet.
+        drop(first);
+        action(&mut panel, 's');
+        assert!(!panel.view.running);
+        assert_original();
+        drop(second);
+
+        review(&mut panel, 's');
+        panel.key(key('n'));
+        wait(&mut panel);
+        assert!(!panel.view.running);
+        assert_original();
+        action(&mut panel, 's');
+        assert!(panel.view.running);
+        assert!(!panel.view.owned);
+        assert!(TcpStream::connect_timeout(&http, Duration::from_secs(2)).is_ok());
+        assert!(TcpStream::connect_timeout(&socks, Duration::from_secs(2)).is_ok());
+        assert_original();
+
+        review(&mut panel, 'a');
+        fs::write(&path, format!("{source}\n# external edit\n")).unwrap();
+        confirm(&mut panel);
+        assert!(!panel.view.owned);
+        assert_original();
+        fs::write(&path, &source).unwrap();
+
+        action(&mut panel, 'a');
+        assert!(panel.view.owned);
+        assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
+        panel.key(key('c'));
+        wait(&mut panel);
+        assert!(panel.phase == Phase::Idle);
+        assert!(panel.view.owned);
+
+        action(&mut panel, 'r');
+        assert!(!panel.view.owned);
+        assert!(panel.view.running);
+        assert_original();
+        action(&mut panel, 'a');
+        action(&mut panel, 'x');
+        assert!(!panel.view.running);
+        assert!(!panel.view.owned);
+        assert_original();
+
+        // Terminal failure/drop follows the same owned restoration path.
+        action(&mut panel, 's');
+        action(&mut panel, 'a');
+        assert!(panel.view.owned);
+        drop(panel);
+        assert_original();
+
+        // Off permits a local client but must never grant WinINet consent.
+        doc.client.proxy.system_proxy = config::SystemProxy::Off;
+        let off = toml::to_string(&doc).unwrap();
+        fs::write(&path, &off).unwrap();
+        let mut panel = Panel::open(path, Sha256::digest(off.as_bytes()).into()).unwrap();
+        wait(&mut panel);
+        action(&mut panel, 's');
+        assert!(panel.view.running);
+        panel.key(key('a'));
+        wait(&mut panel);
+        assert!(panel.phase == Phase::Idle);
+        assert!(!panel.view.owned);
+        assert_original();
+        action(&mut panel, 'x');
+        drop(panel);
+        drop(bearer);
+        fs::remove_dir_all(directory).unwrap();
+        assert_original();
     }
 
     #[test]

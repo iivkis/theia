@@ -444,10 +444,7 @@ pub(crate) struct PreparedLocalProxy {
 
 #[cfg(windows)]
 impl PreparedLocalProxy {
-    pub(crate) async fn start(
-        path: &Path,
-        expected: [u8; 32],
-    ) -> Result<Self, ClientError> {
+    pub(crate) async fn start(path: &Path, expected: [u8; 32]) -> Result<Self, ClientError> {
         let bytes = saved_client_bytes(path, expected)?;
         let Config::Client(document) =
             config::parse(std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?)
