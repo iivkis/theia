@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 use crate::config::{self, WriteFailure};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
+use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fmt, path::Path};
@@ -202,6 +202,11 @@ fn signing_input(payload: &[u8]) -> Vec<u8> {
 /// primitive. This does NOT sign a TLS transcript or prove session identity.
 pub fn sign(descriptor: &Descriptor, key: &Ed25519KeyPair) -> Result<String, Error> {
     let payload = descriptor.payload()?;
+    if let Some(next) = &descriptor.next_identity {
+        if canonical_base64::<32>(next)?.as_slice() == key.public_key().as_ref() {
+            return Err(Error::Format);
+        }
+    }
     let signature = key.sign(&signing_input(payload.as_bytes()));
     let envelope = Envelope {
         payload: URL_SAFE_NO_PAD.encode(payload.as_bytes()),
@@ -213,6 +218,7 @@ pub fn sign(descriptor: &Descriptor, key: &Ed25519KeyPair) -> Result<String, Err
 pub struct Verified {
     descriptor: Descriptor,
     digest: [u8; 32],
+    signer: [u8; 32],
 }
 impl Verified {
     pub fn descriptor(&self) -> &Descriptor { &self.descriptor }
@@ -223,7 +229,7 @@ impl Verified {
         Ok(())
     }
     pub fn compare(&self, next: &Self) -> Result<Change, Error> {
-        if self.descriptor.scope != next.descriptor.scope {
+        if self.descriptor.scope != next.descriptor.scope || self.signer != next.signer {
             return Err(Error::Scope);
         }
         match next.descriptor.revision.cmp(&self.descriptor.revision) {
@@ -270,7 +276,7 @@ pub fn verify(document: &str, anchor: &Anchor) -> Result<Verified, Error> {
             return Err(Error::Format);
         }
     }
-    Ok(Verified { descriptor, digest: Sha256::digest(payload).into() })
+    Ok(Verified { descriptor, digest: Sha256::digest(payload).into(), signer: anchor.public_key })
 }
 
 /// Local-only store. The path must be absolute and its directory trusted.

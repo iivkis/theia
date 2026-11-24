@@ -41,6 +41,12 @@ fn signed_descriptor_binds_every_field_to_independent_anchor() {
     verified.check_time(100).unwrap();
     assert_error(verified.check_time(200), Error::Validity);
     assert_error(descriptor::verify(&raw, &anchor(&d, &other)), Error::Signature);
+    let foreign = descriptor::verify(
+        &descriptor::sign(&d, &other).unwrap(), &anchor(&d, &other)
+    ).unwrap();
+    assert_error(verified.compare(&foreign), Error::Scope);
+    let floor = Anchor::new(d.scope.clone(), key.public_key().as_ref().try_into().unwrap(), 2).unwrap();
+    assert_error(descriptor::verify(&raw, &floor), Error::Rollback);
     let mut wrong = d.clone();
     wrong.scope.inbound = "other".into();
     assert_error(descriptor::verify(&descriptor::sign(&wrong, &key).unwrap(), &a), Error::Scope);
@@ -142,4 +148,54 @@ fn durable_revision_floor_rejects_rollback_equivocation_and_key_substitution_aft
     substituted.next_identity = None;
     assert_error(reopened.update(&descriptor::sign(&substituted, &successor).unwrap(), 220), Error::Signature);
     assert_eq!(fs::read_to_string(&path).unwrap(), next);
+}
+
+#[test]
+fn concurrent_signed_updates_never_publish_a_lower_revision_over_a_higher_one() {
+    use std::{sync::Barrier, thread};
+    let temp = Scratch::new();
+    let path = temp.0.join("trust.toml");
+    let key = key();
+    let first = fixture(1);
+    let anchor = anchor(&first, &key);
+    let store = Store::new(&path, anchor.clone()).unwrap();
+    store.initialize(&descriptor::sign(&first, &key).unwrap(), 120).unwrap();
+    let second = descriptor::sign(&fixture(2), &key).unwrap();
+    let third = descriptor::sign(&fixture(3), &key).unwrap();
+    let barrier = Barrier::new(2);
+    let (a, b) = thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            barrier.wait();
+            store.update(&second, 120)
+        });
+        let b = scope.spawn(|| {
+            barrier.wait();
+            store.update(&third, 120)
+        });
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert!(a.is_ok() || b.is_ok());
+    let revision = store.load(120).unwrap().descriptor().revision;
+    if b.is_ok() { assert_eq!(revision, 3); }
+    if a.is_ok() { assert!(revision >= 2); }
+    // A failed writer retries only after re-reading the signed snapshot.
+    if revision == 2 {
+        assert_eq!(store.update(&third, 120).unwrap(), Change::Advanced);
+    }
+    assert_error(store.update(&second, 120), Error::Rollback);
+    assert_eq!(fs::read_to_string(&path).unwrap(), third);
+}
+
+#[test]
+fn initialization_never_overwrites_corrupt_or_unrelated_local_state() {
+    let temp = Scratch::new();
+    let path = temp.0.join("trust.toml");
+    fs::write(&path, b"unrelated").unwrap();
+    let key = key();
+    let first = fixture(1);
+    let store = Store::new(&path, anchor(&first, &key)).unwrap();
+    let signed = descriptor::sign(&first, &key).unwrap();
+    assert_error(store.initialize(&signed, 120), Error::Storage);
+    assert!(store.update(&signed, 120).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"unrelated");
 }
