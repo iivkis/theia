@@ -721,6 +721,13 @@ fn guarded_write_with_sync(
 /// Signed trust snapshots share the same cooperating CAS lock and atomic
 /// publication as config. None is an explicit create-only operation, never
 /// an overwrite. The caller must validate the whole document before use.
+/// Linearize a no-op trust update against cooperating writers without
+/// replacing the file. The caller must have already checked its contents.
+pub(crate) fn guarded_trust_assert(path: &Path, expected: &[u8]) -> Result<(), ConfigError> {
+    let _lock = editor_lock(path)?;
+    require_unchanged(path, expected)
+}
+
 pub(crate) fn guarded_trust_write(
     path: &Path,
     data: &str,

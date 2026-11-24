@@ -93,7 +93,10 @@ pub(crate) fn verify(directory: &Path, stamp: Stamp, now: u64) -> Result<(), Err
 /// writes a file. A competing write is refused and must be re-read.
 pub(crate) fn accept(directory: &Path, stamp: Stamp, now: u64) -> Result<(), Error> {
     let (raw, previous) = read(directory)?;
-    if !previous.permits(stamp, now)? { return Ok(()); }
+    if !previous.permits(stamp, now)? {
+        return config::guarded_trust_assert(&directory.join(FILE), raw.as_bytes())
+            .map_err(|_| Error::Storage);
+    }
     let next = Floor { schema_version: 1, accepted_at: now, stamp };
     config::guarded_trust_write(&directory.join(FILE), &next.encode()?, Some(raw.as_bytes()))
         .map_err(|error| match error {
@@ -141,6 +144,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), raw);
         let next = Stamp { generation: 2, publication: [4;32], ..first };
         accept(&dir, next, 102).unwrap();
+        assert!(config::guarded_trust_assert(&dir.join(FILE), &raw).is_err());
         assert!(verify(&dir, first, 103).is_err());
         assert_eq!(accept(&dir, next, 101), Err(Error::Clock));
         accept(&dir, next, 103).unwrap();

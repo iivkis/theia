@@ -478,7 +478,15 @@ impl Publication {
         if state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256 {
             return Err(Error::Approval);
         }
-        checked.current.check_time(now).map_err(|_| Error::Descriptor)?;
+        // Once the old signed interval ends, a still-valid successor
+        // remains usable until explicit retirement. Restart must not take
+        // that successor offline merely because the old document expired.
+        // The old key is never selectable outside its signed interval.
+        let old_valid = checked.current.check_time(now).is_ok();
+        if !old_valid && !record.pending.as_ref().is_some_and(|pending|
+            now >= pending.ends_at && now >= checked.current.descriptor().not_before) {
+            return Err(Error::Descriptor);
+        }
         state.validate_active(checked.current.descriptor(), now).map_err(|_| Error::Health)?;
         let next = match (checked.next, record.pending) {
             (Some((identity, verified)), Some(pending)) => {
@@ -974,6 +982,12 @@ mod tests {
         assert_eq!(store.load(now + 1).unwrap().signer(), next.public_key());
 
         let ends = overlap.overlap_ends_at.unwrap();
+        let fresh = state.record(vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }], ends).unwrap();
+        let post_overlap = publication.capture(&fresh, overlap.snapshot_sha256, ends).unwrap();
+        assert!(post_overlap.select(active.public_key(), ends).is_err());
+        assert!(post_overlap.select(next.public_key(), ends).is_ok());
+        assert!(post_overlap.select(next.public_key(), ends - 1).is_err());
+        assert!(publication.capture(&state, overlap.snapshot_sha256, ends).is_err());
         assert!(publication
             .promote(overlap.snapshot_sha256, fingerprint, ends - 1)
             .is_err());

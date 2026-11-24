@@ -79,21 +79,25 @@ pub struct Status {
     pub health_revision: u64,
     pub active_reference: u8,
     pub overlap: bool,
+    pub active_usable: bool,
+    pub successor_usable: bool,
 }
 
 /// An immutable local candidate snapshot, not a handshake authorization.
 /// No signing key or bearer is exposed. Existing owners can retain a lease
 /// for accounting without preventing the next generation from being loaded.
-pub struct Lease(Arc<Generation>);
+pub struct Lease(Arc<Generation>, u64);
 
 impl Lease {
     pub fn status(&self) -> Status {
         let generation = &self.0;
         let publication = &generation.publication;
-        let active = publication.active().verified().descriptor();
-        Status { generation: publication.generation(), revision: active.revision,
-            health_revision: generation.health_revision, active_reference: active.active_reference,
-            overlap: publication.next().is_some() }
+        let active = publication.active().verified();
+        let active_usable = active.check_time(self.1).is_ok();
+        let successor_usable = publication.next().is_some_and(|entry| entry.verified().check_time(self.1).is_ok());
+        Status { generation: publication.generation(), revision: active.descriptor().revision,
+            health_revision: generation.health_revision, active_reference: active.descriptor().active_reference,
+            overlap: active_usable && successor_usable, active_usable, successor_usable }
     }
 }
 
@@ -139,7 +143,7 @@ impl Manager {
             || candidate.health_digest != slot.last.health_digest {
             slot.last = Arc::new(candidate);
         }
-        Ok(Lease(Arc::clone(&slot.last)))
+        Ok(Lease(Arc::clone(&slot.last), now))
     }
 }
 
