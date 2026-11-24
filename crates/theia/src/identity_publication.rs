@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(status.active_fingerprint, bootstrap::fingerprint(identity.public_key()));
         let next = descriptor::verify(&publication.documents(time).unwrap().0, &anchor).unwrap();
         assert_eq!(next.descriptor().path_prefix, old.descriptor().path_prefix);
-        assert_eq!(next.descriptor().references, old.descriptor().references);
+        assert!(next.descriptor().references == old.descriptor().references);
         assert!(next.descriptor().h3);
         assert!(publication.apply_failover(&twice, approval, time).is_err());
         // Refresh after the first reference failed is valid for the now
