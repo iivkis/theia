@@ -119,6 +119,15 @@ require("cargo fmt --all -- --check" in linux,
 require("cargo clippy --workspace --all-targets --all-features -- -D warnings" in linux,
         "mandatory Clippy warnings-as-errors must run")
 require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
+require("Real Linux H2 fingerprint vs pinned Go uTLS (reuse compiled root harness)" in linux
+        and "cargo test --workspace --locked --test fingerprint_h2" in linux
+        and "go mod verify" in linux,
+        "Linux H2 fingerprint must reuse the root test harness after all-targets")
+require(linux.index("Tests first") < linux.index("Real Linux H2 fingerprint vs pinned Go uTLS"),
+        "Linux fingerprint must follow the root all-targets compilation")
+require("cargo test --workspace --locked --test fingerprint_h2" not in job("m0-1-api-spike"),
+        "M0.1 Linux spike must NOT duplicate root workspace compilation")
+
 
 # The specification is now the ONLY formatting gate.  Every native job
 # tests the checked-out commit byte-for-byte, with no format overlay, post-green
@@ -167,7 +176,7 @@ go_steps = re.findall(
     r"(?m)^      - uses: actions/setup-go@v5\n(?:        if: [^\n]+\n)?        with:\n((?:          [^\n]+\n)+)",
     workflow,
 )
-require(len(go_steps) == 5, "all five pinned Go toolchains must be audited; post-green formatter Go was removed")
+require(len(go_steps) == 6, "all six pinned Go toolchains must be audited, including the reused Linux fingerprint")
 for step in go_steps:
     require("cache: true" in step,
             "Go module/build cache must be enabled for recurring CI")
