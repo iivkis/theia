@@ -25,7 +25,7 @@ use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
 };
 use sha2::{Digest, Sha256};
-use std::{fmt, path::Path, sync::Arc};
+use std::{fmt, path::Path, sync::{Arc, Mutex}};
 use time::{Duration, OffsetDateTime};
 use zeroize::Zeroizing;
 
@@ -34,6 +34,7 @@ const KEY_FILE_PREFIX: &str = "theia-identity-v1";
 const CA_NAME_PREFIX: &str = "Theia v1 ";
 const SCOPE_DOMAIN: &[u8] = b"Theia/identity-tls/issuer/v1\0";
 const LEAF_LIFETIME: i64 = 3600;
+const LEAF_RENEWAL: i64 = LEAF_LIFETIME / 2;
 const CLOCK_SKEW: i64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,7 +204,7 @@ impl Identity {
         let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(&*self.pkcs8));
         let raw = Zeroizing::new(format!(
             "{KEY_FILE_PREFIX}\n{}\n{}\n{}\n",
-            self.scope.inbound, self.scope.endpoint, &*encoded
+            self.scope.inbound, self.scope.endpoint, encoded.as_str()
         ));
         config::guarded_trust_write(path, &raw, None).map_err(storage_error)
     }
@@ -305,9 +306,20 @@ impl Identity {
     }
 
     pub fn server_tls(&self, name: &str, branch: Branch) -> Result<ServerConfig, Error> {
-        self.server_tls_at(name, branch, OffsetDateTime::now_utc())
+        let resolver = Arc::new(RenewingLeaf::new(self, name, branch)?);
+        let mut config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .map_err(|_| Error::Tls)?
+                .with_no_client_auth()
+                .with_cert_resolver(resolver);
+        config.alpn_protocols = vec![branch.alpn().to_vec()];
+        config.max_early_data_size = 0;
+        config.send_tls13_tickets = 0;
+        Ok(config)
     }
 
+    #[cfg(test)]
     fn server_tls_at(
         &self,
         name: &str,
@@ -336,6 +348,74 @@ impl Identity {
         config.transport_config(crate::quic_transport::transport_config());
         config.migration(false);
         Ok(config)
+    }
+}
+
+/// Cache a short-lived leaf per immutable identity, name and branch.
+/// Existing sessions retain their negotiated keys; renewal affects only
+/// new full handshakes. The resolver never chooses a different signer.
+struct CachedLeaf {
+    issued_at: OffsetDateTime,
+    key: Arc<rustls::sign::CertifiedKey>,
+}
+
+struct RenewingLeaf {
+    identity: Identity,
+    name: String,
+    branch: Branch,
+    leaf: Mutex<CachedLeaf>,
+}
+
+impl fmt::Debug for RenewingLeaf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RenewingLeaf").field("branch", &self.branch).finish_non_exhaustive()
+    }
+}
+
+impl RenewingLeaf {
+    fn issue(identity: &Identity, name: &str, branch: Branch, now: OffsetDateTime) -> Result<CachedLeaf, Error> {
+        let (cert, private) = identity.leaf(name, branch, now)?;
+        let provider = rustls::crypto::ring::default_provider();
+        let key = rustls::sign::CertifiedKey::from_der(vec![cert], private, &provider)
+            .map_err(|_| Error::Tls)?;
+        Ok(CachedLeaf { issued_at: now, key: Arc::new(key) })
+    }
+
+    fn new(identity: &Identity, name: &str, branch: Branch) -> Result<Self, Error> {
+        let leaf = Self::issue(identity, name, branch, OffsetDateTime::now_utc())?;
+        Ok(Self {
+            identity: Identity {
+                scope: identity.scope.clone(),
+                pkcs8: Zeroizing::new(identity.pkcs8.to_vec()),
+                public: identity.public,
+            },
+            name: name.to_owned(),
+            branch,
+            leaf: Mutex::new(leaf),
+        })
+    }
+
+    fn certificate_at(&self, now: OffsetDateTime) -> Result<Arc<rustls::sign::CertifiedKey>, Error> {
+        let mut leaf = self.leaf.lock().map_err(|_| Error::Tls)?;
+        if now < leaf.issued_at {
+            // Do not extend a validity period on clock rollback.
+            return Err(Error::Clock);
+        }
+        if now - leaf.issued_at >= Duration::seconds(LEAF_RENEWAL) {
+            *leaf = Self::issue(&self.identity, &self.name, self.branch, now)?;
+        }
+        Ok(Arc::clone(&leaf.key))
+    }
+}
+
+impl rustls::server::ResolvesServerCert for RenewingLeaf {
+    fn resolve(&self, hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if !hello.server_name().is_some_and(|name| name.eq_ignore_ascii_case(&self.name))
+            || !hello.alpn().is_some_and(|mut offered| offered.any(|value| value == self.branch.alpn()))
+        {
+            return None;
+        }
+        self.certificate_at(OffsetDateTime::now_utc()).ok()
     }
 }
 
@@ -385,6 +465,23 @@ mod tests {
             inbound: "edge".into(),
             endpoint: "edge.example.org:443".into(),
         }
+    }
+
+    #[test]
+    fn renewable_leaf_is_cached_then_replaced_without_changing_identity() {
+        let identity = Identity::generate(scope()).unwrap();
+        let resolver = RenewingLeaf::new(&identity, "edge.example.org", Branch::H2).unwrap();
+        let issued = resolver.leaf.lock().unwrap().issued_at;
+        let initial = resolver.certificate_at(issued).unwrap();
+        let cached = resolver.certificate_at(issued + Duration::seconds(LEAF_RENEWAL - 1)).unwrap();
+        assert!(Arc::ptr_eq(&initial, &cached));
+        let renewed_at = issued + Duration::seconds(LEAF_RENEWAL);
+        let renewed = resolver.certificate_at(renewed_at).unwrap();
+        assert!(!Arc::ptr_eq(&initial, &renewed));
+        assert_ne!(initial.cert[0], renewed.cert[0]);
+        assert_eq!(resolver.identity.public_key(), identity.public_key());
+        assert!(resolver.certificate_at(issued).is_err());
+        assert!(Arc::ptr_eq(&renewed, &resolver.certificate_at(renewed_at).unwrap()));
     }
 
     #[test]

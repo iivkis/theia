@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 
 const MAX_BYTES: usize = 128 * 1024;
 const OVERLAP: u64 = 7 * 24 * 60 * 60;
+// Provisional dev cooldown; any intervening publication resets it
+// conservatively. This prevents immediate back-and-forth switches.
+const FAILOVER_COOLDOWN: u64 = 60 * 60;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +41,8 @@ struct Record {
     scope: Scope,
     generation: u64,
     clock_floor: u64,
+    // Exact approved plan, including IP pins and declared server addresses.
+    plan_sha256: [u8; 32],
     active_key: String,
     active_document: String,
     retired: Vec<String>,
@@ -83,6 +88,7 @@ impl Record {
         if self.schema_version != 1
             || self.generation == 0
             || self.clock_floor == 0
+            || self.plan_sha256 == [0; 32]
             || self.retired.len() > 64
         {
             return Err(Error::Format);
@@ -250,6 +256,7 @@ impl Publication {
                 scope,
                 generation: 1,
                 clock_floor: now,
+                plan_sha256: state.plan().digest().map_err(|_| Error::Health)?,
                 active_key: key_file,
                 active_document,
                 retired: Vec::new(),
@@ -266,8 +273,10 @@ impl Publication {
         record.check_clock(now)?;
         Ok(Status {
             generation: record.generation,
+            plan_sha256: record.plan_sha256,
             snapshot_sha256: bootstrap::digest(&raw),
             revision: checked.current.descriptor().revision,
+            active_reference: checked.current.descriptor().active_reference,
             active_fingerprint: bootstrap::fingerprint(checked.active.public_key()),
             valid_now: checked.current.check_time(now).is_ok(),
             next_fingerprint: checked
@@ -305,8 +314,80 @@ impl Publication {
             return Err(Error::Approval);
         }
         record.check_clock(now)?;
+        if state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256 {
+            return Err(Error::Approval);
+        }
         record.active_document =
             bootstrap::refresh_descriptor(state, &checked.active, &record.active_document, now)?;
+        record.advance(now)?;
+        self.write(&record, Some(&old))
+    }
+
+    fn reference_change(
+        state: &reference_health::State,
+        record: &Record,
+        checked: &Checked,
+        now: u64,
+    ) -> Result<u8, Error> {
+        record.check_clock(now)?;
+        if record.pending.is_some()
+            || state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256
+        {
+            return Err(Error::Approval);
+        }
+        if now.saturating_sub(record.clock_floor) < FAILOVER_COOLDOWN {
+            return Err(Error::Health);
+        }
+        let index = state.failover_candidate(checked.current.descriptor(), now)
+            .map_err(|_| Error::Health)?;
+        u8::try_from(index).map_err(|_| Error::Health)
+    }
+
+    /// Read-only exact preview. Local publication is not a runtime Apply.
+    pub fn preview_failover(
+        &self,
+        state: &reference_health::State,
+        now: u64,
+    ) -> Result<FailoverPreview, Error> {
+        let (old, record, checked) = self.snapshot()?;
+        let selected = Self::reference_change(state, &record, &checked, now)?;
+        Ok(FailoverPreview {
+            publication_sha256: bootstrap::digest(&old),
+            health_sha256: state.snapshot_sha256().map_err(|_| Error::Health)?,
+            current_reference: checked.current.descriptor().active_reference,
+            selected_reference: selected,
+            next_revision: checked.current.descriptor().revision.checked_add(1).ok_or(Error::Descriptor)?,
+        })
+    }
+
+    /// Explicit offline publication after a separately confirmed client
+    /// recovery plan. The caller must distribute the new signed descriptor
+    /// through the authenticated recovery path; this changes no listeners.
+    /// The exact evidence is still required to be fresh at commit time.
+    pub fn apply_failover(
+        &self,
+        state: &reference_health::State,
+        approval: FailoverApproval,
+        now: u64,
+    ) -> Result<(), Error> {
+        let (old, mut record, checked) = self.snapshot()?;
+        if bootstrap::digest(&old) != approval.publication_sha256
+            || state.snapshot_sha256().map_err(|_| Error::Health)? != approval.health_sha256
+        {
+            return Err(Error::Approval);
+        }
+        let selected = Self::reference_change(state, &record, &checked, now)?;
+        if selected != approval.selected_reference {
+            return Err(Error::Approval);
+        }
+        let mut next = checked.current.descriptor().clone();
+        next.active_reference = selected;
+        next.revision = next.revision.checked_add(1).ok_or(Error::Descriptor)?;
+        next.not_before = now;
+        next.not_after = now.checked_add(VALIDITY).ok_or(Error::Clock)?;
+        state.validate_active(&next, now).map_err(|_| Error::Health)?;
+        record.active_document = checked.active.sign_descriptor(&next)
+            .map_err(|_| Error::Descriptor)?;
         record.advance(now)?;
         self.write(&record, Some(&old))
     }
@@ -403,10 +484,28 @@ impl Publication {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct FailoverPreview {
+    pub publication_sha256: [u8; 32],
+    pub health_sha256: [u8; 32],
+    pub current_reference: u8,
+    pub selected_reference: u8,
+    pub next_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailoverApproval {
+    pub publication_sha256: [u8; 32],
+    pub health_sha256: [u8; 32],
+    pub selected_reference: u8,
+}
+
 pub struct Status {
     pub generation: u64,
+    pub plan_sha256: [u8; 32],
     pub snapshot_sha256: [u8; 32],
     pub revision: u64,
+    pub active_reference: u8,
     pub active_fingerprint: [u8; 32],
     pub valid_now: bool,
     pub next_fingerprint: Option<[u8; 32]>,
@@ -437,6 +536,63 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn guarded_failover_keeps_identity_routes_and_transport_and_refuses_stale_evidence() {
+        let now = 1000;
+        let dir = Scratch::new();
+        let plan = reference_health::Plan {
+            schema_version: 1,
+            inbound: "edge".into(),
+            endpoint: "edge.example.org:443".into(),
+            own_ips: vec!["93.184.216.1".parse().unwrap()],
+            references: (2..=4).map(|i| reference_health::Target {
+                server_name: format!("ref{i}.example.org"),
+                address: format!("93.184.216.{i}:443").parse().unwrap(),
+            }).collect(),
+        };
+        let h3 = reference_health::Evidence { h2_status: Some(200), h3_status: Some(200) };
+        let h2 = reference_health::Evidence { h2_status: Some(200), h3_status: None };
+        let state = reference_health::State::new(plan, vec![h3, h2, h3], now).unwrap();
+        let scope = Scope { inbound: state.plan().inbound.clone(), endpoint: state.plan().endpoint.clone() };
+        let identity = Identity::generate(scope.clone()).unwrap();
+        let key = dir.0.join("active.key");
+        identity.save_new(&key).unwrap();
+        let publication = Publication::new(&dir.0.join("publication.toml")).unwrap();
+        publication.initialize(&state, &key, now).unwrap();
+        let original = publication.documents(now).unwrap().0;
+        let anchor = Anchor::new(scope, identity.public_key(), 1, bootstrap::auto_policy()).unwrap();
+        let old = descriptor::verify(&original, &anchor).unwrap();
+        let time = now + FAILOVER_COOLDOWN + 10;
+        let failed = vec![reference_health::Evidence::default(), h2, h3];
+        let once = state.record(failed.clone(), time - 10).unwrap();
+        assert!(publication.preview_failover(&once, time).is_err());
+        let twice = once.record(failed, time).unwrap();
+        let preview = publication.preview_failover(&twice, time).unwrap();
+        assert_eq!(preview.selected_reference, 2);
+        assert_eq!(preview.next_revision, 2);
+        assert!(publication.preview_failover(&twice, time + 61).is_err());
+        let approval = FailoverApproval {
+            publication_sha256: preview.publication_sha256,
+            health_sha256: preview.health_sha256,
+            selected_reference: 2,
+        };
+        assert!(publication.apply_failover(&twice, FailoverApproval { selected_reference: 1, ..approval }, time).is_err());
+        assert!(publication.apply_failover(&twice, FailoverApproval { health_sha256: [0; 32], ..approval }, time).is_err());
+        publication.apply_failover(&twice, approval, time).unwrap();
+        let status = publication.inspect(time).unwrap();
+        assert_eq!(status.active_reference, 2);
+        assert_eq!(status.active_fingerprint, bootstrap::fingerprint(identity.public_key()));
+        let next = descriptor::verify(&publication.documents(time).unwrap().0, &anchor).unwrap();
+        assert_eq!(next.descriptor().path_prefix, old.descriptor().path_prefix);
+        assert!(next.descriptor().references == old.descriptor().references);
+        assert!(next.descriptor().h3);
+        assert!(publication.apply_failover(&twice, approval, time).is_err());
+        // Refresh after the first reference failed is valid for the now
+        // active reference; new invitations can carry the updated snapshot.
+        publication.refresh(&twice, status.snapshot_sha256, time + 1).unwrap();
+        assert_eq!(publication.inspect(time + 1).unwrap().revision, 3);
     }
 
     #[test]
@@ -478,6 +634,16 @@ mod tests {
         assert!(publication.initialize(&state, &old_key, now).is_err());
         let start = publication.inspect(now).unwrap();
         let initial = publication.documents(now).unwrap().0;
+        let mut substituted = state.plan().clone();
+        substituted.references[0].address = "93.184.216.3:443".parse().unwrap();
+        let substituted = reference_health::State::new(
+            substituted,
+            vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }],
+            now,
+        ).unwrap();
+        assert!(matches!(publication.refresh(&substituted, start.snapshot_sha256, now + 1), Err(Error::Approval)));
+        assert_eq!(publication.inspect(now + 1).unwrap().snapshot_sha256, start.snapshot_sha256);
+        assert_eq!(start.plan_sha256, state.plan().digest().unwrap());
         let fingerprint = bootstrap::fingerprint(next.public_key());
         assert!(publication
             .begin_rotation(&next_key, [0; 32], fingerprint, now + 1)

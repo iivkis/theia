@@ -431,6 +431,11 @@ async fn check_target(target: &Target, roots: &RootCertStore, own: &HashSet<IpAd
         round.h2_status = h2.ok().flatten();
         round.h3_status = h3.ok().flatten();
     }
+    // Check once more after the application observations: a DNS change
+    // during the last handshake must not be recorded as fresh evidence.
+    if fresh_dns(target, own).await.is_err() {
+        return Evidence::default();
+    }
     Evidence {
         h2_status: stable(rounds[0].h2_status, rounds[1].h2_status),
         h3_status: stable(rounds[0].h3_status, rounds[1].h3_status),
@@ -545,6 +550,12 @@ impl State {
         self.revision
     }
 
+    /// Evidence digest binds the exact approved pins, check timestamp,
+    /// revision and observed transport status for a guarded preview.
+    pub fn snapshot_sha256(&self) -> Result<[u8; 32], Error> {
+        Ok(digest(&self.encode()?))
+    }
+
     pub fn plan(&self) -> &Plan {
         &self.plan
     }
@@ -572,6 +583,70 @@ impl State {
                 h3: entry.evidence.h3(),
             })
             .collect())
+    }
+
+    /// Validate the active signed reference without requiring every inactive
+    /// reserve to be currently reachable. References remain an approved
+    /// inventory, not a promise that all of them are currently healthy.
+    pub fn validate_active(
+        &self,
+        signed: &crate::descriptor::Descriptor,
+        now: u64,
+    ) -> Result<(), Error> {
+        self.validate()?;
+        if now < self.last_checked_at {
+            return Err(Error::Clock);
+        }
+        if now > self.next_check_at()?.saturating_add(JITTER)
+            || signed.scope.inbound != self.plan.inbound
+            || signed.scope.endpoint != self.plan.endpoint
+            || signed.references.len() != self.plan.references.len()
+            || signed.references.iter().zip(&self.plan.references).any(|(reference, target)| {
+                reference.server_name != target.server_name || reference.port != target.address.port()
+            })
+        {
+            return Err(Error::NotEligible);
+        }
+        let active = self.health.get(usize::from(signed.active_reference)).ok_or(Error::Format)?;
+        if !active.evidence.eligible() || (signed.h3 && !active.evidence.h3()) {
+            return Err(Error::NotEligible);
+        }
+        Ok(())
+    }
+
+    /// A candidate is not a live switch. The two-cycle failure threshold
+    /// applies to the currently published reference, not always index zero.
+    /// All newly admitted transport modes must be retained.
+    pub fn failover_candidate(
+        &self,
+        signed: &crate::descriptor::Descriptor,
+        now: u64,
+    ) -> Result<usize, Error> {
+        self.validate()?;
+        if now < self.last_checked_at {
+            return Err(Error::Clock);
+        }
+        if now - self.last_checked_at > 60
+            || signed.scope.inbound != self.plan.inbound
+            || signed.scope.endpoint != self.plan.endpoint
+            || signed.references.len() != self.plan.references.len()
+            || signed.references.iter().zip(&self.plan.references).any(|(reference, target)| {
+                reference.server_name != target.server_name || reference.port != target.address.port()
+            })
+        {
+            return Err(Error::NotEligible);
+        }
+        let active_index = usize::from(signed.active_reference);
+        let active = self.health.get(active_index).ok_or(Error::Format)?;
+        if active.failures < FAILURE_THRESHOLD || active.evidence.eligible() {
+            return Err(Error::NotEligible);
+        }
+        self.health.iter().enumerate()
+            .filter(|(index, health)| *index != active_index && health.evidence.eligible()
+                && (!signed.h3 || (health.evidence.h3() && signed.references[*index].h3)))
+            .max_by_key(|(index, health)| (health.evidence.score(), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index)
+            .ok_or(Error::NotEligible)
     }
 
     pub fn next_check_at(&self) -> Result<u64, Error> {
@@ -668,6 +743,56 @@ impl State {
             return Err(Error::Format);
         }
         Ok(raw)
+    }
+}
+
+/// A freshly revalidated exact approved reference. Its socket cannot be
+/// supplied by network input. Leases expire after 60 seconds; a caller must
+/// renew via State and the current verified signed descriptor.
+pub struct RelayLease {
+    address: SocketAddr,
+    expires: tokio::time::Instant,
+}
+
+impl RelayLease {
+    pub(crate) fn address(&self) -> Result<SocketAddr, Error> {
+        if tokio::time::Instant::now() >= self.expires {
+            return Err(Error::NotEligible);
+        }
+        Ok(self.address)
+    }
+}
+
+impl State {
+    pub async fn relay_lease(
+        &self,
+        verified: &crate::descriptor::Verified,
+        approved_plan_sha256: [u8; 32],
+    ) -> Result<RelayLease, Error> {
+        if self.plan.digest()? != approved_plan_sha256 {
+            return Err(Error::Approval);
+        }
+        let now = unix_now()?;
+        verified.check_time(now).map_err(|_| Error::NotEligible)?;
+        self.validate_active(verified.descriptor(), now)?;
+        let target = self.plan.references.get(usize::from(verified.descriptor().active_reference))
+            .ok_or(Error::Format)?;
+        // The target is derived exclusively from the signed active index
+        // and immutable approved plan, never from ClientHello contents.
+        let _permit = timeout(ATTEMPT, ACTIVE.acquire()).await
+            .map_err(|_| Error::Timeout)?.map_err(|_| Error::Timeout)?;
+        let own = extend_endpoint_addresses(&self.plan, own_addresses(&self.plan)?).await?;
+        fresh_dns(target, &own).await?;
+        let now = unix_now()?;
+        self.validate_active(verified.descriptor(), now)?;
+        verified.check_time(now).map_err(|_| Error::NotEligible)?;
+        let remaining = verified.descriptor().not_after.checked_sub(now)
+            .ok_or(Error::Clock)?.min(60);
+        if remaining == 0 { return Err(Error::NotEligible); }
+        Ok(RelayLease {
+            address: target.address,
+            expires: tokio::time::Instant::now() + Duration::from_secs(remaining),
+        })
     }
 }
 
