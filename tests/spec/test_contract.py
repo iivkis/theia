@@ -498,8 +498,25 @@ class SpecContractTests(unittest.TestCase):
     def test_m33_quic_congestion_comparison_is_mandatory(self):
         workflow = read(".github/workflows/ci.yml")
         gate = workflow.split("\n  ci-gate:\n", 1)[1]
-        self.assertIn("m3-3-bbr-comparison", gate)
-        self.assertIn("m3-3-bbr-comparison", workflow.split("\n  ci-gate:\n")[0])
+        # Native BBR evidence is mandatory inside the existing Linux/Windows
+        # M0.1 jobs, not via another pair of identical Cargo builds.
+        self.assertIn("m0-1-api-spike", gate)
+        self.assertIn("m0-1-windows-spike", gate)
+        self.assertNotIn("\n  m3-3-bbr-comparison:\n", workflow)
+        bbr = ("comparison_records_all_controller_scenarios_ci_only "
+               "-- --ignored --exact --nocapture")
+        for name in ("m0-1-api-spike", "m0-1-windows-spike"):
+            match = re.search(
+                r"(?ms)^  " + re.escape(name)
+                + r":\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+                workflow,
+            )
+            self.assertIsNotNone(match)
+            block = match.group(1)
+            self.assertIn(bbr, block)
+            self.assertIn("python tests/benchmark/check_bbr_comparison.py", block)
+            self.assertIn("name: m3-3-quic-comparison-", block)
+            self.assertIn("if-no-files-found: error", block)
         benchmark = read("spikes/m0_1/tests/quic_congestion_comparison.rs")
         for expected in ("quinn::congestion::Bbr", "quinn::congestion::Cubic",
                          "loss_delay_jitter", "max_transmit_segments",

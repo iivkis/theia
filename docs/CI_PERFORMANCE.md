@@ -208,3 +208,38 @@ The CI graph regression test asserts the central format commands remain
 present and that no native job re-adds them. This is modest runner-minute
 hygiene rather than a claim of significant end-to-end wall-clock speedup;
 real measurements must be compared after CI passes on the exact PR SHA.
+
+## Remove duplicate M0.1 compilation runners for BBR/CUBIC evidence
+
+The [pre-change full main run 45364323549](https://github.com/iivkis/theia/actions/runs/45364323549)
+succeeded in **323 s**. Independent mandatory `m3-3-bbr-comparison`
+Linux and Windows jobs occupied **44 s** and **55 s**, respectively.
+They duplicated setup/cache and compilation of the same isolated
+`spikes/m0_1` workspace that the already mandatory native M0.1 Linux
+(**30 s**) and Windows (**89 s**) jobs compile.
+
+Native BBR/CUBIC acceptance is **not removed**. Each existing M0.1 job
+now also runs the same ignored
+`comparison_records_all_controller_scenarios_ci_only` test: all
+**16 real loopback trials** (2 controllers × 4 impairment conditions ×
+2 repetitions) on its own operating system. It validates real CSV data
+with the unchanged `tests/benchmark/check_bbr_comparison.py`,
+and uploads the same `m3-3-quic-comparison-Linux` and
+`m3-3-quic-comparison-Windows` artifact names. A missing CSV
+fails the job. The `ci-gate` requires both full M0.1 jobs, now
+including this BBR test and validator, so the native BBR security/transport
+regression coverage is preserved.
+
+The CI workflow now has **13 logical jobs** rather than 15, while
+the original M0.1 tests and mandatory Rust, uTLS, WinINet, ConPTY,
+Windows SID kernel isolation, Chromium and real WSL2 H2/H3 gates
+remain. Release compilation is still explicitly manual-only.
+A separate concurrent optimization in PR #99 centralized all Rustfmt and
+gofmt checks in the fail-fast specification; this change preserves it
+unchanged and does not install Go twice.
+
+**Expected until measured:** fewer CI runner startups and no duplicate
+M0.1 Cargo compilation in BBR-only jobs. Native BBR execution time
+moves into the M0.1 jobs, so do not claim all 99 old runner-seconds were
+saved or promise a whole-workflow speedup until exact-head CI and
+follow-up warm-cache measurements confirm it.
