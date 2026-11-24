@@ -555,7 +555,9 @@ impl PreparedQuic {
                         let initial_continuation = header.as_ref().is_some_and(|h|
                             admitted.iter().any(|((addr, _), (scid, until))|
                                 *addr == peer && *until > now && h.scid == scid.as_slice()));
-                        if n <= LOCAL_MAX && (!is_initial || existing_local || initial_continuation) {
+                        let initial_current = !is_initial || crate::reference_health::unix_now().is_ok_and(|wall|
+                            self.generation.publication().active().verified().check_time(wall).is_ok());
+                        if n <= LOCAL_MAX && initial_current && (!is_initial || existing_local || initial_continuation) {
                             let _ = self.local.try_send((peer, data.to_vec()));
                         }
                         continue;

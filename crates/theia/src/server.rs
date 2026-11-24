@@ -2377,6 +2377,13 @@ fn has_reality(document: &ServerDocument) -> bool {
 /// The current REALITY generation is immutable; ordinary own-TLS hot
 /// replacement cannot mutate it. Management is status-only in this mode.
 async fn run_reality_document(document: ServerDocument) -> Result<(), ServerError> {
+    run_reality_document_with_ready(document, None).await
+}
+
+pub(crate) async fn run_reality_document_with_ready(
+    document: ServerDocument,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), ServerError> {
     let config = Config::Server(document.clone());
     config.validate().map_err(|_| ServerError::Config)?;
     if !document.server.enabled { return Err(ServerError::Config); }
@@ -2459,6 +2466,7 @@ async fn run_reality_document(document: ServerDocument) -> Result<(), ServerErro
     if let Some(management) = management {
         tasks.spawn(async move { management.serve().await.map_err(|_| ServerError::Io) });
     }
+    if let Some(started) = started { let _ = started.send(()); }
     let result = match tasks.join_next().await {
         Some(Ok(result)) => result,
         _ => Err(ServerError::Io),

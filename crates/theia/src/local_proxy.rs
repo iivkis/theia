@@ -1154,6 +1154,153 @@ async fn handle(
 mod selector_tests {
     use super::*;
 
+    // The public-address reference evidence is synthetic and deliberately
+    // not used by the admitted test branch. All application I/O is loopback;
+    // this does not assert external reference parity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registered_reality_startup_serves_native_connect_and_socks5() {
+        use crate::{
+            descriptor::ClientPolicy,
+            reality_bootstrap as bootstrap,
+            reality_config::{self, Request, ServerRequest, ClientRequest},
+            reality_generation::Manager,
+            reference_health::{self, Evidence, Plan, State, Store, Target},
+        };
+        use sha2::{Digest,Sha256};
+        use std::{path::PathBuf, sync::atomic::{AtomicU64,Ordering}};
+        struct Scratch(PathBuf);
+        impl Drop for Scratch { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let dir = Scratch(std::env::temp_dir().join(format!("theia-reality-native-{}-{}",
+            std::process::id(),SEQUENCE.fetch_add(1,Ordering::Relaxed))));
+        std::fs::create_dir(&dir.0).unwrap();
+        timeout(Duration::from_secs(45), async {
+            let remote = {
+                let mut selected = None;
+                for _ in 0..16 {
+                    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = tcp.local_addr().unwrap();
+                    if let Ok(udp) = std::net::UdpSocket::bind(addr) {
+                        selected = Some(addr); drop(udp); break;
+                    }
+                }
+                selected.unwrap()
+            };
+            let now = reference_health::unix_now().unwrap();
+            let state = State::new(Plan { schema_version: 1, inbound: "reality-native".into(),
+                endpoint: remote.to_string(), own_ips: vec![remote.ip()],
+                references: vec![Target { server_name: "ref.example.org".into(),
+                    address: "93.184.216.2:443".parse().unwrap() }] },
+                vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+            let health = dir.0.join("health.toml");
+            Store::new(&health).unwrap().enroll(&state).unwrap();
+            let bundle = dir.0.join("bundle");
+            let digest = state.snapshot_sha256().unwrap();
+            let record = crate::reality_provision::create(&state,digest,&bundle,now).unwrap();
+            let token = [42u8;32];
+            let server_path = dir.0.join("server.toml");
+            let source = include_str!("../../../examples/server.toml")
+                .replace("REPLACE_WITH_64_LOWERCASE_HEX",&format!("{:x}",Sha256::digest(token)));
+            std::fs::write(&server_path,source).unwrap();
+            let request = Request::Server(ServerRequest { health, bundle:bundle.clone(),
+                health_sha256:digest,identity_sha256:record.identity_sha256,listen:remote,
+                grants:vec!["device-a".into()] });
+            let preview = reality_config::prepare(&server_path,&request,now).unwrap();
+            reality_config::apply(&server_path,&request,preview.approval_sha256(),now).unwrap();
+            let Config::Server(mut server_doc) = config::read_file(&server_path).unwrap() else { panic!() };
+            // The template own-TLS inbound has placeholder PEM paths.
+            // Test the registered REALITY branch, not an invalid template.
+            server_doc.server.inbounds.retain(|i| i.id=="reality-native");
+            server_doc.server.policy.allow_private_ips = true;
+            let config = Config::Server(server_doc.clone());
+            let lease = Manager::new(&config,"reality-native",now).unwrap().refresh(now).unwrap();
+            let material = lease.publication().active();
+            let invite = bootstrap::Invitation::public(material.identity(),material.signed(),now).unwrap();
+            let uri = invite.encode().unwrap();
+            let client_path = dir.0.join("client.toml");
+            let mut bearer = crate::client_import::PrivateBearer::create(&client_path,&token).unwrap();
+            let reference = bearer.reference().unwrap();
+            bearer.commit();
+            std::fs::write(&client_path,include_str!("../../../examples/client.toml")).unwrap();
+            for (id,transport) in [("native-h2",Transport::H2),("native-h3",Transport::H3)] {
+                let enrollment = dir.0.join(format!("{id}.toml"));
+                let trust = dir.0.join(format!("{id}-trust.toml"));
+                bootstrap::import(&uri,bootstrap::ImportApproval {
+                    document_sha256:bootstrap::digest(&uri),identity_sha256:invite.fingerprint(),
+                }, &enrollment,&trust,bootstrap::EnrollmentMaterial {
+                    admission_path:&bundle.join("admission.key"),expected_admission:None,
+                    external_token:Some(&reference),
+                },ClientPolicy { transport,xhttp_mode:XhttpMode::StreamOne },now).unwrap();
+                let request = Request::Client(ClientRequest {
+                    enrollment,identity_sha256:invite.fingerprint(),id:id.into(),
+                });
+                let preview = reality_config::prepare(&client_path,&request,now).unwrap();
+                reality_config::apply(&client_path,&request,preview.approval_sha256(),now).unwrap();
+            }
+            // A single signed snapshot is the source of both native carriers.
+            drop(lease);
+            let (started,ready) = tokio::sync::oneshot::channel();
+            let mut server = JoinSet::new();
+            server.spawn(crate::server::run_reality_document_with_ready(server_doc,Some(started)));
+            ready.await.unwrap();
+            let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = echo.local_addr().unwrap();
+            let mut echo_tasks = JoinSet::new();
+            echo_tasks.spawn(async move {
+                for _ in 0..2 {
+                    let (mut stream,_) = echo.accept().await.unwrap();
+                    let mut bytes = [0;4];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                }
+            });
+            let Config::Client(mut client_doc) = config::read_file(&client_path).unwrap() else { panic!() };
+            for (id,socks_mode) in [("native-h2",false),("native-h3",true)] {
+                client_doc.client.active_profile=id.into();
+                let profile = client_doc.client.profiles.iter().find(|p|p.id==id).unwrap();
+                let client = load_client(profile).await.unwrap();
+                let ProxyClient::Reality(managed) = &client else { panic!("wrong security mode") };
+                let current = managed.generation().await.unwrap();
+                assert!(match (&current.carrier,socks_mode) {
+                    (RealityCarrier::H2(_),false)|(RealityCarrier::H3(_),true)=>true,
+                    _=>false,
+                });
+                let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let listen = if socks_mode { socks.local_addr().unwrap() } else { http.local_addr().unwrap() };
+                let mut proxy = JoinSet::new();
+                proxy.spawn(serve_proxy(http,socks,client));
+                let mut stream = TcpStream::connect(listen).await.unwrap();
+                if socks_mode {
+                    stream.write_all(&[5,1,0]).await.unwrap();
+                    let mut response = [0;2];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(response,[5,0]);
+                    let mut request = vec![5,1,0,1,127,0,0,1];
+                    request.extend_from_slice(&target.port().to_be_bytes());
+                    stream.write_all(&request).await.unwrap();
+                    let mut response = [0;10];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(&response[..2],&[5,0]);
+                } else {
+                    stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).await.unwrap();
+                    let mut response = vec![0;HTTP_OK.len()];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(response,HTTP_OK);
+                }
+                stream.write_all(b"ping").await.unwrap();
+                let mut bytes=[0;4];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes,b"ping");
+                drop(stream);
+                proxy.shutdown().await;
+            }
+            assert!(echo_tasks.join_next().await.unwrap().is_ok());
+            server.shutdown().await;
+        }).await.unwrap();
+    }
+
     #[test]
     fn runtime_file_reference_refuses_non_native_or_oversized_input() {
         use std::fs;
