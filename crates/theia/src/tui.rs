@@ -3226,13 +3226,20 @@ mod tests {
     fn credential_and_revocation_panels_distinguish_saved_state_from_runtime() {
         fn render(mut render_panel: impl FnMut(&mut Frame<'_>, Rect)) -> String {
             let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-            terminal.draw(|frame| {
-                let area = frame.area();
-                render_panel(frame, area);
-            }).unwrap();
-            terminal.backend().buffer().content().chunks(120)
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_panel(frame, area);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(120)
                 .map(|line| line.iter().map(|cell| cell.symbol()).collect::<String>())
-                .collect::<Vec<_>>().join("\n")
+                .collect::<Vec<_>>()
+                .join("\n")
         }
         let hidden = "DO-NOT-EXPOSE-BEARER-TEST";
         for (kind, label) in [
@@ -3240,14 +3247,18 @@ mod tests {
             (IssueKind::Rotation, "Ротация токена"),
             (IssueKind::Reenable, "Восстановление отключённого"),
         ] {
-            let input = render(|f,a| draw_issuance(f,a,&IssueFlow::Input("device-a".into()),None,kind));
+            let input = render(|f, a| {
+                draw_issuance(f, a, &IssueFlow::Input("device-a".into()), None, kind)
+            });
             assert!(input.contains(label));
-            let confirm = render(|f,a| draw_issuance(f,a,&IssueFlow::Confirm("device-a".into()),None,kind));
+            let confirm = render(|f, a| {
+                draw_issuance(f, a, &IssueFlow::Confirm("device-a".into()), None, kind)
+            });
             assert!(confirm.contains("Подтверждение"));
             assert!(confirm.contains("y: подтвердить"));
-            let failed = render(|f,a| draw_issuance(f,a,&IssueFlow::SaveFailed,None,kind));
+            let failed = render(|f, a| draw_issuance(f, a, &IssueFlow::SaveFailed, None, kind));
             assert!(failed.contains("ссылка заблокирована"));
-            let offer = render(|f,a| draw_issuance(f,a,&IssueFlow::Offer,None,kind));
+            let offer = render(|f, a| draw_issuance(f, a, &IssueFlow::Offer, None, kind));
             assert!(offer.contains("Одноразовая"));
             assert!(offer.contains("Runtime") || offer.contains("runtime"));
             assert!(!offer.contains(hidden));
@@ -3256,40 +3267,66 @@ mod tests {
             (IssueFlow::Saving, "Конфиденциальная ссылка скрыта"),
             (IssueFlow::ConfirmExport, "Ссылка не будет показана"),
             (IssueFlow::Exporting, "Runtime не обновляется"),
-            (IssueFlow::Exported(PathBuf::from("private.invite")), "Файл содержит bearer"),
+            (
+                IssueFlow::Exported(PathBuf::from("private.invite")),
+                "Файл содержит bearer",
+            ),
             (IssueFlow::ExportFailed, "Секрет повторно не выдаётся"),
         ] {
-            let screen = render(|f,a| draw_issuance(f,a,&flow,None,IssueKind::NewUser));
+            let screen = render(|f, a| draw_issuance(f, a, &flow, None, IssueKind::NewUser));
             assert!(screen.contains(label), "{screen}");
             assert!(!screen.contains(hidden));
         }
-        let shown = render(|f,a| draw_issuance(f,a,&IssueFlow::Showing(Zeroizing::new(hidden.into())),None,IssueKind::NewUser));
+        let shown = render(|f, a| {
+            draw_issuance(
+                f,
+                a,
+                &IssueFlow::Showing(Zeroizing::new(hidden.into())),
+                None,
+                IssueKind::NewUser,
+            )
+        });
         assert!(shown.contains(hidden));
         assert!(shown.contains("однократный просмотр"));
         for (flow, label) in [
-            (DisableFlow::Input("device-a".into()), "Отключить существующего"),
-            (DisableFlow::Confirm("device-a".into()), "отдельного auth-only Apply"),
+            (
+                DisableFlow::Input("device-a".into()),
+                "Отключить существующего",
+            ),
+            (
+                DisableFlow::Confirm("device-a".into()),
+                "отдельного auth-only Apply",
+            ),
             (DisableFlow::Saving, "Runtime не изменяется"),
             (DisableFlow::SaveFailed, "TOML НЕ сохранён"),
             (DisableFlow::Done, "подтвердить auth-only Apply"),
         ] {
-            let screen = render(|f,a| draw_revocation(f,a,&flow,None));
+            let screen = render(|f, a| draw_revocation(f, a, &flow, None));
             assert!(screen.contains(label), "{screen}");
         }
-        let input = render(|f,a| draw_import(f,a,&ImportFlow::Input(Zeroizing::new(hidden.into())),None));
+        let input = render(|f, a| {
+            draw_import(
+                f,
+                a,
+                &ImportFlow::Input(Zeroizing::new(hidden.into())),
+                None,
+            )
+        });
         assert!(!input.contains(hidden));
         assert!(input.contains("скрыто"));
-        for (flow,label) in [
+        for (flow, label) in [
             (ImportFlow::RefreshSaving, "Runtime не меняется"),
-            (ImportFlow::RefreshDone, "соединение и системный прокси не менялись"),
+            (
+                ImportFlow::RefreshDone,
+                "соединение и системный прокси не менялись",
+            ),
             (ImportFlow::Saving, "Секрет не отображается"),
             (ImportFlow::Done, "исходный active_profile не изменён"),
             (ImportFlow::Failed, "Импорт НЕ подтверждён"),
         ] {
-            let screen = render(|f,a| draw_import(f,a,&flow,None));
+            let screen = render(|f, a| draw_import(f, a, &flow, None));
             assert!(screen.contains(label), "{screen}");
             assert!(!screen.contains(hidden));
         }
     }
-
 }

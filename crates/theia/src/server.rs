@@ -2785,27 +2785,45 @@ mod hardening_tests {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[tokio::test]
     async fn supervisor_prepares_both_transports_rotates_rolls_back_and_cuts_over_shared_limits() {
-        use crate::runtime_generation::{ChangeKind, RestartRequest, State, View};
         use crate::reload_preflight::ReloadPreflight;
-        use std::{fs, net::{TcpListener as StdTcp, UdpSocket as StdUdp}};
-        let directory = std::env::temp_dir().join(format!("theia-supervisor-native-{}-{:?}", std::process::id(), std::thread::current().id()));
+        use crate::runtime_generation::{ChangeKind, RestartRequest, State, View};
+        use std::{
+            fs,
+            net::{TcpListener as StdTcp, UdpSocket as StdUdp},
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "theia-supervisor-native-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         fs::create_dir_all(&directory).unwrap();
         struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
         let _cleanup = Cleanup(directory.clone());
         let path = directory.join("server.toml");
-        let material = |name: &str| -> (String,String) {
-            let generated = rcgen::generate_simple_self_signed(vec!["a.example.org".into(),"b.example.org".into()]).unwrap();
+        let material = |name: &str| -> (String, String) {
+            let generated = rcgen::generate_simple_self_signed(vec![
+                "a.example.org".into(),
+                "b.example.org".into(),
+            ])
+            .unwrap();
             let cert = directory.join(format!("{name}.pem"));
             let key = directory.join(format!("{name}.key"));
-            fs::write(&cert,generated.cert.pem()).unwrap();
-            fs::write(&key,generated.key_pair.serialize_pem()).unwrap();
+            fs::write(&cert, generated.cert.pem()).unwrap();
+            fs::write(&key, generated.key_pair.serialize_pem()).unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&key,fs::Permissions::from_mode(0o600)).unwrap();
+                fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
             }
-            (format!("file:{}",cert.display()),format!("file:{}",key.display()))
+            (
+                format!("file:{}", cert.display()),
+                format!("file:{}", key.display()),
+            )
         };
         let addresses = |doc: &mut ServerDocument| {
             let mut tcp = Vec::new();
@@ -2815,95 +2833,129 @@ mod hardening_tests {
                 let u = StdUdp::bind("127.0.0.1:0").unwrap();
                 inbound.h2_listen = t.local_addr().unwrap().to_string();
                 inbound.quic_listen = u.local_addr().unwrap().to_string();
-                tcp.push(t); udp.push(u);
+                tcp.push(t);
+                udp.push(u);
             }
-            (tcp,udp)
+            (tcp, udp)
         };
-        let (cert,key) = material("old");
+        let (cert, key) = material("old");
         let mut initial = live_auth_fixture();
         for inbound in &mut initial.server.inbounds {
-            inbound.tls_cert.clone_from(&cert); inbound.tls_key.clone_from(&key);
+            inbound.tls_cert.clone_from(&cert);
+            inbound.tls_key.clone_from(&key);
         }
         let reservations = addresses(&mut initial);
         let limits = GenerationLimits::new(&initial);
         // No generation may partially start when its TCP port is occupied.
-        assert!(prepare_generation(&initial,1,&limits,None).await.is_err());
+        assert!(prepare_generation(&initial, 1, &limits, None)
+            .await
+            .is_err());
         drop(reservations);
-        let prepared = prepare_generation(&initial,1,&limits,None).await.unwrap();
+        let prepared = prepare_generation(&initial, 1, &limits, None)
+            .await
+            .unwrap();
         let ids = prepared.identities.clone();
         let runtime = State::new(View {
-            document: Arc::new(initial.clone()), inbounds: initial.server.inbounds.len(),
-            preflight: Arc::new(ReloadPreflight::new(path.clone(),initial.clone(),ids.clone())),
+            document: Arc::new(initial.clone()),
+            inbounds: initial.server.inbounds.len(),
+            preflight: Arc::new(ReloadPreflight::new(
+                path.clone(),
+                initial.clone(),
+                ids.clone(),
+            )),
             live: prepared.live,
         });
-        let mut running = RunningGeneration::launch(prepared.listeners,GenerationPhase::Prepared);
+        let mut running = RunningGeneration::launch(prepared.listeners, GenerationPhase::Prepared);
         tokio::task::yield_now().await;
         assert!(running.is_healthy_before_activation());
         running.start();
         let request = |candidate: ServerDocument, kind, captured| {
             let previous = runtime.snapshot().unwrap();
             let expected_revision = previous.live.revision().unwrap();
-            let (complete,_reply) = tokio::sync::oneshot::channel();
-            RestartRequest { kind, previous, expected_revision, candidate, material: captured, complete }
+            let (complete, _reply) = tokio::sync::oneshot::channel();
+            RestartRequest {
+                kind,
+                previous,
+                expected_revision,
+                candidate,
+                material: captured,
+                complete,
+            }
         };
-        let (new_cert,new_key) = material("rotated");
+        let (new_cert, new_key) = material("rotated");
         let mut rotation = initial.clone();
         for inbound in &mut rotation.server.inbounds {
-            inbound.tls_cert.clone_from(&new_cert); inbound.tls_key.clone_from(&new_key);
+            inbound.tls_cert.clone_from(&new_cert);
+            inbound.tls_key.clone_from(&new_key);
         }
-        let missing = request(rotation.clone(),ChangeKind::Restart,None);
-        assert!(commit_same_port_tls(&runtime,&mut running,&missing,&ids,&path).is_err());
+        let missing = request(rotation.clone(), ChangeKind::Restart, None);
+        assert!(commit_same_port_tls(&runtime, &mut running, &missing, &ids, &path).is_err());
         let captured = CapturedTls::capture(&rotation).unwrap();
-        let rotate = request(rotation.clone(),ChangeKind::Restart,Some(captured));
-        let (rotated_ids,revision,mut slot) = commit_same_port_tls(&runtime,&mut running,&rotate,&ids,&path).unwrap();
-        assert_eq!(revision,2);
+        let rotate = request(rotation.clone(), ChangeKind::Restart, Some(captured));
+        let (rotated_ids, revision, mut slot) =
+            commit_same_port_tls(&runtime, &mut running, &rotate, &ids, &path).unwrap();
+        assert_eq!(revision, 2);
         assert!(rotated_ids != ids);
-        assert_eq!(runtime.snapshot().unwrap().document.as_ref(),&rotation);
-        assert!(commit_same_port_tls(&runtime,&mut running,&rotate,&ids,&path).is_err());
-        assert!(commit_tls_rollback(&runtime,&mut running,&slot,1,&path).is_err());
+        assert_eq!(runtime.snapshot().unwrap().document.as_ref(), &rotation);
+        assert!(commit_same_port_tls(&runtime, &mut running, &rotate, &ids, &path).is_err());
+        assert!(commit_tls_rollback(&runtime, &mut running, &slot, 1, &path).is_err());
 
         let mut quota = rotation.clone();
         quota.server.policy.max_connections_total += 1;
         let occupied = limits.ledger.acquire_session("alice").unwrap();
-        let invalid_quota = request(rotation.clone(),ChangeKind::Quota,None);
-        assert!(commit_live_quota(&runtime,&invalid_quota,&limits.ledger).is_err());
-        let quota_request = request(quota.clone(),ChangeKind::Quota,None);
-        assert_eq!(commit_live_quota(&runtime,&quota_request,&limits.ledger),Ok(3));
+        let invalid_quota = request(rotation.clone(), ChangeKind::Quota, None);
+        assert!(commit_live_quota(&runtime, &invalid_quota, &limits.ledger).is_err());
+        let quota_request = request(quota.clone(), ChangeKind::Quota, None);
+        assert_eq!(
+            commit_live_quota(&runtime, &quota_request, &limits.ledger),
+            Ok(3)
+        );
         assert!(limits.ledger.acquire_session("alice").is_none());
         drop(occupied);
         let deadline = slot.expires;
         slot.expires = Instant::now();
-        assert!(commit_tls_rollback(&runtime,&mut running,&slot,3,&path).is_err());
+        assert!(commit_tls_rollback(&runtime, &mut running, &slot, 3, &path).is_err());
         slot.expires = deadline;
-        let (restored,revision) = commit_tls_rollback(&runtime,&mut running,&slot,3,&path).unwrap();
-        assert_eq!(revision,4);
+        let (restored, revision) =
+            commit_tls_rollback(&runtime, &mut running, &slot, 3, &path).unwrap();
+        assert_eq!(revision, 4);
         assert!(restored == ids);
         let current = runtime.snapshot().unwrap();
-        assert_eq!(current.document.server.policy,quota.server.policy);
-        assert_eq!(current.document.server.inbounds[0].tls_cert,cert);
-        assert_eq!(current.document.server.inbounds[0].tls_key,key);
+        assert_eq!(current.document.server.policy, quota.server.policy);
+        assert_eq!(current.document.server.inbounds[0].tls_cert, cert);
+        assert_eq!(current.document.server.inbounds[0].tls_key, key);
         // A fresh generation uses the same ledger and preserves the old
         // listener sockets until the candidate is published.
         let mut candidate = current.document.as_ref().clone();
         let fresh_reservations = addresses(&mut candidate);
         let captured = CapturedTls::capture(&candidate).unwrap();
-        let fresh = request(candidate.clone(),ChangeKind::Restart,Some(captured));
-        assert!(stage_fresh_generation(&fresh,&restored,&limits,&path).await.is_err());
+        let fresh = request(candidate.clone(), ChangeKind::Restart, Some(captured));
+        assert!(stage_fresh_generation(&fresh, &restored, &limits, &path)
+            .await
+            .is_err());
         drop(fresh_reservations);
-        let (successor,next,next_ids,revision) = stage_fresh_generation(&fresh,&restored,&limits,&path).await.unwrap();
-        assert_eq!(revision,5);
+        let (successor, next, next_ids, revision) =
+            stage_fresh_generation(&fresh, &restored, &limits, &path)
+                .await
+                .unwrap();
+        assert_eq!(revision, 5);
         assert!(next_ids == restored);
-        assert_eq!(runtime.snapshot().unwrap().live.revision(),Ok(4));
+        assert_eq!(runtime.snapshot().unwrap().live.revision(), Ok(4));
         assert!(StdTcp::bind(&initial.server.inbounds[0].h2_listen).is_err());
         assert!(StdTcp::bind(&candidate.server.inbounds[0].h2_listen).is_err());
-        runtime.commit_restart(&fresh.previous,fresh.expected_revision,next).unwrap();
+        runtime
+            .commit_restart(&fresh.previous, fresh.expected_revision, next)
+            .unwrap();
         successor.start();
-        assert_eq!(runtime.snapshot().unwrap().live.revision(),Ok(5));
+        assert_eq!(runtime.snapshot().unwrap().live.revision(), Ok(5));
         let retired = fresh.previous.live.shared().load().unwrap();
         assert!(retired.grants.is_empty());
         assert!(retired.users.iter().all(|u| u.disabled));
-        tokio::time::timeout(Duration::from_secs(5),reap_previous(running)).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5),reap_previous(successor)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reap_previous(running))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reap_previous(successor))
+            .await
+            .unwrap();
     }
-
 }

@@ -609,7 +609,6 @@ pub fn run(command: Command) -> Result<String, Error> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,7 +619,11 @@ mod tests {
     impl Scratch {
         fn new() -> Self {
             static SEQ: AtomicU64 = AtomicU64::new(0);
-            let dir = std::env::temp_dir().join(format!("theia-reality-cli-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+            let dir = std::env::temp_dir().join(format!(
+                "theia-reality-cli-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir(&dir).unwrap();
             Self(dir)
         }
@@ -629,23 +632,48 @@ mod tests {
         }
     }
     impl Drop for Scratch {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
     fn invoke(args: &[&str]) -> Result<String, Error> {
         run(parse(args).unwrap())
     }
     fn field<'a>(output: &'a str, key: &str) -> &'a str {
-        output.lines().find_map(|line| line.split_once('=').filter(|(name, _)| *name == key).map(|(_, value)| value)).unwrap()
+        output
+            .lines()
+            .find_map(|line| {
+                line.split_once('=')
+                    .filter(|(name, _)| *name == key)
+                    .map(|(_, value)| value)
+            })
+            .unwrap()
     }
     fn health(dir: &Scratch) -> String {
         let health = dir.file("health.toml");
         let now = reference_health::unix_now().unwrap();
-        let state = reference_health::State::new(reference_health::Plan {
-            schema_version: 1, inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
-            own_ips: vec!["93.184.216.1".parse().unwrap()],
-            references: vec![reference_health::Target { server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap() }],
-        }, vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }], now).unwrap();
-        reference_health::Store::new(Path::new(&health)).unwrap().enroll(&state).unwrap();
+        let state = reference_health::State::new(
+            reference_health::Plan {
+                schema_version: 1,
+                inbound: "edge".into(),
+                endpoint: "edge.example.org:443".into(),
+                own_ips: vec!["93.184.216.1".parse().unwrap()],
+                references: vec![reference_health::Target {
+                    server_name: "reference.example.org".into(),
+                    address: "93.184.216.2:443".parse().unwrap(),
+                }],
+            },
+            vec![reference_health::Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
+            now,
+        )
+        .unwrap();
+        reference_health::Store::new(Path::new(&health))
+            .unwrap()
+            .enroll(&state)
+            .unwrap();
         health
     }
 
@@ -658,38 +686,129 @@ mod tests {
         let i = dir.file("invitation");
         let p = dir.file("profile.toml");
         let t = dir.file("trust.toml");
-        let a = ["identity-new","--inbound","edge","--endpoint","edge.example.org:443","--key",&k,"--confirm"];
+        let a = [
+            "identity-new",
+            "--inbound",
+            "edge",
+            "--endpoint",
+            "edge.example.org:443",
+            "--key",
+            &k,
+            "--confirm",
+        ];
         let identity = invoke(&a).unwrap();
-        let fingerprint = field(&identity,"identity_sha256");
-        assert_eq!(fingerprint.len(),64);
+        let fingerprint = field(&identity, "identity_sha256");
+        assert_eq!(fingerprint.len(), 64);
         let original_key = std::fs::read(&k).unwrap();
         assert!(invoke(&a).is_err());
-        assert_eq!(std::fs::read(&k).unwrap(),original_key);
-        let desc = ["descriptor-new","--health",&h,"--key",&k,"--output",&d,"--confirm"];
+        assert_eq!(std::fs::read(&k).unwrap(), original_key);
+        let desc = [
+            "descriptor-new",
+            "--health",
+            &h,
+            "--key",
+            &k,
+            "--output",
+            &d,
+            "--confirm",
+        ];
         let descriptor = invoke(&desc).unwrap();
-        let doc_digest = field(&descriptor,"document_sha256");
+        let doc_digest = field(&descriptor, "document_sha256");
         assert!(invoke(&desc).is_err());
         let raw = std::fs::read_to_string(&d).unwrap();
-        assert_eq!(hex(bootstrap::digest(&raw)),doc_digest);
-        invoke(&["invite-public","--health",&h,"--key",&k,"--descriptor",&d,"--output",&i,"--confirm"]).unwrap();
-        let preview = invoke(&["preview-import","--invitation",&i]).unwrap();
-        let digest = field(&preview,"document_sha256");
+        assert_eq!(hex(bootstrap::digest(&raw)), doc_digest);
+        invoke(&[
+            "invite-public",
+            "--health",
+            &h,
+            "--key",
+            &k,
+            "--descriptor",
+            &d,
+            "--output",
+            &i,
+            "--confirm",
+        ])
+        .unwrap();
+        let preview = invoke(&["preview-import", "--invitation", &i]).unwrap();
+        let digest = field(&preview, "document_sha256");
         let wrong = "0".repeat(64);
-        assert!(invoke(&["import","--invitation",&i,"--profile",&p,"--trust",&t,"--sha256",digest,"--identity-sha256",&wrong,"--token-ref","env:THEIA_TOKEN","--confirm"]).is_err());
+        assert!(invoke(&[
+            "import",
+            "--invitation",
+            &i,
+            "--profile",
+            &p,
+            "--trust",
+            &t,
+            "--sha256",
+            digest,
+            "--identity-sha256",
+            &wrong,
+            "--token-ref",
+            "env:THEIA_TOKEN",
+            "--confirm"
+        ])
+        .is_err());
         assert!(!Path::new(&p).exists());
         assert!(!Path::new(&t).exists());
-        assert!(invoke(&["import","--invitation",&i,"--profile",&p,"--trust",&t,"--sha256",digest,"--identity-sha256",fingerprint,"--token-ref","env:THEIA_TOKEN","--confirm"]).unwrap().contains("runtime UNCHANGED"));
-        let inspected = invoke(&["inspect","--profile",&p]).unwrap();
-        assert_eq!(field(&inspected,"revision"),"1");
-        assert_eq!(field(&inspected,"identity_sha256"),fingerprint);
+        assert!(invoke(&[
+            "import",
+            "--invitation",
+            &i,
+            "--profile",
+            &p,
+            "--trust",
+            &t,
+            "--sha256",
+            digest,
+            "--identity-sha256",
+            fingerprint,
+            "--token-ref",
+            "env:THEIA_TOKEN",
+            "--confirm"
+        ])
+        .unwrap()
+        .contains("runtime UNCHANGED"));
+        let inspected = invoke(&["inspect", "--profile", &p]).unwrap();
+        assert_eq!(field(&inspected, "revision"), "1");
+        assert_eq!(field(&inspected, "identity_sha256"), fingerprint);
         let saved = std::fs::read(&p).unwrap();
-        assert!(invoke(&["recovery-preview","--profile",&p,"--descriptor",&d]).is_err());
-        assert!(invoke(&["recovery-apply","--profile",&p,"--descriptor",&d,"--expected-revision","1","--sha256",doc_digest,"--identity-sha256",fingerprint,"--confirm"]).is_err());
-        assert_eq!(std::fs::read(&p).unwrap(),saved);
+        assert!(invoke(&["recovery-preview", "--profile", &p, "--descriptor", &d]).is_err());
+        assert!(invoke(&[
+            "recovery-apply",
+            "--profile",
+            &p,
+            "--descriptor",
+            &d,
+            "--expected-revision",
+            "1",
+            "--sha256",
+            doc_digest,
+            "--identity-sha256",
+            fingerprint,
+            "--confirm"
+        ])
+        .is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), saved);
         let next = dir.file("next");
-        assert!(invoke(&["descriptor-refresh","--health",&h,"--key",&k,"--previous",&d,"--output",&next,"--sha256",&wrong,"--confirm"]).is_err());
+        assert!(invoke(&[
+            "descriptor-refresh",
+            "--health",
+            &h,
+            "--key",
+            &k,
+            "--previous",
+            &d,
+            "--output",
+            &next,
+            "--sha256",
+            &wrong,
+            "--confirm"
+        ])
+        .is_err());
         assert!(!Path::new(&next).exists());
-        assert_eq!(std::fs::read_to_string(&d).unwrap(),raw);
+        assert_eq!(std::fs::read_to_string(&d).unwrap(), raw);
     }
 
     #[test]
@@ -701,28 +820,121 @@ mod tests {
         let p = dir.file("publication.toml");
         let d = dir.file("current");
         let successor = dir.file("successor");
-        for key in [&k,&next] {
-            invoke(&["identity-new","--inbound","edge","--endpoint","edge.example.org:443","--key",key,"--confirm"]).unwrap();
+        for key in [&k, &next] {
+            invoke(&[
+                "identity-new",
+                "--inbound",
+                "edge",
+                "--endpoint",
+                "edge.example.org:443",
+                "--key",
+                key,
+                "--confirm",
+            ])
+            .unwrap();
         }
-        let status = invoke(&["publish-new","--health",&h,"--key",&k,"--publication",&p,"--confirm"]).unwrap();
-        assert_eq!(field(&status,"revision"),"1");
-        assert_eq!(field(&status,"next_identity_sha256"),"none");
-        let observed = invoke(&["publish-status","--publication",&p]).unwrap();
-        assert_eq!(field(&observed,"snapshot_sha256"),field(&status,"snapshot_sha256"));
-        invoke(&["publish-export","--publication",&p,"--output",&d,"--confirm"]).unwrap();
+        let status = invoke(&[
+            "publish-new",
+            "--health",
+            &h,
+            "--key",
+            &k,
+            "--publication",
+            &p,
+            "--confirm",
+        ])
+        .unwrap();
+        assert_eq!(field(&status, "revision"), "1");
+        assert_eq!(field(&status, "next_identity_sha256"), "none");
+        let observed = invoke(&["publish-status", "--publication", &p]).unwrap();
+        assert_eq!(
+            field(&observed, "snapshot_sha256"),
+            field(&status, "snapshot_sha256")
+        );
+        invoke(&[
+            "publish-export",
+            "--publication",
+            &p,
+            "--output",
+            &d,
+            "--confirm",
+        ])
+        .unwrap();
         let original = std::fs::read(&d).unwrap();
-        assert!(invoke(&["publish-export","--publication",&p,"--output",&d,"--confirm"]).is_err());
-        assert_eq!(std::fs::read(&d).unwrap(),original);
-        assert!(invoke(&["successor-export","--publication",&p,"--output",&successor,"--confirm"]).is_err());
+        assert!(invoke(&[
+            "publish-export",
+            "--publication",
+            &p,
+            "--output",
+            &d,
+            "--confirm"
+        ])
+        .is_err());
+        assert_eq!(std::fs::read(&d).unwrap(), original);
+        assert!(invoke(&[
+            "successor-export",
+            "--publication",
+            &p,
+            "--output",
+            &successor,
+            "--confirm"
+        ])
+        .is_err());
         assert!(!Path::new(&successor).exists());
         let wrong = "0".repeat(64);
         let before = std::fs::read(&p).unwrap();
-        assert!(invoke(&["publish-refresh","--health",&h,"--publication",&p,"--sha256",&wrong,"--confirm"]).is_err());
-        assert!(invoke(&["failover-preview","--health",&h,"--publication",&p]).is_err());
-        assert!(invoke(&["failover-apply","--health",&h,"--publication",&p,"--sha256",&wrong,"--health-sha256",&wrong,"--reference","0","--confirm-recovery-plan"]).is_err());
-        assert!(invoke(&["rotation-stage","--publication",&p,"--next-key",&next,"--sha256",&wrong,"--identity-sha256",&wrong,"--confirm"]).is_err());
-        assert!(invoke(&["rotation-promote","--publication",&p,"--sha256",&wrong,"--identity-sha256",&wrong,"--confirm"]).is_err());
-        assert_eq!(std::fs::read(&p).unwrap(),before);
+        assert!(invoke(&[
+            "publish-refresh",
+            "--health",
+            &h,
+            "--publication",
+            &p,
+            "--sha256",
+            &wrong,
+            "--confirm"
+        ])
+        .is_err());
+        assert!(invoke(&["failover-preview", "--health", &h, "--publication", &p]).is_err());
+        assert!(invoke(&[
+            "failover-apply",
+            "--health",
+            &h,
+            "--publication",
+            &p,
+            "--sha256",
+            &wrong,
+            "--health-sha256",
+            &wrong,
+            "--reference",
+            "0",
+            "--confirm-recovery-plan"
+        ])
+        .is_err());
+        assert!(invoke(&[
+            "rotation-stage",
+            "--publication",
+            &p,
+            "--next-key",
+            &next,
+            "--sha256",
+            &wrong,
+            "--identity-sha256",
+            &wrong,
+            "--confirm"
+        ])
+        .is_err());
+        assert!(invoke(&[
+            "rotation-promote",
+            "--publication",
+            &p,
+            "--sha256",
+            &wrong,
+            "--identity-sha256",
+            &wrong,
+            "--confirm"
+        ])
+        .is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 
     #[test]
@@ -732,15 +944,90 @@ mod tests {
         let d = dir.file("descriptor");
         let h = "a".repeat(64);
         for args in [
-            vec!["inspect","--profile","relative.toml"],
-            vec!["identity-new","--inbound","edge","--endpoint","edge.example.org:443","--key",&p],
-            vec!["recovery-apply","--profile",&p,"--descriptor",&d,"--expected-revision","0","--sha256",&h,"--identity-sha256",&h,"--confirm"],
-            vec!["publish-refresh","--health",&p,"--publication",&d,"--sha256","xyz","--confirm"],
-            vec!["failover-apply","--health",&p,"--publication",&d,"--sha256",&h,"--health-sha256",&h,"--reference","3","--confirm-recovery-plan"],
+            vec!["inspect", "--profile", "relative.toml"],
+            vec![
+                "identity-new",
+                "--inbound",
+                "edge",
+                "--endpoint",
+                "edge.example.org:443",
+                "--key",
+                &p,
+            ],
+            vec![
+                "recovery-apply",
+                "--profile",
+                &p,
+                "--descriptor",
+                &d,
+                "--expected-revision",
+                "0",
+                "--sha256",
+                &h,
+                "--identity-sha256",
+                &h,
+                "--confirm",
+            ],
+            vec![
+                "publish-refresh",
+                "--health",
+                &p,
+                "--publication",
+                &d,
+                "--sha256",
+                "xyz",
+                "--confirm",
+            ],
+            vec![
+                "failover-apply",
+                "--health",
+                &p,
+                "--publication",
+                &d,
+                "--sha256",
+                &h,
+                "--health-sha256",
+                &h,
+                "--reference",
+                "3",
+                "--confirm-recovery-plan",
+            ],
         ] {
-            assert!(parse(&args).is_err(),"{args:?}");
+            assert!(parse(&args).is_err(), "{args:?}");
         }
-        assert!(parse(&["invite-issued","--health",&p,"--key",&p,"--descriptor",&d,"--server",&p,"--user","device-a","--token-file",&d,"--output",&p,"--confirm"]).is_ok());
-        assert!(parse(&["import","--invitation",&d,"--profile",&p,"--trust",&d,"--sha256",&h,"--identity-sha256",&h,"--confirm"]).is_ok());
+        assert!(parse(&[
+            "invite-issued",
+            "--health",
+            &p,
+            "--key",
+            &p,
+            "--descriptor",
+            &d,
+            "--server",
+            &p,
+            "--user",
+            "device-a",
+            "--token-file",
+            &d,
+            "--output",
+            &p,
+            "--confirm"
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "import",
+            "--invitation",
+            &d,
+            "--profile",
+            &p,
+            "--trust",
+            &d,
+            "--sha256",
+            &h,
+            "--identity-sha256",
+            &h,
+            "--confirm"
+        ])
+        .is_ok());
     }
 }

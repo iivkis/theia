@@ -244,27 +244,98 @@ mod tests {
         std::fs::write(&plan_path, &document).unwrap();
         let p = plan_path.to_str().unwrap();
         let s = state_path.to_str().unwrap();
-        let preview = run(parse(&["preview", "--plan", p]).unwrap()).await.unwrap();
-        assert!(preview.contains(&format!("document_sha256={}", hex(&health::digest(&document)))));
+        let preview = run(parse(&["preview", "--plan", p]).unwrap())
+            .await
+            .unwrap();
+        assert!(preview.contains(&format!(
+            "document_sha256={}",
+            hex(&health::digest(&document))
+        )));
         assert!(preview.contains("no network, no runtime Apply"));
         assert!(preview.contains("reference.example.com"));
         let wrong = "00".repeat(32);
-        assert!(matches!(run(parse(&["check","--plan",p,"--sha256",&wrong,"--confirm"]).unwrap()).await, Err(Error::Approval)));
-        assert!(matches!(run(parse(&["enroll","--plan",p,"--store",s,"--sha256",&wrong,"--confirm"]).unwrap()).await, Err(Error::Approval)));
+        assert!(matches!(
+            run(parse(&["check", "--plan", p, "--sha256", &wrong, "--confirm"]).unwrap()).await,
+            Err(Error::Approval)
+        ));
+        assert!(matches!(
+            run(parse(&[
+                "enroll",
+                "--plan",
+                p,
+                "--store",
+                s,
+                "--sha256",
+                &wrong,
+                "--confirm"
+            ])
+            .unwrap())
+            .await,
+            Err(Error::Approval)
+        ));
         assert!(!state_path.exists());
         let digest = hex(&plan.digest().unwrap());
-        let state = State::new(plan, vec![health::Evidence { h2_status: Some(200), h3_status: Some(200) }], health::unix_now().unwrap()).unwrap();
+        let state = State::new(
+            plan,
+            vec![health::Evidence {
+                h2_status: Some(200),
+                h3_status: Some(200),
+            }],
+            health::unix_now().unwrap(),
+        )
+        .unwrap();
         Store::new(&state_path).unwrap().enroll(&state).unwrap();
         let original = std::fs::read(&state_path).unwrap();
-        let report = run(parse(&["inspect","--store",s]).unwrap()).await.unwrap();
+        let report = run(parse(&["inspect", "--store", s]).unwrap())
+            .await
+            .unwrap();
         assert!(report.contains("revision=1"));
         assert!(report.contains("primary_status=Healthy"));
         assert!(report.contains(&format!("plan_sha256={digest}")));
-        assert!(matches!(run(parse(&["recheck","--store",s,"--expected-revision","2","--plan-sha256",&digest,"--confirm"]).unwrap()).await, Err(Error::Conflict)));
-        assert!(matches!(run(parse(&["recheck","--store",s,"--expected-revision","1","--plan-sha256",&wrong,"--confirm"]).unwrap()).await, Err(Error::Approval)));
-        assert!(matches!(run(parse(&["monitor","--store",s,"--plan-sha256",&wrong,"--confirm"]).unwrap()).await, Err(Error::Approval)));
+        assert!(matches!(
+            run(parse(&[
+                "recheck",
+                "--store",
+                s,
+                "--expected-revision",
+                "2",
+                "--plan-sha256",
+                &digest,
+                "--confirm"
+            ])
+            .unwrap())
+            .await,
+            Err(Error::Conflict)
+        ));
+        assert!(matches!(
+            run(parse(&[
+                "recheck",
+                "--store",
+                s,
+                "--expected-revision",
+                "1",
+                "--plan-sha256",
+                &wrong,
+                "--confirm"
+            ])
+            .unwrap())
+            .await,
+            Err(Error::Approval)
+        ));
+        assert!(matches!(
+            run(parse(&[
+                "monitor",
+                "--store",
+                s,
+                "--plan-sha256",
+                &wrong,
+                "--confirm"
+            ])
+            .unwrap())
+            .await,
+            Err(Error::Approval)
+        ));
         assert_eq!(std::fs::read(&state_path).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
     }
-
 }
