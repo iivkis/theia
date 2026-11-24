@@ -167,7 +167,7 @@ go_steps = re.findall(
     r"(?m)^      - uses: actions/setup-go@v5\n(?:        if: [^\n]+\n)?        with:\n((?:          [^\n]+\n)+)",
     workflow,
 )
-require(len(go_steps) == 6, "all test-only and formatter Go toolchains must be audited")
+require(len(go_steps) == 5, "all five pinned Go toolchains must be audited; post-green formatter Go was removed")
 for step in go_steps:
     require("cache: true" in step,
             "Go module/build cache must be enabled for recurring CI")
