@@ -362,7 +362,7 @@ async fn h2_tls_default_policy_rejects_private_ip_without_tcp_dial() {
                 address: Address::V4([127, 0, 0, 1]),
                 port: target.port(),
             },
-            true,
+            false,
         )
         .await;
         assert_eq!(
@@ -600,7 +600,7 @@ async fn default_acl_checks_server_resolved_localhost_before_dial() {
                 address: Address::Dns("localhost".into()),
                 port: destination.port(),
             },
-            true,
+            false,
         )
         .await;
         assert_eq!(
@@ -895,6 +895,50 @@ async fn h2_rejects_unnegotiated_padding_before_target_dial() {
             .unwrap(),
         );
         tx.send_data(Bytes::from(bytes), false).unwrap();
+        assert_eq!(
+            next_frame(&mut rx, &mut decoder, &mut queued).await,
+            Frame::Abort(ErrorCode::ProtocolError)
+        );
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
+        driver.abort();
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_request_eof_before_open_is_protocol_error_without_dial() {
+    timeout(Duration::from_secs(10), async {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (acceptor, connector) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, acceptor, Arc::new(context(true))));
+        let (mut sender, driver) = client(address, connector).await;
+        let (response, mut tx) = sender.send_request(request(&bearer()), false).unwrap();
+        let mut rx = response.await.unwrap().into_body();
+        let mut decoder = Decoder::new();
+        let mut queued = VecDeque::new();
+        send(
+            &mut tx,
+            &Frame::Hello {
+                version: VERSION,
+                capabilities: 0,
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            next_frame(&mut rx, &mut decoder, &mut queued).await,
+            Frame::HelloAck {
+                version: VERSION,
+                accepted_capabilities: 0
+            }
+        );
+        tx.send_data(Bytes::new(), true).unwrap();
         assert_eq!(
             next_frame(&mut rx, &mut decoder, &mut queued).await,
             Frame::Abort(ErrorCode::ProtocolError)
