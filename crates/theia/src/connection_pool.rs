@@ -39,6 +39,9 @@ impl<C> Lease<C> {
     pub(crate) fn connection(&self) -> &C { &self.entry.connection }
     pub(crate) fn id(&self) -> u32 { self.id }
     pub(crate) fn admitted(&mut self) { self.admitted = true; }
+    pub(crate) fn shares_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.entry, &other.entry)
+    }
 }
 impl<C> Drop for Lease<C> {
     fn drop(&mut self) {
@@ -86,6 +89,11 @@ impl<C> Pool<C> {
         }
         // Count draining connections as well as reusable ones; active
         // leases retain the permit even after their entry is evicted.
+        if self.connections.available_permits() == 0 {
+            if let Some(index) = entries.iter().position(|entry| entry.active.load(Ordering::Acquire) == 0) {
+                entries.remove(index);
+            }
+        }
         let permit = self.connections.clone().try_acquire_owned()
             .map_err(|_| ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))?;
         let connection = create.await?;

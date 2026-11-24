@@ -336,6 +336,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn pending_limit_burns_rejected_id_and_releases_on_cancel() {
+        let registry = Pair::new();
+        let mut pending = Vec::new();
+        for id in 1..=MAX_PENDING_PAIRS as u32 {
+            let mut wait = Box::pin(registry.join(id, Leg::Upload, id));
+            tokio::select! {
+                biased;
+                _ = &mut wait => panic!("unpaired leg must wait"),
+                _ = tokio::task::yield_now() => {}
+            }
+            pending.push(wait);
+        }
+        let overflow = MAX_PENDING_PAIRS as u32 + 1;
+        assert_eq!(registry.join(overflow, Leg::Upload, overflow).await, None);
+        pending.clear();
+        assert_eq!(registry.join(overflow, Leg::Download, overflow).await, None);
+        let fresh = overflow + 1;
+        let (a, b) = tokio::join!(
+            registry.join(fresh, Leg::Upload, 1),
+            registry.join(fresh, Leg::Download, 2),
+        );
+        assert_eq!((a, b), (Some((1, 2)), None));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn duplicate_or_other_connection_never_pairs() {
         let pair = Pair::new();
         let (a, b) = tokio::join!(pair.join(1, Leg::Upload, 1), pair.join(1, Leg::Upload, 2));

@@ -681,6 +681,12 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    /// True when both tunnels share one verified transport connection.
+    /// Does not reveal peer addresses, credentials or connection identifiers.
+    pub fn shares_transport_with(&self, other: &Self) -> bool {
+        self._lease.shares_connection(&other._lease)
+    }
+
     /// Relay a local duplex byte stream after OPEN_OK. Each direction has
     /// independent flow control, one bounded frame buffer and FIN state.
     pub async fn relay<S>(mut self, local: S) -> Result<(), ClientError>

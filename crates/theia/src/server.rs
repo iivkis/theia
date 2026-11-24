@@ -236,6 +236,7 @@ impl ServerContext {
             || request.method() != Method::POST
             || request.uri().path() != self.security_mode.path()
             || request.uri().query().is_some()
+            || request.headers().contains_key(crate::split_http::PAIR_HEADER)
             || request
                 .headers()
                 .get_all(header::CONTENT_TYPE)

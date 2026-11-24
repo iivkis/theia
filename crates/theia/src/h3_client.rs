@@ -495,6 +495,12 @@ pub struct H3Tunnel {
 }
 
 impl H3Tunnel {
+    /// True when both tunnels share one verified transport connection.
+    /// Does not reveal peer addresses, credentials or connection identifiers.
+    pub fn shares_transport_with(&self, other: &Self) -> bool {
+        self._lease.shares_connection(&other._lease)
+    }
+
     pub async fn relay<S>(mut self, local: S) -> Result<(), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
