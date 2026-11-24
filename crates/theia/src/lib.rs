@@ -38,6 +38,7 @@ pub mod reality_admission;
 pub mod reality_bootstrap;
 pub mod reality_cli;
 pub mod reality_config;
+pub mod reality_generation;
 pub mod reality_provision;
 pub mod reality_tcp;
 pub mod reference_cli;

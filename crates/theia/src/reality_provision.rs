@@ -143,6 +143,14 @@ pub fn inspect_registered(
     scope: &Scope,
     now: u64,
 ) -> Result<crate::descriptor::Verified, Error> {
+    let (record, _admission) = registered_material(directory, binding, state, scope)?;
+    Publication::new(&directory.join(PUBLICATION))?.inspect_rooted(scope,
+        binding.identity_sha256, record.initial_payload_sha256, record.plan_sha256, now)
+}
+
+fn registered_material(
+    directory: &Path, binding: &crate::config::RealityBinding, state: &State, scope: &Scope,
+) -> Result<(Record, Secret), Error> {
     use subtle::ConstantTimeEq;
     let record = read_manifest(directory)?;
     if &record.scope != scope || record.health_sha256 != binding.initial_health_sha256
@@ -155,8 +163,19 @@ pub fn inspect_registered(
     if !bool::from(admission.commitment().ct_eq(&record.admission_commitment)) {
         return Err(Error::Credential);
     }
-    Publication::new(&directory.join(PUBLICATION))?.inspect_rooted(scope,
-        binding.identity_sha256, record.initial_payload_sha256, record.plan_sha256, now)
+    Ok((record, admission))
+}
+
+/// Root and material are validated together before a new local candidate
+/// generation is constructed. This does not bind a socket or enable a backend.
+pub(crate) fn capture_registered(
+    directory: &Path, binding: &crate::config::RealityBinding, state: &State,
+    scope: &Scope, now: u64,
+) -> Result<(crate::identity_publication::CapturedPublication, Secret), Error> {
+    let (record, admission) = registered_material(directory, binding, state, scope)?;
+    let captured = Publication::new(&directory.join(PUBLICATION))?.capture_rooted(
+        state, scope, binding.identity_sha256, record.initial_payload_sha256, now)?;
+    Ok((captured, admission))
 }
 
 /// Reopen an initial, unmodified provisioning receipt. An independent

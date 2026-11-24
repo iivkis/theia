@@ -297,6 +297,8 @@ impl CapturedPublication {
     pub fn generation(&self) -> u64 { self.generation }
     pub fn snapshot_sha256(&self) -> [u8; 32] { self.snapshot_sha256 }
     pub fn plan_sha256(&self) -> [u8; 32] { self.plan_sha256 }
+    pub fn active(&self) -> &PublishedIdentity { &self.active }
+    pub fn next(&self) -> Option<&PublishedIdentity> { self.next.as_ref() }
 
     /// Selection uses the exact independently authenticated public identity.
     /// Old admission cannot select the next signer, or vice versa.
@@ -408,6 +410,16 @@ impl Publication {
         Ok(checked.current)
     }
 
+    fn check_root(record: &Record, scope: &Scope, expected_root: [u8; 32],
+        expected_initial: [u8; 32], expected_plan: [u8; 32]) -> Result<(), Error> {
+        let (root, initial, _) = record.lineage()?;
+        if &record.scope != scope || bootstrap::fingerprint(root) != expected_root
+            || initial.payload_sha256() != expected_initial || record.plan_sha256 != expected_plan {
+            return Err(Error::Approval);
+        }
+        Ok(())
+    }
+
     /// Reopen the current signed publication only when its complete
     /// lineage matches the independently pinned initial receipt. The
     /// returned status is local and does not authorize activation.
@@ -417,11 +429,7 @@ impl Publication {
     ) -> Result<Verified, Error> {
         let (_, record, checked) = self.snapshot()?;
         record.check_clock(now)?;
-        let (root, initial, _) = record.lineage()?;
-        if &record.scope != scope || bootstrap::fingerprint(root) != expected_root
-            || initial.payload_sha256() != expected_initial || record.plan_sha256 != expected_plan {
-            return Err(Error::Approval);
-        }
+        Self::check_root(&record, scope, expected_root, expected_initial, expected_plan)?;
         Ok(checked.current)
     }
 
@@ -435,9 +443,31 @@ impl Publication {
         now: u64,
     ) -> Result<CapturedPublication, Error> {
         let (raw, record, checked) = self.snapshot()?;
+        if bootstrap::digest(&raw) != expected_snapshot {
+            return Err(Error::Approval);
+        }
+        Self::capture_checked(record, checked, expected_snapshot, state, now)
+    }
+
+    /// Validate the independent root and capture both key generations from
+    /// the SAME file read. Never use a separately inspected snapshot to
+    /// authorize keys from a later, potentially replaced publication.
+    pub(crate) fn capture_rooted(
+        &self, state: &reference_health::State, scope: &Scope,
+        expected_root: [u8; 32], expected_initial: [u8; 32], now: u64,
+    ) -> Result<CapturedPublication, Error> {
+        let (raw, record, checked) = self.snapshot()?;
+        Self::check_root(&record, scope, expected_root, expected_initial,
+            state.plan().digest().map_err(|_| Error::Health)?)?;
+        Self::capture_checked(record, checked, bootstrap::digest(&raw), state, now)
+    }
+
+    fn capture_checked(
+        record: Record, checked: Checked, expected_snapshot: [u8; 32],
+        state: &reference_health::State, now: u64,
+    ) -> Result<CapturedPublication, Error> {
         record.check_clock(now)?;
-        if bootstrap::digest(&raw) != expected_snapshot
-            || state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256 {
+        if state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256 {
             return Err(Error::Approval);
         }
         checked.current.check_time(now).map_err(|_| Error::Descriptor)?;
