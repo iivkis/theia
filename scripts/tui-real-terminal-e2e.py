@@ -353,6 +353,10 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
         review(tty, "x", "Остановить локальный клиент?")
         confirm(tty, "Локальный клиент остановлен")
         proxy_status(binary, "NoJournal")
+        for port in (http_port, socks_port):
+            with socket.socket() as sock:
+                sock.settimeout(2)
+                assert sock.connect_ex(("127.0.0.1", port)) != 0, "listener leaked after stop"
         tty.send("\x1b")
         tty.wait("Редактор TOML")
         tty.send("q")
@@ -366,8 +370,19 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     try:
         local_start(tty)
         apply(tty)
+        # Explicit process termination, never a graceful Ctrl+C/close request.
+        killed = subprocess.run(
+            ["taskkill", "/PID", str(tty.win.pid), "/F"],
+            capture_output=True, timeout=10, check=False,
+        )
+        assert killed.returncode == 0, "could not hard-kill compiled TUI"
+        deadline = time.monotonic() + 7
+        while tty.alive() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not tty.alive(), "compiled TUI survived hard kill"
     finally:
-        tty.close(expect_success=False)
+        if tty.alive():
+            tty.close(expect_success=False)
     proxy_status(binary, "PendingOwned")
 
     tty = open_panel()

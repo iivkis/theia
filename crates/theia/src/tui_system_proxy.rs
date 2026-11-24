@@ -266,8 +266,12 @@ async fn run(
                 worker.local = None;
                 let result = worker.stop().await;
                 let message = match result {
-                    Ok(()) => "Локальный клиент неожиданно завершился; собственный lease завершён.".into(),
-                    Err(error) => format!("Клиент завершился; восстановление не подтверждено: {error}."),
+                    Ok(()) => {
+                        "Локальный клиент неожиданно завершился; собственный lease завершён.".into()
+                    }
+                    Err(error) => {
+                        format!("Клиент завершился; восстановление не подтверждено: {error}.")
+                    }
                 };
                 if events.send(Event { view: worker.view(), message, review: false }).is_err() {
                     break;

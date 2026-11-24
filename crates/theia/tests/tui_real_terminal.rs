@@ -397,18 +397,15 @@ impl Drop for TempDir {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "disposable Windows CI only: actual ConPTY changes per-user WinINet"]
 async fn compiled_client_proxy_conpty_lifecycle() {
-    use std::io;
-    use tokio::net::TcpListener as AsyncListener;
     use theia::client_import::PrivateBearer;
+    use tokio::net::TcpListener as AsyncListener;
 
     assert_eq!(
         std::env::var("THEIA_WINDOWS_PROXY_E2E_ALLOWED").as_deref(),
         Ok("yes")
     );
-    let base = std::env::temp_dir().join(format!(
-        "theia-client-proxy-conpty-{}",
-        std::process::id()
-    ));
+    let base =
+        std::env::temp_dir().join(format!("theia-client-proxy-conpty-{}", std::process::id()));
     fs::create_dir(&base).unwrap();
     let _cleanup = TempDir(base.clone());
     let cert_path = base.join("cert.pem");
@@ -490,15 +487,12 @@ async fn compiled_client_proxy_conpty_lifecycle() {
     let echo = AsyncListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo.local_addr().unwrap().port();
     let echo_task = tokio::spawn(async move {
-        loop {
-            let (socket, _) = echo.accept().await?;
+        while let Ok((socket, _)) = echo.accept().await {
             tokio::spawn(async move {
                 let (mut reader, mut writer) = socket.into_split();
                 let _ = tokio::io::copy(&mut reader, &mut writer).await;
             });
         }
-        #[allow(unreachable_code)]
-        Ok::<(), io::Error>(())
     });
 
     let bearer = PrivateBearer::create(&client_file, &[42; 32]).unwrap();

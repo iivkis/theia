@@ -160,7 +160,10 @@ impl Journal {
             .and_then(|(http, https)| (http == https).then_some(http))
             .and_then(|value| value.parse().ok())
             .ok_or(ProxyError::Journal)?;
-        let expected = self.before.for_loopback(bind).map_err(|_| ProxyError::Journal)?;
+        let expected = self
+            .before
+            .for_loopback(bind)
+            .map_err(|_| ProxyError::Journal)?;
         if expected != self.applied || self.before == self.applied {
             return Err(ProxyError::Journal);
         }
@@ -793,7 +796,10 @@ impl OwnedProxy {
         Self::apply_inner(bind, None)
     }
 
-    pub(crate) fn apply_reviewed(bind: SocketAddr, review: ApplyReview) -> Result<Self, ProxyError> {
+    pub(crate) fn apply_reviewed(
+        bind: SocketAddr,
+        review: ApplyReview,
+    ) -> Result<Self, ProxyError> {
         Self::apply_inner(bind, Some(review))
     }
 
