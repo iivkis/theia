@@ -97,6 +97,24 @@ impl PreparedFixture {
         users: &[User],
         policy: &ServerPolicy,
     ) -> Result<Self, ServerError> {
+        Self::build(tcp, identity, signed, inbound, users, policy, None)
+    }
+
+    /// Exercise admission and identity verification with real native
+    /// carriers, without contacting an external reference.
+    pub fn new_admitted(
+        tcp: TcpListener, identity: &Identity, signed: &str,
+        inbound: &Inbound, users: &[User], policy: &ServerPolicy,
+        admission: (Arc<crate::reality_admission::Secret>, Arc<crate::reality_admission::ReplayGuard>),
+    ) -> Result<Self, ServerError> {
+        Self::build(tcp, identity, signed, inbound, users, policy, Some(admission))
+    }
+
+    fn build(
+        tcp: TcpListener, identity: &Identity, signed: &str,
+        inbound: &Inbound, users: &[User], policy: &ServerPolicy,
+        admission: Option<(Arc<crate::reality_admission::Secret>, Arc<crate::reality_admission::ReplayGuard>)>,
+    ) -> Result<Self, ServerError> {
         let local = tcp.local_addr().map_err(|_| ServerError::Io)?;
         if !local.ip().is_loopback()
             || identity.scope().endpoint != local.to_string()
@@ -124,16 +142,18 @@ impl PreparedFixture {
             &value,
             Arc::from(signed),
         )?);
-        let tls = identity
-            .server_tls("localhost", Branch::H2)
-            .map_err(|_| ServerError::Tls)?;
+        let tls = match &admission {
+            Some((secret, guard)) => crate::identity_tls::checked_server_tls(identity, &value, Branch::H2, secret.clone(), guard.clone()),
+            None => identity.server_tls("localhost", Branch::H2),
+        }.map_err(|_| ServerError::Tls)?;
         let h2 = TlsAcceptor::from(Arc::new(tls));
         let h3 = if value.descriptor().h3 {
             Some(
                 quinn::Endpoint::server(
-                    identity
-                        .quic_server("localhost")
-                        .map_err(|_| ServerError::Tls)?,
+                    match &admission {
+                        Some((secret, guard)) => crate::identity_tls::checked_quic_server(identity, &value, secret.clone(), guard.clone()),
+                        None => identity.quic_server("localhost"),
+                    }.map_err(|_| ServerError::Tls)?,
                     local,
                 )
                 .map_err(|_| ServerError::Io)?,
@@ -210,6 +230,18 @@ impl FixtureClient {
         let carrier = match branch {
             Branch::H2 => Carrier::H2(H2Client::identity_fixture(remote, token, &value)?),
             Branch::H3 => Carrier::H3(H3Client::identity_fixture(remote, token, &value)?),
+        };
+        Ok(Self { carrier, value })
+    }
+
+    pub fn new_admitted(
+        remote: SocketAddr, token: &str, value: Verified, branch: Branch,
+        secret: Arc<crate::reality_admission::Secret>,
+    ) -> Result<Self, ClientError> {
+        value.check_time(now()?).map_err(|_| ClientError::Tls)?;
+        let carrier = match branch {
+            Branch::H2 => Carrier::H2(H2Client::admitted_fixture(remote, token, &value, secret)?),
+            Branch::H3 => Carrier::H3(H3Client::admitted_fixture(remote, token, &value, secret)?),
         };
         Ok(Self { carrier, value })
     }

@@ -559,3 +559,87 @@ async fn native_admission_callbacks_complete_full_tls_and_quic_before_applicatio
         server_task.await.unwrap();
     }).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admitted_native_application_carriers_and_descriptor_refresh() {
+    timeout(DEADLINE, async {
+        let tcp = bind().await;
+        let remote = tcp.local_addr().unwrap();
+        let scope = Scope {
+            inbound: "edge".into(),
+            endpoint: remote.to_string(),
+        };
+        let identity = Identity::generate(scope.clone()).unwrap();
+        let now = reference_health::unix_now().unwrap();
+        let first = value(scope, true, now);
+        let first_raw = identity.sign_descriptor(&first).unwrap();
+        let mut second = first.clone();
+        second.revision = 2;
+        let second_raw = identity.sign_descriptor(&second).unwrap();
+        let (inbound, users) = config(remote);
+        let secret = std::sync::Arc::new(theia::reality_admission::Secret::generate().unwrap());
+        let guard = std::sync::Arc::new(theia::reality_admission::ReplayGuard::new(65536, now.saturating_sub(121)).unwrap());
+        let server = PreparedFixture::new_admitted(tcp, &identity, &second_raw, &inbound, &users, &policy(true), (secret.clone(), guard)).unwrap();
+        let server = tokio::spawn(server.serve());
+        let scratch = Scratch::new();
+        for (branch, mode) in [
+            (Branch::H2, XhttpMode::StreamOne),
+            (Branch::H2, XhttpMode::StreamUp),
+            (Branch::H3, XhttpMode::StreamOne),
+            (Branch::H3, XhttpMode::StreamUp),
+        ] {
+            let anchor = anchor(&identity, mode);
+            let verified = descriptor::verify(&first_raw, &anchor).unwrap();
+            let client =
+                FixtureClient::new_admitted(remote, &URL_SAFE_NO_PAD.encode(TOKEN), verified, branch, secret.clone())
+                    .unwrap();
+            let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = target.local_addr().unwrap().port();
+            let echo = tokio::spawn(async move {
+                let (mut socket, _) = target.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                socket.read_to_end(&mut bytes).await.unwrap();
+                socket.write_all(&bytes).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let tunnel = client
+                .open(Address::Dns("localhost".into()), port)
+                .await
+                .unwrap();
+            let (mut app, local) = tokio::io::duplex(4096);
+            let relay = tokio::spawn(tunnel.relay(local));
+            let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+            app.write_all(&payload).await.unwrap();
+            app.shutdown().await.unwrap();
+            let mut returned = Vec::new();
+            app.read_to_end(&mut returned).await.unwrap();
+            assert_eq!(returned, payload);
+            relay.await.unwrap().unwrap();
+            echo.await.unwrap();
+
+            let path = scratch.0.join(format!("{branch:?}-{mode:?}.toml"));
+            let store = Store::new(&path, anchor.clone()).unwrap();
+            store.initialize(&first_raw, now).unwrap();
+            assert_eq!(
+                client.refresh(&store).await.unwrap(),
+                descriptor::Change::Advanced
+            );
+            let reopened = Store::new(&path, anchor).unwrap();
+            assert_eq!(
+                reopened
+                    .load(reference_health::unix_now().unwrap())
+                    .unwrap()
+                    .descriptor()
+                    .revision,
+                2
+            );
+            // A client holding the old immutable snapshot cannot overwrite a
+            // newer snapshot. It must reopen the verified store first.
+            assert!(client.refresh(&reopened).await.is_err());
+        }
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+

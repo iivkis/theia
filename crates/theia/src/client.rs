@@ -155,26 +155,37 @@ impl H2Client {
     }
 
     pub(crate) fn identity_fixture(
-        remote: std::net::SocketAddr,
-        token: &str,
-        value: &crate::descriptor::Verified,
+        remote: std::net::SocketAddr, token: &str, value: &crate::descriptor::Verified,
     ) -> Result<Self, ClientError> {
         let d = value.descriptor();
-        if !remote.ip().is_loopback()
-            || d.scope.endpoint != remote.to_string()
-            || !value.effective_modes().h2
-        {
+        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string() || !value.effective_modes().h2 {
             return Err(ClientError::Configuration);
         }
-        let tls = crate::identity_tls::client_tls(
-            &d.scope,
-            value.signer(),
-            crate::identity_tls::Branch::H2,
-        )
-        .map_err(|_| ClientError::Tls)?;
+        let tls = crate::identity_tls::client_tls(&d.scope, value.signer(), crate::identity_tls::Branch::H2).map_err(|_| ClientError::Tls)?;
+        Self::identity_carrier(remote, "localhost", token, value, tls)
+    }
+
+    pub(crate) fn admitted_fixture(
+        remote: std::net::SocketAddr, token: &str, value: &crate::descriptor::Verified,
+        secret: Arc<crate::reality_admission::Secret>,
+    ) -> Result<Self, ClientError> {
+        let d = value.descriptor();
+        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string() || !value.effective_modes().h2 {
+            return Err(ClientError::Configuration);
+        }
+        let name = &d.references.get(usize::from(d.active_reference)).ok_or(ClientError::Configuration)?.server_name;
+        let tls = crate::identity_tls::admitted_client_tls(value, crate::identity_tls::Branch::H2, secret).map_err(|_| ClientError::Tls)?;
+        Self::identity_carrier(remote, name, token, value, tls)
+    }
+
+    fn identity_carrier(
+        remote: std::net::SocketAddr, name: &str, token: &str, value: &crate::descriptor::Verified,
+        tls: rustls::ClientConfig,
+    ) -> Result<Self, ClientError> {
+        let d = value.descriptor();
         let mut client = Self::with_connector(
             &remote.to_string(),
-            "localhost",
+            name,
             token,
             H2Tls::Rustls(TlsConnector::from(Arc::new(tls))),
             H2WireShape::Standard,
@@ -182,7 +193,7 @@ impl H2Client {
         let routes = crate::split_http::IdentityRoutes::new(&d.path_prefix)?;
         client.uri = http::Uri::builder()
             .scheme("https")
-            .authority("localhost")
+            .authority(name)
             .path_and_query(routes.single.as_str())
             .build()
             .map_err(|_| ClientError::Configuration)?;

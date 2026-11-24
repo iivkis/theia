@@ -77,29 +77,44 @@ impl H3Client {
     }
 
     pub(crate) fn identity_fixture(
-        remote: SocketAddr,
-        token: &str,
-        value: &crate::descriptor::Verified,
+        remote: SocketAddr, token: &str, value: &crate::descriptor::Verified,
     ) -> Result<Self, ClientError> {
         let d = value.descriptor();
-        if !remote.ip().is_loopback()
-            || d.scope.endpoint != remote.to_string()
-            || !value.effective_modes().h3
-        {
+        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string() || !value.effective_modes().h3 {
             return Err(ClientError::Configuration);
         }
-        let quic = crate::identity_tls::quic_client(&d.scope, value.signer())
-            .map_err(|_| ClientError::Tls)?;
+        let quic = crate::identity_tls::quic_client(&d.scope, value.signer()).map_err(|_| ClientError::Tls)?;
+        Self::identity_carrier(remote, "localhost", token, value, quic)
+    }
+
+    pub(crate) fn admitted_fixture(
+        remote: SocketAddr, token: &str, value: &crate::descriptor::Verified,
+        secret: Arc<crate::reality_admission::Secret>,
+    ) -> Result<Self, ClientError> {
+        let d = value.descriptor();
+        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string() || !value.effective_modes().h3 {
+            return Err(ClientError::Configuration);
+        }
+        let name = &d.references.get(usize::from(d.active_reference)).ok_or(ClientError::Configuration)?.server_name;
+        let quic = crate::identity_tls::admitted_quic_client(value, secret).map_err(|_| ClientError::Tls)?;
+        Self::identity_carrier(remote, name, token, value, quic)
+    }
+
+    fn identity_carrier(
+        remote: SocketAddr, name: &str, token: &str, value: &crate::descriptor::Verified,
+        quic: quinn::ClientConfig,
+    ) -> Result<Self, ClientError> {
+        let d = value.descriptor();
         let routes = crate::split_http::IdentityRoutes::new(&d.path_prefix)?;
         let uri = Uri::builder()
             .scheme("https")
-            .authority("localhost")
+            .authority(name)
             .path_and_query(routes.single.as_str())
             .build()
             .map_err(|_| ClientError::Configuration)?;
         let mut client = Self {
             remote,
-            name: "localhost".into(),
+            name: name.to_owned(),
             uri,
             authorization: bearer_header(token)?,
             roots: RootCertStore::empty(),
