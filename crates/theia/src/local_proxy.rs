@@ -232,15 +232,20 @@ impl RealityClient {
         let enrollment = crate::reality_config::pinned_client(profile).map_err(|_| ClientError::Configuration)?;
         let value = enrollment.load(Self::now()?).map_err(|_| ClientError::Tls)?;
         let remote = resolve_server(profile).await?;
-        let first = Self::build(profile, remote, &enrollment, value)?;
+        let first = Self::build(profile, remote, &enrollment, value, None)?;
         Ok(Self { profile: profile.clone(), remote, current: tokio::sync::Mutex::new(Arc::new(first)),
             changed: Notify::new() })
     }
     fn build(profile: &Profile, remote: SocketAddr, enrollment: &crate::reality_bootstrap::Profile,
-        value: crate::descriptor::Verified) -> Result<RealityGeneration, ClientError> {
+        value: crate::descriptor::Verified, expected_credential: Option<[u8;32]>) -> Result<RealityGeneration, ClientError> {
         if value.descriptor().scope.endpoint != profile.server { return Err(ClientError::Configuration); }
         let secret = Arc::new(enrollment.admission().map_err(|_| ClientError::Tls)?);
         let token = read_token(profile)?;
+        use sha2::{Digest, Sha256};
+        let credential_digest: [u8;32] = Sha256::digest(token.as_bytes()).into();
+        if expected_credential.is_some_and(|expected| expected != credential_digest) {
+            return Err(ClientError::Configuration);
+        }
         let modes = value.effective_modes();
         let ttl = Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s));
         let timeout = Duration::from_millis(u64::from(profile.quic_connect_timeout_ms));
@@ -260,8 +265,6 @@ impl RealityClient {
             (None,Some(h3)) => RealityCarrier::H3(h3),
             _ => return Err(ClientError::Configuration),
         };
-        use sha2::{Digest, Sha256};
-        let credential_digest = Sha256::digest(token.as_bytes()).into();
         Ok(RealityGeneration { value, carrier, credential_digest })
     }
     async fn generation(&self) -> Result<Arc<RealityGeneration>, ClientError> {
@@ -283,7 +286,8 @@ impl RealityClient {
         } else if value.descriptor().revision <= old.descriptor().revision {
             return Err(ClientError::Tls);
         }
-        let next = Arc::new(Self::build(&self.profile, self.remote, &enrollment, value)?);
+        let next = Arc::new(Self::build(&self.profile, self.remote, &enrollment, value,
+            Some(slot.credential_digest))?);
         *slot = next.clone();
         self.changed.notify_one();
         Ok(next)
@@ -302,9 +306,9 @@ impl RealityClient {
         let signed = match &generation.carrier {
             RealityCarrier::H2(h2) => h2.fetch_identity_descriptor().await?,
             RealityCarrier::H3(h3) => h3.fetch_identity_descriptor().await?,
-            // Descriptor refresh must preserve identity; use the permitted
-            // H2 carrier, never a CA-verified or arbitrary discovery request.
-            RealityCarrier::Auto(auto) => auto.h2.fetch_identity_descriptor().await?,
+            // Same route-generation and two-silent-attempt policy as the
+            // ordinary auto tunnel. Authentication/HTTP errors are terminal.
+            RealityCarrier::Auto(auto) => auto.fetch_identity_descriptor().await?,
         };
         store.update_matching(&signed, &generation.value, Self::now()?).map_err(|_| ClientError::Tls)?;
         Ok(())
@@ -530,6 +534,25 @@ impl AutoClient {
                 }
             }
         }
+    }
+
+    async fn fetch_identity_descriptor(&self) -> Result<String, ClientError> {
+        let (generation,cached) = self.observe()?;
+        if !cached {
+            for attempt in 0..AUTO_QUIC_ATTEMPTS {
+                match self.h3.fetch_identity_descriptor().await {
+                    Ok(value) => { self.complete(generation,false)?; return Ok(value); }
+                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
+                        if self.observe()?.0 != generation { return Err(ClientError::QuicUnreachable); }
+                    }
+                    Err(ClientError::QuicUnreachable) => {
+                        if !self.complete(generation,true)? { return Err(ClientError::QuicUnreachable); }
+                    }
+                    Err(error) => { self.complete(generation,false)?; return Err(error); }
+                }
+            }
+        }
+        self.h2.fetch_identity_descriptor().await
     }
 
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {

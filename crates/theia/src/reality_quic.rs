@@ -106,7 +106,7 @@ impl Session {
                     // The first post-Retry Initial must echo the exact
                     // token on the original path. Do not accept another
                     // server CID as a replacement before that exchange.
-                    return h.token == retry.token && (h.dcid == retry.cid
+                    return peer == self.first_peer && h.token == retry.token && (h.dcid == retry.cid
                         || (self.retry_echoed && self.server_initial && self.server.contains(h.dcid)));
                 }
             }
@@ -555,8 +555,11 @@ impl PreparedQuic {
                         let initial_continuation = header.as_ref().is_some_and(|h|
                             admitted.iter().any(|((addr, _), (scid, until))|
                                 *addr == peer && *until > now && h.scid == scid.as_slice()));
-                        let initial_current = !is_initial || crate::reference_health::unix_now().is_ok_and(|wall|
-                            self.generation.publication().active().verified().check_time(wall).is_ok());
+                        let initial_current = !is_initial || crate::reference_health::unix_now().is_ok_and(|wall| {
+                            let value = self.generation.publication().active().verified();
+                            value.check_time(wall).is_ok()
+                                && self.generation.health().validate_active(value.descriptor(),wall).is_ok()
+                        });
                         if n <= LOCAL_MAX && initial_current && (!is_initial || existing_local || initial_continuation) {
                             let _ = self.local.try_send((peer, data.to_vec()));
                         }
@@ -591,7 +594,8 @@ impl PreparedQuic {
                     let Ok(wall) = crate::reference_health::unix_now() else { continue; };
                     let publication = self.generation.publication();
                     let value = publication.active().verified();
-                    if value.check_time(wall).is_err() { continue; }
+                    if value.check_time(wall).is_err()
+                        || self.generation.health().validate_active(value.descriptor(),wall).is_err() { continue; }
                     let d = value.descriptor();
                     let Some(reference) = d.references.get(usize::from(d.active_reference)) else { continue; };
                     let secret = self.generation.admission();

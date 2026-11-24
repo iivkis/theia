@@ -11,10 +11,12 @@ the existing SOCKS5/CONNECT relay and conservative auto transport. New
 logical operations check the durable signed trust state and credential
 digest; a changed signed revision gets a new carrier pool and fallback
 cache. Authenticated descriptor refresh is bounded and tied to the running
-proxy. Existing tunnels retain their carrier leases.
+proxy; auto uses the same H3-first, two silent attempts, route-scoped
+fallback rules as new tunnels. Existing tunnels retain their carrier leases.
 
 This is development code, not a release acceptance claim. REALITY
-server startup supports a single immutable signer/generation, with
+server startup supports a single immutable signer/generation, fails closed
+for new handshakes when captured health or descriptor validity expires, with
 status-only IPC for any configuration containing REALITY; mixed inbounds
 do not support the existing own-TLS live mutation operations in this
 candidate. Dual identity, live reference/descriptor generation changes,
@@ -30,5 +32,8 @@ CID issuance and PATH_RESPONSE cannot be observed; an unknown CID on a
 new tuple is dropped and the external cap is not lifted. Native Quinn
 handles authenticated validation and CID retirement for admitted traffic.
 
-Tests for Retry continuity, retirement, and closed paths are authored.
+Tests for Retry continuity, retirement, closed paths, registered startup,
+H2 HTTP CONNECT, and H3 SOCKS5 are authored. The latter uses synthetic
+reference evidence and loopback application I/O, not actual public relay
+interoperability.
 All build/test/coverage acceptance is deferred to the post-merge main CI.

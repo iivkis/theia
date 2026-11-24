@@ -356,7 +356,8 @@ impl PreparedTcp {
                         let publication = backend.lease.publication();
                         let material = publication.active();
                         let value = material.verified();
-                        if value.check_time(now).is_err() { return; }
+                        if value.check_time(now).is_err()
+                            || backend.lease.health().validate_active(value.descriptor(),now).is_err() { return; }
                         let Ok(reference) = active_reference(value) else { return; };
                         let secret = backend.lease.admission();
                         let admission = Context { scope: &value.descriptor().scope,

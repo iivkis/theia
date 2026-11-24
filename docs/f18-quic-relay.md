@@ -1,6 +1,8 @@
 # F-18: prepared external QUIC v1 backend
 
-This development candidate is not activated by normal production startup.
+This development candidate is now connected to normal server startup for
+registered REALITY configurations. It is not release-accepted; see
+f18-runtime.md for the startup and management limitations.
 It composes the registered immutable generation, QUIC Initial admission,
 the native H3 application endpoint, and a byte-exact UDP reference relay.
 
@@ -57,5 +59,5 @@ connected-loopback UDP fixture checks byte preservation, isolation of two
 physical paths and rejection of a foreign source.
 Independent real reference QUIC E2E (Retry, migration, CID rotation,
 probe parity, quota exhaustion), admitted path lifetime/retirement,
-production multi-inbound activation and post-merge CI remain required.
+live multi-inbound management/rotation and post-merge CI remain required.
 No build, test, or coverage result is claimed for development commits.
