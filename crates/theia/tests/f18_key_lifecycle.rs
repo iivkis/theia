@@ -7,8 +7,15 @@ mod lab;
 
 use lab::{Branch, Failure, ReplayWindow, Transcript};
 use ring::{
-    rand::SystemRandom,
+    rand::{SecureRandom, SystemRandom},
     signature::{Ed25519KeyPair, KeyPair},
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
 };
 
 const MAX_PINS: usize = 2;
@@ -31,7 +38,8 @@ const EDGE: Scope = Scope {
     port: 443,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Pin {
     key: [u8; 32],
     valid_from: u64,
@@ -461,4 +469,385 @@ fn emergency_deny_all_retires_unexpired_pins_and_requires_new_trust() {
             Ok(())
         );
     }
+}
+
+// This is a research checkpoint for public trust metadata, not a production
+// persistence format. The expected digest must come from a separately
+// trusted, non-rollbackable source; storing it beside the file is insufficient.
+const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Checkpoint {
+    version: u32,
+    inbound: String,
+    host: String,
+    port: u16,
+    generation: u64,
+    pins: Vec<Pin>,
+    retired: Vec<[u8; 32]>,
+    last_ms: u64,
+}
+
+struct Anchor {
+    generation: u64,
+    digest: [u8; 32],
+}
+
+fn checkpoint(trust: &Trust) -> Checkpoint {
+    Checkpoint {
+        version: 1,
+        inbound: trust.policy.scope.inbound.into(),
+        host: trust.policy.scope.host.into(),
+        port: trust.policy.scope.port,
+        generation: trust.policy.generation,
+        pins: trust.policy.pins.clone(),
+        retired: trust.retired.clone(),
+        last_ms: trust.last_ms,
+    }
+}
+
+fn encode_checkpoint(value: &Checkpoint) -> String {
+    toml::to_string(value).unwrap()
+}
+
+// Test fixture for an independently authorized external anchor, NOT a
+// trust-on-first-use function. Never derive this from an untrusted file.
+fn authorize_fixture(value: &Checkpoint, text: &str) -> Anchor {
+    Anchor {
+        generation: value.generation,
+        digest: Sha256::digest(text.as_bytes()).into(),
+    }
+}
+
+fn restore(text: &str, anchor: &Anchor, scope: Scope, now_ms: u64) -> Result<Trust, Rejection> {
+    if text.len() > MAX_CHECKPOINT_BYTES {
+        return Err(Rejection::Policy);
+    }
+    let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+    if digest != anchor.digest {
+        return Err(Rejection::Policy);
+    }
+    let saved: Checkpoint = toml::from_str(text).map_err(|_| Rejection::Policy)?;
+    if saved.version != 1 || saved.generation != anchor.generation {
+        return Err(Rejection::Generation);
+    }
+    if saved.inbound != scope.inbound || saved.host != scope.host || saved.port != scope.port {
+        return Err(Rejection::Scope);
+    }
+    if now_ms < saved.last_ms {
+        return Err(Rejection::Clock);
+    }
+    if saved.retired.len() > MAX_RETIRED {
+        return Err(Rejection::RetiredCapacity);
+    }
+    for (index, key) in saved.retired.iter().enumerate() {
+        if *key == [0; 32]
+            || saved.retired[..index].contains(key)
+            || saved.pins.iter().any(|pin| pin.key == *key)
+        {
+            return Err(Rejection::Key);
+        }
+    }
+    let policy = Policy {
+        scope,
+        generation: saved.generation,
+        pins: saved.pins,
+    };
+    let mut trust = Trust::new(policy, now_ms)?;
+    trust.retired = saved.retired;
+    // Replay is deliberately NOT restored. The separate channel-binding
+    // evidence requires a fresh verified connection after restart.
+    Ok(trust)
+}
+
+#[test]
+fn checkpoint_restore_keeps_retired_keys_and_rejects_rollback() {
+    for branch in [Branch::H2, Branch::H3] {
+        let old = keypair();
+        let new = keypair();
+        let old_pin = pin(&old, START, END);
+        let new_pin = pin(&new, ROTATE, END);
+        let mut trust = Trust::new(policy(1, vec![old_pin]), START).unwrap();
+        let previous = encode_checkpoint(&checkpoint(&trust));
+        trust.replace(policy(2, vec![new_pin]), ROTATE).unwrap();
+
+        let saved = checkpoint(&trust);
+        let text = encode_checkpoint(&saved);
+        let anchor = authorize_fixture(&saved, &text);
+        drop(trust);
+
+        // A prior valid snapshot cannot be used against the latest anchor.
+        assert!(matches!(
+            restore(&previous, &anchor, EDGE, ROTATE),
+            Err(Rejection::Policy)
+        ));
+        assert!(matches!(
+            restore(&text, &anchor, EDGE, ROTATE - 1),
+            Err(Rejection::Clock)
+        ));
+        let mut foreign = EDGE;
+        foreign.inbound = "edge-b";
+        assert!(matches!(
+            restore(&text, &anchor, foreign, ROTATE),
+            Err(Rejection::Scope)
+        ));
+        let mut restored = restore(&text, &anchor, EDGE, ROTATE).unwrap();
+        assert_eq!(
+            restored.replace(policy(3, vec![old_pin]), ROTATE),
+            Err(Rejection::Key)
+        );
+        let proof = transcript(branch, ROTATE, 7);
+        assert_eq!(
+            verify(&mut restored, expected(branch), &old, &proof, ROTATE),
+            Err(Rejection::Key)
+        );
+        assert_eq!(
+            verify(&mut restored, expected(branch), &new, &proof, ROTATE),
+            Ok(())
+        );
+    }
+}
+
+#[test]
+fn checkpoint_rejects_tamper_truncation_unknown_fields_and_bad_anchors() {
+    let key = keypair();
+    let trust = Trust::new(policy(1, vec![pin(&key, START, END)]), START).unwrap();
+    let saved = checkpoint(&trust);
+    let text = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &text);
+    for bad in [
+        String::new(),
+        text[..text.len() / 2].to_owned(),
+        format!("{text}# changed\n"),
+        "x".repeat(MAX_CHECKPOINT_BYTES + 1),
+    ] {
+        assert!(matches!(
+            restore(&bad, &anchor, EDGE, START),
+            Err(Rejection::Policy)
+        ));
+    }
+
+    // Even independently authorized malformed snapshots must fail validation.
+    let unknown = format!("unknown = true\n{text}");
+    let unknown_anchor = authorize_fixture(&saved, &unknown);
+    assert!(matches!(
+        restore(&unknown, &unknown_anchor, EDGE, START),
+        Err(Rejection::Policy)
+    ));
+    let wrong_generation = Anchor {
+        generation: 2,
+        digest: anchor.digest,
+    };
+    assert!(matches!(
+        restore(&text, &wrong_generation, EDGE, START),
+        Err(Rejection::Generation)
+    ));
+}
+
+#[test]
+fn checkpoint_rejects_invalid_retired_history_and_restores_explicit_deny_all() {
+    let key = keypair();
+    let old_pin = pin(&key, START, END);
+    let mut trust = Trust::new(policy(1, vec![old_pin]), START).unwrap();
+    let mut saved = checkpoint(&trust);
+    saved.retired.push(old_pin.key);
+    let overlapping = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &overlapping);
+    assert!(matches!(
+        restore(&overlapping, &anchor, EDGE, START),
+        Err(Rejection::Key)
+    ));
+
+    trust.replace(policy(2, vec![]), ROTATE).unwrap();
+    let mut saved = checkpoint(&trust);
+    let text = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &text);
+    let mut restored = restore(&text, &anchor, EDGE, ROTATE).unwrap();
+    assert!(restored.policy.pins.is_empty());
+    assert_eq!(
+        restored.replace(policy(3, vec![old_pin]), ROTATE),
+        Err(Rejection::Key)
+    );
+
+    saved.retired.push(old_pin.key);
+    let duplicate = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &duplicate);
+    assert!(matches!(
+        restore(&duplicate, &anchor, EDGE, ROTATE),
+        Err(Rejection::Key)
+    ));
+    saved.retired = vec![[1; 32]; MAX_RETIRED + 1];
+    let oversized = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &oversized);
+    assert!(matches!(
+        restore(&oversized, &anchor, EDGE, ROTATE),
+        Err(Rejection::RetiredCapacity)
+    ));
+}
+
+// File fixtures use a unique, isolated test directory. They do not model
+// concurrent hostile filesystem mutation, ACL provisioning or power loss.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        let mut nonce = [0; 8];
+        SystemRandom::new().fill(&mut nonce).unwrap();
+        let name = format!("theia-f18-checkpoint-{:016x}", u64::from_be_bytes(nonce));
+        let path = std::env::temp_dir().join(name);
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_fixture(path: &Path, bytes: &[u8]) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn restore_file(path: &Path, anchor: &Anchor, now_ms: u64) -> Result<Trust, Rejection> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| Rejection::Policy)?;
+    if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_BYTES as u64 {
+        return Err(Rejection::Policy);
+    }
+    let file = File::open(path).map_err(|_| Rejection::Policy)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CHECKPOINT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Rejection::Policy)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| Rejection::Policy)?;
+    restore(text, anchor, EDGE, now_ms)
+}
+
+#[test]
+fn file_checkpoint_recovery_rejects_partial_stale_and_missing_commits() {
+    let dir = Scratch::new();
+    let old = keypair();
+    let new = keypair();
+    let old_pin = pin(&old, START, END);
+    let new_pin = pin(&new, ROTATE, END);
+    let mut trust = Trust::new(policy(1, vec![old_pin]), START).unwrap();
+    let old_text = encode_checkpoint(&checkpoint(&trust));
+    let previous = dir.0.join("previous.toml");
+    write_fixture(&previous, old_text.as_bytes());
+
+    trust.replace(policy(2, vec![new_pin]), ROTATE).unwrap();
+    let saved = checkpoint(&trust);
+    let text = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &text);
+    drop(trust);
+
+    let committed = dir.0.join("committed.toml");
+    let partial = dir.0.join("partial.tmp");
+    write_fixture(&partial, &text.as_bytes()[..text.len() / 2]);
+
+    // A selected commit that is absent must not fall back to any older
+    // complete snapshot or an incomplete temporary file.
+    for path in [&committed, &previous, &partial, &dir.0] {
+        assert!(matches!(
+            restore_file(path, &anchor, ROTATE),
+            Err(Rejection::Policy)
+        ));
+    }
+
+    let staged = dir.0.join("staged.tmp");
+    write_fixture(&staged, text.as_bytes());
+    // Same-directory rename into an absent destination. This is a
+    // controlled publication test, not a replacement or durability claim.
+    fs::rename(&staged, &committed).unwrap();
+    assert!(!staged.exists());
+    let mut restored = restore_file(&committed, &anchor, ROTATE).unwrap();
+    assert_eq!(
+        restored.replace(policy(3, vec![old_pin]), ROTATE),
+        Err(Rejection::Key)
+    );
+    let proof = transcript(Branch::H2, ROTATE, 6);
+    assert_eq!(
+        verify(&mut restored, expected(Branch::H2), &old, &proof, ROTATE),
+        Err(Rejection::Key)
+    );
+    assert_eq!(
+        verify(&mut restored, expected(Branch::H2), &new, &proof, ROTATE),
+        Ok(())
+    );
+
+    // A damaged committed file must fail closed even when an older
+    // complete snapshot remains available in the same directory.
+    fs::write(&committed, [0xff, 0xfe]).unwrap();
+    assert!(matches!(
+        restore_file(&committed, &anchor, ROTATE),
+        Err(Rejection::Policy)
+    ));
+    fs::write(&committed, vec![b'x'; MAX_CHECKPOINT_BYTES + 1]).unwrap();
+    assert!(matches!(
+        restore_file(&committed, &anchor, ROTATE),
+        Err(Rejection::Policy)
+    ));
+    assert!(matches!(
+        restore_file(&previous, &anchor, ROTATE),
+        Err(Rejection::Policy)
+    ));
+}
+
+#[test]
+fn independently_anchored_checkpoint_must_still_have_valid_policy() {
+    let key = keypair();
+    let good = pin(&key, START, END);
+    let trust = Trust::new(policy(1, vec![good]), START).unwrap();
+    let mut saved = checkpoint(&trust);
+
+    saved.version = 2;
+    let text = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &text);
+    assert!(matches!(
+        restore(&text, &anchor, EDGE, START),
+        Err(Rejection::Generation)
+    ));
+    saved.version = 1;
+    saved.generation = 0;
+    let text = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &text);
+    assert!(matches!(
+        restore(&text, &anchor, EDGE, START),
+        Err(Rejection::Policy)
+    ));
+    saved.generation = 1;
+    for pins in [
+        vec![good, good],
+        vec![good; MAX_PINS + 1],
+        vec![pin(&key, END, START)],
+        vec![Pin {
+            key: [0; 32],
+            ..good
+        }],
+    ] {
+        saved.pins = pins;
+        let text = encode_checkpoint(&saved);
+        let anchor = authorize_fixture(&saved, &text);
+        assert!(matches!(
+            restore(&text, &anchor, EDGE, START),
+            Err(Rejection::Policy)
+        ));
+    }
+
+    saved.pins = vec![good];
+    saved.retired = vec![[0; 32]];
+    let text = encode_checkpoint(&saved);
+    let anchor = authorize_fixture(&saved, &text);
+    assert!(matches!(
+        restore(&text, &anchor, EDGE, START),
+        Err(Rejection::Key)
+    ));
 }
