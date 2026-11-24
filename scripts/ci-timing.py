@@ -64,8 +64,21 @@ def summarize(run: dict, response: dict) -> dict:
     require(created <= started <= updated, "inconsistent run timestamps")
 
     jobs = response.get("jobs")
-    require(isinstance(jobs, list) and response.get("total_count") == len(EXPECTED_JOBS)
-            and len(jobs) == len(EXPECTED_JOBS), "incomplete or unexpected job matrix")
+    require(isinstance(jobs, list) and response.get("total_count") == len(jobs)
+            and len(jobs) in {len(EXPECTED_JOBS), len(EXPECTED_JOBS) + 1},
+            "incomplete or unexpected job matrix")
+    # Old successful snapshots predate the optional repair job. Current clean
+    # runs may contain exactly one skipped repair; it is not runner time.
+    repair_jobs = [job for job in jobs
+                   if isinstance(job, dict) and job.get("name") == "format-repair"]
+    require(len(repair_jobs) <= 1, "duplicate format repair")
+    for repair in repair_jobs:
+        require(repair.get("run_id") == run_id and repair.get("head_sha") == sha
+                and repair.get("run_attempt") == attempt, "repair job identity mismatch")
+        require(repair.get("status") == "completed" and repair.get("conclusion") == "skipped",
+                "successful ordinary CI cannot execute format repair")
+    jobs = [job for job in jobs if job not in repair_jobs]
+    require(len(jobs) == len(EXPECTED_JOBS), "incomplete required job matrix")
     timings = {}
     steps = {}
     first = None

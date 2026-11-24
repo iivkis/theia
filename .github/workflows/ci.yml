@@ -5,6 +5,17 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      formatted_sha:
+        description: 'Internal: exact formatter commit to test (empty for manual release CI)'
+        required: false
+        type: string
+        default: ''
+      formatted_base_sha:
+        description: 'Internal: PR base contained in the formatter commit'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -12,7 +23,7 @@ permissions:
 concurrency:
   # A new CI DAG epoch isolates this job topology from an unresponsive
   # cancelled v1 Windows runner. PR head supersession still cancels within v2.
-  group: ci-fast-v3-${{ github.workflow }}-${{ github.ref }}
+  group: ci-fast-v4-${{ github.workflow }}-${{ github.ref }}-${{ inputs.formatted_sha || 'ordinary' }}
   cancel-in-progress: true
 
 jobs:
@@ -23,11 +34,25 @@ jobs:
     outputs:
       rust_ready: ${{ steps.detect.outputs.rust_ready }}
       native_required: ${{ steps.scope.outputs.native_required }}
+      format_drift: ${{ steps.format.outputs.format_drift }}
     steps:
       - uses: actions/checkout@v4
         with:
           # Two generations: PR merge base/push parent; missing history -> full CI.
-          fetch-depth: 2
+          fetch-depth: ${{ github.event_name == 'workflow_dispatch' && inputs.formatted_sha != '' && '0' || '2' }}
+          persist-credentials: false
+      - name: Verify dispatched formatter SHA
+        if: github.event_name == 'workflow_dispatch' && inputs.formatted_sha != ''
+        env:
+          FORMATTED_SHA: ${{ inputs.formatted_sha }}
+          FORMATTED_BASE_SHA: ${{ inputs.formatted_base_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$FORMATTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$FORMATTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$FORMATTED_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$FORMATTED_SHA"
+          git merge-base --is-ancestor "$FORMATTED_BASE_SHA" HEAD
       - name: Preflight syntax and F-14 guest network regression before Rust
         run: |
           python3 -m compileall -q scripts tests
@@ -40,6 +65,8 @@ jobs:
         run: python3 -m unittest discover -s tests/ci -p 'test_ci_scope.py' -v
       - name: Test independent TLS client input and frame boundaries
         run: python3 -m unittest discover -s tests/ci -p 'test_independent_h2_probe.py' -v
+      - name: Test format-only repair safety and dispatch contract
+        run: python3 -m unittest discover -s tests/ci -p 'test_ci_format_repair.py' -v
       - name: Test CI timing evidence validation and comparison
         run: python3 -m unittest discover -s tests/ci -p 'test_ci_timing.py' -v
       - name: Detect documentation-only change scope
@@ -72,17 +99,70 @@ jobs:
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
         with:
           components: rustfmt
-      - name: Fail fast on formatting drift before expensive native builds
+      - name: Detect repairable formatting drift before expensive native builds
+        id: format
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
+        run: python3 scripts/ci-format-repair.py probe
+
+  format-repair:
+    name: format-repair
+    needs: specification
+    # Only trusted branches of this repository. Never write to main/default,
+    # a PR base branch, a fork, or a manually dispatched repair run.
+    if: >-
+      ${{ always() && needs.specification.result == 'failure'
+          && needs.specification.outputs.format_drift == 'true'
+          && github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && github.event.pull_request.head.ref != 'main'
+          && github.event.pull_request.head.ref != github.event.repository.default_branch
+          && github.event.pull_request.head.ref != github.event.pull_request.base.ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Prepare one verified Rust-only formatting commit
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci-format-repair.py repair
+      - name: Push exact child and dispatch full CI on new SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         shell: bash
         run: |
           set -euo pipefail
-          cargo fmt --all -- --check
-          cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check
-          cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all -- --check
-          # Every test consumes exactly the checked-out commit, never a
-          # silently modified formatting overlay or a post-green bot commit.
-          git diff --exit-code -- '*.rs'
+          test "$PR_BRANCH" != main
+          test "$PR_BRANCH" != "$PR_BASE"
+          test "$PR_BRANCH" != "$DEFAULT_BRANCH"
+          git check-ref-format "refs/heads/$PR_BRANCH"
+          test "$(git rev-parse HEAD^)" = "$PR_HEAD_SHA"
+          new_sha="$(git rev-parse HEAD)"
+          gh auth setup-git
+          # The dispatched run tests its branch head, not a synthetic merge.
+          # Only repair a branch which already contains the current PR base.
+          git fetch --no-tags origin "refs/heads/$PR_BASE"
+          base_sha="$(git rev-parse FETCH_HEAD)"
+          git merge-base --is-ancestor "$base_sha" HEAD
+          # Lease checks the exact old tip. The commit is its direct child,
+          # so this is a fast-forward, not a history rewrite.
+          git push --force-with-lease="refs/heads/$PR_BRANCH:$PR_HEAD_SHA" origin "HEAD:refs/heads/$PR_BRANCH"
+          # GITHUB_TOKEN pushes cannot be relied on to trigger normal CI.
+          # Dispatch is explicit and the new run verifies its own exact SHA.
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$PR_BRANCH" -f "formatted_sha=$new_sha" -f "formatted_base_sha=$base_sha"
 
   m0-1-api-spike:
     name: m0-1-api-spike (Linux)
@@ -232,7 +312,7 @@ jobs:
       # full optimized compilation; explicit workflow_dispatch runs still
       # verify the real release profile on both operating systems.
       - name: Manual release compilation (Linux)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.formatted_sha == ''
         run: cargo build --workspace --release --locked
       - name: Upload sanitized trace logs on CI failure
         if: failure()
@@ -319,7 +399,7 @@ jobs:
       # full optimized compilation; explicit workflow_dispatch runs still
       # verify the real release profile on both operating systems.
       - name: Manual release compilation (Windows)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.formatted_sha == ''
         run: cargo build --workspace --release --locked
       - name: Upload sanitized trace logs on CI failure
         if: failure()
@@ -497,7 +577,7 @@ jobs:
 
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-4-btls-spike, m3-4e-btls-production-feature]
+    needs: [specification, format-repair, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-4-btls-spike, m3-4e-btls-production-feature]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -513,6 +593,8 @@ jobs:
 
           results = json.loads(os.environ["JOB_RESULTS"])
           expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-4-btls-spike", "m3-4e-btls-production-feature"}
+          if results.get("format-repair", {}).get("result") != "skipped":
+              raise SystemExit("Formatter repair ran or was unavailable; only the new clean SHA may pass")
           native = os.environ["NATIVE_REQUIRED"]
           if native not in {"true", "false"}:
               raise SystemExit("Unknown native scope; fail closed")

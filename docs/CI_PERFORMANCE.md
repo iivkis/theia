@@ -294,3 +294,7 @@ The Markdown-only scope classifier also checks raw Git modes/status: regular non
 | Cross-host | 82 | 76 | -6 |
 
 Source: completed first-attempt GitHub Actions job timestamps for both exact PR heads, same 13-job matrix. The aggregate job-duration observation decreases by 11.0%; wall clock decreases by 0.6%. This is not a controlled benchmark or billed-minutes saving. Multiple changes, cache state and runner scheduling differ. Windows smoke and WSL2 remain the dominant dependency path; retain coverage. No claim that each job became faster.
+
+## Pre-native auto-format repair (ADR-0080)
+
+The historical fail-fast-only policy is superseded for same-repository PRs: an isolated conditional repair job may commit a verified Rust-only direct child after a failed preflight, then dispatch full CI on the new SHA. The old run cannot pass; native jobs never test an overlay. Ordinary clean runs have 13 mandatory successful jobs and one skipped repair. The timing validator accepts historical 13-job snapshots and current snapshots with exactly one identity-verified skipped repair, but excludes automated dispatch, failed and partial runs from ordinary comparisons. No measured speedup claimed yet; this removes manual formatting intervention, not native coverage.

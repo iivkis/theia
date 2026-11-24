@@ -1,0 +1,15 @@
+# ADR-0079: Reject machine-wide WinINet scope and extend recovery evidence
+
+**State:** proposed; exact-head native acceptance required.
+
+The F-07 contract permits only the current user's default LAN WinINet settings. Microsoft documents the machine-wide scope policy at HKLM\\Software\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings, value ProxySettingsPerUser (DWORD 0 selects machine-wide settings). A successful per-connection API call alone does not establish that writes affect only that user.
+
+Before and after native snapshot reads and writes, read this value with KEY_QUERY_VALUE. Missing key/value or explicit DWORD 1 permits the existing per-user operation. Other values, unexpected type/size or an inaccessible registry key refuse with a redacted policy-scope error. No policy value is created, changed or removed by production code. This also blocks a recovery operation if the scope changes; retain its journal. The last native write can still race an external policy change: no OS-wide atomicity or domain Group Policy compatibility claim. Named VPN/RAS connections and other policy restrictions remain out of scope.
+
+Native test reads a unique volatile HKCU fixture rather than modifying real HKLM policy. It verifies absent key/value, explicit per-user scope, machine-wide and unknown values and wrong registry type. Extend the existing opt-in disposable WinINet scenario with no-journal, already-restored v1 recovery and journal replacement after recovery review. Keep exact snapshot checks and the previous owner/crash/foreign-state cases. This is not a true upgrade from a compiled old executable, live GPO or VPN acceptance; those remain open. No additional CI job, dependency or TOML/wire change.
+
+## Cross-session ownership
+
+The HKCU journal is shared by all sessions of a user. Current binaries first acquire a Global SID-named mutex with a protected user/LocalSystem DACL and verified owner and ACL, then the previous Local SID-named mutex. Failure to create, inspect or acquire either refuses; the first lock is released on second-lock failure. The old local name remains unchanged for same-session compatibility. Both guards stay on the same native owner thread. The existing disposable Windows case tests real contention on each lock, release and hard-exit recovery; it does not simulate two actual terminal sessions. Older binaries in other sessions do not know the global mutex, so stop all old clients before upgrade. This is not an OS-wide lock against non-Theia writers or complete cross-session upgrade proof.
+
+References: [Microsoft HKLMProxyEnable](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-ie-clientnetworkprotocolimplementation-hklmproxyenable), [Microsoft WinINet per-connection options](https://learn.microsoft.com/en-us/windows/win32/api/wininet/ns-wininet-internet_per_conn_option_listw). [Kernel object namespaces](https://learn.microsoft.com/en-us/windows/win32/termserv/kernel-object-namespaces).

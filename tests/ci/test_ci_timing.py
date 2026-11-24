@@ -105,6 +105,23 @@ class TimingTests(unittest.TestCase):
                 with self.assertRaises(timing.EvidenceError):
                     timing.summarize(run, broken)
 
+    def test_optional_repair_must_be_skipped_and_exact_identity(self):
+        run, jobs = snapshot()
+        repair = {
+            "name": "format-repair", "run_id": run["id"], "head_sha": run["head_sha"],
+            "run_attempt": 1, "status": "completed", "conclusion": "skipped",
+            "started_at": None, "completed_at": None, "steps": [],
+        }
+        jobs["jobs"].append(repair)
+        jobs["total_count"] += 1
+        self.assertEqual(timing.summarize(run, jobs)["runner_job_seconds"], 780)
+        for field, value in (("conclusion", "success"), ("head_sha", "b" * 40),
+                             ("status", "in_progress")):
+            broken = deepcopy(jobs)
+            broken["jobs"][-1][field] = value
+            with self.assertRaises(timing.EvidenceError):
+                timing.summarize(run, broken)
+
     def test_bad_step_data_cannot_be_reported(self):
         run, jobs = snapshot()
         for field, value in [

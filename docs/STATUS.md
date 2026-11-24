@@ -1,6 +1,6 @@
 # Фактический статус Theia
 
-**Срез состояния:** 2026-11-24, после merge [PR #111](https://github.com/iivkis/theia/pull/111) в `main` (`cafafedecf934c4e7222ab6224a02708e8078980`). Это **не release-acceptance**: проект experimental/unreleased. [Exact-head CI PR #111](https://github.com/iivkis/theia/actions/runs/45403726044): **13/13 SUCCESS**; push-CI проверяется отдельно.
+**Срез состояния:** 2026-11-24, после merge [PR #112](https://github.com/iivkis/theia/pull/112) в `main` (`7e44b75ffad67fec69f1442cd5c4c356a9879998`). Это **не release-acceptance**: проект experimental/unreleased. [Exact-head CI PR #112](https://github.com/iivkis/theia/actions/runs/45413929157): **13/13 SUCCESS**; push-CI проверяется отдельно.
 
 Этот файл — актуальная сводка реализованных контрактов. [IMPLEMENTATION_SPEC](IMPLEMENTATION_SPEC.md) остаётся нормативной спецификацией **целевой** функциональности, [IMPLEMENTATION_PLAN](IMPLEMENTATION_PLAN.md) — историческим перечнем этапов, [ADR](adr/) — архивом решений, а [TESTING_CI](TESTING_CI.md) — контрактом тестирования.
 
@@ -16,7 +16,7 @@
 | F-14 частично | Canonical `theia://v1` codec, серверные `u` (CSPRNG issuance), `x` (global disable), `t` (явно подтверждённая ротация действующего bearer); клиентская TUI `i` локально импортирует приглашение с отдельным CA/защищённым credential file. Native Linux/Windows H2 binary E2E прошёл в PR #80/#81; ни одна операция не выполняет автоматический runtime Apply. M4.4e защищённый файловый экспорт (CI run 45392909341 passed all 13 jobs); M4.4f общий bounded input runtime/preflight/import и stale reveal guard; M4.4g явная замена credential существующего профиля; M4.4h восстановление отключённого пользователя с новым bearer (M4.4f–h CI 45395505034 passed all 13 jobs); M4.4i публичная ссылка без токена и native Windows recovery parity (PR #109, CI 45397074048 passed 13/13). |
 | F-18 исследования | M3.5a0–a6 test-only TLS/exporter, identity/reconnect, H2/H3 DATA and local key lifecycle evidence; M3.5a7 v1 export downgrade fix and review packet; M3.5a8 bounded trust checkpoint reconstruction and isolated file recovery; M3.5a9–a10 native storage/process-exit, concurrent trust updates, local isolation regressions and shared F-14 local input and guarded configuration transaction hardening (CI run 45391036352 passed all 13 jobs); M3.5b1 offline candidate planning; M3.5b2a exact-consent strict H2 TLS; M4.5a–i passive discovery, DNS pin и согласованные отдельные H2/H3 кандидаты. Нет автоматического сканирования сторонних IP и нет REALITY режима. |
 
-Последний слитый срез: **ADR-0076, функциональная навигация Chromium через H2/H3 на Linux/Windows и отказ при неверном/отсутствующем QUIC ALPN**. F-13 и остальные независимые P0 остаются открытыми.
+Последний слитый срез: **ADR-0077, нативный Windows TUI WinINet lifecycle и ConPTY E2E**; ранее PR #113 сократил документацию и trace (ADR-0078), PR #111 подтвердил Chromium H2/H3 navigation и отрицательные QUIC ALPN. F-13/F-07 и остальные независимые P0 остаются открытыми.
 
 ## Открытые P0 и ограничения безопасности
 
@@ -24,7 +24,7 @@
 - **F-14:** PR #80 (ротация bearer) и #81 (локальный клиентский импорт с отдельным CA/credential file и нативным H2 E2E) слиты после успешного CI. Защищённый экспорт файла и автоматический Linux WSL2 server → native Windows H2/H3 E2E подтверждены CI; clipboard/QR, защищённая передача между физическими хостами и power-loss recovery не доказаны. M4.4f–h приняты: PR #108, CI 45395505034 (13/13); M4.4i принят: PR #109, CI 45397074048 (13/13). `disabled=true`/ротация из редактора действуют для новых сессий **только после** отдельного auth-only CAS Apply; активные туннели не отзываются.
 - **F-18:** криптографически проверенный REALITY-подобный security mode, anti-probing/replay, безопасный двухшаговый picker/Apply и cross-host security evidence не реализованы. `TlsEvidence`/score не доказывают DPI-невидимость и не авторизуют активные сетевые проверки.
 - **F-19:** flow-shaping, независимый TLS-in-TLS classifier, benchmark thresholds и измеренное улучшение не реализованы.
-- **M4.3:** PR #82 / ADR-0056 accepted native WinINet per-user snapshot, explicit CLI apply, SID ownership mutex, guarded CAS restore, durable HKCU recovery journal and hard-kill/foreign-edit tests. ADR-0077 adds separate TUI local start/apply/restore/stop/recovery, exact saved TOML/snapshot and journal ownership checks (приёмка ещё не подтверждена). Policy/VPN, upgrade and extended acceptance remain open.
+- **M4.3:** PR #82 / ADR-0056 accepted explicit CLI native WinINet CAS, journal and hard-kill recovery. PR #112 / ADR-0077 accepted separately confirmed TUI local start/apply/restore/stop/recovery, saved TOML/snapshot and journal ownership checks, compiled real ConPTY H2 CONNECT/SOCKS5 and hard-kill recovery. ADR-0079 adds policy scope refusal and global SID plus legacy local mutex with extended recovery tests (приёмка ещё не подтверждена). Named VPN, real GPO, multi-session upgrade and extended acceptance remain open.
 - **M5:** стабильная release CI/benchmark/security acceptance, full BBR throughput/RTT/fairness/CPU/RSS и P0 end-to-end ещё открыты.
 
 ## Что нельзя удалять при уборке
