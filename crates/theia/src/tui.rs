@@ -997,8 +997,7 @@ impl Interaction {
                 && key.modifiers.is_empty()
             {
                 if editor.dirty() {
-                    editor.error =
-                        Some("Сохраните или отмените черновик перед запуском.".into());
+                    editor.error = Some("Сохраните или отмените черновик перед запуском.".into());
                 } else {
                     #[cfg(windows)]
                     match crate::tui_system_proxy::Panel::open(
@@ -1365,8 +1364,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         "j/k: запись  Tab: поле  Enter/e: ввод  l: ссылка  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить  p: сеть"
     };
     frame.render_widget(
-        Paragraph::new(footer)
-        .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         parts[2],
     );
 }

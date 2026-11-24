@@ -192,7 +192,7 @@ struct PerConnectionList {
 fn option(id: u32) -> PerConnectionOption {
     PerConnectionOption {
         id,
-        value: OptionValue { number: 0 },
+        value: OptionValue { text: null_mut() },
     }
 }
 fn list(options: &mut [PerConnectionOption; 4]) -> PerConnectionList {
@@ -278,8 +278,10 @@ fn query_with_flags(flag_id: u32) -> Result<Snapshot, ProxyError> {
     observed
 }
 fn query() -> Result<Snapshot, ProxyError> {
-    query_with_flags(INTERNET_PER_CONN_FLAGS_UI)
-        .or_else(|_| query_with_flags(INTERNET_PER_CONN_FLAGS))
+    match query_with_flags(INTERNET_PER_CONN_FLAGS_UI) {
+        Err(ProxyError::Unavailable) => query_with_flags(INTERNET_PER_CONN_FLAGS),
+        result => result,
+    }
 }
 fn set(state: &Snapshot) -> Result<(), ProxyError> {
     state.validate()?;
@@ -616,7 +618,15 @@ fn recover_locked() -> Result<Recovery, ProxyError> {
     restore_journal(&journal, None)
 }
 
+fn require_journal(journal: &Journal) -> Result<(), ProxyError> {
+    if read_journal()?.as_ref() != Some(journal) {
+        return Err(ProxyError::Conflict);
+    }
+    Ok(())
+}
+
 fn restore_journal(journal: &Journal, expected: Option<&Snapshot>) -> Result<Recovery, ProxyError> {
+    require_journal(journal)?;
     let current = query()?;
     if expected.is_some_and(|expected| expected != &current) {
         return Err(ProxyError::Conflict);
@@ -624,6 +634,7 @@ fn restore_journal(journal: &Journal, expected: Option<&Snapshot>) -> Result<Rec
     if current == journal.before {
         // Process crashed before WinINet commit or another actor restored the
         // *exact* old state. Clear the stale journal without touching WinINet.
+        require_journal(journal)?;
         delete_journal()?;
         return Ok(Recovery::AlreadyRestored);
     }
@@ -631,10 +642,15 @@ fn restore_journal(journal: &Journal, expected: Option<&Snapshot>) -> Result<Rec
         // Never stomp a new VPN, PAC URL, browser or another local proxy.
         return Err(ProxyError::Conflict);
     }
+    require_journal(journal)?;
+    if query()? != current {
+        return Err(ProxyError::Conflict);
+    }
     set(&journal.before)?;
     if query()? != journal.before {
         return Err(ProxyError::Conflict);
     }
+    require_journal(journal)?;
     delete_journal()?;
     Ok(Recovery::Restored)
 }
@@ -714,9 +730,6 @@ pub(crate) fn review_recovery() -> Result<RecoveryReview, ProxyError> {
 
 pub(crate) fn recover_reviewed(review: RecoveryReview) -> Result<Recovery, ProxyError> {
     let _lock = Mutex::acquire()?;
-    if read_journal()?.as_ref() != Some(&review.journal) {
-        return Err(ProxyError::Conflict);
-    }
     restore_journal(&review.journal, Some(&review.current))
 }
 
@@ -725,6 +738,7 @@ pub(crate) fn recover_reviewed(review: RecoveryReview) -> Result<Recovery, Proxy
 /// apply and every CAS restore are pinned to this dedicated native thread.
 struct NativeOwner {
     _lock: Mutex,
+    journal: Journal,
     active: bool,
 }
 
@@ -742,23 +756,27 @@ impl NativeOwner {
         if applied == before {
             return Err(ProxyError::InvalidSettings);
         }
-        save_journal(&Journal {
+        let journal = Journal {
             version: 1,
             user_sid: current_user_sid().map_err(|_| ProxyError::Journal)?,
-            before: before.clone(),
-            applied: applied.clone(),
-        })?;
+            before,
+            applied,
+        };
+        save_journal(&journal)?;
         // Compare-before-write. Other applications do not honor this mutex:
         // a subsequent foreign edit cannot be overwritten during restore.
-        if query()? != before {
+        require_journal(&journal)?;
+        if query()? != journal.before {
             return Err(ProxyError::Conflict);
         }
-        set(&applied)?;
-        if query()? != applied {
+        set(&journal.applied)?;
+        if query()? != journal.applied {
             return Err(ProxyError::Conflict);
         }
+        require_journal(&journal)?;
         Ok(Self {
             _lock: lock,
+            journal,
             active: true,
         })
     }
@@ -767,7 +785,7 @@ impl NativeOwner {
         if !self.active {
             return Ok(Recovery::NothingPending);
         }
-        let outcome = recover_locked()?;
+        let outcome = restore_journal(&self.journal, None)?;
         self.active = false;
         Ok(outcome)
     }
@@ -967,6 +985,57 @@ mod tests {
         journal.user_sid = "S-1-5-18".into();
         assert_eq!(journal.validate(), Err(ProxyError::Journal));
     }
+    // The previous v1 writer used exactly these fields. A strict upgrade
+    // must still accept all valid legacy snapshots without rewriting them.
+    fn read_legacy_journal(journal: &Journal) -> Journal {
+        let encoded = toml::to_string(journal).unwrap();
+        toml::from_str(&encoded).unwrap()
+    }
+
+    #[test]
+    fn legacy_v1_journal_preserves_proxy_pac_and_autodetect_fields() {
+        let sid = current_user_sid().unwrap();
+        let legacy = format!(
+            r#"version = 1
+user_sid = "{sid}"
+
+[before]
+flags = 15
+server = "http=old.invalid:8080;https=old.invalid:8443"
+bypass = "<local>;internal.invalid"
+auto_url = "https://pac.invalid/proxy.pac"
+
+[applied]
+flags = 3
+server = "http=127.0.0.1:7890;https=127.0.0.1:7890"
+bypass = "<local>;localhost;127.0.0.1;[::1]"
+auto_url = "https://pac.invalid/proxy.pac"
+"#
+        );
+        let journal: Journal = toml::from_str(&legacy).unwrap();
+        journal.validate().unwrap();
+        assert_eq!(journal.before.flags, 15);
+        assert_eq!(journal.before.bypass, "<local>;internal.invalid");
+        assert_eq!(journal.before.auto_url, journal.applied.auto_url);
+        assert_eq!(read_legacy_journal(&journal), journal);
+        for flags in 1..=VALID_PROXY_FLAGS {
+            let mut before = journal.before.clone();
+            before.flags = flags;
+            let applied = before.for_loopback("[::1]:7890".parse().unwrap()).unwrap();
+            let candidate = Journal {
+                version: 1,
+                user_sid: sid.clone(),
+                before,
+                applied,
+            };
+            candidate.validate().unwrap();
+            assert_eq!(read_legacy_journal(&candidate), candidate);
+        }
+        let unknown = legacy.replace("version = 1", "version = 2");
+        let record: Journal = toml::from_str(&unknown).unwrap();
+        assert_eq!(record.validate(), Err(ProxyError::Journal));
+    }
+
     /// Opt-in native OS settings test, ONLY on a disposable CI Windows user
     /// and only when THEIA_WINDOWS_PROXY_E2E_ALLOWED is set. Never auto-run on
     /// developer machines. This temporarily changes the *current user's*
@@ -1009,6 +1078,20 @@ mod tests {
             Err(ProxyError::Busy),
             "running owner is protected by mutex"
         );
+        // A live owner cannot restore from a missing or replaced journal,
+        // even if the currently applied WinINet snapshot still matches.
+        let journal = read_journal().unwrap().unwrap();
+        delete_journal().unwrap();
+        assert_eq!(proxy.restore(), Err(ProxyError::Conflict));
+        assert_eq!(query().unwrap(), applied);
+        let mut replacement = read_legacy_journal(&journal);
+        replacement.before.bypass.push_str(";replacement.invalid");
+        save_journal(&replacement).unwrap();
+        assert_eq!(proxy.restore(), Err(ProxyError::Conflict));
+        assert_eq!(query().unwrap(), applied);
+        assert_eq!(read_journal().unwrap(), Some(replacement));
+        delete_journal().unwrap();
+        save_journal(&journal).unwrap();
         // Make a foreign WinINet edit and verify CAS refuses to erase it.
         let mut foreign = applied.clone();
         foreign.bypass.push_str(";example.org");
@@ -1026,7 +1109,9 @@ mod tests {
         let crash = || {
             let self_executable = std::env::current_exe().unwrap();
             let result = std::process::Command::new(self_executable)
-                .arg("windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override")
+                .arg(
+                    "windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override",
+                )
                 .arg("--exact")
                 .arg("--ignored")
                 .env("THEIA_PROXY_CRASH_CHILD", "yes")
