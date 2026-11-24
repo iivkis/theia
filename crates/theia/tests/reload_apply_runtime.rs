@@ -20,8 +20,11 @@ use theia::{
     client::{ClientError, H2Client},
     config::{Config, Inbound, Management, ServerDocument, ServerPolicy, ServerSettings, Ui, User},
     h3_client::H3Client,
+    invite::Invitation,
     management::{query_in, ManagementError, StatusCommand, StatusReply},
     protocol::Address,
+    tui_editor::Editor,
+    Role,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -34,21 +37,6 @@ impl Drop for Running {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
-    }
-}
-fn port(tcp: bool) -> u16 {
-    if tcp {
-        StdTcp::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    } else {
-        UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
     }
 }
 fn save(path: &Path, doc: &ServerDocument) {
@@ -84,7 +72,7 @@ async fn has_revision(dir: &Path, revision: u64) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas() {
-    timeout(Duration::from_secs(35), async {
+    timeout(Duration::from_secs(45), async {
         let dir = std::env::temp_dir().join(format!(
             "theia-apply-{}-{}",
             std::process::id(),
@@ -109,8 +97,15 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
         let mut roots = RootCertStore::empty();
         roots.add(generated.cert.der().clone()).unwrap();
-        let tcp = port(true);
-        let udp = port(false);
+        let (tcp_reservation, udp_reservation) = (0..32)
+            .find_map(|_| {
+                let tcp = StdTcp::bind("127.0.0.1:0").ok()?;
+                let udp = UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
+                Some((tcp, udp))
+            })
+            .expect("reserve common TCP/UDP port");
+        let tcp = tcp_reservation.local_addr().unwrap().port();
+        let udp = udp_reservation.local_addr().unwrap().port();
         let mut doc = ServerDocument {
             schema_version: 1,
             server: ServerSettings {
@@ -145,6 +140,8 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
             },
         };
         save(&toml, &doc);
+        drop(tcp_reservation);
+        drop(udp_reservation);
         let mut server = Running(
             Command::new(env!("CARGO_BIN_EXE_theia"))
                 .args(["server", "run", "--config"])
@@ -201,6 +198,30 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         .unwrap();
         let mut h2_open = Some(h2old.open(addr.clone(), target_port).await.unwrap());
         let mut h3_open = Some(h3old.open(addr.clone(), target_port).await.unwrap());
+
+        // Store the original grant in a separate client configuration.
+        // Import does not select the new profile or launch a connection.
+        let client_path = dir.join("client.toml");
+        fs::write(&client_path, include_str!("../../../examples/client.toml")).unwrap();
+        let mut importer = Editor::load(Role::Client, &client_path).unwrap();
+        let initial = Invitation::issued_from_server(
+            &Config::Server(doc.clone()),
+            "edge",
+            "device-a",
+            &[0x42; 32],
+        )
+        .unwrap();
+        let ca_ref = format!("file:{}", cert_path.display());
+        importer
+            .import_invitation(&initial, Some(&ca_ref), None)
+            .unwrap();
+        let original_config = theia::config::read_file(&client_path).unwrap();
+        let Config::Client(mut original_client) = original_config else {
+            panic!("client");
+        };
+        assert_eq!(original_client.client.active_profile, "home");
+        let original_ref = original_client.client.profiles[1].auth_token.clone();
+        let original_secret = original_ref.strip_prefix("file:").unwrap();
 
         // Stage is a safe read-only preview, not an implicit commit.
         doc.server.users[0].token_sha256 = hash(0x43);
@@ -341,7 +362,7 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
             Some(ClientError::Unauthorized)
         );
         assert_eq!(
-            h3new.open(addr, target_port).await.err(),
+            h3new.open(addr.clone(), target_port).await.err(),
             Some(ClientError::Unauthorized)
         );
 
@@ -361,6 +382,83 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
         .unwrap();
         assert!(status.status.success());
         assert!(String::from_utf8_lossy(&status.stdout).contains("revision=3"));
+
+        // A real explicit editor recovery issues a new bearer. Save
+        // alone must not restore runtime admission on either branch.
+        let mut issuer = Editor::load(Role::Server, &toml).unwrap();
+        issuer.reenable_user("device-a").unwrap();
+        assert!(issuer.take_issued().is_none());
+        assert!(issuer.save());
+        let exported = issuer.export_issued_file().unwrap();
+        let invite = theia::client_import::read_source(exported.to_str().unwrap()).unwrap();
+        let recovered = zeroize::Zeroizing::new(invite.token_bytes().unwrap());
+        assert!(*recovered != [0x42; 32] && *recovered != [0x43; 32]);
+        // Refresh only the credential reference. The original file is
+        // retained even though its token is no longer authorized.
+        importer.refresh_credential(&invite).unwrap();
+        let updated_config = theia::config::read_file(&client_path).unwrap();
+        let Config::Client(updated_client) = updated_config else {
+            panic!("client");
+        };
+        let new_ref = &updated_client.client.profiles[1].auth_token;
+        assert_ne!(new_ref, &original_ref);
+        original_client.client.profiles[1].auth_token = new_ref.clone();
+        assert_eq!(updated_client, original_client);
+        let old_bytes = zeroize::Zeroizing::new(fs::read_to_string(original_secret).unwrap());
+        assert!(old_bytes.as_str() == token(0x42));
+        let new_path = new_ref.strip_prefix("file:").unwrap();
+        let credential = zeroize::Zeroizing::new(fs::read_to_string(new_path).unwrap());
+        assert!(credential.as_str() == URL_SAFE_NO_PAD.encode(*recovered));
+        let h2recovered = H2Client::new(
+            &format!("127.0.0.1:{tcp}"),
+            "localhost",
+            &credential,
+            roots.clone(),
+        )
+        .unwrap();
+        let h3recovered = H3Client::new(
+            format!("127.0.0.1:{udp}").parse().unwrap(),
+            "localhost",
+            &credential,
+            roots,
+        )
+        .unwrap();
+        assert_eq!(
+            h2recovered.open(addr.clone(), target_port).await.err(),
+            Some(ClientError::Unauthorized)
+        );
+        assert_eq!(
+            h3recovered.open(addr.clone(), target_port).await.err(),
+            Some(ClientError::Unauthorized)
+        );
+        has_revision(&dir, 3).await;
+        let digest: [u8; 32] = Sha256::digest(fs::read(&toml).unwrap()).into();
+        assert_eq!(
+            query_in(
+                &dir,
+                StatusCommand::ApplyReloadBound {
+                    expected_revision: 3,
+                    candidate_sha256: digest,
+                }
+            )
+            .await,
+            Ok(StatusReply::Applied { revision: 4 })
+        );
+        has_revision(&dir, 4).await;
+        for old in [&h2old, &h2new] {
+            assert_eq!(
+                old.open(addr.clone(), target_port).await.err(),
+                Some(ClientError::Unauthorized)
+            );
+        }
+        for old in [&h3old, &h3new] {
+            assert_eq!(
+                old.open(addr.clone(), target_port).await.err(),
+                Some(ClientError::Unauthorized)
+            );
+        }
+        assert!(h2recovered.open(addr.clone(), target_port).await.is_ok());
+        assert!(h3recovered.open(addr, target_port).await.is_ok());
 
         echo_task.abort();
         drop(server);

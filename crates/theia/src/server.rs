@@ -1000,27 +1000,13 @@ async fn relay_tcp(
     state.finish().map_err(|_| ServerError::Protocol)
 }
 
-pub(crate) fn pem_data(reference: &str, private_key: bool) -> Result<Vec<u8>, ServerError> {
+pub(crate) fn pem_data(
+    reference: &str,
+    private_key: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, ServerError> {
     let path = reference.strip_prefix("file:").ok_or(ServerError::Config)?;
-    let path = Path::new(path);
-    let meta = std::fs::symlink_metadata(path).map_err(|_| ServerError::Config)?;
-    if !meta.file_type().is_file() || meta.len() > MAX_PEM_BYTES {
-        return Err(ServerError::Config);
-    }
-    #[cfg(unix)]
-    if private_key {
-        use std::os::unix::fs::PermissionsExt;
-        if meta.permissions().mode() & 0o077 != 0 {
-            return Err(ServerError::Config);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = private_key;
-    let bytes = std::fs::read(path).map_err(|_| ServerError::Config)?;
-    if bytes.len() as u64 > MAX_PEM_BYTES {
-        return Err(ServerError::Config);
-    }
-    Ok(bytes)
+    crate::bounded_input::read(Path::new(path), MAX_PEM_BYTES, true, private_key)
+        .map_err(|_| ServerError::Config)
 }
 
 fn check_certificate_name(
@@ -1041,8 +1027,8 @@ struct TlsMaterial {
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
-    let cert_bytes = zeroize::Zeroizing::new(pem_data(&inbound.tls_cert, false)?);
-    let key_bytes = zeroize::Zeroizing::new(pem_data(&inbound.tls_key, true)?);
+    let cert_bytes = pem_data(&inbound.tls_cert, false)?;
+    let key_bytes = pem_data(&inbound.tls_key, true)?;
     tls_material_from_bytes(inbound, &cert_bytes, &key_bytes)
 }
 
@@ -1097,8 +1083,8 @@ impl CapturedTls {
         hash.update((document.server.inbounds.len() as u64).to_be_bytes());
         let mut pairs = Vec::with_capacity(document.server.inbounds.len());
         for inbound in &document.server.inbounds {
-            let cert = zeroize::Zeroizing::new(pem_data(&inbound.tls_cert, false)?);
-            let key = zeroize::Zeroizing::new(pem_data(&inbound.tls_key, true)?);
+            let cert = pem_data(&inbound.tls_cert, false)?;
+            let key = pem_data(&inbound.tls_key, true)?;
             // A successful fingerprint is proof of a usable TLS1.3 identity,
             // not simply that two arbitrary private files could be hashed.
             let material = tls_material_from_bytes(inbound, &cert, &key)?;
@@ -2005,6 +1991,22 @@ async fn run_document_with_config(
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
+
+    #[test]
+    fn pem_reader_refuses_oversized_and_relative_inputs() {
+        use std::fs;
+
+        let name = format!("theia-pem-input-{}", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        fs::write(&path, vec![b'x'; MAX_PEM_BYTES as usize + 1]).unwrap();
+        let reference = format!("file:{}", path.display());
+        assert!(pem_data(&reference, false).is_err());
+        assert!(pem_data("file:relative-key.pem", true).is_err());
+        fs::write(&path, b"public fixture").unwrap();
+        let bytes = pem_data(&reference, false).unwrap();
+        assert_eq!(bytes.as_slice(), b"public fixture");
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn peer_budget_is_bounded_and_ipv4_mapped_shares_quota() {

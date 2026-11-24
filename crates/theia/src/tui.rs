@@ -186,6 +186,7 @@ impl Model {
 enum IssueKind {
     NewUser,
     Rotation,
+    Reenable,
 }
 
 /// Confidential bearer issuance is isolated from ordinary editor commands.
@@ -221,6 +222,9 @@ enum ImportFlow {
         ca: Option<String>,
         reference: String,
     },
+    RefreshConfirm(Invitation),
+    RefreshSaving,
+    RefreshDone,
     Saving,
     Done,
     Failed,
@@ -321,6 +325,18 @@ impl Interaction {
         });
     }
 
+    fn start_refresh(&mut self, invitation: Invitation) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.saving = Some(rx);
+        let _worker = std::thread::spawn(move || {
+            let saved = editor.refresh_credential(&invitation).is_ok();
+            let _ = tx.send((editor, saved));
+        });
+    }
+
     /// Bracketed-paste source text stays in memory and is never rendered.
     fn paste_import_source(&mut self, text: &str) {
         if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
@@ -369,6 +385,13 @@ impl Interaction {
                         DisableFlow::Done
                     } else {
                         DisableFlow::SaveFailed
+                    });
+                }
+                if matches!(self.importing, Some(ImportFlow::RefreshSaving)) {
+                    self.importing = Some(if saved {
+                        ImportFlow::RefreshDone
+                    } else {
+                        ImportFlow::Failed
                     });
                 }
                 if matches!(self.importing, Some(ImportFlow::Saving)) {
@@ -570,6 +593,7 @@ impl Interaction {
                         let result = match self.issue_kind {
                             IssueKind::NewUser => editor.issue_user(&id),
                             IssueKind::Rotation => editor.rotate_user(&id),
+                            IssueKind::Reenable => editor.reenable_user(&id),
                         };
                         if result.is_ok() {
                             self.issuance = Some(IssueFlow::Saving);
@@ -735,6 +759,9 @@ impl Interaction {
                 } => {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('n') => {}
+                        KeyCode::Char('r') if editor.can_refresh_credential(&invitation) => {
+                            self.importing = Some(ImportFlow::RefreshConfirm(invitation));
+                        }
                         KeyCode::Char('c') => {
                             self.importing = Some(ImportFlow::Trust {
                                 invitation,
@@ -888,8 +915,17 @@ impl Interaction {
                         })
                     }
                 },
+                ImportFlow::RefreshConfirm(invitation) => match key.code {
+                    KeyCode::Char('y') => {
+                        self.importing = Some(ImportFlow::RefreshSaving);
+                        self.start_refresh(invitation);
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {}
+                    _ => self.importing = Some(ImportFlow::RefreshConfirm(invitation)),
+                },
+                ImportFlow::RefreshSaving => self.importing = Some(ImportFlow::RefreshSaving),
                 ImportFlow::Saving => self.importing = Some(ImportFlow::Saving),
-                state @ (ImportFlow::Done | ImportFlow::Failed) => {
+                state @ (ImportFlow::Done | ImportFlow::RefreshDone | ImportFlow::Failed) => {
                     if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                         self.importing = Some(state);
                     }
@@ -998,6 +1034,17 @@ impl Interaction {
                 } else {
                     editor.error = None;
                     self.issue_kind = IssueKind::Rotation;
+                    self.issuance = Some(IssueFlow::Input(String::new()));
+                }
+                return false;
+            }
+            if editor.role() == Role::Server && key.code == KeyCode::Char('b') {
+                if editor.dirty() {
+                    editor.error =
+                        Some("Сохраните или отмените черновик перед восстановлением.".into());
+                } else {
+                    editor.error = None;
+                    self.issue_kind = IssueKind::Reenable;
                     self.issuance = Some(IssueFlow::Input(String::new()));
                 }
                 return false;
@@ -1266,16 +1313,21 @@ fn draw_issuance(
     kind: IssueKind,
 ) {
     let rotating = kind == IssueKind::Rotation;
+    let recovering = kind == IssueKind::Reenable;
     let (title, body) = match flow {
         IssueFlow::Input(id) => (
-            if rotating {
+            if recovering {
+                "Восстановление отключённого пользователя"
+            } else if rotating {
                 "Ротация токена существующего пользователя"
             } else {
                 "Новый пользователь для выбранного inbound"
             },
             format!(
                 "ID пользователя: {id}\n\n{}\n\nEnter: продолжить  Backspace: удалить  Esc: отменить\n\n{}",
-                if rotating {
+                if recovering {
+                    "Только отключённый пользователь с grant на выбранном inbound. Будет создан новый bearer."
+                } else if rotating {
                     "Только активный пользователь с grant на выбранном inbound. Новый bearer будет выдан однократно."
                 } else {
                     "Сгенерировать 256-битный токен и назначить доступ только к выбранному inbound."
@@ -1284,7 +1336,9 @@ fn draw_issuance(
             ),
         ),
         IssueFlow::Confirm(id) => (
-            if rotating {
+            if recovering {
+                "Подтверждение восстановления доступа"
+            } else if rotating {
                 "Подтверждение глобальной ротации токена"
             } else {
                 "Подтверждение нового пользователя"
@@ -1292,7 +1346,9 @@ fn draw_issuance(
             format!(
                 "Пользователь: {id}\nInbound: {}\n\n{}\n\ny: подтвердить и сохранить  n/Esc: отменить",
                 editor.map_or("", |e| e.selected_record_id()),
-                if rotating {
+                if recovering {
+                    "ВНИМАНИЕ: восстановление глобально по существующим grants. Создаётся НОВЫЙ bearer; прежний токен не восстанавливается. Только отдельный auth-only CAS Apply меняет runtime."
+                } else if rotating {
                     "ВНИМАНИЕ: замена bearer глобальна для всех inbound данного пользователя. Старый токен станет недействительным для НОВЫХ подключений только после отдельного auth-only CAS Apply. Уже открытые туннели не разрываются. Grants и disabled не меняются. Runtime НЕ обновляется автоматически."
                 } else {
                     "Создать токен CSPRNG и сохранить новую запись в server.toml? Это НЕ перезагружает сервер."
@@ -1313,7 +1369,9 @@ fn draw_issuance(
             "Сохранение НЕ удалось: ссылка заблокирована",
             format!(
                 "{}\n\n{}\n\nr: повторить запись  d: удалить черновик и токен",
-                if rotating {
+                if recovering {
+                    "Восстановление НЕ сохранено. Новый токен не показывался."
+                } else if rotating {
                     "Новый digest НЕ сохранён. Старый токен остаётся в файле; runtime не меняется."
                 } else {
                     "Новый пользователь НЕ записан. Токен не показывался."
@@ -1323,7 +1381,9 @@ fn draw_issuance(
         ),
         IssueFlow::Offer => (
             "Одноразовая выдача конфиденциальной ссылки",
-            if rotating {
+            if recovering {
+                "Восстановление и новый digest сохранены. Runtime не обновлён; отдельный Apply обязателен. Старый токен не восстанавливается.\n\ny: показать один раз  f: экспорт в защищённый файл  n/Esc: отказаться и стереть токен".into()
+            } else if rotating {
                 "Новый digest сохранён в server.toml, runtime НЕ обновлён. Старый bearer ещё принимается runtime до отдельного auth-only CAS Apply. Ссылка содержит НОВЫЙ bearer, повторное восстановление невозможно.\n\ny: показать один раз  f: экспорт в защищённый файл  n/Esc: отказаться и стереть токен"
                     .into()
             } else {
@@ -1415,11 +1475,12 @@ fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Opt
         ImportFlow::Preview { invitation, ca, public_ref } => (
             "F-14: безопасный предпросмотр подключения",
             format!(
-                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nTransport: {:?}\nBearer: {}\nCA trust: {}\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\nНикакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
+                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nTransport: {:?}\nBearer: {}\nCA trust: {}\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
                 invitation.id, invitation.endpoint, invitation.server_name,
                 invitation.transport,
                 if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },
                 if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
+                if editor.is_some_and(|e| e.can_refresh_credential(invitation)) { "r: отдельная замена credential существующего профиля; выбранный CA не используется.\n" } else { "" },
                 if invitation.has_token() { "".into() } else { format!("e: указать env:NAME ({})\n", if public_ref.is_some() { "задано" } else { "обязательно" }) },
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
@@ -1437,6 +1498,21 @@ fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Opt
                 "Укажите заранее созданную env:NAME ссылку (НЕ значение bearer).\nВведено {} символов, скрыто.\n\nEnter: принять  Esc: назад\n\n{}",
                 reference.len(), editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
+        ),
+        ImportFlow::RefreshConfirm(invitation) => (
+            "Подтверждение замены credential",
+            format!(
+                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\n\nТолько новая ссылка на защищённый bearer. CA, TLS, transport и active_profile сохраняются. Старый файл не удаляется. Runtime не меняется.\n\ny: сохранить  n/Esc: отменить",
+                invitation.id, invitation.endpoint, invitation.server_name
+            ),
+        ),
+        ImportFlow::RefreshSaving => (
+            "Замена credential",
+            "Создание нового защищённого файла и guarded TOML commit. Runtime не меняется.".into(),
+        ),
+        ImportFlow::RefreshDone => (
+            "Credential сохранён",
+            "Старый файл сохранён. Проверьте доступ отдельно; соединение и системный прокси не менялись. Enter/Esc: закрыть.".into(),
         ),
         ImportFlow::Saving => ("F-14: безопасное сохранение", "Создание нового приватного bearer и guarded TOML commit. Секрет не отображается.\nНикакого подключения или системного прокси.".into()),
         ImportFlow::Done => ("Импорт сохранён", "Новый профиль добавлен, исходный active_profile не изменён.\nTLS trust должен быть независимо проверен при подключении.\nНикаких сетевых соединений или OS proxy изменений.\n\nEnter/Esc: закрыть".into()),
@@ -1458,7 +1534,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Клиентский импорт: i (URI/локальный файл, скрытый ввод). Ctrl+S только сохраняет; runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Клиентский импорт: i (URI/локальный файл, скрытый ввод). Ctrl+S только сохраняет; runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
@@ -1960,6 +2036,113 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.importing.is_none());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn credential_replacement_requires_separate_confirmation_and_keeps_profile() {
+        use crate::{
+            config::{self, Config},
+            invite::Invitation,
+        };
+        use std::{fs, thread, time::Instant};
+
+        let name = format!("theia-refresh-ui-{}.toml", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let server = config::parse(&server_issuance_fixture()).unwrap();
+        let invitation =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let mut editor = Editor::load(Role::Client, &path).unwrap();
+        let public = Invitation::public_from_server(&server, "public").unwrap();
+        editor
+            .import_invitation(&public, None, Some("env:PREVIOUS_TOKEN"))
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Client));
+        let link = Zeroizing::new(invitation.encode().unwrap());
+
+        for confirm in [false, true] {
+            ui.update(&mut model, press(KeyCode::Char('i')));
+            ui.paste_import_source(&link);
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(matches!(ui.importing, Some(ImportFlow::Preview { .. })));
+            ui.update(&mut model, press(KeyCode::Char('r')));
+            assert!(matches!(ui.importing, Some(ImportFlow::RefreshConfirm(_))));
+            assert!(ui.saving.is_none());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+            if !confirm {
+                ui.update(&mut model, press(KeyCode::Esc));
+                assert!(ui.importing.is_none());
+                continue;
+            }
+            ui.update(&mut model, press(KeyCode::Char('y')));
+            assert!(ui.saving.is_some());
+            let start = Instant::now();
+            while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+                ui.poll_save(&mut model).unwrap();
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(ui.importing, Some(ImportFlow::RefreshDone)));
+        }
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        let Config::Client(after) = config::read_file(&path).unwrap() else {
+            panic!("client");
+        };
+        assert_eq!(after.client.active_profile, "home");
+        assert_eq!(after.client.profiles.len(), 2);
+        assert_eq!(after.client.profiles[1].id, "public");
+        let reference = &after.client.profiles[1].auth_token;
+        let secret = Path::new(reference.strip_prefix("file:").unwrap());
+        fs::remove_file(secret).unwrap();
+        fs::remove_dir(secret.parent().unwrap()).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(config::lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn reenable_requires_separate_confirmation_and_never_reuses_old_bearer() {
+        use std::{fs, thread, time::Instant};
+
+        let name = format!("theia-reenable-ui-{}.toml", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        editor.disable_user("device-a").unwrap();
+        assert!(editor.save());
+        let disabled = fs::read(&path).unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+
+        for confirm in [false, true] {
+            ui.update(&mut model, press(KeyCode::Char('b')));
+            for ch in "device-a".chars() {
+                ui.update(&mut model, press(KeyCode::Char(ch)));
+            }
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(matches!(ui.issuance, Some(IssueFlow::Confirm(_))));
+            assert!(ui.saving.is_none());
+            assert_eq!(fs::read(&path).unwrap(), disabled);
+            if !confirm {
+                ui.update(&mut model, press(KeyCode::Esc));
+                assert!(ui.issuance.is_none());
+                continue;
+            }
+            ui.update(&mut model, press(KeyCode::Char('y')));
+            let start = Instant::now();
+            while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+                ui.poll_save(&mut model).unwrap();
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(ui.issuance, Some(IssueFlow::Offer)));
+        }
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        let invite = ui.editor.as_mut().unwrap().take_issued().unwrap();
+        assert!(invite.token_bytes() != Some([0x42; 32]));
+        assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(crate::config::lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]

@@ -4,8 +4,8 @@
 use crate::invite::Invitation;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    fs::{self, File},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
@@ -44,91 +44,8 @@ pub fn read_source(raw: &str) -> Result<Invitation, ImportError> {
     Invitation::decode(value.trim_end_matches(['\r', '\n'])).map_err(|_| ImportError::InvalidSource)
 }
 
-// Reject ambiguous path forms before touching the filesystem. A drive
-// letter is not proof that a volume is physically local (mapped drives
-// and mounted filesystems are outside this lexical check).
-fn explicit_file_path(path: &Path) -> bool {
-    use std::path::Component;
-
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
-    {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::path::Prefix;
-        let mut parts = path.components();
-        if !matches!(
-            parts.next(),
-            Some(Component::Prefix(prefix))
-                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-        ) {
-            return false;
-        }
-        // Alternate data streams and device syntax are not invitation files.
-        if parts.any(|part| match part {
-            Component::Normal(name) => name.to_string_lossy().contains(':'),
-            _ => false,
-        }) {
-            return false;
-        }
-    }
-    true
-}
-
-fn regular_metadata(metadata: &fs::Metadata, limit: u64) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
-    }
-    metadata.is_file() && metadata.len() <= limit
-}
-
-// Check the opened handle as well as the path; do not follow a final
-// symlink/reparse point on supported release platforms. Parent directory
-// replacement, mounted remote filesystems and trust at later runtime use
-// are separate concerns, not solved by this bounded import reader.
 fn read_local_file(path: &Path, limit: u64) -> Result<Zeroizing<Vec<u8>>, ImportError> {
-    if !explicit_file_path(path) {
-        return Err(ImportError::InvalidSource);
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|_| ImportError::InvalidSource)?;
-    if !regular_metadata(&metadata, limit) {
-        return Err(ImportError::InvalidSource);
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).map_err(|_| ImportError::InvalidSource)?;
-    let metadata = file.metadata().map_err(|_| ImportError::InvalidSource)?;
-    if !regular_metadata(&metadata, limit) {
-        return Err(ImportError::InvalidSource);
-    }
-    let mut contents = Zeroizing::new(Vec::new());
-    file.take(limit + 1)
-        .read_to_end(&mut contents)
-        .map_err(|_| ImportError::InvalidSource)?;
-    if contents.len() as u64 > limit {
-        return Err(ImportError::InvalidSource);
-    }
-    Ok(contents)
+    crate::bounded_input::read(path, limit, true, false).map_err(|_| ImportError::InvalidSource)
 }
 
 pub fn valid_explicit_reference(raw: &str) -> bool {
@@ -280,7 +197,7 @@ fn new_private_directory(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn new_private_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
+    fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -511,6 +428,7 @@ mod windows_acl_tests {
 #[cfg(all(test, any(unix, windows)))]
 mod storage_tests {
     use super::*;
+    use crate::bounded_input::explicit_file_path;
     use sha2::Digest;
     use std::{process::Command, sync::Barrier, thread};
 

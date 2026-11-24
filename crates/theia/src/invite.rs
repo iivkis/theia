@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fmt, net::SocketAddr};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const PREFIX: &str = "theia://v1/";
 const MAX_DATA: usize = 3072;
@@ -67,6 +67,14 @@ struct Wire {
     transport: Transport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+}
+
+impl Drop for Wire {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.as_mut() {
+            token.zeroize();
+        }
+    }
 }
 
 impl Invitation {
@@ -171,17 +179,18 @@ impl Invitation {
             server_name: self.server_name.clone(),
             tls_profile: "default".into(),
             transport: self.transport,
-            token: self.token.map(|v| URL_SAFE_NO_PAD.encode(v)),
+            token: self.token.as_ref().map(|v| URL_SAFE_NO_PAD.encode(v)),
         };
-        let text = toml::to_string(&wire).map_err(|_| InviteError::Invalid)?;
+        let text = Zeroizing::new(toml::to_string(&wire).map_err(|_| InviteError::Invalid)?);
         if text.len() > MAX_DATA {
             return Err(InviteError::Invalid);
         }
-        let uri = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(text.as_bytes()));
+        let mut uri = Zeroizing::new(PREFIX.to_owned());
+        URL_SAFE_NO_PAD.encode_string(text.as_bytes(), &mut uri);
         if uri.len() > MAX_URI {
             return Err(InviteError::Invalid);
         }
-        Ok(uri)
+        Ok(std::mem::take(&mut *uri))
     }
 
     /// Reject non-canonical base64url, unknown fields/versions, invalid
@@ -198,33 +207,44 @@ impl Invitation {
         {
             return Err(InviteError::Invalid);
         }
-        let bytes = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|_| InviteError::Invalid)?;
-        if bytes.len() > MAX_DATA || URL_SAFE_NO_PAD.encode(&bytes) != encoded {
+        let bytes = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|_| InviteError::Invalid)?,
+        );
+        let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice()));
+        if bytes.len() > MAX_DATA || canonical.as_str() != encoded {
             return Err(InviteError::Invalid);
         }
         let text = std::str::from_utf8(&bytes).map_err(|_| InviteError::Invalid)?;
-        let wire: Wire = toml::from_str(text).map_err(|_| InviteError::Invalid)?;
+        let mut wire: Wire = toml::from_str(text).map_err(|_| InviteError::Invalid)?;
         if wire.version != 1 || wire.tls_profile != "default" {
             return Err(InviteError::Invalid);
         }
-        let token = match wire.token {
+        let token = match wire.token.as_ref() {
             Some(raw) => {
-                let value = URL_SAFE_NO_PAD
-                    .decode(&raw)
-                    .map_err(|_| InviteError::Invalid)?;
-                if value.len() != 32 || URL_SAFE_NO_PAD.encode(&value) != raw {
+                let value = Zeroizing::new(
+                    URL_SAFE_NO_PAD
+                        .decode(raw)
+                        .map_err(|_| InviteError::Invalid)?,
+                );
+                let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(value.as_slice()));
+                if value.len() != 32 || canonical.as_str() != raw.as_str() {
                     return Err(InviteError::Invalid);
                 }
-                Some(value.try_into().map_err(|_| InviteError::Invalid)?)
+                Some(
+                    value
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| InviteError::Invalid)?,
+                )
             }
             None => None,
         };
         let invite = Self {
-            id: wire.id,
-            endpoint: wire.endpoint,
-            server_name: wire.server_name,
+            id: std::mem::take(&mut wire.id),
+            endpoint: std::mem::take(&mut wire.endpoint),
+            server_name: std::mem::take(&mut wire.server_name),
             transport: wire.transport,
             token,
         };
