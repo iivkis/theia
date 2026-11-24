@@ -50,6 +50,12 @@
 
 [ADR-0064](adr/0064-f18-m3-5a7-version-boundary-review.md) фиксирует production исправление: `Invitation::public_from_profile` отвергает любой non-default TLS profile вместо незаметной подмены на default. Формат theia://v1 не меняется. Проверяются public/issued invite, version mismatch, duplicate/nested trust fields, попытки добавить pin/generation/retired history и неподдерживаемые TLS/security modes; default export сохраняет transport H2/H3/auto. Отдельно зафиксированы доказательства M3.5a0–a6 и условия независимого security review. Никакой новый security mode, schema v2 или modified handshake не включён.
 
+## M3.5a8 — восстановление политики доверия (research checkpoint)
+
+[ADR-0065](adr/0065-f18-m3-5a8-checkpoint-recovery.md) расширяет существующую test-only модель: сериализованный TOML checkpoint публичных pin, отозванных ключей, scope, поколения и последнего времени проверяется против независимо предоставленного ожидаемого SHA-256 и поколения. Отвергаются устаревшие и изменённые snapshots, несовпадающий scope, rollback часов, неизвестные поля, пересечение активных и отозванных ключей и превышение лимита. Отзыв и deny-all сохраняются при реконструкции модели.
+
+Дополнительно изолированный файловый regression test выполняет create_new/write/sync, публикацию через rename в отсутствующий путь, повторное чтение с ограничением размера и отказ при отсутствующем, старом, частичном, повреждённом либо oversized файле без fallback. Это **не** доказательство защищённого долговременного хранения: внешний доверенный anchor моделируется в тестах, atomic replacement/ACL, конкурентный доступ и power-loss/crash consistency не реализованы, replay-cache не сериализуется. Нужны новый verified TLS channel после restart и отдельное доказательство durable replay при необходимости. Runtime/TOML/invite v1 неизменны. Native CI обязателен.
+
 ## M3.5b1 — чистый offline planner кандидатов (реализован частично)
 
 Файл `crates/theia/src/camouflage_discovery.rs`, integration tests `crates/theia/tests/camouflage_discovery.rs`, ADR-0022. Код в текущем *едином* Rust binary (library module) без новых зависимостей, не имеет ни socket/DNS/HTTP/TLS вызовов, ни CLI/TUI команды:
