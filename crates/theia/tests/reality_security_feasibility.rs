@@ -32,6 +32,57 @@ use zeroize::Zeroize;
 #[path = "support/f18_research_identity.rs"]
 mod f18_identity_lab;
 
+#[test]
+fn h3_identity_proof_must_be_signed_for_its_own_branch_not_replayed_from_h2() {
+    use f18_identity_lab::{Branch, Failure, ReplayWindow, Transcript};
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let signer = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let pinned: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
+    // These fixed bytes are *not* the entropy test. This checks that the
+    // H3-only branch is encoded and signed separately, not silently treated
+    // as an H2 proof. Verified QUIC exporters are exercised below.
+    let h2 = Transcript::new(
+        Branch::H2,
+        "localhost",
+        443,
+        [1; 32],
+        [2; 32],
+        [3; 32],
+        10_000,
+    )
+    .unwrap();
+    let h3 = Transcript::new(
+        Branch::H3,
+        "localhost",
+        443,
+        [1; 32],
+        [2; 32],
+        [3; 32],
+        10_000,
+    )
+    .unwrap();
+    let h2_signature = signer.sign(&h2.encode());
+    let h3_signature = signer.sign(&h3.encode());
+    let mut replay = ReplayWindow::new(4).unwrap();
+    assert_eq!(
+        replay.accept(&pinned, &h3, h2_signature.as_ref(), 10_000),
+        Err(Failure::InvalidProof)
+    );
+    assert_eq!(
+        replay.accept(&pinned, &h3, h3_signature.as_ref(), 10_000),
+        Ok(())
+    );
+    assert_eq!(
+        replay.accept(&pinned, &h3, h3_signature.as_ref(), 10_001),
+        Err(Failure::Replay)
+    );
+}
+
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-Theia-M3.5a-feasibility-only";
 const CONTEXT: &[u8] = b"test-only-domain-separated-channel-binding";
 const DEADLINE: Duration = Duration::from_secs(12);
