@@ -116,7 +116,7 @@ second-user SID test and WSL2 guest provisioning (~50 s), both of which must
 retain native/security correctness. Do not replace these with mocks or
 unverified reusable fixtures just to reduce reported CI time.
 
-## Remove unused release compilation from ordinary CI (PR pending)
+## Remove unused release compilation from ordinary CI (merged PR #97)
 
 The optimized `cargo build --workspace --release --locked` had been executed
 **on every main push**, twice, at the *end* of `rust-tests` (Linux) and
@@ -150,3 +150,37 @@ is necessary.
 The CI DAG regression guard asserts exact manual-only conditions for
 both release-build steps, preventing a later edit from silently restoring
 the main-push expense or dropping release compile checks entirely.
+
+### Verified full native CI after the merge
+
+The exact-head code PR [run 45363429350](https://github.com/iivkis/theia/actions/runs/45363429350)
+succeeded with **all 15 jobs**, including real cross-SID and real WSL2
+cross-host acceptance. After [PR #97](https://github.com/iivkis/theia/pull/97)
+merged, the [main push run 45364323549](https://github.com/iivkis/theia/actions/runs/45364323549)
+also succeeded with **all 15 jobs**. GitHub Actions individually reported
+both `Manual release compilation (Linux)` and
+`Manual release compilation (Windows)` as **skipped** in that main-push
+run. Neither production-mode security tests nor the final `ci-gate` were skipped.
+
+| Measured result | Pre-change main [run 45337912142](https://github.com/iivkis/theia/actions/runs/45337912142) | Post-change main [run 45364323549](https://github.com/iivkis/theia/actions/runs/45364323549) |
+| --- | ---: | ---: |
+| Full workflow creation → completion | **807 s** (13m27s) | **323 s** (5m23s) |
+| Windows smoke native job | **691 s** | **209 s** |
+| Linux native Rust job | **112 s** | **85 s** |
+| Native Windows → real Linux WSL2 cross-host | **74 s** | **76 s** |
+| Windows release compile (step) | ~257 s executed | **skipped** |
+| Linux release compile (step) | ~17 s executed | **skipped** |
+
+Between these **two specific real runs**, the total workflow finished
+**484 s (8m04s, ~60%) sooner**. Do **not** attribute all 484 seconds to
+removing release builds: the older main run had a **cold Windows Cargo
+cache** following a Rust profile change, while the new one restored a
+warm matching cache. The directly deleted extra computation is the
+previously measured ~257 s Windows release + ~17 s Linux release
+(approximately **274 runner-seconds**) in addition to any cache effects.
+Queue times and runner image/caches may also vary; this is not a
+guaranteed speedup on every subsequent commit.
+
+The main Windows smoke and cross-host still validated the same real OS
+security and tunnel behavior. Manual `workflow_dispatch` retains
+explicit verification of release compilation on both platforms.
