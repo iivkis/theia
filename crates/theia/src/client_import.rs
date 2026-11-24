@@ -178,6 +178,16 @@ pub struct PrivateBearer {
 
 impl PrivateBearer {
     pub fn create(config_path: &Path, bytes: &[u8; 32]) -> Result<Self, ImportError> {
+        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes));
+        Self::create_payload(config_path, "bearer", "token", encoded.as_bytes())
+    }
+
+    fn create_payload(
+        config_path: &Path,
+        kind: &str,
+        filename: &str,
+        payload: &[u8],
+    ) -> Result<Self, ImportError> {
         let parent = config_path
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -196,9 +206,9 @@ impl PrivateBearer {
             use std::fmt::Write as _;
             write!(&mut suffix, "{byte:02x}").map_err(|_| ImportError::UnsafeStorage)?;
         }
-        let directory = parent.join(format!(".theia-bearer-{suffix}"));
+        let directory = parent.join(format!(".theia-{kind}-{suffix}"));
         new_private_directory(&directory).map_err(|_| ImportError::UnsafeStorage)?;
-        let file = directory.join("token");
+        let file = directory.join(filename);
         let guard = Self {
             directory,
             file,
@@ -206,8 +216,7 @@ impl PrivateBearer {
         };
         let result = (|| -> io::Result<()> {
             let mut writer = new_private_file(&guard.file)?;
-            let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes));
-            writer.write_all(encoded.as_bytes())?;
+            writer.write_all(payload)?;
             writer.sync_all()?;
             drop(writer);
             #[cfg(unix)]
@@ -228,6 +237,28 @@ impl PrivateBearer {
     pub fn commit(&mut self) {
         self.committed = true;
     }
+}
+
+/// Confidential export is called only after a separate user confirmation.
+/// A fresh protected directory and create-new file avoid overwrite. The
+/// caller owns the returned credential file and is responsible for transfer.
+pub(crate) fn export_invitation_file(
+    config_path: &Path,
+    invite: &Invitation,
+) -> Result<PathBuf, ImportError> {
+    if !invite.has_token() {
+        return Err(ImportError::InvalidSource);
+    }
+    let encoded = Zeroizing::new(invite.encode().map_err(|_| ImportError::InvalidSource)?);
+    let mut output = PrivateBearer::create_payload(
+        config_path,
+        "export",
+        "invitation.theia",
+        encoded.as_bytes(),
+    )?;
+    let path = output.file.clone();
+    output.commit();
+    Ok(path)
 }
 
 impl Drop for PrivateBearer {
@@ -480,6 +511,7 @@ mod windows_acl_tests {
 #[cfg(all(test, any(unix, windows)))]
 mod storage_tests {
     use super::*;
+    use sha2::Digest;
     use std::{process::Command, sync::Barrier, thread};
 
     const CHILD_PARENT: &str = "THEIA_TEST_PRIVATE_BEARER_CHILD_PARENT";
@@ -620,6 +652,30 @@ mod storage_tests {
         }
         assert!(explicit_file_path(Path::new(r"C:\data\invite.txt")));
         assert!(explicit_file_path(Path::new(r"\\?\C:\data\invite.txt")));
+    }
+
+    #[test]
+    fn confidential_export_uses_private_distinct_create_new_files() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("server.toml");
+        let source = include_str!("../../../examples/server.toml").replace(
+            "REPLACE_WITH_64_LOWERCASE_HEX",
+            &format!("{:x}", sha2::Sha256::digest([0x42; 32])),
+        );
+        let server = crate::config::parse(&source).unwrap();
+        let public = Invitation::public_from_server(&server, "public").unwrap();
+        assert!(export_invitation_file(&path, &public).is_err());
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let first = export_invitation_file(&path, &invite).unwrap();
+        let second = export_invitation_file(&path, &invite).unwrap();
+        assert_ne!(first, second);
+        for file in [&first, &second] {
+            assert_private(file, false);
+            assert_private(file.parent().unwrap(), true);
+            let decoded = read_source(file.to_str().unwrap()).unwrap();
+            assert_eq!(decoded.token_bytes(), Some([0x42; 32]));
+        }
     }
 
     #[test]

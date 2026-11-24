@@ -71,3 +71,5 @@
 ADR хранить в `docs/adr/NNNN-title.md` с контекстом, альтернативами, решением, последствиями и планом проверки. Никаких ADR ради очевидных методов.
 
 **F-13 production M3.4 next gate (PR #83; ADR-0057, CI pending):** named `browser-h2-btls-v1` is opt-in only for real TLS1.3/H2, with BoringSSL GREASE/ALPS, strict independent PEM CA/SNI/ALPN and bounded distinct production SETTINGS `[(1,65536),(2,0),(4,262144),(6,8192)]`. Default remains rustls; H3/auto are rejected to prevent silent downgrade. Native compiled client HTTP CONNECT/SOCKS5 and actual H2 wire capture Linux/Windows, mismatch report vs Chromium159 required. **F-13 remains P0 open:** H3 QUIC Initial/reference, cipher/extension fidelity, pseudo-header ordering and broader measurements/release benchmark pending.
+
+**M4.4e — protected file export:** confirmed one-time server issuance/rotation → separate file export confirmation → fresh private file → local client import; tests for stale/unsaved/consumed offer, safe rendering and unchanged active profile. Pending exact-head native CI. No clipboard/QR or automatic transfer.
