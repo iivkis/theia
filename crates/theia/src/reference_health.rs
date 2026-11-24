@@ -746,6 +746,56 @@ impl State {
     }
 }
 
+/// A freshly revalidated exact approved reference. Its socket cannot be
+/// supplied by network input. Leases expire after 60 seconds; a caller must
+/// renew via State and the current verified signed descriptor.
+pub struct RelayLease {
+    address: SocketAddr,
+    expires: tokio::time::Instant,
+}
+
+impl RelayLease {
+    pub(crate) fn address(&self) -> Result<SocketAddr, Error> {
+        if tokio::time::Instant::now() >= self.expires {
+            return Err(Error::NotEligible);
+        }
+        Ok(self.address)
+    }
+}
+
+impl State {
+    pub async fn relay_lease(
+        &self,
+        verified: &crate::descriptor::Verified,
+        approved_plan_sha256: [u8; 32],
+    ) -> Result<RelayLease, Error> {
+        if self.plan.digest()? != approved_plan_sha256 {
+            return Err(Error::Approval);
+        }
+        let now = unix_now()?;
+        verified.check_time(now).map_err(|_| Error::NotEligible)?;
+        self.validate_active(verified.descriptor(), now)?;
+        let target = self.plan.references.get(usize::from(verified.descriptor().active_reference))
+            .ok_or(Error::Format)?;
+        // The target is derived exclusively from the signed active index
+        // and immutable approved plan, never from ClientHello contents.
+        let _permit = timeout(ATTEMPT, ACTIVE.acquire()).await
+            .map_err(|_| Error::Timeout)?.map_err(|_| Error::Timeout)?;
+        let own = extend_endpoint_addresses(&self.plan, own_addresses(&self.plan)?).await?;
+        fresh_dns(target, &own).await?;
+        let now = unix_now()?;
+        self.validate_active(verified.descriptor(), now)?;
+        verified.check_time(now).map_err(|_| Error::NotEligible)?;
+        let remaining = verified.descriptor().not_after.checked_sub(now)
+            .ok_or(Error::Clock)?.min(60);
+        if remaining == 0 { return Err(Error::NotEligible); }
+        Ok(RelayLease {
+            address: target.address,
+            expires: tokio::time::Instant::now() + Duration::from_secs(remaining),
+        })
+    }
+}
+
 pub struct Store {
     path: PathBuf,
 }
