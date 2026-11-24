@@ -87,6 +87,10 @@ fn maybe_live() {}
         self.assertEqual(cov.test_only_lines(source), set(range(4, 11)))
         self.assertFalse(cov.test_only_attribute(b"#[cfg(not(test))]"))
         self.assertFalse(cov.test_only_attribute(b"#[cfg(any(test, windows))]"))
+        self.assertTrue(cov.test_only_attribute(b'#[cfg(all(target_os = "linux", test))]'))
+        self.assertTrue(cov.test_only_attribute(b"#[cfg(not(any(not(test), windows)))]"))
+        self.assertFalse(cov.test_only_attribute(b"#[cfg(all(not(test), windows))]"))
+        self.assertFalse(cov.test_only_attribute(b"#[custom::test]"))
 
 
 if __name__ == "__main__":

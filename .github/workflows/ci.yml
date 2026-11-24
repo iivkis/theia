@@ -556,7 +556,7 @@ jobs:
         if: runner.os == 'Windows'
         run: python -m pip install pywinpty==3.0.5
       - name: Instrument full native workspace tests
-        run: cargo llvm-cov --workspace --all-targets --all-features --locked --lcov --output-path coverage.lcov
+        run: cargo llvm-cov --workspace --all-targets --all-features --locked --lcov --include-build-script --output-path coverage.lcov
       - name: Normalize exact-SHA native line evidence
         run: python scripts/ci-coverage.py collect --lcov coverage.lcov --platform "${{ runner.os }}" --sha "${{ github.event.pull_request.merge_commit_sha }}" --output coverage.json
       - uses: actions/upload-artifact@v4

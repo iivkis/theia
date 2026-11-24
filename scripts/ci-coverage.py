@@ -51,7 +51,8 @@ def inventory(root: Path) -> dict[str, str]:
         file = root / name
         if file.is_symlink() or not file.is_file():
             raise EvidenceError(f"Source is not a regular file: {name}")
-        sources[name] = hashlib.sha256(file.read_bytes()).hexdigest()
+        # Git on Windows may check out CRLF; line identities remain the same.
+        sources[name] = hashlib.sha256(file.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
     if not sources:
         raise EvidenceError("Empty production source inventory")
     return sources
@@ -61,6 +62,7 @@ def exact_head(root: Path, sha: str) -> None:
     actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     if not SHA.fullmatch(sha) or actual != sha:
         raise EvidenceError("Coverage does not belong to the checked-out merge SHA")
+    subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "crates"], cwd=root, check=True)
 
 
 def source_name(raw: str, root: Path) -> str | None:
@@ -123,11 +125,75 @@ def read_lcov(text: str, root: Path, expected: dict[str, str]) -> dict[str, dict
     return files
 
 
+def cfg_production_values(expression: bytes) -> set[bool]:
+    """Conservative Boolean analysis with test=false; other cfg atoms unknown."""
+    token_re = re.compile(rb'[A-Za-z_][A-Za-z_0-9]*|"(?:\\.|[^"\\])*"|[(),=]')
+    tokens = token_re.findall(expression)
+    if b"".join(tokens) != expression:
+        raise EvidenceError("Unrecognized cfg expression")
+    pos = 0
+
+    def take():
+        nonlocal pos
+        if pos >= len(tokens):
+            raise EvidenceError("Incomplete cfg predicate")
+        token = tokens[pos]
+        pos += 1
+        return token
+
+    def predicate():
+        nonlocal pos
+        name = take()
+        if not re.fullmatch(rb"[A-Za-z_][A-Za-z_0-9]*", name):
+            raise EvidenceError("Invalid cfg predicate")
+        if pos < len(tokens) and tokens[pos] == b"=":
+            pos += 1
+            if not take().startswith(b'"'):
+                raise EvidenceError("Invalid cfg value")
+            return {False, True}
+        if pos >= len(tokens) or tokens[pos] != b"(":
+            return {False} if name == b"test" else {False, True}
+        pos += 1
+        args = []
+        while pos < len(tokens) and tokens[pos] != b")":
+            args.append(predicate())
+            separator = take()
+            if separator == b")":
+                pos -= 1
+                break
+            if separator != b",":
+                raise EvidenceError("Invalid cfg arguments")
+        if take() != b")":
+            raise EvidenceError("Unclosed cfg expression")
+        if name == b"not" and len(args) == 1:
+            return {not value for value in args[0]}
+        if name == b"all":
+            result = {True}
+            for arg in args:
+                result = {left and right for left in result for right in arg}
+            return result
+        if name == b"any":
+            result = {False}
+            for arg in args:
+                result = {left or right for left in result for right in arg}
+            return result
+        return {False, True}
+
+    values = predicate()
+    if pos != len(tokens):
+        raise EvidenceError("Trailing cfg tokens")
+    return values
+
+
 def test_only_attribute(raw: bytes) -> bool:
     compact = re.sub(rb"\s+", b"", raw)
-    if compact == b"#[cfg(test)]" or compact.startswith(b"#[cfg(all(test,"):
-        return True
-    return re.fullmatch(rb"#\[(?:[A-Za-z_][A-Za-z_0-9]*::)*test(?:\(.*\))?\]", compact) is not None
+    if compact.startswith(b"#[cfg(") and compact.endswith(b")]"):
+        try:
+            return True not in cfg_production_values(compact[6:-2])
+        except EvidenceError:
+            # Never exclude code based on a predicate we cannot prove test-only.
+            return False
+    return re.fullmatch(rb"#\[(?:test|tokio::test)(?:\(.*\))?\]", compact) is not None
 
 
 def test_only_lines(source: bytes) -> set[int]:
