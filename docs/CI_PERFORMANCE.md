@@ -74,29 +74,44 @@ must instead trigger the full native matrix.
 A failed or cancelled check cannot be reported as green. This check is about
 safe CI scope, not about weakening the F-18 / F-19 security release gates.
 
-## Experiment: Windows MSVC test/dev line-table debug metadata (PR pending)
+## Verified Windows MSVC CI memory/time improvement (PR #95, 2026-11-24)
 
-Native Windows `windows-smoke` spends approximately 140 seconds in
-`cargo test --workspace --all-targets --locked` on the measured warm-cache
-run. This includes real transport/TUI/security runtime, not just compiling.
-The same runner repeatedly links a large collection of Rust integration
-harnesses with Cargo's default full test/dev debugging information.
+[PR #95](https://github.com/iivkis/theia/pull/95) keeps **all** mandatory
+Windows native all-targets tests, WinINet rollback, cross-SID kernel DACL
+denial, ConPTY, and real Linux VM → native Windows H2/H3 cross-host acceptance.
+Only the Windows smoke job overrides Cargo **dev/test** debug metadata with
+`line-tables-only` (retained source-line diagnostics, less expensive full MSVC
+PDB/type/variable data). The release profile, binary semantics and transport
+security remain unchanged. Exact-head [full native CI run
+45336214208](https://github.com/iivkis/theia/actions/runs/45336214208)
+passed, including a selectively rerun Windows job and its dependent cross-host
+acceptance.
 
-The **experimental** workflow overrides only Windows smoke's development
-and test profile debug metadata with `line-tables-only`. Rust retains source
-line locations for panic diagnostics but omits heavyweight full type/variable
-debug information and associated Windows PDB work. `CARGO_INCREMENTAL=0`
-remains unchanged, every test executes, the cross-SID second-account kernel
-denial and ConPTY terminal scenario remain mandatory, the *same* CI-built
-Windows executable goes to the real Linux/Windows H2/H3 cross-host test,
-and the **release build profile is untouched**. Neither crypto features nor
-TLS verification/runtime protocol change.
+| Metric | Baseline warm cache (PR #93) | New cold cache (PR #95) | New warm cache (rerun only Windows + dependencies) |
+| --- | ---: | ---: | ---: |
+| Windows smoke total job | 269 s | 380 s | **209 s** |
+| Windows `cargo test --workspace --all-targets --locked` step | ~140 s | ~282 s | **~104 s** |
+| Restored Rust cache size | 742 MiB | none (new profile key) | **240 MiB** |
+| Windows second-SID + native terminal E2E | mandatory, passed | mandatory, passed | mandatory, passed |
 
-This is **not a proven speed-up yet**. Cargo fingerprint/cache keys change
-for this profile; the first run may be a cold-build regression. Evaluate the
-actual Windows smoke duration after the same profile has populated its
-cache, benchmark against the 257–269-second warm-cache baseline, and
-retain the change only if repeated CI shows a worthwhile improvement
-without introducing test failures. Measure full CI wall time and runner
-minutes separately. Never claim the whole pipeline was accelerated merely
-because a binary is smaller.
+Measured sources: old Windows job in
+[PR #93](https://github.com/iivkis/theia/actions/runs/45333765292/job/138241079317);
+[PR #95 cold job](https://github.com/iivkis/theia/actions/runs/45336214208/job/138248932308);
+[PR #95 warm job](https://github.com/iivkis/theia/actions/runs/45336214208/job/138252017848).
+GitHub Actions timestamps show **60 s (~22%) faster Windows smoke** at
+warm cache than the prior warm-cache baseline, and a **502 MiB (~68%)
+smaller** Rust cache archive. The reduced archive also lowers transfer and
+storage costs. The initial cold run was **111 s slower**, which is an explicit
+one-off cache migration cost rather than a win.
+
+**Scope of result:** this is an A/B observation of individual Windows jobs,
+not a statistically calibrated performance guarantee or a claim that the
+entire full CI became 22% faster. The dependent WSL2 cross-host step remains
+mandatory and creates a lower bound on full CI wall time. Warm cache is only
+usable when the matching Cargo/Rust/lockfile/profile hash is available;
+changing dependencies, toolchain or runner images can restore cold timings.
+
+Next bottlenecks: pinned Go 1.24 setup (~20–30 s on Windows), actual
+second-user SID test and WSL2 guest provisioning (~50 s), both of which must
+retain native/security correctness. Do not replace these with mocks or
+unverified reusable fixtures just to reduce reported CI time.
