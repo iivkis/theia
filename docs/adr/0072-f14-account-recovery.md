@@ -1,9 +1,0 @@
-# ADR-0072: explicit disabled-user recovery and lifecycle acceptance
-
-**Status:** accepted in PR #108, exact-head run 45395505034 (13/13).
-
-Recovering an existing disabled account must be separate from normal rotation. The server editor accepts only a disabled user explicitly granted on the selected inbound, requires a clean editor and separate confirmation, creates a fresh CSPRNG 32-byte bearer and updates only digest and disabled flag. Existing grants are unchanged; a saved account is not a live authorization update. Existing guarded transaction and one-time offer semantics remain. Ordinary rotation of a disabled user and recovery of an enabled user refuse.
-
-Given a disabled user, when explicitly recovering and saving, then the previous digest is replaced, grant set remains identical and only a fresh invitation can be revealed or exported. Given cancel, invalid user or conflicted save, no invitation is revealed. Given saved recovery, a running server still rejects new admission until separately confirmed auth-only CAS Apply. After Apply both prior tokens are rejected and the new credential can open H2/H3 tunnels. Extend the existing compiled Linux server IPC test, not a new job: import the original grant with the independent CA, then refresh from the actual recovered exported invitation, compare the complete client configuration except auth_token, retain the original private file and use the newly stored bytes for H2/H3. Native Windows editor/UI and existing cross-host tests remain mandatory.
-
-No hard revocation of already authenticated tunnels, new grants, automatic runtime Apply, new protocol, durable secret erasure, or F-18 capability. The local account recovery E2E is not a claim of remote cross-host recovery. Fix the reported formatting drift in the same consolidated M4.4f–h block.

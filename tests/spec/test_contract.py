@@ -1,4 +1,4 @@
-"""Specification-only contract checks. NOT Rust implementation tests."""
+"""Repository contract checks. NOT Rust implementation tests. Project documentation is maintained in Notion."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -39,66 +39,12 @@ def explicit_grants_are_valid(server: dict) -> bool:
 class SpecContractTests(unittest.TestCase):
     def test_required_files(self):
         required = [
-            "README.md", "AGENTS.md",
-            "docs/IMPLEMENTATION_SPEC.md", "docs/ARCHITECTURE.md",
-            "docs/SMARTTHEIA_PROTOCOL.md", "docs/CONFIGURATION.md",
-            "docs/TUI_UX.md", "docs/IMPLEMENTATION_PLAN.md",
-            "docs/STEALTH_REALITY.md",
-            "docs/adr/0020-reality-like-and-tls-in-tls.md",
-            "docs/TESTING_CI.md", "docs/STATUS.md",
-            "docs/adr/0001-standard-h3-h2-embedding.md",
-            "docs/adr/0002-inbound-authorization-and-tcp-ack.md",
-            "docs/adr/0003-mvp-bbr-and-fingerprint.md",
             "examples/server.toml", "examples/client.toml",
             ".github/workflows/ci.yml", "scripts/check-spec.sh"
         ]
         for path in required:
             with self.subTest(path=path):
                 self.assertTrue((ROOT / path).is_file(), path)
-
-    def test_local_markdown_links(self):
-        docs = [ROOT / "README.md", ROOT / "AGENTS.md"]
-        docs += list((ROOT / "docs").rglob("*.md"))
-        for file in docs:
-            text = file.read_text(encoding="utf-8")
-            with self.subTest(file=file):
-                self.assertGreater(len(text), 200)
-            for link in re.findall(r"\]\(([^)]+)\)", text):
-                path = link.split("#", 1)[0].strip()
-                if not path or path.startswith(("https://", "http://", "mailto:")):
-                    continue
-                if path.startswith("<") or " " in path:
-                    continue
-                with self.subTest(file=file, link=path):
-                    self.assertTrue((file.parent / path).exists(), f"{file}: {path}")
-
-    def test_live_readme_and_status_are_not_stale_preimplementation_notes(self):
-        readme = read("README.md")
-        status = read("docs/STATUS.md")
-        self.assertLess(len(readme), 14_000, "README must not regrow into PR-by-PR history")
-        self.assertIn("Experimental / unreleased", readme)
-        self.assertIn("M4.4b2a", readme)
-        self.assertNotIn("M4.4a (in review)", readme)
-        self.assertNotIn("Windows пока только Unsupported", readme)
-        self.assertNotIn("реализация ядра по-прежнему **отсутствует**", readme)
-        self.assertIn("docs/STATUS.md", readme)
-        self.assertIn("PR #83", readme)
-        self.assertIn("PR #83", status)
-        for live_path in ("README.md", "docs/STATUS.md", "docs/CONFIGURATION.md", "docs/INVITATIONS.md"):
-            with self.subTest(live_path=live_path):
-                live = read(live_path)
-                self.assertNotIn("CI pending", live)
-                self.assertNotIn("PR/CI", live)
-        self.assertIn("13/13 SUCCESS", status)
-        self.assertIn("только после", status)
-        for item in ("F-13", "F-14", "F-18", "F-19", "M4.3"):
-            with self.subTest(item=item):
-                self.assertIn(item, readme)
-                self.assertIn(item, status)
-        self.assertFalse((ROOT / "docs/SPEC_REVIEW.md").exists())
-        archive = read("docs/archive/spec-review-2026-11-22.md")
-        self.assertIn("Исторический документ", archive)
-        self.assertIn("устарели", archive)
 
     def test_toml_schema_versions(self):
         for kind in ("server", "client"):
@@ -140,18 +86,9 @@ class SpecContractTests(unittest.TestCase):
         for name in ("http_listen", "socks5_listen"):
             self.assertRegex(proxy[name], r"^(127\.0\.0\.1|\[::1\]):[0-9]+$")
 
-    def test_product_mvp_gates(self):
-        text = read("docs/IMPLEMENTATION_SPEC.md")
-        for feature in ("F-06", "F-11", "F-13", "F-16", "F-17"):
-            with self.subTest(feature=feature):
-                self.assertRegex(text, rf"(?m)^\| {feature} \| P0 \|")
-        self.assertIn("BBR", text)
-        self.assertIn("browser-like", text)
-
     def test_m35b2a_explicit_tls_probe_contract(self):
         code = read("crates/theia/src/camouflage_probe.rs")
         tests = read("crates/theia/tests/camouflage_probe.rs")
-        adr = read("docs/adr/0023-m3-5b2a-explicit-tls-probe.md")
         self.assertIn("pub mod camouflage_probe;", read("crates/theia/src/lib.rs"))
         for token in ("pub fn route_selected_local_ip", "pub async fn probe_tls_h2",
                       "ProbeApproval", "IsolatedLoopbackFixture", "PublicHttpsIp",
@@ -162,100 +99,33 @@ class SpecContractTests(unittest.TestCase):
         for token in ("wrong_ca", "wrong_sni", "timeout", "NoTrustAnchors",
                       "NotApproved", "fingerprint", "TLS1.3"):
             with self.subTest(token=token):
-                self.assertIn(token.lower(), (tests + adr).lower())
-        self.assertIn("M3.5b2a", read("docs/STEALTH_REALITY.md"))
-        self.assertIn("M3.5b2a", read("docs/IMPLEMENTATION_PLAN.md"))
-        self.assertIn("M3.5b2a", read("README.md"))
+                self.assertIn(token.lower(), tests.lower())
         self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
 
     def test_m35b1_code_contract_does_not_claim_active_scan_or_reality(self):
         code = read("crates/theia/src/camouflage_discovery.rs")
         tests = read("crates/theia/tests/camouflage_discovery.rs")
-        adr = read("docs/adr/0022-m3-5b1-offline-discovery-and-evidence.md")
         self.assertIn("pub mod camouflage_discovery;", read("crates/theia/src/lib.rs"))
         for token in ("MAX_CANDIDATES", "POPULAR_HTTPS_DOMAINS", "pub fn build_plan",
                       "pub fn suitability", "ProviderPrefixNotAuthorization", "Unknown",
                       "Ipv6EnumerationUnsupported"):
             self.assertIn(token, code)
         for token in ("google.com", "samsung.com", "amd.com",
-                      "zero-I/O", "не", "REALITY"):
-            self.assertIn(token.lower(), (code + tests + adr).lower())
-        self.assertIn("M3.5b1", read("docs/IMPLEMENTATION_PLAN.md"))
-        self.assertIn("M3.5b1", read("docs/STEALTH_REALITY.md"))
-        self.assertIn("M3.5b1", read("README.md"))
+                      "zero-I/O", "REALITY"):
+            self.assertIn(token.lower(), (code + tests).lower())
         self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
 
     def test_f18_picker_discovers_server_range_and_popular_domains_without_manual_seed(self):
-        model = read("docs/STEALTH_REALITY.md")
-        spec = read("docs/IMPLEMENTATION_SPEC.md")
-        plan = read("docs/IMPLEMENTATION_PLAN.md")
-        ui = read("docs/TUI_UX.md")
-        ci = read("docs/TESTING_CI.md")
-        adr = read("docs/adr/0020-reality-like-and-tls-in-tls.md")
-        for needle in (
-            "Автоматическое обнаружение", "назначенные префиксы IPv4/IPv6",
-            "NAT", "RDAP/BGP", "без SNI", "TLS1.3", "SAN",
-            "ALPN", "серверная подсеть", "популярные домены",
-            "google.com", "samsung.com", "amd.com", "microsoft.com",
-            "cloudflare.com", "github.com", "mozilla.org", "wikipedia.org",
-            "лишь с согласия", "приватного ключа",
-        ):
-            with self.subTest(needle=needle):
-                self.assertIn(needle.lower(), model.lower())
-        self.assertIn("вручную вводить список не нужно", spec)
-        self.assertIn("M3.5b", plan)
-        self.assertIn("google.com", plan)
-        self.assertIn("google.com", ui)
-        self.assertIn("CIDR", ci)
-        self.assertIn("google.com", adr)
-        self.assertIn("не реализовано", read("README.md"))
         # Research and docs do not enable any new production security mode.
         self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
 
     def test_future_reality_like_and_tls_in_tls_are_p0_but_not_claimed_live(self):
-        spec = read("docs/IMPLEMENTATION_SPEC.md")
-        plan = read("docs/IMPLEMENTATION_PLAN.md")
-        model = read("docs/STEALTH_REALITY.md")
-        adr = read("docs/adr/0020-reality-like-and-tls-in-tls.md")
-        for feature in ("F-18", "F-19"):
-            with self.subTest(feature=feature):
-                self.assertIn(f"| {feature} | P0 |", spec)
-                self.assertIn(feature, model)
-                self.assertIn(feature, plan)
-                self.assertIn(feature, adr)
-        for text in (
-            "REALITY", "TLS-in-TLS", "не реализовано", "Проверить и подобрать",
-            "Применить", "score", "confidence", "SSRF", "FPR", "OPEN_OK",
-            "Linux/Windows", "H2", "H3", "theia://v1",
-        ):
-            with self.subTest(token=text):
-                self.assertIn(text.lower(), model.lower())
-        self.assertIn("M3.5a", plan)
-        self.assertIn("M3.5d", plan)
-        self.assertIn("M4.5", plan)
-        self.assertIn("off/optional/required", model)
-        self.assertIn("не реализовано", read("README.md"))
         client = toml("examples/client.toml")["client"]
         self.assertTrue(all(p["tls_profile"] == "default" for p in client["profiles"]))
         self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
-        self.assertIn("REALITY", read("docs/TUI_UX.md"))
-        self.assertIn("TLS-in-TLS", read("docs/TESTING_CI.md"))
-        self.assertIn("schema_version=1", read("docs/CONFIGURATION.md"))
-
-    def test_smarttheia_protocol_and_ack_contract(self):
-        text = read("docs/SMARTTHEIA_PROTOCOL.md")
-        for token in ("0x01", "0x02", "0x03", "0x04", "0x05", "0x10", "0x11", "0x12",
-                      "65 536", "OPEN_OK", "full-duplex", "h3", "h2"):
-            self.assertIn(token, text)
-        self.assertNotIn("client_nonce", text)
-        self.assertIn("ровно 6 байт", text)
 
     def test_windows_manual_proxy_is_not_auto_enabled(self):
-        config = read("docs/CONFIGURATION.md")
-        self.assertIn("только `off` и `manual`", config)
-        self.assertNotIn("`on` — явный opt-in", config)
         self.assertNotIn('system_proxy = "on"', read("examples/client.toml"))
-        self.assertIn("CAS", read("docs/TUI_UX.md") + config)  # compare-and-swap restoration documented
 
     def test_m01_api_spike_isolated_and_locked(self):
         from pathlib import Path
@@ -276,7 +146,6 @@ class SpecContractTests(unittest.TestCase):
                          "default_rustls_h2_clienthello", "default_rustls_quic_h3_clienthello",
                          "write_tls", "write_hs"):
             self.assertIn(required, probe)
-        self.assertIn("P0 BLOCKER", read("docs/adr/0005-tls-fingerprint-baseline.md"))
         self.assertFalse((spike / "utls_reference").exists())
         live_probe = read("scripts/independent-h2-probe.py")
         for required in ("ssl.PROTOCOL_TLS_CLIENT", "ssl.CERT_REQUIRED",
@@ -292,7 +161,6 @@ class SpecContractTests(unittest.TestCase):
         self.assertNotIn("actions/setup-go", workflow)
         self.assertIn("--test independent_h2_loopback -- --ignored", workflow)
         self.assertIn("actual_chromium_h2_settings_and_pseudo_order_reference", workflow)
-        self.assertIn("ADR-0074", read("AGENTS.md"))
         h2_tls = (spike / "tests" / "h2_tls.rs")
         self.assertTrue(h2_tls.is_file())
         loss_test = spike / "tests" / "quic_bbr_loss.rs"
@@ -355,15 +223,6 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("accepted_runtime_commands_fail_closed", integration)
         self.assertIn("rejected_arguments_cannot_start_a_runtime", integration)
         self.assertIn("windows_proxy_commands_fail_closed_on_other_platforms", integration)
-
-    def test_documented_toml_examples_parse(self):
-        config = read("docs/CONFIGURATION.md")
-        examples = re.findall(r"```toml\n(.*?)\n```", config, re.DOTALL)
-        self.assertGreaterEqual(len(examples), 2)
-        for example in examples:
-            with self.subTest(example=example.splitlines()[0]):
-                tomllib.loads(example)
-
 
     def test_m12_typed_toml_implementation_is_strict(self):
         manifest = tomllib.loads(read("crates/theia/Cargo.toml"))
@@ -428,11 +287,6 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("always()", gate)
         self.assertIn('get("result") != "success"', gate)
         self.assertIn("raise SystemExit", gate)
-        self.assertIn("CI-only", read("AGENTS.md"))
-        self.assertIn("CI-only", read("docs/TESTING_CI.md"))
-        self.assertNotIn("manual Windows smoke tests", read("docs/IMPLEMENTATION_PLAN.md"))
-        self.assertNotIn("ручным smoke-тестом", read("docs/IMPLEMENTATION_SPEC.md"))
-        self.assertNotIn("## 3. Локальная проверка", read("docs/TESTING_CI.md"))
 
     def test_m22_local_proxy_gate_and_cli_wiring(self):
         implementation = read("crates/theia/src/local_proxy.rs")
@@ -477,32 +331,6 @@ class SpecContractTests(unittest.TestCase):
                       read("crates/theia/tests/client_h2.rs"))
 
     def test_smarttheia_native_xhttp_contract(self):
-        spec = read("docs/IMPLEMENTATION_SPEC.md")
-        self.assertIn("SmartTheia XHTTP", spec)
-        self.assertIn("не реализуем полную копию Xray REALITY или Xray XHTTP", spec)
-        self.assertIn("0.6 (проектная)", spec)
-        self.assertIn("не смена протокола или транспорта SmartTheia", spec)
-        self.assertIn("параметров единственного XHTTP", spec)
-        self.assertIn("Xray XHTTP и Xray REALITY — только источники идей", spec)
-        self.assertIn("полное копирование реализации Xray не является целью", spec)
-        self.assertIn("воспроизведение Xray first flight", spec)
-        adr = read("docs/adr/0086-custom-xhttp-and-reality-design-authority.md")
-        self.assertIn("inspiration only", adr)
-        self.assertIn("not a clone", adr)
-        for document in ("AGENTS.md", "README.md", "docs/SMARTTHEIA_PROTOCOL.md", "docs/ARCHITECTURE.md", "docs/STEALTH_REALITY.md", "docs/TUI_UX.md"):
-            with self.subTest(document=document):
-                source = read(document)
-                self.assertIn("Xray XHTTP", source)
-                self.assertIn("Xray REALITY", source)
-                self.assertIn("не копия", source)
-        self.assertIn("единственный транспорт протокола SmartTheia", spec)
-        self.assertIn("Собственный TLS: исключительно ручная настройка", spec)
-        self.assertIn("SmartTheia REALITY: настройка через двухшаговый мастер", spec)
-        self.assertIn("QUIC-first является штатной политикой клиента", spec)
-        self.assertIn("не являются третьим режимом безопасности", spec)
-        adr = read("docs/adr/0085-single-xhttp-inbound-security-choice.md")
-        self.assertIn("one transport", adr)
-        self.assertIn("manual only", adr)
         split = read("crates/theia/src/split_http.rs")
         self.assertIn("UPLOAD_PATH", split)
         self.assertIn("DOWNLOAD_PATH", split)
@@ -638,7 +466,6 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("crate::tcp_bbr::bind", server)
         self.assertIn("crate::tcp_bbr::select(&socket)", server)
         self.assertIn("BbrConfig::default()", read("crates/theia/src/quic_transport.rs"))
-        self.assertIn("not configurable", read("docs/adr/0090-mandatory-bbr-for-h2-and-h3.md"))
 
     def test_reality_identity_before_bearer_and_no_new_invitation_version(self):
         identity = read("crates/theia/src/reality_identity.rs")
@@ -654,7 +481,6 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("server_public_key: Option<String>", invite)
         self.assertNotIn("PREFIX_V2", invite)
         self.assertIn("reality_key", read("crates/theia/src/reload_preflight.rs"))
-        self.assertIn("active probing", read("docs/adr/0089-independent-ed25519-xhttp-identity.md"))
 
     def test_f18_independent_native_acceptance_contract(self):
         guest = read("scripts/f14-wsl-server.py")
@@ -682,13 +508,9 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("start_generated_reality_review", read("crates/theia/src/tui.rs"))
 
     def test_m35a_test_only_feasibility_never_claims_security_mode(self):
-        spec = read("docs/STEALTH_REALITY.md")
-        adr = read("docs/adr/0021-m3-5a-rustls-quic-auth-feasibility.md")
         tests = read("crates/theia/tests/reality_security_feasibility.rs")
         config = read("crates/theia/src/config.rs")
         invite = read("crates/theia/src/invite.rs")
-        self.assertIn("M3.5a0", spec)
-        self.assertIn("M3.5a1", adr)
         for name in (
             "verified_h2_tls_exporter_is_identical_on_peers_and_context_separated",
             "verified_h3_quic_exporter_matches_both_peers_with_domain_separation",
@@ -704,8 +526,6 @@ class SpecContractTests(unittest.TestCase):
         self.assertNotIn("PREFIX_V2", invite)
         self.assertNotIn("portable_from_profile", invite)
         self.assertIn("leaf_sha256: Option<String>", invite)
-        self.assertIn("Никакой REALITY-подобный режим", adr)
-        self.assertIn("F-18/F-19", read("docs/IMPLEMENTATION_PLAN.md"))
 
 
 if __name__ == "__main__":
