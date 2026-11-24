@@ -30,6 +30,8 @@ pub mod local_proxy;
 pub mod management;
 pub mod protocol;
 pub mod quic_transport;
+pub mod reference_health;
+pub mod reference_cli;
 pub(crate) mod quota;
 mod relay_liveness;
 pub mod reload_preflight;
@@ -70,6 +72,7 @@ pub enum Command {
     Help(Option<&'static str>),
     Version,
     Trust(descriptor_cli::Command),
+    Reference(reference_cli::Command),
     Tui {
         role: Option<Role>,
     },
@@ -126,6 +129,7 @@ pub enum CliError {
     NotImplemented(&'static str),
     Config(config::ConfigError),
     Trust(descriptor::Error),
+    Reference(reference_health::Error),
     Server(server::ServerError),
     Management(management::ManagementError),
     Client(client::ClientError),
@@ -155,6 +159,7 @@ impl fmt::Display for CliError {
             Self::NonUtf8Argument => write!(f, "arguments must be UTF-8"),
             Self::Config(error) => write!(f, "configuration invalid: {error}"),
             Self::Trust(error) => write!(f, "offline trust: {error}"),
+            Self::Reference(error) => write!(f, "reference health: {error}"),
             Self::Server(error) => write!(f, "server failed: {error}"),
             Self::Management(error) => write!(f, "management status unavailable: {error}"),
             Self::Client(error) => write!(f, "client failed: {error}"),
@@ -224,6 +229,8 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["config", "--help" | "-h"] => Ok(Command::Help(Some("config"))),
         ["trust", "--help" | "-h"] => Ok(Command::Help(Some("trust"))),
         ["trust", rest @ ..] => descriptor_cli::parse(rest).map(Command::Trust),
+        ["reference", "--help" | "-h"] => Ok(Command::Help(Some("reference"))),
+        ["reference", rest @ ..] => reference_cli::parse(rest).map(Command::Reference),
         ["tui", "--role", selected] => Ok(Command::Tui {
             role: Some(role(selected)?),
         }),
@@ -316,6 +323,7 @@ Usage:\n\
   theia client proxy --recover --confirm  # Windows crash recovery, CAS only\n\
   theia config validate --config <path>\n\
   theia trust --help                  # offline candidate, no runtime Apply\n\
+  theia reference --help              # consented reference health checks\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
 Client requires tls_ca PEM bundle. Windows system proxy requires explicit --system-proxy --confirm, a manual config flag and live bound listeners; normal client run and TUI never alter OS proxy.";
 
@@ -333,6 +341,7 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
             Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
         Some("trust") => Ok(descriptor_cli::HELP),
+        Some("reference") => Ok(reference_cli::HELP),
         Some("config") => {
             Ok("Usage: theia config validate --config <path>\nValidate TOML v1 without reading secret values.")
         }

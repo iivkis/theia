@@ -242,6 +242,9 @@ async fn main() {
             }
         }
         Ok(Command::Trust(command)) => theia::descriptor_cli::run(command).map_err(CliError::Trust),
+        Ok(Command::Reference(command)) => theia::reference_cli::run(command)
+            .await
+            .map_err(CliError::Reference),
         Ok(Command::Help(topic)) => help(topic).map(str::to_owned),
         Ok(Command::Version) => Ok(version().to_owned()),
         Ok(Command::ConfigValidate { config }) => {
