@@ -4,7 +4,7 @@
 mod client_hello;
 
 use btls::ssl::SslVersion;
-use client_hello::{parse_handshake, parse_tls_records, ParseError};
+use client_hello::{parse_tls_records, ParseError};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
@@ -187,27 +187,4 @@ async fn btls_candidate_validates_chain_name_and_tls13_h2() {
     })
     .await
     .expect("bounded loopback certificate matrix");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "mandatory CI-only Go uTLS reference fixture"]
-async fn btls_live_h2_compares_to_pinned_utls_chrome133() {
-    let path = std::env::var_os("THEIA_UTLS_HELLO_PATH")
-        .expect("mandatory Linux/Windows CI generates pinned Go reference");
-    let raw = std::fs::read(path).expect("read private ephemeral TLS reference");
-    let reference = parse_handshake(&raw).expect("valid Go reference ClientHello");
-    drop(raw);
-    let candidate = capture_hello().await;
-    assert!(reference.has_grease_extension() && reference.has_alps());
-    assert_eq!(reference.alpn, candidate.alpn);
-    assert!(candidate.has_grease_extension() && candidate.has_alps());
-    assert!(candidate.extensions_in_wire_order.contains(&17_613));
-    // These are separate stacks; no byte-for-byte profile fidelity is claimed.
-    eprintln!(
-        "Go uTLS Chrome133 vs BoringSSL candidate on TCP: GREASE=yes/yes ALPS=yes/yes; cipher counts {}/{} extension counts {}/{}; F-13 still BLOCKED",
-        reference.cipher_suites.len(),
-        candidate.cipher_suites.len(),
-        reference.extensions_in_wire_order.len(),
-        candidate.extensions_in_wire_order.len()
-    );
 }

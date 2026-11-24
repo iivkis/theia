@@ -78,4 +78,6 @@ ADR хранить в `docs/adr/NNNN-title.md` с контекстом, альт
 
 **M4.4h — explicit disabled-user recovery:** restore only a disabled user on an existing grant with a fresh CSPRNG token, preserve grant set, guard the save and separately confirm reveal/export and auth-only Apply. Extend existing real Linux H2/H3 Apply test to prove no admission before Apply and no old-token revival afterward. Accepted in PR #108, run 45395505034 (13/13).
 
-**M4.4i — public share and native lifecycle parity:** tokenless saved-record share in TUI; native Windows Named Pipe recovery test mirrors existing Linux IPC evidence; consolidate F-14 acceptance and remaining release limits. Pending exact-head native CI.
+**M4.4i — public share and native lifecycle parity:** tokenless saved-record share in TUI; native Windows Named Pipe recovery test mirrors existing Linux IPC evidence; consolidate F-14 acceptance and remaining release limits. Accepted in PR #109, run 45397074048 (13/13).
+
+**ADR-0074 — browser-reference policy:** retire Go/uTLS synthetic reference and retain independent TLS compatibility via standard OpenSSL. Actual pinned browser evidence is the only browser reference; H2 existing evidence remains partial, H3 reference remains open. Earlier Go milestones remain historical evidence only. No runtime profile changes.

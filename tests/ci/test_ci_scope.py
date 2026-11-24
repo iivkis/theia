@@ -42,8 +42,31 @@ class ScopeTests(unittest.TestCase):
             ["docs/../README.md"],
             ["unknown.md"],
             ["docs/example.md", "Cargo.lock"],
+            ["docs/bad\0.md"],
         ]:
             self.assertFalse(scope.documentation_only(paths), paths)
+
+    def test_raw_modes_and_status_are_conservative(self) -> None:
+        for old, new, status in [
+            ("000000", "100644", "A"),
+            ("100644", "100644", "M"),
+            ("100644", "000000", "D"),
+        ]:
+            record = f":{old} {new} abc def {status}".encode()
+            raw = record + b"\0docs/readme.md\0"
+            self.assertEqual(scope.regular_markdown_paths(raw), ["docs/readme.md"])
+        for old, new, status in [
+            ("100644", "120000", "T"),
+            ("000000", "120000", "A"),
+            ("000000", "160000", "A"),
+            ("100644", "100755", "M"),
+            ("100644", "100644", "R100"),
+            ("100644", "100644", "A"),
+        ]:
+            record = f":{old} {new} abc def {status}".encode()
+            self.assertIsNone(scope.regular_markdown_paths(record + b"\0docs/a.md\0"))
+        for raw in [b"bad", b"bad\0", b":100644 100644 abc def M\0\0"]:
+            self.assertIsNone(scope.regular_markdown_paths(raw))
 
     def test_unknown_or_malformed_history_runs_full_native_matrix(self) -> None:
         for base in ["", "deadbeef", "z" * 40, "0" * 40]:
@@ -72,6 +95,13 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(scope.changed_paths(base), ["docs/guide.md"])
                 self.assertFalse(scope.native_required(base))
                 self.assertTrue(scope.native_required(head, base))
+                # A Markdown path with executable mode is not docs-only.
+                git(repo, "update-index", "--chmod=+x", "docs/guide.md")
+                git(repo, "commit", "-qm", "executable docs path")
+                self.assertTrue(scope.native_required(head))
+                git(repo, "update-index", "--chmod=-x", "docs/guide.md")
+                git(repo, "commit", "-qm", "restore ordinary mode")
+                head = git(repo, "rev-parse", "HEAD")
                 git(repo, "mv", "main.rs", "docs/moved.md")
                 git(repo, "commit", "-qm", "rename code into docs")
                 self.assertTrue(scope.native_required(head))

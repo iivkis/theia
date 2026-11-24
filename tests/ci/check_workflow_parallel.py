@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CI DAG performance guard: parallel tests, intact mandatory gates and safe Go caches.
+"""CI DAG performance guard: parallel tests, intact mandatory gates and independent TLS checks.
 
 No YAML parser or network dependencies. Each assertion is an explicit check
 against the current CI contract; a workflow refactor must update this test
@@ -121,16 +121,6 @@ for os, payload in (("Linux", job("rust-tests")), ("Windows", windows)):
 require(workflow.count("run: cargo build --workspace --release --locked") == 2,
         "only the two explicitly requested release compilations may exist")
 
-require("Real Windows live Theia H2 fingerprint vs pinned Go uTLS" in windows
-        and "cargo test --workspace --locked --test fingerprint_h2" in windows,
-        "Windows fingerprint must reuse the previously compiled root workspace")
-require(windows.index("Native Windows tests")
-        < windows.index("Real Windows live Theia H2 fingerprint vs pinned Go uTLS"),
-        "fingerprint must run after native Windows root build")
-require("cargo test --workspace --locked --test fingerprint_h2" not in job("m0-1-windows-spike"),
-        "isolated Windows M0.1 job must not repeat the whole root workspace build")
-require("go mod verify" in windows and "go run . $hello" in windows,
-        "native Windows fingerprint must generate its pinned uTLS reference")
 require("python3 -m compileall -q scripts tests" in job("specification"),
         "cheap Python preflight must execute before Rust tests")
 linux = job("rust-tests")
@@ -162,14 +152,6 @@ for name, platform in (("m0-1-api-spike", "ubuntu-latest"),
 require("  m3-3-bbr-comparison:" not in workflow,
         "duplicate BBR Rust build runners must stay removed")
 require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
-require("Real Linux H2 fingerprint vs pinned Go uTLS (reuse compiled root harness)" in linux
-        and "cargo test --workspace --locked --test fingerprint_h2" in linux
-        and "go mod verify" in linux,
-        "Linux H2 fingerprint must reuse the root test harness after all-targets")
-require(linux.index("Tests first") < linux.index("Real Linux H2 fingerprint vs pinned Go uTLS"),
-        "Linux fingerprint must follow the root all-targets compilation")
-require("cargo test --workspace --locked --test fingerprint_h2" not in job("m0-1-api-spike"),
-        "M0.1 Linux spike must NOT duplicate root workspace compilation")
 
 
 # The specification is now the ONLY formatting gate.  Every native job
@@ -187,17 +169,16 @@ require("cargo fmt --all -- --check" in spec
         and "cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check" in spec
         and "cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all -- --check" in spec,
         "all Rust workspaces must be checked BEFORE native CI fan-out")
-require("gofmt -l" in spec and "git diff --exit-code" in spec,
-        "Go formatting and unmodified source tree are required")
-require("gofmt -w" not in spec and "ci-formatted-source" not in workflow
+require("git diff --exit-code" in spec,
+        "unmodified Rust source tree is required")
+require("ci-formatted-source" not in workflow
         and "persist-format:" not in workflow,
         "never change PR SHA after successful CI or upload/download formatter overlays")
-# Formatting is an exact-SHA, fail-fast preflight gate. Re-running rustfmt and
-# gofmt after fan-out costs runner time but cannot add coverage: downstream
-# jobs check out the same immutable tree and never modify Rust/Go files.
+# Formatting is an exact-SHA, fail-fast preflight gate. Re-running rustfmt after fan-out costs runner time but cannot add coverage: downstream
+# jobs check out the same immutable tree and never modify Rust files.
 for name in mandatory - {"specification"}:
     payload = job(name)
-    require("cargo fmt " not in payload and "gofmt -l" not in payload,
+    require("cargo fmt " not in payload,
             f"{name}: formatting must run once in specification, not per native job")
 for name in mandatory - {"specification"}:
     payload = job(name)
@@ -220,21 +201,22 @@ require('("success" if name == "specification" else "skipped")' in gate,
 require("contents: write" not in workflow,
         "normal CI must never receive repository contents write permission")
 
-require((ROOT / "spikes/m0_1/utls_reference/go.sum").is_file(),
-        "pinned uTLS Go module dependency lock must exist")
-go_steps = re.findall(
-    r"(?m)^      - uses: actions/setup-go@v5\n(?:        if: [^\n]+\n)?        with:\n((?:          [^\n]+\n)+)",
-    workflow,
-)
-require(len(go_steps) == 6, "all six pinned Go toolchains must be audited, including the reused Linux fingerprint")
-for step in go_steps:
-    require("cache: true" in step,
-            "Go module/build cache must be enabled for recurring CI")
-    require("cache-dependency-path: spikes/m0_1/utls_reference/go.sum" in step,
-            "Go cache must use the pinned uTLS lockfile, not an unscoped key")
+require("actions/setup-go" not in workflow and "THEIA_UTLS" not in workflow
+        and "utls_reference" not in workflow and "gofmt " not in workflow,
+        "retired Go/uTLS toolchain must not return")
+for name in ("m0-1-api-spike", "m0-1-windows-spike"):
+    payload = job(name)
+    require("actions/setup-python@v5" in payload and "python-version: '3.12'" in payload,
+            f"{name}: independent TLS probe interpreter required")
+    require("cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test independent_h2_loopback -- --ignored --nocapture" in payload,
+            f"{name}: independent strict PKI/H2 test cannot be removed")
+require("test_independent_h2_probe.py" in spec and "test_ci_timing.py" in spec,
+        "cheap probe and timing regressions must run")
+require("actual_chromium_h2_settings_and_pseudo_order_reference" in job("browser-e2e"),
+        "real browser H2 reference remains mandatory")
 
 require(
     "concurrency:" in workflow and "cancel-in-progress: true" in workflow,
     "outdated PR runs must still be cancelled",
 )
-print("CI_GRAPH_PARALLEL_AND_GO_CACHE_OK")
+print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")

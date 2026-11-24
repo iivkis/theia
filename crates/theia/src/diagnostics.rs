@@ -172,14 +172,18 @@ fn log_directory() -> PathBuf {
 }
 
 fn private_directory(path: &Path) -> io::Result<()> {
-    let existed = fs::symlink_metadata(path).is_ok();
-    if !existed {
-        fs::create_dir_all(path)?;
+    // Create private from the first filesystem operation. A separate chmod
+    // leaves a public-mode interval and races with another process starting
+    // in the same trace directory. Never chmod an existing directory.
+    if !path.exists() {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
+        builder.create(path)?;
     }
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -187,6 +191,18 @@ fn private_directory(path: &Path) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             "unsafe trace directory",
         ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe trace directory",
+            ));
+        }
     }
     #[cfg(unix)]
     {
@@ -372,6 +388,45 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("trace.log")).unwrap(), "ok\n");
         drop(writer);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_is_created_without_relaxing_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = directory();
+        let nested = root.join("new").join("logs");
+        private_directory(&nested).unwrap();
+        for path in [root.join("new"), nested.clone()] {
+            let mode = fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+
+        let existing = root.join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_directory(&existing).is_err());
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_directory_never_follows_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = directory();
+        let target = root.join("target");
+        private_directory(&target).unwrap();
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(private_directory(&link).is_err());
+        assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

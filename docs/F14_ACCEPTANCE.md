@@ -14,10 +14,10 @@ Scope: existing versioned v1 connection data, local server/client editors, and a
 | Explicit matching-profile credential-only replacement | ADR-0071, PR #108 | Accepted: PR #108 run 45395505034, 13/13 |
 | Disabled-user recovery with fresh digest, retained grants | ADR-0072, PR #108 | Accepted: PR #108 run 45395505034, 13/13 |
 | Linux binary IPC recovery through import/refresh and CAS Apply; old tokens rejected | reload_apply_runtime.rs, PR #108 | Accepted: PR #108 run 45395505034, 13/13 |
-| Public saved-record tokenless share; no mutation or secret read | editor and TUI tests, ADR-0073 | Pending |
-| Native Windows binary Named Pipe recovery through import/refresh and CAS Apply | reload_apply_windows.rs, ADR-0073 | Pending |
-| Actual Linux WSL2 → Windows host H2/H3 CONNECT/SOCKS5, wrong CA/token denial | f14_cross_host.rs, PR #107 run 45392909341 | Accepted for VM topology; rerun on code changes |
-| Public profile with wrong explicit env credential rejected, then guarded replacement succeeds on real cross-host H2/H3 | f14_cross_host.rs, ADR-0073 | Pending |
+| Public saved-record tokenless share; no mutation or secret read | editor and TUI tests, ADR-0073 | Accepted: PR #109 run 45397074048, 13/13 |
+| Native Windows binary Named Pipe recovery through import/refresh and CAS Apply | reload_apply_windows.rs, ADR-0073 | Accepted: PR #109 run 45397074048, 13/13 |
+| Actual Linux WSL2 → Windows host H2/H3 CONNECT/SOCKS5, wrong CA/token denial | f14_cross_host.rs, PR #107 run 45392909341 | Accepted for VM topology; rerun passed in PR #109 |
+| Public profile with wrong explicit env credential rejected, then guarded replacement succeeds on real cross-host H2/H3 | f14_cross_host.rs, ADR-0073 | Accepted: PR #109 run 45397074048, 13/13 |
 
 ## Remaining boundaries
 
@@ -27,4 +27,4 @@ Scope: existing versioned v1 connection data, local server/client editors, and a
 - Retained private credentials and crash orphans are not automatically removed; no power-loss guarantee or proof of secure erasure. Trusted parent directories required.
 - Release readiness requires all P0 gates and independent security review; do not convert pending entries to accepted until the exact-head mandatory CI succeeds.
 
-Evidence links: [PR #106](https://github.com/iivkis/theia/pull/106), [PR #107](https://github.com/iivkis/theia/pull/107), [PR #108](https://github.com/iivkis/theia/pull/108), [ADR-0073](adr/0073-f14-public-share-and-native-parity.md).
+Evidence links: [PR #106](https://github.com/iivkis/theia/pull/106), [PR #107](https://github.com/iivkis/theia/pull/107), [PR #108](https://github.com/iivkis/theia/pull/108), [PR #109](https://github.com/iivkis/theia/pull/109), [ADR-0073](adr/0073-f14-public-share-and-native-parity.md).

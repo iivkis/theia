@@ -28,7 +28,7 @@ def documentation_only(paths: list[str]) -> bool:
             path.is_absolute()
             or ".." in path.parts
             or not name.endswith(".md")
-            or ("\\u0000" in name)
+            or ("\0" in name)
         ):
             return False
         if name not in ROOT_DOCS and (
@@ -36,6 +36,39 @@ def documentation_only(paths: list[str]) -> bool:
         ):
             return False
     return True
+
+
+def regular_markdown_paths(raw: bytes) -> list[str] | None:
+    """Accept only regular non-executable file changes, with exact raw records.
+
+    Markdown-named symlinks, gitlinks, executable files and type changes
+    are not documentation-only. No rename inference is allowed.
+    """
+    if not raw:
+        return []
+    parts = raw.split(b"\0")
+    if parts[-1] != b"" or len(parts) % 2 != 1:
+        return None
+    paths = []
+    for index in range(0, len(parts) - 1, 2):
+        header, name = parts[index:index + 2]
+        match = re.fullmatch(
+            rb":(000000|100644) (000000|100644) [0-9a-f]+ [0-9a-f]+ ([AMD])",
+            header,
+        )
+        if match is None:
+            return None
+        old, new, status = match.groups()
+        if (old, new) != {
+            b"A": (b"000000", b"100644"),
+            b"M": (b"100644", b"100644"),
+            b"D": (b"100644", b"000000"),
+        }[status]:
+            return None
+        if not name:
+            return None
+        paths.append(name.decode("utf-8", "strict"))
+    return paths
 
 
 def changed_paths(base: str, head: str = "HEAD") -> list[str] | None:
@@ -52,10 +85,10 @@ def changed_paths(base: str, head: str = "HEAD") -> list[str] | None:
         )
         changed = subprocess.check_output(
             ["git", "-c", "core.quotePath=false", "diff", "--no-ext-diff",
-             "--no-renames", "--name-only", "-z", base, head, "--"],
+             "--no-renames", "--raw", "--no-abbrev", "-z", base, head, "--"],
             stderr=subprocess.DEVNULL,
         )
-        return [name.decode("utf-8", "strict") for name in changed.split(b"\0") if name]
+        return regular_markdown_paths(changed)
     except (OSError, ValueError, UnicodeError, subprocess.CalledProcessError):
         return None
 

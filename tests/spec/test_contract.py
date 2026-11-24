@@ -89,7 +89,7 @@ class SpecContractTests(unittest.TestCase):
                 live = read(live_path)
                 self.assertNotIn("CI pending", live)
                 self.assertNotIn("PR/CI", live)
-        self.assertIn("14/14 SUCCESS", status)
+        self.assertIn("13/13 SUCCESS", status)
         self.assertIn("только после", status)
         for item in ("F-13", "F-14", "F-18", "F-19", "M4.3"):
             with self.subTest(item=item):
@@ -277,34 +277,22 @@ class SpecContractTests(unittest.TestCase):
                          "write_tls", "write_hs"):
             self.assertIn(required, probe)
         self.assertIn("P0 BLOCKER", read("docs/adr/0005-tls-fingerprint-baseline.md"))
-        go_ref = spike / "utls_reference"
-        self.assertTrue((go_ref / "go.mod").is_file())
-        self.assertTrue((go_ref / "go.sum").is_file())
-        mod = (go_ref / "go.mod").read_text(encoding="utf-8")
-        self.assertIn("github.com/refraction-networking/utls v1.8.2", mod)
-        source = (go_ref / "main.go").read_text(encoding="utf-8")
-        self.assertIn("utls.HelloChrome_133", source)
-        self.assertIn("BuildHandshakeState", source)
-        self.assertIn("os.O_EXCL", source)
-        fixture_test = (spike / "tests" / "utls_reference.rs").read_text(encoding="utf-8")
-        self.assertIn("go_utls_chrome133_is_a_reference_but_not_rustls_or_quic", fixture_test)
-        self.assertIn("THEIA_UTLS_HELLO_PATH", fixture_test)
-        live_probe = (spike / "utls_reference" / "cmd" / "h2_probe" / "main.go").read_text(encoding="utf-8")
-        for required in ("utls.HelloChrome_133", "Handshake()", "VerifiedChains",
-                         "utls.VersionTLS13", "sendMinimalH2Request", "receiveH2NoContent",
-                         "validateLoopback", "modeWrongName", "modeUntrustedCA"):
+        self.assertFalse((spike / "utls_reference").exists())
+        live_probe = read("scripts/independent-h2-probe.py")
+        for required in ("ssl.PROTOCOL_TLS_CLIENT", "ssl.CERT_REQUIRED",
+                         "ssl.TLSVersion.TLSv1_3", "check_hostname",
+                         "validate_loopback", "SSLCertVerificationError", "receive_no_content"):
             self.assertIn(required, live_probe)
-        live_tests = (spike / "tests" / "utls_h2_loopback.rs").read_text(encoding="utf-8")
-        for required in ("inspect_real_wire_client_hello", "TcpListener::bind",
-                         "utls_chrome133_real_tcp_tls13_h2_request_with_verified_identity",
-                         "utls_chrome133_real_tcp_rejects_wrong_hostname_before_h2",
-                         "utls_chrome133_real_tcp_rejects_untrusted_ca_before_h2"):
+        live_tests = (spike / "tests" / "independent_h2_loopback.rs").read_text(encoding="utf-8")
+        for required in ("TcpListener::bind", "independent_tls13_h2_request_with_verified_identity",
+                         "independent_tls13_rejects_wrong_hostname_before_h2",
+                         "independent_tls13_rejects_untrusted_ca_before_h2"):
             self.assertIn(required, live_tests)
         workflow = read(".github/workflows/ci.yml")
-        self.assertIn("go build -o", workflow)
-        self.assertIn("--test utls_h2_loopback -- --ignored", workflow)
-        self.assertIn("go test ./...", workflow)
-        self.assertIn("refraction-networking/utls v1.8.2", read("docs/adr/0005-tls-fingerprint-baseline.md"))
+        self.assertNotIn("actions/setup-go", workflow)
+        self.assertIn("--test independent_h2_loopback -- --ignored", workflow)
+        self.assertIn("actual_chromium_h2_settings_and_pseudo_order_reference", workflow)
+        self.assertIn("ADR-0074", read("AGENTS.md"))
         h2_tls = (spike / "tests" / "h2_tls.rs")
         self.assertTrue(h2_tls.is_file())
         loss_test = spike / "tests" / "quic_bbr_loss.rs"

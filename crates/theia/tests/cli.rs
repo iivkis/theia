@@ -13,7 +13,11 @@ fn help_and_version_exit_successfully() {
     let help = invoke(&["--help"]);
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("H2 server inbound"));
-    assert!(help.stderr.is_empty());
+    assert!(
+        help.stderr.is_empty(),
+        "successful --help must not emit diagnostics warnings: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
 
     let version = invoke(&["--version"]);
     assert!(version.status.success());
