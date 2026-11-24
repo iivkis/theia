@@ -18,11 +18,11 @@
 
 | Требование | Текущее ограничение |
 | --- | --- |
-| **F-13 browser-like fingerprint** | PR #83 слит после успешного CI: opt-in `browser-h2-btls-v1` на BoringSSL, отдельные измеряемые H2 SETTINGS и нативный клиентский E2E на Linux/Windows. Это частичный H2-профиль, **не** полное соответствие Chromium; H3/QUIC fingerprint и релизный F-13 всё ещё открыты. |
-| **F-14 приглашения** | Серверная выдача, отключение и подтверждённая ротация bearer, защищённый локальный импорт `theia://v1` в клиентскую TUI с отдельным доверенным CA и нативный H2 E2E реализованы (PR #80/#81, CI пройден). Защищённый экспорт файла/clipboard, H3 и Linux→Windows cross-host E2E, полная crash/ACL-матрица остаются открытыми. |
+| **F-13 browser-like fingerprint** | Opt-in `browser-h2-btls-v1` (PR #83) и функциональная навигация Chromium через H2/H3 на Linux/Windows (PR #111, ADR-0076) подтверждены CI. Полное соответствие Chromium TLS/H2/QUIC first flight и релизная приёмка не доказаны. |
+| **F-14 приглашения** | Выдача, отключение, ротация, восстановление пользователя с новым bearer, локальный импорт/замена credential, защищённый файл и автоматический WSL2 Linux → native Windows H2/H3 E2E подтверждены CI. Clipboard/QR, перенос между физическими хостами и power-loss recovery остаются открытыми. |
 | **F-18 REALITY-подобная защита** | Нет согласованного криптографического identity/security mode, антипробинга и законченного двухшагового мастера с безопасным Apply. Текущие H2/H3 TLS probes — только evidence. |
 | **F-19 TLS-in-TLS** | Нет измеренной flow-shaping защиты с независимым classifier и release thresholds. |
-| **Windows system proxy / M4.3** | PR #82 слит после Windows CI: только явная команда с `--system-proxy --confirm` выполняет WinINet apply/owned CAS restore, есть подтверждаемое восстановление после аварии. Автоматического включения нет; ADR-0077 добавляет отдельные подтверждаемые операции в клиентской TUI (приёмка ещё не подтверждена). Policy/VPN-совместимость и расширенная приёмка остаются открытыми. |
+| **Windows system proxy / M4.3** | PR #82: explicit WinINet apply/owned CAS restore and crash recovery accepted. ADR-0077 adds separately confirmed client TUI lifecycle (приёмка ещё не подтверждена). Автоматического включения нет; policy/VPN и upgrade acceptance остаются открытыми. |
 | **M5 release** | Нужны дополнительные сравнительные BBR/fingerprint/performance/security gates и end-to-end приёмка всех P0. |
 
 **Важно:** отключение пользователя в TUI ставит `users[].disabled = true` в **сохранённом TOML**, но не завершает активные туннели и не обновляет runtime само по себе. Для отказа в *новых* подключениях нужно отдельно подтвердить auth-only Apply в защищённом локальном IPC. Нельзя считать это hard revocation. Подробности: [инвайты](docs/INVITATIONS.md) и [ADR-0053](docs/adr/0053-m4-4b2a-explicit-existing-user-disable.md).
@@ -38,21 +38,21 @@ theia tui --role server --config server.toml
 theia tui --role client --config client.toml
 ```
 
-Для opt-in управления действующим сервером: на Linux заранее создайте частный каталог `0700` и передайте `THEIA_CONTROL_DIR`; на Windows задайте `THEIA_CONTROL_PIPE` для текущего SID. Команды `theia server status`, `theia server reload --check`, подтверждаемое Apply и отдельные TLS/restart/quota CLI-операции описаны в [CONFIGURATION](docs/CONFIGURATION.md) и [TUI UX](docs/TUI_UX.md). Windows system proxy не включается автоматически: на Windows доступна явная команда `theia client run --config FILE --system-proxy --confirm`; ADR-0077 добавляет клиентскую TUI `p` с отдельными `s/y` и `a/y` (приёмка ещё не подтверждена). Для аварийного восстановления есть `theia client proxy --status` и `--recover --confirm` (см. CONFIGURATION).
+Для opt-in управления действующим сервером: на Linux заранее создайте частный каталог `0700` и передайте `THEIA_CONTROL_DIR`; на Windows задайте `THEIA_CONTROL_PIPE` для текущего SID. Команды `theia server status`, `theia server reload --check`, подтверждаемое Apply и отдельные TLS/restart/quota CLI-операции описаны в [CONFIGURATION](docs/CONFIGURATION.md) и [TUI UX](docs/TUI_UX.md). Windows system proxy не включается автоматически: на Windows доступно явное `theia client run --config FILE --system-proxy --confirm`, а ADR-0077 добавляет клиентскую TUI `p` с отдельными подтверждениями local start и WinINet apply (приёмка ещё не подтверждена); для аварийного восстановления есть `theia client proxy --status` и `--recover --confirm` (см. CONFIGURATION).
 
 Шаблоны [server.toml](examples/server.toml) и [client.toml](examples/client.toml) содержат **негодные заглушки**; для реального запуска нужны корректные сертификаты, секреты, маршруты и доверенные CA. Ссылку `theia://v1/...` с bearer нельзя помещать в shell history, Git или логи.
 
 ## Диагностический trace-журнал
 
-Экспериментальный безопасный trace-логгер **включён по умолчанию** на сервере, клиенте, TUI и CLI. Каждому запуску принадлежит отдельный лог (PID + время старта); журнал содержит время Unix/elapsed, ID операций, этапы H2/H3/QUIC, отказов/таймаутов, квоты и количество переданных байтов без содержимого пакетов. Не записываются bearer, хеши, адреса назначения, заголовки, конфиги и параметры командной строки.
+Безопасный журнал включён по умолчанию на уровне `info`: запуск/остановка, основные итоги сеансов, предупреждения и ошибки. Каждый процесс пишет отдельный файл. Credentials, адреса назначения, заголовки, конфиги и payload не записываются даже в подробном режиме.
 
 - Linux: `${XDG_STATE_HOME:-$HOME/.local/state}/theia/logs`; Windows: `%LOCALAPPDATA%\\Theia\\logs`.
 - `THEIA_TRACE_DIR` задаёт доверенный приватный каталог (Linux: `0700`, лог `0600`; Windows: ограниченный ACL). Если запись невозможна, выводится предупреждение, а программа продолжает работу.
-- `THEIA_TRACE_OFF=1` отключает журнал целиком.
+- `THEIA_TRACE_LEVEL=error|warn|info|debug|trace`: `debug` добавляет промежуточные стадии, `trace` — события отдельных кадров. Отсутствующее или неверное значение означает `info`. `THEIA_TRACE_OFF=1` отключает журнал независимо от уровня.
 - Лимит **50 МиБ на один запуск**: два сегмента по 25 МиБ (`*.trace.log` и `*.trace.log.1`), старейшие записи замещаются. **Логи предыдущих запусков автоматически не удаляются**; оператор отвечает за срок хранения.
 - Для CI нативные тесты используют `THEIA_TRACE_DIR`, а при сбое соответствующего job загружают журналы как GitHub Actions artifacts. Возможны потери событий при переполнении очереди или жёстком завершении процесса.
 
-Подробнее: [ADR-0058](docs/adr/0058-default-on-bounded-safe-trace-logging.md). Прежний `management.log_level` не изменяет новый независимый безопасный trace; произвольное расширенное логирование метаданных не включается.
+Подробнее: [ADR-0058](docs/adr/0058-default-on-bounded-safe-trace-logging.md), [ADR-0078](docs/adr/0078-compact-default-trace.md). `management.log_level` не меняет независимый safe trace.
 
 ## Документы и порядок доверия
 

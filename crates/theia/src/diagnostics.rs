@@ -26,7 +26,7 @@ static START: OnceLock<Instant> = OnceLock::new();
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static OPERATIONS: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Error,
     Warn,
@@ -36,6 +36,20 @@ pub enum Level {
 }
 
 impl Level {
+    fn configured(value: Option<&str>) -> Self {
+        match value {
+            Some("error") => Self::Error,
+            Some("warn") => Self::Warn,
+            Some("debug") => Self::Debug,
+            Some("trace") => Self::Trace,
+            _ => Self::Info,
+        }
+    }
+
+    fn allows(self, event: Self) -> bool {
+        event <= self
+    }
+
     const fn label(self) -> &'static str {
         match self {
             Self::Error => "ERROR",
@@ -61,6 +75,7 @@ enum Message {
 }
 
 struct Logger {
+    level: Level,
     sender: SyncSender<Message>,
     dropped: std::sync::Arc<AtomicU64>,
 }
@@ -86,6 +101,9 @@ pub fn emit(
     let Some(logger) = LOGGER.get_or_init(start_logger) else {
         return;
     };
+    if !logger.level.allows(level) {
+        return;
+    }
     let epoch_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -260,7 +278,12 @@ fn open_logger() -> io::Result<Logger> {
                 }
             }
         })?;
-    Ok(Logger { sender, dropped })
+    let level = Level::configured(env::var("THEIA_TRACE_LEVEL").ok().as_deref());
+    Ok(Logger {
+        level,
+        sender,
+        dropped,
+    })
 }
 
 struct RotatingFile {
@@ -357,6 +380,29 @@ mod tests {
         let dir = env::temp_dir().join(format!("theia-trace-test-{}-{stamp}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn trace_levels_are_ordered_and_invalid_values_default_to_info() {
+        let levels = [
+            Level::Error,
+            Level::Warn,
+            Level::Info,
+            Level::Debug,
+            Level::Trace,
+        ];
+        for (index, configured) in levels.iter().enumerate() {
+            for (event_index, event) in levels.iter().enumerate() {
+                assert_eq!(configured.allows(*event), event_index <= index);
+            }
+        }
+        assert_eq!(Level::configured(None), Level::Info);
+        assert_eq!(Level::configured(Some("info")), Level::Info);
+        assert_eq!(Level::configured(Some("invalid")), Level::Info);
+        assert_eq!(Level::configured(Some("error")), Level::Error);
+        assert_eq!(Level::configured(Some("warn")), Level::Warn);
+        assert_eq!(Level::configured(Some("debug")), Level::Debug);
+        assert_eq!(Level::configured(Some("trace")), Level::Trace);
     }
 
     #[test]

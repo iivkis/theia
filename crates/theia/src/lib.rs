@@ -1,6 +1,5 @@
-//! Theia command-line contract. Network runtimes and configuration validation
-//! are intentionally unavailable until their respective implementation stages.
-//! Parsing must never trigger networking, file I/O, or OS proxy modifications.
+//! Theia command-line contract. Parsing never triggers networking, file I/O,
+//! or OS proxy modifications; the executable dispatches runtime commands.
 
 mod bounded_input;
 pub mod camouflage_batch;
@@ -306,44 +305,32 @@ Usage:\n\
 Client requires tls_ca PEM bundle. Windows system proxy requires explicit --system-proxy --confirm, a manual config flag and live bound listeners; normal client run and TUI never alter OS proxy.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
-pub fn execute(command: Command) -> Result<&'static str, CliError> {
-    match command {
-        Command::Help(None) => Ok(HELP),
-        Command::Help(Some("tui")) => {
+pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
+    match topic {
+        None => Ok(HELP),
+        Some("tui") => {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
-        Command::Help(Some("server")) => {
+        Some("server") => {
             Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server tls rollback --check | theia server tls rollback --apply --expected-revision N --confirm | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --expected-revision N\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
         }
-        Command::Help(Some("client")) => {
+        Some("client") => {
             Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
-        Command::Help(Some("config")) => {
+        Some("config") => {
             Ok("Usage: theia config validate --config <path>\nValidate TOML v1 without reading secret values.")
         }
-        Command::Help(Some(_)) => Err(CliError::InvalidArguments),
-        Command::Version => Ok(concat!("theia ", env!("CARGO_PKG_VERSION"))),
-        Command::Tui { .. } | Command::TuiEdit { .. } => Err(CliError::NotImplemented("TUI")),
-        Command::ServerRun { .. } => Err(CliError::NotImplemented("server runtime")),
-        Command::ServerStatus
-        | Command::ServerCheckReload
-        | Command::ServerCheckRestart
-        | Command::ServerTlsFingerprint { .. }
-        | Command::ServerTlsRollbackCheck
-        | Command::ServerTlsRollbackApply { .. }
-        | Command::ServerCheckQuota
-        | Command::ServerApplyQuota { .. }
-        | Command::ServerApplyRestart { .. }
-        | Command::ServerApplyReload { .. } => {
-            Err(CliError::NotImplemented("async management IPC"))
-        },
-        Command::ClientRun { .. } | Command::ClientRunSystemProxy { .. } => Err(CliError::NotImplemented("client runtime")),
-        Command::ClientProxyStatus | Command::ClientProxyRecover => Err(CliError::NotImplemented("Windows system proxy management")),
-        Command::ConfigValidate { config } => {
-            config::read_file(Path::new(&config)).map_err(CliError::Config)?;
-            Ok("configuration structurally valid (secret/file existence not checked)")
-        }
+        Some(_) => Err(CliError::InvalidArguments),
     }
+}
+
+pub fn version() -> &'static str {
+    concat!("theia ", env!("CARGO_PKG_VERSION"))
+}
+
+pub fn validate_config(path: &Path) -> Result<&'static str, CliError> {
+    config::read_file(path).map_err(CliError::Config)?;
+    Ok("configuration structurally valid (secret/file existence not checked)")
 }
 
 #[cfg(test)]
@@ -364,10 +351,9 @@ mod tests {
         assert_eq!(command(&["--help"]), Ok(Command::Help(None)));
         assert_eq!(command(&["-h"]), Ok(Command::Help(None)));
         assert_eq!(command(&["--version"]), Ok(Command::Version));
-        assert!(execute(Command::Version).unwrap().starts_with("theia "));
-        assert!(execute(Command::Help(None))
-            .unwrap()
-            .contains("H2 server inbound"));
+        assert!(version().starts_with("theia "));
+        assert!(help(None).unwrap().contains("H2 server inbound"));
+        assert_eq!(help(Some("unknown")), Err(CliError::InvalidArguments));
     }
 
     #[test]
@@ -768,21 +754,5 @@ mod tests {
             command(&["client", "run", "--config", "--help"]),
             Err(CliError::InvalidConfigPath)
         );
-    }
-
-    #[test]
-    fn unavailable_features_never_report_success() {
-        for command in [
-            Command::Tui { role: None },
-            Command::Tui {
-                role: Some(Role::Server),
-            },
-            Command::ClientRun {
-                config: "client.toml".into(),
-            },
-        ] {
-            let error = execute(command).expect_err("stub must fail closed");
-            assert_eq!(error.exit_code(), 3);
-        }
     }
 }

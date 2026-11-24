@@ -1059,8 +1059,11 @@ auto_url = "https://pac.invalid/proxy.pac"
         let bind = "127.0.0.1:45991".parse().unwrap();
         let review = review_apply(bind).unwrap();
         let mut changed = original.clone();
-        changed.bypass.push_str(";review-drift.invalid");
+        changed.bypass = "review-drift.invalid".into();
         set(&changed).unwrap();
+        let changed = query().unwrap();
+        assert_ne!(changed, original);
+        assert_eq!(changed.bypass, "review-drift.invalid");
         assert!(matches!(
             OwnedProxy::apply_reviewed(bind, review),
             Err(ProxyError::Conflict)
@@ -1132,8 +1135,11 @@ auto_url = "https://pac.invalid/proxy.pac"
         let review = review_recovery().unwrap();
         let applied = query().unwrap();
         let mut changed = applied.clone();
-        changed.bypass.push_str(";recovery-drift.invalid");
+        changed.bypass = "recovery-drift.invalid".into();
         set(&changed).unwrap();
+        let changed = query().unwrap();
+        assert_ne!(changed, applied);
+        assert_eq!(changed.bypass, "recovery-drift.invalid");
         assert_eq!(recover_reviewed(review), Err(ProxyError::Conflict));
         assert_eq!(query().unwrap(), changed);
         assert_eq!(status().unwrap(), ProxyStatus::PendingConflict);

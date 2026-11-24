@@ -332,7 +332,7 @@ class SpecContractTests(unittest.TestCase):
             self.assertNotIn("spikes/m0_1", workspace.get("members", []),
                              "Research-only spike must not be part of the production workspace")
 
-    def test_m11_cli_workspace_is_real_but_runtime_is_not(self):
+    def test_cli_workspace_and_real_dispatch_contract(self):
         root = toml("Cargo.toml")
         workspace = root["workspace"]
         self.assertEqual(workspace["members"], ["crates/theia"])
@@ -342,11 +342,28 @@ class SpecContractTests(unittest.TestCase):
         self.assertEqual(package["name"], "theia")
         source = read("crates/theia/src/lib.rs")
         for marker in ("ServerRun", "ClientRun", "ConfigValidate", "NotImplemented",
-                       "pub fn parse(", "pub fn execute(", "CliError::InvalidArguments"):
+                       "pub fn parse(", "pub fn help(", "pub fn validate_config(",
+                       "CliError::InvalidArguments"):
             self.assertIn(marker, source)
+        self.assertNotIn("pub fn execute(", source)
+        main = read("crates/theia/src/main.rs")
+        self.assertNotIn("Ok(command) =>", main)
+        for marker in ("server::run_file(", "local_proxy::run_file(", "tui::run(",
+                       "Ok(Command::Help(", "Ok(Command::ConfigValidate"):
+            self.assertIn(marker, main)
         integration = read("crates/theia/tests/cli.rs")
         self.assertIn("accepted_runtime_commands_fail_closed", integration)
         self.assertIn("rejected_arguments_cannot_start_a_runtime", integration)
+        self.assertIn("windows_proxy_commands_fail_closed_on_other_platforms", integration)
+
+    def test_documented_toml_examples_parse(self):
+        config = read("docs/CONFIGURATION.md")
+        examples = re.findall(r"```toml\n(.*?)\n```", config, re.DOTALL)
+        self.assertGreaterEqual(len(examples), 2)
+        for example in examples:
+            with self.subTest(example=example.splitlines()[0]):
+                tomllib.loads(example)
+
 
     def test_m12_typed_toml_implementation_is_strict(self):
         manifest = tomllib.loads(read("crates/theia/Cargo.toml"))

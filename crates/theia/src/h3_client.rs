@@ -90,7 +90,7 @@ impl H3Client {
             .and_then(|result| result);
         match &result {
             Ok(_) => crate::diag!(
-                Info,
+                Debug,
                 "client.h3",
                 "open_confirmed",
                 "op" = Value::Count(operation)
@@ -260,7 +260,7 @@ impl H3Tunnel {
     {
         let operation = self.operation;
         crate::diag!(
-            Info,
+            Debug,
             "client.h3",
             "relay_begin",
             "op" = Value::Count(operation)
@@ -357,7 +357,7 @@ impl H3Tunnel {
             return Err(error);
         }
         crate::diag!(
-            Info,
+            Debug,
             "client.h3",
             "relay_completed",
             "op" = Value::Count(operation)
