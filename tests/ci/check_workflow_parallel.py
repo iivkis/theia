@@ -137,7 +137,9 @@ require(needs("coverage-native") == {"specification"} and
         "coverage gate must consume both native jobs")
 for term in ("os: [ubuntu-latest, windows-latest]", "llvm-tools-preview",
              "cargo llvm-cov --workspace --all-targets --all-features --locked --lcov",
-             "ci-coverage.py collect", "if-no-files-found: error"):
+             "cargo llvm-cov report --json --include-build-script",
+             "ci-coverage.py collect", "--llvm-json coverage-segments.json",
+             "if-no-files-found: error"):
     require(term in coverage_native, "missing native coverage contract: " + term)
 for term in ("coverage-Linux", "coverage-Windows", "ci-coverage.py gate",
              "THEIA_COVERAGE_SYNTAX_TESTS"):

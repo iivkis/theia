@@ -75,7 +75,75 @@ def source_name(raw: str, root: Path) -> str | None:
         return None  # External dependency, not an owned source.
 
 
-def read_lcov(text: str, root: Path, expected: dict[str, str]) -> dict[str, dict[str, int]]:
+def llvm_segment_lines(segments: list, max_line: int) -> dict[str, int]:
+    """Reconstruct LLVM file-level LineCoverageStats from export segments.
+
+    The line summary is calculated per function group, not from these unique
+    file lines. Match the actual LCOV DA records instead of equating counts.
+    """
+    if not isinstance(segments, list):
+        raise EvidenceError("Missing LLVM file segments")
+    grouped = {}
+    previous = (0, 0)
+    for segment in segments:
+        if (not isinstance(segment, list) or len(segment) != 6
+                or any(type(value) is not int for value in segment[:3])
+                or any(type(value) is not bool for value in segment[3:])):
+            raise EvidenceError("Malformed LLVM coverage segment")
+        line, column, hits, has_count, entry, gap = segment
+        if not 1 <= line <= max_line + 1 or column < 1 or hits < 0 or (line, column) <= previous:
+            raise EvidenceError("Invalid or unordered LLVM coverage segment")
+        previous = (line, column)
+        grouped.setdefault(line, []).append(segment)
+    result = {}
+    wrapped = None
+    for line in range(1, previous[0] + 1):
+        current = grouped.get(line, [])
+        starts = [s for s in current if s[3] and s[4] and not s[5]]
+        skipped = bool(current and not current[0][3] and current[0][4])
+        mapped = (not skipped and ((wrapped is not None and wrapped[3]) or bool(starts))
+                  or any(s[3] and s[4] for s in current))
+        if mapped:
+            if line > max_line:
+                raise EvidenceError("LLVM mapped line outside tracked source")
+            count = max([wrapped[2] if wrapped is not None else 0] + [s[2] for s in starts])
+            result[str(line)] = int(count > 0)
+        if current:
+            wrapped = current[-1]
+    return result
+
+
+def read_llvm_export(data: dict, root: Path, expected: dict[str, str]) -> dict:
+    if (not isinstance(data, dict) or data.get("type") != "llvm.coverage.json.export"
+            or not isinstance(data.get("version"), str)
+            or not re.fullmatch(r"2\.\d+\.\d+", data["version"])
+            or not isinstance(data.get("data"), list) or len(data["data"]) != 1
+            or not isinstance(data["data"][0], dict)
+            or not isinstance(data["data"][0].get("files"), list)):
+        raise EvidenceError("Unsupported or incomplete LLVM JSON export")
+    result = {}
+    for record in data["data"][0]["files"]:
+        if not isinstance(record, dict) or not isinstance(record.get("filename"), str):
+            raise EvidenceError("Malformed LLVM file record")
+        name = source_name(record["filename"], root)
+        if name not in expected:
+            continue
+        if name in result:
+            raise EvidenceError(f"Duplicate LLVM production source: {name}")
+        summary = record.get("summary", {}).get("lines", {})
+        lf, lh = summary.get("count"), summary.get("covered")
+        if type(lf) is not int or type(lh) is not int or not 0 <= lh <= lf:
+            raise EvidenceError(f"Malformed LLVM line summary: {name}")
+        length = len((root / name).read_bytes().splitlines())
+        lines = llvm_segment_lines(record.get("segments"), length)
+        result[name] = (lines, lf, lh)
+    if not result:
+        raise EvidenceError("Empty LLVM production export")
+    return result
+
+
+def read_lcov(text: str, root: Path, expected: dict[str, str],
+              llvm: dict | None = None) -> dict[str, dict[str, int]]:
     files: dict[str, dict[str, int]] = {}
     active = False
     source = None
@@ -111,8 +179,17 @@ def read_lcov(text: str, root: Path, expected: dict[str, str]) -> dict[str, dict
                     raise EvidenceError("Duplicate LH")
                 lh = int(raw[3:])
         elif raw == "end_of_record":
-            if not active or lf != len(lines) or lh != sum(lines.values()):
-                raise EvidenceError("Incomplete or inconsistent LCOV record")
+            if not active or lf is None or lh is None or not 0 <= lh <= lf:
+                raise EvidenceError(f"Incomplete or inconsistent LCOV record: {source}")
+            if llvm is None:
+                if lf != len(lines) or lh != sum(lines.values()):
+                    raise EvidenceError(f"Inconsistent LCOV line counts: {source}")
+            elif source in expected:
+                # LLVM LF/LH are summed per function group. DA is the union
+                # of unique mapped lines in the file. Verify both against the
+                # second export from the exact same instrumented profiles.
+                if llvm.get(source) != (lines, lf, lh):
+                    raise EvidenceError(f"LCOV/LLVM segment or summary mismatch: {source}")
             if source in expected:
                 if source in files:
                     raise EvidenceError(f"Duplicate production source record: {source}")
@@ -122,6 +199,8 @@ def read_lcov(text: str, root: Path, expected: dict[str, str]) -> dict[str, dict
             raise EvidenceError("Unrecognized LCOV record")
     if active or not files:
         raise EvidenceError("Incomplete or empty native coverage report")
+    if llvm is not None and set(files) != set(llvm):
+        raise EvidenceError("LCOV/LLVM production source inventory mismatch")
     return files
 
 
@@ -303,6 +382,7 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     collect = commands.add_parser("collect")
     collect.add_argument("--lcov", type=Path, required=True)
+    collect.add_argument("--llvm-json", type=Path, required=True)
     collect.add_argument("--platform", choices=sorted(PLATFORMS), required=True)
     gate = commands.add_parser("gate")
     gate.add_argument("--linux", type=Path, required=True)
@@ -314,7 +394,8 @@ def main() -> int:
     exact_head(ROOT, args.sha)
     expected = inventory(ROOT)
     if args.command == "collect":
-        files = read_lcov(args.lcov.read_text(encoding="utf-8"), ROOT, expected)
+        llvm = read_llvm_export(read_report(args.llvm_json), ROOT, expected)
+        files = read_lcov(args.lcov.read_text(encoding="utf-8"), ROOT, expected, llvm)
         write_json(args.output, {"schema": 1, "sha": args.sha, "platform": args.platform,
                                  "inventory": expected, "files": files})
         return 0

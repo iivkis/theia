@@ -207,7 +207,7 @@ async fn transfer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             return Ok(());
         }
         remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 left.checked_sub(count)
             })
             .map_err(|_| Error::Limit)?;
