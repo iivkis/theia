@@ -393,6 +393,16 @@ impl ExpectClientHello {
             ProtocolVersion::TLSv1_2
         };
 
+        if let Some(check) = &self.config.client_hello_check {
+            if version != ProtocolVersion::TLSv1_3 || self.previous_hello.is_some() {
+                return Err(Error::General("initial ClientHello check requires a full TLS 1.3 handshake".into()));
+            }
+            let crate::msgs::message::MessagePayload::Handshake { encoded, .. } = &m.payload else {
+                return Err(Error::General("expected initial ClientHello".into()));
+            };
+            check.check(encoded.bytes())?;
+        }
+
         cx.common.negotiated_version = Some(version);
 
         // We communicate to the upper layer what kind of key they should choose

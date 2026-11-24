@@ -105,6 +105,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
 
         ServerConfig {
             provider: self.provider,
+            client_hello_check: None,
             verifier: self.state.verifier,
             cert_resolver,
             ignore_client_order: false,

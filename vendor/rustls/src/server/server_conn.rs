@@ -295,6 +295,9 @@ impl<'a> ClientHello<'a> {
 /// [`ServerSessionMemoryCache`]: crate::server::handy::ServerSessionMemoryCache
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    /// Optional check of the exact initial TLS 1.3 handshake bytes.
+    /// This is not a packet-routing interface: failure aborts TLS.
+    pub client_hello_check: Option<Arc<dyn ClientHelloCheck>>,
     /// Source of randomness and other crypto.
     pub(super) provider: Arc<CryptoProvider>,
 
@@ -1295,4 +1298,13 @@ mod tests {
             "Err(Kind(BrokenPipe))"
         );
     }
+}
+
+
+/// Check an initial ClientHello before certificate selection or transcript
+/// processing. The argument is the original, unmodified handshake bytes,
+/// including the four-byte handshake header.
+pub trait ClientHelloCheck: core::fmt::Debug + Send + Sync {
+    /// Return an error to abort the handshake.
+    fn check(&self, handshake: &[u8]) -> Result<(), Error>;
 }
