@@ -131,7 +131,9 @@ jobs:
           go run . "$RUNNER_TEMP/theia-utls-h2-hello.bin"
           popd
           THEIA_UTLS_HELLO_PATH="$RUNNER_TEMP/theia-utls-h2-hello.bin" cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_reference -- --ignored --nocapture
-          THEIA_UTLS_HELLO_PATH="$RUNNER_TEMP/theia-utls-h2-hello.bin" cargo test --workspace --locked --test fingerprint_h2 -- --ignored --nocapture
+          # Root fingerprint comparison belongs to rust-tests: the root
+          # harness was already compiled there. Do NOT duplicate the entire
+          # root Cargo workspace inside this isolated M0.1 target directory.
           rm -f "$RUNNER_TEMP/theia-utls-h2-hello.bin"
       - name: Real Go uTLS H2 request and strict certificate verification against Rust server
         shell: bash
@@ -230,6 +232,23 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
+      - name: Real Linux H2 fingerprint vs pinned Go uTLS (reuse compiled root harness)
+        shell: bash
+        run: |
+          set -euo pipefail
+          hello="$RUNNER_TEMP/theia-utls-root-h2-hello.bin"
+          trap 'rm -f "$hello"' EXIT
+          (
+            cd spikes/m0_1/utls_reference
+            go mod verify
+            go run . "$hello"
+          )
+          THEIA_UTLS_HELLO_PATH="$hello" cargo test --workspace --locked --test fingerprint_h2 -- --ignored --nocapture
       - name: Build genuine Linux server for Windows cross-OS F-14 E2E
         run: cargo build --workspace --locked --bin theia
       - uses: actions/upload-artifact@v4
