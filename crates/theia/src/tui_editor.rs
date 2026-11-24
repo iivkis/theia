@@ -2287,7 +2287,10 @@ mod tests {
         assert_eq!(saved.client.profiles[1].server_name, "new-work.example.org");
         assert_eq!(saved.client.profiles[1].transport, config::Transport::H2);
         assert_eq!(saved.client.profiles[1].xhttp_mode, Some(XhttpMode::Auto));
-        assert_eq!(saved.client.profiles[0].effective_xhttp_mode(), XhttpMode::Auto);
+        assert_eq!(
+            saved.client.profiles[0].effective_xhttp_mode(),
+            XhttpMode::Auto
+        );
         assert_eq!(saved.client.profiles[1].auth_token, "env:THEIA_AUTH_TOKEN");
     }
 

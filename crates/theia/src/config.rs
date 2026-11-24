@@ -811,7 +811,10 @@ mod tests {
         let Config::Client(defaults) = parse(&original).unwrap() else {
             panic!("client");
         };
-        assert_eq!(defaults.client.profiles[0].effective_xhttp_mode(), XhttpMode::Auto);
+        assert_eq!(
+            defaults.client.profiles[0].effective_xhttp_mode(),
+            XhttpMode::Auto
+        );
         for (raw, mode) in [
             ("auto", XhttpMode::Auto),
             ("stream-one", XhttpMode::StreamOne),

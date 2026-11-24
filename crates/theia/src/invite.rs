@@ -490,13 +490,21 @@ mod tests {
             let decoded = Invitation::decode(&link).unwrap();
             assert_eq!(decoded.xhttp_mode(), mode);
             assert_eq!(
-                decoded.to_profile("env:TOKEN", None).unwrap().effective_xhttp_mode(),
+                decoded
+                    .to_profile("env:TOKEN", None)
+                    .unwrap()
+                    .effective_xhttp_mode(),
                 mode
             );
             assert_eq!(decoded.encode().unwrap(), link);
         }
         profile.xhttp_mode = None;
-        assert_eq!(Invitation::public_from_profile(&profile).unwrap().xhttp_mode(), XhttpMode::Auto);
+        assert_eq!(
+            Invitation::public_from_profile(&profile)
+                .unwrap()
+                .xhttp_mode(),
+            XhttpMode::Auto
+        );
     }
 
     #[test]
