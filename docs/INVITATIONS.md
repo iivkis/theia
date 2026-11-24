@@ -22,7 +22,9 @@ transport = "auto"
 # token = "..." # ONLY for explicitly confirmed one-time confidential export
 ```
 
-Fields: `version` must be 1, `id` a v1-compatible profile ID, `endpoint` a valid host:port or [IPv6]:port, `server_name` a valid TLS DNS SNI, `tls_profile` **default only** until F-13 proves an alternative, `transport` auto/h2/h3. Optional `token` is exactly 32 random raw bytes represented as canonical 43-character base64url without padding. The invite has no secret reference, key hash, TLS private key, ACL grant, OS settings, local listener binds, certificate override or arbitrary path. Unknown, duplicate or extra fields/versions, malformed UTF-8/base64, over-limit payload and invalid values fail closed. This URI version is independent of SmartTheia frame version and TOML config schema_version.
+Fields: `version` must be 1, `id` a v1-compatible profile ID, `endpoint` a valid host:port or [IPv6]:port, `server_name` a valid TLS DNS SNI, `tls_profile` **default only** (including when the local binary supports a named F-13 profile; v1 cannot represent it), `transport` auto/h2/h3. Optional `token` is exactly 32 random raw bytes represented as canonical 43-character base64url without padding. The invite has no secret reference, key hash, TLS private key, ACL grant, OS settings, local listener binds, certificate override or arbitrary path. Unknown, duplicate or extra fields/versions, malformed UTF-8/base64, over-limit payload and invalid values fail closed. This URI version is independent of SmartTheia frame version and TOML config schema_version.
+
+**No export downgrade:** `Invitation::public_from_profile` rejects every non-default TLS profile, including the locally supported H2 BoringSSL profile, instead of producing a default-profile URI. A future versioned invitation must explicitly represent and validate any additional profile. Existing default H2/H3/auto public shares and server-issued bearer links remain unchanged. See ADR-0064.
 
 ## Server: issuance and one-time export
 

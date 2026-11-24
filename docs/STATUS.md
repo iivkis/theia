@@ -14,7 +14,7 @@
 | TUI M4.1 | Роли server/client, три безопасных поля существующей записи, проверка/атомарное сохранение TOML; без общего CRUD и без автоматического runtime Apply. |
 | Local management M4.2 | Opt-in Linux Unix IPC / Windows SID-DACL Named Pipe, revisioned auth CAS, свежие порты, same-port TLS rotation, quota resize, pin TLS PEM bytes и one-shot 300s same-port rollback **только по явно подтверждаемым CLI-командам**. |
 | F-14 частично | Canonical `theia://v1` codec, серверные `u` (CSPRNG issuance), `x` (global disable), `t` (явно подтверждённая ротация действующего bearer); клиентская TUI `i` локально импортирует приглашение с отдельным CA/защищённым credential file. Native Linux/Windows H2 binary E2E прошёл в PR #80/#81; ни одна операция не выполняет автоматический runtime Apply. |
-| F-18 исследования | M3.5b1 offline candidate planning; M3.5b2a exact-consent strict H2 TLS; M4.5a–i passive discovery, DNS pin и согласованные отдельные H2/H3 кандидаты. Нет автоматического сканирования сторонних IP и нет REALITY режима. |
+| F-18 исследования | M3.5a0–a6 test-only TLS/exporter, identity/reconnect, H2/H3 DATA and local key lifecycle evidence; M3.5a7 v1 export downgrade fix and review packet (pending CI); M3.5b1 offline candidate planning; M3.5b2a exact-consent strict H2 TLS; M4.5a–i passive discovery, DNS pin и согласованные отдельные H2/H3 кандидаты. Нет автоматического сканирования сторонних IP и нет REALITY режима. |
 
 Последний слитый срез: **F-13 / ADR-0057 (частичный именованный H2-профиль)**. [Exact-head CI PR #83](https://github.com/iivkis/theia/actions/runs/45264439305): **14/14 SUCCESS**, включая `ci-gate`; merge в `main` выполнен после этого результата. F-13 в целом остаётся незавершённым.
 
