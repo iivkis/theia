@@ -136,7 +136,11 @@ fn validate_hello(hello: &[u8], name: &str, branch: Branch) -> Result<(), Error>
                 if versions.is_empty() || versions.len() % 2 != 0 {
                     return Err(Error::Format);
                 }
-                tls13 = versions.as_chunks::<2>().0.iter().any(|pair| *pair == [3, 4]);
+                tls13 = versions
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|pair| *pair == [3, 4]);
             }
             51 => {
                 let mut shares = Cursor(field.vector16()?);
