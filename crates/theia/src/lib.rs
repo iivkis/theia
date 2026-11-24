@@ -31,6 +31,7 @@ pub mod management;
 pub mod protocol;
 pub mod quic_transport;
 pub mod reference_health;
+pub mod identity_tls;
 pub mod reference_cli;
 pub(crate) mod quota;
 mod relay_liveness;

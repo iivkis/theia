@@ -54,7 +54,7 @@ impl fmt::Display for QuicError {
 }
 impl std::error::Error for QuicError {}
 
-fn transport_config() -> Arc<TransportConfig> {
+pub(crate) fn transport_config() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
     config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     // Bounded per-connection stream credit. Leave unidirectional credit for
