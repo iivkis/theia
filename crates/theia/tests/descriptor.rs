@@ -613,3 +613,22 @@ fn offline_cli_requires_exact_preview_digest_and_guarded_revision() {
     assert!(text.contains("runtime UNCHANGED"));
     assert!(!text.contains("edge.example.org"));
 }
+
+#[test]
+fn persisted_acceptance_time_prevents_ordinary_clock_rollback() {
+    let temp = Scratch::new();
+    let root = key();
+    let first = fixture(1);
+    let path = temp.0.join("trust.toml");
+    let pinned = anchor(&first, &root);
+    let store = Store::new(&path, pinned.clone()).unwrap();
+    store.initialize(&descriptor::sign(&first, &root).unwrap(), 120).unwrap();
+    let second = descriptor::sign(&fixture(2), &root).unwrap();
+    store.update_at(&second, 1, 150).unwrap();
+    let reopened = Store::new(&path, pinned).unwrap();
+    let saved = fs::read(&path).unwrap();
+    assert_error(reopened.inspect(149), Error::Validity);
+    assert_error(reopened.update(&descriptor::sign(&fixture(3), &root).unwrap(), 149), Error::Validity);
+    assert_eq!(fs::read(&path).unwrap(), saved);
+    assert_eq!(reopened.load(150).unwrap().descriptor().revision, 2);
+}

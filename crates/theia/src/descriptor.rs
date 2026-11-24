@@ -329,6 +329,7 @@ struct Transition {
 #[serde(deny_unknown_fields)]
 struct Snapshot {
     schema_version: u16,
+    last_accepted_at: u64,
     current: String,
     transitions: Vec<Transition>,
 }
@@ -465,6 +466,9 @@ impl Snapshot {
             history.floor = Some(next);
         }
         let current = history.verify_current(&self.current)?;
+        history.check_clock(self.last_accepted_at)?;
+        current.check_time(self.last_accepted_at)?;
+        history.last_transition = self.last_accepted_at;
         Ok((history, current))
     }
 }
@@ -534,6 +538,7 @@ impl Store {
         next.check_time(now)?;
         let snapshot = Snapshot {
             schema_version: 1,
+            last_accepted_at: now,
             current: document.to_owned(),
             transitions: Vec::new(),
         };
@@ -562,6 +567,8 @@ impl Store {
         next.check_time(now)?;
         let change = previous.compare(&next)?;
         snapshot.current = document.to_owned();
+        snapshot.last_accepted_at = now;
+        snapshot.validate(&self.anchor)?;
         config::guarded_trust_write(&self.path, &snapshot.encode()?, Some(old.as_bytes()))
             .map_err(storage_error)?;
         Ok(change)
@@ -589,6 +596,7 @@ impl Store {
             successor: successor.to_owned(),
             accepted_at: now,
         });
+        snapshot.last_accepted_at = now;
         // Re-verify the exact candidate from the independent root before CAS.
         snapshot.validate(&self.anchor)?;
         config::guarded_trust_write(&self.path, &snapshot.encode()?, Some(old.as_bytes()))

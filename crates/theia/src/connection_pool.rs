@@ -9,9 +9,9 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::{sync::{Mutex, OwnedSemaphorePermit, Semaphore}, time::Instant};
 
 const MAX_CONNECTIONS: usize = 4;
 const MAX_TUNNELS: usize = 16;
@@ -20,7 +20,7 @@ const MAX_TUNNELS: usize = 16;
 const MAX_REUSE_AGE: Duration = Duration::from_secs(20);
 
 pub(crate) struct Pool<C> {
-    entries: Mutex<Vec<Arc<Entry<C>>>>,
+    entries: Arc<Mutex<Vec<Arc<Entry<C>>>>>,
     connections: Arc<Semaphore>,
 }
 struct Entry<C> {
@@ -63,12 +63,12 @@ impl<C> Drop for Lease<C> {
 impl<C> Default for Pool<C> {
     fn default() -> Self {
         Self {
-            entries: Mutex::new(Vec::new()),
+            entries: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         }
     }
 }
-impl<C> Pool<C> {
+impl<C: Send + Sync + 'static> Pool<C> {
     pub(crate) async fn acquire(
         &self,
         route: Option<SocketAddr>,
@@ -130,6 +130,19 @@ impl<C> Pool<C> {
         });
         if reusable && route.is_some() {
             entries.push(entry.clone());
+            // No traffic is necessary to clean up an idle expired carrier.
+            // Keep only weak references across the timer; dropping the
+            // profile or evicting a connection cannot extend its lifetime.
+            let weak_entries = Arc::downgrade(&self.entries);
+            let weak_entry = Arc::downgrade(&entry);
+            let deadline = entry.created + MAX_REUSE_AGE;
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                if let (Some(entries), Some(expired)) = (weak_entries.upgrade(), weak_entry.upgrade()) {
+                    expired.retired.store(true, Ordering::Release);
+                    entries.lock().await.retain(|candidate| !Arc::ptr_eq(candidate, &expired));
+                }
+            });
         }
         Ok(Lease {
             entry,
@@ -142,6 +155,29 @@ impl<C> Pool<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn expiry_releases_idle_connection_and_drains_live_lease() {
+        let pool = Pool::default();
+        let route = Some("127.0.0.1:0".parse().unwrap());
+        let mut active = pool.acquire(route, false, true, |_| true, async { Ok(1) }).await.unwrap();
+        active.admitted();
+        let mut idle = pool.acquire(route, true, true, |_| true, async { Ok(2) }).await.unwrap();
+        idle.admitted();
+        drop(idle);
+        tokio::task::yield_now().await;
+        tokio::time::advance(MAX_REUSE_AGE + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(pool.entries.lock().await.is_empty());
+        assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);
+        assert_eq!(*active.connection(), 1);
+        let mut fresh = pool.acquire(route, false, true, |_| true, async { Ok(3) }).await.unwrap();
+        fresh.admitted();
+        assert_eq!(*fresh.connection(), 3);
+        assert!(!active.shares_connection(&fresh));
+        drop(active);
+        assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);
+    }
+
     #[tokio::test]
     async fn scope_retirement_and_capacity_keep_live_leases() {
         let pool = Pool::default();
