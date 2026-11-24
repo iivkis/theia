@@ -243,7 +243,9 @@ async fn main() {
         }
         Ok(Command::Help(topic)) => help(topic).map(str::to_owned),
         Ok(Command::Version) => Ok(version().to_owned()),
-        Ok(Command::ConfigValidate { config }) => validate_config(Path::new(&config)).map(str::to_owned),
+        Ok(Command::ConfigValidate { config }) => {
+            validate_config(Path::new(&config)).map(str::to_owned)
+        }
         Err(error) => Err(error),
     };
     match result {

@@ -18,8 +18,8 @@
 
 | Требование | Текущее ограничение |
 | --- | --- |
-| **F-13 browser-like fingerprint** | PR #83 слит после успешного CI: opt-in `browser-h2-btls-v1` на BoringSSL, отдельные измеряемые H2 SETTINGS и нативный клиентский E2E на Linux/Windows. Это частичный H2-профиль, **не** полное соответствие Chromium; H3/QUIC fingerprint и релизный F-13 всё ещё открыты. |
-| **F-14 приглашения** | Серверная выдача, отключение и подтверждённая ротация bearer, защищённый локальный импорт `theia://v1` в клиентскую TUI с отдельным доверенным CA и нативный H2 E2E реализованы (PR #80/#81, CI пройден). Защищённый экспорт файла/clipboard, H3 и Linux→Windows cross-host E2E, полная crash/ACL-матрица остаются открытыми. |
+| **F-13 browser-like fingerprint** | Opt-in `browser-h2-btls-v1` (PR #83) и функциональная навигация Chromium через H2/H3 на Linux/Windows (PR #111, ADR-0076) подтверждены CI. Полное соответствие Chromium TLS/H2/QUIC first flight и релизная приёмка не доказаны. |
+| **F-14 приглашения** | Выдача, отключение, ротация, восстановление пользователя с новым bearer, локальный импорт/замена credential, защищённый файл и автоматический WSL2 Linux → native Windows H2/H3 E2E подтверждены CI. Clipboard/QR, перенос между физическими хостами и power-loss recovery остаются открытыми. |
 | **F-18 REALITY-подобная защита** | Нет согласованного криптографического identity/security mode, антипробинга и законченного двухшагового мастера с безопасным Apply. Текущие H2/H3 TLS probes — только evidence. |
 | **F-19 TLS-in-TLS** | Нет измеренной flow-shaping защиты с независимым classifier и release thresholds. |
 | **Windows system proxy / M4.3** | PR #82 слит после Windows CI: только явная команда с `--system-proxy --confirm` выполняет WinINet apply/owned CAS restore, есть подтверждаемое восстановление после аварии. Автоматического включения нет; TUI-интеграция, policy/VPN-совместимость и расширенная приёмка остаются открытыми. |

@@ -47,7 +47,7 @@ In `theia tui --role server --config FILE`, select the inbound that already gran
 
 The new `theia://v1` link is offered only **after** strict document validation and successful guarded atomic TOML save; external file conflict blocks reveal. `y` separately shows the confidential URI once, `n/Esc` discards unseen bearer, Esc hides a shown bearer. No file, log, CLI argv, system proxy change or automatic runtime Apply. **Until separate native IPC auth-only CAS Apply, the running server still accepts the OLD bearer for new sessions**; after Apply it accepts the new bearer and refuses the old for new sessions across all inbounds, while **already-open tunnels continue**. No immediate hard revoke or implicit re-enable. See [ADR-0054](adr/0054-m4-4b2b1-confirmed-bearer-rotation.md).
 
-**This is a bounded partial F-14 slice** (PR #80 merged after native CI). Protected file export, clipboard, disabled-user re-enable and cross-host H2/H3 E2E remain open; local client import with native H2 E2E has since been merged in PR #81.
+Rotation is independently confirmed by PR #80; protected file export, disabled-user recovery and automated H2/H3 cross-host acceptance were added later. See [F14_ACCEPTANCE](F14_ACCEPTANCE.md) for remaining limitations.
 
 ## Client: import and TLS trust
 
@@ -65,11 +65,11 @@ An optional separate \`c\` step selects a **pre-trusted** \`file:/absolute/ca.pe
 
 After final \`y\` the importer reuses guarded typed TOML validation/atomic save in a background worker. External edits/failed saves roll back the new private token when safe. A post-rename fsync ambiguity preserves the file referenced by the observed committed TOML rather than deleting it and silently breaking configuration. Link input is dropped/zeroized best-effort; caller retains responsibility for source file, terminal/SSH scrollback and private folder. Import success is **not** a claim of TLS connection or token acceptance until a separately selected profile reaches real \`OPEN_OK\`.
 
-Native Linux/Windows integration verifies the actual \`theia client run\` binary with imported private bearer, separately trusted CA, SOCKS5 and HTTP CONNECT over real authenticated H2 (including distinct user action to change active profile). M4.4c **does not** complete F-14: cross-host Linux→Windows/H3, full ACL/adversarial and crash/recovery matrix, and more protected export options remain release blockers. M4.3 WinINet is independently delivered in PR #82 with additional policy/VPN acceptance still open. [ADR-0055](adr/0055-f14-secure-client-import.md).
+Native Linux/Windows integration verifies the actual \`theia client run\` binary with imported private bearer, separately trusted CA, SOCKS5 and HTTP CONNECT over real authenticated H2 (including distinct user action to change active profile). M4.4c **does not** complete F-14: automated WSL2 Linux→native Windows H2/H3 acceptance has since passed; physical cross-host transfer, complete ACL/adversarial and power-loss recovery matrices and clipboard/QR remain open. M4.3 WinINet is independently delivered in PR #82 with additional policy/VPN acceptance still open. [ADR-0055](adr/0055-f14-secure-client-import.md).
 
-## Security tests and limitations of M4.4a
+## Codec security tests
 
-The pure codec rejects wrong prefix/version, noncanonical/oversized base64, unknown fields, non-256-bit token, bad endpoint/SNI, unknown TLS profile, invalid env/file references and mismatched/disabled/ungranted server users. The computed full client profile is checked with the existing typed config validator; importing never trusts a provided CA path from the URI. The encoded token is held in memory for import, so the raw link and process memory must be treated as confidential. M4.4a has **no** CSPRNG issuance, file/clipboard UI, ACL, QR, import transaction, runtime reload or service connection; these remain open P0.
+The pure codec rejects wrong prefix/version, noncanonical/oversized base64, unknown fields, non-256-bit token, bad endpoint/SNI, unknown TLS profile, invalid env/file references and mismatched/disabled/ungranted server users. The computed full client profile is checked with the existing typed config validator; importing never trusts a provided CA path from the URI. The encoded token is held in memory for import, so the raw link and process memory must be treated as confidential. The codec is not an issuance, storage or runtime API; those boundaries are tested separately.
 
 ## Будущие F-18/F-19 (не реализовано)
 

@@ -21,7 +21,7 @@
 - SmartTheia v1 — прикладные фреймы внутри стандартных **HTTP/3 (QUIC)** и **HTTP/2 (TLS)**. Не вводить самодельную криптографию, TLS, HTTP/2 или QUIC.
 - QUIC-first, H2-fallback **только по сетевой недоступности UDP/QUIC**, никогда вследствие отказа авторизации, ошибки сертификата или явной несовместимости протокола. Нельзя молча ослаблять проверки.
 - **BBR — P0:** на обоих QUIC endpoints фактически выбран и измерен BBR. Проверить API выбранного quinn/backend, не заменять молча алгоритм; без теста и замеров MVP не готов.
-- **Browser TLS/HTTP interoperability and evidence — P0 (ADR-0074):** actual pinned browser runs are the only browser reference; H2/TLS and H3/QUIC are evaluated separately on Linux/Windows. Preserve independent strict CA/hostname/ALPN and authorization checks. uTLS comparison is retired, not a release prerequisite. H2 browser evidence is partial, H3 browser evidence remains open. Never claim byte-exact browser parity or DPI invisibility from a library, User-Agent or test result. No production wire/backend change in this migration.
+- **Browser TLS/HTTP interoperability and evidence — P0 (ADR-0074):** actual pinned browser runs are the only browser reference; H2/TLS and H3/QUIC are evaluated separately on Linux/Windows. Preserve independent strict CA/hostname/ALPN and authorization checks. uTLS comparison is retired, not a release prerequisite. H2/H3 functional Chromium coverage on Linux/Windows is confirmed (ADR-0076); browser wire/fingerprint parity remains open. Never claim byte-exact browser parity or DPI invisibility from a library, User-Agent or test result. No production wire/backend change in this migration.
 - В первой поставке: Linux-сервер, Windows x64-клиент, локальные HTTP CONNECT/SOCKS5 и пользовательский Windows system proxy с восстановлением прежних параметров.
 - Секреты не пишутся в логи или TUI в открытом виде (кроме явного одноразового confidential export с подтверждением). Примеры не содержат действующих ключей.
 - **F-18/F-19 P0 (spec + M3.5a0 feasibility + M3.5b1 offline planner + M3.5b2a explicit strict H2 TLS probe, без режима/автоматического scanner):** криптографически аутентифицированный REALITY-подобный SmartTheia security mode, прозрачный двухшаговый серверный мастер подбора IP/domain с bounded opt-in active scans только разрешённых целей и anti-SSRF, независимая измеренная защита от TLS-in-TLS через flow shaping и classifier/performance E2E Linux/Windows. Не выдавать User-Agent/SNI/padding или единичный зелёный fingerprint test за готовую реализацию и не обещать гарантий DPI-невидимости. Не менять TOML/invite v1 без отдельного ADR и тестов; docs/STEALTH_REALITY.md и ADR-0020.
@@ -61,13 +61,7 @@
 - **Экономь на количестве запусков и дублировании, а не на покрытии.** Не удаляй обязательные native Linux/Windows, security, BBR, fingerprint, F-14 cross-host, smoke/E2E, fuzz или иные release gates ради скорости. Docs-only fast path допустим лишь при доказанном безопасном diff; неизвестные/смешанные изменения требуют полной матрицы. Сохраняй CI-only и fail-closed семантику итогового `ci-gate`; запрещены skip обязательных jobs, подмена native E2E моками и ложный green.
 - Никакой микрооптимизации без замеров и регрессий в тестах. Производительность в `docs/TESTING_CI.md` — измеряется на одинаковых условиях.
 
-- **M1.1 CLI shell:** корневой workspace `crates/theia` с зафиксированным `Cargo.lock`; отдельный `spikes/m0_1` не входит в production workspace. Работают только `--help` и `--version`. Распознаваемые `tui`, `server/client run`, `config validate` обязаны завершаться nonzero без сети, TUI и модификации OS proxy, пока реализация соответствующих M1.2/M2/M4 этапов отсутствует. Проверять unit + CLI integration tests на Linux/Windows; не называть синтаксический parser реализацией proxy.
-
-- **M1.2 typed TOML:** `config.rs` содержит строгую serde-модель, безопасные проверки grants/binds/secret refs, upper bound 1 МиБ и атомарную запись. `config validate` структурная проверка без чтения secret content; не считать отсутствие проверки base64url токена из env/file полной runtime validation. Запуск client/server остаётся fail-closed.
-
-- **M1.3 SmartTheia v1 pure codec:** frame layout + header 6 bytes, max 65 536 payload, strict flags/version, 8 типов, limited incremental buffer и state transitions tested. `Session::tunnel_open()` true только после правильного OPEN_OK, DATA после FIN запрещено; ABORT/OPEN_ERROR terminal. Настоящие HTTP/2/3 transports, TLS auth/ACL, local CONNECT/SOCKS5 и runtime persistence **не** реализованы. Не заявлять E2E или production readiness.
-
-- **M2.1 H2 server inbound:** unit/loopback TLS1.3/H2 tests с проверенным hostname/ALPN, canonical base64url bearer SHA-256 constant-time digest, inbound grants, denied private IP by default, server-side DNS + pinned IP dial, OPEN_OK после TCP connect, refusal codes и bounded sessions. Это первая серверная реализация; **не** H3/QUIC и не клиентский CONNECT/SOCKS5. Не считать M2.1 полностью закрытым до mass-cancel/rate-limit/PKI cert-name binding тестов. Нельзя логировать токены или адреса целей.
+- Production CLI dispatch is exhaustive: parsing is side-effect-free, invalid arguments fail before runtime, unsupported platforms refuse explicitly. Both server and client H2/H3 runtimes, typed TOML and the TUI are integrated; retain the compiled binary's positive and negative CI regressions.
 
 ## Definition of Done (для каждого среза)
 
@@ -84,31 +78,6 @@
 
 **Сначала минимальный защищённый TCP-туннель с тестами. Перед объявлением MVP готовым обязательно завершить P0 BBR, REALITY-подобный F-18, измеренную защиту TLS-in-TLS F-19 и проверенный browser-like fingerprint профиль; ни один из этапов нельзя выдавать за уже реализованный.**
 
+## История этапов
 
-M2.1 hardening: preflight certificate SAN matches configured DNS name (not full PKI chain/time validation), bounded shared IP request budget (120/min; 4096 peers; fixed windows; all requests), 8 KiB H2 header limit, H2/TLS handshake deadlines, single DNS/dial deadline with at most 64 results, task ownership via JoinSet, and bounded abort/drain. Remaining stress and full PKI checks are not claimed complete.
-
-M2.1 relay regression: independently driven TCP read/write halves, bounded H2 frame send, direction-specific FSM checks, stream reset on interrupted wire frame. Production-server integration tests exercise withheld response credit (1 KiB H2 window, 256 KiB download, successful concurrent upload and FIN) and eight open tunnels on one H2 connection with one cancelled stream and byte-exact sibling transfers. These are bounded regression tests, not a peak-RSS or large-scale benchmark; await Linux/Windows CI.
-
-M2.2a client transport: `H2Client::open` only yields a `Tunnel` after strict verified TLS1.3/ALPN + HTTP auth/HELLO/OPEN_OK. Client target DNS is never resolved locally. Caller-owned RootCertStore (nonempty); no insecure verification. Local CONNECT/SOCKS5/CLI, platform trust loading, and config secret resolution remain M2.2b. Do not claim browser-ready client until those are integrated and tested.
-
-M2.2b: explicit `h2` runtime binds both loopback listeners before accepting; bounded 64 local sessions, negotiation and write deadlines, strict CONNECT authority and SOCKS5 CONNECT-only, success after `H2Client::open`, no OS side effects. CA PEM reference required for runtime, token read from env/file; no silent `auto`/H3 fallback. Automatic CI tests are mandatory; platform roots and browser automation remain open.
-
-M2.2b CI executable regression: real curl through the compiled client over CONNECT and SOCKS5h to an isolated loopback origin, using generated PKI and child-only token. CI must fail if curl or the binary is unavailable, not skip the test. No browser E2E claim until automated browser coverage exists.
-
-CI-only browser regression: Playwright/Chromium in a mandatory Linux/Windows matrix (no production dependency), navigation through a test-only single-origin guard and real Theia SOCKS5 listener, compiled CLI and actual H2 server. Browser connectivity is not proof of a browser-like TLS fingerprint; fingerprint gate remains open.
-
-M3.1a: production QUIC composition root only; strict full TLS1.3 handshake, ALPN h3, active BBR on both peers, bounded stream/connection credit, no early data and no H2 fallback inference from handshake errors. CI-only H3 HELLO/ACK and PKI regressions. No H3 runtime enablement until auth/ACL/OPEN_OK/TCP relay, quotas and E2E are integrated.
-
-M3.1b: both H2/H3 share a single request authorization/admission routine and ServerContext quotas. H3 library server accepts verified QUIC, limits headers/handlers/session, dials only vetted candidates, sends OPEN_OK after TCP success, owns connection/stream tasks. No H3 CLI or selector yet; tests must pass before claiming working H3 server. No weakening TLS or bearer/ACL.
-
-M3.1c: H3Client uses explicit server SocketAddr, verified full QUIC handshake before auth, active BBR, shared bearer header validation and private OPEN_OK-gated H3Tunnel. Dedicated owned endpoint and driver cancel on drop. No fallback or CLI enabling before integration; no local DNS for targets. CI-only tests against production H3 server.
-
-M3.1d: explicit H3 server/client CLI integration, one common local proxy parser and OPEN_OK acknowledgement gate; shared inbound/global connection and user quotas for TCP/H2 and UDP/H3. Auto still fails closed. No claimed fallback or browser TLS fingerprint; only CI checks acceptance.
-
-M3.2a: auto fallback is strictly pre-auth, actual UDP transmit and no observed receive at configured handshake deadline. Generic timeout, TLS/ALPN, auth, protocol, OPEN and all post-handshake failures are never retryable. Profile-local monotonic negative TTL; no live tunnel migration. OS network change invalidation remains pending. CI-only acceptance.
-
-M3.2b: on every new auto tunnel observe local source address for the pinned server; invalidate negative cache on changes and uncertain route, reject stale generation updates; no probing application traffic or active session migration. Same-IP network changes and server DNS refresh remain open. CI-only.
-
-M3.3: mandatory CI-only exploratory BBR/CUBIC comparison jobs Linux+Windows record byte-exact QUIC transfer and synthetic UDP loss/delay/jitter to machine-readable artifacts. A green comparison is evidence the experiments executed, not evidence BBR is faster or F-11 release acceptance. Dedicated bandwidth/RTT/pacing/fairness/CPU/RSS benchmark gates remain open; never weaken them to declare the MVP complete.
-
-**M3.5a0 test-only:** новые Linux/Windows CI-тесты проверяют экспорт ключевого материала только после настоящего TLS1.3 H2 и QUIC H3 handshakes, одинаковые результаты при совпадающем context и раздельность при разных contexts. Не считать exporter доказательством server-key identity или REALITY-маскировки; нужен ADR-0021, отдельный crypto design и measured first-flight. F-18/F-19 P0 открыты.
+Исторические M1–M4 состояния и evidence находятся в [плане реализации](docs/IMPLEMENTATION_PLAN.md), [контрактах тестирования](docs/TESTING_CI.md) и [ADR](docs/adr/). Текущая готовность определяется только по [STATUS](docs/STATUS.md) и exact-head CI. Не копируй сюда хронологические отчёты и устаревшие ограничения промежуточных срезов.
