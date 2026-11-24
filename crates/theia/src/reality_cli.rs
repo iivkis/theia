@@ -227,13 +227,15 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
             profile: path(p)?,
             descriptor: path(d)?,
         },
-        ["recovery-apply", "--profile", p, "--descriptor", d, "--expected-revision", r, "--sha256", h, "--identity-sha256", i, "--confirm"] => Command::RecoveryApply {
-            profile: path(p)?,
-            descriptor: path(d)?,
-            revision: crate::expected_revision(r)?,
-            digest: hash(h)?,
-            identity: hash(i)?,
-        },
+        ["recovery-apply", "--profile", p, "--descriptor", d, "--expected-revision", r, "--sha256", h, "--identity-sha256", i, "--confirm"] => {
+            Command::RecoveryApply {
+                profile: path(p)?,
+                descriptor: path(d)?,
+                revision: crate::expected_revision(r)?,
+                digest: hash(h)?,
+                identity: hash(i)?,
+            }
+        }
         ["publish-new", "--health", h, "--key", k, "--publication", p, "--confirm"] => {
             Command::PublishNew {
                 health: path(h)?,
@@ -252,11 +254,15 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
             }
         }
         ["failover-preview", "--health", h, "--publication", p] => Command::FailoverPreview {
-            health: path(h)?, publication: path(p)?,
+            health: path(h)?,
+            publication: path(p)?,
         },
-        ["failover-apply", "--health", h, "--publication", p, "--sha256", d, "--health-sha256", e, "--reference", r, "--confirm-recovery-plan"] => {
+        ["failover-apply", "--health", h, "--publication", p, "--sha256", d, "--health-sha256", e, "--reference", r, "--confirm-recovery-plan"] =>
+        {
             let selected_reference = match *r {
-                "0" => 0, "1" => 1, "2" => 2,
+                "0" => 0,
+                "1" => 1,
+                "2" => 2,
                 _ => return Err(CliError::InvalidArguments),
             };
             Command::FailoverApply {
@@ -336,19 +342,42 @@ fn publication_status(
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
-        Command::RecoveryPreview { profile, descriptor } => {
+        Command::RecoveryPreview {
+            profile,
+            descriptor,
+        } => {
             let profile = Profile::read(Path::new(&profile))?;
-            let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
+            let raw = bootstrap::read_text(
+                Path::new(&descriptor),
+                crate::descriptor::MAX_DOCUMENT,
+                false,
+            )?;
             let preview = profile.preview_recovery(&raw, now)?;
             Ok(format!("Offline recovery preview; runtime UNCHANGED\nexpected_revision={}\nnext_revision={}\ncurrent_expired={}\nreference_changed={}\ndocument_sha256={}\nidentity_sha256={}\nConfirm the fingerprint independently. This cannot recover a compromised or retired identity.",
                 preview.expected_revision, preview.next_revision, preview.current_expired, preview.reference_changed, hex(preview.document_sha256), hex(preview.identity_sha256)))
         }
-        Command::RecoveryApply { profile, descriptor, revision, digest, identity } => {
+        Command::RecoveryApply {
+            profile,
+            descriptor,
+            revision,
+            digest,
+            identity,
+        } => {
             let profile = Profile::read(Path::new(&profile))?;
-            let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
-            profile.recover(&raw, bootstrap::RecoveryApproval {
-                expected_revision: revision, document_sha256: digest, identity_sha256: identity,
-            }, now)?;
+            let raw = bootstrap::read_text(
+                Path::new(&descriptor),
+                crate::descriptor::MAX_DOCUMENT,
+                false,
+            )?;
+            profile.recover(
+                &raw,
+                bootstrap::RecoveryApproval {
+                    expected_revision: revision,
+                    document_sha256: digest,
+                    identity_sha256: identity,
+                },
+                now,
+            )?;
             Ok("Trust snapshot recovered; profile, credentials and runtime UNCHANGED".into())
         }
         Command::PublishNew {
@@ -383,18 +412,31 @@ pub fn run(command: Command) -> Result<String, Error> {
             publication.refresh(&state, digest, now)?;
             publication_status(&publication, now)
         }
-        Command::FailoverPreview { health, publication } => {
-            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?
-                .inspect().map_err(|_| Error::Health)?;
-            let publication = crate::identity_publication::Publication::new(Path::new(&publication))?;
+        Command::FailoverPreview {
+            health,
+            publication,
+        } => {
+            let state = reference_health::Store::new(Path::new(&health))
+                .map_err(|_| Error::Health)?
+                .inspect()
+                .map_err(|_| Error::Health)?;
+            let publication =
+                crate::identity_publication::Publication::new(Path::new(&publication))?;
             let preview = publication.preview_failover(&state, now)?;
             Ok(format!("Offline failover preview; runtime UNCHANGED\ncurrent_reference={}\nselected_reference={}\nnext_revision={}\npublication_sha256={}\nhealth_sha256={}\nRequires explicit confirmed recovery plan for all existing clients; export the updated signed document and distribute it through authenticated recovery. Evidence must be at most 60s old.",
                 preview.current_reference, preview.selected_reference, preview.next_revision, hex(preview.publication_sha256), hex(preview.health_sha256)))
         }
-        Command::FailoverApply { health, publication, approval } => {
-            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?
-                .inspect().map_err(|_| Error::Health)?;
-            let publication = crate::identity_publication::Publication::new(Path::new(&publication))?;
+        Command::FailoverApply {
+            health,
+            publication,
+            approval,
+        } => {
+            let state = reference_health::Store::new(Path::new(&health))
+                .map_err(|_| Error::Health)?
+                .inspect()
+                .map_err(|_| Error::Health)?;
+            let publication =
+                crate::identity_publication::Publication::new(Path::new(&publication))?;
             publication.apply_failover(&state, approval, now)?;
             publication_status(&publication, now)
         }

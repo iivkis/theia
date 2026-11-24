@@ -338,7 +338,8 @@ impl Publication {
         if now.saturating_sub(record.clock_floor) < FAILOVER_COOLDOWN {
             return Err(Error::Health);
         }
-        let index = state.failover_candidate(checked.current.descriptor(), now)
+        let index = state
+            .failover_candidate(checked.current.descriptor(), now)
             .map_err(|_| Error::Health)?;
         u8::try_from(index).map_err(|_| Error::Health)
     }
@@ -356,7 +357,12 @@ impl Publication {
             health_sha256: state.snapshot_sha256().map_err(|_| Error::Health)?,
             current_reference: checked.current.descriptor().active_reference,
             selected_reference: selected,
-            next_revision: checked.current.descriptor().revision.checked_add(1).ok_or(Error::Descriptor)?,
+            next_revision: checked
+                .current
+                .descriptor()
+                .revision
+                .checked_add(1)
+                .ok_or(Error::Descriptor)?,
         })
     }
 
@@ -385,8 +391,12 @@ impl Publication {
         next.revision = next.revision.checked_add(1).ok_or(Error::Descriptor)?;
         next.not_before = now;
         next.not_after = now.checked_add(VALIDITY).ok_or(Error::Clock)?;
-        state.validate_active(&next, now).map_err(|_| Error::Health)?;
-        record.active_document = checked.active.sign_descriptor(&next)
+        state
+            .validate_active(&next, now)
+            .map_err(|_| Error::Health)?;
+        record.active_document = checked
+            .active
+            .sign_descriptor(&next)
             .map_err(|_| Error::Descriptor)?;
         record.advance(now)?;
         self.write(&record, Some(&old))
@@ -547,22 +557,34 @@ mod tests {
             inbound: "edge".into(),
             endpoint: "edge.example.org:443".into(),
             own_ips: vec!["93.184.216.1".parse().unwrap()],
-            references: (2..=4).map(|i| reference_health::Target {
-                server_name: format!("ref{i}.example.org"),
-                address: format!("93.184.216.{i}:443").parse().unwrap(),
-            }).collect(),
+            references: (2..=4)
+                .map(|i| reference_health::Target {
+                    server_name: format!("ref{i}.example.org"),
+                    address: format!("93.184.216.{i}:443").parse().unwrap(),
+                })
+                .collect(),
         };
-        let h3 = reference_health::Evidence { h2_status: Some(200), h3_status: Some(200) };
-        let h2 = reference_health::Evidence { h2_status: Some(200), h3_status: None };
+        let h3 = reference_health::Evidence {
+            h2_status: Some(200),
+            h3_status: Some(200),
+        };
+        let h2 = reference_health::Evidence {
+            h2_status: Some(200),
+            h3_status: None,
+        };
         let state = reference_health::State::new(plan, vec![h3, h2, h3], now).unwrap();
-        let scope = Scope { inbound: state.plan().inbound.clone(), endpoint: state.plan().endpoint.clone() };
+        let scope = Scope {
+            inbound: state.plan().inbound.clone(),
+            endpoint: state.plan().endpoint.clone(),
+        };
         let identity = Identity::generate(scope.clone()).unwrap();
         let key = dir.0.join("active.key");
         identity.save_new(&key).unwrap();
         let publication = Publication::new(&dir.0.join("publication.toml")).unwrap();
         publication.initialize(&state, &key, now).unwrap();
         let original = publication.documents(now).unwrap().0;
-        let anchor = Anchor::new(scope, identity.public_key(), 1, bootstrap::auto_policy()).unwrap();
+        let anchor =
+            Anchor::new(scope, identity.public_key(), 1, bootstrap::auto_policy()).unwrap();
         let old = descriptor::verify(&original, &anchor).unwrap();
         let time = now + FAILOVER_COOLDOWN + 10;
         let failed = vec![reference_health::Evidence::default(), h2, h3];
@@ -578,12 +600,33 @@ mod tests {
             health_sha256: preview.health_sha256,
             selected_reference: 2,
         };
-        assert!(publication.apply_failover(&twice, FailoverApproval { selected_reference: 1, ..approval }, time).is_err());
-        assert!(publication.apply_failover(&twice, FailoverApproval { health_sha256: [0; 32], ..approval }, time).is_err());
+        assert!(publication
+            .apply_failover(
+                &twice,
+                FailoverApproval {
+                    selected_reference: 1,
+                    ..approval
+                },
+                time
+            )
+            .is_err());
+        assert!(publication
+            .apply_failover(
+                &twice,
+                FailoverApproval {
+                    health_sha256: [0; 32],
+                    ..approval
+                },
+                time
+            )
+            .is_err());
         publication.apply_failover(&twice, approval, time).unwrap();
         let status = publication.inspect(time).unwrap();
         assert_eq!(status.active_reference, 2);
-        assert_eq!(status.active_fingerprint, bootstrap::fingerprint(identity.public_key()));
+        assert_eq!(
+            status.active_fingerprint,
+            bootstrap::fingerprint(identity.public_key())
+        );
         let next = descriptor::verify(&publication.documents(time).unwrap().0, &anchor).unwrap();
         assert_eq!(next.descriptor().path_prefix, old.descriptor().path_prefix);
         assert!(next.descriptor().references == old.descriptor().references);
@@ -591,7 +634,9 @@ mod tests {
         assert!(publication.apply_failover(&twice, approval, time).is_err());
         // Refresh after the first reference failed is valid for the now
         // active reference; new invitations can carry the updated snapshot.
-        publication.refresh(&twice, status.snapshot_sha256, time + 1).unwrap();
+        publication
+            .refresh(&twice, status.snapshot_sha256, time + 1)
+            .unwrap();
         assert_eq!(publication.inspect(time + 1).unwrap().revision, 3);
     }
 
@@ -638,11 +683,21 @@ mod tests {
         substituted.references[0].address = "93.184.216.3:443".parse().unwrap();
         let substituted = reference_health::State::new(
             substituted,
-            vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }],
+            vec![reference_health::Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
             now,
-        ).unwrap();
-        assert!(matches!(publication.refresh(&substituted, start.snapshot_sha256, now + 1), Err(Error::Approval)));
-        assert_eq!(publication.inspect(now + 1).unwrap().snapshot_sha256, start.snapshot_sha256);
+        )
+        .unwrap();
+        assert!(matches!(
+            publication.refresh(&substituted, start.snapshot_sha256, now + 1),
+            Err(Error::Approval)
+        ));
+        assert_eq!(
+            publication.inspect(now + 1).unwrap().snapshot_sha256,
+            start.snapshot_sha256
+        );
         assert_eq!(start.plan_sha256, state.plan().digest().unwrap());
         let fingerprint = bootstrap::fingerprint(next.public_key());
         assert!(publication

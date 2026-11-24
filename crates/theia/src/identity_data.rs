@@ -206,7 +206,10 @@ impl FixtureClient {
             .map_err(|_| ClientError::Tls)?;
         match &self.carrier {
             Carrier::H2(client) => client.open(target, port).await.map(FixtureTunnel::H2),
-            Carrier::H3(client) => client.open(target, port).await.map(|tunnel| FixtureTunnel::H3(Box::new(tunnel))),
+            Carrier::H3(client) => client
+                .open(target, port)
+                .await
+                .map(|tunnel| FixtureTunnel::H3(Box::new(tunnel))),
         }
     }
 

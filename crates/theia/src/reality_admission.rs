@@ -9,7 +9,10 @@ use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
 };
-use std::{collections::{HashMap, HashSet}, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 use zeroize::Zeroizing;
 
 pub const MAX_HELLO: usize = 32 * 1024;
@@ -55,20 +58,29 @@ impl<'a> Cursor<'a> {
         self.take(size)
     }
     fn finish(self) -> Result<(), Error> {
-        if self.0.is_empty() { Ok(()) } else { Err(Error::Format) }
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Format)
+        }
     }
 }
 
 fn alpn(branch: Branch) -> &'static [u8] {
-    match branch { Branch::H2 => b"h2", Branch::H3 => b"h3" }
+    match branch {
+        Branch::H2 => b"h2",
+        Branch::H3 => b"h3",
+    }
 }
 
 /// Inspect the complete first TLS handshake message, not TLS records or
 /// QUIC packets. The transport adapter is responsible for bounded reassembly.
 fn validate_hello(hello: &[u8], name: &str, branch: Branch) -> Result<(), Error> {
-    if hello.len() < RANDOM_END || hello.len() > MAX_HELLO
+    if hello.len() < RANDOM_END
+        || hello.len() > MAX_HELLO
         || hello[0] != 1
-        || ((usize::from(hello[1]) << 16) | (usize::from(hello[2]) << 8) | usize::from(hello[3])) != hello.len() - 4
+        || ((usize::from(hello[1]) << 16) | (usize::from(hello[2]) << 8) | usize::from(hello[3]))
+            != hello.len() - 4
         || !config::valid_dns(name)
     {
         return Err(Error::Format);
@@ -112,7 +124,9 @@ fn validate_hello(hello: &[u8], name: &str, branch: Branch) -> Result<(), Error>
                 field.finish()?;
                 while !protocols.0.is_empty() {
                     let value = protocols.vector8()?;
-                    if value.is_empty() { return Err(Error::Format); }
+                    if value.is_empty() {
+                        return Err(Error::Format);
+                    }
                     protocol |= value == alpn(branch);
                 }
             }
@@ -131,7 +145,9 @@ fn validate_hello(hello: &[u8], name: &str, branch: Branch) -> Result<(), Error>
                 while !shares.0.is_empty() {
                     let group = shares.u16()?;
                     let public = shares.vector16()?;
-                    if public.is_empty() || !groups.insert(group) { return Err(Error::Format); }
+                    if public.is_empty() || !groups.insert(group) {
+                        return Err(Error::Format);
+                    }
                     if group == 29 {
                         if public.len() != 32 || public.iter().all(|byte| *byte == 0) {
                             return Err(Error::Format);
@@ -159,16 +175,21 @@ pub struct Secret(Zeroizing<[u8; 32]>);
 impl Secret {
     pub fn generate() -> Result<Self, Error> {
         let mut bytes = Zeroizing::new([0; 32]);
-        SystemRandom::new().fill(bytes.as_mut()).map_err(|_| Error::Crypto)?;
+        SystemRandom::new()
+            .fill(bytes.as_mut())
+            .map_err(|_| Error::Crypto)?;
         Self::new(*bytes)
     }
     pub fn new(bytes: [u8; 32]) -> Result<Self, Error> {
-        if bytes == [0; 32] { return Err(Error::Crypto); }
+        if bytes == [0; 32] {
+            return Err(Error::Crypto);
+        }
         Ok(Self(Zeroizing::new(bytes)))
     }
     fn key(&self) -> Result<LessSafeKey, Error> {
         UnboundKey::new(&aead::CHACHA20_POLY1305, self.0.as_ref())
-            .map(LessSafeKey::new).map_err(|_| Error::Crypto)
+            .map(LessSafeKey::new)
+            .map_err(|_| Error::Crypto)
     }
 }
 
@@ -213,15 +234,27 @@ impl Context<'_> {
 /// The timestamp is encrypted; both transports share the same field layout.
 /// The entire remaining ClientHello (including the ephemeral key share),
 /// scope, signer, reference and branch are authenticated associated data.
-pub fn seal(secret: &Secret, context: &Context<'_>, hello: &mut [u8], now: u64) -> Result<(), Error> {
+pub fn seal(
+    secret: &Secret,
+    context: &Context<'_>,
+    hello: &mut [u8],
+    now: u64,
+) -> Result<(), Error> {
     let timestamp = u32::try_from(now).map_err(|_| Error::Clock)?;
     let aad = context.aad(hello)?;
     let mut nonce = [0; NONCE_LEN];
-    SystemRandom::new().fill(&mut nonce).map_err(|_| Error::Crypto)?;
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| Error::Crypto)?;
     let mut payload = timestamp.to_be_bytes();
-    let tag = secret.key()?.seal_in_place_separate_tag(
-        Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut payload,
-    ).map_err(|_| Error::Crypto)?;
+    let tag = secret
+        .key()?
+        .seal_in_place_separate_tag(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(aad),
+            &mut payload,
+        )
+        .map_err(|_| Error::Crypto)?;
     let random = &mut hello[RANDOM_START..RANDOM_END];
     random[..NONCE_LEN].copy_from_slice(&nonce);
     random[NONCE_LEN..NONCE_LEN + payload.len()].copy_from_slice(&payload);
@@ -248,33 +281,57 @@ pub struct ReplayGuard {
 
 impl ReplayGuard {
     pub fn new(capacity: usize, started_at: u64) -> Result<Self, Error> {
-        if !(1..=65536).contains(&capacity) { return Err(Error::Capacity); }
+        if !(1..=65536).contains(&capacity) {
+            return Err(Error::Capacity);
+        }
         Ok(Self {
             capacity,
             startup_cutoff: started_at.checked_add(WINDOW).ok_or(Error::Clock)?,
-            state: Mutex::new(ReplayState { seen: HashMap::new(), clock_floor: started_at }),
+            state: Mutex::new(ReplayState {
+                seen: HashMap::new(),
+                clock_floor: started_at,
+            }),
         })
     }
 
-    pub fn admit(&self, secret: &Secret, context: &Context<'_>, hello: &[u8], now: u64) -> Result<(), Error> {
+    pub fn admit(
+        &self,
+        secret: &Secret,
+        context: &Context<'_>,
+        hello: &[u8],
+        now: u64,
+    ) -> Result<(), Error> {
         let aad = context.aad(hello)?;
         let random = &hello[RANDOM_START..RANDOM_END];
         let nonce: [u8; NONCE_LEN] = random[..NONCE_LEN].try_into().map_err(|_| Error::Format)?;
         let mut payload = Zeroizing::new([0; 20]);
         payload.copy_from_slice(&random[NONCE_LEN..]);
-        let plain = secret.key()?.open_in_place(
-            Nonce::assume_unique_for_key(nonce), Aad::from(aad), payload.as_mut(),
-        ).map_err(|_| Error::Crypto)?;
-        let timestamp = u64::from(u32::from_be_bytes(plain.try_into().map_err(|_| Error::Format)?));
+        let plain = secret
+            .key()?
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(aad),
+                payload.as_mut(),
+            )
+            .map_err(|_| Error::Crypto)?;
+        let timestamp = u64::from(u32::from_be_bytes(
+            plain.try_into().map_err(|_| Error::Format)?,
+        ));
         if timestamp <= self.startup_cutoff || timestamp.abs_diff(now) > WINDOW {
             return Err(Error::Clock);
         }
         let mut state = self.state.lock().map_err(|_| Error::Replay)?;
-        if now < state.clock_floor { return Err(Error::Clock); }
+        if now < state.clock_floor {
+            return Err(Error::Clock);
+        }
         state.clock_floor = now;
         state.seen.retain(|_, expiry| *expiry >= now);
-        if state.seen.contains_key(&nonce) { return Err(Error::Replay); }
-        if state.seen.len() == self.capacity { return Err(Error::Capacity); }
+        if state.seen.contains_key(&nonce) {
+            return Err(Error::Replay);
+        }
+        if state.seen.len() == self.capacity {
+            return Err(Error::Capacity);
+        }
         state.seen.insert(nonce, timestamp.saturating_add(WINDOW));
         Ok(())
     }
@@ -321,12 +378,20 @@ mod tests {
         result
     }
     fn scope() -> Scope {
-        Scope { inbound: "edge".into(), endpoint: "edge.example.org:443".into() }
+        Scope {
+            inbound: "edge".into(),
+            endpoint: "edge.example.org:443".into(),
+        }
     }
     #[test]
     fn admission_is_scope_branch_and_exact_hello_bound_and_one_use() {
         let scope = scope();
-        let context = Context { scope: &scope, identity: [3; 32], reference: "ref.example.org", branch: Branch::H2 };
+        let context = Context {
+            scope: &scope,
+            identity: [3; 32],
+            reference: "ref.example.org",
+            branch: Branch::H2,
+        };
         let secret = Secret::new([4; 32]).unwrap();
         let mut message = hello(context.reference, context.branch);
         let now = 2000;
@@ -337,19 +402,36 @@ mod tests {
         let mut changed = message.clone();
         *changed.last_mut().unwrap() ^= 1;
         assert!(guard.admit(&secret, &context, &changed, now).is_err());
-        let foreign = Context { identity: [8; 32], ..context };
+        let foreign = Context {
+            identity: [8; 32],
+            ..context
+        };
         assert!(guard.admit(&secret, &foreign, &message, now).is_err());
-        let h3 = Context { branch: Branch::H3, ..context };
+        let h3 = Context {
+            branch: Branch::H3,
+            ..context
+        };
         assert!(guard.admit(&secret, &h3, &message, now).is_err());
         assert_eq!(guard.admit(&secret, &context, &message, now), Ok(()));
-        assert_eq!(guard.admit(&secret, &context, &message, now), Err(Error::Replay));
+        assert_eq!(
+            guard.admit(&secret, &context, &message, now),
+            Err(Error::Replay)
+        );
         let restarted = ReplayGuard::new(2, now).unwrap();
-        assert_eq!(restarted.admit(&secret, &context, &message, now), Err(Error::Clock));
+        assert_eq!(
+            restarted.admit(&secret, &context, &message, now),
+            Err(Error::Clock)
+        );
     }
     #[test]
     fn cache_never_evicts_live_entries_and_time_window_is_bounded() {
         let scope = scope();
-        let context = Context { scope: &scope, identity: [3; 32], reference: "ref.example.org", branch: Branch::H3 };
+        let context = Context {
+            scope: &scope,
+            identity: [3; 32],
+            reference: "ref.example.org",
+            branch: Branch::H3,
+        };
         let secret = Secret::new([4; 32]).unwrap();
         let guard = ReplayGuard::new(1, 1000).unwrap();
         let mut first = hello(context.reference, context.branch);
@@ -357,16 +439,30 @@ mod tests {
         seal(&secret, &context, &mut first, 2000).unwrap();
         seal(&secret, &context, &mut second, 2001).unwrap();
         assert_eq!(guard.admit(&secret, &context, &first, 2000), Ok(()));
-        assert_eq!(guard.admit(&secret, &context, &second, 2001), Err(Error::Capacity));
-        assert_eq!(guard.admit(&secret, &context, &first, 2001), Err(Error::Replay));
+        assert_eq!(
+            guard.admit(&secret, &context, &second, 2001),
+            Err(Error::Capacity)
+        );
+        assert_eq!(
+            guard.admit(&secret, &context, &first, 2001),
+            Err(Error::Replay)
+        );
         assert_eq!(guard.admit(&secret, &context, &second, 2121), Ok(()));
-        assert_eq!(guard.admit(&secret, &context, &second, 2122), Err(Error::Clock));
+        assert_eq!(
+            guard.admit(&secret, &context, &second, 2122),
+            Err(Error::Clock)
+        );
         assert!(guard.admit(&secret, &context, &second, 2119).is_err());
     }
     #[test]
     fn malformed_hello_and_wrong_reference_are_refused() {
         let scope = scope();
-        let context = Context { scope: &scope, identity: [3; 32], reference: "ref.example.org", branch: Branch::H2 };
+        let context = Context {
+            scope: &scope,
+            identity: [3; 32],
+            reference: "ref.example.org",
+            branch: Branch::H2,
+        };
         let secret = Secret::new([4; 32]).unwrap();
         let mut wrong = hello("other.example.org", Branch::H2);
         assert!(seal(&secret, &context, &mut wrong, 2000).is_err());

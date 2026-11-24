@@ -601,13 +601,21 @@ impl State {
             || signed.scope.inbound != self.plan.inbound
             || signed.scope.endpoint != self.plan.endpoint
             || signed.references.len() != self.plan.references.len()
-            || signed.references.iter().zip(&self.plan.references).any(|(reference, target)| {
-                reference.server_name != target.server_name || reference.port != target.address.port()
-            })
+            || signed
+                .references
+                .iter()
+                .zip(&self.plan.references)
+                .any(|(reference, target)| {
+                    reference.server_name != target.server_name
+                        || reference.port != target.address.port()
+                })
         {
             return Err(Error::NotEligible);
         }
-        let active = self.health.get(usize::from(signed.active_reference)).ok_or(Error::Format)?;
+        let active = self
+            .health
+            .get(usize::from(signed.active_reference))
+            .ok_or(Error::Format)?;
         if !active.evidence.eligible() || (signed.h3 && !active.evidence.h3()) {
             return Err(Error::NotEligible);
         }
@@ -630,9 +638,14 @@ impl State {
             || signed.scope.inbound != self.plan.inbound
             || signed.scope.endpoint != self.plan.endpoint
             || signed.references.len() != self.plan.references.len()
-            || signed.references.iter().zip(&self.plan.references).any(|(reference, target)| {
-                reference.server_name != target.server_name || reference.port != target.address.port()
-            })
+            || signed
+                .references
+                .iter()
+                .zip(&self.plan.references)
+                .any(|(reference, target)| {
+                    reference.server_name != target.server_name
+                        || reference.port != target.address.port()
+                })
         {
             return Err(Error::NotEligible);
         }
@@ -641,9 +654,14 @@ impl State {
         if active.failures < FAILURE_THRESHOLD || active.evidence.eligible() {
             return Err(Error::NotEligible);
         }
-        self.health.iter().enumerate()
-            .filter(|(index, health)| *index != active_index && health.evidence.eligible()
-                && (!signed.h3 || (health.evidence.h3() && signed.references[*index].h3)))
+        self.health
+            .iter()
+            .enumerate()
+            .filter(|(index, health)| {
+                *index != active_index
+                    && health.evidence.eligible()
+                    && (!signed.h3 || (health.evidence.h3() && signed.references[*index].h3))
+            })
             .max_by_key(|(index, health)| (health.evidence.score(), std::cmp::Reverse(*index)))
             .map(|(index, _)| index)
             .ok_or(Error::NotEligible)
@@ -775,20 +793,31 @@ impl State {
         let now = unix_now()?;
         verified.check_time(now).map_err(|_| Error::NotEligible)?;
         self.validate_active(verified.descriptor(), now)?;
-        let target = self.plan.references.get(usize::from(verified.descriptor().active_reference))
+        let target = self
+            .plan
+            .references
+            .get(usize::from(verified.descriptor().active_reference))
             .ok_or(Error::Format)?;
         // The target is derived exclusively from the signed active index
         // and immutable approved plan, never from ClientHello contents.
-        let _permit = timeout(ATTEMPT, ACTIVE.acquire()).await
-            .map_err(|_| Error::Timeout)?.map_err(|_| Error::Timeout)?;
+        let _permit = timeout(ATTEMPT, ACTIVE.acquire())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::Timeout)?;
         let own = extend_endpoint_addresses(&self.plan, own_addresses(&self.plan)?).await?;
         fresh_dns(target, &own).await?;
         let now = unix_now()?;
         self.validate_active(verified.descriptor(), now)?;
         verified.check_time(now).map_err(|_| Error::NotEligible)?;
-        let remaining = verified.descriptor().not_after.checked_sub(now)
-            .ok_or(Error::Clock)?.min(60);
-        if remaining == 0 { return Err(Error::NotEligible); }
+        let remaining = verified
+            .descriptor()
+            .not_after
+            .checked_sub(now)
+            .ok_or(Error::Clock)?
+            .min(60);
+        if remaining == 0 {
+            return Err(Error::NotEligible);
+        }
         Ok(RelayLease {
             address: target.address,
             expires: tokio::time::Instant::now() + Duration::from_secs(remaining),

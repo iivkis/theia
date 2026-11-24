@@ -186,7 +186,9 @@ pub fn validate_publication(
         auto_policy(),
         now,
     )?;
-    state.validate_active(value.descriptor(), now).map_err(|_| Error::Health)
+    state
+        .validate_active(value.descriptor(), now)
+        .map_err(|_| Error::Health)
 }
 
 pub fn refresh_descriptor(
@@ -206,7 +208,9 @@ pub fn refresh_descriptor(
     if now <= next.not_before {
         return Err(Error::Clock);
     }
-    state.validate_active(&next, now).map_err(|_| Error::Health)?;
+    state
+        .validate_active(&next, now)
+        .map_err(|_| Error::Health)?;
     // Do not enable a previously unavailable transport by refresh alone.
     next.revision = next.revision.checked_add(1).ok_or(Error::Descriptor)?;
     next.not_before = now;
@@ -525,22 +529,15 @@ impl Profile {
             identity_sha256: fingerprint(next.signer()),
             document_sha256: digest(signed),
             current_expired: current.check_time(now).is_err(),
-            reference_changed: current.descriptor().references
-                != next.descriptor().references
-                || current.descriptor().active_reference
-                    != next.descriptor().active_reference,
+            reference_changed: current.descriptor().references != next.descriptor().references
+                || current.descriptor().active_reference != next.descriptor().active_reference,
         })
     }
 
     /// Explicit operator recovery, including skipped revisions under the
     /// current trusted signer. Never accepts a new identity via this path.
     /// Store CAS retains rollback/equivocation and local policy checks.
-    pub fn recover(
-        &self,
-        signed: &str,
-        approval: RecoveryApproval,
-        now: u64,
-    ) -> Result<(), Error> {
+    pub fn recover(&self, signed: &str, approval: RecoveryApproval, now: u64) -> Result<(), Error> {
         let preview = self.preview_recovery(signed, now)?;
         if preview.expected_revision != approval.expected_revision
             || !bool::from(preview.document_sha256.ct_eq(&approval.document_sha256))
@@ -818,7 +815,10 @@ mod tests {
         let profile_path = dir.0.join("profile.toml");
         let trust_path = dir.0.join("trust.toml");
         let raw = initial_descriptor(&state, &identity, NOW).unwrap();
-        let uri = Invitation::public(&identity, &raw, NOW).unwrap().encode().unwrap();
+        let uri = Invitation::public(&identity, &raw, NOW)
+            .unwrap()
+            .encode()
+            .unwrap();
         import(
             &uri,
             ImportApproval {
@@ -830,12 +830,19 @@ mod tests {
             Some("env:THEIA_TOKEN"),
             auto_policy(),
             NOW,
-        ).unwrap();
+        )
+        .unwrap();
         let saved = std::fs::read(&profile_path).unwrap();
         let profile = Profile::read(&profile_path).unwrap();
         let later = NOW + VALIDITY + 100;
         assert!(profile.load(later).is_err());
-        let mut next = profile.store().unwrap().inspect(later).unwrap().descriptor().clone();
+        let mut next = profile
+            .store()
+            .unwrap()
+            .inspect(later)
+            .unwrap()
+            .descriptor()
+            .clone();
         next.revision += 5;
         next.not_before = later;
         next.not_after = later + VALIDITY;
@@ -848,16 +855,40 @@ mod tests {
             document_sha256: digest(&updated),
             identity_sha256: fingerprint(identity.public_key()),
         };
-        assert!(profile.recover(&updated, RecoveryApproval {
-            document_sha256: [0; 32], ..approval
-        }, later).is_err());
-        assert!(profile.recover(&updated, RecoveryApproval {
-            identity_sha256: [0; 32], ..approval
-        }, later).is_err());
+        assert!(profile
+            .recover(
+                &updated,
+                RecoveryApproval {
+                    document_sha256: [0; 32],
+                    ..approval
+                },
+                later
+            )
+            .is_err());
+        assert!(profile
+            .recover(
+                &updated,
+                RecoveryApproval {
+                    identity_sha256: [0; 32],
+                    ..approval
+                },
+                later
+            )
+            .is_err());
         let stranger = Identity::generate(identity.scope().clone()).unwrap();
-        assert!(profile.preview_recovery(&stranger.sign_descriptor(&next).unwrap(), later).is_err());
+        assert!(profile
+            .preview_recovery(&stranger.sign_descriptor(&next).unwrap(), later)
+            .is_err());
         profile.recover(&updated, approval, later).unwrap();
-        assert_eq!(Profile::read(&profile_path).unwrap().load(later).unwrap().descriptor().revision, 6);
+        assert_eq!(
+            Profile::read(&profile_path)
+                .unwrap()
+                .load(later)
+                .unwrap()
+                .descriptor()
+                .revision,
+            6
+        );
         assert!(profile.recover(&updated, approval, later).is_err());
         assert!(profile.preview_recovery(&raw, later).is_err());
         assert_eq!(std::fs::read(&profile_path).unwrap(), saved);
@@ -880,7 +911,10 @@ mod tests {
         assert_eq!(
             import(
                 &uri,
-                ImportApproval { document_sha256: expected, identity_sha256: [0; 32] },
+                ImportApproval {
+                    document_sha256: expected,
+                    identity_sha256: [0; 32]
+                },
                 &profile,
                 &trust,
                 Some("env:TEST_TOKEN"),
@@ -893,7 +927,10 @@ mod tests {
         assert_eq!(
             import(
                 &uri,
-                ImportApproval { document_sha256: expected, identity_sha256: pin },
+                ImportApproval {
+                    document_sha256: expected,
+                    identity_sha256: pin
+                },
                 &profile,
                 &trust,
                 None,
@@ -905,7 +942,10 @@ mod tests {
         assert!(!profile.exists() && !trust.exists());
         import(
             &uri,
-            ImportApproval { document_sha256: expected, identity_sha256: pin },
+            ImportApproval {
+                document_sha256: expected,
+                identity_sha256: pin,
+            },
             &profile,
             &trust,
             Some("env:TEST_TOKEN"),
@@ -920,7 +960,10 @@ mod tests {
         assert_eq!(
             import(
                 &uri,
-                ImportApproval { document_sha256: expected, identity_sha256: pin },
+                ImportApproval {
+                    document_sha256: expected,
+                    identity_sha256: pin
+                },
                 &profile,
                 &trust,
                 Some("env:OTHER"),
@@ -973,7 +1016,10 @@ mod tests {
         let trust = scratch.0.join("trust.toml");
         import(
             &uri,
-            ImportApproval { document_sha256: digest(&uri), identity_sha256: invite.fingerprint() },
+            ImportApproval {
+                document_sha256: digest(&uri),
+                identity_sha256: invite.fingerprint(),
+            },
             &profile,
             &trust,
             None,

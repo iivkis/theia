@@ -3,11 +3,17 @@
 //! complete standard TLS 1.3 and independent identity authentication.
 #![forbid(unsafe_code)]
 
-use crate::{reality_admission::{self, Context, ReplayGuard, Secret}, reference_health::RelayLease};
+use crate::{
+    reality_admission::{self, Context, ReplayGuard, Secret},
+    reference_health::RelayLease,
+};
 use std::{
     io,
     pin::Pin,
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -15,7 +21,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
     sync::Semaphore,
-    time::{Instant, timeout, timeout_at},
+    time::{timeout, timeout_at, Instant},
 };
 
 const MAX_RECORD: usize = 16 * 1024;
@@ -43,7 +49,11 @@ pub struct Prefixed<T> {
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for Prefixed<T> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, out: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         if !self.prefix.is_empty() {
             let count = out.remaining().min(self.prefix.len());
             out.put_slice(&self.prefix.split_to(count));
@@ -54,7 +64,11 @@ impl<T: AsyncRead + Unpin> AsyncRead for Prefixed<T> {
 }
 
 impl<T: AsyncWrite + Unpin> AsyncWrite for Prefixed<T> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, input: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, input)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
@@ -74,8 +88,18 @@ impl<T> Inspected<T> {
     /// Only a verified and consumed marker enters the admitted branch.
     /// All other observations collapse to Relay, including replay and
     /// cache exhaustion. No diagnostic is exposed on the network.
-    pub fn classify(self, guard: &ReplayGuard, secret: &Secret, context: &Context<'_>, now: u64) -> Decision<T> {
-        if self.hello.as_ref().is_some_and(|hello| guard.admit(secret, context, hello, now).is_ok()) {
+    pub fn classify(
+        self,
+        guard: &ReplayGuard,
+        secret: &Secret,
+        context: &Context<'_>,
+        now: u64,
+    ) -> Decision<T> {
+        if self
+            .hello
+            .as_ref()
+            .is_some_and(|hello| guard.admit(secret, context, hello, now).is_ok())
+        {
             Decision::Admitted(self.io)
         } else {
             Decision::Relay(self.io)
@@ -88,8 +112,15 @@ pub enum Decision<T> {
     Relay(Prefixed<T>),
 }
 
-async fn fill<T: AsyncRead + Unpin>(io: &mut T, raw: &mut Vec<u8>, end: usize, deadline: Instant) -> Result<bool, Error> {
-    if end > MAX_WIRE { return Ok(false); }
+async fn fill<T: AsyncRead + Unpin>(
+    io: &mut T,
+    raw: &mut Vec<u8>,
+    end: usize,
+    deadline: Instant,
+) -> Result<bool, Error> {
+    if end > MAX_WIRE {
+        return Ok(false);
+    }
     let mut block = [0; 4096];
     while raw.len() < end {
         let count = (end - raw.len()).min(block.len());
@@ -98,7 +129,9 @@ async fn fill<T: AsyncRead + Unpin>(io: &mut T, raw: &mut Vec<u8>, end: usize, d
             Ok(Err(_)) => return Err(Error::Io),
             Err(_) => return Ok(false),
         };
-        if n == 0 { return Ok(false); }
+        if n == 0 {
+            return Ok(false);
+        }
         raw.extend_from_slice(&block[..n]);
     }
     Ok(true)
@@ -114,23 +147,37 @@ pub async fn inspect<T: AsyncRead + Unpin>(mut io: T) -> Result<Inspected<T>, Er
     let mut complete = false;
     loop {
         let start = raw.len();
-        if !fill(&mut io, &mut raw, start + 5, deadline).await? { break; }
-        let header = &raw[start..start + 5];
-        let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
-        if header[0] != 22 || header[1] != 3 || !(1..=3).contains(&header[2])
-            || !(1..=MAX_RECORD).contains(&length) {
+        if !fill(&mut io, &mut raw, start + 5, deadline).await? {
             break;
         }
-        if !fill(&mut io, &mut raw, start + 5 + length, deadline).await? { break; }
+        let header = &raw[start..start + 5];
+        let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        if header[0] != 22
+            || header[1] != 3
+            || !(1..=3).contains(&header[2])
+            || !(1..=MAX_RECORD).contains(&length)
+        {
+            break;
+        }
+        if !fill(&mut io, &mut raw, start + 5 + length, deadline).await? {
+            break;
+        }
         let record = &raw[start + 5..];
         if hello.len() + record.len() > reality_admission::MAX_HELLO + MAX_RECORD {
             break;
         }
         hello.extend_from_slice(record);
-        if hello.first() != Some(&1) { break; }
+        if hello.first() != Some(&1) {
+            break;
+        }
         if hello.len() >= 4 {
-            let expected = 4 + ((usize::from(hello[1]) << 16) | (usize::from(hello[2]) << 8) | usize::from(hello[3]));
-            if !(38..=reality_admission::MAX_HELLO).contains(&expected) { break; }
+            let expected = 4
+                + ((usize::from(hello[1]) << 16)
+                    | (usize::from(hello[2]) << 8)
+                    | usize::from(hello[3]));
+            if !(38..=reality_admission::MAX_HELLO).contains(&expected) {
+                break;
+            }
             if hello.len() >= expected {
                 hello.truncate(expected);
                 complete = true;
@@ -138,11 +185,19 @@ pub async fn inspect<T: AsyncRead + Unpin>(mut io: T) -> Result<Inspected<T>, Er
             }
         }
     }
-    Ok(Inspected { io: Prefixed { inner: io, prefix: raw.into() }, hello: complete.then_some(hello) })
+    Ok(Inspected {
+        io: Prefixed {
+            inner: io,
+            prefix: raw.into(),
+        },
+        hello: complete.then_some(hello),
+    })
 }
 
 async fn transfer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    mut reader: R, mut writer: W, remaining: &AtomicUsize,
+    mut reader: R,
+    mut writer: W,
+    remaining: &AtomicUsize,
 ) -> Result<(), Error> {
     let mut buffer = [0; 8192];
     loop {
@@ -151,17 +206,31 @@ async fn transfer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             writer.shutdown().await.map_err(|_| Error::Io)?;
             return Ok(());
         }
-        remaining.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| left.checked_sub(count))
+        remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(count)
+            })
             .map_err(|_| Error::Limit)?;
-        writer.write_all(&buffer[..count]).await.map_err(|_| Error::Io)?;
+        writer
+            .write_all(&buffer[..count])
+            .await
+            .map_err(|_| Error::Io)?;
     }
 }
 
 /// Single shared byte cap across directions; partial reads are never
 /// expanded or rewritten. Cancellation closes both streams and releases
 /// all permits. The timeout is total duration, not reset by traffic.
-async fn relay_io<A, B>(client: A, upstream: B, limit: usize, lifetime: Duration) -> Result<(), Error>
-where A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite + Unpin {
+async fn relay_io<A, B>(
+    client: A,
+    upstream: B,
+    limit: usize,
+    lifetime: Duration,
+) -> Result<(), Error>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
     let (client_read, client_write) = tokio::io::split(client);
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
     let remaining = AtomicUsize::new(limit);
@@ -171,7 +240,9 @@ where A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite + Unpin {
             transfer(upstream_read, client_write, &remaining),
         )?;
         Ok(())
-    }).await.map_err(|_| Error::Deadline)?
+    })
+    .await
+    .map_err(|_| Error::Deadline)?
 }
 
 /// One gate per runtime inbound; callers must acquire a slot before
@@ -182,19 +253,30 @@ pub struct RelayGate {
 
 impl Default for RelayGate {
     fn default() -> Self {
-        Self { slots: Arc::new(Semaphore::new(RELAY_CONNECTIONS)) }
+        Self {
+            slots: Arc::new(Semaphore::new(RELAY_CONNECTIONS)),
+        }
     }
 }
 
 impl RelayGate {
     pub async fn relay<T>(&self, client: Prefixed<T>, lease: &RelayLease) -> Result<(), Error>
-    where T: AsyncRead + AsyncWrite + Unpin {
-        let _slot = self.slots.clone().try_acquire_owned().map_err(|_| Error::Limit)?;
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let _slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Limit)?;
         let address = lease.address().map_err(|_| Error::Reference)?;
-        let upstream = timeout(CONNECT, TcpStream::connect(address)).await
-            .map_err(|_| Error::Deadline)?.map_err(|_| Error::Io)?;
+        let upstream = timeout(CONNECT, TcpStream::connect(address))
+            .await
+            .map_err(|_| Error::Deadline)?
+            .map_err(|_| Error::Io)?;
         if upstream.peer_addr().map_err(|_| Error::Io)? != address
-            || lease.address().map_err(|_| Error::Reference)? != address {
+            || lease.address().map_err(|_| Error::Reference)? != address
+        {
             return Err(Error::Reference);
         }
         relay_io(client, upstream, RELAY_BYTES, RELAY_LIFETIME).await
@@ -224,7 +306,9 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(1024);
         let original = raw.clone();
         let producer = tokio::spawn(async move {
-            for byte in original { writer.write_all(&[byte]).await.unwrap(); }
+            for byte in original {
+                writer.write_all(&[byte]).await.unwrap();
+            }
             writer.shutdown().await.unwrap();
         });
         let mut inspected = inspect(reader).await.unwrap();
@@ -237,7 +321,11 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_and_partial_inputs_are_not_lost() {
-        for raw in [b"GET / HTTP/1.1\r\n".as_slice(), &[22, 3, 3, 0, 12, 1, 0], &[22, 3]] {
+        for raw in [
+            b"GET / HTTP/1.1\r\n".as_slice(),
+            &[22, 3, 3, 0, 12, 1, 0],
+            &[22, 3],
+        ] {
             let (mut writer, reader) = tokio::io::duplex(1024);
             writer.write_all(raw).await.unwrap();
             writer.shutdown().await.unwrap();
@@ -253,7 +341,12 @@ mod tests {
     async fn relay_preserves_both_directions_and_half_close() {
         let (mut client, relay_client) = tokio::io::duplex(1024);
         let (relay_reference, mut reference) = tokio::io::duplex(1024);
-        let task = tokio::spawn(relay_io(relay_client, relay_reference, 100, Duration::from_secs(2)));
+        let task = tokio::spawn(relay_io(
+            relay_client,
+            relay_reference,
+            100,
+            Duration::from_secs(2),
+        ));
         client.write_all(b"request").await.unwrap();
         client.shutdown().await.unwrap();
         let mut seen = Vec::new();
@@ -271,7 +364,12 @@ mod tests {
     async fn relay_total_cap_and_deadline_are_enforced() {
         let (mut client, relay_client) = tokio::io::duplex(1024);
         let (relay_reference, mut reference) = tokio::io::duplex(1024);
-        let task = tokio::spawn(relay_io(relay_client, relay_reference, 5, Duration::from_secs(2)));
+        let task = tokio::spawn(relay_io(
+            relay_client,
+            relay_reference,
+            5,
+            Duration::from_secs(2),
+        ));
         client.write_all(b"1234").await.unwrap();
         let mut first = [0; 4];
         reference.read_exact(&mut first).await.unwrap();
@@ -280,6 +378,9 @@ mod tests {
         assert_eq!(task.await.unwrap(), Err(Error::Limit));
         let (client, _writer) = tokio::io::duplex(16);
         let (reference, _reader) = tokio::io::duplex(16);
-        assert_eq!(relay_io(client, reference, 16, Duration::from_millis(10)).await, Err(Error::Deadline));
+        assert_eq!(
+            relay_io(client, reference, 16, Duration::from_millis(10)).await,
+            Err(Error::Deadline)
+        );
     }
 }

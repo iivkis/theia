@@ -25,7 +25,11 @@ use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
 };
 use sha2::{Digest, Sha256};
-use std::{fmt, path::Path, sync::{Arc, Mutex}};
+use std::{
+    fmt,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 use time::{Duration, OffsetDateTime};
 use zeroize::Zeroizing;
 
@@ -204,7 +208,9 @@ impl Identity {
         let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(&*self.pkcs8));
         let raw = Zeroizing::new(format!(
             "{KEY_FILE_PREFIX}\n{}\n{}\n{}\n",
-            self.scope.inbound, self.scope.endpoint, encoded.as_str()
+            self.scope.inbound,
+            self.scope.endpoint,
+            encoded.as_str()
         ));
         config::guarded_trust_write(path, &raw, None).map_err(storage_error)
     }
@@ -368,17 +374,27 @@ struct RenewingLeaf {
 
 impl fmt::Debug for RenewingLeaf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RenewingLeaf").field("branch", &self.branch).finish_non_exhaustive()
+        f.debug_struct("RenewingLeaf")
+            .field("branch", &self.branch)
+            .finish_non_exhaustive()
     }
 }
 
 impl RenewingLeaf {
-    fn issue(identity: &Identity, name: &str, branch: Branch, now: OffsetDateTime) -> Result<CachedLeaf, Error> {
+    fn issue(
+        identity: &Identity,
+        name: &str,
+        branch: Branch,
+        now: OffsetDateTime,
+    ) -> Result<CachedLeaf, Error> {
         let (cert, private) = identity.leaf(name, branch, now)?;
         let provider = rustls::crypto::ring::default_provider();
         let key = rustls::sign::CertifiedKey::from_der(vec![cert], private, &provider)
             .map_err(|_| Error::Tls)?;
-        Ok(CachedLeaf { issued_at: now, key: Arc::new(key) })
+        Ok(CachedLeaf {
+            issued_at: now,
+            key: Arc::new(key),
+        })
     }
 
     fn new(identity: &Identity, name: &str, branch: Branch) -> Result<Self, Error> {
@@ -395,7 +411,10 @@ impl RenewingLeaf {
         })
     }
 
-    fn certificate_at(&self, now: OffsetDateTime) -> Result<Arc<rustls::sign::CertifiedKey>, Error> {
+    fn certificate_at(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Arc<rustls::sign::CertifiedKey>, Error> {
         let mut leaf = self.leaf.lock().map_err(|_| Error::Tls)?;
         if now < leaf.issued_at {
             // Do not extend a validity period on clock rollback.
@@ -409,9 +428,16 @@ impl RenewingLeaf {
 }
 
 impl rustls::server::ResolvesServerCert for RenewingLeaf {
-    fn resolve(&self, hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        if !hello.server_name().is_some_and(|name| name.eq_ignore_ascii_case(&self.name))
-            || !hello.alpn().is_some_and(|mut offered| offered.any(|value| value == self.branch.alpn()))
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if !hello
+            .server_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&self.name))
+            || !hello
+                .alpn()
+                .is_some_and(|mut offered| offered.any(|value| value == self.branch.alpn()))
         {
             return None;
         }
@@ -473,7 +499,9 @@ mod tests {
         let resolver = RenewingLeaf::new(&identity, "edge.example.org", Branch::H2).unwrap();
         let issued = resolver.leaf.lock().unwrap().issued_at;
         let initial = resolver.certificate_at(issued).unwrap();
-        let cached = resolver.certificate_at(issued + Duration::seconds(LEAF_RENEWAL - 1)).unwrap();
+        let cached = resolver
+            .certificate_at(issued + Duration::seconds(LEAF_RENEWAL - 1))
+            .unwrap();
         assert!(Arc::ptr_eq(&initial, &cached));
         let renewed_at = issued + Duration::seconds(LEAF_RENEWAL);
         let renewed = resolver.certificate_at(renewed_at).unwrap();
@@ -481,7 +509,10 @@ mod tests {
         assert_ne!(initial.cert[0], renewed.cert[0]);
         assert_eq!(resolver.identity.public_key(), identity.public_key());
         assert!(resolver.certificate_at(issued).is_err());
-        assert!(Arc::ptr_eq(&renewed, &resolver.certificate_at(renewed_at).unwrap()));
+        assert!(Arc::ptr_eq(
+            &renewed,
+            &resolver.certificate_at(renewed_at).unwrap()
+        ));
     }
 
     #[test]
