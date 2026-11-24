@@ -13,6 +13,8 @@ pub mod camouflage_interfaces;
 pub mod camouflage_probe;
 pub mod camouflage_workflow;
 mod channel_binding;
+mod tcp_bbr;
+pub mod reality_identity;
 pub mod client;
 pub mod client_import;
 pub mod config;

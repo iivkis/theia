@@ -85,6 +85,8 @@ pub struct Inbound {
         skip_serializing_if = "crate::security_profile::SecurityMode::is_plain"
     )]
     pub security_mode: crate::security_profile::SecurityMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality_key: Option<String>,
     pub allowed_user_ids: Vec<String>,
     pub quic_listen: String,
     pub h2_listen: String,
@@ -394,6 +396,16 @@ impl ServerDocument {
                 format!("{field}.tls_key"),
                 "expected absolute file: reference",
             )?;
+            ensure(
+                match &inbound.reality_key {
+                    Some(reference) => inbound.security_mode.is_reality()
+                        && valid_file_ref(reference)
+                        && reference != &inbound.tls_key,
+                    None => !inbound.security_mode.is_reality(),
+                },
+                format!("{field}.reality_key"),
+                "REALITY requires a separate absolute Ed25519 PKCS#8 file; other modes forbid it",
+            )?;
             let udp = listen(&inbound.quic_listen, &format!("{field}.quic_listen"))?;
             let tcp = listen(&inbound.h2_listen, &format!("{field}.h2_listen"))?;
             ensure(
@@ -489,6 +501,7 @@ impl ClientDocument {
                 profile.tls_profile == "default"
                     || crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile)
                         .is_some()
+                    || crate::reality_identity::PublicIdentity::parse_profile(&profile.tls_profile).is_some()
                     || (cfg!(feature = "experimental-btls-h2")
                         && profile.tls_profile == "browser-h2-btls-v1"
                         && profile.transport == Transport::H2),

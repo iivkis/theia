@@ -30,6 +30,7 @@ fn inbound() -> Inbound {
         server_name: "localhost".into(),
         tls_cert: "file:/tmp/test-cert.pem".into(),
         security_mode: Default::default(),
+        reality_key: None,
         tls_key: "file:/tmp/test-key.pem".into(),
     }
 }

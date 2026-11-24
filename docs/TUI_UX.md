@@ -249,3 +249,7 @@ Public share and disabled-user recovery shortcuts are included in the main edito
 ### Replacement v1 (ADR-0087)
 
 ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. Server l/u/t/b and client i use the new single format. Preview shows the exact runtime TLS profile. Reissue old links. Verify public pin over an authenticated channel. Existing protected storage/rotation and separate restart rules remain.
+
+### Independent own-key review (ADR-0089)
+
+On a clean saved server inbound, Y opens hidden input for an operator-provisioned absolute `file:` Ed25519 PKCS#8 DER key reference. Enter validates own TLS cert/key, name and separate identity key; preview displays public key/profile and never the key path or private bytes. y revalidates the original saved snapshot and identities before guarded save; n/Esc cancels. Existing restart/Apply is separate. No candidate is allowed to supply the local private key or silently change the local TLS identity. The external candidate review remains read-only until its independent security/evidence requirements are satisfied.

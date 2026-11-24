@@ -83,6 +83,7 @@ async fn production_listener(allow_private: bool, alpn: &[u8]) -> (String, Strin
         server_name: "localhost".into(),
         tls_cert: "ephemeral-test-only".into(),
         security_mode: Default::default(),
+        reality_key: None,
         tls_key: "ephemeral-test-only".into(),
     };
     let user = User {

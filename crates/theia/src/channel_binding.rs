@@ -61,6 +61,8 @@ pub(crate) fn attach<T>(
 pub(crate) struct Admission {
     key: Key,
     used: AtomicBool,
+    identity_required: bool,
+    identity_issued: AtomicBool,
 }
 
 impl Admission {
@@ -68,7 +70,21 @@ impl Admission {
         Self {
             key,
             used: AtomicBool::new(false),
+            identity_required: false,
+            identity_issued: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn requiring_identity(mut self, required: bool) -> Self {
+        self.identity_required = required;
+        self
+    }
+
+    pub(crate) fn identity_response(&self, signer: &crate::reality_identity::Signer) -> Option<http::Response<()>> {
+        if !self.identity_required || self.identity_issued.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return None;
+        }
+        signer.response(&self.key)
     }
 
     fn verifies<T>(&self, request: &Request<T>) -> bool {
@@ -87,7 +103,8 @@ impl Admission {
     /// At most one logical admission per verified pinned connection.
     /// Pairing remains same-connection and each leg has its own proof.
     pub(crate) fn admit<T>(&self, requests: &[&Request<T>]) -> bool {
-        if !(1..=2).contains(&requests.len())
+        if (self.identity_required && !self.identity_issued.load(Ordering::Acquire))
+            || !(1..=2).contains(&requests.len())
             || !requests.iter().all(|request| self.verifies(request))
         {
             return false;

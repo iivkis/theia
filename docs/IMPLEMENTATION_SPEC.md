@@ -153,3 +153,7 @@ Theia — self-hosted прокси-система на Rust с одним бин
 **ADR-0087 (breaking pre-release replacement):** ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. The complete REALITY adapter, transactional candidate Apply and independent security review remain release requirements.
 
 ADR-0088 adds required channel-bound HTTP admission for the intermediate pinned profiles, with distinct H2/H3 exporter contexts and bounded one-admission state. It does not fulfill the independent REALITY identity, anti-probing, candidate Apply or F-19 acceptance requirements.
+
+ADR-0089 implements an explicit independent Ed25519 server identity adapter for the existing SmartTheia XHTTP H2/H3 stream-up mode, with strict TLS checks and proof before bearer. It is a partial F-18 implementation; the remaining security, picker Apply, cross-host independent-key and F-19 release evidence requirements are unchanged.
+
+ADR-0090 sets fixed BBR-first/CUBIC fallback for both carriers. Linux selects and verifies the TCP controller; H3 retains Quinn BBR. Windows H2 uses OS-managed TCP (CUBIC deployment preference, actual controller unverified); lack of BBR2 is not a release blocker by itself. Native functional and measured evidence remain mandatory.

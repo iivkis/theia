@@ -265,6 +265,7 @@ struct Interaction {
     domain: Option<DomainPanel>,
     probe: Option<ProbePanel>,
     runtime: Option<RuntimePanel>,
+    reality_key_input: Option<Zeroizing<String>>,
     pinned_review: Option<PinnedModeReview>,
     pinned_loading: Option<mpsc::Receiver<PinnedReviewResult>>,
     #[cfg(windows)]
@@ -288,6 +289,7 @@ impl Interaction {
             domain: None,
             probe: None,
             runtime: None,
+            reality_key_input: None,
             pinned_review: None,
             pinned_loading: None,
             #[cfg(windows)]
@@ -319,6 +321,19 @@ impl Interaction {
         self.pinned_loading = Some(rx);
         let _worker = std::thread::spawn(move || {
             let result = editor.review_pinned_mode(stream_up);
+            editor.error = result.as_ref().err().map(|message| (*message).to_owned());
+            let _ = tx.send((editor, result));
+        });
+    }
+
+    fn start_reality_review(&mut self, reference: Zeroizing<String>) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.pinned_loading = Some(rx);
+        let _worker = std::thread::spawn(move || {
+            let result = editor.review_reality_mode(&reference);
             editor.error = result.as_ref().err().map(|message| (*message).to_owned());
             let _ = tx.send((editor, result));
         });
@@ -384,6 +399,13 @@ impl Interaction {
 
     /// Bracketed-paste source text stays in memory and is never rendered.
     fn paste_import_source(&mut self, text: &str) {
+        if let Some(reference) = self.reality_key_input.as_mut() {
+            let input = text.trim_end_matches(['\r', '\n']);
+            if reference.len().saturating_add(input.len()) <= 1024 && !input.chars().any(char::is_control) {
+                reference.push_str(input);
+            }
+            return;
+        }
         if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
             let input = text.trim_end_matches(['\r', '\n']);
             if source.len().saturating_add(input.len()) <= 4096 && !input.contains('\0') {
@@ -487,6 +509,23 @@ impl Interaction {
             if proxy.key(key) {
                 self.system_proxy = None;
             }
+            return false;
+        }
+        if let Some(mut reference) = self.reality_key_input.take() {
+            match key.code {
+                KeyCode::Esc => return false,
+                KeyCode::Enter if !reference.is_empty() => {
+                    self.start_reality_review(reference);
+                    return false;
+                }
+                KeyCode::Backspace => { reference.pop(); }
+                KeyCode::Char(ch) if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                    && !ch.is_control() && reference.len() + ch.len_utf8() <= 1024 => {
+                    reference.push(ch);
+                }
+                _ => {}
+            }
+            self.reality_key_input = Some(reference);
             return false;
         }
         if let Some(review) = self.pinned_review.take() {
@@ -1114,6 +1153,15 @@ impl Interaction {
                 }
                 return false;
             }
+            if editor.role() == Role::Server && key.code == KeyCode::Char('Y') {
+                if editor.dirty() {
+                    editor.error = Some("Сначала сохраните или отмените черновик.".into());
+                } else {
+                    editor.error = None;
+                    self.reality_key_input = Some(Zeroizing::new(String::new()));
+                }
+                return false;
+            }
             if editor.role() == Role::Server && matches!(key.code, KeyCode::Char('P' | 'X')) {
                 self.start_pinned_review(key.code == KeyCode::Char('X'));
                 return false;
@@ -1333,17 +1381,19 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели P: локальный pinned-cert-v1 (stream-one), X: собственный XHTTP stream-up с pin; y подтверждает сохранение (не полноценный REALITY), u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели Y: отдельный Ed25519 key file, проверка и guarded save REALITY; P: локальный pinned-cert-v1 (stream-one), X: собственный XHTTP stream-up с pin; y подтверждает сохранение (не полноценный REALITY), u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
             true,
         ),
     }
     if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
         panel(frame, parts[1], runtime.title(), &runtime.body(), true);
+    } else if interaction.is_some_and(|ui| ui.reality_key_input.is_some()) {
+        panel(frame, parts[1], "Независимая server identity", "Введите file:/absolute/path к собственному Ed25519 PKCS#8 DER key. Ввод скрыт. Enter: проверить; Esc: отмена. Не вводите содержимое ключа.", true);
     } else if let Some(review) = interaction.and_then(|ui| ui.pinned_review.as_ref()) {
         panel(
             frame,
             parts[1],
-            "H2/H3: дополнительная identity pin (не REALITY)",
+            "H2/H3: проверка собственной identity",
             &review.body(),
             true,
         );

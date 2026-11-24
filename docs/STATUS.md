@@ -46,7 +46,7 @@ F-14 evidence and residual gaps: [F14_ACCEPTANCE.md](F14_ACCEPTANCE.md). Do not 
 
 ### F-18 дополнительная идентичность (предлагаемый срез)
 
-ADR-0082/0083: read-only второй шаг мастера с exact/fresh dual evidence и дополнительный `pinned-cert-v1` для собственного server inbound, H2/H3/auto client, mutual mode refusal, guarded сохранение с отдельным restart. Это не modified REALITY handshake, не pin key lifecycle audit, не F-18/F-19 acceptance. Промежуточный код прошёл 13/13 проверок на [точном head da21649](https://github.com/iivkis/theia/actions/runs/45425811970); текущая ветка PR #116 ещё не принята в main.
+ADR-0082/0083: read-only второй шаг мастера с exact/fresh dual evidence и дополнительный `pinned-cert-v1` для собственного server inbound, H2/H3/auto client, mutual mode refusal, guarded сохранение с отдельным restart. Это не modified REALITY handshake, не pin key lifecycle audit, не F-18/F-19 acceptance. Промежуточный код прошёл 13/13 проверок на [точном head da21649](https://github.com/iivkis/theia/actions/runs/45425811970); PR #116 принят в main (45f42b1).
 
 ### Pending ADR-0084
 
@@ -54,8 +54,16 @@ ADR-0082/0083: read-only второй шаг мастера с exact/fresh dual 
 
 ## ADR-0087 — replacement invitation and cross-host pinned XHTTP acceptance
 
-ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. Implementation and extended mandatory WSL2 Linux/native Windows binary tests are submitted; no new acceptance result is claimed. Prior PR #116 was merged at 45f42b1 after CI 45429164950. F-18/F-19 remain open.
+ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. Implementation and extended mandatory WSL2 Linux/native Windows binary tests passed in CI 45434713045 and PR #117 was merged at 5cd3a41. Prior PR #116 was merged at 45f42b1 after CI 45429164950. F-18/F-19 remain open.
 
 ## ADR-0088 — exporter-bound pinned XHTTP admission
 
 Implementation submitted: H2 and H3 use separate TLS-exporter contexts, per-request HMAC, both stream-up legs and atomic one-admission connection state. Added independent raw H2/H3 negative tests and pure race/route/credential regressions. Acceptance requires exact-head CI. Independent server identity, complete candidate Apply, active-probing and F-19 remain open.
+
+## ADR-0089 — independent server identity (implementation submitted)
+
+PR #117 was merged at 5cd3a41 after exact-head CI 45434713045 (all 13 required jobs successful). New implementation: explicit smart-reality-v1 mode with independent Ed25519 key, verified over actual H2/H3 exporter before bearer; same-connection stream-up admission; strict replacement v1 invitation; captured key lifecycle and guarded local TUI review/save. New native and negative tests are submitted; this block requires its own exact-head CI. Candidate Apply, anti-probing, F-19 measurements and independent security review remain open.
+
+## ADR-0090 — BBR-first with CUBIC fallback
+
+Owner superseded the strict BBR-only draft. Linux selects BBR, falls back to CUBIC and verifies sockets; H3 retains Quinn BBR. Windows H2 uses OS-managed TCP (CUBIC deployment preference, not verified per socket). No global settings or user-facing switch. Native tests and previous REALITY fixes are submitted together; exact-head CI remains required.

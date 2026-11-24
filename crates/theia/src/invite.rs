@@ -63,6 +63,7 @@ impl Drop for Invitation {
 enum WireSecurity {
     OwnTls,
     PinnedTls,
+    SmartReality,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -84,6 +85,8 @@ struct Wire {
     xhttp_mode: WireXhttpMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     leaf_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_public_key: Option<String>,
     transport: Transport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
@@ -141,6 +144,9 @@ impl Invitation {
         }
         let tls_profile = if inbound.security_mode.is_plain() {
             "default".into()
+        } else if inbound.security_mode.is_reality() {
+            crate::server::configured_reality_identity(inbound)
+                .map_err(|_| InviteError::Unavailable)?.profile()
         } else {
             let pin = crate::server::configured_certificate_pin(inbound)
                 .map_err(|_| InviteError::Unavailable)?;
@@ -200,8 +206,10 @@ impl Invitation {
     /// Returned URI is confidential whenever it contains a token.
     pub fn encode(&self) -> Result<String, InviteError> {
         self.check()?;
-        let (security_mode, xhttp_mode, leaf_sha256) = if self.tls_profile == "default" {
-            (WireSecurity::OwnTls, WireXhttpMode::StreamOne, None)
+        let (security_mode, xhttp_mode, leaf_sha256, server_public_key) = if self.tls_profile == "default" {
+            (WireSecurity::OwnTls, WireXhttpMode::StreamOne, None, None)
+        } else if let Some(identity) = crate::reality_identity::PublicIdentity::parse_profile(&self.tls_profile) {
+            (WireSecurity::SmartReality, WireXhttpMode::StreamUp, None, Some(identity.encoded()))
         } else {
             let pin = crate::security_profile::CertificatePin::parse_profile(&self.tls_profile)
                 .ok_or(InviteError::Invalid)?;
@@ -219,6 +227,7 @@ impl Invitation {
                     WireXhttpMode::StreamOne
                 },
                 Some(leaf.to_owned()),
+                None,
             )
         };
         let wire = Wire {
@@ -230,6 +239,7 @@ impl Invitation {
             security_mode,
             xhttp_mode,
             leaf_sha256,
+            server_public_key,
             transport: self.transport,
             token: self.token.as_ref().map(|v| URL_SAFE_NO_PAD.encode(v)),
         };
@@ -277,9 +287,15 @@ impl Invitation {
             wire.security_mode,
             wire.xhttp_mode,
             wire.leaf_sha256.as_deref(),
+            wire.server_public_key.as_deref(),
         ) {
-            (WireSecurity::OwnTls, WireXhttpMode::StreamOne, None) => "default".into(),
-            (WireSecurity::PinnedTls, mode, Some(leaf)) => {
+            (WireSecurity::OwnTls, WireXhttpMode::StreamOne, None, None) => "default".into(),
+            (WireSecurity::SmartReality, WireXhttpMode::StreamUp, None, Some(key)) => {
+                let profile = format!("smart-reality-v1:{key}");
+                crate::reality_identity::PublicIdentity::parse_profile(&profile).ok_or(InviteError::Invalid)?;
+                profile
+            }
+            (WireSecurity::PinnedTls, mode, Some(leaf), None) => {
                 let prefix = match mode {
                     WireXhttpMode::StreamOne => "pinned-cert-v1:",
                     WireXhttpMode::StreamUp => "pinned-cert-stream-up-v1:",
@@ -361,6 +377,7 @@ impl Invitation {
     fn check(&self) -> Result<(), InviteError> {
         if self.tls_profile != "default"
             && crate::security_profile::CertificatePin::parse_profile(&self.tls_profile).is_none()
+            && crate::reality_identity::PublicIdentity::parse_profile(&self.tls_profile).is_none()
         {
             return Err(InviteError::Invalid);
         }
@@ -626,6 +643,42 @@ mod tests {
         );
         profile.tls_profile = "browser-h2-btls-v1".into();
         assert!(Invitation::public_from_profile(&profile).is_err());
+    }
+
+    #[test]
+    fn reality_v1_invitation_requires_independent_public_key_and_exact_mode() {
+        use ring::{rand::SystemRandom, signature::{Ed25519KeyPair, KeyPair}};
+        let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(der.as_ref()).unwrap();
+        let key = URL_SAFE_NO_PAD.encode(pair.public_key().as_ref());
+        let Config::Client(doc) = crate::config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+            panic!("client fixture");
+        };
+        let mut profile = doc.client.profiles[0].clone();
+        profile.tls_profile = format!("smart-reality-v1:{key}");
+        for transport in [Transport::Auto, Transport::H2, Transport::H3] {
+            profile.transport = transport;
+            let encoded = Invitation::public_from_profile(&profile).unwrap().encode().unwrap();
+            let payload = encoded.strip_prefix(PREFIX).unwrap();
+            let raw = String::from_utf8(URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+            assert!(raw.contains("security_mode = \"smart-reality\""));
+            assert!(raw.contains("xhttp_mode = \"stream-up\""));
+            assert!(raw.contains(&format!("server_public_key = \"{key}\"")));
+            assert!(!raw.contains("leaf_sha256"));
+            let recovered = Invitation::decode(&encoded).unwrap().to_profile("env:TOKEN", None).unwrap();
+            assert_eq!(recovered.tls_profile, profile.tls_profile);
+            assert_eq!(recovered.transport, transport);
+            for invalid in [
+                raw.replace(&key, "invalid"),
+                raw.replace("smart-reality", "pinned-tls"),
+                raw.replace("stream-up", "stream-one"),
+                raw.lines().filter(|line| !line.starts_with("server_public_key = ")).collect::<Vec<_>>().join("\n"),
+                format!("{raw}leaf_sha256 = \"{}\"\n", "42".repeat(32)),
+                format!("{raw}reality_key = \"file:/private/key.der\"\n"),
+            ] {
+                assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(invalid))).is_err());
+            }
+        }
     }
 
     #[test]

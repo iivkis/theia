@@ -103,3 +103,11 @@ ADR-0087: the sole replacement theia://v1/ invitation explicitly represents Smar
 ### ADR-0088 — channel binding before OPEN
 
 Integrate TLS exporters into the actual H2/H3 pinned runtime before HTTP admission, verify per-leg proofs and reject replay in bounded per-connection state. Retain strict grants and all native acceptance. Independent identity and remaining F-18/F-19 work are not closed.
+
+### ADR-0089 — independent identity and guarded manual configuration
+
+Production-path H2/H3 identity proof before bearer, explicit separate Ed25519 key, strict v1 invitation, captured key lifecycle, guarded manual TUI save and native negative/positive loopback tests. Next acceptance still requires independent review, candidate Apply, active-probing evidence, cross-host independent-key E2E and measured F-19. No new CI job.
+
+### ADR-0090 — BBR-first with CUBIC fallback
+
+Linux TCP_CONGESTION selection before connect/listen and real socket readback; CUBIC when BBR is unavailable. Windows native TCP continues with its OS-managed controller and CUBIC deployment preference. H3 retains available Quinn BBR. Keep full native and cross-host CI; measure actual H2/H3 performance separately. No user setting or global edits.

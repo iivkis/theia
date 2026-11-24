@@ -101,7 +101,8 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             return Err(ClientError::Configuration);
         }
     }
-    let certificate_pin = if profile.tls_profile == "default" {
+    let identity = crate::reality_identity::PublicIdentity::parse_profile(&profile.tls_profile);
+    let certificate_pin = if profile.tls_profile == "default" || identity.is_some() {
         None
     } else {
         Some(
@@ -110,10 +111,11 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
         )
     };
     let stream_up =
-        crate::security_profile::CertificatePin::is_stream_up_profile(&profile.tls_profile);
+        identity.is_some() || crate::security_profile::CertificatePin::is_stream_up_profile(&profile.tls_profile);
     match profile.transport {
         Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)?
             .with_certificate_pin(certificate_pin)?
+            .with_server_identity(identity)?
             .with_stream_up(stream_up)
             .map(Arc::new)
             .map(ProxyClient::H2),
@@ -128,6 +130,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             let h3 = Arc::new(
                 H3Client::new(remote, &profile.server_name, &token, roots.clone())?
                     .with_certificate_pin(certificate_pin)?
+            .with_server_identity(identity)?
                     .with_stream_up(stream_up)?
                     .with_connect_timeout(Duration::from_millis(u64::from(
                         profile.quic_connect_timeout_ms,
@@ -139,6 +142,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             let h2 = Arc::new(
                 H2Client::new(&profile.server, &profile.server_name, &token, roots)?
                     .with_certificate_pin(certificate_pin)?
+            .with_server_identity(identity)?
                     .with_stream_up(stream_up)?,
             );
             Ok(ProxyClient::Auto(Arc::new(AutoClient {
