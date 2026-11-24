@@ -92,7 +92,7 @@ impl std::fmt::Display for ProxyError {
             Self::RecoveryRequired => "previous Theia proxy journal requires explicit recovery",
             Self::Conflict => "Windows user proxy changed; refusing to overwrite another owner",
             Self::InvalidSettings => "Windows proxy configuration could not be safely managed",
-            Self::PolicyManaged => "Windows proxy scope is not confirmed per-user; no write allowed",
+            Self::PolicyManaged => "Windows proxy scope not confirmed per-user; write refused",
             Self::Journal => "cannot safely read or durably update proxy recovery journal",
         })
     }
@@ -472,8 +472,7 @@ impl Drop for Key {
 // Never modify policy and never assume access denied means not configured.
 fn require_per_user_scope_at(root: HKEY, path: &str) -> Result<(), ProxyError> {
     let mut key = null_mut();
-    let result =
-        unsafe { RegOpenKeyExW(root, wide(path).as_ptr(), 0, KEY_QUERY_VALUE, &mut key) };
+    let result = unsafe { RegOpenKeyExW(root, wide(path).as_ptr(), 0, KEY_QUERY_VALUE, &mut key) };
     if result == ERROR_FILE_NOT_FOUND {
         return Ok(());
     }
