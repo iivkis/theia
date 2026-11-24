@@ -73,3 +73,30 @@ must instead trigger the full native matrix.
 
 A failed or cancelled check cannot be reported as green. This check is about
 safe CI scope, not about weakening the F-18 / F-19 security release gates.
+
+## Experiment: Windows MSVC test/dev line-table debug metadata (PR pending)
+
+Native Windows `windows-smoke` spends approximately 140 seconds in
+`cargo test --workspace --all-targets --locked` on the measured warm-cache
+run. This includes real transport/TUI/security runtime, not just compiling.
+The same runner repeatedly links a large collection of Rust integration
+harnesses with Cargo's default full test/dev debugging information.
+
+The **experimental** workflow overrides only Windows smoke's development
+and test profile debug metadata with `line-tables-only`. Rust retains source
+line locations for panic diagnostics but omits heavyweight full type/variable
+debug information and associated Windows PDB work. `CARGO_INCREMENTAL=0`
+remains unchanged, every test executes, the cross-SID second-account kernel
+denial and ConPTY terminal scenario remain mandatory, the *same* CI-built
+Windows executable goes to the real Linux/Windows H2/H3 cross-host test,
+and the **release build profile is untouched**. Neither crypto features nor
+TLS verification/runtime protocol change.
+
+This is **not a proven speed-up yet**. Cargo fingerprint/cache keys change
+for this profile; the first run may be a cold-build regression. Evaluate the
+actual Windows smoke duration after the same profile has populated its
+cache, benchmark against the 257–269-second warm-cache baseline, and
+retain the change only if repeated CI shows a worthwhile improvement
+without introducing test failures. Measure full CI wall time and runner
+minutes separately. Never claim the whole pipeline was accelerated merely
+because a binary is smaller.
