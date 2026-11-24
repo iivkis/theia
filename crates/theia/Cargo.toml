@@ -35,6 +35,8 @@ tokio = { version = "=1.52.1", features = ["rt-multi-thread", "macros", "net", "
 tokio-rustls = "=0.26.6"
 
 [dev-dependencies]
+# Deterministic liveness deadlines; no new package or production feature.
+tokio = { version = "=1.52.1", features = ["test-util"] }
 rcgen = "=0.13.2"
 # Research-only F-18 signature lab; ring already ships transitively via rustls.
 ring = "=0.17.14"

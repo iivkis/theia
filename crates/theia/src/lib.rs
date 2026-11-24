@@ -27,6 +27,7 @@ pub mod management;
 pub mod protocol;
 pub mod quic_transport;
 pub(crate) mod quota;
+mod relay_liveness;
 pub mod reload_preflight;
 pub mod restart_guard;
 #[cfg(any(target_os = "linux", target_os = "windows"))]

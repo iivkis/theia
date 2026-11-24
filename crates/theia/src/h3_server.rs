@@ -287,10 +287,7 @@ impl Incoming {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
             }
-            let data = timeout(IDLE_TIMEOUT, stream.recv_data())
-                .await
-                .map_err(|_| ServerError::TimedOut)?
-                .map_err(|_| ServerError::Io)?;
+            let data = stream.recv_data().await.map_err(|_| ServerError::Io)?;
             let Some(mut data) = data else {
                 self.decoder.finish().map_err(|_| ServerError::Protocol)?;
                 // SmartTheia has no HTTP trailers.
@@ -419,6 +416,8 @@ async fn relay(
     let (mut read, mut write) = tcp.into_split();
     let mut upload_state = state.clone();
     let mut download_state = state.clone();
+    let activity = crate::relay_liveness::Activity::new();
+    let (download_done, download_finished) = tokio::sync::oneshot::channel();
     let upload = async {
         loop {
             let frame = incoming.next(rx).await?.ok_or(ServerError::Protocol)?;
@@ -438,6 +437,7 @@ async fn relay(
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
+                    activity.data(data.len());
                 }
                 Frame::Fin => {
                     crate::diag!(
@@ -450,15 +450,17 @@ async fn relay(
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
+                    activity.fin();
                     break;
                 }
                 _ => return Err(ServerError::Protocol),
             }
         }
-        if timeout(IDLE_TIMEOUT, incoming.next(rx))
-            .await
-            .map_err(|_| ServerError::TimedOut)??
-            .is_some()
+        if crate::relay_liveness::receive_tail(
+            incoming.next(rx),
+            download_finished,
+            ServerError::TimedOut,
+        ).await?.is_some()
         {
             return Err(ServerError::Protocol);
         }
@@ -467,10 +469,7 @@ async fn relay(
     let download = async {
         let mut buffer = [0; 4096];
         loop {
-            let n = timeout(IDLE_TIMEOUT, read.read(&mut buffer))
-                .await
-                .map_err(|_| ServerError::TimedOut)?
-                .map_err(|_| ServerError::Io)?;
+            let n = read.read(&mut buffer).await.map_err(|_| ServerError::Io)?;
             let frame = if n == 0 {
                 Frame::Fin
             } else {
@@ -489,11 +488,14 @@ async fn relay(
                 .map_err(|_| ServerError::Protocol)?;
             send(tx, &frame).await?;
             if n == 0 {
+                activity.fin();
+                let _ = download_done.send(());
                 return Ok::<(), ServerError>(());
             }
+            activity.data(n);
         }
     };
-    tokio::try_join!(upload, download)?;
+    activity.run(upload, download, ServerError::TimedOut).await?;
     state
         .apply(Direction::Receive, &Frame::Fin)
         .map_err(|_| ServerError::Protocol)?;

@@ -775,11 +775,12 @@ impl IncomingFrames {
             if let Some(frame) = self.ready.pop_front() {
                 return Ok(Some(frame));
             }
-            let block = timeout(FRAME_IDLE_TIMEOUT, incoming.data())
-                .await
-                .map_err(|_| ServerError::TimedOut)?;
+            let block = incoming.data().await;
             let Some(block) = block else {
                 self.decoder.finish().map_err(|_| ServerError::Protocol)?;
+                if incoming.trailers().await.map_err(|_| ServerError::Http2)?.is_some() {
+                    return Err(ServerError::Protocol);
+                }
                 return Ok(None);
             };
             let block = block.map_err(|_| ServerError::Http2)?;
@@ -897,7 +898,8 @@ async fn relay_tcp(
     let (mut read, mut write) = tcp.into_split();
     let mut rx_state = state.clone();
     let mut tx_state = state.clone();
-    let (download_done, mut download_finished) = tokio::sync::oneshot::channel();
+    let activity = crate::relay_liveness::Activity::new();
+    let (download_done, download_finished) = tokio::sync::oneshot::channel();
     let upload = async {
         loop {
             let frame = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
@@ -917,6 +919,7 @@ async fn relay_tcp(
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
+                    activity.data(data.len());
                 }
                 Frame::Fin => {
                     crate::diag!(
@@ -929,6 +932,7 @@ async fn relay_tcp(
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
+                    activity.fin();
                     break;
                 }
                 Frame::Abort(_) => return Err(ServerError::Http2),
@@ -937,14 +941,11 @@ async fn relay_tcp(
         }
         // FIN half-closes TCP upload, not the HTTP request itself. Keep
         // watching for reset, trailing frames or request EOF while downloading.
-        let tail = tokio::select! {
-            result = decoder.next(incoming) => result?,
-            _ = &mut download_finished => {
-                timeout(CLOSE_TIMEOUT, decoder.next(incoming))
-                    .await
-                    .map_err(|_| ServerError::TimedOut)??
-            }
-        };
+        let tail = crate::relay_liveness::receive_tail(
+            decoder.next(incoming),
+            download_finished,
+            ServerError::TimedOut,
+        ).await?;
         if tail.is_some() {
             return Err(ServerError::Protocol);
         }
@@ -954,9 +955,8 @@ async fn relay_tcp(
         let mut buffer = [0u8; 4096];
         loop {
             let size = tokio::select! {
-                result = timeout(FRAME_IDLE_TIMEOUT, read.read(&mut buffer)) => {
-                    result.map_err(|_| ServerError::TimedOut)?
-                        .map_err(|_| ServerError::Io)?
+                result = read.read(&mut buffer) => {
+                    result.map_err(|_| ServerError::Io)?
                 }
                 _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
                     return Err(ServerError::Http2);
@@ -982,15 +982,20 @@ async fn relay_tcp(
                 .await
                 .map_err(|_| ServerError::TimedOut)??;
             if size == 0 {
+                activity.fin();
                 let _ = download_done.send(());
                 return Ok::<(), ServerError>(());
             }
+            activity.data(size);
         }
     };
 
     // An error can cancel send_frame halfway through an H2 window. Reset
     // the stream instead of appending an ABORT to a partially written frame.
-    tokio::try_join!(upload, download).map_err(|_| ServerError::Http2)?;
+    activity.run(upload, download, ServerError::TimedOut).await.map_err(|error| {
+        // Preserve timeout diagnostics; other errors can interrupt an H2 frame.
+        if matches!(error, ServerError::TimedOut) { error } else { ServerError::Http2 }
+    })?;
     state
         .apply(Direction::Receive, &Frame::Fin)
         .map_err(|_| ServerError::Protocol)?;
