@@ -625,7 +625,7 @@ impl Store {
     /// Ordinary updates cannot change identity. Read/verify old and new,
     /// then CAS the entire signed snapshot, including the immutable history.
     pub fn update(&self, document: &str, now: u64) -> Result<Change, Error> {
-        self.update_inner(document, None, now)
+        self.update_inner(document, None, None, now)
     }
 
     /// Guarded offline operator update; the revision check is inside the
@@ -636,18 +636,36 @@ impl Store {
         expected_revision: u64,
         now: u64,
     ) -> Result<Change, Error> {
-        self.update_inner(document, Some(expected_revision), now)
+        self.update_inner(document, Some(expected_revision), None, now)
+    }
+
+    /// Bind an authenticated download to the exact descriptor used for its
+    /// connection, including signer, scope, revision and signed digest.
+    pub fn update_matching(
+        &self,
+        document: &str,
+        expected: &Verified,
+        now: u64,
+    ) -> Result<Change, Error> {
+        self.update_inner(document, Some(expected.descriptor.revision), Some(expected), now)
     }
 
     fn update_inner(
         &self,
         document: &str,
         expected_revision: Option<u64>,
+        expected: Option<&Verified>,
         now: u64,
     ) -> Result<Change, Error> {
         let (old, mut snapshot, history, previous) = self.snapshot()?;
         if expected_revision.is_some_and(|rev| rev != previous.descriptor.revision) {
             return Err(Error::Rollback);
+        }
+        if let Some(expected) = expected {
+            if expected.compare(&previous)? != Change::Unchanged {
+                return Err(Error::Rollback);
+            }
+            expected.check_time(now)?;
         }
         history.check_clock(now)?;
         let next = history.verify_current(document)?;

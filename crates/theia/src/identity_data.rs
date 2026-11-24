@@ -228,18 +228,95 @@ impl FixtureClient {
             Carrier::H3(client) => client.fetch_identity_descriptor().await?,
         };
         let timestamp = now()?;
-        let previous = store.load(timestamp).map_err(|_| ClientError::Tls)?;
-        if previous.descriptor().scope != self.value.descriptor().scope
-            || previous.signer() != self.value.signer()
-            || previous.descriptor().revision != self.value.descriptor().revision
-        {
-            return Err(ClientError::Tls);
-        }
-        self.value
-            .compare(&previous)
-            .map_err(|_| ClientError::Tls)?;
         store
-            .update_at(&raw, previous.descriptor().revision, timestamp)
+            .update_matching(&raw, &self.value, timestamp)
             .map_err(|_| ClientError::Tls)
+    }
+}
+
+
+/// Persistent trust-backed application-plane client for controlled loopback
+/// fixtures. Re-read the verified store before every new logical operation.
+/// A new signed revision (or explicitly promoted signer) replaces the
+/// carrier/pool as one generation; outstanding tunnels own their leases.
+pub struct ManagedFixtureClient {
+    remote: SocketAddr,
+    branch: Branch,
+    token: zeroize::Zeroizing<String>,
+    store: descriptor::Store,
+    current: tokio::sync::Mutex<Option<Arc<FixtureClient>>>,
+}
+
+impl ManagedFixtureClient {
+    pub fn new(
+        remote: SocketAddr,
+        branch: Branch,
+        token: &str,
+        store: descriptor::Store,
+    ) -> Result<Self, ClientError> {
+        if !remote.ip().is_loopback() {
+            return Err(ClientError::Configuration);
+        }
+        let value = store.load(now()?).map_err(|_| ClientError::Tls)?;
+        let first = Self::build(remote, token, value, branch)?;
+        Ok(Self {
+            remote,
+            branch,
+            token: zeroize::Zeroizing::new(token.to_owned()),
+            store,
+            current: tokio::sync::Mutex::new(Some(Arc::new(first))),
+        })
+    }
+
+    fn build(remote: SocketAddr, token: &str, value: Verified, branch: Branch) -> Result<FixtureClient, ClientError> {
+        let mut client = FixtureClient::new(remote, token, value, branch)?;
+        client.carrier = match client.carrier {
+            Carrier::H2(h2) => Carrier::H2(h2.with_connection_pool()),
+            Carrier::H3(h3) => Carrier::H3(h3.with_connection_pool()),
+        };
+        Ok(client)
+    }
+
+    async fn generation(&self) -> Result<Arc<FixtureClient>, ClientError> {
+        let mut slot = self.current.lock().await;
+        let value = self.store.load(now()?).map_err(|_| ClientError::Tls)?;
+        if let Some(previous) = slot.as_ref() {
+            let old = &previous.value;
+            if old.descriptor().scope != value.descriptor().scope
+                || value.descriptor().revision < old.descriptor().revision
+            {
+                return Err(ClientError::Tls);
+            }
+            if old.signer() == value.signer() {
+                if old.compare(&value).map_err(|_| ClientError::Tls)? == descriptor::Change::Unchanged {
+                    return Ok(previous.clone());
+                }
+            } else if value.descriptor().revision <= old.descriptor().revision {
+                return Err(ClientError::Tls);
+            }
+        }
+        // No fallback to the previous carrier on policy, key, expiry or
+        // construction errors. A separately promoted signer must already be
+        // authenticated by the full persisted Store history.
+        let next = Arc::new(Self::build(self.remote, &self.token, value, self.branch)?);
+        *slot = Some(next.clone());
+        Ok(next)
+    }
+
+    pub async fn revision(&self) -> Result<u64, ClientError> {
+        Ok(self.generation().await?.value.descriptor().revision)
+    }
+
+    pub async fn open(&self, target: Address, port: u16) -> Result<FixtureTunnel, ClientError> {
+        self.generation().await?.open(target, port).await
+    }
+
+    pub async fn refresh(&self) -> Result<descriptor::Change, ClientError> {
+        let current = self.generation().await?;
+        let change = current.refresh(&self.store).await?;
+        // Rebuild before any subsequent new connection. If another local
+        // operation superseded the update, the latest verified Store wins.
+        self.generation().await?;
+        Ok(change)
     }
 }

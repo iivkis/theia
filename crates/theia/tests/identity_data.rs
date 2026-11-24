@@ -17,7 +17,7 @@ use theia::{
         self, Anchor, ClientPolicy, Descriptor, Padding, Reference, Rotation, Scope, SecurityMode,
         Store,
     },
-    identity_data::{FixtureClient, PreparedFixture},
+    identity_data::{FixtureClient, ManagedFixtureClient, PreparedFixture},
     identity_tls::{Branch, Identity},
     protocol::{Address, ErrorCode},
     reference_health,
@@ -332,4 +332,68 @@ async fn h2_only_descriptor_refuses_h3_and_private_target_acl_remains_effective(
     })
     .await
     .unwrap();
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_generations_refresh_persistent_revision_without_reusing_old_pool() {
+    timeout(DEADLINE, async {
+        let tcp = bind().await;
+        let remote = tcp.local_addr().unwrap();
+        let scope = Scope { inbound: "edge".into(), endpoint: remote.to_string() };
+        let identity = Identity::generate(scope.clone()).unwrap();
+        let now = reference_health::unix_now().unwrap();
+        let first = value(scope, true, now);
+        let initial = identity.sign_descriptor(&first).unwrap();
+        let mut second = first.clone();
+        second.revision = 2;
+        let latest = identity.sign_descriptor(&second).unwrap();
+        let (inbound, users) = config(remote);
+        let server = tokio::spawn(PreparedFixture::new(tcp, &identity, &latest, &inbound, &users, &policy(true)).unwrap().serve());
+        let scratch = Scratch::new();
+        for branch in [Branch::H2, Branch::H3] {
+            let path = scratch.0.join(format!("managed-{branch:?}.toml"));
+            let anchor = anchor(&identity, XhttpMode::StreamOne);
+            let store = Store::new(&path, anchor.clone()).unwrap();
+            store.initialize(&initial, now).unwrap();
+            let manager = ManagedFixtureClient::new(remote, branch, &URL_SAFE_NO_PAD.encode(TOKEN), store).unwrap();
+            assert_eq!(manager.revision().await.unwrap(), 1);
+            let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = target.local_addr().unwrap().port();
+            let address = Address::V4([127,0,0,1]);
+            let old = manager.open(address.clone(), port).await.unwrap();
+            let (mut old_remote, _) = target.accept().await.unwrap();
+            assert_eq!(manager.refresh().await.unwrap(), descriptor::Change::Advanced);
+            assert_eq!(manager.revision().await.unwrap(), 2);
+            let new = manager.open(address, port).await.unwrap();
+            let (mut new_remote, _) = target.accept().await.unwrap();
+            match (&old, &new) {
+                (theia::identity_data::FixtureTunnel::H2(a), theia::identity_data::FixtureTunnel::H2(b)) => assert!(!a.shares_transport_with(b)),
+                (theia::identity_data::FixtureTunnel::H3(a), theia::identity_data::FixtureTunnel::H3(b)) => assert!(!a.shares_transport_with(b)),
+                _ => panic!("branch changed"),
+            }
+            // Old and new tunnels remain independently usable.
+            for (tunnel, socket) in [(old, &mut old_remote), (new, &mut new_remote)] {
+                let (mut app, local) = tokio::io::duplex(1024);
+                let relay = tokio::spawn(tunnel.relay(local));
+                app.write_all(b"generation").await.unwrap();
+                let mut bytes = [0; 10];
+                socket.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"generation");
+                socket.write_all(&bytes).await.unwrap();
+                app.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"generation");
+                app.shutdown().await.unwrap();
+                socket.shutdown().await.unwrap();
+                relay.await.unwrap().unwrap();
+            }
+            let reopened = Store::new(&path, anchor).unwrap();
+            assert_eq!(reopened.load(reference_health::unix_now().unwrap()).unwrap().descriptor().revision, 2);
+            assert!(reopened.update(&initial, reference_health::unix_now().unwrap()).is_err());
+            // An unreadable trust file never falls back to an in-memory pool.
+            std::fs::write(&path, b"invalid").unwrap();
+            assert!(matches!(manager.revision().await, Err(ClientError::Tls)));
+        }
+        server.abort();
+    }).await.unwrap();
 }
