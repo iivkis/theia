@@ -23,15 +23,16 @@ use windows_sys::Win32::{
     Security::{
         Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
-            GetSecurityInfo, SE_REGISTRY_KEY,
+            GetSecurityInfo, SE_KERNEL_OBJECT, SE_REGISTRY_KEY,
         },
-        EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
+        EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
     },
     System::{
         Registry::{
             RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegFlushKey, RegOpenKeyExW,
-            RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, KEY_READ,
-            REG_BINARY,
+            RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+            KEY_ALL_ACCESS, KEY_QUERY_VALUE, KEY_READ, REG_BINARY, REG_DWORD,
         },
         Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
     },
@@ -39,6 +40,9 @@ use windows_sys::Win32::{
 
 const JOURNAL_KEY: &str = "Software\\Theia\\WinInetProxyRecoveryV1";
 const JOURNAL_NAME: &str = "OwnerTransactionV1";
+const SCOPE_POLICY_KEY: &str =
+    "Software\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+const SCOPE_POLICY_VALUE: &str = "ProxySettingsPerUser";
 const MAX_JOURNAL: usize = 12 * 1024;
 const MAX_TEXT: usize = 2048;
 const INTERNET_OPTION_PER_CONNECTION_OPTION: u32 = 75;
@@ -76,6 +80,7 @@ pub enum ProxyError {
     RecoveryRequired,
     Conflict,
     InvalidSettings,
+    PolicyManaged,
     Journal,
 }
 impl std::fmt::Display for ProxyError {
@@ -87,6 +92,7 @@ impl std::fmt::Display for ProxyError {
             Self::RecoveryRequired => "previous Theia proxy journal requires explicit recovery",
             Self::Conflict => "Windows user proxy changed; refusing to overwrite another owner",
             Self::InvalidSettings => "Windows proxy configuration could not be safely managed",
+            Self::PolicyManaged => "Windows proxy scope is not confirmed per-user; no write allowed",
             Self::Journal => "cannot safely read or durably update proxy recovery journal",
         })
     }
@@ -278,13 +284,17 @@ fn query_with_flags(flag_id: u32) -> Result<Snapshot, ProxyError> {
     observed
 }
 fn query() -> Result<Snapshot, ProxyError> {
-    match query_with_flags(INTERNET_PER_CONN_FLAGS_UI) {
+    require_per_user_scope()?;
+    let observed = match query_with_flags(INTERNET_PER_CONN_FLAGS_UI) {
         Err(ProxyError::Unavailable) => query_with_flags(INTERNET_PER_CONN_FLAGS),
         result => result,
-    }
+    }?;
+    require_per_user_scope()?;
+    Ok(observed)
 }
 fn set(state: &Snapshot) -> Result<(), ProxyError> {
     state.validate()?;
+    require_per_user_scope()?;
     let mut strings = [
         wide(&state.server),
         wide(&state.bypass),
@@ -336,23 +346,55 @@ fn set(state: &Snapshot) -> Result<(), ProxyError> {
             return Err(ProxyError::Unavailable);
         }
     }
-    Ok(())
+    require_per_user_scope()
 }
 
-struct Mutex(HANDLE);
+// The journal is HKCU-wide, so current binaries must serialize across
+// terminal sessions as well as within the session used by older binaries.
+struct Mutex {
+    _legacy: MutexHandle,
+    _global: MutexHandle,
+}
+
 impl Mutex {
     fn acquire() -> Result<Self, ProxyError> {
         let sid = current_user_sid().map_err(|_| ProxyError::Unavailable)?;
         if sid == "S-1-5-18" {
             return Err(ProxyError::Unavailable);
         }
-        let name = wide(&format!("Local\\Theia-WinInet-Proxy-{sid}"));
-        // SAFETY: private per-user name, no initial ownership, explicit wait.
-        let handle = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
+        let global_name = format!("Global\\Theia-WinInet-Proxy-{sid}");
+        let local_name = format!("Local\\Theia-WinInet-Proxy-{sid}");
+        let global = MutexHandle::acquire(&global_name, Some(&sid))?;
+        let legacy = MutexHandle::acquire(&local_name, None)?;
+        Ok(Self {
+            _legacy: legacy,
+            _global: global,
+        })
+    }
+}
+
+struct MutexHandle(HANDLE);
+impl MutexHandle {
+    fn acquire(name: &str, protected_sid: Option<&str>) -> Result<Self, ProxyError> {
+        let security = protected_sid
+            .map(|sid| security_descriptor(&format!("O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)")))
+            .transpose()?;
+        let attrs = security.as_ref().map(|security| SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: security.0,
+            bInheritHandle: 0,
+        });
+        let attributes = attrs.as_ref().map_or(null(), |attrs| attrs as *const _);
+        // SAFETY: terminated name and optional live security descriptor.
+        let handle = unsafe { CreateMutexW(attributes, 0, wide(name).as_ptr()) };
         if handle.is_null() {
             return Err(ProxyError::Unavailable);
         }
-        // SAFETY: valid mutex handle; no blocking beyond zero milliseconds.
+        if protected_sid.is_some() && check_mutex_security(handle).is_err() {
+            unsafe { CloseHandle(handle) };
+            return Err(ProxyError::Unavailable);
+        }
+        // SAFETY: valid mutex handle, nonblocking wait.
         let wait = unsafe { WaitForSingleObject(handle, 0) };
         if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
             unsafe { CloseHandle(handle) };
@@ -361,9 +403,9 @@ impl Mutex {
         Ok(Self(handle))
     }
 }
-impl Drop for Mutex {
+impl Drop for MutexHandle {
     fn drop(&mut self) {
-        // SAFETY: owner acquired this mutex in the current process.
+        // SAFETY: this handle was acquired on the current native thread.
         unsafe {
             ReleaseMutex(self.0);
             CloseHandle(self.0);
@@ -382,7 +424,11 @@ impl Drop for Security {
 }
 fn private_security() -> Result<Security, ProxyError> {
     let sid = current_user_sid().map_err(|_| ProxyError::Journal)?;
-    let descriptor = wide(&format!("D:P(A;;KA;;;{sid})(A;;KA;;;SY)"));
+    security_descriptor(&format!("D:P(A;;KA;;;{sid})(A;;KA;;;SY)"))
+}
+
+fn security_descriptor(sddl: &str) -> Result<Security, ProxyError> {
+    let descriptor = wide(sddl);
     let mut pointer = null_mut();
     // SAFETY: terminated SDDL with protected user and SYSTEM only.
     if unsafe {
@@ -422,6 +468,45 @@ impl Drop for Key {
         }
     }
 }
+// Only absent policy or an explicit DWORD 1 permits per-user WinINet.
+// Never modify policy and never assume access denied means not configured.
+fn require_per_user_scope_at(root: HKEY, path: &str) -> Result<(), ProxyError> {
+    let mut key = null_mut();
+    let result =
+        unsafe { RegOpenKeyExW(root, wide(path).as_ptr(), 0, KEY_QUERY_VALUE, &mut key) };
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(());
+    }
+    if result != 0 {
+        return Err(ProxyError::PolicyManaged);
+    }
+    let key = Key(key);
+    let mut kind = 0;
+    let mut bytes = [0u8; 4];
+    let mut length = bytes.len() as u32;
+    let result = unsafe {
+        RegQueryValueExW(
+            key.0,
+            wide(SCOPE_POLICY_VALUE).as_ptr(),
+            null(),
+            &mut kind,
+            bytes.as_mut_ptr(),
+            &mut length,
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(());
+    }
+    if result != 0 || kind != REG_DWORD || length != 4 || u32::from_le_bytes(bytes) != 1 {
+        return Err(ProxyError::PolicyManaged);
+    }
+    Ok(())
+}
+
+fn require_per_user_scope() -> Result<(), ProxyError> {
+    require_per_user_scope_at(HKEY_LOCAL_MACHINE, SCOPE_POLICY_KEY)
+}
+
 fn check_acl(key: HKEY) -> Result<(), ProxyError> {
     let mut acl: *mut ACL = null_mut();
     let mut descriptor = null_mut();
@@ -445,6 +530,41 @@ fn check_acl(key: HKEY) -> Result<(), ProxyError> {
     let _descriptor = Security(descriptor);
     let user = parsed_sid(&current_user_sid().map_err(|_| ProxyError::Journal)?)?;
     let system = parsed_sid("S-1-5-18")?;
+    check_sid_acl(acl, &user, &system)
+}
+
+fn check_mutex_security(handle: HANDLE) -> Result<(), ProxyError> {
+    let mut acl: *mut ACL = null_mut();
+    let mut owner = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: live mutex handle and owned descriptor outputs.
+    let result = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut acl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    let _descriptor = Security(descriptor);
+    if result != 0 || acl.is_null() || owner.is_null() {
+        return Err(ProxyError::Unavailable);
+    }
+    let user = parsed_sid(&current_user_sid().map_err(|_| ProxyError::Unavailable)?)?;
+    let system = parsed_sid("S-1-5-18")?;
+    if unsafe { EqualSid(owner, user.0) } == 0 && unsafe { EqualSid(owner, system.0) } == 0 {
+        return Err(ProxyError::Unavailable);
+    }
+    check_sid_acl(acl, &user, &system).map_err(|_| ProxyError::Unavailable)
+}
+
+// SAFETY invariant: callers retain the GetSecurityInfo descriptor and
+// supply its non-null ACL for the entire validation.
+fn check_sid_acl(acl: *mut ACL, user: &Sid, system: &Sid) -> Result<(), ProxyError> {
     let count = unsafe { (*acl).AceCount };
     if count != 2 {
         return Err(ProxyError::Journal);
@@ -993,6 +1113,71 @@ mod tests {
     }
 
     #[test]
+    fn native_scope_policy_reader_refuses_machine_and_malformed_values() {
+        use windows_sys::Win32::System::Registry::{RegDeleteKeyW, REG_OPTION_VOLATILE};
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = format!("Software\\TheiaProxyPolicyTest-{}-{stamp}", std::process::id());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(&self.0).as_ptr()) };
+            }
+        }
+        assert_eq!(require_per_user_scope_at(HKEY_CURRENT_USER, &path), Ok(()));
+        let mut handle = null_mut();
+        let mut disposition = 0;
+        assert_eq!(
+            unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide(&path).as_ptr(),
+                    0,
+                    null_mut(),
+                    REG_OPTION_VOLATILE,
+                    KEY_ALL_ACCESS,
+                    null(),
+                    &mut handle,
+                    &mut disposition,
+                )
+            },
+            0
+        );
+        let _cleanup = Cleanup(path.clone());
+        let key = Key(handle);
+        assert_eq!(require_per_user_scope_at(HKEY_CURRENT_USER, &path), Ok(()));
+        for (kind, bytes, expected) in [
+            (REG_DWORD, 1u32.to_le_bytes(), Ok(())),
+            (REG_DWORD, 0u32.to_le_bytes(), Err(ProxyError::PolicyManaged)),
+            (REG_DWORD, 2u32.to_le_bytes(), Err(ProxyError::PolicyManaged)),
+            (REG_BINARY, 1u32.to_le_bytes(), Err(ProxyError::PolicyManaged)),
+        ] {
+            assert_eq!(
+                unsafe {
+                    RegSetValueExW(
+                        key.0,
+                        wide(SCOPE_POLICY_VALUE).as_ptr(),
+                        0,
+                        kind,
+                        bytes.as_ptr(),
+                        bytes.len() as u32,
+                    )
+                },
+                0
+            );
+            assert_eq!(require_per_user_scope_at(HKEY_CURRENT_USER, &path), expected);
+        }
+        assert_eq!(
+            unsafe { RegDeleteValueW(key.0, wide(SCOPE_POLICY_VALUE).as_ptr()) },
+            0
+        );
+        assert_eq!(require_per_user_scope_at(HKEY_CURRENT_USER, &path), Ok(()));
+    }
+
+    #[test]
     fn legacy_v1_journal_preserves_proxy_pac_and_autodetect_fields() {
         let sid = current_user_sid().unwrap();
         let legacy = format!(
@@ -1054,6 +1239,29 @@ auto_url = "https://pac.invalid/proxy.pac"
             assert_eq!(status().unwrap(), ProxyStatus::PendingOwned);
             std::process::exit(73);
         }
+        // Current clients serialize on the global SID mutex and also honor
+        // a legacy session-local owner. Exercise both with native threads.
+        let sid = current_user_sid().unwrap();
+        let global_name = format!("Global\\Theia-WinInet-Proxy-{sid}");
+        let legacy_name = format!("Local\\Theia-WinInet-Proxy-{sid}");
+        let global = MutexHandle::acquire(&global_name, Some(&sid)).unwrap();
+        assert_eq!(
+            std::thread::spawn(|| Mutex::acquire().map(|_| ()))
+                .join()
+                .unwrap(),
+            Err(ProxyError::Busy)
+        );
+        drop(global);
+        let legacy = MutexHandle::acquire(&legacy_name, None).unwrap();
+        assert_eq!(
+            std::thread::spawn(|| Mutex::acquire().map(|_| ()))
+                .join()
+                .unwrap(),
+            Err(ProxyError::Busy)
+        );
+        drop(legacy);
+        drop(Mutex::acquire().unwrap());
+
         let original = query().unwrap();
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
         let bind = "127.0.0.1:45991".parse().unwrap();
@@ -1131,6 +1339,37 @@ auto_url = "https://pac.invalid/proxy.pac"
         assert_eq!(recover_explicit(), Ok(Recovery::Restored));
         assert_eq!(query().unwrap(), original);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
+        assert_eq!(recover_explicit(), Ok(Recovery::NothingPending));
+        assert_eq!(query().unwrap(), original);
+
+        // A v1 record can survive a process exit before apply or an external
+        // restoration. Clear only the record, with the exact original intact.
+        crash();
+        set(&original).unwrap();
+        assert_eq!(status().unwrap(), ProxyStatus::PendingAlreadyRestored);
+        let review = review_recovery().unwrap();
+        assert_eq!(recover_reviewed(review), Ok(Recovery::AlreadyRestored));
+        assert_eq!(query().unwrap(), original);
+        assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
+
+        // Recovery consent also expires when the journal itself is replaced.
+        crash();
+        let review = review_recovery().unwrap();
+        let record = read_journal().unwrap().unwrap();
+        let applied = query().unwrap();
+        let mut replacement = read_legacy_journal(&record);
+        replacement.before.bypass = "replacement.invalid".into();
+        delete_journal().unwrap();
+        save_journal(&replacement).unwrap();
+        assert_eq!(recover_reviewed(review), Err(ProxyError::Conflict));
+        assert_eq!(query().unwrap(), applied);
+        assert_eq!(read_journal().unwrap(), Some(replacement));
+        delete_journal().unwrap();
+        save_journal(&record).unwrap();
+        assert_eq!(recover_explicit(), Ok(Recovery::Restored));
+        assert_eq!(query().unwrap(), original);
+        assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
+
         crash();
         let review = review_recovery().unwrap();
         let applied = query().unwrap();
