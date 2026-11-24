@@ -232,7 +232,10 @@ mod private_windows {
     fn security_descriptor() -> io::Result<Descriptor> {
         let sid = crate::windows_control::current_user_sid()
             .map_err(|_| io::Error::other("private user SID unavailable"))?;
-        let sddl = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+        let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+        descriptor_from_sddl(&sddl)
+    }
+    fn descriptor_from_sddl(sddl: &str) -> io::Result<Descriptor> {
         let wide = sddl
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -276,7 +279,15 @@ mod private_windows {
         Ok(())
     }
     pub(super) fn file(path: &Path) -> io::Result<File> {
-        let descriptor = security_descriptor()?;
+        file_with_descriptor(path, security_descriptor()?)
+    }
+    #[cfg(test)]
+    pub(super) fn broad_file(path: &Path) -> io::Result<File> {
+        let sid = crate::windows_control::current_user_sid()
+            .map_err(|_| io::Error::other("private user SID unavailable"))?;
+        file_with_descriptor(path, descriptor_from_sddl(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FR;;;WD)"))?)
+    }
+    fn file_with_descriptor(path: &Path, descriptor: Descriptor) -> io::Result<File> {
         let attrs = attrs(&descriptor);
         // SAFETY: CREATE_NEW refuses existing targets, including symlink/reparse
         // objects. Security attributes are explicit and protected, not inherited.
@@ -297,6 +308,11 @@ mod private_windows {
         // SAFETY: owns a valid, freshly created Win32 file handle.
         Ok(unsafe { File::from_raw_handle(handle) })
     }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_broad_file(path: &Path) -> io::Result<File> {
+    private_windows::broad_file(path)
 }
 
 #[cfg(windows)]
