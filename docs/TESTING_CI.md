@@ -72,3 +72,11 @@ Required check: `ci-gate` на актуальном SHA; настройка bran
 Обязательны нативные E2E XHTTP × два security modes × H2/H3, для каждого QUIC-first и network-only fallback с неизменными identity/security/XHTTP/auth, отказ при TLS/key/ALPN/auth/protocol ошибках. REALITY wizard/manual формируют один тип и используют один валидатор. TLS только ручные cert/key paths, отказ при неверной паре, без wizard. Guarded Apply/rollback, byte-exact DATA, OPEN_OK, FIN, cancellation и backpressure. Матрица — нормативное требование, не результат тестирования.
 
 **ADR-0086:** acceptance измеряет собственный SmartTheia contract, не Xray interoperability или побайтовое воспроизведение его handshake. Никакого требования копировать Xray XHTTP modes, REALITY key format или config. Нативные H2/H3 E2E каждого security mode, fallback, crypto/security review, F-13/F-19 независимые измерения, Apply/rollback и все existing mandatory checks остаются обязательными. Spec assertions защищают формулировки, но не заменяют behavioral tests.
+
+### ADR-0087 replacement invitation and cross-host gate
+
+ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. Existing mandatory F-14 cross-host job retains all prior scenarios and adds two Linux inbounds and native Windows CONNECT/SOCKS5 over H2/H3/auto with round-tripped pinned public invite, separate CA/credential, wrong pin and wrong carrier-mode refusal. Linux private key stays in Linux. No extra workflow or weakened gate.
+
+### ADR-0088 channel binding acceptance
+
+Mandatory existing workspace tests cover pure proof mutation/race and independent raw real TLS/H2 and QUIC/H3 same/fresh connection replay refusal. Existing full relay and cross-host pinned tests exercise the new adapter. No job or dependency version changes; exact-head CI required.

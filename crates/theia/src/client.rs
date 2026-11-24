@@ -305,7 +305,7 @@ impl H2Client {
         let socket = TcpStream::connect(self.endpoint.as_str())
             .await
             .map_err(|_| ClientError::Io)?;
-        let (mut sender, driver) = match &self.connector {
+        let (mut sender, driver, binding) = match &self.connector {
             H2Tls::Rustls(connector) => {
                 let tls = connector
                     .connect(self.server_name.clone(), socket)
@@ -324,7 +324,18 @@ impl H2Client {
                             .as_ref(),
                     )?;
                 }
-                start_h2(tls, self.wire_shape).await?
+                let binding = if self.certificate_pin.is_some() {
+                    Some(zeroize::Zeroizing::new(
+                        tls.get_ref().1.export_keying_material(
+                            [0u8; 32], crate::channel_binding::LABEL,
+                            Some(crate::channel_binding::H2),
+                        ).map_err(|_| ClientError::Tls)?,
+                    ))
+                } else {
+                    None
+                };
+                let (sender, driver) = start_h2(tls, self.wire_shape).await?;
+                (sender, driver, binding)
             }
             #[cfg(feature = "experimental-btls-h2")]
             H2Tls::Btls {
@@ -332,7 +343,8 @@ impl H2Client {
                 trusted_ca_pem,
             } => {
                 let tls = crate::h2_btls::connect(socket, server_name, trusted_ca_pem).await?;
-                start_h2(tls, self.wire_shape).await?
+                let (sender, driver) = start_h2(tls, self.wire_shape).await?;
+                (sender, driver, None)
             }
         };
         crate::diag!(
@@ -347,14 +359,20 @@ impl H2Client {
             use crate::split_http::{self, Leg};
             let (download, _) = sender
                 .send_request(
-                    split_http::request(&self.uri, Leg::Download, &self.authorization)?,
+                    crate::channel_binding::attach(
+                        binding.as_ref(),
+                        split_http::request(&self.uri, Leg::Download, &self.authorization)?,
+                    )?,
                     true,
                 )
                 .map_err(|_| ClientError::Http2)?;
             let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
             let (upload, tx) = sender
                 .send_request(
-                    split_http::request(&self.uri, Leg::Upload, &self.authorization)?,
+                    crate::channel_binding::attach(
+                        binding.as_ref(),
+                        split_http::request(&self.uri, Leg::Upload, &self.authorization)?,
+                    )?,
                     false,
                 )
                 .map_err(|_| ClientError::Http2)?;
@@ -378,7 +396,7 @@ impl H2Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let (response, tx) = sender
-                .send_request(request, false)
+                .send_request(crate::channel_binding::attach(binding.as_ref(), request)?, false)
                 .map_err(|_| ClientError::Http2)?;
             (response.await.map_err(|_| ClientError::Http2)?, tx)
         };

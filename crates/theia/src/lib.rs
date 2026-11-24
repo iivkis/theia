@@ -32,6 +32,7 @@ pub mod reload_preflight;
 pub mod restart_guard;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
+mod channel_binding;
 pub mod security_profile;
 pub mod server;
 mod split_http;

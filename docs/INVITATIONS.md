@@ -10,21 +10,21 @@ One binary built per platform, with independent **server** and **client** roles.
 
 Use scheme prefix `theia://v1/` followed by **unpadded canonical base64url** (RFC 4648 URL-safe alphabet) of UTF-8 TOML data with `deny_unknown_fields`. Total URI max 4096 bytes; decoded payload max 3072 bytes. This is data, not an HTTP URL. Do not follow redirects, fetch hosts or auto-execute it.
 
-Payload (illustrative **without bearer**; not a runnable server):
+Payload (public, illustrative; no bearer):
 
 ```toml
 version = 1
 id = "public"
 endpoint = "edge.example.org:443"
 server_name = "edge.example.org"
-tls_profile = "default"
+carrier = "smarttheia-xhttp"
+security_mode = "pinned-tls"
+xhttp_mode = "stream-up"
+leaf_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 transport = "auto"
-# token = "..." # ONLY for explicitly confirmed one-time confidential export
 ```
 
-Fields: `version` must be 1, `id` a v1-compatible profile ID, `endpoint` a valid host:port or [IPv6]:port, `server_name` a valid TLS DNS SNI, `tls_profile` **default only** (including when the local binary supports a named F-13 profile; v1 cannot represent it), `transport` auto/h2/h3. Optional `token` is exactly 32 random raw bytes represented as canonical 43-character base64url without padding. The invite has no secret reference, key hash, TLS private key, ACL grant, OS settings, local listener binds, certificate override or arbitrary path. Unknown, duplicate or extra fields/versions, malformed UTF-8/base64, over-limit payload and invalid values fail closed. This URI version is independent of SmartTheia frame version and TOML config schema_version.
-
-**No export downgrade:** `Invitation::public_from_profile` rejects every non-default TLS profile, including the locally supported H2 BoringSSL profile, instead of producing a default-profile URI. A future versioned invitation must explicitly represent and validate any additional profile. Existing default H2/H3/auto public shares and server-issued bearer links remain unchanged. See ADR-0064.
+The required carrier is smarttheia-xhttp. own-tls permits stream-one and no leaf_sha256; pinned-tls permits stream-one or stream-up with exactly 64 lowercase hex SHA-256 of the entire DER leaf. All require separate CA at runtime. Unknown combinations, missing/extra/duplicate fields, old tls_profile envelopes, v2, bad SNI/endpoint, noncanonical base64 and oversize data are refused. Optional token is exactly 32 raw random bytes encoded in canonical 43-character base64url. Never include CA paths, private keys, OS settings, grants or arbitrary paths. URI is unsigned; verify pin using an authenticated channel. No backward compatibility. See ADR-0087.
 
 ## Server: issuance and one-time export
 
@@ -51,7 +51,7 @@ Rotation is independently confirmed by PR #80; protected file export, disabled-u
 
 ## Client: import and TLS trust
 
-- Import from the paste buffer or a **local file**, with no automatic network fetch, shell args or web-admin API. Preview only id/endpoint/SNI/transport and whether a credential is present, **never token bytes**. Do not activate imported profiles, connect, reload, or enable system proxy without separate confirmation.
+- Import from the paste buffer or a **local file**, with no automatic network fetch, shell args or web-admin API. Preview id/endpoint/SNI/exact TLS and HTTP mode/transport and whether a credential is present, **never token bytes**. Do not activate imported profiles, connect, reload, or enable system proxy without separate confirmation.
 - The token must be written as exact canonical base64url (43 bytes, no trailing newline) in a unique trusted new file under a trusted directory (Unix 0600, Windows per-user ACL) or provisioned explicitly into an env reference. `client.profiles[].auth_token` must remain an `env:` or absolute `file:` reference, **never literal**. A public link requires explicit independent credential input. Existing profile IDs are never silently overwritten, no tokens in debug, audit or UI diagnostics.
 - TLS trust is **not shipped or replaced by the share URI**. The client must obtain/verify its trusted certificate authority separately and verify the TLS SNI/chain exactly as for a manually configured client. If explicit `tls_ca` is needed for runtime, import without a trusted CA may save a non-connected draft but cannot claim ready to connect. No insecure verifier, silent downgrade, trust-on-first-use or arbitrary file import.
 - Durable profile and credential-file writes need a tested transaction/rollback strategy; Windows ACL checks, crash and collision tests must pass before declaring P0. Safe preview must work with token masked.
@@ -69,13 +69,13 @@ Native Linux/Windows integration verifies the actual \`theia client run\` binary
 
 ## Codec security tests
 
-The pure codec rejects wrong prefix/version, noncanonical/oversized base64, unknown fields, non-256-bit token, bad endpoint/SNI, unknown TLS profile, invalid env/file references and mismatched/disabled/ungranted server users. The computed full client profile is checked with the existing typed config validator; importing never trusts a provided CA path from the URI. The encoded token is held in memory for import, so the raw link and process memory must be treated as confidential. The codec is not an issuance, storage or runtime API; those boundaries are tested separately.
+The replacement codec rejects wrong prefix/version, noncanonical/oversized base64, unknown fields, non-256-bit token, bad endpoint/SNI, unknown TLS profile, invalid env/file references and mismatched/disabled/ungranted server users. The computed full client profile is checked with the existing typed config validator; importing never trusts a provided CA path from the URI. The encoded token is held in memory for import, so the raw link and process memory must be treated as confidential. The codec is not an issuance, storage or runtime API; those boundaries are tested separately.
 
 ## Будущие F-18/F-19 (не реализовано)
 
 Целевое приглашение SmartTheia версионируется независимо от Xray/VLESS, сохраняет собственные identity/security mode и параметры единственного XHTTP на H3/H2. SmartTheia REALITY и SmartTheia XHTTP вдохновлены Xray, но не требуют его URI/key/config формата или wire compatibility (ADR-0086).
 
-REALITY-подобный отдельный security mode и anti-TLS-in-TLS требуют **нового versioned invitation contract** с подтверждённой identity сервера, а не молчаливого расширения theia://v1. Текущий invite v1 разрешает только стандартный TLS с tls_profile=default и строгой проверкой cert/SNI; не принимает неизвестные поля. Новый scanner не экспортирует ключи сервера, bearer или пользовательские URL. См. docs/STEALTH_REALITY.md.
+REALITY-подобный отдельный security mode и anti-TLS-in-TLS требуют **нового versioned invitation contract** с подтверждённой identity сервера, а не молчаливого расширения theia://v1. Новый invite v1 сохраняет явный режим и промежуточный pin без ослабления cert/SNI; не принимает старый payload или неизвестные поля. Новый scanner не экспортирует ключи сервера, bearer или пользовательские URL. См. docs/STEALTH_REALITY.md.
 
 **Additional native storage regression (ADR-0066):** isolated tests exercise the existing private bearer primitives with file/directory collisions, concurrent create-new, guard ownership and abrupt process exit before commit. A pre-commit exit can leave an unreferenced private credential; this test requires unchanged TOML and no automatic adoption. It does not implement orphan cleanup, power-loss recovery or new credential types.
 
@@ -102,3 +102,9 @@ A rotated confidential invitation may be used to replace only the bearer referen
 In the loaded server/client editor, l displays a repeatable, tokenless v1 share from the selected saved record. It never creates a user or credential, reads a bearer file/env secret, writes TOML, or enters confidential issuance. Dirty, stale or pending-issuance editors refuse; the v1 codec rejects incompatible ports or unsupported TLS profiles. The recipient still selects independent CA and explicit credential. The native Windows Named Pipe Apply E2E now exercises the same account recovery/import/credential-only replacement and old-token denial as the Linux IPC test. Both are local real binary server tests, not remote recovery across two physical hosts.
 
 The existing cross-host harness also verifies the public form with an explicitly provisioned incorrect environment credential: both local proxies deny access. After the client exits, a separate matching-profile refresh from the confidential invitation replaces only auth_token; the next client process must succeed with the saved file and unchanged CA/transport. The Linux server grant is unchanged in this case; this is not a remote server rotation test.
+
+## Replacement v1 (ADR-0087)
+
+The previous default-only envelope is retired. No compatibility reader, v2 or automatic migration. Reissue all invitations. The new strict v1 carries explicit carrier, security_mode, xhttp_mode and (for pinned-tls) leaf_sha256. It maps to the exact existing runtime TLS profile with separate CA selection. Public import does not activate a profile; confidential bearer remains protected. Saved own cert/key validation and one-time stale leaf refusal apply to pinned issuance. Native acceptance is tracked in STATUS.md. No full REALITY or candidate Apply claim.
+
+ADR-0088: the imported pinned profile implies mandatory channel-bound HTTP admission on both carriers. No new invitation field and no old pinned runtime fallback. This is not a full REALITY identity.

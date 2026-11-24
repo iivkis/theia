@@ -16,6 +16,7 @@ use theia::{
     client_import,
     config::{self, ClientDocument, Config, SystemProxy, Transport},
     invite::Invitation,
+    security_profile::CertificatePin,
     tui_editor::Editor,
     Role,
 };
@@ -249,6 +250,94 @@ async fn client_scenario(
     }
 }
 
+// The Linux fixture key never crosses to Windows. Construct a public
+// invitation from independently transferred public trust material and
+// provision the known per-run bearer via an explicit env reference.
+async fn pinned_client_scenario(
+    fixture: &CrossOsFixture<'_>,
+    transport: Transport,
+    stream_up: bool,
+) {
+    let mut endpoint = fixture.endpoint.parse::<SocketAddr>().unwrap();
+    endpoint.set_port(endpoint.port() + if stream_up { 2 } else { 1 });
+    let trusted = fs::read(fixture.ca).unwrap();
+    let leaf = rustls_pemfile::certs(&mut std::io::BufReader::new(trusted.as_slice()))
+        .next()
+        .unwrap()
+        .unwrap();
+    let pin = CertificatePin::from_der(leaf.as_ref());
+    let wrong_ca = std::env::var("THEIA_F14_XHOST_WRONG_CA").unwrap();
+    let wrong = fs::read(wrong_ca).unwrap();
+    let other = rustls_pemfile::certs(&mut std::io::BufReader::new(wrong.as_slice()))
+        .next()
+        .unwrap()
+        .unwrap();
+    let wrong_pin = CertificatePin::from_der(other.as_ref());
+
+    let dir = Directory(std::env::temp_dir().join(format!(
+        "theia-f18-cross-os-{}-{transport:?}-{stream_up}",
+        std::process::id()
+    )));
+    fs::create_dir(&dir.0).unwrap();
+    let config_path = dir.0.join("client.toml");
+    let source = include_str!("../../../examples/client.toml");
+    fs::write(&config_path, source).unwrap();
+    let Config::Client(doc) = config::parse(source).unwrap() else {
+        panic!("client fixture");
+    };
+    let mut profile = doc.client.profiles[0].clone();
+    profile.id = if stream_up {
+        "cross-split"
+    } else {
+        "cross-pin"
+    }
+    .into();
+    profile.server = endpoint.to_string();
+    profile.server_name = "localhost".into();
+    profile.transport = transport;
+    profile.tls_profile = if stream_up {
+        pin.stream_up_profile()
+    } else {
+        pin.profile()
+    };
+    let uri = Invitation::public_from_profile(&profile)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let invitation = client_import::read_source(&uri).unwrap();
+    assert_eq!(invitation.tls_profile(), profile.tls_profile);
+    assert!(!invitation.has_token());
+
+    let mut editor = Editor::load(Role::Client, &config_path).unwrap();
+    let ca = format!("file:{}", fixture.ca.display());
+    editor
+        .import_invitation(&invitation, Some(&ca), Some("env:THEIA_F18_XHOST_TOKEN"))
+        .unwrap();
+    let Config::Client(mut imported) = config::read_file(&config_path).unwrap() else {
+        panic!("imported client");
+    };
+    assert_eq!(imported.client.active_profile, "home");
+    assert_eq!(imported.client.profiles[1].tls_profile, profile.tls_profile);
+    assert_eq!(imported.client.profiles[1].transport, transport);
+    imported.client.active_profile = profile.id;
+    run_client(&config_path, imported.clone(), fixture.origin, true).await;
+
+    let mut invalid = imported.clone();
+    invalid.client.profiles[1].tls_profile = if stream_up {
+        wrong_pin.stream_up_profile()
+    } else {
+        wrong_pin.profile()
+    };
+    run_client(&config_path, invalid, fixture.origin, false).await;
+    // Correct pin with the opposite HTTP mode must not open a tunnel.
+    imported.client.profiles[1].tls_profile = if stream_up {
+        pin.profile()
+    } else {
+        pin.stream_up_profile()
+    };
+    run_client(&config_path, imported, fixture.origin, false).await;
+}
+
 async fn run_client(
     config_path: &Path,
     mut client_doc: ClientDocument,
@@ -271,6 +360,10 @@ async fn run_client(
             .arg(config_path)
             .env_remove("THEIA_AUTH_TOKEN")
             .env(
+                "THEIA_F18_XHOST_TOKEN",
+                std::env::var("THEIA_F14_XHOST_TOKEN").unwrap(),
+            )
+            .env(
                 "THEIA_F14_XHOST_WRONG_TOKEN",
                 URL_SAFE_NO_PAD.encode([0x99; 32]),
             )
@@ -290,7 +383,7 @@ async fn run_client(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "required by the dedicated native Windows + Linux VM cross-OS CI job"]
 async fn linux_server_windows_client_f14_h2_h3_open_ok() {
-    timeout(Duration::from_secs(150), async {
+    timeout(Duration::from_secs(240), async {
         assert_eq!(std::env::var("THEIA_F14_XHOST_RUN").unwrap(), "yes");
         let endpoint = std::env::var("THEIA_F14_XHOST_ENDPOINT").unwrap();
         let target = endpoint.parse::<SocketAddr>().unwrap();
@@ -319,6 +412,12 @@ async fn linux_server_windows_client_f14_h2_h3_open_ok() {
             client_scenario(&fixture, transport, false, false).await;
             client_scenario(&fixture, transport, true, false).await;
             client_scenario(&fixture, transport, false, true).await;
+            for stream_up in [false, true] {
+                pinned_client_scenario(&fixture, transport, stream_up).await;
+            }
+        }
+        for stream_up in [false, true] {
+            pinned_client_scenario(&fixture, Transport::Auto, stream_up).await;
         }
     })
     .await

@@ -154,7 +154,7 @@ fn v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile() {
 }
 
 #[test]
-fn v1_invite_rejects_new_mode_and_identity_injection_without_a_version_bump() {
+fn replacement_v1_invite_rejects_unsupported_mode_and_identity_injection() {
     let cfg = checked_server_fixture();
     let public = Invitation::public_from_server(&cfg, "public").unwrap();
     let token = [0x42; 32];
@@ -170,8 +170,8 @@ fn v1_invite_rejects_new_mode_and_identity_injection_without_a_version_bump() {
         let text = std::str::from_utf8(&wire).unwrap();
         for profile in ["smart-reality-v1", "browser-h2-btls-v1", "reality"] {
             let changed = text.replace(
-                "tls_profile = \"default\"",
-                &format!("tls_profile = \"{profile}\""),
+                "security_mode = \"own-tls\"",
+                &format!("security_mode = \"{profile}\""),
             );
             assert!(changed != text);
             let encoded = URL_SAFE_NO_PAD.encode(changed.as_bytes());

@@ -222,3 +222,7 @@ Production `pinned-cert-v1` — дополнительный exact leaf SHA-256 
 ## ADR-0084: собственные SmartTheia REALITY и XHTTP
 
 Целевой security adapter и carrier являются самостоятельными аналогами, не копиями Xray. XHTTP является транспортом SmartTheia с общим frame/FSM на H2/H3. Реализуемый stream-up разделяет HTTP upload/download на одной проверенной сессии; дополнительные режимы не объявляются до отдельной реализации. `pinned-cert-stream-up-v1` сохраняет обычную PKI и дополнительный pin; это промежуточный профиль, не полноценный REALITY. Требования F-18 к идентичности, key lifecycle, независимому crypto review и мастеру сохраняются. См. IMPLEMENTATION_SPEC v0.4 и ADR-0084.
+
+ADR-0087: the sole replacement theia://v1/ invitation explicitly represents SmartTheia XHTTP, own TLS stream-one or intermediate pinned TLS stream-one/stream-up, and H2/H3/auto. The old default-only envelope is rejected; no v2, no compatibility adapter. CA remains independent; no runtime downgrade or activation. Full SmartTheia REALITY is not yet implemented. No candidate changes own server identity; no anti-probing/replay or flow-shaping claim.
+
+ADR-0088 implements a production TLS-exporter-bound HTTP admission primitive for both intermediate pinned XHTTP profiles. Existing ring HMAC authenticates exact method/path/bearer within a specific verified connection; one logical admission per connection prevents copied proof replay. This is not an independent REALITY identity, protection against stolen bearer, active-probing resistance or F-19 shaping.

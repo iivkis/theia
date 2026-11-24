@@ -131,7 +131,8 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
     token = secrets.token_bytes(32)
     digest = hashlib.sha256(token).hexdigest()
     token_b64 = base64.urlsafe_b64encode(token).decode("ascii").rstrip("=")
-    port = secrets.randbelow(8000) + 42000
+    # Reserve two adjacent ports for the pinned inbounds.
+    port = secrets.randbelow(7998) + 42000
     origin = secrets.randbelow(8000) + 52000
     if port == origin:
         origin += 1
@@ -177,7 +178,7 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
                     if server.poll() is not None:
                         details = server.stderr.read().decode("utf-8", "replace")
                         raise RuntimeError("Linux server failed to start: " + details[-1500:])
-                    if guest_exists(guest_dir + "/ready") and is_listening(ip, port):
+                    if guest_exists(guest_dir + "/ready") and all(is_listening(ip, port + offset) for offset in range(3)):
                         break
                     time.sleep(0.25)
                 else:
@@ -204,9 +205,9 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
                     ],
                     env=env,
                     check=True,
-                    timeout=270,
+                    timeout=300,
                 )
-                print("F-14: real H2/H3 OPEN_OK, SOCKS5/CONNECT and PKI/auth negatives passed")
+                print("F-14/F-18: real H2/H3 OPEN_OK, pinned XHTTP and PKI/auth/identity negatives passed")
             finally:
                 subprocess.run(
                     wsl_command("touch", guest_dir + "/stop"),
