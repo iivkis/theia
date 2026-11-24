@@ -67,7 +67,11 @@ impl Anchor {
         if !scope.valid() || public_key == [0; 32] || minimum_revision == 0 {
             return Err(Error::Format);
         }
-        Ok(Self { scope, public_key, minimum_revision })
+        Ok(Self {
+            scope,
+            public_key,
+            minimum_revision,
+        })
     }
 }
 
@@ -137,13 +141,19 @@ fn canonical_base64<const N: usize>(raw: &str) -> Result<[u8; N], Error> {
 impl Descriptor {
     fn validate(&self) -> Result<(), Error> {
         let prefix = self.path_prefix.strip_prefix("/v1/").ok_or(Error::Format)?;
-        if self.schema_version != 1 || self.wire_version != 1
-            || self.revision == 0 || self.not_before >= self.not_after
-            || !self.scope.valid() || !(1..=3).contains(&self.references.len())
+        if self.schema_version != 1
+            || self.wire_version != 1
+            || self.revision == 0
+            || self.not_before >= self.not_after
+            || !self.scope.valid()
+            || !(1..=3).contains(&self.references.len())
             || usize::from(self.active_reference) >= self.references.len()
             || !(self.stream_one || self.stream_up)
-            || prefix.is_empty() || prefix.len() > 64
-            || !prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || prefix.is_empty()
+            || prefix.len() > 64
+            || !prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             || self.padding.header_min > self.padding.header_max
             || self.padding.header_max > 8192
             || self.padding.frame_min > self.padding.frame_max
@@ -156,10 +166,12 @@ impl Descriptor {
             return Err(Error::Format);
         }
         for (i, reference) in self.references.iter().enumerate() {
-            if !config::valid_dns(&reference.server_name) || reference.port == 0
+            if !config::valid_dns(&reference.server_name)
+                || reference.port == 0
                 || reference.server_name != reference.server_name.to_ascii_lowercase()
-                || self.references[..i].iter().any(|old|
-                    old.server_name == reference.server_name && old.port == reference.port)
+                || self.references[..i].iter().any(|old| {
+                    old.server_name == reference.server_name && old.port == reference.port
+                })
             {
                 return Err(Error::Format);
             }
@@ -221,7 +233,9 @@ pub struct Verified {
     signer: [u8; 32],
 }
 impl Verified {
-    pub fn descriptor(&self) -> &Descriptor { &self.descriptor }
+    pub fn descriptor(&self) -> &Descriptor {
+        &self.descriptor
+    }
     pub fn check_time(&self, now: u64) -> Result<(), Error> {
         if now < self.descriptor.not_before || now >= self.descriptor.not_after {
             return Err(Error::Validity);
@@ -242,7 +256,10 @@ impl Verified {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Change { Unchanged, Advanced }
+pub enum Change {
+    Unchanged,
+    Advanced,
+}
 
 /// Verify signature BEFORE parsing the signed payload. Only exact typed,
 /// canonical TOML is accepted, with no extra, duplicate or unknown fields.
@@ -253,13 +270,16 @@ pub fn verify(document: &str, anchor: &Anchor) -> Result<Verified, Error> {
         return Err(Error::Format);
     }
     let envelope: Envelope = toml::from_str(document).map_err(|_| Error::Format)?;
-    let payload = URL_SAFE_NO_PAD.decode(&envelope.payload).map_err(|_| Error::Format)?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(&envelope.payload)
+        .map_err(|_| Error::Format)?;
     if payload.len() > MAX_PAYLOAD || URL_SAFE_NO_PAD.encode(&payload) != envelope.payload {
         return Err(Error::Format);
     }
     let signature = canonical_base64::<64>(&envelope.signature)?;
     UnparsedPublicKey::new(&ED25519, anchor.public_key)
-        .verify(&signing_input(&payload), &signature).map_err(|_| Error::Signature)?;
+        .verify(&signing_input(&payload), &signature)
+        .map_err(|_| Error::Signature)?;
     let text = std::str::from_utf8(&payload).map_err(|_| Error::Format)?;
     let descriptor: Descriptor = toml::from_str(text).map_err(|_| Error::Format)?;
     if descriptor.payload()? != text {
@@ -276,7 +296,11 @@ pub fn verify(document: &str, anchor: &Anchor) -> Result<Verified, Error> {
             return Err(Error::Format);
         }
     }
-    Ok(Verified { descriptor, digest: Sha256::digest(payload).into(), signer: anchor.public_key })
+    Ok(Verified {
+        descriptor,
+        digest: Sha256::digest(payload).into(),
+        signer: anchor.public_key,
+    })
 }
 
 /// Local-only store. The path must be absolute and its directory trusted.
@@ -291,7 +315,10 @@ impl Store {
         if !crate::bounded_input::explicit_file_path(path) {
             return Err(Error::Storage);
         }
-        Ok(Self { anchor, path: path.to_owned() })
+        Ok(Self {
+            anchor,
+            path: path.to_owned(),
+        })
     }
 
     fn snapshot(&self) -> Result<(String, Verified), Error> {

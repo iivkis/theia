@@ -753,12 +753,16 @@ fn atomic_write_bytes(
             // pathname (including a symlink). Unsupported filesystems refuse.
             fs::hard_link(&temp, path)
                 .map_err(|_| ConfigError::new("config", "cannot publish new trust snapshot"))?;
-            fs::remove_file(&temp).map_err(|_| WriteFailure::AfterReplace(
-                ConfigError::new("config", "cannot remove published temporary link")
-            ))?;
+            fs::remove_file(&temp).map_err(|_| {
+                WriteFailure::AfterReplace(ConfigError::new(
+                    "config",
+                    "cannot remove published temporary link",
+                ))
+            })?;
         } else {
-            fs::rename(&temp, path)
-                .map_err(|_| ConfigError::new("config", "cannot atomically replace configuration"))?;
+            fs::rename(&temp, path).map_err(|_| {
+                ConfigError::new("config", "cannot atomically replace configuration")
+            })?;
         }
         sync_parent(parent).map_err(WriteFailure::AfterReplace)?;
         Ok(())
