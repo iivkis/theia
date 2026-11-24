@@ -38,6 +38,8 @@ struct Record {
     scope: Scope,
     generation: u64,
     clock_floor: u64,
+    // Exact approved plan, including IP pins and declared server addresses.
+    plan_sha256: [u8; 32],
     active_key: String,
     active_document: String,
     retired: Vec<String>,
@@ -83,6 +85,7 @@ impl Record {
         if self.schema_version != 1
             || self.generation == 0
             || self.clock_floor == 0
+            || self.plan_sha256 == [0; 32]
             || self.retired.len() > 64
         {
             return Err(Error::Format);
@@ -250,6 +253,7 @@ impl Publication {
                 scope,
                 generation: 1,
                 clock_floor: now,
+                plan_sha256: state.plan().digest().map_err(|_| Error::Health)?,
                 active_key: key_file,
                 active_document,
                 retired: Vec::new(),
@@ -266,6 +270,7 @@ impl Publication {
         record.check_clock(now)?;
         Ok(Status {
             generation: record.generation,
+            plan_sha256: record.plan_sha256,
             snapshot_sha256: bootstrap::digest(&raw),
             revision: checked.current.descriptor().revision,
             active_fingerprint: bootstrap::fingerprint(checked.active.public_key()),
@@ -305,6 +310,9 @@ impl Publication {
             return Err(Error::Approval);
         }
         record.check_clock(now)?;
+        if state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256 {
+            return Err(Error::Approval);
+        }
         record.active_document =
             bootstrap::refresh_descriptor(state, &checked.active, &record.active_document, now)?;
         record.advance(now)?;
@@ -405,6 +413,7 @@ impl Publication {
 
 pub struct Status {
     pub generation: u64,
+    pub plan_sha256: [u8; 32],
     pub snapshot_sha256: [u8; 32],
     pub revision: u64,
     pub active_fingerprint: [u8; 32],
@@ -478,6 +487,16 @@ mod tests {
         assert!(publication.initialize(&state, &old_key, now).is_err());
         let start = publication.inspect(now).unwrap();
         let initial = publication.documents(now).unwrap().0;
+        let mut substituted = state.plan().clone();
+        substituted.references[0].address = "93.184.216.3:443".parse().unwrap();
+        let substituted = reference_health::State::new(
+            substituted,
+            vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }],
+            now,
+        ).unwrap();
+        assert!(matches!(publication.refresh(&substituted, start.snapshot_sha256, now + 1), Err(Error::Approval)));
+        assert_eq!(publication.inspect(now + 1).unwrap().snapshot_sha256, start.snapshot_sha256);
+        assert_eq!(start.plan_sha256, state.plan().digest().unwrap());
         let fingerprint = bootstrap::fingerprint(next.public_key());
         assert!(publication
             .begin_rotation(&next_key, [0; 32], fingerprint, now + 1)

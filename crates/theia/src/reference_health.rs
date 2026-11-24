@@ -431,6 +431,11 @@ async fn check_target(target: &Target, roots: &RootCertStore, own: &HashSet<IpAd
         round.h2_status = h2.ok().flatten();
         round.h3_status = h3.ok().flatten();
     }
+    // Check once more after the application observations: a DNS change
+    // during the last handshake must not be recorded as fresh evidence.
+    if fresh_dns(target, own).await.is_err() {
+        return Evidence::default();
+    }
     Evidence {
         h2_status: stable(rounds[0].h2_status, rounds[1].h2_status),
         h3_status: stable(rounds[0].h3_status, rounds[1].h3_status),
@@ -543,6 +548,12 @@ impl State {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Evidence digest binds the exact approved pins, check timestamp,
+    /// revision and observed transport status for a guarded preview.
+    pub fn snapshot_sha256(&self) -> Result<[u8; 32], Error> {
+        Ok(digest(&self.encode()?))
     }
 
     pub fn plan(&self) -> &Plan {

@@ -19,6 +19,8 @@ theia reality preview-import --invitation PATH\n\
 theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --token-ref REF --confirm\n\
 theia reality inspect --profile PATH\n\
+theia reality recovery-preview --profile PATH --descriptor PATH\n\
+theia reality recovery-apply --profile PATH --descriptor PATH --expected-revision N --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality publish-new --health PATH --key PATH --publication PATH --confirm\n\
 theia reality publish-status --publication PATH\n\
 theia reality publish-refresh --health PATH --publication PATH --sha256 HEX --confirm\n\
@@ -75,6 +77,17 @@ pub enum Command {
     },
     Inspect {
         profile: String,
+    },
+    RecoveryPreview {
+        profile: String,
+        descriptor: String,
+    },
+    RecoveryApply {
+        profile: String,
+        descriptor: String,
+        revision: u64,
+        digest: [u8; 32],
+        identity: [u8; 32],
     },
     PublishNew {
         health: String,
@@ -199,6 +212,17 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
             }
         }
         ["inspect", "--profile", p] => Command::Inspect { profile: path(p)? },
+        ["recovery-preview", "--profile", p, "--descriptor", d] => Command::RecoveryPreview {
+            profile: path(p)?,
+            descriptor: path(d)?,
+        },
+        ["recovery-apply", "--profile", p, "--descriptor", d, "--expected-revision", r, "--sha256", h, "--identity-sha256", i, "--confirm"] => Command::RecoveryApply {
+            profile: path(p)?,
+            descriptor: path(d)?,
+            revision: crate::expected_revision(r)?,
+            digest: hash(h)?,
+            identity: hash(i)?,
+        },
         ["publish-new", "--health", h, "--key", k, "--publication", p, "--confirm"] => {
             Command::PublishNew {
                 health: path(h)?,
@@ -276,13 +300,28 @@ fn publication_status(
         .overlap_ends_at
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".into());
-    Ok(format!("Local publication; runtime UNCHANGED\ngeneration={}\nrevision={}\nvalid_now={}\nidentity_sha256={}\nnext_identity_sha256={}\noverlap_ends_at={}\nsnapshot_sha256={}",
-        status.generation, status.revision, status.valid_now, hex(status.active_fingerprint), next, ends, hex(status.snapshot_sha256)))
+    Ok(format!("Local publication; runtime UNCHANGED\ngeneration={}\nrevision={}\nvalid_now={}\nidentity_sha256={}\nnext_identity_sha256={}\noverlap_ends_at={}\nplan_sha256={}\nsnapshot_sha256={}",
+        status.generation, status.revision, status.valid_now, hex(status.active_fingerprint), next, ends, hex(status.plan_sha256), hex(status.snapshot_sha256)))
 }
 
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
+        Command::RecoveryPreview { profile, descriptor } => {
+            let profile = Profile::read(Path::new(&profile))?;
+            let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
+            let preview = profile.preview_recovery(&raw, now)?;
+            Ok(format!("Offline recovery preview; runtime UNCHANGED\nexpected_revision={}\nnext_revision={}\ncurrent_expired={}\nreference_changed={}\ndocument_sha256={}\nidentity_sha256={}\nConfirm the fingerprint independently. This cannot recover a compromised or retired identity.",
+                preview.expected_revision, preview.next_revision, preview.current_expired, preview.reference_changed, hex(preview.document_sha256), hex(preview.identity_sha256)))
+        }
+        Command::RecoveryApply { profile, descriptor, revision, digest, identity } => {
+            let profile = Profile::read(Path::new(&profile))?;
+            let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
+            profile.recover(&raw, bootstrap::RecoveryApproval {
+                expected_revision: revision, document_sha256: digest, identity_sha256: identity,
+            }, now)?;
+            Ok("Trust snapshot recovered; profile, credentials and runtime UNCHANGED".into())
+        }
         Command::PublishNew {
             health,
             key,
