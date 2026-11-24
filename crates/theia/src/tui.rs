@@ -12,6 +12,7 @@ use crate::{
     tui_editor::{Editor, PinnedModeReview, RecordAction, RecordReview},
     tui_probe::ProbePanel,
     tui_reality_provision::ProvisionPanel,
+    tui_reality_enroll::EnrollmentPanel,
     tui_runtime::RuntimePanel,
     Role,
 };
@@ -308,6 +309,7 @@ struct Interaction {
     domain: Option<DomainPanel>,
     probe: Option<ProbePanel>,
     reality_provision: Option<ProvisionPanel>,
+    reality_enrollment: Option<EnrollmentPanel>,
     runtime: Option<RuntimePanel>,
     pinned_review: Option<PinnedModeReview>,
     pinned_loading: Option<mpsc::Receiver<PinnedReviewResult>>,
@@ -333,6 +335,7 @@ impl Interaction {
             domain: None,
             probe: None,
             reality_provision: None,
+            reality_enrollment: None,
             runtime: None,
             pinned_review: None,
             pinned_loading: None,
@@ -429,6 +432,10 @@ impl Interaction {
     }
 
     fn paste_record_field(&mut self, text: &str) {
+        if let Some(panel) = self.reality_enrollment.as_mut() {
+            panel.paste(text);
+            return;
+        }
         if let Some(panel) = self.reality_provision.as_mut() {
             panel.paste(text);
             return;
@@ -548,6 +555,10 @@ impl Interaction {
             if proxy.key(key) {
                 self.system_proxy = None;
             }
+            return false;
+        }
+        if let Some(panel) = self.reality_enrollment.as_mut() {
+            if panel.key(key) { self.reality_enrollment = None; }
             return false;
         }
         if let Some(panel) = self.reality_provision.as_mut() {
@@ -713,6 +724,10 @@ impl Interaction {
             return false;
         }
         let Some(editor) = self.editor.as_mut() else {
+            if model.screen == Screen::Client && key.code == KeyCode::Char('I') {
+                self.reality_enrollment = Some(EnrollmentPanel::new());
+                return false;
+            }
             if model.screen == Screen::Server && key.code == KeyCode::Char('W') {
                 self.reality_provision = Some(ProvisionPanel::new());
                 return false;
@@ -1369,6 +1384,15 @@ impl Interaction {
                 }
                 return false;
             }
+            if editor.role() == Role::Client && key.code == KeyCode::Char('I') {
+                if editor.dirty() {
+                    editor.error = Some("Сохраните или отмените черновик перед импортом REALITY.".into());
+                } else {
+                    editor.error = None;
+                    self.reality_enrollment = Some(EnrollmentPanel::new());
+                }
+                return false;
+            }
             if editor.role() == Role::Client && key.code == KeyCode::Char('i') {
                 if editor.dirty() {
                     editor.error = Some("Сохраните или отмените черновик перед импортом.".into());
@@ -1525,7 +1549,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         ),
     }
-    if let Some(provision) = interaction.and_then(|ui| ui.reality_provision.as_ref()) {
+    if let Some(enrollment) = interaction.and_then(|ui| ui.reality_enrollment.as_ref()) {
+        panel(frame, parts[1], "F-18: импорт REALITY", &enrollment.body(), true);
+    } else if let Some(provision) = interaction.and_then(|ui| ui.reality_provision.as_ref()) {
         panel(frame, parts[1], "F-18: подготовка REALITY", &provision.body(), true);
     } else if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
         panel(frame, parts[1], runtime.title(), &runtime.body(), true);
@@ -1642,7 +1668,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     }
     let footer = if model.screen == Screen::Client {
-        "N/D/A/E: профили  p: Windows proxy  i: импорт  Ctrl+S: сохранить"
+        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  Ctrl+S: сохранить"
     } else {
         "N/D/G/U/E: записи  W: REALITY  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
     };
@@ -1959,6 +1985,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(provision) = interaction.reality_provision.as_mut() {
             provision.poll();
+        }
+        if let Some(enrollment) = interaction.reality_enrollment.as_mut() {
+            enrollment.poll();
         }
         if let Some(domain) = interaction.domain.as_mut() {
             domain.poll();
@@ -3005,6 +3034,20 @@ mod tests {
         assert!(ui.revocation.is_none());
         assert!(ui.editor.as_ref().unwrap().dirty());
         fs::remove_file(server_path).unwrap();
+    }
+
+    #[test]
+    fn reality_enrollment_panel_is_client_only() {
+        let mut ui = Interaction::new(None);
+        let mut model = Model::new(Some(Role::Server));
+        ui.update(&mut model, press(KeyCode::Char('I')));
+        assert!(ui.reality_enrollment.is_none());
+        model.update(press(KeyCode::Char('2')));
+        ui.update(&mut model, press(KeyCode::Char('I')));
+        assert!(ui.reality_enrollment.is_some());
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("F-18: импорт REALITY"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.reality_enrollment.is_none());
     }
 
     #[test]
