@@ -20,6 +20,12 @@
 
 **Не подтверждено:** расшифрованный QUIC Initial CRYPTO и полный on-wire TLS ClientHello/transport parameters, воспроизведение browser H3 fingerprint, modified REALITY first flight, early server-side client authentication/anti-probing, replays после перезапуска, полноценный F-18 security mode или F-19 shaping. HTTP 200 в исследовательском эксперименте **не** SmartTheia OPEN_OK. Это исследовательский тест, а не новый runtime security mode. Отдельное доказательство совместимости modification backend и независимый crypto review остаются блокирующими.
 
+## M3.5a3 — восстановленный из настоящего QUIC Initial ClientHello + active-probe baseline
+
+[ADR-0061](adr/0061-f18-m3-5a3-initial-visibility-active-probing.md) дополняет M3.5a2: native CI теперь не только разбирает открытые метаданные QUIC Initial, но и **с использованием публичной библиотеки Quinn** (без собственной AEAD/HKDF) восстанавливает Initial packet, проверяет AEAD и декодирует first ClientHello из настоящей loopback UDP datagram. Независимый тестовый certificate/private key для observer подтверждает, что Initial keys восстанавливаются из публичного CID и версии QUIC, **без** секретов сервера. Проверяются TLS1.3, признак SNI, ALPN h3, QUIC TLS transport parameters, наличие/отсутствие ALPS/GREASE и fail-closed на изменённый ciphertext. В CI нет сохранения pcap/сырого ClientHello/имени хоста или CID в логах; ограниченный parser **не** полноценная обработка coalesced Initial/Retry.
+
+Реальный production H3 listener отдельно проверяется на **активное зондирование**: доверенный TLS peer без bearer может получить `HTTP 401` на `POST /v1/session`, с неверным bearer тоже получает `401`; с корректным bearer виден `HTTP 200` **до OPEN_OK**. Это безопасная авторизация обычного Theia v1 без неавторизованного relay, но **не** скрытый REALITY-like режим. F-18 остаётся **P0 blocked**: до production необходимы независимый crypto review, pre-auth anti-probing state machine, modified first-flight backend feasibility, настоящий браузерный H2/H3 reference, versioned schema/invite и end-to-end fail-closed security.
+
 ## M3.5b1 — чистый offline planner кандидатов (реализован частично)
 
 Файл `crates/theia/src/camouflage_discovery.rs`, integration tests `crates/theia/tests/camouflage_discovery.rs`, ADR-0022. Код в текущем *едином* Rust binary (library module) без новых зависимостей, не имеет ни socket/DNS/HTTP/TLS вызовов, ни CLI/TUI команды:
