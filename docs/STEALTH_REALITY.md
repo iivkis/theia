@@ -14,6 +14,12 @@
 
 Этот код существует **только в CI integration tests**, не доступен из production server/client, не меняет TOML/invite v1 и **не является** REALITY-подобным режимом, реальным on-wire contract, anti-probing или TLS camouflage. Подпись после обычного TLS не скрывает первый TLS/QUIC handshake. M3.5a2 QUIC first-flight и независимый security review остаются блокирующими перед любым user-facing mode. Нельзя считать F-18 выполненным по этим тестам.
 
+## M3.5a2 — реальный QUIC Initial witness + HTTP/3 DATA proof (research-only)
+
+[ADR-0060](adr/0060-f18-m3-5a2-quic-initial-h3-research.md) и `crates/theia/tests/f18_h3_first_flight.rs` добавляют **нативный Linux/Windows CI-only эксперимент**. Настоящий Quinn client отправляет Initial через строго локальный bounded UDP observer, который разбирает **только открытые QUIC v1 long-header поля**: тип пакета, версию, длины CID, token length, packet/datagram length и обязательное QUIC-пополнение до ≥1200 байт. Не сохраняются байты пакетов, реальные CID, секреты, TLS ClientHello или адреса пользователя. В том же controlled loopback используется строгий QUIC/TLS1.3/CA/SAN/SNI/ALPN=h3 и настоящий **HTTP/3 POST DATA** для challenge/Ed25519-pinned identity response с real post-handshake exporter. Неправильный публичный ключ, H2↔H3 подмена и replay отвергаются test-only verifier; malformed/short/non-v1 Initial не выдаются за доказательство.
+
+**Не подтверждено:** расшифрованный QUIC Initial CRYPTO и полный on-wire TLS ClientHello/transport parameters, воспроизведение browser H3 fingerprint, modified REALITY first flight, early server-side client authentication/anti-probing, replays после перезапуска, полноценный F-18 security mode или F-19 shaping. HTTP 200 в исследовательском эксперименте **не** SmartTheia OPEN_OK. Это исследовательский тест, а не новый runtime security mode. Отдельное доказательство совместимости modification backend и независимый crypto review остаются блокирующими.
+
 ## M3.5b1 — чистый offline planner кандидатов (реализован частично)
 
 Файл `crates/theia/src/camouflage_discovery.rs`, integration tests `crates/theia/tests/camouflage_discovery.rs`, ADR-0022. Код в текущем *едином* Rust binary (library module) без новых зависимостей, не имеет ни socket/DNS/HTTP/TLS вызовов, ни CLI/TUI команды:
