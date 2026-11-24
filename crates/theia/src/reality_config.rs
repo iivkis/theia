@@ -34,6 +34,8 @@ pub struct ClientRequest {
 pub enum Request {
     Server(ServerRequest),
     Client(ClientRequest),
+    /// Explicit independent re-enrollment, never an automatic trust transition.
+    Reenroll(ClientRequest),
 }
 
 pub struct Prepared {
@@ -152,6 +154,48 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
                 r.id, profile.endpoint(), hex(bootstrap::fingerprint(value.signer())), value.descriptor().revision,
                 modes.h2, modes.h3, modes.stream_one, modes.stream_up);
             (report, value.payload_sha256())
+        }
+        (Config::Client(document), Request::Reenroll(r)) => {
+            let entry = document.client.profiles.iter_mut().find(|p| p.id == r.id).ok_or(Error::Scope)?;
+            let old = pinned_client(entry)?;
+            let binding = entry.reality_profile.as_ref().ok_or(Error::Format)?;
+            let new_path = path_string(&r.enrollment)?;
+            if new_path == binding.enrollment { return Err(Error::Approval); }
+            let (replacement, enrollment_sha256) = bootstrap::Profile::read_snapshot(&r.enrollment)?;
+            if !bool::from(replacement.enrollment_identity()?.ct_eq(&r.identity_sha256)) {
+                return Err(Error::Approval);
+            }
+            let (new_snapshot, value) = replacement.store()?.inspect_bound(now).map_err(|_| Error::Descriptor)?;
+            value.check_time(now).map_err(|_| Error::Descriptor)?;
+            // This is a freshly and independently enrolled root, not a
+            // successor inferred from untrusted data or a historical key.
+            if bootstrap::fingerprint(value.signer()) != r.identity_sha256 {
+                return Err(Error::Identity);
+            }
+            let (old_snapshot, previous) = old.store()?.inspect_replacement(value.signer(), now)
+                .map_err(|_| Error::Descriptor)?;
+            if previous.descriptor().scope != value.descriptor().scope
+                || old.endpoint() != replacement.endpoint()
+                || old.policy().transport != replacement.policy().transport
+                || old.policy().xhttp_mode != replacement.policy().xhttp_mode {
+                return Err(Error::Scope);
+            }
+            let credential_changed = entry.auth_token != replacement.credential_reference();
+            entry.auth_token = replacement.credential_reference().to_owned();
+            entry.reality_profile = Some(RealityClientBinding {
+                enrollment: new_path, enrollment_sha256, identity_sha256: r.identity_sha256,
+            });
+            // Keep the old files untouched for investigation. The normal
+            // config CAS is the only publication point of the replacement.
+            let mut hash = Sha256::new();
+            hash.update(b"Theia/independent-reenrollment/v1\0");
+            hash.update(old_snapshot);
+            hash.update(new_snapshot);
+            let evidence = hash.finalize().into();
+            let report = format!("Independent REALITY re-enrollment; saved configuration only\nprofile={}\nendpoint={}\nold_identity_sha256={}\nnew_identity_sha256={}\nold_revision={}\nnew_revision={}\nold_valid_now={}\ncredential_reference_changed={}\nConfirm new identity independently. Not an automatic trust transition. Old enrollment and trust files retained. Active profile, transport policy and proxy unchanged; no runtime activation.",
+                r.id, old.endpoint(), hex(bootstrap::fingerprint(previous.signer())), hex(r.identity_sha256),
+                previous.descriptor().revision, value.descriptor().revision, previous.check_time(now).is_ok(), credential_changed);
+            (report, evidence)
         }
         _ => return Err(Error::Format),
     };
@@ -333,6 +377,61 @@ mod tests {
         let mut mixed = saved;
         mixed.server.inbounds.last_mut().unwrap().tls_cert = "file:/tmp/foreign.pem".into();
         assert!(Config::Server(mixed).validate().is_err());
+    }
+
+    #[test]
+    fn independent_reenrollment_replaces_only_selected_binding_and_requires_fresh_confirmation() {
+        let dir = Scratch::new();
+        let state = health();
+        let scope = Scope { inbound: state.plan().inbound.clone(), endpoint: state.plan().endpoint.clone() };
+        let old = Identity::generate(scope.clone()).unwrap();
+        let next = Identity::generate(scope).unwrap();
+        let enroll = |identity: &Identity, state: &State, name: &str, now: u64| {
+            let signed = bootstrap::initial_descriptor(state, identity, now).unwrap();
+            let invitation = bootstrap::Invitation::public(identity, &signed, now).unwrap();
+            let uri = invitation.encode().unwrap();
+            let admission = dir.0.join(format!("{name}-admission"));
+            Secret::generate().unwrap().save_new(identity.scope(), &admission).unwrap();
+            let enrollment = dir.0.join(format!("{name}-enrollment"));
+            let trust = dir.0.join(format!("{name}-trust"));
+            let pin = invitation.fingerprint();
+            bootstrap::import(&uri, bootstrap::ImportApproval { document_sha256: bootstrap::digest(&uri), identity_sha256: pin },
+                &enrollment, &trust, bootstrap::EnrollmentMaterial { admission_path: &admission,
+                    expected_admission: None, external_token: Some("env:THEIA_TEST") }, bootstrap::auto_policy(), now).unwrap();
+            (enrollment, trust, pin, signed)
+        };
+        let (old_path, old_trust, old_pin, _) = enroll(&old, &state, "old", 1000);
+        let cfg = dir.0.join("client.toml");
+        std::fs::write(&cfg, include_str!("../../../examples/client.toml")).unwrap();
+        let initial = Request::Client(ClientRequest { enrollment: old_path.clone(), identity_sha256: old_pin, id: "recovery".into() });
+        let preview = prepare(&cfg, &initial, 1000).unwrap();
+        apply(&cfg, &initial, preview.approval_sha256(), 1000).unwrap();
+        let Config::Client(before) = config::read_file(&cfg).unwrap() else { panic!() };
+        let expired = validate_client(before.client.profiles.last().unwrap(), 1000).unwrap().descriptor().not_after;
+        let fresh = State::new(state.plan().clone(), vec![Evidence { h2_status: Some(200), h3_status: None }], expired).unwrap();
+        let (new_path, new_trust, new_pin, signed) = enroll(&next, &fresh, "new", expired);
+        let req = ClientRequest { enrollment: new_path.clone(), identity_sha256: new_pin, id: "recovery".into() };
+        let old_bytes = std::fs::read(&old_trust).unwrap();
+        let before_bytes = std::fs::read(&cfg).unwrap();
+        assert!(prepare(&cfg, &Request::Reenroll(ClientRequest { identity_sha256: old_pin, ..req.clone() }), expired).is_err());
+        let request = Request::Reenroll(req);
+        let preview = prepare(&cfg, &request, expired).unwrap();
+        assert!(preview.report().contains("old_valid_now=false"));
+        assert!(!preview.report().contains("THEIA_TEST"));
+        assert_eq!(std::fs::read(&cfg).unwrap(), before_bytes);
+        assert_eq!(apply(&cfg, &request, [0;32], expired), Err(Error::Approval));
+        bootstrap::Profile::read(&new_path).unwrap().store().unwrap().update(&signed, expired + 1).unwrap();
+        assert_eq!(apply(&cfg, &request, preview.approval_sha256(), expired + 1), Err(Error::Approval));
+        let preview = prepare(&cfg, &request, expired + 1).unwrap();
+        apply(&cfg, &request, preview.approval_sha256(), expired + 1).unwrap();
+        let Config::Client(after) = config::read_file(&cfg).unwrap() else { panic!() };
+        assert_eq!(after.client.active_profile, before.client.active_profile);
+        assert_eq!(after.client.proxy, before.client.proxy);
+        assert_eq!(after.client.profiles.len(), before.client.profiles.len());
+        assert_eq!(validate_client(after.client.profiles.last().unwrap(), expired + 1).unwrap().signer(), next.public_key());
+        assert_eq!(std::fs::read(&old_trust).unwrap(), old_bytes);
+        assert!(old_path.exists() && new_trust.exists());
+        assert!(prepare(&cfg, &request, expired + 1).is_err());
     }
 
     #[test]

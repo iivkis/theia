@@ -564,9 +564,25 @@ impl Store {
     /// Authenticated local snapshot for offline review. Expiration does
     /// not erase the revision floor; callers must display validity separately.
     pub fn inspect(&self, now: u64) -> Result<Verified, Error> {
-        let (_, _, history, verified) = self.snapshot()?;
+        self.inspect_bound(now).map(|(_, value)| value)
+    }
+
+    pub(crate) fn inspect_bound(&self, now: u64) -> Result<([u8;32], Verified), Error> {
+        let (raw, _, history, verified) = self.snapshot()?;
         history.check_clock(now)?;
-        Ok(verified)
+        Ok((Sha256::digest(raw.as_bytes()).into(), verified))
+    }
+
+    /// Independent re-enrollment must not resurrect a key this trust
+    /// history already retired, or disguise ordinary renewal as a reset.
+    pub(crate) fn inspect_replacement(&self, proposed: [u8;32], now: u64) -> Result<([u8;32], Verified), Error> {
+        let (raw, _, history, verified) = self.snapshot()?;
+        history.check_clock(now)?;
+        if proposed == self.anchor.public_key || proposed == verified.signer()
+            || history.retired.contains(&proposed) {
+            return Err(Error::Rotation);
+        }
+        Ok((Sha256::digest(raw.as_bytes()).into(), verified))
     }
 
     pub fn preview_update(&self, document: &str, now: u64) -> Result<(u64, Verified), Error> {

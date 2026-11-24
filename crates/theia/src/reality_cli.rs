@@ -14,6 +14,8 @@ theia reality registered-status --config PATH --id ID\n\
 theia reality register-server-preview --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID\n\
 theia reality register-server-save --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID --sha256 HEX --confirm\n\
 theia reality register-client-preview --config PATH --profile PATH --identity-sha256 HEX --id ID\n\
+theia reality reenroll-preview --config PATH --profile NEW_PATH --identity-sha256 HEX --id ID\n\
+theia reality reenroll-save --config PATH --profile NEW_PATH --identity-sha256 HEX --id ID --sha256 HEX --confirm-reenrollment\n\
 theia reality register-client-save --config PATH --profile PATH --identity-sha256 HEX --id ID --sha256 HEX --confirm\n\
 theia reality provision-preview --health PATH\n\
 theia reality provision-inspect --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX\n\
@@ -225,6 +227,21 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
                     enrollment: path(p)?.into(), identity_sha256: hash(i)?, id: (*id).to_owned(),
                 }),
                 approval: registration_approval(kind, tail)?,
+            }
+        }
+        [kind @ ("reenroll-preview" | "reenroll-save"), "--config", c, "--profile", p,
+            "--identity-sha256", i, "--id", id, tail @ ..] if config::valid_id(id) => {
+            let approval = match (*kind, tail) {
+                ("reenroll-preview", []) => None,
+                ("reenroll-save", ["--sha256", digest, "--confirm-reenrollment"]) => Some(hash(digest)?),
+                _ => return Err(CliError::InvalidArguments),
+            };
+            Command::RegisterConfig {
+                config: path(c)?,
+                request: reality_config::Request::Reenroll(reality_config::ClientRequest {
+                    enrollment: path(p)?.into(), identity_sha256: hash(i)?, id: (*id).to_owned(),
+                }),
+                approval,
             }
         }
         ["provision-preview", "--health", h] => Command::ProvisionPreview { health: path(h)? },
