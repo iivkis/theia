@@ -40,6 +40,12 @@
 
 Никаких изменений runtime, TLS verifier, TOML/invite, proxy или внешних сетевых целей. M3.5a5 не доказывает modified handshake, browser fingerprint, anti-probing, key lifecycle или самостоятельный security audit. До зелёного CI результат не подтверждён.
 
+## M3.5a6 — жизненный цикл доверенных ключей (CI-only policy model)
+
+[ADR-0063](adr/0063-f18-m3-5a6-key-lifecycle-model.md) и `crates/theia/tests/f18_key_lifecycle.rs` исследуют локальные, заранее авторизованные snapshots политики: конкретный inbound/hostname/port, строго возрастающее поколение, от нуля до двух одновременно разрешённых pin (явный пустой snapshot запрещает все proof), интервалы действия [from, until), перекрытие при ротации и досрочный отзыв без повторного допуска удалённого ключа в пределах одного процесса. Модель отвергает неправильный scope, H2/H3 substitution, downgrade до plain TLS, rollback поколения/часов, расширение срока старого pin и переполнение bounded истории отзыва без вытеснения. Сохраняется replay-cache между обновлениями политики.
+
+Используются настоящие test-only Ed25519 signatures и существующий research verifier, но synthetic exporter/nonce/time. Это **не** production key storage, authenticated update channel, persistent revocation, cross-process isolation или реальная реализация F-18. TLS и TOML/invite v1 неизменны. Обязателен полный native exact-head CI; до него результаты не подтверждены.
+
 ## M3.5b1 — чистый offline planner кандидатов (реализован частично)
 
 Файл `crates/theia/src/camouflage_discovery.rs`, integration tests `crates/theia/tests/camouflage_discovery.rs`, ADR-0022. Код в текущем *едином* Rust binary (library module) без новых зависимостей, не имеет ни socket/DNS/HTTP/TLS вызовов, ни CLI/TUI команды:
