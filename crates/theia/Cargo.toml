@@ -36,6 +36,8 @@ tokio-rustls = "=0.26.6"
 
 [dev-dependencies]
 rcgen = "=0.13.2"
+# Research-only F-18 signature lab; ring already ships transitively via rustls.
+ring = "=0.17.14"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.191"

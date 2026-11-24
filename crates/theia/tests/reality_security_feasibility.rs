@@ -29,6 +29,60 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroize;
 
+#[path = "support/f18_research_identity.rs"]
+mod f18_identity_lab;
+
+#[test]
+fn h3_identity_proof_must_be_signed_for_its_own_branch_not_replayed_from_h2() {
+    use f18_identity_lab::{Branch, Failure, ReplayWindow, Transcript};
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let signer = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let pinned: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
+    // These fixed bytes are *not* the entropy test. This checks that the
+    // H3-only branch is encoded and signed separately, not silently treated
+    // as an H2 proof. Verified QUIC exporters are exercised below.
+    let h2 = Transcript::new(
+        Branch::H2,
+        "localhost",
+        443,
+        [1; 32],
+        [2; 32],
+        [3; 32],
+        10_000,
+    )
+    .unwrap();
+    let h3 = Transcript::new(
+        Branch::H3,
+        "localhost",
+        443,
+        [1; 32],
+        [2; 32],
+        [3; 32],
+        10_000,
+    )
+    .unwrap();
+    let h2_signature = signer.sign(&h2.encode());
+    let h3_signature = signer.sign(&h3.encode());
+    let mut replay = ReplayWindow::new(4).unwrap();
+    assert_eq!(
+        replay.accept(&pinned, &h3, h2_signature.as_ref(), 10_000),
+        Err(Failure::InvalidProof)
+    );
+    assert_eq!(
+        replay.accept(&pinned, &h3, h3_signature.as_ref(), 10_000),
+        Ok(())
+    );
+    assert_eq!(
+        replay.accept(&pinned, &h3, h3_signature.as_ref(), 10_001),
+        Err(Failure::Replay)
+    );
+}
+
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-Theia-M3.5a-feasibility-only";
 const CONTEXT: &[u8] = b"test-only-domain-separated-channel-binding";
 const DEADLINE: Duration = Duration::from_secs(12);
@@ -325,4 +379,133 @@ async fn tls_exporter_is_unavailable_for_untrusted_certificates() {
     })
     .await
     .expect("test-only negative handshake completed within deadline");
+}
+
+/// M3.5a1 *research* application flight over a real, strictly verified
+/// TLS1.3/H2-ALPN channel. This does NOT modify TLS ClientHello, QUIC Initial,
+/// the production wire, existing bearer grants or active-probing behavior.
+/// Proof/signature and client challenge travel on this private loopback fixture
+/// only. The signed transcript contains the actual post-verification exporter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_tls_h2_channel_supports_independent_pinned_ed25519_identity_proof() {
+    use f18_identity_lab::{Branch, ReplayWindow, Transcript};
+    use ring::{
+        rand::{SecureRandom, SystemRandom},
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    timeout(DEADLINE, async {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let signer = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pinned: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
+        let mut signing_key = pkcs8.as_ref().to_vec();
+        let mut client_nonce = [0u8; 32];
+        rng.fill(&mut client_nonce).unwrap();
+
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let chain = vec![cert.cert.der().clone()];
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            chain.clone(),
+            PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        )
+        .unwrap();
+        server_tls.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(server_tls));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+            let mut received_nonce = [0u8; 32];
+            tls.read_exact(&mut received_nonce).await.unwrap();
+            let mut exporter = tls
+                .get_ref()
+                .1
+                .export_keying_material([0u8; 32], EXPORTER_LABEL, Some(CONTEXT))
+                .unwrap();
+            let mut server_nonce = [0u8; 32];
+            SystemRandom::new().fill(&mut server_nonce).unwrap();
+            let transcript = Transcript::new(
+                Branch::H2,
+                "localhost",
+                443,
+                received_nonce,
+                server_nonce,
+                exporter,
+                10_000,
+            )
+            .unwrap();
+            let signature = Ed25519KeyPair::from_pkcs8(&signing_key)
+                .unwrap()
+                .sign(&transcript.encode());
+            tls.write_all(&server_nonce).await.unwrap();
+            tls.write_all(signature.as_ref()).await.unwrap();
+            tls.flush().await.unwrap();
+            signing_key.zeroize();
+            exporter.zeroize();
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(chain[0].clone()).unwrap();
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = TlsConnector::from(Arc::new(client_tls));
+        let socket = TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), socket)
+            .await
+            .unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        tls.write_all(&client_nonce).await.unwrap();
+        tls.flush().await.unwrap();
+        let mut server_nonce = [0u8; 32];
+        let mut signature = [0u8; 64];
+        tls.read_exact(&mut server_nonce).await.unwrap();
+        tls.read_exact(&mut signature).await.unwrap();
+        let mut exporter = tls
+            .get_ref()
+            .1
+            .export_keying_material([0u8; 32], EXPORTER_LABEL, Some(CONTEXT))
+            .unwrap();
+        let transcript = Transcript::new(
+            Branch::H2,
+            "localhost",
+            443,
+            client_nonce,
+            server_nonce,
+            exporter,
+            10_000,
+        )
+        .unwrap();
+        let mut seen = ReplayWindow::new(8).unwrap();
+        assert_eq!(
+            seen.accept(&pinned, &transcript, &signature, 10_000),
+            Ok(())
+        );
+        assert_eq!(
+            seen.accept(&pinned, &transcript, &signature, 10_001),
+            Err(f18_identity_lab::Failure::Replay)
+        );
+        exporter.zeroize();
+        signature.zeroize();
+        server_task.await.unwrap();
+    })
+    .await
+    .expect("research-only independent TLS exporter identity proof bounded by deadline");
 }
