@@ -321,12 +321,22 @@ impl Publication {
             active_reference: checked.current.descriptor().active_reference,
             active_fingerprint: bootstrap::fingerprint(checked.active.public_key()),
             valid_now: checked.current.check_time(now).is_ok(),
+            not_after: checked.current.descriptor().not_after,
             next_fingerprint: checked
                 .next
                 .as_ref()
                 .map(|(key, _)| bootstrap::fingerprint(key.public_key())),
             overlap_ends_at: record.pending.as_ref().map(|pending| pending.ends_at),
         })
+    }
+
+    /// Read-only descriptor inspection tied to the exact approved publication.
+    /// Expiry does not remove the last authenticated configuration.
+    pub fn inspect_descriptor(&self, expected: [u8; 32], now: u64) -> Result<Verified, Error> {
+        let (raw, record, checked) = self.snapshot()?;
+        record.check_clock(now)?;
+        if bootstrap::digest(&raw) != expected { return Err(Error::Approval); }
+        Ok(checked.current)
     }
 
     /// Capture both signing generations from the same verified file
@@ -597,6 +607,7 @@ pub struct Status {
     pub active_reference: u8,
     pub active_fingerprint: [u8; 32],
     pub valid_now: bool,
+    pub not_after: u64,
     pub next_fingerprint: Option<[u8; 32]>,
     pub overlap_ends_at: Option<u64>,
 }

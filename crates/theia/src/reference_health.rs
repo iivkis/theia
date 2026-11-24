@@ -487,6 +487,7 @@ pub async fn check(plan: &Plan, approved: [u8; 32]) -> Result<Vec<Evidence>, Err
 pub struct Health {
     pub evidence: Evidence,
     pub failures: u8,
+    pub h3_failures: u8,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -524,6 +525,7 @@ impl State {
                 .map(|evidence| Health {
                     evidence,
                     failures: 0,
+                    h3_failures: if evidence.h3() { 0 } else { 1 },
                 })
                 .collect(),
         };
@@ -539,6 +541,7 @@ impl State {
             || self.health.len() != self.plan.references.len()
             || self.health.iter().any(|entry| {
                 !entry.evidence.valid() || (entry.failures == 0) != entry.evidence.eligible()
+                    || (entry.h3_failures == 0) != entry.evidence.h3()
             })
         {
             return Err(Error::Format);
@@ -595,6 +598,58 @@ impl State {
             .collect())
     }
 
+    /// Observe the actual published reference and required transport set,
+    /// not necessarily inventory index zero. H3 absence is a failure only
+    /// when the already signed descriptor offers H3.
+    pub fn active_status(
+        &self,
+        signed: &crate::descriptor::Descriptor,
+        now: u64,
+    ) -> Result<(PrimaryStatus, Option<usize>), Error> {
+        self.validate()?;
+        if now < self.last_checked_at { return Err(Error::Clock); }
+        if !self.matches_descriptor(signed) { return Err(Error::Approval); }
+        if now > self.next_check_at()?.saturating_add(JITTER) {
+            return Ok((PrimaryStatus::Stale, None));
+        }
+        let active_index = usize::from(signed.active_reference);
+        let active = self.health.get(active_index).ok_or(Error::Format)?;
+        let eligible = |index: usize, entry: &Health| {
+            entry.evidence.eligible() && (!signed.h3 || (entry.evidence.h3() && signed.references[index].h3))
+        };
+        if eligible(active_index, active) { return Ok((PrimaryStatus::Healthy, None)); }
+        let failures = if signed.h3 { active.failures.max(active.h3_failures) } else { active.failures };
+        if failures < FAILURE_THRESHOLD { return Ok((PrimaryStatus::Suspect, None)); }
+        let reserve = self.health.iter().enumerate()
+            .filter(|(index, entry)| *index != active_index && eligible(*index, entry))
+            .max_by_key(|(index, entry)| (entry.evidence.score(), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index);
+        Ok(match reserve {
+            Some(index) => (PrimaryStatus::Degraded, Some(index)),
+            None => (PrimaryStatus::Unavailable, None),
+        })
+    }
+
+    fn matches_descriptor(&self, signed: &crate::descriptor::Descriptor) -> bool {
+        signed.scope.inbound == self.plan.inbound
+            && signed.scope.endpoint == self.plan.endpoint
+            && signed.references.len() == self.plan.references.len()
+            && usize::from(signed.active_reference) < self.health.len()
+            && signed.references.iter().zip(&self.plan.references).all(|(reference, target)| {
+                reference.server_name == target.server_name && reference.port == target.address.port()
+            })
+    }
+
+    /// One bounded follow-up after the first failure, rather than waiting
+    /// another twelve hours to distinguish a transient outage.
+    pub fn next_active_check_at(&self, signed: &crate::descriptor::Descriptor, now: u64) -> Result<u64, Error> {
+        if self.active_status(signed, now)?.0 == PrimaryStatus::Suspect {
+            self.last_checked_at.checked_add(300).ok_or(Error::Clock)
+        } else {
+            self.next_check_at()
+        }
+    }
+
     /// Validate the active signed reference without requiring every inactive
     /// reserve to be currently reachable. References remain an approved
     /// inventory, not a promise that all of them are currently healthy.
@@ -607,19 +662,7 @@ impl State {
         if now < self.last_checked_at {
             return Err(Error::Clock);
         }
-        if now > self.next_check_at()?.saturating_add(JITTER)
-            || signed.scope.inbound != self.plan.inbound
-            || signed.scope.endpoint != self.plan.endpoint
-            || signed.references.len() != self.plan.references.len()
-            || signed
-                .references
-                .iter()
-                .zip(&self.plan.references)
-                .any(|(reference, target)| {
-                    reference.server_name != target.server_name
-                        || reference.port != target.address.port()
-                })
-        {
+        if now > self.next_check_at()?.saturating_add(JITTER) || !self.matches_descriptor(signed) {
             return Err(Error::NotEligible);
         }
         let active = self
@@ -640,41 +683,12 @@ impl State {
         signed: &crate::descriptor::Descriptor,
         now: u64,
     ) -> Result<usize, Error> {
-        self.validate()?;
-        if now < self.last_checked_at {
-            return Err(Error::Clock);
-        }
-        if now - self.last_checked_at > 60
-            || signed.scope.inbound != self.plan.inbound
-            || signed.scope.endpoint != self.plan.endpoint
-            || signed.references.len() != self.plan.references.len()
-            || signed
-                .references
-                .iter()
-                .zip(&self.plan.references)
-                .any(|(reference, target)| {
-                    reference.server_name != target.server_name
-                        || reference.port != target.address.port()
-                })
-        {
+        if now.checked_sub(self.last_checked_at).ok_or(Error::Clock)? > 60 {
             return Err(Error::NotEligible);
         }
-        let active_index = usize::from(signed.active_reference);
-        let active = self.health.get(active_index).ok_or(Error::Format)?;
-        if active.failures < FAILURE_THRESHOLD || active.evidence.eligible() {
-            return Err(Error::NotEligible);
-        }
-        self.health
-            .iter()
-            .enumerate()
-            .filter(|(index, health)| {
-                *index != active_index
-                    && health.evidence.eligible()
-                    && (!signed.h3 || (health.evidence.h3() && signed.references[*index].h3))
-            })
-            .max_by_key(|(index, health)| (health.evidence.score(), std::cmp::Reverse(*index)))
-            .map(|(index, _)| index)
-            .ok_or(Error::NotEligible)
+        let (status, reserve) = self.active_status(signed, now)?;
+        if status != PrimaryStatus::Degraded { return Err(Error::NotEligible); }
+        reserve.ok_or(Error::NotEligible)
     }
 
     pub fn next_check_at(&self) -> Result<u64, Error> {
@@ -705,6 +719,7 @@ impl State {
             } else {
                 entry.failures.saturating_add(1)
             };
+            entry.h3_failures = if observation.h3() { 0 } else { entry.h3_failures.saturating_add(1) };
             entry.evidence = observation;
         }
         next.validate()?;
@@ -751,11 +766,12 @@ impl State {
         );
         for (index, entry) in self.health.iter().enumerate() {
             result.push_str(&format!(
-                "\nreference[{index}]: h2={} h3={} score={} consecutive_failures={}",
+                "\nreference[{index}]: h2={} h3={} score={} consecutive_failures={} consecutive_h3_failures={}",
                 entry.evidence.eligible(),
                 entry.evidence.h3(),
                 entry.evidence.score(),
-                entry.failures
+                entry.failures,
+                entry.h3_failures
             ));
         }
         if let Some(index) = reserve {
@@ -1017,6 +1033,34 @@ mod tests {
         assert_eq!(recovered.status(400), Ok((PrimaryStatus::Healthy, None)));
         let down = twice.record(vec![Evidence::default(); 3], 401).unwrap();
         assert_eq!(down.status(401), Ok((PrimaryStatus::Unavailable, None)));
+    }
+
+    #[test]
+    fn active_health_follows_published_index_and_required_transport() {
+        let plan = plan();
+        let identity = crate::identity_tls::Identity::generate(crate::descriptor::Scope {
+            inbound: plan.inbound.clone(), endpoint: plan.endpoint.clone()
+        }).unwrap();
+        let start = State::new(plan, vec![good(true); 3], 100).unwrap();
+        let signed = crate::reality_bootstrap::initial_descriptor(&start, &identity, 100).unwrap();
+        let anchor = crate::descriptor::Anchor::new(identity.scope().clone(), identity.public_key(), 1, crate::reality_bootstrap::auto_policy()).unwrap();
+        let mut d = crate::descriptor::verify(&signed, &anchor).unwrap().descriptor().clone();
+        d.active_reference = 1;
+        let once = start.record(vec![good(true), good(false), good(true)], 200).unwrap();
+        assert_eq!(once.status(200), Ok((PrimaryStatus::Healthy, None)));
+        assert_eq!(once.active_status(&d, 200), Ok((PrimaryStatus::Suspect, None)));
+        assert_eq!(once.next_active_check_at(&d, 200), Ok(500));
+        assert!(once.failover_candidate(&d, 200).is_err());
+        let twice = once.record(vec![good(false), good(false), good(true)], 500).unwrap();
+        assert_eq!(twice.active_status(&d, 500), Ok((PrimaryStatus::Degraded, Some(2))));
+        assert_eq!(twice.failover_candidate(&d, 500), Ok(2));
+        assert!(twice.failover_candidate(&d, 561).is_err());
+        let reopened: State = toml::from_str(&twice.encode().unwrap()).unwrap();
+        assert_eq!(reopened.active_status(&d, 500), Ok((PrimaryStatus::Degraded, Some(2))));
+        d.h3 = false;
+        assert_eq!(reopened.active_status(&d, 500), Ok((PrimaryStatus::Healthy, None)));
+        d.references[1].server_name = "wrong.example.org".into();
+        assert_eq!(reopened.active_status(&d, 500), Err(Error::Approval));
     }
 
     #[test]
