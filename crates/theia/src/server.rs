@@ -181,9 +181,12 @@ impl ServerContext {
         // Library callers have no prepared generation. A missing/invalid key
         // leaves REALITY unready, and both serve entry points refuse startup.
         if inbound.security_mode.is_reality() {
-            context.reality_signer = crate::reality_identity::read_key(inbound.reality_key.as_deref())
-                .ok().flatten().and_then(|der| crate::reality_identity::Signer::from_der(&der).ok())
-                .map(Arc::new);
+            context.reality_signer =
+                crate::reality_identity::read_key(inbound.reality_key.as_deref())
+                    .ok()
+                    .flatten()
+                    .and_then(|der| crate::reality_identity::Signer::from_der(&der).ok())
+                    .map(Arc::new);
         }
         context
     }
@@ -288,7 +291,11 @@ impl ServerContext {
         !self.requires_identity() || self.reality_signer.is_some()
     }
 
-    pub(crate) fn identity_response(&self, peer: IpAddr, binding: Option<&crate::channel_binding::Admission>) -> Option<Response<()>> {
+    pub(crate) fn identity_response(
+        &self,
+        peer: IpAddr,
+        binding: Option<&crate::channel_binding::Admission>,
+    ) -> Option<Response<()>> {
         if !self.requires_identity() || !self.peer_budget.admit(peer, Instant::now()) {
             return None;
         }
@@ -771,15 +778,23 @@ async fn handle_identity_request(
     }
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         request.body_mut().data().await.is_none()
-            && request.body_mut().trailers().await.is_ok_and(|value| value.is_none())
-    }).await.unwrap_or(false);
+            && request
+                .body_mut()
+                .trailers()
+                .await
+                .is_ok_and(|value| value.is_none())
+    })
+    .await
+    .unwrap_or(false);
     if !empty {
         return reject(&mut respond, StatusCode::BAD_REQUEST).await;
     }
     let Some(response) = context.identity_response(peer, binding) else {
         return reject(&mut respond, StatusCode::UNAUTHORIZED).await;
     };
-    respond.send_response(response, true).map_err(|_| ServerError::Http2)?;
+    respond
+        .send_response(response, true)
+        .map_err(|_| ServerError::Http2)?;
     Ok(())
 }
 
@@ -1281,13 +1296,27 @@ pub(crate) fn configured_certificate_pin(
     Ok(pin)
 }
 
-pub(crate) fn configured_reality_identity(inbound: &Inbound) -> Result<crate::reality_identity::PublicIdentity, ServerError> {
+pub(crate) fn configured_reality_identity(
+    inbound: &Inbound,
+) -> Result<crate::reality_identity::PublicIdentity, ServerError> {
     configured_reality_review(inbound).map(|(public, _)| public)
 }
 
-pub(crate) fn configured_reality_review(inbound: &Inbound) -> Result<(crate::reality_identity::PublicIdentity, crate::security_profile::CertificatePin), ServerError> {
+pub(crate) fn configured_reality_review(
+    inbound: &Inbound,
+) -> Result<
+    (
+        crate::reality_identity::PublicIdentity,
+        crate::security_profile::CertificatePin,
+    ),
+    ServerError,
+> {
     let material = tls_material(inbound)?;
-    let public = material.reality_signer.as_ref().ok_or(ServerError::Config)?.public();
+    let public = material
+        .reality_signer
+        .as_ref()
+        .ok_or(ServerError::Config)?
+        .public();
     let leaf = material.certs.first().ok_or(ServerError::Config)?;
     let pin = crate::security_profile::CertificatePin::from_der(leaf.as_ref());
     let _ = tls_acceptor(material.certs, material.key)?;
@@ -1298,7 +1327,12 @@ fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     let cert_bytes = pem_data(&inbound.tls_cert, false)?;
     let key_bytes = pem_data(&inbound.tls_key, true)?;
     let reality = crate::reality_identity::read_key(inbound.reality_key.as_deref())?;
-    tls_material_from_bytes(inbound, &cert_bytes, &key_bytes, reality.as_ref().map(|bytes| bytes.as_slice()))
+    tls_material_from_bytes(
+        inbound,
+        &cert_bytes,
+        &key_bytes,
+        reality.as_ref().map(|bytes| bytes.as_slice()),
+    )
 }
 
 fn tls_material_from_bytes(
@@ -1308,7 +1342,8 @@ fn tls_material_from_bytes(
     reality_bytes: Option<&[u8]>,
 ) -> Result<TlsMaterial, ServerError> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let identity = crate::reload_preflight::IdentityHash::from_pem(cert_bytes, key_bytes).with_reality(reality_bytes);
+    let identity = crate::reload_preflight::IdentityHash::from_pem(cert_bytes, key_bytes)
+        .with_reality(reality_bytes);
     let mut cert_reader = BufReader::new(cert_bytes);
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
@@ -1391,7 +1426,8 @@ impl CapturedTls {
                 hash.update((bytes.len() as u64).to_be_bytes());
                 hash.update(bytes);
             }
-            let identity = crate::reload_preflight::IdentityHash::from_pem(&cert, &key).with_reality(reality_bytes);
+            let identity = crate::reload_preflight::IdentityHash::from_pem(&cert, &key)
+                .with_reality(reality_bytes);
             pairs.push(CapturedPem {
                 cert,
                 key,
@@ -1418,7 +1454,12 @@ impl CapturedTls {
 
     fn material(&self, inbound: &Inbound, index: usize) -> Result<TlsMaterial, ServerError> {
         let pair = self.pairs.get(index).ok_or(ServerError::Config)?;
-        tls_material_from_bytes(inbound, &pair.cert, &pair.key, pair.reality.as_ref().map(|bytes| bytes.as_slice()))
+        tls_material_from_bytes(
+            inbound,
+            &pair.cert,
+            &pair.key,
+            pair.reality.as_ref().map(|bytes| bytes.as_slice()),
+        )
     }
 }
 

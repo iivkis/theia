@@ -252,7 +252,8 @@ impl ReloadPreflight {
                 let Ok(key) = crate::server::pem_data(&inbound.tls_key, true) else {
                     return false;
                 };
-                let Ok(reality) = crate::reality_identity::read_key(inbound.reality_key.as_deref()) else {
+                let Ok(reality) = crate::reality_identity::read_key(inbound.reality_key.as_deref())
+                else {
                     return false;
                 };
                 identity.matches_full(&cert, &key, reality.as_ref().map(|bytes| bytes.as_slice()))

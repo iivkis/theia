@@ -642,8 +642,13 @@ impl Editor {
     }
 
     /// Explicit operator-selected local file, never a third-party candidate.
-    pub(crate) fn review_reality_mode(&self, reference: &str) -> Result<PinnedModeReview, &'static str> {
-        if self.editing || self.dirty() || self.issued.is_some()
+    pub(crate) fn review_reality_mode(
+        &self,
+        reference: &str,
+    ) -> Result<PinnedModeReview, &'static str> {
+        if self.editing
+            || self.dirty()
+            || self.issued.is_some()
             || !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source)
         {
             return Err("Save/reload clean server config first");
@@ -654,17 +659,31 @@ impl Editor {
         if !doc.server.enabled {
             return Err("Server disabled");
         }
-        let inbound = doc.server.inbounds.get_mut(self.selected_record).ok_or("Inbound missing")?;
+        let inbound = doc
+            .server
+            .inbounds
+            .get_mut(self.selected_record)
+            .ok_or("Inbound missing")?;
         inbound.security_mode = crate::security_profile::SecurityMode::SmartRealityV1;
         inbound.reality_key = Some(reference.to_owned());
         let candidate = Config::Server(doc);
-        candidate.validate().map_err(|_| "Invalid REALITY configuration")?;
+        candidate
+            .validate()
+            .map_err(|_| "Invalid REALITY configuration")?;
         let Config::Server(doc) = &candidate else {
             return Err("Server required");
         };
-        let inbound = doc.server.inbounds.get(self.selected_record).ok_or("Inbound missing")?;
-        let tcp: std::net::SocketAddr = inbound.h2_listen.parse().map_err(|_| "Invalid TCP bind")?;
-        let udp: std::net::SocketAddr = inbound.quic_listen.parse().map_err(|_| "Invalid UDP bind")?;
+        let inbound = doc
+            .server
+            .inbounds
+            .get(self.selected_record)
+            .ok_or("Inbound missing")?;
+        let tcp: std::net::SocketAddr =
+            inbound.h2_listen.parse().map_err(|_| "Invalid TCP bind")?;
+        let udp: std::net::SocketAddr = inbound
+            .quic_listen
+            .parse()
+            .map_err(|_| "Invalid UDP bind")?;
         if tcp.port() != udp.port() || tcp.port() == 0 {
             return Err("H2/H3 ports must agree");
         }
@@ -687,7 +706,12 @@ impl Editor {
         review: &PinnedModeReview,
     ) -> Result<(), &'static str> {
         let current = if review.mode.is_reality() {
-            self.review_reality_mode(review.key_reference.as_deref().ok_or("Missing key reference")?)?
+            self.review_reality_mode(
+                review
+                    .key_reference
+                    .as_deref()
+                    .ok_or("Missing key reference")?,
+            )?
         } else {
             self.review_pinned_mode(review.mode.is_stream_up())?
         };
@@ -1207,7 +1231,8 @@ mod tests {
     #[test]
     fn reality_review_refuses_key_drift_and_preserves_independent_identity() {
         use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
-        let generated = rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
         let certificate = Temp::write(&generated.cert.pem());
         let tls_key = Temp::write(&generated.key_pair.serialize_pem());
         let key = Temp::write("");
@@ -1231,7 +1256,9 @@ mod tests {
         let mut editor = Editor::load(Role::Server, &file.0).unwrap();
         let reference = format!("file:{}", key.0.display());
         assert!(editor.review_reality_mode("file:relative.der").is_err());
-        assert!(editor.review_reality_mode(&doc.server.inbounds[0].tls_key).is_err());
+        assert!(editor
+            .review_reality_mode(&doc.server.inbounds[0].tls_key)
+            .is_err());
         let review = editor.review_reality_mode(&reference).unwrap();
         assert!(!review.body().contains(&reference));
         assert!(review.body().contains("smart-reality-v1:"));
@@ -1244,7 +1271,10 @@ mod tests {
             panic!("server");
         };
         assert!(saved.server.inbounds[0].security_mode.is_reality());
-        assert_eq!(saved.server.inbounds[0].reality_key.as_deref(), Some(reference.as_str()));
+        assert_eq!(
+            saved.server.inbounds[0].reality_key.as_deref(),
+            Some(reference.as_str())
+        );
         let invitation = Invitation::decode(&editor.public_share().unwrap()).unwrap();
         assert_eq!(invitation.tls_profile(), review.reality.unwrap().profile());
         assert!(!invitation.has_token());

@@ -82,8 +82,7 @@ impl Signer {
 
     pub(crate) fn response(&self, key: &crate::channel_binding::Key) -> Option<Response<()>> {
         let signature = self.0.sign(&transcript(key));
-        let mut value = HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(signature.as_ref()))
-            .ok()?;
+        let mut value = HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(signature.as_ref())).ok()?;
         value.set_sensitive(true);
         let mut response = Response::new(());
         response.headers_mut().insert(SIGNATURE, value);
@@ -105,7 +104,9 @@ pub(crate) fn read_key(
 ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, crate::server::ServerError> {
     reference
         .map(|reference| {
-            let path = reference.strip_prefix("file:").ok_or(crate::server::ServerError::Config)?;
+            let path = reference
+                .strip_prefix("file:")
+                .ok_or(crate::server::ServerError::Config)?;
             crate::bounded_input::read(Path::new(path), MAX_KEY_BYTES, true, true)
                 .map_err(|_| crate::server::ServerError::Config)
         })
@@ -145,7 +146,10 @@ mod tests {
         let key = Zeroizing::new([1u8; 32]);
         let different = Zeroizing::new([2u8; 32]);
         let identity = signer.public();
-        assert_eq!(PublicIdentity::parse_profile(&identity.profile()), Some(identity));
+        assert_eq!(
+            PublicIdentity::parse_profile(&identity.profile()),
+            Some(identity)
+        );
         assert!(PublicIdentity::parse_profile(&format!("{}=", identity.profile())).is_none());
         assert!(Signer::from_der(b"not pkcs8").is_err());
         let mut response = signer.response(&key).unwrap();

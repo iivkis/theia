@@ -143,7 +143,10 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
         {
             return;
         }
-        Some(Arc::new(crate::channel_binding::Admission::new(key).requiring_identity(context.requires_identity())))
+        Some(Arc::new(
+            crate::channel_binding::Admission::new(key)
+                .requiring_identity(context.requires_identity()),
+        ))
     } else {
         None
     };
@@ -219,8 +222,13 @@ async fn handle_identity_request(
     }
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         stream.recv_data().await.is_ok_and(|value| value.is_none())
-            && stream.recv_trailers().await.is_ok_and(|value| value.is_none())
-    }).await.unwrap_or(false);
+            && stream
+                .recv_trailers()
+                .await
+                .is_ok_and(|value| value.is_none())
+    })
+    .await
+    .unwrap_or(false);
     if !empty {
         reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
         return;
@@ -232,7 +240,8 @@ async fn handle_identity_request(
     let _ = timeout(CLOSE_TIMEOUT, async {
         stream.send_response(response).await?;
         stream.finish().await
-    }).await;
+    })
+    .await;
 }
 
 async fn handle_request(

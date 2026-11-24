@@ -287,7 +287,8 @@ impl H2Client {
     /// An explicit second HTTP stream; cannot weaken the selected identity.
     pub fn with_stream_up(mut self, enabled: bool) -> Result<Self, ClientError> {
         if (enabled && self.certificate_pin.is_none() && self.server_identity.is_none())
-            || (self.stream_up && !enabled) {
+            || (self.stream_up && !enabled)
+        {
             return Err(ClientError::Configuration);
         }
         self.stream_up = enabled;
@@ -336,7 +337,13 @@ impl H2Client {
                 crate::tcp_bbr::Error::Network => ClientError::Io,
                 crate::tcp_bbr::Error::Unavailable => ClientError::TcpControllerUnavailable,
             })?;
-        crate::diag!(Trace, "client.h2", "tcp_controller_selected", "controller" = Value::Label(controller.label()), "op" = Value::Count(operation));
+        crate::diag!(
+            Trace,
+            "client.h2",
+            "tcp_controller_selected",
+            "controller" = Value::Label(controller.label()),
+            "op" = Value::Count(operation)
+        );
         let (mut sender, driver, binding) = match &self.connector {
             H2Tls::Rustls(connector) => {
                 let tls = connector
@@ -398,7 +405,11 @@ impl H2Client {
             identity.verify(key, &response)?;
             let mut body = response.into_body();
             if body.data().await.is_some()
-                || body.trailers().await.map_err(|_| ClientError::Http2)?.is_some()
+                || body
+                    .trailers()
+                    .await
+                    .map_err(|_| ClientError::Http2)?
+                    .is_some()
             {
                 return Err(ClientError::Protocol);
             }

@@ -73,13 +73,23 @@ impl Fixture {
         .unwrap();
         let h3 = udp.local_addr().unwrap();
         let (identity, reality_key, key_path) = if mode.is_reality() {
-            use ring::{rand::SystemRandom, signature::{Ed25519KeyPair, KeyPair}};
+            use ring::{
+                rand::SystemRandom,
+                signature::{Ed25519KeyPair, KeyPair},
+            };
             use std::io::Write;
             let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
             let pair = Ed25519KeyPair::from_pkcs8(der.as_ref()).unwrap();
-            let profile = format!("smart-reality-v1:{}", URL_SAFE_NO_PAD.encode(pair.public_key().as_ref()));
+            let profile = format!(
+                "smart-reality-v1:{}",
+                URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
+            );
             let identity = PublicIdentity::parse_profile(&profile).unwrap();
-            let path = std::env::temp_dir().join(format!("theia-reality-{}-{}.der", std::process::id(), URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())));
+            let path = std::env::temp_dir().join(format!(
+                "theia-reality-{}-{}.der",
+                std::process::id(),
+                URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
+            ));
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -90,7 +100,11 @@ impl Fixture {
             let mut file = options.open(&path).unwrap();
             file.write_all(der.as_ref()).unwrap();
             drop(file);
-            (Some(identity), Some(format!("file:{}", path.display())), Some(path))
+            (
+                Some(identity),
+                Some(format!("file:{}", path.display())),
+                Some(path),
+            )
         } else {
             (None, None, None)
         };
@@ -229,7 +243,8 @@ impl Fixture {
             assert_eq!(received.transport, profile.transport);
             let imported_pin = CertificatePin::parse_profile(&received.tls_profile);
             let identity = PublicIdentity::parse_profile(&received.tls_profile);
-            let stream_up = identity.is_some() || CertificatePin::is_stream_up_profile(&received.tls_profile);
+            let stream_up =
+                identity.is_some() || CertificatePin::is_stream_up_profile(&received.tls_profile);
             let token = URL_SAFE_NO_PAD.encode(TOKEN);
             let (mut app, local) = tokio::io::duplex(4096);
             let relay = if received.transport == Transport::H3 {
@@ -563,12 +578,27 @@ async fn reality_independent_identity_h2_h3_and_wrong_key_refusal() {
         let token = URL_SAFE_NO_PAD.encode(TOKEN);
         let wrong = other.identity.unwrap();
         assert_ne!(Some(wrong), fixture.identity);
-        let h2 = H2Client::new(&fixture.h2.to_string(), "localhost", &token, fixture.roots.clone())
-            .unwrap().with_server_identity(Some(wrong)).unwrap();
+        let h2 = H2Client::new(
+            &fixture.h2.to_string(),
+            "localhost",
+            &token,
+            fixture.roots.clone(),
+        )
+        .unwrap()
+        .with_server_identity(Some(wrong))
+        .unwrap();
         let h3 = H3Client::new(fixture.h3, "localhost", &token, fixture.roots.clone())
-            .unwrap().with_server_identity(Some(wrong)).unwrap();
-        assert_eq!(h2.open(address.clone(), port).await.err(), Some(ClientError::Tls));
-        assert_eq!(h3.open(address.clone(), port).await.err(), Some(ClientError::Tls));
+            .unwrap()
+            .with_server_identity(Some(wrong))
+            .unwrap();
+        assert_eq!(
+            h2.open(address.clone(), port).await.err(),
+            Some(ClientError::Tls)
+        );
+        assert_eq!(
+            h3.open(address.clone(), port).await.err(),
+            Some(ClientError::Tls)
+        );
 
         // The ordinary pinned stream-up client must not silently enter the
         // independent-identity mode even with valid PKI, pin and bearer.
@@ -576,7 +606,11 @@ async fn reality_independent_identity_h2_h3_and_wrong_key_refusal() {
         let h3 = fixture.h3(Some(fixture.pin), "localhost", &TOKEN);
         assert!(h2.open(address.clone(), port).await.is_err());
         assert!(h3.open(address, port).await.is_err());
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
         fixture.transfer(None, &target).await;
-    }).await.expect("bounded independent identity H2/H3 matrix");
+    })
+    .await
+    .expect("bounded independent identity H2/H3 matrix");
 }

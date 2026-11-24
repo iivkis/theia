@@ -80,8 +80,16 @@ impl Admission {
         self
     }
 
-    pub(crate) fn identity_response(&self, signer: &crate::reality_identity::Signer) -> Option<http::Response<()>> {
-        if !self.identity_required || self.identity_issued.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    pub(crate) fn identity_response(
+        &self,
+        signer: &crate::reality_identity::Signer,
+    ) -> Option<http::Response<()>> {
+        if !self.identity_required
+            || self
+                .identity_issued
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
             return None;
         }
         signer.response(&self.key)

@@ -178,12 +178,18 @@ mod tests {
             use std::os::fd::AsRawFd;
             let name = b"cubic\0";
             // SAFETY: live fd and static option buffer.
-            assert_eq!(unsafe {
-                libc::setsockopt(
-                    client.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_CONGESTION,
-                    name.as_ptr().cast(), name.len() as libc::socklen_t,
-                )
-            }, 0);
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        client.as_raw_fd(),
+                        libc::IPPROTO_TCP,
+                        libc::TCP_CONGESTION,
+                        name.as_ptr().cast(),
+                        name.len() as libc::socklen_t,
+                    )
+                },
+                0
+            );
             assert_eq!(verify(&client), Ok(Controller::Cubic));
             // If BBR is selectable, the preference must win over CUBIC.
             assert_eq!(select(&client).unwrap(), selected);
@@ -191,10 +197,14 @@ mod tests {
             // SAFETY: live fd and static option buffer.
             if unsafe {
                 libc::setsockopt(
-                    client.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_CONGESTION,
-                    name.as_ptr().cast(), name.len() as libc::socklen_t,
+                    client.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_CONGESTION,
+                    name.as_ptr().cast(),
+                    name.len() as libc::socklen_t,
                 )
-            } == 0 {
+            } == 0
+            {
                 assert_eq!(verify(&client), Err(Error::Unavailable));
             }
         }

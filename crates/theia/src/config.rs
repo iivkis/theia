@@ -398,9 +398,11 @@ impl ServerDocument {
             )?;
             ensure(
                 match &inbound.reality_key {
-                    Some(reference) => inbound.security_mode.is_reality()
-                        && valid_file_ref(reference)
-                        && reference != &inbound.tls_key,
+                    Some(reference) => {
+                        inbound.security_mode.is_reality()
+                            && valid_file_ref(reference)
+                            && reference != &inbound.tls_key
+                    }
                     None => !inbound.security_mode.is_reality(),
                 },
                 format!("{field}.reality_key"),
@@ -501,7 +503,8 @@ impl ClientDocument {
                 profile.tls_profile == "default"
                     || crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile)
                         .is_some()
-                    || crate::reality_identity::PublicIdentity::parse_profile(&profile.tls_profile).is_some()
+                    || crate::reality_identity::PublicIdentity::parse_profile(&profile.tls_profile)
+                        .is_some()
                     || (cfg!(feature = "experimental-btls-h2")
                         && profile.tls_profile == "browser-h2-btls-v1"
                         && profile.transport == Transport::H2),

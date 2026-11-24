@@ -109,7 +109,8 @@ impl H3Client {
     /// An explicit second HTTP stream; cannot weaken the selected identity.
     pub fn with_stream_up(mut self, enabled: bool) -> Result<Self, ClientError> {
         if (enabled && self.certificate_pin.is_none() && self.server_identity.is_none())
-            || (self.stream_up && !enabled) {
+            || (self.stream_up && !enabled)
+        {
             return Err(ClientError::Configuration);
         }
         self.stream_up = enabled;
@@ -214,13 +215,26 @@ impl H3Client {
         }));
         if let Some(identity) = self.server_identity {
             let key = binding.as_ref().ok_or(ClientError::Tls)?;
-            let mut stream = sender.send_request(crate::reality_identity::request(&self.uri)?)
-                .await.map_err(|_| ClientError::Http3)?;
+            let mut stream = sender
+                .send_request(crate::reality_identity::request(&self.uri)?)
+                .await
+                .map_err(|_| ClientError::Http3)?;
             stream.finish().await.map_err(|_| ClientError::Http3)?;
-            let response = stream.recv_response().await.map_err(|_| ClientError::Http3)?;
+            let response = stream
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
             identity.verify(key, &response)?;
-            if stream.recv_data().await.map_err(|_| ClientError::Http3)?.is_some()
-                || stream.recv_trailers().await.map_err(|_| ClientError::Http3)?.is_some()
+            if stream
+                .recv_data()
+                .await
+                .map_err(|_| ClientError::Http3)?
+                .is_some()
+                || stream
+                    .recv_trailers()
+                    .await
+                    .map_err(|_| ClientError::Http3)?
+                    .is_some()
             {
                 return Err(ClientError::Protocol);
             }

@@ -401,7 +401,9 @@ impl Interaction {
     fn paste_import_source(&mut self, text: &str) {
         if let Some(reference) = self.reality_key_input.as_mut() {
             let input = text.trim_end_matches(['\r', '\n']);
-            if reference.len().saturating_add(input.len()) <= 1024 && !input.chars().any(char::is_control) {
+            if reference.len().saturating_add(input.len()) <= 1024
+                && !input.chars().any(char::is_control)
+            {
                 reference.push_str(input);
             }
             return;
@@ -518,9 +520,14 @@ impl Interaction {
                     self.start_reality_review(reference);
                     return false;
                 }
-                KeyCode::Backspace => { reference.pop(); }
-                KeyCode::Char(ch) if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-                    && !ch.is_control() && reference.len() + ch.len_utf8() <= 1024 => {
+                KeyCode::Backspace => {
+                    reference.pop();
+                }
+                KeyCode::Char(ch)
+                    if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                        && !ch.is_control()
+                        && reference.len() + ch.len_utf8() <= 1024 =>
+                {
                     reference.push(ch);
                 }
                 _ => {}
