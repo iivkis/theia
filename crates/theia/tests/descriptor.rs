@@ -320,33 +320,66 @@ fn explicit_rotation_survives_restart_and_retires_previous_signers() {
     initial.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&next)));
     let pinned = anchor(&initial, &root);
     let store = Store::new(&path, pinned.clone()).unwrap();
-    store.initialize(&descriptor::sign(&initial, &root).unwrap(), 120).unwrap();
+    store
+        .initialize(&descriptor::sign(&initial, &root).unwrap(), 120)
+        .unwrap();
     let mut second = fixture(2);
     second.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&third)));
     let signed = descriptor::sign(&second, &next).unwrap();
     let before = fs::read(&path).unwrap();
     assert_error(store.update(&signed, 120), Error::Signature);
-    assert_error(store.promote(&signed, 2, public(&next), 120), Error::Rotation);
-    assert_error(store.promote(&signed, 1, public(&third), 120), Error::Rotation);
-    assert_error(store.promote(&descriptor::sign(&second, &root).unwrap(), 1, public(&next), 120), Error::Signature);
+    assert_error(
+        store.promote(&signed, 2, public(&next), 120),
+        Error::Rotation,
+    );
+    assert_error(
+        store.promote(&signed, 1, public(&third), 120),
+        Error::Rotation,
+    );
+    assert_error(
+        store.promote(
+            &descriptor::sign(&second, &root).unwrap(),
+            1,
+            public(&next),
+            120,
+        ),
+        Error::Signature,
+    );
     assert_eq!(fs::read(&path).unwrap(), before);
-    assert_eq!(store.promote(&signed, 1, public(&next), 120).unwrap(), Change::Advanced);
+    assert_eq!(
+        store.promote(&signed, 1, public(&next), 120).unwrap(),
+        Change::Advanced
+    );
     drop(store);
     let reopened = Store::new(&path, pinned.clone()).unwrap();
     assert_eq!(reopened.load(120).unwrap().signer(), public(&next));
     assert_error(reopened.load(119), Error::Validity);
-    assert_error(reopened.update(&descriptor::sign(&fixture(3), &root).unwrap(), 130), Error::Signature);
+    assert_error(
+        reopened.update(&descriptor::sign(&fixture(3), &root).unwrap(), 130),
+        Error::Signature,
+    );
     let mut retired = fixture(3);
     retired.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&root)));
-    assert_error(reopened.update(&descriptor::sign(&retired, &next).unwrap(), 130), Error::Rotation);
+    assert_error(
+        reopened.update(&descriptor::sign(&retired, &next).unwrap(), 130),
+        Error::Rotation,
+    );
     let final_signed = descriptor::sign(&fixture(4), &third).unwrap();
-    assert_eq!(reopened.promote(&final_signed, 2, public(&third), 130).unwrap(), Change::Advanced);
+    assert_eq!(
+        reopened
+            .promote(&final_signed, 2, public(&third), 130)
+            .unwrap(),
+        Change::Advanced
+    );
     drop(reopened);
     let reopened = Store::new(&path, pinned).unwrap();
     let current = reopened.load(130).unwrap();
     assert_eq!(current.signer(), public(&third));
     assert_eq!(current.descriptor().revision, 4);
-    assert_error(reopened.update(&descriptor::sign(&fixture(5), &next).unwrap(), 130), Error::Signature);
+    assert_error(
+        reopened.update(&descriptor::sign(&fixture(5), &next).unwrap(), 130),
+        Error::Signature,
+    );
 }
 
 #[test]
@@ -358,14 +391,22 @@ fn missed_overlap_requires_independent_enrollment_and_preserves_snapshot() {
     let mut first = fixture(1);
     first.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&next)));
     let store = Store::new(&path, anchor(&first, &root)).unwrap();
-    store.initialize(&descriptor::sign(&first, &root).unwrap(), 120).unwrap();
+    store
+        .initialize(&descriptor::sign(&first, &root).unwrap(), 120)
+        .unwrap();
     let before = fs::read(&path).unwrap();
     let mut second = fixture(2);
     second.not_before = 200;
     second.not_after = 300;
     let successor = descriptor::sign(&second, &next).unwrap();
-    assert_error(store.promote(&successor, 1, public(&next), 199), Error::Validity);
-    assert_error(store.promote(&successor, 1, public(&next), 200), Error::ReenrollmentRequired);
+    assert_error(
+        store.promote(&successor, 1, public(&next), 199),
+        Error::Validity,
+    );
+    assert_error(
+        store.promote(&successor, 1, public(&next), 200),
+        Error::ReenrollmentRequired,
+    );
     assert_error(store.load(200), Error::Validity);
     assert_eq!(fs::read(&path).unwrap(), before);
     // Recovery must independently pin a new key, in a fresh store.
@@ -386,21 +427,33 @@ fn persisted_transition_tampering_is_rejected_without_partial_update() {
     initial.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&next)));
     let pinned = anchor(&initial, &root);
     let store = Store::new(&path, pinned.clone()).unwrap();
-    store.initialize(&descriptor::sign(&initial, &root).unwrap(), 120).unwrap();
+    store
+        .initialize(&descriptor::sign(&initial, &root).unwrap(), 120)
+        .unwrap();
     let signed = descriptor::sign(&fixture(2), &next).unwrap();
     store.promote(&signed, 1, public(&next), 120).unwrap();
     let saved = fs::read_to_string(&path).unwrap();
     let mut forged: toml::Table = toml::from_str(&saved).unwrap();
-    let transitions = forged.get_mut("transitions").unwrap().as_array_mut().unwrap();
+    let transitions = forged
+        .get_mut("transitions")
+        .unwrap()
+        .as_array_mut()
+        .unwrap();
     transitions[0].as_table_mut().unwrap().insert(
         "successor".into(),
         toml::Value::String(descriptor::sign(&fixture(2), &unrelated).unwrap()),
     );
     // Deliberately corrupt an already private fixture, not the product store.
     fs::write(&path, toml::to_string(&forged).unwrap()).unwrap();
-    assert_error(Store::new(&path, pinned).unwrap().load(120), Error::Signature);
+    assert_error(
+        Store::new(&path, pinned).unwrap().load(120),
+        Error::Signature,
+    );
     let corrupt = fs::read(&path).unwrap();
-    assert_error(store.update(&descriptor::sign(&fixture(3), &next).unwrap(), 130), Error::Signature);
+    assert_error(
+        store.update(&descriptor::sign(&fixture(3), &next).unwrap(), 130),
+        Error::Signature,
+    );
     assert_eq!(fs::read(&path).unwrap(), corrupt);
 }
 
@@ -413,21 +466,36 @@ fn bounded_history_requires_reenrollment_instead_of_forgetting_retired_keys() {
     initial.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&keys[1])));
     let root = anchor(&initial, &keys[0]);
     let store = Store::new(&path, root.clone()).unwrap();
-    store.initialize(&descriptor::sign(&initial, &keys[0]).unwrap(), 120).unwrap();
+    store
+        .initialize(&descriptor::sign(&initial, &keys[0]).unwrap(), 120)
+        .unwrap();
     for i in 1..=8 {
         let mut next = fixture(i as u64 + 1);
         next.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&keys[i + 1])));
         let signed = descriptor::sign(&next, &keys[i]).unwrap();
-        assert_eq!(store.promote(&signed, i as u64, public(&keys[i]), 120).unwrap(), Change::Advanced);
+        assert_eq!(
+            store
+                .promote(&signed, i as u64, public(&keys[i]), 120)
+                .unwrap(),
+            Change::Advanced
+        );
     }
     let saved = fs::read(&path).unwrap();
     let latest = descriptor::sign(&fixture(10), &keys[9]).unwrap();
     let reopened = Store::new(&path, root).unwrap();
     assert_eq!(reopened.load(120).unwrap().descriptor().revision, 9);
-    assert_error(reopened.promote(&latest, 9, public(&keys[9]), 120), Error::ReenrollmentRequired);
+    assert_error(
+        reopened.promote(&latest, 9, public(&keys[9]), 120),
+        Error::ReenrollmentRequired,
+    );
     assert_eq!(fs::read(&path).unwrap(), saved);
     // Ordinary same-key updates remain possible even at the history ceiling.
-    assert_eq!(reopened.update(&descriptor::sign(&fixture(10), &keys[8]).unwrap(), 120).unwrap(), Change::Advanced);
+    assert_eq!(
+        reopened
+            .update(&descriptor::sign(&fixture(10), &keys[8]).unwrap(), 120)
+            .unwrap(),
+        Change::Advanced
+    );
 }
 
 #[test]
@@ -441,7 +509,9 @@ fn competing_promotion_and_old_key_update_have_one_revision_guard() {
     first.next_identity = Some(URL_SAFE_NO_PAD.encode(public(&successor)));
     let root = anchor(&first, &old);
     let store = Store::new(&path, root.clone()).unwrap();
-    store.initialize(&descriptor::sign(&first, &old).unwrap(), 120).unwrap();
+    store
+        .initialize(&descriptor::sign(&first, &old).unwrap(), 120)
+        .unwrap();
     let replacement = descriptor::sign(&fixture(2), &successor).unwrap();
     let old_update = descriptor::sign(&fixture(3), &old).unwrap();
     let barrier = Barrier::new(2);
@@ -466,6 +536,9 @@ fn competing_promotion_and_old_key_update_have_one_revision_guard() {
     } else {
         assert_eq!(current.signer(), public(&old));
         assert_eq!(current.descriptor().revision, 3);
-        assert_error(reopened.promote(&replacement, 1, public(&successor), 120), Error::Rotation);
+        assert_error(
+            reopened.promote(&replacement, 1, public(&successor), 120),
+            Error::Rotation,
+        );
     }
 }

@@ -398,8 +398,14 @@ impl History {
         // The current identity must still be valid at the transition.
         // A client that missed overlap cannot recover through an expired
         // announcement or a key supplied by the untrusted successor alone.
-        announcement.check_time(now).map_err(|_| Error::ReenrollmentRequired)?;
-        let raw = announcement.descriptor.next_identity.as_ref().ok_or(Error::Rotation)?;
+        announcement
+            .check_time(now)
+            .map_err(|_| Error::ReenrollmentRequired)?;
+        let raw = announcement
+            .descriptor
+            .next_identity
+            .as_ref()
+            .ok_or(Error::Rotation)?;
         let next_key = canonical_base64::<32>(raw)?;
         if next_key != expected_key
             || next_key == self.anchor.public_key
@@ -407,7 +413,10 @@ impl History {
         {
             return Err(Error::Rotation);
         }
-        let minimum = announcement.descriptor.revision.checked_add(1)
+        let minimum = announcement
+            .descriptor
+            .revision
+            .checked_add(1)
             .ok_or(Error::ReenrollmentRequired)?;
         let new_anchor = Anchor::new(self.anchor.scope.clone(), next_key, minimum)?;
         let next = verify(successor, &new_anchor)?;
@@ -441,7 +450,11 @@ impl Snapshot {
         let mut history = History::new(root);
         for transition in &self.transitions {
             let announcement = history.verify_current(&transition.announcement)?;
-            let raw = announcement.descriptor.next_identity.as_ref().ok_or(Error::Rotation)?;
+            let raw = announcement
+                .descriptor
+                .next_identity
+                .as_ref()
+                .ok_or(Error::Rotation)?;
             let key = canonical_base64::<32>(raw)?;
             let next = history.advance(
                 &announcement,
