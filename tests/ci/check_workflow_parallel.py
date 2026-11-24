@@ -137,8 +137,6 @@ require("python3 -m compileall -q scripts tests" in job("specification"),
 linux = job("rust-tests")
 require("cargo test --workspace --all-targets --locked" in linux,
         "mandatory Linux all-target tests must run")
-require("cargo fmt --all -- --check" in linux,
-        "mandatory Rust formatting must run")
 require("cargo clippy --workspace --all-targets --all-features -- -D warnings" in linux,
         "mandatory Clippy warnings-as-errors must run")
 require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
@@ -172,6 +170,13 @@ require("gofmt -l" in spec and "git diff --exit-code" in spec,
 require("gofmt -w" not in spec and "ci-formatted-source" not in workflow
         and "persist-format:" not in workflow,
         "never change PR SHA after successful CI or upload/download formatter overlays")
+# Formatting is an exact-SHA, fail-fast preflight gate. Re-running rustfmt and
+# gofmt after fan-out costs runner time but cannot add coverage: downstream
+# jobs check out the same immutable tree and never modify Rust/Go files.
+for name in mandatory - {"specification"}:
+    payload = job(name)
+    require("cargo fmt " not in payload and "gofmt -l" not in payload,
+            f"{name}: formatting must run once in specification, not per native job")
 for name in mandatory - {"specification"}:
     payload = job(name)
     require("needs.specification.outputs.native_required == 'true'" in payload,
