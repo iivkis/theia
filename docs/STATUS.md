@@ -67,3 +67,11 @@ PR #117 was merged at 5cd3a41 after exact-head CI 45434713045 (all 13 required j
 ## ADR-0090 — BBR-first with CUBIC fallback
 
 Owner superseded the strict BBR-only draft. Linux selects BBR, falls back to CUBIC and verifies sockets; H3 retains Quinn BBR. Windows H2 uses OS-managed TCP (CUBIC deployment preference, not verified per socket). No global settings or user-facing switch. Native tests and previous REALITY fixes are submitted together; exact-head CI remains required.
+
+## ADR-0091 — F-18 native independent identity evidence and guarded review
+
+PR #118 merged into main at b503c6f after all 13 mandatory jobs succeeded for head 68773a4 (run 45440123346). ADR-0091 submits the next single-commit F-18 slice: native Linux VM/Windows binary cross-host independent Ed25519 positive and wrong-key/PKI/bearer/mode negative matrix (H2/H3/auto); independent raw wire signatures on four connections and one-response enforcement; exact full material fingerprint at guarded local review/save. Tests are submitted, not yet accepted. Candidate observations still lack HTTP/3 application semantics and ownership proof; external candidate Apply and independent review remain open, and no active-probing-resistance or F-19 claim is made.
+
+## ADR-0092 — local REALITY key provisioning wizard
+
+The next consolidated F-18 PR adds G on a selected own saved inbound: stage a fresh protected Ed25519 PKCS#8 key, verify the same cert/key and identity with both H2/H3 builders, show only public identity, explicitly save or cancel. Cancel/definite failure removes the staged key; uncertain write retains it for inspection. Native mode/DACL and guarded-save regression tests included. The preceding exact-head run failed in an existing Auto test's local TCP connect before CONNECT; the test now retries only local handshake refusal/reset, preserving the remote denial assertions. Full current-head CI, independent review and external candidate Apply remain pending; no claim of full F-18 or active-probing resistance.

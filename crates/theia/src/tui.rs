@@ -339,14 +339,27 @@ impl Interaction {
         });
     }
 
-    fn start_pinned_save(&mut self, review: PinnedModeReview) {
+    fn start_generated_reality_review(&mut self) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.pinned_loading = Some(rx);
+        let _worker = std::thread::spawn(move || {
+            let result = editor.review_generated_reality_mode();
+            editor.error = result.as_ref().err().map(|message| (*message).to_owned());
+            let _ = tx.send((editor, result));
+        });
+    }
+
+    fn start_pinned_save(&mut self, mut review: PinnedModeReview) {
         let Some(mut editor) = self.editor.take() else {
             return;
         };
         let (tx, rx) = mpsc::channel();
         self.saving = Some(rx);
         let _worker = std::thread::spawn(move || {
-            let result = editor.apply_pinned_mode(&review);
+            let result = editor.apply_pinned_mode(&mut review);
             if let Err(message) = result {
                 editor.error = Some(message.into());
             }
@@ -1160,6 +1173,12 @@ impl Interaction {
                 }
                 return false;
             }
+            if editor.role() == Role::Server && key.code == KeyCode::Char('G') {
+                // Explicit two-stage own inbound provisioning; review only
+                // stages a private file, never writes configuration/runtime.
+                self.start_generated_reality_review();
+                return false;
+            }
             if editor.role() == Role::Server && key.code == KeyCode::Char('Y') {
                 if editor.dirty() {
                     editor.error = Some("Сначала сохраните или отмените черновик.".into());
@@ -1388,7 +1407,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели Y: отдельный Ed25519 key file, проверка и guarded save REALITY; P: локальный pinned-cert-v1 (stream-one), X: собственный XHTTP stream-up с pin; y подтверждает сохранение (не полноценный REALITY), u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели G: создать отдельный Ed25519 key для собственного inbound, preview и guarded save; Y: отдельный Ed25519 key file, проверка и guarded save REALITY; P: локальный pinned-cert-v1 (stream-one), X: собственный XHTTP stream-up с pin; y подтверждает сохранение (не полноценный REALITY), u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
             true,
         ),
     }

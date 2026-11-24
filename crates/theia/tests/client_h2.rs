@@ -1040,7 +1040,14 @@ async fn auto_connect(proxy: std::net::SocketAddr, port: u16) -> String {
         loop {
             match TcpStream::connect(proxy).await {
                 Ok(stream) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    // No CONNECT request has been sent on this failed local
+                    // handshake. This is never a retry of remote admission.
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 Err(error) => panic!("local HTTP proxy connection failed: {error}"),

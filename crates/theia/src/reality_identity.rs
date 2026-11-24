@@ -138,6 +138,39 @@ mod tests {
     use zeroize::Zeroizing;
 
     #[test]
+    fn identity_request_rejects_unexpected_credentials_and_metadata() {
+        let make = || {
+            Request::get("https://localhost/v1/identity")
+                .body(())
+                .unwrap()
+        };
+        assert!(is_request(&make()));
+        for name in [
+            "authorization",
+            "content-length",
+            "theia-channel-proof",
+            SIGNATURE,
+        ] {
+            let mut request = make();
+            request
+                .headers_mut()
+                .insert(name, HeaderValue::from_static("0"));
+            assert!(!is_request(&request));
+        }
+        for uri in [
+            "https://localhost/v1/identity?x=1",
+            "https://localhost/other",
+        ] {
+            assert!(!is_request(&Request::get(uri).body(()).unwrap()));
+        }
+        assert!(!is_request(
+            &Request::post("https://localhost/v1/identity")
+                .body(())
+                .unwrap()
+        ));
+    }
+
+    #[test]
     fn independent_identity_signature_rejects_wrong_key_channel_and_duplicate() {
         let der = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
         let signer = Signer::from_der(der.as_ref()).unwrap();

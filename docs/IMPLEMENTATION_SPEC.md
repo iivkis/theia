@@ -157,3 +157,7 @@ ADR-0088 adds required channel-bound HTTP admission for the intermediate pinned 
 ADR-0089 implements an explicit independent Ed25519 server identity adapter for the existing SmartTheia XHTTP H2/H3 stream-up mode, with strict TLS checks and proof before bearer. It is a partial F-18 implementation; the remaining security, picker Apply, cross-host independent-key and F-19 release evidence requirements are unchanged.
 
 ADR-0090 sets fixed BBR-first/CUBIC fallback for both carriers. Linux selects and verifies the TCP controller; H3 retains Quinn BBR. Windows H2 uses OS-managed TCP (CUBIC deployment preference, actual controller unverified); lack of BBR2 is not a release blocker by itself. Native functional and measured evidence remain mandatory.
+
+ADR-0091 extends independent REALITY acceptance with raw H2/H3 exporter/signature cross-connection/transport negative witnesses, native Linux VM to Windows H2/H3/auto invitations and rejection matrix, and exact local cert/key/independent-key material review. This does not authorize external candidate Apply from TLS/ALPN observations. Independent review, full candidate wizard and active-probing evidence remain required.
+
+ADR-0092 provides explicit two-stage local REALITY key generation for an existing operator-owned inbound, with the same local validator and guarded save as the manual key path. It does not transform a remote candidate observation into local ownership or authorization. External picker Apply and independent review remain open.
