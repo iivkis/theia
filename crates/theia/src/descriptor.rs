@@ -575,6 +575,21 @@ impl Store {
         Ok((previous.descriptor.revision, next))
     }
 
+    /// Bind an explicit trust transition to the complete current persistent
+    /// snapshot, not merely its revision (including the accepted history).
+    pub fn preview_promotion_bound(
+        &self,
+        document: &str,
+        now: u64,
+    ) -> Result<([u8; 32], Verified, Verified), Error> {
+        let (raw, _, mut history, previous) = self.snapshot()?;
+        let next_key = canonical_base64::<32>(
+            previous.descriptor.next_identity.as_deref().ok_or(Error::Rotation)?,
+        )?;
+        let next = history.advance(&previous, document, next_key, now)?;
+        Ok((Sha256::digest(raw.as_bytes()).into(), previous, next))
+    }
+
     pub fn preview_promotion(
         &self,
         document: &str,
@@ -658,8 +673,33 @@ impl Store {
         expected_key: [u8; 32],
         now: u64,
     ) -> Result<Change, Error> {
+        self.promote_inner(successor, expected_revision, expected_key, None, now)
+    }
+
+    pub fn promote_bound(
+        &self,
+        successor: &str,
+        expected_revision: u64,
+        expected_key: [u8; 32],
+        expected_snapshot: [u8; 32],
+        now: u64,
+    ) -> Result<Change, Error> {
+        self.promote_inner(successor, expected_revision, expected_key, Some(expected_snapshot), now)
+    }
+
+    fn promote_inner(
+        &self,
+        successor: &str,
+        expected_revision: u64,
+        expected_key: [u8; 32],
+        expected_snapshot: Option<[u8; 32]>,
+        now: u64,
+    ) -> Result<Change, Error> {
         let (old, mut snapshot, mut history, previous) = self.snapshot()?;
-        if previous.descriptor.revision != expected_revision {
+        let actual: [u8; 32] = Sha256::digest(old.as_bytes()).into();
+        if previous.descriptor.revision != expected_revision
+            || expected_snapshot.is_some_and(|expected| expected != actual)
+        {
             return Err(Error::Rotation);
         }
         history.advance(&previous, successor, expected_key, now)?;

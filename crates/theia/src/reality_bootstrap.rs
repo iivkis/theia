@@ -554,9 +554,78 @@ impl Profile {
         Ok(())
     }
 
+    /// Preview the already-announced successor, signed by that successor.
+    /// A missed/expired overlap is not recoverable using an old key alone.
+    pub fn preview_promotion(&self, signed: &str, now: u64) -> Result<PromotionPreview, Error> {
+        let (snapshot_sha256, old, next) = self.store()?
+            .preview_promotion_bound(signed, now)
+            .map_err(|_| Error::Descriptor)?;
+        let a = old.descriptor();
+        let b = next.descriptor();
+        // A trust change is not an implicit change of operational parameters.
+        if a.references != b.references || a.active_reference != b.active_reference
+            || a.h3 != b.h3 || a.stream_one != b.stream_one || a.stream_up != b.stream_up
+            || a.path_prefix != b.path_prefix || a.padding != b.padding || a.rotation != b.rotation
+            || b.revision != a.revision.checked_add(1).ok_or(Error::Descriptor)?
+            || b.next_identity.is_some() {
+            return Err(Error::Descriptor);
+        }
+        Ok(PromotionPreview {
+            expected_revision: a.revision,
+            next_revision: b.revision,
+            current_identity_sha256: fingerprint(old.signer()),
+            next_identity_sha256: fingerprint(next.signer()),
+            document_sha256: digest(signed),
+            snapshot_sha256,
+            overlap_ends_at: a.not_after,
+        })
+    }
+
+    pub fn promote(&self, signed: &str, approval: PromotionApproval, now: u64) -> Result<(), Error> {
+        let preview = self.preview_promotion(signed, now)?;
+        if preview.expected_revision != approval.expected_revision
+            || !bool::from(preview.snapshot_sha256.ct_eq(&approval.snapshot_sha256))
+            || !bool::from(preview.document_sha256.ct_eq(&approval.document_sha256))
+            || !bool::from(preview.next_identity_sha256.ct_eq(&approval.next_identity_sha256))
+        {
+            return Err(Error::Approval);
+        }
+        let (snapshot, _, next) = self.store()?.preview_promotion_bound(signed, now)
+            .map_err(|_| Error::Descriptor)?;
+        if !bool::from(snapshot.ct_eq(&approval.snapshot_sha256)) {
+            return Err(Error::Approval);
+        }
+        self.store()?.promote_bound(signed, approval.expected_revision, next.signer(),
+            approval.snapshot_sha256, now).map_err(|error| match error {
+                descriptor::Error::Indeterminate => Error::Indeterminate,
+                _ => Error::Descriptor,
+            })?;
+        Ok(())
+    }
+
     pub fn credential_reference(&self) -> &str {
         &self.auth_token
     }
+}
+
+/// Redacted explicit client-side identity promotion. No credential material.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PromotionPreview {
+    pub expected_revision: u64,
+    pub next_revision: u64,
+    pub current_identity_sha256: [u8; 32],
+    pub next_identity_sha256: [u8; 32],
+    pub document_sha256: [u8; 32],
+    pub snapshot_sha256: [u8; 32],
+    pub overlap_ends_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PromotionApproval {
+    pub expected_revision: u64,
+    pub snapshot_sha256: [u8; 32],
+    pub document_sha256: [u8; 32],
+    pub next_identity_sha256: [u8; 32],
 }
 
 /// Redacted offline recovery preview. All values are public trust metadata.
@@ -806,6 +875,68 @@ mod tests {
             .record(vec![reference_health::Evidence::default()], NOW + 1)
             .unwrap();
         assert!(refresh_descriptor(&failed, &identity, &raw, NOW + 2).is_err());
+    }
+
+    #[test]
+    fn guarded_client_promotion_binds_snapshot_and_preserves_credentials() {
+        let (state, identity) = fixture();
+        let next = Identity::generate(identity.scope().clone()).unwrap();
+        let dir = Scratch::new();
+        let profile_path = dir.0.join("profile.toml");
+        let trust_path = dir.0.join("trust.toml");
+        let initial = initial_descriptor(&state, &identity, NOW).unwrap();
+        let invitation = Invitation::public(&identity, &initial, NOW).unwrap().encode().unwrap();
+        import(&invitation, ImportApproval {
+            document_sha256: digest(&invitation), identity_sha256: fingerprint(identity.public_key()),
+        }, &profile_path, &trust_path, Some("env:THEIA_TOKEN"), auto_policy(), NOW).unwrap();
+        let profile = Profile::read(&profile_path).unwrap();
+        let profile_bytes = std::fs::read(&profile_path).unwrap();
+        let mut announcement = profile.load(NOW).unwrap().descriptor().clone();
+        announcement.revision = 2;
+        announcement.not_before = NOW + 1;
+        announcement.next_identity = Some(URL_SAFE_NO_PAD.encode(next.public_key()));
+        let signed = identity.sign_descriptor(&announcement).unwrap();
+        profile.store().unwrap().update_at(&signed, 1, NOW + 1).unwrap();
+        let mut successor = announcement.clone();
+        successor.revision = 3;
+        successor.next_identity = None;
+        successor.not_after += VALIDITY;
+        let document = next.sign_descriptor(&successor).unwrap();
+        let preview = profile.preview_promotion(&document, NOW + 2).unwrap();
+        assert_eq!(preview.expected_revision, 2);
+        assert_eq!(preview.next_revision, 3);
+        let approval = PromotionApproval {
+            expected_revision: 2,
+            snapshot_sha256: preview.snapshot_sha256,
+            document_sha256: preview.document_sha256,
+            next_identity_sha256: preview.next_identity_sha256,
+        };
+        let old = std::fs::read(&trust_path).unwrap();
+        for wrong in [
+            PromotionApproval { snapshot_sha256: [0; 32], ..approval },
+            PromotionApproval { document_sha256: [0; 32], ..approval },
+            PromotionApproval { next_identity_sha256: [0; 32], ..approval },
+            PromotionApproval { expected_revision: 1, ..approval },
+        ] {
+            assert!(profile.promote(&document, wrong, NOW + 2).is_err());
+            assert_eq!(std::fs::read(&trust_path).unwrap(), old);
+        }
+        let mut altered = successor.clone();
+        altered.path_prefix = "/v1/substituted".into();
+        assert!(profile.preview_promotion(&next.sign_descriptor(&altered).unwrap(), NOW + 2).is_err());
+        assert!(profile.preview_promotion(&document, announcement.not_after).is_err());
+        // Even the same revision can have a more recent durable acceptance time.
+        profile.store().unwrap().update_at(&signed, 2, NOW + 3).unwrap();
+        assert!(profile.promote(&document, approval, NOW + 3).is_err());
+        let refreshed = profile.preview_promotion(&document, NOW + 3).unwrap();
+        profile.promote(&document, PromotionApproval {
+            snapshot_sha256: refreshed.snapshot_sha256, ..approval
+        }, NOW + 3).unwrap();
+        let reopened = Profile::read(&profile_path).unwrap();
+        assert_eq!(reopened.load(NOW + 4).unwrap().signer(), next.public_key());
+        assert_eq!(reopened.credential_reference(), "env:THEIA_TOKEN");
+        assert_eq!(std::fs::read(&profile_path).unwrap(), profile_bytes);
+        assert!(reopened.promote(&document, approval, NOW + 4).is_err());
     }
 
     #[test]

@@ -19,6 +19,8 @@ theia reality preview-import --invitation PATH\n\
 theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --token-ref REF --confirm\n\
 theia reality inspect --profile PATH\n\
+theia reality promotion-preview --profile PATH --descriptor PATH\n\
+theia reality promotion-apply --profile PATH --descriptor PATH --expected-revision N --snapshot-sha256 HEX --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality recovery-preview --profile PATH --descriptor PATH\n\
 theia reality recovery-apply --profile PATH --descriptor PATH --expected-revision N --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality publish-new --health PATH --key PATH --publication PATH --confirm\n\
@@ -79,6 +81,15 @@ pub enum Command {
     },
     Inspect {
         profile: String,
+    },
+    PromotionPreview {
+        profile: String,
+        descriptor: String,
+    },
+    PromotionApply {
+        profile: String,
+        descriptor: String,
+        approval: bootstrap::PromotionApproval,
     },
     RecoveryPreview {
         profile: String,
@@ -223,6 +234,20 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
             }
         }
         ["inspect", "--profile", p] => Command::Inspect { profile: path(p)? },
+        ["promotion-preview", "--profile", p, "--descriptor", d] => Command::PromotionPreview {
+            profile: path(p)?,
+            descriptor: path(d)?,
+        },
+        ["promotion-apply", "--profile", p, "--descriptor", d, "--expected-revision", r, "--snapshot-sha256", s, "--sha256", h, "--identity-sha256", i, "--confirm"] => Command::PromotionApply {
+            profile: path(p)?,
+            descriptor: path(d)?,
+            approval: bootstrap::PromotionApproval {
+                expected_revision: crate::expected_revision(r)?,
+                snapshot_sha256: hash(s)?,
+                document_sha256: hash(h)?,
+                next_identity_sha256: hash(i)?,
+            },
+        },
         ["recovery-preview", "--profile", p, "--descriptor", d] => Command::RecoveryPreview {
             profile: path(p)?,
             descriptor: path(d)?,
@@ -342,6 +367,21 @@ fn publication_status(
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
+        Command::PromotionPreview { profile, descriptor } => {
+            let profile = Profile::read(Path::new(&profile))?;
+            let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
+            let preview = profile.preview_promotion(&raw, now)?;
+            Ok(format!("Identity promotion preview; runtime UNCHANGED\nexpected_revision={}\nnext_revision={}\ncurrent_identity_sha256={}\nnext_identity_sha256={}\nsnapshot_sha256={}\ndocument_sha256={}\noverlap_ends_at={}\nIndependently confirm successor identity; this is not compromise recovery.",
+                preview.expected_revision, preview.next_revision, hex(preview.current_identity_sha256),
+                hex(preview.next_identity_sha256), hex(preview.snapshot_sha256),
+                hex(preview.document_sha256), preview.overlap_ends_at))
+        }
+        Command::PromotionApply { profile, descriptor, approval } => {
+            let profile = Profile::read(Path::new(&profile))?;
+            let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
+            profile.promote(&raw, approval, now)?;
+            Ok("Identity trust promoted; credentials, profile and runtime UNCHANGED".into())
+        }
         Command::RecoveryPreview {
             profile,
             descriptor,
