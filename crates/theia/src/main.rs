@@ -1,5 +1,8 @@
 use std::path::Path;
-use theia::{diagnostics, execute, local_proxy, management, parse, server, tui, CliError, Command};
+use theia::{
+    diagnostics, help, local_proxy, management, parse, server, tui, validate_config, version,
+    CliError, Command,
+};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -238,7 +241,11 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
-        Ok(command) => execute(command).map(str::to_owned),
+        Ok(Command::Help(topic)) => help(topic).map(str::to_owned),
+        Ok(Command::Version) => Ok(version().to_owned()),
+        Ok(Command::ConfigValidate { config }) => {
+            validate_config(Path::new(&config)).map(str::to_owned)
+        }
         Err(error) => Err(error),
     };
     match result {

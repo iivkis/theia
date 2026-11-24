@@ -254,7 +254,7 @@ impl AutoClient {
                 Ok(tunnel) => {
                     self.complete(generation, false)?;
                     crate::diag!(
-                        Info,
+                        Debug,
                         "client.auto",
                         "selected_h3",
                         "generation" = Value::Count(generation)
@@ -709,7 +709,7 @@ async fn handle(
     match client.open(address, port).await {
         Ok(tunnel) => {
             crate::diag!(
-                Info,
+                Debug,
                 "client.proxy",
                 "remote_open_ok",
                 "session" = Value::Count(session_id)

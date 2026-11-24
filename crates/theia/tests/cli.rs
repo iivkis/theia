@@ -108,3 +108,26 @@ fn client_run_missing_config_fails_before_binding() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("client failed"));
     assert!(result.stdout.is_empty());
 }
+
+// An unsupported OS command still fails closed with its original exit code.
+#[cfg(not(windows))]
+#[test]
+fn windows_proxy_commands_fail_closed_on_other_platforms() {
+    for args in [
+        vec!["client", "proxy", "--status"],
+        vec!["client", "proxy", "--recover", "--confirm"],
+        vec![
+            "client",
+            "run",
+            "--config",
+            "missing.toml",
+            "--system-proxy",
+            "--confirm",
+        ],
+    ] {
+        let result = invoke(&args);
+        assert_eq!(result.status.code(), Some(3));
+        assert!(result.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Windows user proxy"));
+    }
+}

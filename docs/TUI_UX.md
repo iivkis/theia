@@ -1,12 +1,12 @@
-### M4.3 F-07: Windows system proxy safety boundary (CLI opt-in; TUI apply not yet wired)
-
-The current client TUI does **not** enable WinINet. Editing TOML \`system_proxy = "manual"\` is not an action. A separate Windows client process \`theia client run --config FILE --system-proxy --confirm\` explicitly opts into applying the current-user WinINet default LAN HTTP(S) proxy, **only after** both loopback listener binds and independent TLS/credential checks. A durable protected HKCU recovery journal and user-SID mutex guard ownership. Normal Ctrl+C conditionally restores; hard-kill requires another explicit \`client proxy --recover --confirm\` and refuses if Windows settings differ from the owned snapshot. No user-friendly TUI Apply/Restore yet; full M4.3 acceptance remains open. See ADR-0056.
-
 # TUI / UX specification (ratatui)
 
 **M4.2f terminal acceptance:** Отображаемые TUI modal title/status, два шага Ctrl+R → явно отдельное y, n/Esc отказ, revision после Apply, реакция на изменённый извне сохранённый файл и dirty/client/no-config границы теперь проверяются обязательным CI через реальный Linux PTY и Windows ConPTY, а не только unit KeyEvent/TestBackend. Проверка появления надписи успеха сама по себе недостаточна: реальный compiled server status должен показать CAS 1→2. TerminalGuard восстанавливает alternate screen после выхода. Удалённый SSH E2E остаётся отдельным этапом (ADR-0045).
 
 **Задача:** понятная локальная консоль управления без веб-панели. И сервер, и клиент доступны из одного `theia tui`. Полноценный keyboard-first workflow, минимальное число модалок, ошибки по делу. Тексты основного интерфейса — русский, с перспективой en.
+
+### M4.3 F-07: Windows system proxy safety boundary (CLI opt-in; TUI apply not yet wired)
+
+The current client TUI does **not** enable WinINet. Editing TOML \`system_proxy = "manual"\` is not an action. A separate Windows client process \`theia client run --config FILE --system-proxy --confirm\` explicitly opts into applying the current-user WinINet default LAN HTTP(S) proxy, **only after** both loopback listener binds and independent TLS/credential checks. A durable protected HKCU recovery journal and user-SID mutex guard ownership. Normal Ctrl+C conditionally restores; hard-kill requires another explicit \`client proxy --recover --confirm\` and refuses if Windows settings differ from the owned snapshot. No user-friendly TUI Apply/Restore yet; full M4.3 acceptance remains open. See ADR-0056.
 
 ## 1. Информационная архитектура
 
@@ -188,24 +188,24 @@ M4.4a реализует **только доменный codec**, не UI/CLI в
 
 При явном `theia tui --role server --config FILE` и существующем валидном серверном TOML пользователь выбирает inbound (`j/k`, стрелки), затем `u` для ввода нового ID (1..64 ASCII-символов: буквы, цифры, `_`, `-`). `Enter` показывает подтверждение; `y` генерирует 32 криптографически случайных байта, сохраняет SHA-256 в новой записи users и добавляет ID только в allowed_user_ids выбранного inbound. При незавершённых изменениях, дубликате, невалидном ID, конфликте портов H2/H3 и ошибке RNG действие блокируется.
 
-Сохранение полной проверенной конфигурации выполняется в фоновом worker с существующей проверкой внешнего изменения файла. **До успеха никакая ссылка и token не отображаются**. При ошибке доступны `r` повторить и `d` уничтожить черновик/токен. После сохранения отдельное `y` раскрывает конфиденциальный `theia://v1/...` только один раз; `n`/Esc вместо этого уничтожают токен; `Esc` после показа стирает URI с экрана и из состояния TUI. Пользовательская строка URI может быть длинной; вывод только в доверенном терминале/SSH, удобного безопасного экспорта в файл/clipboard/QR пока нет.
+Сохранение полной проверенной конфигурации выполняется в фоновом worker с существующей проверкой внешнего изменения файла. **До успеха никакая ссылка и token не отображаются**. При ошибке доступны `r` повторить и `d` уничтожить черновик/токен. После сохранения отдельное `y` раскрывает конфиденциальный `theia://v1/...` только один раз; `n`/Esc вместо этого уничтожают токен; `Esc` после показа стирает URI с экрана и из состояния TUI. Пользовательская строка URI может быть длинной; вывод только в доверенном терминале/SSH, доступен отдельно подтверждаемый защищённый экспорт в файл (`f`); clipboard/QR остаются открытыми.
 
-Важно: добавление записи в server.toml **не обновляет работающий процесс**. Секрет нельзя восстановить из digest; при его потере для работы понадобится будущая ротация. В M4.4b2a отдельно добавлено подтверждённое отключение существующего пользователя, но ротация токена, защищённый файл экспорта, управление users как список, импорт ссылки в клиентскую конфигурацию и системный прокси ещё не реализованы.
+Важно: добавление записи в server.toml **не обновляет работающий процесс**. Секрет нельзя восстановить из digest; для утраченного bearer используется отдельная подтверждаемая ротация. Отключение `x`, ротация `t`, восстановление `b`, экспорт `f`, публичная ссылка `l` и импорт `i` описаны в [INVITATIONS](INVITATIONS.md).
 
 
-## 12. M4.4c — client-only import: masked source, trust and safe save
+## 10. M4.4c — client-only import: masked source, trust and safe save
 
 The local client TUI with explicit \`--role client --config FILE\` offers \`i\` to import a pasted \`theia://v1\` URI or **absolute local file**. Bracketed-paste text stays in a zeroizing input state and is never rendered, even as a field being edited. Enter previews only **profile ID / endpoint / SNI / transport / bearer present?**; the token itself and source URI never appear in TUI diagnostics. A separate optional \`c\` step accepts a pre-trusted absolute CA PEM \`file:\` reference. Without CA the resulting profile is not connectable. A secretless public URI requires separate \`e\` + \`env:NAME\` rather than fabricated default credentials.
 
-Confirming \`y\` triggers worker-based protected bearer creation and guarded atomic TOML append; no profile ID overwrite, activation, reload or Windows OS proxy. A conflict/failed save preserves the existing profile, rolls back the new secret when safe and exposes no credential. The new profile is never active automatically. This is the F-14 M4.4c implementation under CI review (ADR-0055), not the cross-host M4.4d acceptance.
+Confirming \`y\` triggers worker-based protected bearer creation and guarded atomic TOML append; no profile ID overwrite, activation, reload or Windows OS proxy. A conflict/failed save preserves the existing profile, rolls back the new secret when safe and exposes no credential. The new profile is never active automatically. This is the merged F-14 local import contract (ADR-0055); automated WSL2 Linux → native Windows H2/H3 acceptance is tracked separately in [F14_ACCEPTANCE](F14_ACCEPTANCE.md).
 
-## 10. M4.4b2a — явное отключение существующего пользователя
+## 11. M4.4b2a — явное отключение существующего пользователя
 
 В серверном `theia tui --role server --config FILE` на **сохранённом** чистом TOML выбирается inbound; `x` открывает ввод ID уже существующего активного пользователя с grant на этот inbound. Enter показывает отдельное подтверждение `y` / `n` / Esc и предупреждение: `users[].disabled` **глобален для всех inbound**. `y` ставит только `disabled=true`, проверяет весь документ и использует фоновой атомарный Ctrl+S worker с обнаружением внешнего конфликта. В случае ошибки `r` повторяет запись, `d` уничтожает черновик. В client role, с несохранённым или редактируемым черновиком, для неизвестного/неразрешённого/уже отключённого ID действие блокируется.
 
-Токен и его SHA-256 не показываются и не меняются. После сохранения UI **не** вызывает IPC Apply; отдельно требуется read-only revision/status и подтверждённый auth-only CAS Apply. Действующие H2/H3 туннели не разрываются. Ротация, повторное включение, защищённый экспорт и немедленное завершение сессий остаются будущими работами. [ADR-0053](adr/0053-m4-4b2a-explicit-existing-user-disable.md).
+Токен и его SHA-256 не показываются и не меняются. После сохранения UI **не** вызывает IPC Apply; отдельно требуется read-only revision/status и подтверждённый auth-only CAS Apply. Действующие H2/H3 туннели не разрываются. Ротация, восстановление пользователя и защищённый экспорт доступны отдельными действиями; немедленное завершение существующих сессий остаётся открытым. [ADR-0053](adr/0053-m4-4b2a-explicit-existing-user-disable.md).
 
-## 11. M4.4b2b1 — подтверждённая ротация токена активного пользователя
+## 12. M4.4b2b1 — подтверждённая ротация токена активного пользователя
 
 В серверном редакторе после выбора inbound клавиша `t` открывает отдельный ввод ID существующего активного пользователя с grant именно на этот inbound. Enter → экран предварительного просмотра предупреждает, что токен глобально изменится **на всех inbound** этого пользователя, но grants/disabled не меняются, старые сессии остаются и runtime не меняется до отдельного auth-only CAS Apply. `y` подтверждает создание нового CSPRNG 32-byte bearer и guarded фоновое атомарное сохранение `users[].token_sha256`; `n/Esc` отменяет до генерации.
 
