@@ -65,6 +65,7 @@ mod tui_reality_review;
 mod tui_reality_provision;
 mod tui_reality_enroll;
 mod tui_reality_register;
+mod tui_reality_status;
 pub(crate) mod tui_runtime;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;

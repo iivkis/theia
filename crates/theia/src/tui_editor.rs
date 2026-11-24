@@ -1236,7 +1236,7 @@ impl Editor {
         &self.path
     }
 
-    fn selected_reality(&self) -> bool {
+    pub(crate) fn selected_reality(&self) -> bool {
         match &self.draft {
             Config::Server(doc) => doc.server.inbounds.get(self.selected_record).is_some_and(|i|
                 i.security_mode == crate::security_profile::SecurityMode::SmartReality),

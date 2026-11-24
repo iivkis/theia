@@ -151,8 +151,13 @@ pub fn inspect_registered(
     now: u64,
 ) -> Result<crate::descriptor::Verified, Error> {
     let (record, _admission) = registered_material(directory, binding, state, scope)?;
-    Publication::new(&directory.join(PUBLICATION))?.inspect_rooted(scope,
-        binding.identity_sha256, record.initial_payload_sha256, record.plan_sha256, now)
+    let (value, generation, publication) = Publication::new(&directory.join(PUBLICATION))?
+        .inspect_rooted_snapshot(scope, binding.identity_sha256, record.initial_payload_sha256, record.plan_sha256, now)?;
+    crate::reality_checkpoint::verify(directory, crate::reality_checkpoint::Stamp {
+        manifest: binding.manifest_sha256, generation, publication,
+        health_revision: state.revision(), health: state.snapshot_sha256().map_err(|_| Error::Health)?,
+    }, now)?;
+    Ok(value)
 }
 
 fn registered_material(

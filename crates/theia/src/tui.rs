@@ -14,6 +14,7 @@ use crate::{
     tui_reality_provision::ProvisionPanel,
     tui_reality_enroll::EnrollmentPanel,
     tui_reality_register::RegistrationPanel,
+    tui_reality_status::StatusPanel,
     tui_runtime::RuntimePanel,
     Role,
 };
@@ -312,6 +313,7 @@ struct Interaction {
     reality_provision: Option<ProvisionPanel>,
     reality_enrollment: Option<EnrollmentPanel>,
     reality_registration: Option<RegistrationPanel>,
+    reality_status: Option<StatusPanel>,
     runtime: Option<RuntimePanel>,
     pinned_review: Option<PinnedModeReview>,
     pinned_loading: Option<mpsc::Receiver<PinnedReviewResult>>,
@@ -339,6 +341,7 @@ impl Interaction {
             reality_provision: None,
             reality_enrollment: None,
             reality_registration: None,
+            reality_status: None,
             runtime: None,
             pinned_review: None,
             pinned_loading: None,
@@ -562,6 +565,10 @@ impl Interaction {
             if proxy.key(key) {
                 self.system_proxy = None;
             }
+            return false;
+        }
+        if let Some(panel) = self.reality_status.as_mut() {
+            if panel.key(key) { self.reality_status = None; }
             return false;
         }
         if let Some(panel) = self.reality_registration.as_mut() {
@@ -1224,6 +1231,20 @@ impl Interaction {
             (Screen::Server, Role::Server) | (Screen::Client, Role::Client)
         );
         if active {
+            if key.code == KeyCode::Char('V') && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+                if !editor.selected_reality() {
+                    editor.error = Some("Выберите зарегистрированный REALITY inbound/профиль.".into());
+                } else {
+                    match editor.require_clean_records() {
+                        Ok(()) => {
+                            editor.error = None;
+                            self.reality_status = Some(StatusPanel::open(editor));
+                        }
+                        Err(message) => editor.error = Some(message.into()),
+                    }
+                }
+                return false;
+            }
             if key.code == KeyCode::Char('M') && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
                 match editor.require_clean_records() {
                     Ok(()) => match RegistrationPanel::new(editor) {
@@ -1570,7 +1591,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         ),
     }
-    if let Some(registration) = interaction.and_then(|ui| ui.reality_registration.as_ref()) {
+    if let Some(status) = interaction.and_then(|ui| ui.reality_status.as_ref()) {
+        panel(frame, parts[1], "F-18: состояние REALITY", &status.body(), true);
+    } else if let Some(registration) = interaction.and_then(|ui| ui.reality_registration.as_ref()) {
         panel(frame, parts[1], "F-18: сохранить в общую конфигурацию", &registration.body(), true);
     } else if let Some(enrollment) = interaction.and_then(|ui| ui.reality_enrollment.as_ref()) {
         panel(frame, parts[1], "F-18: импорт REALITY", &enrollment.body(), true);
@@ -1691,9 +1714,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     }
     let footer = if model.screen == Screen::Client {
-        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  M: регистрация  Ctrl+S: сохранить"
+        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  M: регистрация  V: REALITY status  Ctrl+S: сохранить"
     } else {
-        "N/D/G/U/E: записи  W: REALITY  M: регистрация  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
+        "N/D/G/U/E: записи  W: REALITY  M: регистрация  V: REALITY status  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
     };
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
@@ -2011,6 +2034,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(enrollment) = interaction.reality_enrollment.as_mut() {
             enrollment.poll();
+        }
+        if let Some(status) = interaction.reality_status.as_mut() {
+            status.poll();
         }
         if let Some(registration) = interaction.reality_registration.as_mut() {
             if let Some(editor) = registration.poll() {

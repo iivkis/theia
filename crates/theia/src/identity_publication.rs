@@ -427,10 +427,18 @@ impl Publication {
         &self, scope: &Scope, expected_root: [u8; 32], expected_initial: [u8; 32],
         expected_plan: [u8; 32], now: u64,
     ) -> Result<Verified, Error> {
-        let (_, record, checked) = self.snapshot()?;
+        self.inspect_rooted_snapshot(scope, expected_root, expected_initial, expected_plan, now)
+            .map(|(value, _, _)| value)
+    }
+
+    pub(crate) fn inspect_rooted_snapshot(
+        &self, scope: &Scope, expected_root: [u8; 32], expected_initial: [u8; 32],
+        expected_plan: [u8; 32], now: u64,
+    ) -> Result<(Verified, u64, [u8; 32]), Error> {
+        let (raw, record, checked) = self.snapshot()?;
         record.check_clock(now)?;
         Self::check_root(&record, scope, expected_root, expected_initial, expected_plan)?;
-        Ok(checked.current)
+        Ok((checked.current, record.generation, bootstrap::digest(&raw)))
     }
 
     /// Capture both signing generations from the same verified file

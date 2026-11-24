@@ -179,7 +179,7 @@ pub fn apply(path: &Path, request: &Request, expected: [u8; 32], now: u64) -> Re
 /// Validate the immutable enrollment pinned by the shared config before
 /// interpreting mutable trust history. A copied/replaced profile, changed
 /// bearer ref or independently edited mode must not silently take effect.
-pub fn validate_client(profile: &Profile, now: u64) -> Result<crate::descriptor::Verified, Error> {
+fn pinned_client(profile: &Profile) -> Result<bootstrap::Profile, Error> {
     if profile.tls_profile != "smart-reality" || profile.tls_ca.is_some() {
         return Err(Error::Format);
     }
@@ -193,7 +193,11 @@ pub fn validate_client(profile: &Profile, now: u64) -> Result<crate::descriptor:
         || enrollment.policy().xhttp_mode != profile.effective_xhttp_mode() {
         return Err(Error::Approval);
     }
-    enrollment.load(now)
+    Ok(enrollment)
+}
+
+pub fn validate_client(profile: &Profile, now: u64) -> Result<crate::descriptor::Verified, Error> {
+    pinned_client(profile)?.load(now)
 }
 
 /// Read-only status for a saved REALITY record. Distinguish valid trust,
@@ -201,6 +205,22 @@ pub fn validate_client(profile: &Profile, now: u64) -> Result<crate::descriptor:
 pub fn registered_status(path: &Path, id: &str, now: u64) -> Result<String, Error> {
     path_string(path)?;
     let document = config::read_file(path).map_err(|_| Error::Format)?;
+    status_document(&document, id, now)
+}
+
+/// Render from the exact saved configuration bytes selected by the editor.
+/// Never use a second file read that may inspect a different record.
+pub(crate) fn status_expected(path: &Path, expected: [u8; 32], id: &str, now: u64) -> Result<String, Error> {
+    path_string(path)?;
+    let raw = config::editor_bytes(path).map_err(|_| Error::Storage)?;
+    let actual: [u8; 32] = Sha256::digest(&raw).into();
+    if actual != expected { return Err(Error::Approval); }
+    let document = config::parse(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
+        .map_err(|_| Error::Format)?;
+    status_document(&document, id, now)
+}
+
+fn status_document(document: &Config, id: &str, now: u64) -> Result<String, Error> {
     match document {
         Config::Server(doc) => {
             let inbound = doc.server.inbounds.iter().find(|i| i.id == id).ok_or(Error::Scope)?;
@@ -223,10 +243,13 @@ pub fn registered_status(path: &Path, id: &str, now: u64) -> Result<String, Erro
         }
         Config::Client(doc) => {
             let profile = doc.client.profiles.iter().find(|p| p.id == id).ok_or(Error::Scope)?;
-            let value = validate_client(profile, now)?;
+            let enrollment = pinned_client(profile)?;
+            let value = enrollment.store()?.inspect(now).map_err(|_| Error::Descriptor)?;
             let modes = value.effective_modes();
-            Ok(format!("Saved REALITY profile; runtime NOT ACTIVATED\nprofile={id}\nactive_profile={}\nrevision={}\nidentity_sha256={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nbackend_available=false",
+            let valid = value.check_time(now).is_ok();
+            Ok(format!("Saved REALITY profile; runtime NOT ACTIVATED\nprofile={id}\nactive_profile={}\nrevision={}\nidentity_sha256={}\nvalid_now={valid}\nrequired_action={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nbackend_available=false",
                 doc.client.active_profile == id, value.descriptor().revision, hex(bootstrap::fingerprint(value.signer())),
+                if valid { "backend-unavailable" } else { "authenticated-offline-recovery" },
                 modes.h2, modes.h3, modes.stream_one, modes.stream_up))
         }
     }
@@ -295,6 +318,9 @@ mod tests {
         assert_eq!(inbound.allowed_user_ids, vec!["device-a"]);
         assert!(prepare(&path, &req, 1000).is_err());
         let status = registered_status(&path, "reality-edge", 1000).unwrap();
+        let saved_digest: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
+        assert_eq!(status_expected(&path, saved_digest, "reality-edge", 1000).unwrap(), status);
+        assert_eq!(status_expected(&path, [0;32], "reality-edge", 1000), Err(Error::Approval));
         assert!(status.contains("backend_available=false"));
         assert!(status.contains("active_reference=ref.example.org"));
         // Compatible renewal advances publication without rewriting the
@@ -339,6 +365,11 @@ mod tests {
         let mut new = saved.client.profiles.last().unwrap().clone();
         assert!(validate_client(&new, 1000).is_ok());
         assert!(registered_status(&path, "reality-client", 1000).unwrap().contains("active_profile=false"));
+        let expired = validate_client(&new, 1000).unwrap().descriptor().not_after;
+        assert!(validate_client(&new, expired).is_err());
+        let offline = registered_status(&path, "reality-client", expired).unwrap();
+        assert!(offline.contains("valid_now=false"));
+        assert!(offline.contains("required_action=authenticated-offline-recovery"));
         new.auth_token = "env:OTHER".into();
         assert!(matches!(validate_client(&new, 1000), Err(Error::Approval)));
         let mut replacement = std::fs::read_to_string(&enrollment).unwrap();
