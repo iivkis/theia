@@ -95,6 +95,7 @@ ACTIVE_H3/H2 → stream ends → CLOSED
 - TLS hostname validation одинаково строгая в обеих ветках. Никакого insecure toggle в публичном релизе.
 - При обрыве живого потока не «продолжать» его на новом транспорте: это не поддерживаемая миграция.
 - QUIC congestion controller: BBR — **P0 release gate**. Выбранный QUIC backend должен реально поддерживать BBR и на client send, и на server send. Проверить установленную реализацию и тесты под loss/jitter, не подменять молча CUBIC. До реализации/замеров продукт не заявляется готовым.
+- ADR-0081: shared per-tunnel idle deadline starts at OPEN_OK and extends only on forwarded nonempty DATA or FIN, independent of direction. Keep the existing bounded write/flow-credit and handshake budgets, 300s absolute server session cap and bounded FIN-to-EOF drain. No change to fallback or connection reuse; proposed native acceptance.
 - Backpressure: bounded channels; ограничение одновременно открытых HTTP-streams и remote dials; timeouts с отменой.
 
 ## 5. Хранилище и конфигурация

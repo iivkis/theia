@@ -41,11 +41,10 @@ struct Fixture {
     h2: SocketAddr,
     h3: SocketAddr,
     roots: RootCertStore,
-    _servers: JoinSet<Result<(), server::ServerError>>,
 }
 
 impl Fixture {
-    async fn start() -> Self {
+    async fn start() -> (Self, JoinSet<Result<(), server::ServerError>>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
         let key = cert.key_pair.serialize_der();
@@ -92,7 +91,7 @@ impl Fixture {
         let mut servers = JoinSet::new();
         servers.spawn(server::serve(tcp, TlsAcceptor::from(Arc::new(tls)), context.clone()));
         servers.spawn(theia::h3_server::serve(udp, context));
-        Self { h2, h3, roots, _servers: servers }
+        (Self { h2, h3, roots }, servers)
     }
 
     async fn exercise(&self, transport: Transport, case: Case) {
@@ -186,7 +185,8 @@ impl Fixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_h2_h3_asymmetric_traffic_half_close_and_idle() {
     timeout(Duration::from_secs(75), async {
-        let fixture = Arc::new(Fixture::start().await);
+        let (fixture, _servers) = Fixture::start().await;
+        let fixture = Arc::new(fixture);
         let mut cases = JoinSet::new();
         for transport in [Transport::H2, Transport::H3] {
             for case in [Case::Upload, Case::Download, Case::UploadAfterRemoteFin, Case::DownloadAfterLocalFin, Case::Idle] {
