@@ -205,3 +205,11 @@ Theia должен предлагать отдельно от обычных H2/
 - Xray transport REALITY: https://xtls.github.io/en/config/transports/reality.html
 - Xue et al., *Fingerprinting Obfuscated Proxy Traffic with Encapsulated TLS Handshakes*, USENIX Security 2024: https://www.usenix.org/conference/usenixsecurity24/presentation/xue-fingerprinting
 - Frolov et al., *The Use of TLS in Censorship Circumvention*, NDSS 2019: https://www.ndss-symposium.org/wp-content/uploads/2019/02/ndss2019_03B-2-1_Frolov_paper.pdf
+
+## ADR-0082: read-only второй шаг мастера
+
+Оба batch-пути получают один просмотр выбранного фактического результата (j/k, a), отдельные H2/H3 статусы, консервативный 60-секундный freshness gate от начала проверки, дополнительный DNS pin gate для каталога и сверку точного набора согласованных адресов. Просроченные, неполные или несогласованные наблюдения не дают положительного статуса. Apply всегда блокирован до production security mode, identity, HTTP semantics и независимого security review. Никаких новых сетевых запросов, автоматического выбора, изменения профилей или выдачи ключей; нативные regression tests ещё требуют CI.
+
+## ADR-0083: дополнительная идентичность собственного H2/H3 inbound
+
+Production `pinned-cert-v1` — дополнительный exact leaf SHA-256 pin до bearer, с обязательными TLS1.3 PKI/SAN/ALPN и отдельным mutually exclusive HTTP path. Серверный TUI `P` → `y` валидирует собственную сохранённую пару cert/key, показывает публичный клиентский pin и записывает только выбранный security_mode через guarded TOML. Кандидаты из прежнего мастера не могут стать чужим сертификатом, активировать режим или перезаписать конфигурацию. Перезапуск и ручное согласование клиента необходимы. Это криптографическая привязка обычного TLS, **не REALITY**, не изменённый ClientHello/QUIC Initial, не самостоятельный Ed25519 identity/replay protocol или anti-probing. Настоящий F-18/F-19 и независимый crypto review остаются открыты. Нативная приёмка требует CI.

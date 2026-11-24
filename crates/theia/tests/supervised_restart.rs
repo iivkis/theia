@@ -285,6 +285,7 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
                     quic_listen: format!("127.0.0.1:{old_udp}"),
                     server_name: "localhost".into(),
                     tls_cert: format!("file:{}", old_cert.display()),
+                    security_mode: Default::default(),
                     tls_key: format!("file:{}", old_key.display()),
                 }],
                 users: vec![User {
@@ -557,6 +558,7 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
                     quic_listen: format!("127.0.0.1:{udp_port}"),
                     server_name: "localhost".into(),
                     tls_cert: format!("file:{}", old_cert.display()),
+                    security_mode: Default::default(),
                     tls_key: format!("file:{}", old_key.display()),
                 }],
                 users: vec![User {
@@ -915,6 +917,7 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
                     quic_listen: format!("127.0.0.1:{udp_port}"),
                     server_name: "localhost".into(),
                     tls_cert: format!("file:{}", cert.display()),
+                    security_mode: Default::default(),
                     tls_key: format!("file:{}", key.display()),
                 }],
                 users: vec![User {

@@ -122,3 +122,7 @@ The versioned theia://v1 invitation is **not** a SmartTheia frame, HTTP endpoint
 ## F-18/F-19: будущие security mode и TLS-in-TLS (не реализовано)
 
 Текущий SmartTheia frame v1 и H2/H3 transport contract **не меняются**. REALITY-подобная проверка идентичности сервера и camouflaged handshake является задачей внешнего security/transport adapter, не новым SmartTheia type или собственным TLS cipher. Anti-TLS-in-TLS flow shaping не дешифрует inner TLS и обязан сохранять byte-exact TCP и OPEN_OK/FIN/backpressure. H2 и H3 требуют отдельных wire feasibility/CI и явного согласования security mode без silent downgrade. Расширения version/capabilities, TOML и invite v2 требуют ADR, миграции, негативных TLS/auth/replay/probing тестов. До реализации такого режима в бинарнике нет; см. docs/STEALTH_REALITY.md и ADR-0020.
+
+## Дополнительный pinned-cert-v1 route (ADR-0083)
+
+Опциональный серверный `security_mode = "pinned-cert-v1"` принимает только `POST /v1/pinned-session`; plain принимает только `/v1/session`. Одинаковый SmartTheia v1 codec, bearer grants и OPEN_OK. Клиент проверяет точный SHA-256 DER leaf после стандартной TLS1.3 PKI/SAN/ALPN и перед отправкой HTTP bearer на обоих транспортах. Ни один mode mismatch, wrong pin, CA или auth failure не вызывает downgrade. Никаких изменений frame IDs или invitation v1; настоящий REALITY не реализован. Нативная приёмка нового режима требуется.

@@ -51,6 +51,7 @@ pub(crate) struct CandidateBatchPanel {
     selected: Vec<IpAddr>,
     state: BatchState,
     observed_at: Option<Instant>,
+    review: crate::tui_reality_review::ReviewCursor,
 }
 
 impl CandidateBatchPanel {
@@ -75,6 +76,7 @@ impl CandidateBatchPanel {
             selected: Vec::new(),
             state: BatchState::Select,
             observed_at: None,
+            review: Default::default(),
         }
     }
 
@@ -95,6 +97,10 @@ impl CandidateBatchPanel {
     }
 
     pub(crate) fn next(&mut self) {
+        if let BatchState::Complete(Ok(report)) = &self.state {
+            self.review.move_by(report.results.len(), true);
+            return;
+        }
         if matches!(self.state, BatchState::Select | BatchState::Complete(_))
             && !self.entries.is_empty()
         {
@@ -104,6 +110,10 @@ impl CandidateBatchPanel {
     }
 
     pub(crate) fn previous(&mut self) {
+        if let BatchState::Complete(Ok(report)) = &self.state {
+            self.review.move_by(report.results.len(), false);
+            return;
+        }
         if matches!(self.state, BatchState::Select | BatchState::Complete(_))
             && !self.entries.is_empty()
         {
@@ -113,6 +123,7 @@ impl CandidateBatchPanel {
     }
 
     pub(crate) fn toggle_current(&mut self) {
+        if self.review.is_open() { return; }
         if !matches!(self.state, BatchState::Select | BatchState::Complete(_)) {
             return;
         }
@@ -133,6 +144,7 @@ impl CandidateBatchPanel {
 
     /// Enter is a preview, NOT consent. Never open a socket in this method.
     pub(crate) fn ask_confirmation(&mut self) {
+        if self.review.is_open() { return; }
         if !matches!(self.state, BatchState::Select | BatchState::Complete(_))
             || self.server_name.is_none()
             || self.selected.is_empty()
@@ -143,6 +155,7 @@ impl CandidateBatchPanel {
     }
 
     pub(crate) fn decline(&mut self) {
+        if self.review.close() { return; }
         if self.is_confirming() {
             self.state = BatchState::Select;
         }
@@ -166,7 +179,9 @@ impl CandidateBatchPanel {
         let preview = self.preview.clone();
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        self.observed_at = None;
+        // Conservative age starts before worker I/O; polling cannot refresh it.
+        self.observed_at = Some(Instant::now());
+        self.review.reset();
         let started = std::thread::Builder::new()
             .name("theia-exact-h2-h3-cidr-batch".to_owned())
             .spawn(move || {
@@ -233,7 +248,6 @@ impl CandidateBatchPanel {
             _ => None,
         };
         if let Some(outcome) = response {
-            self.observed_at = Some(Instant::now());
             self.state = BatchState::Complete(outcome);
         }
     }
@@ -248,7 +262,14 @@ impl CandidateBatchPanel {
 
     /// Escape from confirmation returns to selection. Escape from the list
     /// or the completed/running view leaves and discards all scope/consent.
+    pub(crate) fn open_review(&mut self) {
+        if let BatchState::Complete(Ok(report)) = &self.state {
+            self.review.open(report);
+        }
+    }
+
     pub(crate) fn back_or_close(&mut self) -> bool {
+        if self.review.close() { return false; }
         if self.is_confirming() {
             self.decline();
             false
@@ -330,9 +351,12 @@ impl CandidateBatchPanel {
                 ));
             }
             BatchState::Complete(Ok(report)) => {
+                if self.review.is_open() {
+                    return self.review.body(report, &self.selected, self.server_name.as_deref().unwrap_or(""), self.observed_at, true);
+                }
                 let age = self.observed_at.map_or_else(
                     || "давность неизвестна".to_owned(),
-                    |t| format!("{} сек назад", t.elapsed().as_secs()),
+                    |t| format!("{} сек с начала проверки", t.elapsed().as_secs()),
                 );
                 out.push_str(&format!(
                     "Проверено целей: {}. Совместимы по H2+H3: {}/{}; измерение: {age}.\n",
@@ -340,11 +364,15 @@ impl CandidateBatchPanel {
                     report.dual_verified_count(),
                     report.results.len(),
                 ));
-                for entry in &report.results {
+                if !(crate::tui_reality_review::evidence_fresh(self.observed_at, Instant::now())) {
+                    out.push_str("Исторические наблюдения: срок действия истёк или неизвестен.\n");
+                }
+                for (index, entry) in report.results.iter().enumerate() {
+                    out.push_str(self.review.marker(index));
                     match &entry.result {
                         Ok(both) if both.address == entry.address => {
                             let h2 = match &both.h2 {
-                                Ok(observed) if observed.connected_ip == entry.address.ip() => {
+                                Ok(observed) if both.h2_verified() => {
                                     let score = observed.evidence.suitability(
                                         crate::camouflage_discovery::Transport::H2,
                                     );
@@ -353,7 +381,7 @@ impl CandidateBatchPanel {
                                 _ => "H2: отказ/Unknown".to_owned(),
                             };
                             let h3 = match &both.h3 {
-                                Ok(observed) if observed.connected_ip == entry.address.ip() => {
+                                Ok(observed) if both.h3_verified() => {
                                     let score = observed.evidence.suitability(
                                         crate::camouflage_discovery::Transport::H3,
                                     );
@@ -378,7 +406,7 @@ impl CandidateBatchPanel {
                     }
                 }
                 out.push_str(
-                    "\nREALITY: НЕ готов. Fingerprint, HTTP/3 semantics, server identity и anti-DPI не проверены.\nScore не является вероятностью обхода DPI. Нет Apply/сохранения/автоподбора.\nEsc: вернуться",
+                    "\nREALITY: НЕ готов. Fingerprint, HTTP/3 semantics, server identity и anti-DPI не проверены.\nScore не является вероятностью обхода DPI. Нет Apply/сохранения/автоподбора.\nj/k: выбрать результат; a: шаг 2 (просмотр). Esc: вернуться",
                 );
             }
         }
@@ -593,6 +621,34 @@ mod tests {
         assert!(output.contains("H3: отказ"));
         assert!(output.contains("REALITY: НЕ готов"));
         assert!(!output.contains("REALITY: ГОТОВ"));
+    }
+
+    #[test]
+    fn completed_report_review_is_read_only_and_poll_does_not_refresh_age() {
+        use crate::{camouflage_dual::DualProbeError, camouflage_dual_batch::DualBatchOutcome};
+        let mut panel = panel(false);
+        let ip = panel.entries[0].0;
+        panel.selected = vec![ip];
+        let started = Instant::now() - Duration::from_secs(61);
+        panel.observed_at = Some(started);
+        let (tx, rx) = mpsc::channel();
+        panel.state = BatchState::Running { result: rx, cancel: None };
+        tx.send(Ok(DualBatchReport { results: vec![DualBatchOutcome {
+            address: SocketAddr::new(ip, 443),
+            result: Err(DualProbeError::NotApproved),
+        }] })).unwrap();
+        panel.poll();
+        assert_eq!(panel.observed_at, Some(started));
+        panel.open_review();
+        assert!(panel.body().contains("Apply ЗАБЛОКИРОВАН"));
+        assert!(panel.body().contains("устарели/неизвестны"));
+        panel.ask_confirmation();
+        panel.confirm_and_start();
+        panel.toggle_current();
+        assert!(!panel.is_running());
+        assert_eq!(panel.selected, vec![ip]);
+        assert!(!panel.back_or_close());
+        assert!(!panel.review.is_open());
     }
 
     #[test]

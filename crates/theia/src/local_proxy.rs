@@ -101,11 +101,14 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             return Err(ClientError::Configuration);
         }
     }
-    if profile.tls_profile != "default" {
-        return Err(ClientError::Configuration);
-    }
+    let certificate_pin = if profile.tls_profile == "default" {
+        None
+    } else {
+        Some(crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile).ok_or(ClientError::Configuration)?)
+    };
     match profile.transport {
-        Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)
+        Transport::H2 => H2Client::new(&profile.server, &profile.server_name, &token, roots)?
+            .with_certificate_pin(certificate_pin)
             .map(Arc::new)
             .map(ProxyClient::H2),
         Transport::H3 | Transport::Auto => {
@@ -118,6 +121,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 .ok_or(ClientError::Io)?;
             let h3 = Arc::new(
                 H3Client::new(remote, &profile.server_name, &token, roots.clone())?
+                    .with_certificate_pin(certificate_pin)?
                     .with_connect_timeout(Duration::from_millis(u64::from(
                         profile.quic_connect_timeout_ms,
                     )))?,
@@ -130,7 +134,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 &profile.server_name,
                 &token,
                 roots,
-            )?);
+            )?.with_certificate_pin(certificate_pin)?);
             Ok(ProxyClient::Auto(Arc::new(AutoClient {
                 h2,
                 h3,

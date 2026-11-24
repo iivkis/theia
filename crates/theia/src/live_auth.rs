@@ -284,6 +284,7 @@ mod tests {
                     quic_listen: "127.0.0.1:4443".into(),
                     server_name: "a.example.org".into(),
                     tls_cert: "file:/tmp/cert".into(),
+                    security_mode: Default::default(),
                     tls_key: "file:/tmp/key".into(),
                 }],
                 users: vec![User {

@@ -5,7 +5,7 @@
 //! exact public IPs and affirmative consent, no re-resolution, no Apply.
 use crate::{
     camouflage_discovery::{
-        CandidateHost, CandidateSource, Observation, Transport, POPULAR_HTTPS_DOMAINS,
+        CandidateHost, CandidateSource, Transport, POPULAR_HTTPS_DOMAINS,
     },
     camouflage_domain_dns::{resolve_catalogued_domain, DnsConsent, DnsError, MAX_PINNED_IPS},
     camouflage_dual::{CandidateConsent, DualProbeTarget},
@@ -73,6 +73,7 @@ pub(crate) struct DomainPanel {
     address_index: usize,
     dns_received: Option<Instant>,
     probed_at: Option<Instant>,
+    review: crate::tui_reality_review::ReviewCursor,
     state: DomainState,
 }
 
@@ -97,6 +98,7 @@ impl DomainPanel {
             address_index: 0,
             dns_received: None,
             probed_at: None,
+            review: Default::default(),
             state: DomainState::Catalog,
         }
     }
@@ -139,9 +141,14 @@ impl DomainPanel {
         self.address_index = 0;
         self.dns_received = None;
         self.probed_at = None;
+        self.review.reset();
     }
 
     pub(crate) fn next(&mut self) {
+        if let DomainState::Complete(Ok(report)) = &self.state {
+            self.review.move_by(report.results.len(), true);
+            return;
+        }
         match self.state {
             DomainState::Catalog if !self.domains.is_empty() => {
                 self.domain_index = (self.domain_index + 1) % self.domains.len();
@@ -155,6 +162,10 @@ impl DomainPanel {
     }
 
     pub(crate) fn previous(&mut self) {
+        if let DomainState::Complete(Ok(report)) = &self.state {
+            self.review.move_by(report.results.len(), false);
+            return;
+        }
         match self.state {
             DomainState::Catalog if !self.domains.is_empty() => {
                 self.domain_index =
@@ -170,6 +181,7 @@ impl DomainPanel {
     }
 
     pub(crate) fn ask_confirmation(&mut self) {
+        if self.review.is_open() { return; }
         match self.state {
             DomainState::Catalog if self.domain().is_some() => {
                 self.state = DomainState::DnsConfirm;
@@ -180,6 +192,7 @@ impl DomainPanel {
     }
 
     pub(crate) fn decline(&mut self) {
+        if self.review.close() { return; }
         match self.state {
             DomainState::DnsConfirm => self.state = DomainState::Catalog,
             DomainState::ProbeConfirm => self.state = DomainState::Resolved,
@@ -188,6 +201,7 @@ impl DomainPanel {
     }
 
     pub(crate) fn toggle_current(&mut self) {
+        if self.review.is_open() { return; }
         if !self.is_resolved() || !self.fresh() {
             return;
         }
@@ -274,7 +288,9 @@ impl DomainPanel {
         let observed_at = self.dns_received;
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        self.probed_at = None;
+        // Conservative age starts before worker I/O; polling cannot refresh it.
+        self.probed_at = Some(Instant::now());
+        self.review.reset();
         let started = std::thread::Builder::new()
             .name("theia-catalogue-pinned-dual-batch".to_owned())
             .spawn(move || {
@@ -383,7 +399,6 @@ impl DomainPanel {
                 self.state = DomainState::DnsFailed(error);
             }
             Some(Finished::Probe(report)) => {
-                self.probed_at = Some(Instant::now());
                 self.state = DomainState::Complete(report);
             }
             _ => {}
@@ -403,7 +418,14 @@ impl DomainPanel {
 
     /// Esc unwinds the confirmation stage or discards DNS pins. Esc from a
     /// running worker cancels it and closes the modal immediately.
+    pub(crate) fn open_review(&mut self) {
+        if let DomainState::Complete(Ok(report)) = &self.state {
+            self.review.open(report);
+        }
+    }
+
     pub(crate) fn back_or_close(&mut self) -> bool {
+        if self.review.close() { return false; }
         match self.state {
             DomainState::DnsConfirm | DomainState::ProbeConfirm => {
                 self.decline();
@@ -529,36 +551,27 @@ impl DomainPanel {
                 ));
             }
             DomainState::Complete(Ok(report)) => {
+                if self.review.is_open() {
+                    return self.review.body(report, &self.selected, domain, self.probed_at, self.fresh());
+                }
                 let age = self.probed_at.map_or_else(
                     || "неизвестна".to_owned(),
-                    |at| format!("{} сек назад", at.elapsed().as_secs()),
+                    |at| format!("{} сек с начала проверки", at.elapsed().as_secs()),
                 );
                 out.push_str(&format!(
                     "Домен/SNI: {domain}. Оба H2+H3: {}/{}; измерение {age}.\n",
                     report.dual_verified_count(),
                     report.results.len(),
                 ));
-                for candidate in &report.results {
+                if !(crate::tui_reality_review::evidence_fresh(self.probed_at, Instant::now()) && self.fresh()) {
+                    out.push_str("Исторические наблюдения: срок действия истёк или неизвестен.\n");
+                }
+                for (index, candidate) in report.results.iter().enumerate() {
+                    out.push_str(self.review.marker(index));
                     match &candidate.result {
                         Ok(result) if result.address == candidate.address => {
-                            let h2 = result.h2.as_ref().ok().filter(|p| {
-                                p.connected_ip == candidate.address.ip()
-                                    && p.evidence.tls13 == Observation::Verified
-                                    && p.evidence.trusted_chain == Observation::Verified
-                                    && p.evidence.sni_san_match == Observation::Verified
-                                    && p.evidence.certificate_current == Observation::Verified
-                                    && p.evidence.reachable == Observation::Verified
-                                    && p.evidence.alpn_h2 == Observation::Verified
-                            });
-                            let h3 = result.h3.as_ref().ok().filter(|p| {
-                                p.connected_ip == candidate.address.ip()
-                                    && p.evidence.tls13 == Observation::Verified
-                                    && p.evidence.trusted_chain == Observation::Verified
-                                    && p.evidence.sni_san_match == Observation::Verified
-                                    && p.evidence.certificate_current == Observation::Verified
-                                    && p.evidence.reachable == Observation::Verified
-                                    && p.evidence.alpn_h3 == Observation::Verified
-                            });
+                            let h2 = result.h2.as_ref().ok().filter(|_| result.h2_verified());
+                            let h3 = result.h3.as_ref().ok().filter(|_| result.h3_verified());
                             let h2_display = h2.map_or_else(
                                 || "H2: отказ/Unknown".to_owned(),
                                 |p| {
@@ -586,7 +599,7 @@ impl DomainPanel {
                     }
                 }
                 out.push_str(
-                    "\nREALITY: НЕ готов. Результат подтверждает лишь транспортный TLS/ALPN, НЕ HTTP/3 fingerprint/identity/DPI.\nScore не является вероятностью обхода DPI; нет Apply и автоматического сканирования каталога.\nEsc: каталог",
+                    "\nREALITY: НЕ готов. Результат подтверждает лишь транспортный TLS/ALPN, НЕ HTTP/3 fingerprint/identity/DPI.\nScore не является вероятностью обхода DPI; нет Apply и автоматического сканирования каталога.\nj/k: выбрать результат; a: шаг 2 (просмотр). Esc: каталог",
                 );
             }
         }
@@ -884,6 +897,45 @@ mod tests {
         assert!(out.contains("H2: 80/100, 85% confidence"));
         assert!(out.contains("H3: 80/100, 85% confidence"));
         assert!(out.contains("REALITY: НЕ готов"));
+
+        panel.selected = vec![ip];
+        panel.dns_received = Some(Instant::now());
+        panel.probed_at = Some(Instant::now());
+        panel.open_review();
+        let preview = panel.body();
+        assert!(preview.contains("Оба TLS/ALPN наблюдения актуальны"));
+        assert!(preview.contains("Apply ЗАБЛОКИРОВАН"));
+        panel.dns_received = None;
+        let expired = panel.body();
+        assert!(!expired.contains("Оба TLS/ALPN наблюдения актуальны"));
+        assert!(expired.contains("устарели/неизвестны"));
+    }
+
+    #[test]
+    fn review_after_delayed_probe_poll_keeps_original_age_and_cannot_apply() {
+        use crate::{camouflage_dual::DualProbeError, camouflage_dual_batch::DualBatchOutcome};
+        let mut panel = panel();
+        let ip = "93.184.216.10".parse().unwrap();
+        panel.selected = vec![ip];
+        panel.dns_received = Some(Instant::now());
+        let started = Instant::now() - Duration::from_secs(61);
+        panel.probed_at = Some(started);
+        let (tx, rx) = mpsc::channel();
+        panel.state = DomainState::ProbeRunning { result: rx, cancel: None };
+        tx.send(Ok(DualBatchReport { results: vec![DualBatchOutcome {
+            address: SocketAddr::new(ip, 443),
+            result: Err(DualProbeError::NotApproved),
+        }] })).unwrap();
+        panel.poll();
+        assert_eq!(panel.probed_at, Some(started));
+        panel.open_review();
+        assert!(panel.body().contains("Apply ЗАБЛОКИРОВАН"));
+        assert!(panel.body().contains("устарели/неизвестны"));
+        panel.ask_confirmation();
+        panel.confirm_probes_and_start();
+        assert!(!panel.is_running());
+        assert!(!panel.back_or_close());
+        assert!(!panel.review.is_open());
     }
 
     #[test]

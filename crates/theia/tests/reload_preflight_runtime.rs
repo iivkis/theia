@@ -86,6 +86,7 @@ async fn live_binary_preflight_accepts_safe_delta_rejects_identity_drift_and_nev
                 quic_listen: format!("127.0.0.1:{h3}"),
                 server_name: "localhost".into(),
                 tls_cert: format!("file:{}", cert_path.display()),
+                security_mode: Default::default(),
                 tls_key: format!("file:{}", key_path.display()),
             }],
             users: vec![User {

@@ -222,3 +222,11 @@ For uncertain TOML replacement, issuance/rotation and disable failure panels mus
 **M4.4i:** l in the loaded editor opens the public tokenless link for the selected saved server inbound or client profile; Enter/Esc closes. No file write, secret lookup, runtime Apply or account change. Confidential issuance remains a distinct action. Dirty/stale/unsupported records refuse. Native Windows recovery parity is tested through the existing Named Pipe Apply scenario.
 
 Public share and disabled-user recovery shortcuts are included in the main editor and help. The public-share panel is separate from confidential issuance; no implicit token retrieval.
+
+### F-18: общий второй шаг просмотра результата (ADR-0082)
+
+После завершения уже отдельно согласованного H2/H3 batch (`p→r→b` или `p→r→d`) j/k перемещает указатель по фактическим результатам, `a` открывает read-only preview точного IP:443/SNI. Возраст считается консервативно от старта worker, не poll; после 60с или истечения DNS pin отображается отказ. Сверяется весь набор без дубликатов/подмены порта/адреса и две независимые TLS/ALPN проверки. Esc/n возвращают отчёт; `y` ничего не применяет. Ни один новый DNS/HTTP/TLS запрос, запись TOML, создание ключа, выдача приглашения или runtime Apply недоступны через preview. Это подготовка границы второго шага, не готовый security mode. Нативная приёмка требуется.
+
+### Дополнительная идентичность своего inbound
+
+В серверном редакторе `P` запускает локальную проверку сохранённых TOML/cert/key в worker. Просмотр показывает свой inbound, имя, порт и публичный pin; `y` повторно проверяет точный snapshot/leaf и сохраняет только `security_mode = "pinned-cert-v1"` через guarded write. `n`/Esc отменяют. Ни одного сетевого запроса или runtime Apply; отдельный restart обязателен. Профиль вручную переносится в клиент по доверенному каналу. Никаких третьих адресов, автоматической мимикрии или REALITY-ready. Существующий кандидатный `a` остаётся read-only.

@@ -64,3 +64,5 @@
 ## 5. Release gates и merge
 
 Required check: `ci-gate` на актуальном SHA; настройка branch protection отдельна. Все обязательные positive/negative native, security, browser и cross-host тесты сохраняются. Не заменять реальный E2E моками, не расширять skip rules и не удалять evidence ради экономии CI. До автоматизации и успешного выполнения всех независимых P0 gates, including F-07, F-11, F-13, F-14, F-18, F-19 и M5, релиз не допускается. Не считать test-only TLS primitives, partial fingerprint, синтетический benchmark или зелёный unit test полной приёмкой.
+
+- ADR-0082/0083 (proposed): exact/fresh wizard review and own-cert guarded TOML save, explicit pinned TLS profile over H2/H3, wrong trusted pin/hostname/bearer/mode mismatch before target dial, correct byte-exact relays, real binary auto fallback only on observed UDP silence and terminal H3 pin mismatch, restart-only/mode and invite v1 refusal. Existing native matrix, no extra job; unverified until exact-head CI.

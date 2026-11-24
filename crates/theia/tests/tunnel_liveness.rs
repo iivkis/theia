@@ -78,6 +78,7 @@ impl Fixture {
             quic_listen: h3.to_string(),
             server_name: "localhost".into(),
             tls_cert: "unused".into(),
+            security_mode: Default::default(),
             tls_key: "unused".into(),
         };
         let user = User {

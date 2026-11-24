@@ -29,6 +29,7 @@ pub struct H3Client {
     authorization: HeaderValue,
     roots: RootCertStore,
     connect_timeout: Duration,
+    certificate_pin: Option<crate::security_profile::CertificatePin>,
 }
 
 impl H3Client {
@@ -59,7 +60,18 @@ impl H3Client {
             authorization: bearer_header(token)?,
             roots,
             connect_timeout: Duration::from_secs(10),
+            certificate_pin: None,
         })
+    }
+
+    pub fn with_certificate_pin(mut self, pin: Option<crate::security_profile::CertificatePin>) -> Result<Self, ClientError> {
+        if pin.is_some() {
+            self.uri = Uri::builder().scheme("https").authority(self.name.as_str()).path_and_query(crate::security_profile::PINNED_PATH).build().map_err(|_| ClientError::Configuration)?;
+        } else if self.certificate_pin.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        self.certificate_pin = pin;
+        Ok(self)
     }
 
     pub(crate) fn remote(&self) -> SocketAddr {
@@ -118,6 +130,11 @@ impl H3Client {
             .connect(self.remote, &self.name, self.connect_timeout)
             .await
             .map_err(quic_error)?;
+        if let Some(pin) = self.certificate_pin {
+            let chain = connection.peer_identity().ok_or(ClientError::Tls)?
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().map_err(|_| ClientError::Tls)?;
+            pin.verify(chain.first().ok_or(ClientError::Tls)?.as_ref())?;
+        }
         crate::diag!(
             Trace,
             "client.h3",

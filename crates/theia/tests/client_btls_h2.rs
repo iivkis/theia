@@ -82,6 +82,7 @@ async fn production_listener(allow_private: bool, alpn: &[u8]) -> (String, Strin
         quic_listen: "127.0.0.1:0".into(),
         server_name: "localhost".into(),
         tls_cert: "ephemeral-test-only".into(),
+        security_mode: Default::default(),
         tls_key: "ephemeral-test-only".into(),
     };
     let user = User {

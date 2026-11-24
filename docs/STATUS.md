@@ -1,6 +1,6 @@
 # Фактический статус Theia
 
-**Срез состояния:** 2026-11-24, после merge [PR #114](https://github.com/iivkis/theia/pull/114) в `main` (`b511c1aad58456c3adf70e1d366d6846e51cee91`). Это **не release-acceptance**: проект experimental/unreleased. [Exact-head CI PR #114](https://github.com/iivkis/theia/actions/runs/45417397070): **13/13 SUCCESS**, условный format-repair skipped; автоформатирование подтверждено [предыдущим прогоном](https://github.com/iivkis/theia/actions/runs/45417334164).
+**Срез состояния:** 2026-11-24, после merge [PR #115](https://github.com/iivkis/theia/pull/115) в `main` (`c85e5c3847d5bb3c91b7203b90dc6b9b31c67e69`). Это **не release-acceptance**: проект experimental/unreleased. [Exact-head CI PR #115](https://github.com/iivkis/theia/actions/runs/45419559187): **13/13 SUCCESS**, format-repair skipped. H2/H3 relay liveness принят.
 
 Этот файл — актуальная сводка реализованных контрактов. [IMPLEMENTATION_SPEC](IMPLEMENTATION_SPEC.md) остаётся нормативной спецификацией **целевой** функциональности, [IMPLEMENTATION_PLAN](IMPLEMENTATION_PLAN.md) — историческим перечнем этапов, [ADR](adr/) — архивом решений, а [TESTING_CI](TESTING_CI.md) — контрактом тестирования.
 
@@ -43,3 +43,7 @@
 F-14 evidence and residual gaps: [F14_ACCEPTANCE.md](F14_ACCEPTANCE.md). Do not equate a saved configuration with live authorization or release readiness.
 
 **Reference policy (ADR-0074–0076):** Go/uTLS comparison retired; independent Python/OpenSSL strict H2 interoperability and pinned Chromium H2/H3 functional acceptance are mandatory. Browser origin navigation via local SOCKS5 is not a browser QUIC first-flight reference or packet parity claim.
+
+### F-18 дополнительная идентичность (предлагаемый срез)
+
+ADR-0082/0083: read-only второй шаг мастера с exact/fresh dual evidence и дополнительный `pinned-cert-v1` для собственного server inbound, H2/H3/auto client, mutual mode refusal, guarded сохранение с отдельным restart. Это не modified REALITY handshake, не pin key lifecycle audit, не F-18/F-19 acceptance. CI нового блока ещё не подтверждён.

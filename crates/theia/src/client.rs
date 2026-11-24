@@ -117,6 +117,7 @@ pub struct H2Client {
     authorization: HeaderValue,
     connector: H2Tls,
     wire_shape: H2WireShape,
+    certificate_pin: Option<crate::security_profile::CertificatePin>,
 }
 
 impl H2Client {
@@ -223,7 +224,22 @@ impl H2Client {
             authorization,
             connector,
             wire_shape,
+            certificate_pin: None,
         })
+    }
+
+    /// Opt in to an additional exact leaf certificate identity, retaining PKI.
+    pub fn with_certificate_pin(mut self, pin: Option<crate::security_profile::CertificatePin>) -> Result<Self, ClientError> {
+        if pin.is_some() {
+            if !matches!(&self.connector, H2Tls::Rustls(_)) {
+                return Err(ClientError::Configuration);
+            }
+            self.uri = http::Uri::builder().scheme("https").authority(self.uri.authority().ok_or(ClientError::Configuration)?.as_str()).path_and_query(crate::security_profile::PINNED_PATH).build().map_err(|_| ClientError::Configuration)?;
+        } else if self.certificate_pin.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        self.certificate_pin = pin;
+        Ok(self)
     }
 
     /// Resolve only the configured server endpoint. DNS target names are
@@ -273,6 +289,9 @@ impl H2Client {
                     .map_err(|_| ClientError::Tls)?;
                 if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
                     return Err(ClientError::Tls);
+                }
+                if let Some(pin) = self.certificate_pin {
+                    pin.verify(tls.get_ref().1.peer_certificates().and_then(|chain| chain.first()).ok_or(ClientError::Tls)?.as_ref())?;
                 }
                 start_h2(tls, self.wire_shape).await?
             }

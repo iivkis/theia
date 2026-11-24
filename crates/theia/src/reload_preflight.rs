@@ -64,6 +64,7 @@ pub fn assess_reload(
             || before.server_name != after.server_name
             || before.tls_cert != after.tls_cert
             || before.tls_key != after.tls_key
+            || before.security_mode != after.security_mode
         {
             return Err(ReloadCheckError::RequiresRestart);
         }
@@ -346,6 +347,7 @@ mod tests {
                     h2_listen: "127.0.0.1:9443".into(),
                     server_name: "edge.example.org".into(),
                     tls_cert: "file:/tmp/theia-cert.pem".into(),
+                    security_mode: Default::default(),
                     tls_key: "file:/tmp/theia-key.pem".into(),
                 }],
                 users: vec![User {

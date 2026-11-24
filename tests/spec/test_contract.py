@@ -455,6 +455,43 @@ class SpecContractTests(unittest.TestCase):
                       read("crates/theia/tests/h3_server.rs"))
         self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
 
+    def test_pinned_identity_is_additional_and_mode_is_explicit(self):
+        security = read("crates/theia/src/security_profile.rs")
+        self.assertIn("pinned-cert-v1:", security)
+        self.assertIn("ConstantTimeEq", security)
+        for path in ("client.rs", "h3_client.rs"):
+            source = read("crates/theia/src/" + path)
+            self.assertIn("pin.verify(", source)
+            self.assertIn("PINNED_PATH", source)
+            self.assertIn("with_certificate_pin", source)
+        server = read("crates/theia/src/server.rs")
+        self.assertIn("self.security_mode.path()", server)
+        self.assertIn("before.security_mode != after.security_mode",
+                      read("crates/theia/src/reload_preflight.rs"))
+        editor = read("crates/theia/src/tui_editor.rs")
+        self.assertIn("review_pinned_mode", editor)
+        self.assertIn("apply_pinned_mode", editor)
+        self.assertIn("h2_h3_pinned_identity_and_mode_are_fail_closed",
+                      read("crates/theia/tests/security_profile.rs"))
+        self.assertIn("pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_silence",
+                      read("crates/theia/tests/client_h2.rs"))
+
+    def test_f18_second_stage_is_read_only_and_shared(self):
+        review = read("crates/theia/src/tui_reality_review.rs")
+        self.assertIn("matches_selection", review)
+        self.assertIn("checked_duration_since", review)
+        self.assertIn("Apply ЗАБЛОКИРОВАН", review)
+        for forbidden in ("probe_dual_batch(", "std::fs", "write_all(", "runtime_apply"):
+            self.assertNotIn(forbidden, review)
+        for path in ("tui_candidate_batch.rs", "tui_domain.rs"):
+            source = read("crates/theia/src/" + path)
+            self.assertIn("ReviewCursor", source)
+            self.assertIn("self.review.body(", source)
+            self.assertIn("pub(crate) fn open_review", source)
+        tui = read("crates/theia/src/tui.rs")
+        self.assertIn("domain.open_review()", tui)
+        self.assertIn("batch.open_review()", tui)
+
     def test_m31_h3_server_reuses_security_boundary(self):
         h2 = read("crates/theia/src/server.rs")
         h3 = read("crates/theia/src/h3_server.rs")
