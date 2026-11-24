@@ -55,7 +55,7 @@ for name in ("windows-smoke", "browser-e2e"):
         "needs.specification.outputs.rust_ready == 'true'" in job(name),
         f"{name} must retain the Rust readiness precondition",
     )
-require(needs("ci-gate") == mandatory, "ci-gate must depend on EVERY required job")
+require(needs("ci-gate") == mandatory | {"format-repair"}, "ci-gate must depend on EVERY required job and repair outcome")
 require(needs("f14-cross-host") == {"specification", "rust-tests", "windows-smoke"},
         "F-14 must consume verified Linux and Windows CI-built executable artifacts")
 cross_host = job("f14-cross-host")
@@ -116,7 +116,7 @@ require("  workflow_dispatch:" in workflow,
 for os, payload in (("Linux", job("rust-tests")), ("Windows", windows)):
     require(re.search(
         rf"(?m)^      - name: Manual release compilation \({os}\)\n"
-        r"        if: github.event_name == 'workflow_dispatch'\n"
+        r"        if: github.event_name == 'workflow_dispatch' && inputs.formatted_sha == ''\n"
         r"        run: cargo build --workspace --release --locked$",
         payload,
     ) is not None, f"{os}: optimized release build must be manual and unmodified")
@@ -158,28 +158,44 @@ require("  m3-3-bbr-comparison:" not in workflow,
 require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
 
 
-# The specification is now the ONLY formatting gate.  Every native job
-# tests the checked-out commit byte-for-byte, with no format overlay, post-green
-# bot push, or extra untested SHA. Syntax/format errors abort before the matrix.
+# Formatting is checked before native fan-out. A dirty tree is NEVER tested;
+# only a new commit and a fresh CI run may pass. The write job is isolated.
 spec = job("specification")
+repair = job("format-repair")
 require("fetch-depth: 2" in spec,
         "PR merge base and previous push commit must be available for scope proof")
 require("steps.scope.outputs.native_required" in spec,
         "specification must publish fail-closed native CI scope")
-require("scripts/ci-scope.py --base" in spec
-        and "test_ci_scope.py" in spec,
-        "scope detector and its negative-history tests must run before any skip")
-require("cargo fmt --all -- --check" in spec
-        and "cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check" in spec
-        and "cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all -- --check" in spec,
-        "all Rust workspaces must be checked BEFORE native CI fan-out")
-require("git diff --exit-code" in spec,
-        "unmodified Rust source tree is required")
-require("ci-formatted-source" not in workflow
-        and "persist-format:" not in workflow,
-        "never change PR SHA after successful CI or upload/download formatter overlays")
-# Formatting is an exact-SHA, fail-fast preflight gate. Re-running rustfmt after fan-out costs runner time but cannot add coverage: downstream
-# jobs check out the same immutable tree and never modify Rust files.
+require("scripts/ci-scope.py --base" in spec and "test_ci_scope.py" in spec,
+        "scope detector and negative-history tests must run before any skip")
+require("scripts/ci-format-repair.py probe" in spec
+        and "steps.format.outputs.format_drift" in spec
+        and "test_ci_format_repair.py" in spec,
+        "format preflight and its safety regressions must precede fan-out")
+require("test \"$FORMATTED_SHA\" = \"$GITHUB_SHA\"" in spec
+        and "formatted_sha" in workflow,
+        "automatic dispatch must test the exact requested commit")
+require(needs("format-repair") == {"specification"}
+        and "needs.specification.result == 'failure'" in repair
+        and "needs.specification.outputs.format_drift == 'true'" in repair
+        and "github.event_name == 'pull_request'" in repair
+        and "github.event.pull_request.head.repo.full_name == github.repository" in repair
+        and "github.event.pull_request.head.ref != 'main'" in repair
+        and "github.event.pull_request.head.ref != github.event.repository.default_branch" in repair
+        and "github.event.pull_request.head.ref != github.event.pull_request.base.ref" in repair,
+        "repair only a failed format probe on trusted non-base PR head")
+require("ref: ${{ github.event.pull_request.head.sha }}" in repair
+        and "persist-credentials: false" in repair
+        and "scripts/ci-format-repair.py repair" in repair
+        and 'git rev-parse HEAD^' in repair
+        and 'git push --force-with-lease=' in repair
+        and 'gh workflow run ci.yml' in repair
+        and 'formatted_sha=$new_sha' in repair,
+        "repair must commit only on exact head, lease push and explicitly dispatch new SHA")
+require("ci-formatted-source" not in workflow and "persist-format:" not in workflow,
+        "never test a formatter overlay or mutate a green SHA")
+require('results.get("format-repair", {}).get("result") != "skipped"' in gate,
+        "old repair run cannot pass ci-gate")
 for name in mandatory - {"specification"}:
     payload = job(name)
     require("cargo fmt " not in payload,
@@ -202,8 +218,9 @@ require('native not in {"true", "false"}' in gate,
         "unset native scope must fail closed")
 require('("success" if name == "specification" else "skipped")' in gate,
         "docs-only path must require a successful spec and skipped native matrix")
-require("contents: write" not in workflow,
-        "normal CI must never receive repository contents write permission")
+require(workflow.count("contents: write") == 1 and "contents: write" in repair
+        and workflow.count("actions: write") == 1 and "actions: write" in repair,
+        "only the guarded repair job may write or dispatch")
 
 require("actions/setup-go" not in workflow and "THEIA_UTLS" not in workflow
         and "utls_reference" not in workflow and "gofmt " not in workflow,

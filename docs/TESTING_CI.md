@@ -4,11 +4,11 @@
 
 ## 1. Порядок GitHub Actions
 
-Источник исполнения: [workflow](../.github/workflows/ci.yml). На PR и push в main запускаются specification и ci-gate. Для обычного изменения кода обязательны 13 jobs с учётом OS matrix:
+Источник исполнения: [workflow](../.github/workflows/ci.yml). На PR и push в main запускаются specification и ci-gate. Для обычного изменения кода обязательны 13 jobs с учётом OS matrix, плюс условный `format-repair` (skipped на чистом SHA):
 
 | Job | Обязательные проверки |
 | --- | --- |
-| specification | Markdown links, TOML/schema и контракты, syntax/F-14 guest network, CI DAG, docs-only classifier, independent TLS probe, timing validation; fail-fast `cargo fmt --all -- --check`. |
+| specification | Markdown links, TOML/schema и контракты, syntax/F-14 guest network, CI DAG, docs-only classifier, independent TLS probe, timing validation; fail-fast Rustfmt preflight всех трёх workspaces. |
 | rust-tests (Linux) | Locked all-target tests, Clippy с `-D warnings`, реальный Linux binary для cross-host acceptance. |
 | windows-smoke | Native all-target tests, PTY/ConPTY, отдельный opt-in disposable WinINet CAS/recovery, cross-logon Named Pipe kernel denial, staging Windows artifacts. |
 | m0-1-api-spike / m0-1-windows-spike | Изолированный Rust crate: strict TLS/H2 и QUIC/H3, full-duplex, flow credit, cancellation, BBR/CUBIC с детерминированной потерей/задержкой; Python/OpenSSL independent H2 interoperability и negative CA/hostname. |
@@ -21,7 +21,7 @@
 - После specification независимые native jobs выполняются параллельно. `f14-cross-host` ждёт Linux/Windows artifacts. Используются pinned dependencies, committed lockfiles и `Swatinem/rust-cache`; устаревшие runs одной ветки отменяются.
 - Полные release builds по явному `workflow_dispatch`; обычные PR не дублируют их. Без root Cargo.toml/Cargo.lock production validation не считается выполненной.
 - Docs-only fast path допускается только при доказанном Git diff из обычных non-executable Markdown add/modify/delete в allowlist. Неизвестный diff, rename/type/mode changes и non-Markdown запускают full native. Specification и ci-gate остаются обязательными.
-- CI не переписывает тестируемый head и не подменяет форматирование; исправления отправляются отдельным commit. Нельзя заявлять red/green evidence без соответствующих запусков.
+- Rustfmt drift: `specification` форматирует локально и доказывает, что diff содержит только изменения tracked regular `.rs`; грязный SHA падает до native fan-out. `format-repair` только для собственной PR-ветки, не main/base/fork, создаёт один проверенный дочерний commit с lease на точный head и явно запускает `workflow_dispatch` на новом SHA. Новый CI проверяет его полностью, без release-сборки и без повторного auto-repair. `ci-gate` требует skipped repair на зелёном прогоне. Синтаксическая ошибка, не-Rust diff, конфликт ветки, отсутствие прав или ошибка dispatch блокируют merge. Никаких formatter overlays или post-green commits.
 - Никаких обязательных локальных ручных smoke-тестов. Для автоматизированной приёмки использовать loopback/изолированные VM, ephemeral PKI/credentials, machine-checkable assertions и cleanup. Не обращаться к внешним production endpoints.
 
 ## 2. Контракт автоматизированных проверок

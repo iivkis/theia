@@ -18,7 +18,7 @@ permissions:
 concurrency:
   # A new CI DAG epoch isolates this job topology from an unresponsive
   # cancelled v1 Windows runner. PR head supersession still cancels within v2.
-  group: ci-fast-v4-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.ref_name }}
+  group: ci-fast-v4-${{ github.workflow }}-${{ github.ref }}-${{ inputs.formatted_sha || 'ordinary' }}
   cancel-in-progress: true
 
 jobs:
