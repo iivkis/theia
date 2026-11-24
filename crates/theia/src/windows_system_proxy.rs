@@ -605,11 +605,17 @@ fn recover_locked() -> Result<Recovery, ProxyError> {
     let Some(journal) = read_journal()? else {
         return Ok(Recovery::NothingPending);
     };
-    restore_journal(&journal)
+    restore_journal(&journal, None)
 }
 
-fn restore_journal(journal: &Journal) -> Result<Recovery, ProxyError> {
+fn restore_journal(
+    journal: &Journal,
+    expected: Option<&Snapshot>,
+) -> Result<Recovery, ProxyError> {
     let current = query()?;
+    if expected.is_some_and(|expected| expected != &current) {
+        return Err(ProxyError::Conflict);
+    }
     if current == journal.before {
         // Process crashed before WinINet commit or another actor restored the
         // *exact* old state. Clear the stale journal without touching WinINet.
@@ -703,10 +709,10 @@ pub(crate) fn review_recovery() -> Result<RecoveryReview, ProxyError> {
 
 pub(crate) fn recover_reviewed(review: RecoveryReview) -> Result<Recovery, ProxyError> {
     let _lock = Mutex::acquire()?;
-    if read_journal()?.as_ref() != Some(&review.journal) || query()? != review.current {
+    if read_journal()?.as_ref() != Some(&review.journal) {
         return Err(ProxyError::Conflict);
     }
-    restore_journal(&review.journal)
+    restore_journal(&review.journal, Some(&review.current))
 }
 
 /// The Windows mutex is **thread-owned**, not task-owned. A Tokio task can
