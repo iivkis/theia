@@ -74,8 +74,16 @@ class CoverageTests(unittest.TestCase):
             }
             export = {"type": "llvm.coverage.json.export", "version": "2.0.1",
                       "data": [{"files": [record]}]}
-            llvm = cov.read_llvm_export(export, root, FILES)
-            self.assertEqual(llvm[A], ({"1": 1, "2": 1}, 3, 2))
+            for version in ("2.0.1", "3.1.0"):
+                export["version"] = version
+                llvm = cov.read_llvm_export(export, root, FILES)
+                self.assertEqual(llvm[A], ({"1": 1, "2": 1}, 3, 2))
+            for version in ("3.2.0", "4.0.0", "invalid", None):
+                with self.subTest(version=version), self.assertRaises(cov.EvidenceError):
+                    cov.read_llvm_export({**export, "version": version}, root, FILES)
+            for bad in ({"type": "other"}, {"data": []}, {"data": [{"files": None}]}):
+                with self.subTest(bad=bad), self.assertRaises(cov.EvidenceError):
+                    cov.read_llvm_export({**export, **bad}, root, FILES)
             text = f"SF:{source}\nDA:1,3\nDA:2,3\nLF:3\nLH:2\nend_of_record\n"
             self.assertEqual(cov.read_lcov(text, root, FILES, llvm), {A: {"1": 1, "2": 1}})
             for bad in (text.replace("DA:2,3\n", ""), text.replace("DA:2,3", "DA:2,0"),
@@ -98,6 +106,20 @@ class CoverageTests(unittest.TestCase):
                     [6, 1, 0, False, False, False]]
         self.assertEqual(cov.llvm_segment_lines(segments, 6),
                          {"1": 0, "2": 0, "4": 1, "5": 1, "6": 0})
+
+    def test_llvm_zero_length_skipped_segment_can_share_position(self):
+        segments = [[1, 1, 5, True, True, False],
+                    [2, 3, 0, False, True, False],
+                    [2, 3, 5, True, False, False],
+                    [4, 1, 0, False, False, False]]
+        # A skipped entry at the start of line 2 suppresses mapping on that
+        # line; the resumed region supplies the wrapped count on line 3.
+        self.assertEqual(cov.llvm_segment_lines(segments, 4),
+                         {"1": 1, "3": 1, "4": 1})
+        for bad in ([segments[0], segments[2], segments[1]],
+                    [segments[2], segments[0]], [segments[0], segments[0]]):
+            with self.subTest(bad=bad), self.assertRaises(cov.EvidenceError):
+                cov.llvm_segment_lines(bad, 4)
 
     def test_duplicate_json_keys_are_rejected(self):
         with self.assertRaises(cov.EvidenceError):
