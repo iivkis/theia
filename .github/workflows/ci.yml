@@ -611,8 +611,10 @@ jobs:
         run: python -m pip install pywinpty==3.0.5
       - name: Instrument full native workspace tests
         run: cargo llvm-cov --workspace --all-targets --all-features --locked --lcov --include-build-script --output-path coverage.lcov
+      - name: Export independent LLVM file segments from the same profiles
+        run: cargo llvm-cov report --json --include-build-script --output-path coverage-segments.json
       - name: Normalize exact-SHA native line evidence
-        run: python scripts/ci-coverage.py collect --lcov coverage.lcov --platform "${{ runner.os }}" --sha "${{ needs.specification.outputs.tested_sha }}" --output coverage.json
+        run: python scripts/ci-coverage.py collect --lcov coverage.lcov --llvm-json coverage-segments.json --platform "${{ runner.os }}" --sha "${{ needs.specification.outputs.tested_sha }}" --output coverage.json
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-${{ runner.os }}

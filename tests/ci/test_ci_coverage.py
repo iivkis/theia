@@ -59,6 +59,46 @@ class CoverageTests(unittest.TestCase):
                 with self.subTest(bad=bad), self.assertRaises(cov.EvidenceError):
                     cov.read_lcov(bad, root, FILES)
 
+    def test_llvm_file_union_can_differ_from_function_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / A
+            source.parent.mkdir(parents=True)
+            source.write_text("first\nsecond\nthird\n", encoding="utf-8")
+            record = {
+                "filename": str(source),
+                "segments": [[1, 1, 3, True, True, False],
+                             [2, 1, 0, True, True, False],
+                             [2, 5, 0, False, False, False]],
+                "summary": {"lines": {"count": 3, "covered": 2}},
+            }
+            export = {"type": "llvm.coverage.json.export", "version": "2.0.1",
+                      "data": [{"files": [record]}]}
+            llvm = cov.read_llvm_export(export, root, FILES)
+            self.assertEqual(llvm[A], ({"1": 1, "2": 1}, 3, 2))
+            text = f"SF:{source}\nDA:1,3\nDA:2,3\nLF:3\nLH:2\nend_of_record\n"
+            self.assertEqual(cov.read_lcov(text, root, FILES, llvm), {A: {"1": 1, "2": 1}})
+            for bad in (text.replace("DA:2,3\n", ""), text.replace("DA:2,3", "DA:2,0"),
+                        text.replace("LF:3", "LF:2"), text.replace("end_of_record\n", ""),
+                        text + text):
+                with self.subTest(bad=bad), self.assertRaises(cov.EvidenceError):
+                    cov.read_lcov(bad, root, FILES, llvm)
+            with self.assertRaises(cov.EvidenceError):
+                cov.read_lcov(text, root, FILES, {**llvm, B: ({}, 0, 0)})
+            with self.assertRaises(cov.EvidenceError):
+                cov.llvm_segment_lines([[1, 1, 0, True, True, False],
+                                       [1, 1, 0, False, False, False]], 3)
+
+    def test_llvm_segment_skips_gaps_and_tracks_wrapped_regions(self):
+        segments = [[1, 1, 0, True, True, False],
+                    [3, 1, 0, False, True, False],
+                    [4, 1, 7, True, True, False],
+                    [5, 1, 0, False, True, False],
+                    [5, 2, 0, True, True, True],
+                    [6, 1, 0, False, False, False]]
+        self.assertEqual(cov.llvm_segment_lines(segments, 6),
+                         {"1": 0, "2": 0, "4": 1, "5": 1, "6": 0})
+
     def test_duplicate_json_keys_are_rejected(self):
         with self.assertRaises(cov.EvidenceError):
             cov.strict_object([("a", 1), ("a", 0)])
