@@ -41,6 +41,8 @@ pub(crate) mod tui_domain;
 pub mod tui_editor;
 pub(crate) mod tui_probe;
 pub(crate) mod tui_runtime;
+#[cfg(windows)]
+pub(crate) mod tui_system_proxy;
 #[cfg(target_os = "windows")]
 pub mod windows_control;
 #[cfg(target_os = "windows")]
