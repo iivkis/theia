@@ -200,18 +200,18 @@ impl H2Client {
             let (response, _) = sender.send_request(request, true).map_err(|_| ClientError::Http2)?;
             let response = response.await.map_err(|_| ClientError::Http2)?;
             crate::split_http::check_status(response.status())?;
-            crate::identity_data::validate_descriptor_headers(response.headers())?;
+            let expected = crate::identity_data::validate_descriptor_headers(response.headers())?;
             let mut body = response.into_body();
             let mut bytes = Vec::new();
             while let Some(chunk) = body.data().await {
                 let chunk = chunk.map_err(|_| ClientError::Http2)?;
-                crate::identity_data::append_descriptor(&mut bytes, &chunk)?;
+                crate::identity_data::append_descriptor(&mut bytes, &chunk, expected)?;
                 body.flow_control().release_capacity(chunk.len()).map_err(|_| ClientError::Http2)?;
             }
             if body.trailers().await.map_err(|_| ClientError::Http2)?.is_some() {
                 return Err(ClientError::Protocol);
             }
-            String::from_utf8(bytes).map_err(|_| ClientError::Protocol)
+            crate::identity_data::finish_descriptor(bytes, expected)
         }).await.map_err(|_| ClientError::Timeout)?
     }
 

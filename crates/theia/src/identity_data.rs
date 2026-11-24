@@ -19,26 +19,39 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_rustls::TlsAcceptor;
 
-pub(crate) fn validate_descriptor_headers(headers: &http::HeaderMap) -> Result<(), ClientError> {
+pub(crate) fn validate_descriptor_headers(headers: &http::HeaderMap) -> Result<usize, ClientError> {
     use http::header;
     if headers.get_all(header::CONTENT_TYPE).iter().count() != 1
         || headers.get(header::CONTENT_TYPE).map(|v| v.as_bytes()) != Some(b"application/octet-stream".as_slice())
         || headers.get_all(header::CONTENT_LENGTH).iter().count() != 1
-        || !headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())
-            .is_some_and(|n| n > 0 && n <= descriptor::MAX_DOCUMENT)
+        || headers.contains_key(header::CONTENT_ENCODING)
     {
         return Err(ClientError::Protocol);
     }
-    Ok(())
+    let raw = headers.get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()).ok_or(ClientError::Protocol)?;
+    let len: usize = raw.parse().map_err(|_| ClientError::Protocol)?;
+    if !(1..=descriptor::MAX_DOCUMENT).contains(&len) || raw != len.to_string() {
+        return Err(ClientError::Protocol);
+    }
+    Ok(len)
 }
 
-pub(crate) fn append_descriptor(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ClientError> {
-    if chunk.len() > descriptor::MAX_DOCUMENT - bytes.len() {
+pub(crate) fn append_descriptor(bytes: &mut Vec<u8>, chunk: &[u8], expected: usize) -> Result<(), ClientError> {
+    if expected > descriptor::MAX_DOCUMENT
+        || bytes.len().checked_add(chunk.len()).is_none_or(|len| len > expected)
+    {
         return Err(ClientError::Protocol);
     }
     bytes.extend_from_slice(chunk);
     Ok(())
+}
+
+pub(crate) fn finish_descriptor(bytes: Vec<u8>, expected: usize) -> Result<String, ClientError> {
+    if bytes.len() != expected {
+        return Err(ClientError::Protocol);
+    }
+    String::from_utf8(bytes).map_err(|_| ClientError::Protocol)
 }
 
 fn now() -> Result<u64, ClientError> {

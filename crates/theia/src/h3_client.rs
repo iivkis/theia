@@ -129,19 +129,19 @@ impl H3Client {
             stream.finish().await.map_err(|_| ClientError::Http3)?;
             let response = stream.recv_response().await.map_err(|_| ClientError::Http3)?;
             crate::split_http::check_status(response.status())?;
-            crate::identity_data::validate_descriptor_headers(response.headers())?;
+            let expected = crate::identity_data::validate_descriptor_headers(response.headers())?;
             let mut bytes = Vec::new();
             while let Some(mut chunk) = stream.recv_data().await.map_err(|_| ClientError::Http3)? {
-                if chunk.remaining() > crate::descriptor::MAX_DOCUMENT - bytes.len() {
+                if chunk.remaining() > expected.saturating_sub(bytes.len()) {
                     return Err(ClientError::Protocol);
                 }
                 let chunk = chunk.copy_to_bytes(chunk.remaining());
-                crate::identity_data::append_descriptor(&mut bytes, &chunk)?;
+                crate::identity_data::append_descriptor(&mut bytes, &chunk, expected)?;
             }
             if stream.recv_trailers().await.map_err(|_| ClientError::Http3)?.is_some() {
                 return Err(ClientError::Protocol);
             }
-            String::from_utf8(bytes).map_err(|_| ClientError::Protocol)
+            crate::identity_data::finish_descriptor(bytes, expected)
         }).await.map_err(|_| ClientError::Timeout)?
     }
 

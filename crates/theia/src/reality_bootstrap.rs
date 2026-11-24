@@ -162,6 +162,29 @@ pub fn initial_descriptor(
 /// resetting its revision floor or publishing a different bootstrap target.
 /// A transport removed by reference degradation must not silently break
 /// previously enrolled H3-only profiles. Reserve switching is not performed.
+pub fn validate_publication(
+    state: &reference_health::State,
+    identity: &Identity,
+    signed: &str,
+    now: u64,
+) -> Result<(), Error> {
+    if identity.scope() != &scope_of(state) {
+        return Err(Error::Scope);
+    }
+    let value = verify(signed, identity.scope(), identity.public_key(), 1, auto_policy(), now)?;
+    let offered = &value.descriptor().references;
+    let fresh = state.eligible_references(now).map_err(|_| Error::Health)?;
+    if fresh.len() != offered.len()
+        || fresh.iter().zip(offered).any(|(current, signed)| {
+            current.server_name != signed.server_name || current.port != signed.port
+                || (signed.h3 && !current.h3)
+        })
+    {
+        return Err(Error::Health);
+    }
+    Ok(())
+}
+
 pub fn refresh_descriptor(
     state: &reference_health::State,
     identity: &Identity,

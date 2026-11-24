@@ -121,15 +121,15 @@ pub fn run(command: Command) -> Result<String, Error> {
         }
         Command::Public { health, key, descriptor, output } => {
             let (state, identity) = material(&health, &key)?;
-            state.eligible_references(now).map_err(|_| Error::Health)?;
             let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
+            bootstrap::validate_publication(&state, &identity, &raw, now)?;
             let invite = Invitation::public(&identity, &raw, now)?;
             publish(&output, &invite.encode()?)
         }
         Command::Issued { health, key, descriptor, server, user, token, output } => {
             let (state, identity) = material(&health, &key)?;
-            state.eligible_references(now).map_err(|_| Error::Health)?;
             let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
+            bootstrap::validate_publication(&state, &identity, &raw, now)?;
             let config::Config::Server(document) = config::read_file(Path::new(&server)).map_err(|_| Error::Grant)? else {
                 return Err(Error::Grant);
             };
