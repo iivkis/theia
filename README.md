@@ -75,6 +75,8 @@ theia tui --role client --config client.toml
 
 Проект пока без выбранной лицензии и не предназначен для публичной production-поставки.
 
-### Архитектурный контракт SmartTheia (spec v0.4)
+### Архитектурный контракт SmartTheia (spec v0.5)
 
-SmartTheia XHTTP — собственный транспорт поверх H2/TCP/TLS1.3 и H3/QUIC/TLS1.3 с общим frame/FSM. SmartTheia REALITY — самостоятельный security adapter, не копия Xray REALITY. Совместимость с Xray XHTTP/VLESS не требуется. Статус реализации и доказанные ограничения: [спецификация](docs/IMPLEMENTATION_SPEC.md), [ADR-0084](docs/adr/0084-native-smarttheia-xhttp-and-reality-boundary.md), [STATUS](docs/STATUS.md).
+SmartTheia XHTTP — единственный транспорт поверх H2/TCP/TLS1.3 и H3/QUIC/TLS1.3 с общим frame/FSM. SmartTheia REALITY — самостоятельный security adapter, не копия Xray REALITY. Совместимость с Xray XHTTP/VLESS не требуется. Статус реализации и доказанные ограничения: [спецификация](docs/IMPLEMENTATION_SPEC.md), [ADR-0084](docs/adr/0084-native-smarttheia-xhttp-and-reality-boundary.md), [STATUS](docs/STATUS.md).
+
+При создании inbound оператор явно выбирает SmartTheia REALITY (мастер или вручную) либо собственный TLS (только вручную: X.509 cert/chain и private key). Оба используют QUIC-first → H2 при сетевой недоступности QUIC. [ADR-0085](docs/adr/0085-single-xhttp-inbound-security-choice.md).

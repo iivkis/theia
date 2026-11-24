@@ -87,3 +87,7 @@ ADR хранить в `docs/adr/NNNN-title.md` с контекстом, альт
 ### Единый целевой этап SmartTheia REALITY + XHTTP (ADR-0084)
 
 Не копия Xray. Собственный XHTTP carrier с H2/H3, common FSM и независимым security adapter. Готовность этапа требует production security mode и versioned профилей, рабочего мастера Apply, реальных H2/H3 E2E и негативных проверок; отдельный stream-up с pin не завершает этап. Старые режимы сохраняются только явно, без downgrade. Новые режимы carrier требуют самостоятельной реализации и тестов, а не обещания Xray interoperability.
+
+### Уточнение единого этапа (ADR-0085)
+
+Форма inbound: XHTTP фиксирован, REALITY wizard/manual, TLS только manual cert/key. Оба H2/H3 на одном порту, QUIC-first. Один валидатор REALITY, версионированные профили и приглашения, guarded Apply/rollback и реальные позитивные/негативные E2E. Pin/legacy не полноценный третий режим.

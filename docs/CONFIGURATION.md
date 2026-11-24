@@ -166,3 +166,7 @@ Client runtime: `client.profiles[].tls_ca` is an absolute `file:` reference to a
 ### SmartTheia XHTTP stream-up (ADR-0084)
 
 На собственном inbound: `security_mode = "pinned-cert-stream-up-v1"`; на клиенте `tls_profile = "pinned-cert-stream-up-v1:<64 lowercase hex SHA-256 DER leaf>"`, `tls_ca` обязателен, `transport = "auto"` / `"h2"` / `"h3"`. Профиль требует раздельный POST upload и GET download на том же проверенном соединении. Ни один отказ security/HTTP не переключает на stream-one. Старые `default` и `pinned-cert-v1` остаются явно отдельными. Изменение режима restart-only; theia://v1 не экспортирует его. TUI server X → y сохраняет только локальный mode после проверки cert/key и исходного TOML. Не runtime activation и не полный REALITY.
+
+### Целевая конфигурация inbound (спецификация 0.5, ADR-0085)
+
+Транспорт фиксирован: SmartTheia XHTTP. Ровно один явно выбранный security mode: SmartTheia REALITY (wizard/manual, один валидируемый профиль) либо собственный TLS (manual only). Для TLS `tls_cert` — X.509 сертификат/цепочка, `tls_key` — соответствующий защищённый приватный ключ, `server_name` — проверяемое DNS-имя. Без мастера или генерации сертификата в TLS-ветке. Параметры REALITY определяет собственный security contract. TCP/UDP один порт, QUIC-first, без downgrade. Это нормативная модель, не описание принимаемого сейчас TOML; legacy/pin требуют явной миграции.
