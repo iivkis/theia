@@ -1,4 +1,4 @@
-//! M3.1b: authenticated H3 request handling, not yet bound by server CLI.
+//! Authenticated production H3 request handling.
 //! Reuses H2's inbound context, admission, authorization, quota and DNS ACL.
 use crate::{
     diagnostics::{self, Value},
@@ -20,7 +20,6 @@ use tokio::{
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HANDLERS: usize = 32;
 const MAX_HEADERS: u64 = 8192;
@@ -333,33 +332,25 @@ async fn relay_request(
     context: &ServerContext,
     session_id: u64,
 ) {
-    let result = timeout(
-        SESSION_TIMEOUT,
-        handle_frames(&mut tx, &mut rx, context, session_id),
-    )
-    .await;
+    // The bounded handshake, dial, send and shared idle deadlines remain.
+    // A progressing relay has no absolute session-age limit.
+    let result = handle_frames(&mut tx, &mut rx, context, session_id).await;
     match &result {
-        Ok(Ok(())) => crate::diag!(
+        Ok(()) => crate::diag!(
             Info,
             "server.h3",
             "request_completed",
             "session" = Value::Count(session_id)
         ),
-        Ok(Err(error)) => crate::diag!(
+        Err(error) => crate::diag!(
             Warn,
             "server.h3",
             "request_relay_failed",
             "session" = Value::Count(session_id),
             "reason" = Value::Label(server::error_kind(*error))
         ),
-        Err(_) => crate::diag!(
-            Warn,
-            "server.h3",
-            "request_timeout",
-            "session" = Value::Count(session_id)
-        ),
     }
-    if matches!(result, Ok(Ok(()))) {
+    if result.is_ok() {
         if !matches!(timeout(CLOSE_TIMEOUT, tx.finish()).await, Ok(Ok(()))) {
             tx.stop_stream(Code::H3_REQUEST_CANCELLED);
         }

@@ -207,7 +207,7 @@ def main(binary: Path, windows_test: Path, windows_client: Path) -> None:
                     check=True,
                     timeout=300,
                 )
-                print("F-14/F-18: real H2/H3 OPEN_OK, pinned XHTTP and PKI/auth/identity negatives passed")
+                print("F-14: real H2/H3 OPEN_OK, pinned XHTTP and PKI/auth/identity negatives passed (external REALITY not tested)")
             finally:
                 subprocess.run(
                     wsl_command("touch", guest_dir + "/stop"),
