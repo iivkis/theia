@@ -27,3 +27,5 @@ Trace I/O still has bounded CPU/queue overhead; successful `flush` is not `fsync
 ## Acceptance
 
 Native Linux and Windows tests must verify default-on behavior, no argument/secret leakage, off switch, bounded rotation and private file permissions on Unix, plus new H2/H3/client/server event coverage under existing E2E. CI artifacts must be available if a mandated native job fails. `ci-gate` must pass for the exact PR head before this ADR is marked fully verified.
+
+See ADR-0075 for race-free private directory creation and concurrent CLI regressions; the original default-on privacy and size contracts remain.

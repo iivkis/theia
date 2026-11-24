@@ -1,6 +1,6 @@
 # Theia connection invitations: portable v1 (F-14, P0)
 
-**Нормативный контракт F-14; актуальный статус на 2026-11-24 см. [STATUS.md](STATUS.md).** M4.4a реализует codec, M4.4b1 серверную выдачу, M4.4b2a отключение, M4.4b2b1 подтверждённую ротацию bearer, а M4.4c локальный клиентский импорт с защищённым хранением (PR #80/#81, native Linux/Windows CI успешен). F-14 P0 отслеживается в STATUS.md и матрице F14_ACCEPTANCE.md. Защищённый файловый экспорт и WSL2 Linux → native Windows H2/H3 E2E подтверждены CI; M4.4i ожидает CI.
+**Нормативный контракт F-14; актуальный статус на 2026-11-24 см. [STATUS.md](STATUS.md).** M4.4a реализует codec, M4.4b1 серверную выдачу, M4.4b2a отключение, M4.4b2b1 подтверждённую ротацию bearer, а M4.4c локальный клиентский импорт с защищённым хранением (PR #80/#81, native Linux/Windows CI успешен). F-14 P0 отслеживается в STATUS.md и матрице F14_ACCEPTANCE.md. Защищённый файловый экспорт и WSL2 Linux → native Windows H2/H3 E2E подтверждены CI; M4.4i принят в PR #109, CI 45397074048 (13/13).
 
 ## User model
 
@@ -95,7 +95,7 @@ A rotated confidential invitation may be used to replace only the bearer referen
 
 **M4.4h disabled-user recovery:** server TUI b opens a distinct confirmation for an existing disabled user granted on the selected inbound. It always generates a new 256-bit bearer and changes only digest and disabled=false, preserving all grants. Ordinary rotation still refuses disabled users. Save and one-time reveal/export never update live authorization; a separate content-bound auth-only Apply is needed. The previous bearer is never restored by this operation. Already open tunnels keep their existing semantics. Native Linux H2/H3 IPC E2E extends the existing rotation/disable test through recovery, imports the original grant and refreshes from the exported new invitation, uses the actual saved credential bytes and verifies old tokens remain denied after explicit Apply. Accepted in PR #108 (run 45395505034).
 
-## M4.4i public share and native lifecycle parity (pending CI)
+## M4.4i public share and native lifecycle parity (accepted in PR #109)
 
 In the loaded server/client editor, l displays a repeatable, tokenless v1 share from the selected saved record. It never creates a user or credential, reads a bearer file/env secret, writes TOML, or enters confidential issuance. Dirty, stale or pending-issuance editors refuse; the v1 codec rejects incompatible ports or unsupported TLS profiles. The recipient still selects independent CA and explicit credential. The native Windows Named Pipe Apply E2E now exercises the same account recovery/import/credential-only replacement and old-token denial as the Linux IPC test. Both are local real binary server tests, not remote recovery across two physical hosts.
 

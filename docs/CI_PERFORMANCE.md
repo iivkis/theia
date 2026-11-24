@@ -243,3 +243,40 @@ M0.1 Cargo compilation in BBR-only jobs. Native BBR execution time
 moves into the M0.1 jobs, so do not claim all 99 old runner-seconds were
 saved or promise a whole-workflow speedup until exact-head CI and
 follow-up warm-cache measurements confirm it.
+
+## Measured baseline for milestone-sized PRs (2026-11-24)
+
+Three successful ordinary first-attempt PR runs, with the same 13 required jobs:
+
+| Metric (seconds) | #106 run 45391036352 | #107 run 45392909341 | #108 run 45395505034 |
+|---|---:|---:|---:|
+| Run created to updated (API metadata) | 295 | 333 | 321 |
+| Windows smoke | 173 | 220 | 208 |
+| Windows all-target tests | 90 | 108 | 108 |
+| Windows Go setup | 15 | 25 | 23 |
+| Windows cross-SID E2E | 20 | 25 | 25 |
+| Windows F-14 binary staging | 1 | 1 | 1 |
+| Linux build command for artifact | 0 | 0 | 1 |
+| WSL2 cross-host | 88 | 80 | 78 |
+| Specification | 19 | 21 | 21 |
+| Specification Go setup | 8 | 3 | 9 |
+
+Source: GitHub Actions REST run and jobs timestamps, rounded to integer seconds; zero denotes sub-second/timestamp resolution, not proof of no work. Run updated_at is metadata, not an exact last-job finish. The new timing helper uses last completed job instead. Do not remove artifact staging or native security tests: the former is already cheap and the latter is coverage. Windows smoke and its dependent cross-host remain critical path candidates.
+
+### Next CI maintenance block
+
+The format-only specification Go setup no longer restores or saves module/build cache because gofmt does not use it. All five Go-compiling setups retain the pinned cache and version. Native Windows M0.1 checks go mod verify and go test exit codes before running the next command. The DAG guard tests these distinctions. Expected: small reduction in preflight cache work, not a measured wall-time improvement yet. No job or coverage removed.
+
+### Repeatable comparison
+
+Save successful first-attempt ordinary run metadata and attempt-specific job JSON (with all 13 jobs) from the GitHub Actions API; use the same event type for both snapshots. Run the diagnostic in CI or on exported metadata:
+
+`python3 scripts/ci-timing.py before-run.json before-jobs.json after-run.json after-jobs.json`
+
+The script checks exact SHA/run/attempt identity, successful complete expected matrix, consistent timestamps, step completion and matching event. It rejects missing pages, docs-only, manual, failed and rerun snapshots. It reports wall-clock observation, sum of job durations (not billed runner minutes), and matching step timing; skipped and ambiguous repeated step labels are excluded. No API credentials or network access are needed. Synthetic fixtures validate the tool in the existing specification job. This is a diagnostic, not a substitute for the final gate, and cache/runner/queue differences still require interpretation.
+
+The timing regression suite includes two sanitized actual first-attempt snapshots from runs 45395505034 and 45397074048. Only required run/job/step metadata is retained; no logs, runner names, credentials or environment values. This catches schema drift that synthetic fixtures alone miss. Run #109: Windows smoke 194 s, cross-host 82 s, Linux 86 s, specification 22 s (before the cache change). The 14 s Windows difference is observational, not attributed to the new CI block.
+
+The Markdown-only scope classifier also checks raw Git modes/status: regular non-executable Markdown adds/modifies/deletes may use the cheap path; symlinks, executable mode changes, gitlinks, type changes or malformed raw data force full native CI. This narrows the optimization to genuine documentation edits; it does not introduce new skip paths.
+
+**ADR-0074 migration (pending CI):** the earlier formatter-cache optimization is superseded by removing the Go toolchain altogether. Six setup-go occurrences and synthetic reference generation are retired; independent standard TLS/H2 PKI tests remain on both M0.1 jobs. No CI jobs removed. Measure actual before/after full first-attempt runs; do not infer savings from deleted setup durations alone.

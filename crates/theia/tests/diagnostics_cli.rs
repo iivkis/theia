@@ -2,7 +2,7 @@
 use std::{
     fs,
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,7 +16,10 @@ fn isolated_dir() -> PathBuf {
 
 fn invoke(dir: &PathBuf, args: &[&str], disabled: bool) -> std::process::Output {
     let mut process = Command::new(env!("CARGO_BIN_EXE_theia"));
-    process.args(args).env("THEIA_TRACE_DIR", dir);
+    process
+        .args(args)
+        .env("THEIA_TRACE_DIR", dir)
+        .env("TOKIO_WORKER_THREADS", "2");
     if disabled {
         process.env("THEIA_TRACE_OFF", "1");
     } else {
@@ -86,6 +89,67 @@ fn trace_files_are_readable_only_by_the_owner() {
     assert_eq!(
         fs::metadata(log).unwrap().permissions().mode() & 0o777,
         0o600
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn concurrent_cli_startup_shares_new_private_directory_without_stderr() {
+    let root = isolated_dir();
+    let dir = root.join("new").join("logs");
+    assert!(!root.exists());
+    let children: Vec<_> = (0..12)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_theia"))
+                .arg("--help")
+                .env("THEIA_TRACE_DIR", &dir)
+                .env_remove("THEIA_TRACE_OFF")
+                .env("TOKIO_WORKER_THREADS", "2")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn concurrent CLI")
+        })
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let traces: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(traces.len(), 12);
+    for path in traces {
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("component=process event=started"));
+        assert!(content.contains("component=process event=completed"));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn insecure_existing_trace_directory_warns_without_mutating_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = isolated_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = invoke(&dir, &["--help"], false);
+    assert!(output.status.success());
+    let warning = String::from_utf8_lossy(&output.stderr);
+    assert!(warning.contains("file trace unavailable"));
+    assert!(!warning.contains(dir.to_str().unwrap()));
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    assert_eq!(
+        fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o755
     );
     fs::remove_dir_all(dir).unwrap();
 }

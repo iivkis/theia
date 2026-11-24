@@ -21,7 +21,7 @@
 - SmartTheia v1 — прикладные фреймы внутри стандартных **HTTP/3 (QUIC)** и **HTTP/2 (TLS)**. Не вводить самодельную криптографию, TLS, HTTP/2 или QUIC.
 - QUIC-first, H2-fallback **только по сетевой недоступности UDP/QUIC**, никогда вследствие отказа авторизации, ошибки сертификата или явной несовместимости протокола. Нельзя молча ослаблять проверки.
 - **BBR — P0:** на обоих QUIC endpoints фактически выбран и измерен BBR. Проверить API выбранного quinn/backend, не заменять молча алгоритм; без теста и замеров MVP не готов.
-- **uTLS-like browser fingerprint — P0:** минимум один именованный, реально настроенный и проверенный на Windows/Linux TLS+HTTP profile. **Эталон TLS/H2 генерирует закреплённая Go uTLS v1.8.2 HelloChrome_133 вместо захватов живого браузера**; Go используется только в отдельном исследовательском CI-tool, без runtime зависимости в one-binary Rust Theia. Дополнительный M0.1 тестовый Go uTLS TLS1.3/H2 клиент успешно подключается к Rust h2 серверу на loopback (GET/204 и x509-negative cases); это **не** встроенный браузероподобный Rust client. QUIC/H3 потребует отдельного совместимого эталона и реального backend. Не считать подмену User-Agent или генератор H2 эталона реализацией fingerprint и не обещать DPI-невидимость.
+- **Browser TLS/HTTP interoperability and evidence — P0 (ADR-0074):** actual pinned browser runs are the only browser reference; H2/TLS and H3/QUIC are evaluated separately on Linux/Windows. Preserve independent strict CA/hostname/ALPN and authorization checks. uTLS comparison is retired, not a release prerequisite. H2 browser evidence is partial, H3 browser evidence remains open. Never claim byte-exact browser parity or DPI invisibility from a library, User-Agent or test result. No production wire/backend change in this migration.
 - В первой поставке: Linux-сервер, Windows x64-клиент, локальные HTTP CONNECT/SOCKS5 и пользовательский Windows system proxy с восстановлением прежних параметров.
 - Секреты не пишутся в логи или TUI в открытом виде (кроме явного одноразового confidential export с подтверждением). Примеры не содержат действующих ключей.
 - **F-18/F-19 P0 (spec + M3.5a0 feasibility + M3.5b1 offline planner + M3.5b2a explicit strict H2 TLS probe, без режима/автоматического scanner):** криптографически аутентифицированный REALITY-подобный SmartTheia security mode, прозрачный двухшаговый серверный мастер подбора IP/domain с bounded opt-in active scans только разрешённых целей и anti-SSRF, независимая измеренная защита от TLS-in-TLS через flow shaping и classifier/performance E2E Linux/Windows. Не выдавать User-Agent/SNI/padding или единичный зелёный fingerprint test за готовую реализацию и не обещать гарантий DPI-невидимости. Не менять TOML/invite v1 без отдельного ADR и тестов; docs/STEALTH_REALITY.md и ADR-0020.
@@ -80,7 +80,7 @@
 
 ## Запрет на «фиктивную готовность»
 
-Нельзя закрывать задачу заглушкой, возвращающей успех, snapshot-тестом без проверки поведения, ложным счётчиком скорости, «поддержкой uTLS» через единственный заголовок или fallback при любом исключении.
+Нельзя закрывать задачу заглушкой, возвращающей успех, snapshot-тестом без проверки поведения, ложным счётчиком скорости, «браузерной совместимостью» через единственный заголовок или fallback при любом исключении.
 
 **Сначала минимальный защищённый TCP-туннель с тестами. Перед объявлением MVP готовым обязательно завершить P0 BBR, REALITY-подобный F-18, измеренную защиту TLS-in-TLS F-19 и проверенный browser-like fingerprint профиль; ни один из этапов нельзя выдавать за уже реализованный.**
 

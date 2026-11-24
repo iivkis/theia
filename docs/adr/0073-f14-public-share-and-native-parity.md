@@ -1,6 +1,6 @@
 # ADR-0073: saved public sharing and native F-14 lifecycle parity
 
-**Status:** prepared, pending exact-head native CI.
+**Status:** accepted in PR #109, exact-head run 45397074048 (13/13).
 
 ## Decision
 

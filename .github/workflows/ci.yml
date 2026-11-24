@@ -34,10 +34,14 @@ jobs:
           python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'
       - name: Test documentation and TOML contracts
         run: bash scripts/check-spec.sh
-      - name: Test required CI DAG, native E2E and Go cache contract
+      - name: Test required CI DAG and native E2E contract
         run: python3 tests/ci/check_workflow_parallel.py
       - name: Test conservative docs-only classifier and Git diff failure gates
         run: python3 -m unittest discover -s tests/ci -p 'test_ci_scope.py' -v
+      - name: Test independent TLS client input and frame boundaries
+        run: python3 -m unittest discover -s tests/ci -p 'test_independent_h2_probe.py' -v
+      - name: Test CI timing evidence validation and comparison
+        run: python3 -m unittest discover -s tests/ci -p 'test_ci_timing.py' -v
       - name: Detect documentation-only change scope
         id: scope
         shell: bash
@@ -68,12 +72,6 @@ jobs:
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
         with:
           components: rustfmt
-      - uses: actions/setup-go@v5
-        if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
-        with:
-          go-version: '1.24.x'
-          cache: true
-          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
       - name: Fail fast on formatting drift before expensive native builds
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
         shell: bash
@@ -82,17 +80,9 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path spikes/m0_1/Cargo.toml --all -- --check
           cargo fmt --manifest-path spikes/m3_4/Cargo.toml --all -- --check
-          mapfile -d '' -t go_files < <(git ls-files -z -- '*.go')
-          if (( ${#go_files[@]} )); then
-            unformatted="$(gofmt -l "${go_files[@]}")"
-            if [[ -n "$unformatted" ]]; then
-              echo "::error::Go source formatting drift: $unformatted"
-              exit 1
-            fi
-          fi
           # Every test consumes exactly the checked-out commit, never a
           # silently modified formatting overlay or a post-green bot commit.
-          git diff --exit-code -- '*.rs' '*.go'
+          git diff --exit-code -- '*.rs'
 
   m0-1-api-spike:
     name: m0-1-api-spike (Linux)
@@ -135,39 +125,16 @@ jobs:
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test quic_bbr_loss -- --nocapture
       - name: Fingerprint baseline diagnostics (default rustls, NOT browser profile)
         run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test client_hello_baseline -- --nocapture
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.24.x'
-          cache: true
-          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
-      - name: Generate Go uTLS Chrome133 reference and compare with rustls
-        shell: bash
-        run: |
-          set -euo pipefail
-          trap 'rm -f "$RUNNER_TEMP/theia-utls-h2-hello.bin"' EXIT
-          pushd spikes/m0_1/utls_reference
-          go mod verify
-          go test ./...
-          go run . "$RUNNER_TEMP/theia-utls-h2-hello.bin"
-          popd
-          THEIA_UTLS_HELLO_PATH="$RUNNER_TEMP/theia-utls-h2-hello.bin" cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_reference -- --ignored --nocapture
-          # Root fingerprint comparison belongs to rust-tests: the root
-          # harness was already compiled there. Do NOT duplicate the entire
-          # root Cargo workspace inside this isolated M0.1 target directory.
-          rm -f "$RUNNER_TEMP/theia-utls-h2-hello.bin"
-      - name: Real Go uTLS H2 request and strict certificate verification against Rust server
-        shell: bash
-        run: |
-          set -euo pipefail
-          pushd spikes/m0_1/utls_reference
-          go build -o "$RUNNER_TEMP/theia-utls-h2-probe" ./cmd/h2_probe
-          popd
-          THEIA_UTLS_H2_PROBE="$RUNNER_TEMP/theia-utls-h2-probe" cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_h2_loopback -- --ignored --nocapture
       - name: Check all targets
         run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
       - name: Validate pinned dependency tree
         run: cargo metadata --manifest-path spikes/m0_1/Cargo.toml --locked --format-version 1 --no-deps > /dev/null
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Independent OpenSSL TLS1.3 H2 and strict certificate checks
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test independent_h2_loopback -- --ignored --nocapture
       - name: Upload sanitized trace logs on CI failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -214,37 +181,11 @@ jobs:
           name: m3-3-quic-comparison-${{ runner.os }}
           path: ${{ env.THEIA_BBR_RESULTS_PATH }}
           if-no-files-found: error
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-python@v5
         with:
-          go-version: '1.24.x'
-          cache: true
-          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
-      - name: Native Windows Go uTLS reference and Rust comparison
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Push-Location spikes/m0_1/utls_reference
-          go test ./...
-          $hello = Join-Path $env:RUNNER_TEMP "theia-utls-h2-hello.bin"
-          go run . $hello
-          if ($LASTEXITCODE -ne 0) { throw 'Go uTLS reference failed' }
-          Pop-Location
-          $env:THEIA_UTLS_HELLO_PATH = $hello
-          cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_reference -- --ignored --nocapture
-          if ($LASTEXITCODE -ne 0) { throw 'Rust comparison to Go uTLS failed' }
-          Remove-Item $hello -Force
-      - name: Real Windows Go uTLS H2 handshake and PKI negative tests
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Push-Location spikes/m0_1/utls_reference
-          $env:THEIA_UTLS_H2_PROBE = Join-Path $env:RUNNER_TEMP "theia-utls-h2-probe.exe"
-          go build -o $env:THEIA_UTLS_H2_PROBE ./cmd/h2_probe
-          if ($LASTEXITCODE -ne 0) { throw 'build Go H2 probe failed' }
-          Pop-Location
-          cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test utls_h2_loopback -- --ignored --nocapture
-          if ($LASTEXITCODE -ne 0) { throw 'Go uTLS and Rust H2 E2E failed' }
-
+          python-version: '3.12'
+      - name: Independent OpenSSL TLS1.3 H2 and strict certificate checks
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test independent_h2_loopback -- --ignored --nocapture
       - name: Upload sanitized trace logs on CI failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -278,23 +219,6 @@ jobs:
         run: cargo test --workspace --all-targets --locked
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.24.x'
-          cache: true
-          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
-      - name: Real Linux H2 fingerprint vs pinned Go uTLS (reuse compiled root harness)
-        shell: bash
-        run: |
-          set -euo pipefail
-          hello="$RUNNER_TEMP/theia-utls-root-h2-hello.bin"
-          trap 'rm -f "$hello"' EXIT
-          (
-            cd spikes/m0_1/utls_reference
-            go mod verify
-            go run . "$hello"
-          )
-          THEIA_UTLS_HELLO_PATH="$hello" cargo test --workspace --locked --test fingerprint_h2 -- --ignored --nocapture
       - name: Build genuine Linux server for Windows cross-OS F-14 E2E
         run: cargo build --workspace --locked --bin theia
       - uses: actions/upload-artifact@v4
@@ -346,36 +270,6 @@ jobs:
         run: python -m pip install pywinpty==3.0.5 pyte==0.8.2
       - name: Native Windows tests
         run: cargo test --workspace --all-targets --locked
-      # The root fingerprint test executable has already been built by the
-      # --all-targets command above. Running it in the M0.1 spike job instead
-      # rebuilt the entire root workspace for 5+ minutes on Windows.
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.24.x'
-          cache: true
-          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
-      - name: Real Windows live Theia H2 fingerprint vs pinned Go uTLS
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $hello = Join-Path $env:RUNNER_TEMP "theia-utls-root-h2-hello.bin"
-          try {
-            Push-Location spikes/m0_1/utls_reference
-            try {
-              go mod verify
-              if ($LASTEXITCODE -ne 0) { throw 'Go pinned dependency verification failed' }
-              go run . $hello
-              if ($LASTEXITCODE -ne 0) { throw 'Generate pinned Chrome133 uTLS reference failed' }
-            } finally {
-              Pop-Location
-            }
-            $env:THEIA_UTLS_HELLO_PATH = $hello
-            cargo test --workspace --locked --test fingerprint_h2 -- --ignored --nocapture
-            if ($LASTEXITCODE -ne 0) { throw 'Real Windows H2 fingerprint comparison failed' }
-          } finally {
-            Remove-Item Env:THEIA_UTLS_HELLO_PATH -ErrorAction SilentlyContinue
-            Remove-Item $hello -Force -ErrorAction SilentlyContinue
-          }
       - name: Disposable Windows user WinINet proxy CAS and restore (F-07)
         shell: pwsh
         env:
@@ -545,32 +439,6 @@ jobs:
         run: |
           cargo test --manifest-path spikes/m3_4/Cargo.toml --locked
           if ($LASTEXITCODE -ne 0) { throw 'BoringSSL candidate regressions failed' }
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.24.x'
-          cache: true
-          cache-dependency-path: spikes/m0_1/utls_reference/go.sum
-      - name: Compare real BoringSSL ClientHello to pinned Go uTLS Chrome133 reference
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $hello = Join-Path $env:RUNNER_TEMP "theia-m3-4-utls-hello.bin"
-          try {
-            Push-Location spikes/m0_1/utls_reference
-            try {
-              go mod verify
-              if ($LASTEXITCODE -ne 0) { throw 'Go dependency verification failed' }
-              go run . $hello
-              if ($LASTEXITCODE -ne 0) { throw 'Go ClientHello fixture generation failed' }
-            } finally {
-              Pop-Location
-            }
-            $env:THEIA_UTLS_HELLO_PATH = $hello
-            cargo test --manifest-path spikes/m3_4/Cargo.toml --locked --test btls_h2 -- --ignored --nocapture
-            if ($LASTEXITCODE -ne 0) { throw 'BoringSSL on-wire comparison failed' }
-          } finally {
-            Remove-Item $hello -Force -ErrorAction SilentlyContinue
-          }
       - name: Isolated Clippy warnings as errors
         shell: pwsh
         run: |

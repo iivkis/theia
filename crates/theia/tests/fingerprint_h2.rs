@@ -5,7 +5,7 @@
 mod client_hello;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use client_hello::{parse_handshake, parse_tls_records, ClientHelloSummary, ParseError};
+use client_hello::{parse_tls_records, ClientHelloSummary, ParseError};
 use rustls::RootCertStore;
 use std::time::Duration;
 use theia::{client::H2Client, protocol::Address};
@@ -91,34 +91,5 @@ async fn live_theia_h2_clienthello_is_not_yet_a_browser_profile() {
         observed.cipher_suites.len(),
         observed.extensions_in_wire_order.len(),
         observed.supported_groups.len()
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "mandatory CI-only comparison; requires private Go uTLS HelloChrome_133 fixture"]
-async fn live_theia_h2_vs_pinned_utls_chrome133_reference() {
-    let path = std::env::var_os("THEIA_UTLS_HELLO_PATH")
-        .expect("CI must generate the Go uTLS v1.8.2 HelloChrome_133 fixture");
-    let raw = std::fs::read(path).expect("read ephemeral Go ClientHello");
-    let reference = parse_handshake(&raw).expect("valid reference ClientHello");
-    drop(raw);
-
-    let observed = capture_production_h2_hello().await;
-    assert_eq!(reference.alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
-    assert!(reference.has_grease_extension());
-    assert!(reference.has_alps());
-    assert!(!reference.quic_transport_parameters_present);
-    assert!(!observed.has_grease_extension());
-    assert!(!observed.has_alps());
-    assert_ne!(reference.cipher_suites, observed.cipher_suites);
-    assert_ne!(reference.supported_groups, observed.supported_groups);
-    eprintln!(
-        "H2/TCP live Theia vs Go uTLS 1.8.2 Chrome133: cipher_count={}/{} extension_count={}/{} groups_count={}/{} GREASE=false/true ALPS=false/true; F-13 remains BLOCKED",
-        observed.cipher_suites.len(),
-        reference.cipher_suites.len(),
-        observed.extensions_in_wire_order.len(),
-        reference.extensions_in_wire_order.len(),
-        observed.supported_groups.len(),
-        reference.supported_groups.len()
     );
 }
