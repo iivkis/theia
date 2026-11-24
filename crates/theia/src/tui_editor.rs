@@ -236,7 +236,9 @@ impl Editor {
         if profile.server != invite.endpoint
             || profile.server_name != invite.server_name
             || profile.tls_profile != invite.tls_profile()
-            || profile.xhttp_mode.is_some_and(|mode| mode != config::XhttpMode::StreamOne)
+            || profile
+                .xhttp_mode
+                .is_some_and(|mode| mode != config::XhttpMode::StreamOne)
             || (invite.transport != Transport::Auto && profile.transport != invite.transport)
         {
             return Err("Invitation does not match saved profile identity and transport");
@@ -756,7 +758,9 @@ impl Editor {
     pub fn field_name(&self) -> String {
         let suffix = match self.role {
             Role::Server => ["server_name", "h2_listen", "quic_listen"][self.selected_field],
-            Role::Client => ["server", "server_name", "transport", "xhttp_mode"][self.selected_field],
+            Role::Client => {
+                ["server", "server_name", "transport", "xhttp_mode"][self.selected_field]
+            }
         };
         let records = match self.role {
             Role::Server => "server.inbounds",

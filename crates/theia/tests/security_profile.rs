@@ -114,7 +114,10 @@ impl Fixture {
                 assert_eq!(request.uri().path(), "/v1/session");
                 let mut body = request.into_body();
                 let _outgoing = respond
-                    .send_response(http::Response::builder().status(200).body(()).unwrap(), false)
+                    .send_response(
+                        http::Response::builder().status(200).body(()).unwrap(),
+                        false,
+                    )
                     .unwrap();
                 let observe = async {
                     let mut decoder = theia::protocol::Decoder::new();
@@ -422,7 +425,13 @@ async fn own_tls_accepts_both_xhttp_modes_with_identical_grants() {
         plain.transfer(None, &target).await;
         plain.stream_up = true;
         plain
-            .errors(None, "localhost", &[0x43; 32], port, ClientError::Unauthorized)
+            .errors(
+                None,
+                "localhost",
+                &[0x43; 32],
+                port,
+                ClientError::Unauthorized,
+            )
             .await;
         assert!(timeout(Duration::from_millis(250), target.accept())
             .await
@@ -443,12 +452,19 @@ async fn own_tls_h2_auto_retries_silence_only_before_open() {
             .h2(None, "localhost", &TOKEN)
             .with_auto_stream_up(Duration::from_secs(900))
             .unwrap();
-        let tunnel = client.open(Address::V4([127, 0, 0, 1]), port).await.unwrap();
+        let tunnel = client
+            .open(Address::V4([127, 0, 0, 1]), port)
+            .await
+            .unwrap();
         let (remote, _) = target.accept().await.unwrap();
-        assert!(fixture.silent_h2_hello.load(std::sync::atomic::Ordering::Acquire));
+        assert!(fixture
+            .silent_h2_hello
+            .load(std::sync::atomic::Ordering::Acquire));
         drop(tunnel);
         drop(remote);
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
     })
     .await
     .expect("admitted HELLO silence can retry once; first attempt sends no OPEN");
@@ -462,13 +478,33 @@ async fn own_tls_auto_h2_h3_rejects_auth_and_accepts_normal_stream_one() {
         let port = target.local_addr().unwrap().port();
         let addr = Address::V4([127, 0, 0, 1]);
         let ttl = Duration::from_secs(900);
-        let h2 = fixture.h2(None, "localhost", &[0x43; 32]).with_auto_stream_up(ttl).unwrap();
-        let h3 = fixture.h3(None, "localhost", &[0x43; 32]).with_auto_stream_up(ttl).unwrap();
-        assert_eq!(h2.open(addr.clone(), port).await.err(), Some(ClientError::Unauthorized));
-        assert_eq!(h3.open(addr.clone(), port).await.err(), Some(ClientError::Unauthorized));
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
-        let h2 = fixture.h2(None, "localhost", &TOKEN).with_auto_stream_up(ttl).unwrap();
-        let h3 = fixture.h3(None, "localhost", &TOKEN).with_auto_stream_up(ttl).unwrap();
+        let h2 = fixture
+            .h2(None, "localhost", &[0x43; 32])
+            .with_auto_stream_up(ttl)
+            .unwrap();
+        let h3 = fixture
+            .h3(None, "localhost", &[0x43; 32])
+            .with_auto_stream_up(ttl)
+            .unwrap();
+        assert_eq!(
+            h2.open(addr.clone(), port).await.err(),
+            Some(ClientError::Unauthorized)
+        );
+        assert_eq!(
+            h3.open(addr.clone(), port).await.err(),
+            Some(ClientError::Unauthorized)
+        );
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
+        let h2 = fixture
+            .h2(None, "localhost", &TOKEN)
+            .with_auto_stream_up(ttl)
+            .unwrap();
+        let h3 = fixture
+            .h3(None, "localhost", &TOKEN)
+            .with_auto_stream_up(ttl)
+            .unwrap();
         let tunnel = h2.open(addr.clone(), port).await.unwrap();
         let (remote, _) = target.accept().await.unwrap();
         drop(tunnel);

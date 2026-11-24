@@ -285,7 +285,10 @@ impl H2Client {
         {
             return Err(ClientError::Configuration);
         }
-        let remote = self.endpoint.parse().map_err(|_| ClientError::Configuration)?;
+        let remote = self
+            .endpoint
+            .parse()
+            .map_err(|_| ClientError::Configuration)?;
         self.auto_mode = Some(crate::split_http::AutoMode::new(remote, ttl));
         Ok(self)
     }
@@ -343,11 +346,15 @@ impl H2Client {
         use crate::split_http::HelloOutcome;
         let mut stage = HelloOutcome::Pending;
         let Some(mode) = &self.auto_mode else {
-            return self.open_inner(&open, operation, self.stream_up, &mut stage).await;
+            return self
+                .open_inner(&open, operation, self.stream_up, &mut stage)
+                .await;
         };
         let ticket = mode.select()?;
         let stream_up = preferred.unwrap_or(ticket.stream_up);
-        let result = self.open_inner(&open, operation, stream_up, &mut stage).await;
+        let result = self
+            .open_inner(&open, operation, stream_up, &mut stage)
+            .await;
         if stream_up && stage == HelloOutcome::Acked {
             mode.remember(ticket)?;
         }
@@ -512,7 +519,12 @@ impl H2Client {
             .map_err(|_| ClientError::Protocol)?;
         send_frame(&mut outgoing, &hello, false).await?;
         let ack = if self.auto_mode.is_some() && !stream_up {
-            match timeout(crate::split_http::HELLO_ACK_TIMEOUT, decoder.next(&mut incoming)).await {
+            match timeout(
+                crate::split_http::HELLO_ACK_TIMEOUT,
+                decoder.next(&mut incoming),
+            )
+            .await
+            {
                 Ok(result) => result?,
                 Err(_) => {
                     if !decoder.eof && decoder.decoder.pending_len() == 0 {

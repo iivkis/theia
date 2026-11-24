@@ -209,11 +209,15 @@ impl H3Client {
         use crate::split_http::HelloOutcome;
         let mut stage = HelloOutcome::Pending;
         let Some(mode) = &self.auto_mode else {
-            return self.open_inner(&open, operation, self.stream_up, &mut stage).await;
+            return self
+                .open_inner(&open, operation, self.stream_up, &mut stage)
+                .await;
         };
         let ticket = mode.select()?;
         let stream_up = preferred.unwrap_or(ticket.stream_up);
-        let result = self.open_inner(&open, operation, stream_up, &mut stage).await;
+        let result = self
+            .open_inner(&open, operation, stream_up, &mut stage)
+            .await;
         if stream_up && stage == HelloOutcome::Acked {
             mode.remember(ticket)?;
         }

@@ -103,7 +103,10 @@ impl Invitation {
         // Invitation v1 encodes own TLS stream-one explicitly. Until a new
         // invitation contract is agreed, never export an auto/split profile
         // as a weaker or different exact mode.
-        if profile.xhttp_mode.is_some_and(|mode| mode != crate::config::XhttpMode::StreamOne) {
+        if profile
+            .xhttp_mode
+            .is_some_and(|mode| mode != crate::config::XhttpMode::StreamOne)
+        {
             return Err(InviteError::Invalid);
         }
         let invite = Self {
@@ -473,7 +476,10 @@ mod tests {
             panic!("client");
         };
         let mut profile = doc.client.profiles[0].clone();
-        for mode in [crate::config::XhttpMode::Auto, crate::config::XhttpMode::StreamUp] {
+        for mode in [
+            crate::config::XhttpMode::Auto,
+            crate::config::XhttpMode::StreamUp,
+        ] {
             profile.xhttp_mode = Some(mode);
             assert_eq!(
                 Invitation::public_from_profile(&profile).unwrap_err(),

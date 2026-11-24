@@ -83,12 +83,18 @@ impl AutoMode {
 
     pub(crate) fn select(&self) -> Result<ModeTicket, ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
-        Ok(cache.observe(crate::local_proxy::route_source(self.remote), Instant::now()))
+        Ok(cache.observe(
+            crate::local_proxy::route_source(self.remote),
+            Instant::now(),
+        ))
     }
 
     pub(crate) fn current(&self, ticket: ModeTicket) -> Result<bool, ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
-        cache.observe(crate::local_proxy::route_source(self.remote), Instant::now());
+        cache.observe(
+            crate::local_proxy::route_source(self.remote),
+            Instant::now(),
+        );
         Ok(cache.current(ticket))
     }
 

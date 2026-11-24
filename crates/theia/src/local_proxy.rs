@@ -404,7 +404,11 @@ impl AutoClient {
         };
         if !cached {
             for attempt in 0..AUTO_QUIC_ATTEMPTS {
-                match self.h3.open_preferred(address.clone(), port, preferred).await {
+                match self
+                    .h3
+                    .open_preferred(address.clone(), port, preferred)
+                    .await
+                {
                     Ok(tunnel) => {
                         self.complete(generation, false)?;
                         crate::diag!(
