@@ -138,6 +138,9 @@ require(needs("coverage-native") == {"specification"} and
 for term in ("os: [ubuntu-latest, windows-latest]", "llvm-tools-preview",
              "cargo llvm-cov --workspace --all-targets --all-features --locked --lcov",
              "cargo llvm-cov report --json --include-build-script",
+             "--no-report --lib windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override",
+             "--no-report --test tui_real_terminal compiled_client_proxy_conpty_lifecycle",
+             "THEIA_WINDOWS_PROXY_E2E_ALLOWED", "cargo llvm-cov report --lcov --include-build-script",
              "ci-coverage.py collect", "--llvm-json coverage-segments.json",
              "coverage-raw-failure-", "if: failure()", "coverage.lcov",
              "if-no-files-found: error"):
