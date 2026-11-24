@@ -278,6 +278,13 @@ jobs:
     env:
       THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
+      # MSVC emits very large default full-debuginfo PDBs for each Rust
+      # integration test. Retain source line tables for failures, but omit
+      # expensive variable/type DWARF/PDB metadata.  All tests, assertions,
+      # TLS verification and actual Windows SID/ConPTY E2E still execute.
+      # Profile-only change: not a release build or runtime security change.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
