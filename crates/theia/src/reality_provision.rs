@@ -25,7 +25,7 @@ pub struct Preview {
     pub plan_sha256: [u8; 32],
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
     schema_version: u16,
@@ -67,9 +67,15 @@ pub fn create(
         endpoint: state.plan().endpoint.clone(),
     };
     let identity = Identity::generate(scope.clone()).map_err(|_| Error::Identity)?;
-    identity.save_new(&output.join(IDENTITY)).map_err(|_| Error::Storage)?;
+    identity.save_new(&output.join(IDENTITY)).map_err(|error| match error {
+        crate::identity_tls::Error::Indeterminate => Error::Indeterminate,
+        _ => Error::Storage,
+    })?;
     Secret::generate().map_err(|_| Error::Identity)?
-        .save_new(&scope, &output.join(ADMISSION)).map_err(|_| Error::Storage)?;
+        .save_new(&scope, &output.join(ADMISSION)).map_err(|error| match error {
+            crate::reality_admission::Error::Indeterminate => Error::Indeterminate,
+            _ => Error::Storage,
+        })?;
     let publication = Publication::new(&output.join(PUBLICATION))?;
     publication.initialize(state, &output.join(IDENTITY), now)?;
     let status = publication.inspect(now)?;
@@ -113,7 +119,7 @@ mod tests {
         let approval = preview(&state, 1000).unwrap();
         assert!(preview(&state, 999).is_err());
         assert!(preview(&state, 1061).is_err());
-        assert_eq!(create(&state, [0; 32], &output, 1000), Err(Error::Approval));
+        assert!(matches!(create(&state, [0; 32], &output, 1000), Err(Error::Approval)));
         assert!(!output.exists());
         let record = create(&state, approval.health_sha256, &output, 1060).unwrap();
         let identity = Identity::load(&output.join(IDENTITY), &record.scope).unwrap();
@@ -122,8 +128,8 @@ mod tests {
         let status = Publication::new(&output.join(PUBLICATION)).unwrap().inspect(1060).unwrap();
         assert_eq!(status.snapshot_sha256, record.publication_sha256);
         let raw = bootstrap::read_text(&output.join(MANIFEST), 8192, true).unwrap();
-        assert_eq!(toml::from_str::<Record>(&raw).unwrap(), record);
-        assert_eq!(create(&state, approval.health_sha256, &output, 1060), Err(Error::Storage));
+        assert!(toml::from_str::<Record>(&raw).unwrap() == record);
+        assert!(matches!(create(&state, approval.health_sha256, &output, 1060), Err(Error::Storage)));
         assert_eq!(&*bootstrap::read_text(&output.join(MANIFEST), 8192, true).unwrap(), &*raw);
         std::fs::remove_dir_all(parent).unwrap();
     }
