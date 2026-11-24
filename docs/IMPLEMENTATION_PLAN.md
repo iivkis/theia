@@ -83,3 +83,7 @@ ADR хранить в `docs/adr/NNNN-title.md` с контекстом, альт
 **ADR-0074 — browser-reference policy:** retire Go/uTLS synthetic reference and retain independent TLS compatibility via standard OpenSSL. Actual pinned browser evidence is the only browser reference; H2 existing evidence remains partial, H3 reference remains open. Earlier Go milestones remain historical evidence only. No runtime profile changes.
 
 **ADR-0076 — native H3 functional browser acceptance:** explicitly H3-configured native Theia client, H3-only authenticated server, shared guarded Chromium SOCKS5 navigation (request/response bytes and DOM); real mismatched/missing QUIC ALPN refusal. No production transport profile change; not a browser QUIC reference or full F-13 acceptance. Pending exact-head CI.
+
+### Единый целевой этап SmartTheia REALITY + XHTTP (ADR-0084)
+
+Не копия Xray. Собственный XHTTP carrier с H2/H3, common FSM и независимым security adapter. Готовность этапа требует production security mode и versioned профилей, рабочего мастера Apply, реальных H2/H3 E2E и негативных проверок; отдельный stream-up с pin не завершает этап. Старые режимы сохраняются только явно, без downgrade. Новые режимы carrier требуют самостоятельной реализации и тестов, а не обещания Xray interoperability.

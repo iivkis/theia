@@ -74,3 +74,7 @@ theia tui --role client --config client.toml
 Все автоматические тесты, включая реальные Linux/Windows loopback/E2E, запускаются в GitHub Actions. Финальный `ci-gate` обязан быть зелёным для точного SHA; пропущенный/отменённый job не считается успехом. Исследовательские `spikes/` **используются обязательным CI**, поэтому не удаляются как «старые файлы».
 
 Проект пока без выбранной лицензии и не предназначен для публичной production-поставки.
+
+### Архитектурный контракт SmartTheia (spec v0.4)
+
+SmartTheia XHTTP — собственный транспорт поверх H2/TCP/TLS1.3 и H3/QUIC/TLS1.3 с общим frame/FSM. SmartTheia REALITY — самостоятельный security adapter, не копия Xray REALITY. Совместимость с Xray XHTTP/VLESS не требуется. Статус реализации и доказанные ограничения: [спецификация](docs/IMPLEMENTATION_SPEC.md), [ADR-0084](docs/adr/0084-native-smarttheia-xhttp-and-reality-boundary.md), [STATUS](docs/STATUS.md).

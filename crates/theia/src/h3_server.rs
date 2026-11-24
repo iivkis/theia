@@ -140,6 +140,7 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
     };
     crate::diag!(Trace, "server.h3", "h3_connection_ready");
     let mut handlers = JoinSet::new();
+    let pair = Arc::new(crate::split_http::Pair::new());
     loop {
         // Do not accumulate unresolved header readers indefinitely.
         if handlers.len() >= MAX_HANDLERS {
@@ -164,6 +165,7 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
             break;
         };
         let context = context.clone();
+        let pair = pair.clone();
         handlers.spawn(async move {
             let Ok(Ok((request, stream))) =
                 timeout(HANDSHAKE_TIMEOUT, resolver.resolve_request()).await
@@ -171,7 +173,11 @@ async fn run_connection(connection: quinn::Connection, context: Arc<ServerContex
                 crate::diag!(Warn, "server.h3", "request_headers_failed_or_timeout");
                 return;
             };
-            handle_request(request, stream, &context, peer).await;
+            if context.stream_up() {
+                handle_split_request(request, stream, &context, peer, &pair).await;
+            } else {
+                handle_request(request, stream, &context, peer).await;
+            }
         });
     }
 }
@@ -221,7 +227,72 @@ async fn handle_request(
         return;
     }
 
-    let (mut tx, mut rx) = stream.split();
+    let (tx, rx) = stream.split();
+    relay_request(tx, rx, context, session_id).await;
+    drop(permit);
+}
+
+type SplitPair = crate::split_http::Pair<(Request<()>, Stream)>;
+
+async fn reject_split(stream: &mut Stream, status: StatusCode) {
+    let _ = timeout(CLOSE_TIMEOUT, respond(stream, status)).await;
+    let _ = timeout(CLOSE_TIMEOUT, stream.finish()).await;
+    stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+}
+
+async fn handle_split_request(
+    request: Request<()>,
+    mut stream: Stream,
+    context: &ServerContext,
+    peer: IpAddr,
+    pair: &SplitPair,
+) {
+    let Some(leg) = crate::split_http::leg(&request) else {
+        reject_split(&mut stream, StatusCode::NOT_FOUND).await;
+        return;
+    };
+    let Some(((upload, mut up), (download, mut down))) = pair.join(leg, (request, stream)).await else {
+        return;
+    };
+    let permit = match context.authorize_split_pair(&upload, &download, peer) {
+        Ok(permit) => permit,
+        Err(status) => {
+            reject_split(&mut up, status).await;
+            reject_split(&mut down, status).await;
+            return;
+        }
+    };
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        down.recv_data().await.is_ok_and(|value| value.is_none())
+            && down.recv_trailers().await.is_ok_and(|value| value.is_none())
+    }).await.unwrap_or(false);
+    if !empty {
+        reject_split(&mut up, StatusCode::BAD_REQUEST).await;
+        reject_split(&mut down, StatusCode::BAD_REQUEST).await;
+        return;
+    }
+    if !matches!(timeout(CLOSE_TIMEOUT, async {
+        respond(&mut up, StatusCode::OK).await?;
+        up.finish().await.map_err(|_| ServerError::Io)?;
+        respond(&mut down, StatusCode::OK).await
+    }).await, Ok(Ok(()))) {
+        up.stop_stream(Code::H3_REQUEST_CANCELLED);
+        up.stop_sending(Code::H3_REQUEST_CANCELLED);
+        down.stop_stream(Code::H3_REQUEST_CANCELLED);
+        return;
+    }
+    let (_, rx) = up.split();
+    let (tx, _) = down.split();
+    relay_request(tx, rx, context, diagnostics::next_id()).await;
+    drop(permit);
+}
+
+async fn relay_request(
+    mut tx: RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    mut rx: RequestStream<h3_quinn::RecvStream, Bytes>,
+    context: &ServerContext,
+    session_id: u64,
+) {
     let result = timeout(
         SESSION_TIMEOUT,
         handle_frames(&mut tx, &mut rx, context, session_id),
@@ -258,7 +329,6 @@ async fn handle_request(
         tx.stop_stream(Code::H3_REQUEST_CANCELLED);
         rx.stop_sending(Code::H3_REQUEST_CANCELLED);
     }
-    drop(permit);
 }
 
 async fn respond(stream: &mut Stream, status: StatusCode) -> Result<(), ServerError> {

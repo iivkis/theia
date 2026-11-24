@@ -230,3 +230,7 @@ Public share and disabled-user recovery shortcuts are included in the main edito
 ### Дополнительная идентичность своего inbound
 
 В серверном редакторе `P` запускает локальную проверку сохранённых TOML/cert/key в worker. Просмотр показывает свой inbound, имя, порт и публичный pin; `y` повторно проверяет точный snapshot/leaf и сохраняет только `security_mode = "pinned-cert-v1"` через guarded write. `n`/Esc отменяют. Ни одного сетевого запроса или runtime Apply; отдельный restart обязателен. Профиль вручную переносится в клиент по доверенному каналу. Никаких третьих адресов, автоматической мимикрии или REALITY-ready. Существующий кандидатный `a` остаётся read-only.
+
+### Собственный XHTTP (ADR-0084)
+
+В серверном редакторе `X` открывает guarded preview локального `pinned-cert-stream-up-v1` (H2/H3, раздельные upload/download). `P` сохраняет прежний stream-one pin профиль; `y` подтверждает именно показанный mode, без автоматического запуска или перезагрузки. Кандидаты сторонних адресов не становятся локальными TLS identity. Передача публичного pin клиенту пока ручная. Это не полная реализация SmartTheia REALITY.

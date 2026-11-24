@@ -476,6 +476,22 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_silence",
                       read("crates/theia/tests/client_h2.rs"))
 
+    def test_smarttheia_native_xhttp_contract(self):
+        spec = read("docs/IMPLEMENTATION_SPEC.md")
+        self.assertIn("SmartTheia XHTTP", spec)
+        self.assertIn("не реализуем полную копию Xray REALITY или Xray XHTTP", spec)
+        self.assertIn("0.4 (проектная)", spec)
+        split = read("crates/theia/src/split_http.rs")
+        self.assertIn("UPLOAD_PATH", split)
+        self.assertIn("DOWNLOAD_PATH", split)
+        self.assertIn("PAIR_TIMEOUT", split)
+        for path in ("client.rs", "h3_client.rs"):
+            self.assertIn("with_stream_up", read("crates/theia/src/" + path))
+        for path in ("server.rs", "h3_server.rs"):
+            self.assertIn("handle_split_request", read("crates/theia/src/" + path))
+        self.assertIn("h2_h3_stream_up_separate_http_legs_and_identity",
+                      read("crates/theia/tests/security_profile.rs"))
+
     def test_f18_second_stage_is_read_only_and_shared(self):
         review = read("crates/theia/src/tui_reality_review.rs")
         self.assertIn("matches_selection", review)

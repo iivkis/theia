@@ -2,14 +2,16 @@
 
 **Версия:** 1 (pure frame codec и FSM в `crates/theia/src/protocol.rs`; production H2/H3 client/server и ограниченный QUIC-first fallback реализованы). **Область:** прикладной протокол проксирования поверх аутентифицированных TLS/QUIC HTTP-streams. Не собственный аналог TLS или QUIC.
 
-## 1. Transport embedding
+## 1. Transport embedding: SmartTheia XHTTP
+
+Целевой carrier — собственная реализация XHTTP для SmartTheia, не wire-копия Xray XHTTP/VLESS. Один frame/FSM поверх двух стандартных HTTP носителей; legacy streaming POST остаётся явно версионированным stream-one совместимым режимом. Новый stream-up — отдельные HTTP upload/download на одном проверенном соединении. SmartTheia REALITY — самостоятельный security adapter, не Xray REALITY. Ни один режим не считается автоматически эквивалентным другому.
 
 | Предпочтение | Стек | ALPN | HTTP |
 | --- | --- | --- | --- |
-| primary | QUIC (TLS 1.3), HTTP/3 | `h3` | bidirectional streaming `POST` |
-| fallback | TCP (TLS 1.3), HTTP/2 | `h2` | bidirectional streaming `POST` |
+| primary | QUIC (TLS 1.3), HTTP/3 | `h3` | SmartTheia XHTTP (stream-one / stream-up) |
+| fallback | TCP (TLS 1.3), HTTP/2 | `h2` | тот же SmartTheia XHTTP mode |
 
-Одинаковый inbound может слушать UDP и TCP **одного номера порта**. TLS cert/hostname проверяется на обоих путях. Клиент посылает `POST /v1/session`; `content-type: application/octet-stream`, `Authorization: Bearer <token>` в защищённых HTTP-заголовках. Сервер отвечает HTTP 200 **после проверки HTTP headers, TLS identity и Bearer-права на inbound, но ДО получения всего request body**; двунаправленные body несут SmartTheia frames. Нужен настоящий **full-duplex**: клиент продолжает писать request body и одновременно читает response body, сервер — наоборот. Нельзя ждать EOF request body перед response headers или перед `HELLO_ACK`; иначе неизбежен deadlock. До `OPEN_OK` HTTP 200 означает лишь принятие HTTP-запроса, а не успех целевого TCP dial.
+Для stream-one действует следующий контракт. Stream-up описан отдельно ниже. Одинаковый inbound может слушать UDP и TCP **одного номера порта**. TLS cert/hostname проверяется на обоих путях. Клиент посылает `POST /v1/session`; `content-type: application/octet-stream`, `Authorization: Bearer <token>` в защищённых HTTP-заголовках. Сервер отвечает HTTP 200 **после проверки HTTP headers, TLS identity и Bearer-права на inbound, но ДО получения всего request body**; двунаправленные body несут SmartTheia frames. Нужен настоящий **full-duplex**: клиент продолжает писать request body и одновременно читает response body, сервер — наоборот. Нельзя ждать EOF request body перед response headers или перед `HELLO_ACK`; иначе неизбежен deadlock. До `OPEN_OK` HTTP 200 означает лишь принятие HTTP-запроса, а не успех целевого TCP dial.
 
 Никаких самодельных открытых UDP handshakes, отдельного нестандартного ALPN или ошибок, отключающих TLS checks. TLS ClientHello и QUIC Initial могут быть видны DPI, HTTP path/Authorization защищены TLS. Определить приложение по статистике или активному probing всё равно возможно.
 
@@ -126,3 +128,7 @@ The versioned theia://v1 invitation is **not** a SmartTheia frame, HTTP endpoint
 ## Дополнительный pinned-cert-v1 route (ADR-0083)
 
 Опциональный серверный `security_mode = "pinned-cert-v1"` принимает только `POST /v1/pinned-session`; plain принимает только `/v1/session`. Одинаковый SmartTheia v1 codec, bearer grants и OPEN_OK. Клиент проверяет точный SHA-256 DER leaf после стандартной TLS1.3 PKI/SAN/ALPN и перед отправкой HTTP bearer на обоих транспортах. Ни один mode mismatch, wrong pin, CA или auth failure не вызывает downgrade. Никаких изменений frame IDs или invitation v1; настоящий REALITY не реализован. Нативная приёмка нового режима требуется.
+
+## SmartTheia XHTTP stream-up v1 (ADR-0084, pending native acceptance)
+
+Explicit `security_mode = "pinned-cert-stream-up-v1"` requires two requests on the **same** verified H2 or H3 connection: POST `/v2/stream-up/upload` and empty GET `/v2/stream-up/download`. Both have the same valid bearer and octet-stream content type. One pair per connection; no shared cross-connection identifier, duplicate leg reuse, or unbounded pending map. Before either stream succeeds require exact route/method, same credential, one authorization/quota permit and clean empty GET EOF. POST response is empty HTTP 200, GET response carries server frames. Upload body carries client frames. The common HELLO/OPEN/OPEN_OK/DATA/FIN state machine and existing relay budgets remain authoritative; HTTP 200 alone never means TCP success. Same-connection pairing expires after 10s. No downgrade to stream-one, plain TLS or another pin. This is a native SmartTheia carrier; not Xray XHTTP wire and not a complete REALITY-like security adapter.

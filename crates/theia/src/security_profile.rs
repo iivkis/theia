@@ -7,6 +7,7 @@ use subtle::ConstantTimeEq;
 
 pub const PINNED_PATH: &str = "/v1/pinned-session";
 const PROFILE_PREFIX: &str = "pinned-cert-v1:";
+const SPLIT_PROFILE_PREFIX: &str = "pinned-cert-stream-up-v1:";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -14,6 +15,7 @@ pub enum SecurityMode {
     #[default]
     Plain,
     PinnedCertV1,
+    PinnedCertStreamUpV1,
 }
 
 impl SecurityMode {
@@ -21,10 +23,15 @@ impl SecurityMode {
         *self == Self::Plain
     }
 
+    pub(crate) fn is_stream_up(self) -> bool {
+        self == Self::PinnedCertStreamUpV1
+    }
+
     pub(crate) fn path(self) -> &'static str {
         match self {
             Self::Plain => "/v1/session",
             Self::PinnedCertV1 => PINNED_PATH,
+            Self::PinnedCertStreamUpV1 => crate::split_http::UPLOAD_PATH,
         }
     }
 }
@@ -40,7 +47,8 @@ impl CertificatePin {
     }
 
     pub fn parse_profile(profile: &str) -> Option<Self> {
-        let raw = profile.strip_prefix(PROFILE_PREFIX)?.as_bytes();
+        let raw = profile.strip_prefix(PROFILE_PREFIX)
+            .or_else(|| profile.strip_prefix(SPLIT_PROFILE_PREFIX))?.as_bytes();
         if raw.len() != 64
             || !raw
                 .iter()
@@ -49,7 +57,7 @@ impl CertificatePin {
             return None;
         }
         let mut pin = [0; 32];
-        for (byte, pair) in pin.iter_mut().zip(raw.chunks_exact(2)) {
+        for (byte, pair) in pin.iter_mut().zip(raw.as_chunks::<2>().0) {
             let value = |n: u8| {
                 if n.is_ascii_digit() {
                     n - b'0'
@@ -60,6 +68,14 @@ impl CertificatePin {
             *byte = value(pair[0]) * 16 + value(pair[1]);
         }
         Some(Self(pin))
+    }
+
+    pub fn is_stream_up_profile(profile: &str) -> bool {
+        profile.starts_with(SPLIT_PROFILE_PREFIX) && Self::parse_profile(profile).is_some()
+    }
+
+    pub fn stream_up_profile(self) -> String {
+        self.profile().replacen(PROFILE_PREFIX, SPLIT_PROFILE_PREFIX, 1)
     }
 
     pub fn profile(self) -> String {
@@ -125,6 +141,27 @@ mod tests {
         assert_eq!(config::parse(&encoded).unwrap(), document);
         assert!(Invitation::public_from_server(&document, "public").is_err());
         assert!(config::parse(&encoded.replace("pinned-cert-v1", "pinned-cert-v2")).is_err());
+    }
+
+    #[test]
+    fn stream_up_profile_is_explicit_and_not_an_invitation_v1() {
+        use crate::{config::{self, Config, Transport}, invite::Invitation};
+        let pin = CertificatePin::from_der(b"fixture");
+        let profile = pin.stream_up_profile();
+        assert!(CertificatePin::is_stream_up_profile(&profile));
+        assert!(!CertificatePin::is_stream_up_profile(&pin.profile()));
+        assert!(CertificatePin::parse_profile(&profile).is_some_and(|value| value == pin));
+        let Config::Client(mut client) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+            panic!("client fixture");
+        };
+        for transport in [Transport::H2, Transport::H3, Transport::Auto] {
+            client.client.profiles[0].transport = transport;
+            client.client.profiles[0].tls_profile.clone_from(&profile);
+            let config = Config::Client(client.clone());
+            config.validate().unwrap();
+            assert_eq!(config::parse(&config.to_toml().unwrap()).unwrap(), config);
+            assert!(Invitation::public_from_profile(&client.client.profiles[0]).is_err());
+        }
     }
 
     #[test]

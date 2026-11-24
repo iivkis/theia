@@ -311,14 +311,14 @@ impl Interaction {
         });
     }
 
-    fn start_pinned_review(&mut self) {
+    fn start_pinned_review(&mut self, stream_up: bool) {
         let Some(mut editor) = self.editor.take() else {
             return;
         };
         let (tx, rx) = mpsc::channel();
         self.pinned_loading = Some(rx);
         let _worker = std::thread::spawn(move || {
-            let result = editor.review_pinned_mode();
+            let result = editor.review_pinned_mode(stream_up);
             editor.error = result.as_ref().err().map(|message| (*message).to_owned());
             let _ = tx.send((editor, result));
         });
@@ -1114,8 +1114,8 @@ impl Interaction {
                 }
                 return false;
             }
-            if editor.role() == Role::Server && key.code == KeyCode::Char('P') {
-                self.start_pinned_review();
+            if editor.role() == Role::Server && matches!(key.code, KeyCode::Char('P' | 'X')) {
+                self.start_pinned_review(key.code == KeyCode::Char('X'));
                 return false;
             }
             if editor.role() == Role::Server && key.code == KeyCode::Char('p') {
@@ -1333,7 +1333,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели P: локальная проверка и явное сохранение pinned-cert-v1 (не REALITY), u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели P: локальный pinned-cert-v1 (stream-one), X: собственный XHTTP stream-up с pin; y подтверждает сохранение (не полноценный REALITY), u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
             true,
         ),
     }

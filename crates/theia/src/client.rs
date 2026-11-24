@@ -118,6 +118,7 @@ pub struct H2Client {
     connector: H2Tls,
     wire_shape: H2WireShape,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
+    stream_up: bool,
 }
 
 impl H2Client {
@@ -225,6 +226,7 @@ impl H2Client {
             connector,
             wire_shape,
             certificate_pin: None,
+            stream_up: false,
         })
     }
 
@@ -252,6 +254,15 @@ impl H2Client {
             return Err(ClientError::Configuration);
         }
         self.certificate_pin = pin;
+        Ok(self)
+    }
+
+    /// An explicit second HTTP stream; cannot weaken the selected identity.
+    pub fn with_stream_up(mut self, enabled: bool) -> Result<Self, ClientError> {
+        if (enabled && self.certificate_pin.is_none()) || (self.stream_up && !enabled) {
+            return Err(ClientError::Configuration);
+        }
+        self.stream_up = enabled;
         Ok(self)
     }
 
@@ -332,15 +343,31 @@ impl H2Client {
         );
         // Build and send the credential-bearing POST ONLY after the selected
         // backend verified TLS identity and ALPN and established HTTP/2.
-        let request = Request::post(self.uri.clone())
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::AUTHORIZATION, self.authorization.clone())
-            .body(())
-            .map_err(|_| ClientError::Configuration)?;
-        let (response, mut outgoing) = sender
-            .send_request(request, false)
-            .map_err(|_| ClientError::Http2)?;
-        let response = response.await.map_err(|_| ClientError::Http2)?;
+        let (response, mut outgoing) = if self.stream_up {
+            use crate::split_http::{self, Leg};
+            let (download, _) = sender.send_request(
+                split_http::request(&self.uri, Leg::Download, &self.authorization)?, true,
+            ).map_err(|_| ClientError::Http2)?;
+            let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+            let (upload, tx) = sender.send_request(
+                split_http::request(&self.uri, Leg::Upload, &self.authorization)?, false,
+            ).map_err(|_| ClientError::Http2)?;
+            let upload = upload.await.map_err(|_| ClientError::Http2)?;
+            split_http::check_status(upload.status())?;
+            let mut empty = upload.into_body();
+            if empty.data().await.is_some() || empty.trailers().await.map_err(|_| ClientError::Http2)?.is_some() {
+                return Err(ClientError::Protocol);
+            }
+            (download.await.map_err(|_| ClientError::Http2)?, tx)
+        } else {
+            let request = Request::post(self.uri.clone())
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .body(())
+                .map_err(|_| ClientError::Configuration)?;
+            let (response, tx) = sender.send_request(request, false).map_err(|_| ClientError::Http2)?;
+            (response.await.map_err(|_| ClientError::Http2)?, tx)
+        };
         crate::diag!(
             Trace,
             "client.h2",

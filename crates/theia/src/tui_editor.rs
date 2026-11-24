@@ -23,11 +23,17 @@ pub(crate) struct PinnedModeReview {
     name: String,
     endpoint: String,
     pin: crate::security_profile::CertificatePin,
+    mode: crate::security_profile::SecurityMode,
 }
 
 impl PinnedModeReview {
     pub(crate) fn body(&self) -> String {
-        format!("Собственный inbound: {}\nEndpoint: {}\nSNI: {}\nsecurity_mode = pinned-cert-v1\nКлиентский tls_profile = {}\n\nСохранить режим только в TOML. Старые клиенты и theia://v1 несовместимы. Нужна отдельная перезагрузка сервера; CA/SAN остаются обязательными.\nНе REALITY и не anti-DPI. y: сохранить; n/Esc: отмена", self.inbound, self.endpoint, self.name, self.pin.profile())
+        let (mode, profile) = if self.mode.is_stream_up() {
+            ("pinned-cert-stream-up-v1", self.pin.stream_up_profile())
+        } else {
+            ("pinned-cert-v1", self.pin.profile())
+        };
+        format!("Собственный inbound: {}\nEndpoint: {}\nSNI: {}\nsecurity_mode = {mode}\nКлиентский tls_profile = {profile}\n\nСохранить режим только в TOML. Старые клиенты и theia://v1 несовместимы. Нужна отдельная перезагрузка сервера; CA/SAN остаются обязательными.\nНе полноценный REALITY. y: сохранить; n/Esc: отмена", self.inbound, self.endpoint, self.name)
     }
 }
 
@@ -569,7 +575,7 @@ impl Editor {
 
     /// Preview only the operator's saved local identity. The third-party
     /// candidate review cannot authorize this separate configuration change.
-    pub(crate) fn review_pinned_mode(&self) -> Result<PinnedModeReview, &'static str> {
+    pub(crate) fn review_pinned_mode(&self, stream_up: bool) -> Result<PinnedModeReview, &'static str> {
         if self.editing
             || self.dirty()
             || self.issued.is_some()
@@ -605,6 +611,7 @@ impl Editor {
             name: inbound.server_name.clone(),
             endpoint: format!("{}:{}", inbound.server_name, tcp.port()),
             pin,
+            mode: if stream_up { crate::security_profile::SecurityMode::PinnedCertStreamUpV1 } else { crate::security_profile::SecurityMode::PinnedCertV1 },
         })
     }
 
@@ -612,7 +619,7 @@ impl Editor {
         &mut self,
         review: &PinnedModeReview,
     ) -> Result<(), &'static str> {
-        let current = self.review_pinned_mode()?;
+        let current = self.review_pinned_mode(review.mode.is_stream_up())?;
         if current.source != review.source
             || current.inbound != review.inbound
             || current.name != review.name
@@ -629,7 +636,7 @@ impl Editor {
             .inbounds
             .get_mut(self.selected_record)
             .ok_or("Inbound missing")?;
-        inbound.security_mode = crate::security_profile::SecurityMode::PinnedCertV1;
+        inbound.security_mode = review.mode;
         if !self.save() {
             // Preserve uncertain-write protection; never assert rollback of a
             // committed file if the guarded writer cannot establish outcome.
@@ -1074,7 +1081,7 @@ mod tests {
         let source = Config::Server(doc.clone()).to_toml().unwrap();
         let file = Temp::write(&source);
         let mut editor = Editor::load(Role::Server, &file.0).unwrap();
-        let review = editor.review_pinned_mode().unwrap();
+        let review = editor.review_pinned_mode(false).unwrap();
         assert!(review.pin == CertificatePin::from_der(generated.cert.der().as_ref()));
         assert!(review.body().contains("pinned-cert-v1:"));
         assert_eq!(fs::read_to_string(&file.0).unwrap(), source);
@@ -1106,6 +1113,14 @@ mod tests {
         assert!(crate::reload_preflight::assess_reload(&doc, &saved).is_err());
         assert!(!crate::restart_guard::same_port_tls_only(&doc, &saved));
         assert!(editor.apply_pinned_mode(&review).is_err());
+        let split = editor.review_pinned_mode(true).unwrap();
+        assert!(split.body().contains("pinned-cert-stream-up-v1:"));
+        editor.apply_pinned_mode(&split).unwrap();
+        let Config::Server(saved) = config::read_file(&file.0).unwrap() else {
+            panic!("saved server");
+        };
+        assert_eq!(saved.server.inbounds[0].security_mode, SecurityMode::PinnedCertStreamUpV1);
+        assert!(editor.public_share().is_err());
     }
 
     #[test]

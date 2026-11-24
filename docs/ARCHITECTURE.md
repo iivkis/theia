@@ -6,7 +6,7 @@
                     CLIENT (theia client run)
    ┌──────────────────────────────────────────────────────┐
    │ browser/app → 127.0.0.1 HTTP CONNECT / SOCKS5       │
-   │      → session manager → transport selector         │
+   │      → SmartTheia XHTTP → transport selector        │
    │                           ├── HTTP/3 over QUIC/UDP  │
    │                           └── HTTP/2 over TLS/TCP   │
    └────────────────────────────┬─────────────────────────┘
@@ -20,7 +20,7 @@
             «Для сервера»       «Для клиента»
 ```
 
-**Не писать свой QUIC/HTTP/TLS.** Приложение владеет только SmartTheia frames, авторизацией, transport negotiation и бизнес-правилами.
+**Не писать свой QUIC/HTTP/TLS.** Приложение владеет SmartTheia frames/FSM, собственным XHTTP carrier, авторизацией, transport negotiation и бизнес-правилами. SmartTheia XHTTP использует стандартные H2/TCP/TLS1.3 и H3/QUIC/TLS1.3; SmartTheia REALITY — отдельный собственный security adapter. Xray — концептуальный референс, не wire-совместимость. См. ADR-0084.
 
 ## 2. Rust workspace (целевая, не обязательная физическая разбивка)
 
@@ -48,7 +48,7 @@ fuzz/                  # необязательный отдельный workspa
 | --- | --- | --- |
 | Configuration | TOML schema, валидация, persist, редактирование | TUI и HTTP/QUIC |
 | Protocol | кадры, state machine, лимиты, ошибки wire | Tokio sockets/TUI |
-| Transport | защищённые HTTP/3/H2 duplex streams, выбор пути | бизнес-логика экранов |
+| Transport | SmartTheia XHTTP: stream-one/stream-up, H2/H3, bounded pairing/relay, выбор пути | бизнес-логика экранов |
 | Server ingress | inbound/auth/ACL, dialer, квоты, lifecycle | деталей ratatui |
 | Client access | SOCKS5/CONNECT, профили, системный proxy interface | конкретных виджетов |
 | Presentation | формы, подтверждения, статусы, горячие клавиши | raw TLS sockets |

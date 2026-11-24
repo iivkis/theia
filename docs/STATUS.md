@@ -47,3 +47,7 @@ F-14 evidence and residual gaps: [F14_ACCEPTANCE.md](F14_ACCEPTANCE.md). Do not 
 ### F-18 дополнительная идентичность (предлагаемый срез)
 
 ADR-0082/0083: read-only второй шаг мастера с exact/fresh dual evidence и дополнительный `pinned-cert-v1` для собственного server inbound, H2/H3/auto client, mutual mode refusal, guarded сохранение с отдельным restart. Это не modified REALITY handshake, не pin key lifecycle audit, не F-18/F-19 acceptance. CI нового блока ещё не подтверждён.
+
+### Pending ADR-0084
+
+Спецификация 0.4: SmartTheia REALITY и XHTTP — собственные аналоги; XHTTP carrier H2/H3. Предложен native split stream-up на одном проверенном соединении с общим FSM и pin. Нативная приёмка не подтверждена; F-18/F-19 и полноценный мастер остаются открытыми.

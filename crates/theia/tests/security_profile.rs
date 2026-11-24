@@ -28,6 +28,7 @@ struct Fixture {
     roots: RootCertStore,
     pin: CertificatePin,
     other_pin: CertificatePin,
+    stream_up: bool,
     _servers: JoinSet<Result<(), server::ServerError>>,
 }
 
@@ -100,6 +101,7 @@ impl Fixture {
             roots,
             pin,
             other_pin,
+            stream_up: mode == SecurityMode::PinnedCertStreamUpV1,
             _servers: servers,
         }
     }
@@ -114,6 +116,8 @@ impl Fixture {
         .unwrap()
         .with_certificate_pin(pin)
         .unwrap()
+        .with_stream_up(self.stream_up)
+        .unwrap()
     }
 
     fn h3(&self, pin: Option<CertificatePin>, name: &str, token: &[u8; 32]) -> H3Client {
@@ -125,6 +129,8 @@ impl Fixture {
         )
         .unwrap()
         .with_certificate_pin(pin)
+        .unwrap()
+        .with_stream_up(self.stream_up)
         .unwrap()
     }
 
@@ -171,17 +177,21 @@ impl Fixture {
                 tokio::spawn(tunnel.relay(local))
             };
             let (mut remote, _) = target.accept().await.unwrap();
-            let payload = b"verified pinned tunnel";
-            app.write_all(payload).await.unwrap();
-            app.shutdown().await.unwrap();
-            let mut data = Vec::new();
-            remote.read_to_end(&mut data).await.unwrap();
+            // Full duplex before either FIN, and payload beyond one flow window.
+            let payload: Vec<_> = (0..128 * 1024).map(|n| (n % 251) as u8).collect();
+            let mut data = vec![0; payload.len()];
+            tokio::try_join!(app.write_all(&payload), remote.read_exact(&mut data)).unwrap();
             assert_eq!(data, payload);
-            remote.write_all(&data).await.unwrap();
-            remote.shutdown().await.unwrap();
-            let mut reply = Vec::new();
-            app.read_to_end(&mut reply).await.unwrap();
+            let mut reply = vec![0; payload.len()];
+            tokio::try_join!(remote.write_all(&data), app.read_exact(&mut reply)).unwrap();
             assert_eq!(reply, payload);
+            app.shutdown().await.unwrap();
+            let mut tail = Vec::new();
+            remote.read_to_end(&mut tail).await.unwrap();
+            assert!(tail.is_empty());
+            remote.shutdown().await.unwrap();
+            app.read_to_end(&mut tail).await.unwrap();
+            assert!(tail.is_empty());
             relay.await.unwrap().unwrap();
         }
     }
@@ -248,4 +258,25 @@ async fn h2_h3_pinned_identity_and_mode_are_fail_closed() {
     })
     .await
     .expect("bounded H2/H3 identity and mode matrix");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_h3_stream_up_separate_http_legs_and_identity() {
+    timeout(Duration::from_secs(40), async {
+        let split = Fixture::start(SecurityMode::PinnedCertStreamUpV1).await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        split.errors(Some(split.other_pin), "localhost", &TOKEN, port, ClientError::Tls).await;
+        split.errors(Some(split.pin), "localhost", &[0x43; 32], port, ClientError::Unauthorized).await;
+        let address = Address::V4([127, 0, 0, 1]);
+        let token = URL_SAFE_NO_PAD.encode(TOKEN);
+        let legacy = H2Client::new(&split.h2.to_string(), "localhost", &token, split.roots.clone())
+            .unwrap().with_certificate_pin(Some(split.pin)).unwrap();
+        assert_eq!(legacy.open(address.clone(), port).await.err(), Some(ClientError::Rejected(404)));
+        let legacy = H3Client::new(split.h3, "localhost", &token, split.roots.clone())
+            .unwrap().with_certificate_pin(Some(split.pin)).unwrap();
+        assert_eq!(legacy.open(address, port).await.err(), Some(ClientError::Rejected(404)));
+        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        split.transfer(Some(split.pin), &target).await;
+    }).await.expect("bounded real H2/H3 split transport matrix");
 }
