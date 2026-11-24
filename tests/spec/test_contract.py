@@ -254,14 +254,15 @@ class SpecContractTests(unittest.TestCase):
         for term in ("MAX_PAYLOAD: usize = 65_536", "HEADER_LEN: usize = 6",
                      "pub fn encode(", "pub fn decode(", "pub fn feed_each(",
                      "pub struct Decoder", "pub struct Session", "fn tunnel_open(",
-                     "InvalidFlags", "InvalidTransition", "UnsupportedVersion"):
+                     "InvalidFlags", "InvalidTransition", "UnsupportedVersion", "CAP_PADDING"):
             self.assertIn(term, implementation)
         for test in ("documented_golden_vectors_are_exact",
                      "size_boundaries_are_enforced_before_buffering",
                      "stream_decoder_accepts_every_split_and_multiple_coalesced_frames",
                      "local_success_is_gated_on_open_ok_not_http_or_hello_ack",
                      "full_duplex_half_close_then_both_fin_and_drain",
-                     "deterministic_random_chunks_never_panic_and_bound_partial_memory"):
+                     "deterministic_random_chunks_never_panic_and_bound_partial_memory",
+                     "padding_v1_golden_vectors_and_capability_subset"):
             self.assertIn(test, tests)
 
     def test_m21_h2_ingress_is_real_and_has_fail_closed_tests(self):
@@ -346,6 +347,9 @@ class SpecContractTests(unittest.TestCase):
         split = read("crates/theia/src/split_http.rs")
         self.assertIn("UPLOAD_PATH", split)
         self.assertIn("DOWNLOAD_PATH", split)
+        self.assertIn('"/v1/stream-up/upload"', split)
+        self.assertIn('"/v1/stream-up/download"', split)
+        self.assertIn("stream_up_only_accepts_current_v1_routes", split)
         self.assertIn("PAIR_TIMEOUT", split)
         for path in ("client.rs", "h3_client.rs"):
             self.assertIn("with_stream_up", read("crates/theia/src/" + path))
@@ -401,7 +405,7 @@ class SpecContractTests(unittest.TestCase):
             with self.subTest(adapter=adapter):
                 self.assertIn("relay_liveness::Activity::new()", source)
                 self.assertIn("activity.data(", source)
-                self.assertIn("activity.fin()", source)
+                self.assertIn("activity.half_closed()", source)
                 self.assertIn("relay_liveness::receive_tail(", source)
         tests = read("crates/theia/tests/tunnel_liveness.rs")
         self.assertIn("production_h2_h3_asymmetric_traffic_half_close_and_idle", tests)

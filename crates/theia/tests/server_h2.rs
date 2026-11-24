@@ -852,3 +852,36 @@ async fn h2_request_trailers_after_fin_reset_the_stream() {
     .await
     .expect("bounded trailer rejection");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_rejects_unnegotiated_padding_before_target_dial() {
+    timeout(Duration::from_secs(10), async {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let (acceptor, connector) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, acceptor, Arc::new(context(true))));
+        let (mut sender, driver) = client(address, connector).await;
+        let (response, mut tx) = sender.send_request(request(&bearer()), false).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let mut rx = response.into_body();
+        let mut decoder = Decoder::new();
+        let mut queued = VecDeque::new();
+        send(&mut tx, &Frame::Hello { version: VERSION, capabilities: 0 }, false).await;
+        assert_eq!(next_frame(&mut rx, &mut decoder, &mut queued).await,
+            Frame::HelloAck { version: VERSION, accepted_capabilities: 0 });
+        // Independent wire vector: PADDING followed by an otherwise valid OPEN.
+        let mut bytes = vec![0x13, 0, 0, 0, 0, 1, 0x42];
+        bytes.extend(theia::protocol::encode(&Frame::OpenTcp {
+            address: Address::V4([127, 0, 0, 1]), port,
+        }).unwrap());
+        tx.send_data(Bytes::from(bytes), false).unwrap();
+        assert_eq!(next_frame(&mut rx, &mut decoder, &mut queued).await,
+            Frame::Abort(ErrorCode::ProtocolError));
+        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        driver.abort();
+        server.abort();
+    }).await.unwrap();
+}

@@ -9,8 +9,8 @@ use std::{
 };
 use tokio::{sync::oneshot, time::timeout};
 
-pub(crate) const UPLOAD_PATH: &str = "/v2/stream-up/upload";
-pub(crate) const DOWNLOAD_PATH: &str = "/v2/stream-up/download";
+pub(crate) const UPLOAD_PATH: &str = "/v1/stream-up/upload";
+pub(crate) const DOWNLOAD_PATH: &str = "/v1/stream-up/download";
 const PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -217,6 +217,20 @@ impl<T> Pair<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_up_only_accepts_current_v1_routes() {
+        for (method, path, expected) in [
+            (Method::POST, UPLOAD_PATH, Some(Leg::Upload)),
+            (Method::GET, DOWNLOAD_PATH, Some(Leg::Download)),
+            (Method::POST, "/v2/stream-up/upload", None),
+            (Method::GET, "/v2/stream-up/download", None),
+        ] {
+            let req = Request::builder().method(method).uri(path)
+                .header(header::CONTENT_TYPE, "application/octet-stream").body(()).unwrap();
+            assert!(leg(&req) == expected);
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn both_orders_pair_once_and_missing_half_expires() {

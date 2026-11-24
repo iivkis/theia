@@ -157,7 +157,7 @@ mod padding_tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn padding_does_not_refresh_idle_or_extend_close_deadline() {
+    async fn padding_does_not_refresh_idle() {
         let activity = Activity::new();
         let result = activity.run(
             async {
