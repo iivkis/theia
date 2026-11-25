@@ -6449,6 +6449,96 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+
+    #[test]
+    fn server_workspace_action_selection_and_diagnostics_require_separate_consent() {
+        use crate::camouflage_interfaces::{InterfaceSource, NativeInterfaces, ObservedInterface};
+        use crate::camouflage_workflow::{build_preview, PreviewScope};
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("server-controls").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("server.toml");
+        let original = server_issuance_fixture().replace("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"device-a\", \"device-b\"]").replace("[server.policy]", &format!("[[server.users]]\nid = \"device-b\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]", "11".repeat(32)));
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        let area = Rect::new(0, 0, 160, 42);
+        let body = shell_layout(area)[1];
+        for command in ['x', 't', 'U'] {
+            ui.select_workspace_page(Role::Server, 2);
+            ui.update(&mut model, press(KeyCode::Enter));
+            ui.workspace_user = 0;
+            ui.update(&mut model, press(KeyCode::Down));
+            assert_eq!(ui.workspace_user, 1);
+            ui.update(&mut model, press(KeyCode::Enter));
+            let items = page_actions(Role::Server, 2, ui.editor.as_ref());
+            ui.workspace_action = items.iter().position(|item| item.key == command).unwrap();
+            ui.update(&mut model, press(KeyCode::Enter));
+            match command {
+                'x' => assert!(matches!(&ui.revocation, Some(DisableFlow::Input(id)) if id == "device-b")),
+                't' => assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-b")),
+                'U' => assert!(matches!(&ui.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) if fields.first().is_some_and(|id| id == "device-b"))),
+                _ => unreachable!(),
+            }
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(ui.workspace_visible());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+        ui.update(&mut model, press(KeyCode::F(5)));
+        assert!(ui.show_server_process);
+        let items = ui.server_process.actions();
+        let controls = action_layout(body, items.len()).unwrap()[1];
+        ui.mouse(&mut model, click_at(controls.x + 2, controls.y + 1), area);
+        assert_eq!(ui.server_process.action_focus(), 0);
+        assert!(!ui.server_process.running());
+        assert!(ui.server_process.confirmation().is_none());
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.server_process.confirmation(), Some(true));
+        assert!(rendered_interaction(160, 42, &model, &ui).contains("Запуск сервера"));
+        assert!(!ui.server_process.running());
+        ui.update(&mut model, press(KeyCode::Char('n')));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(!ui.show_server_process);
+
+        let native = NativeInterfaces { interfaces: vec![ObservedInterface { interface_name: "test".into(), address: "93.184.216.10".parse().unwrap(), prefix_len: 29, is_up: true, source: InterfaceSource::LinuxGetifaddrs }] };
+        ui.candidate_batch = Some(CandidateBatchPanel::new(build_preview(&native, None, PreviewScope::PassiveOnly), Some("edge.example.org".into())));
+        click_form_field(&mut ui, &mut model, area, 0);
+        assert_eq!(ui.candidate_batch.as_ref().unwrap().selected_count(), 0);
+        assert!(!ui.candidate_batch.as_ref().unwrap().is_running());
+        let view = rendered_interaction(160, 42, &model, &ui);
+        assert!(view.contains("93.184.216.10:443"));
+        ui.update(&mut model, press(KeyCode::Char(' ')));
+        assert_eq!(ui.candidate_batch.as_ref().unwrap().selected_count(), 1);
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.candidate_batch.as_ref().unwrap().is_confirming());
+        ui.update(&mut model, press(KeyCode::Char('n')));
+        assert!(!ui.candidate_batch.as_ref().unwrap().is_running());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.candidate_batch.is_none());
+
+        ui.domain = Some(DomainPanel::new(build_preview(&native, None, PreviewScope::PassiveOnly)));
+        click_form_field(&mut ui, &mut model, area, 1);
+        assert_eq!(ui.domain.as_ref().unwrap().domain(), Some("samsung.com"));
+        assert_eq!(ui.domain.as_ref().unwrap().selected_count(), 0);
+        assert!(!ui.domain.as_ref().unwrap().is_running());
+        ui.update(&mut model, press(KeyCode::Char('m')));
+        assert!(ui.domain.as_ref().unwrap().is_manual_input());
+        for ch in "example.orgx".chars() {
+            ui.update(&mut model, press(KeyCode::Char(ch)));
+        }
+        ui.update(&mut model, press(KeyCode::Backspace));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.domain.as_ref().unwrap().is_dns_confirming());
+        assert_eq!(ui.domain.as_ref().unwrap().domain(), Some("example.org"));
+        assert!(!ui.domain.as_ref().unwrap().is_running());
+        ui.update(&mut model, press(KeyCode::Char('n')));
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.domain.is_none());
+        assert!(!ui.owned_running(Role::Server));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn qr_worker_cancellation_and_failure_never_import_or_write() {
         let root = std::env::temp_dir().join(crate::tui_editor::generated_id("qr-events").unwrap());
