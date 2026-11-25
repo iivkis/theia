@@ -627,6 +627,7 @@ async fn relay(
     mut state: Session,
     session_id: u64,
 ) -> Result<(), ServerError> {
+    let traffic = crate::traffic::enter(crate::Role::Server, true);
     let (mut read, mut write) = tcp.into_split();
     let mut upload_state = state.clone();
     let mut download_state = state.clone();
@@ -652,6 +653,7 @@ async fn relay(
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
+                    traffic.upload(data.len());
                     activity.data(data.len());
                 }
                 Frame::Fin => {
@@ -728,6 +730,7 @@ async fn relay(
                 let _ = download_done.send(());
                 return Ok::<(), ServerError>(());
             }
+            traffic.download(n);
             activity.data(n);
         }
     };

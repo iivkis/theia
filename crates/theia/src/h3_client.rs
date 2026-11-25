@@ -794,6 +794,7 @@ impl H3Tunnel {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let traffic = crate::traffic::enter(crate::Role::Client, true);
         let operation = self.operation;
         crate::diag!(
             Debug,
@@ -844,6 +845,7 @@ impl H3Tunnel {
                     return Ok::<(), ClientError>(());
                 }
                 self._lease.record_data(n);
+                traffic.upload(n);
                 activity.data(n);
             }
         };
@@ -868,6 +870,7 @@ impl H3Tunnel {
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
                         self._lease.record_data(data.len());
+                        traffic.download(data.len());
                         activity.data(data.len());
                     }
                     Frame::Fin => {

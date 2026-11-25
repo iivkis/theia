@@ -54,6 +54,7 @@ pub mod reference_health;
 pub mod reference_maintenance;
 mod relay_batch;
 mod relay_liveness;
+mod traffic;
 pub mod reload_preflight;
 pub mod restart_guard;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
