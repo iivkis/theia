@@ -3795,10 +3795,16 @@ mod hardening_tests {
         let (owner, phase) = watch::channel(GenerationPhase::Active);
         let (remote, server) = if h3 {
             let endpoint = crate::quic_transport::server_endpoint(
-                "127.0.0.1:0".parse().unwrap(), vec![cert], key.into(),
-            ).unwrap();
+                "127.0.0.1:0".parse().unwrap(),
+                vec![cert],
+                key.into(),
+            )
+            .unwrap();
             let remote = endpoint.local_addr().unwrap();
-            (remote, tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase)))
+            (
+                remote,
+                tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase)),
+            )
         } else {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let remote = listener.local_addr().unwrap();
@@ -3811,12 +3817,15 @@ mod hardening_tests {
             .with_single_cert(vec![cert], key.into())
             .unwrap();
             tls.alpn_protocols = vec![b"h2".to_vec()];
-            (remote, tokio::spawn(serve_generation(
-                listener,
-                TlsAcceptor::from(Arc::new(tls)),
-                context,
-                phase,
-            )))
+            (
+                remote,
+                tokio::spawn(serve_generation(
+                    listener,
+                    TlsAcceptor::from(Arc::new(tls)),
+                    context,
+                    phase,
+                )),
+            )
         };
         let token = URL_SAFE_NO_PAD.encode([7u8; 32]);
         let address = Address::V4([127, 0, 0, 1]);

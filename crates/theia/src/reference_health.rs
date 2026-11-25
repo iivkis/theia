@@ -1287,7 +1287,8 @@ mod tests {
             Some(crate::quic_transport::server_config(vec![cert], key.into()).unwrap()),
             udp_socket,
             Arc::new(quinn::TokioRuntime),
-        ).unwrap();
+        )
+        .unwrap();
         let tcp = Driver(tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let Ok(tls) = acceptor.accept(socket).await else {

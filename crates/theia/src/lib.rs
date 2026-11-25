@@ -2,9 +2,6 @@
 //! or OS proxy modifications; the executable dispatches runtime commands.
 
 mod bounded_input;
-#[cfg(test)]
-#[path = "../tests/support/shared_port.rs"]
-mod shared_port;
 pub mod camouflage_batch;
 pub mod camouflage_discovery;
 pub mod camouflage_domain_dns;
@@ -63,6 +60,9 @@ pub mod restart_guard;
 pub(crate) mod runtime_generation;
 pub mod security_profile;
 pub mod server;
+#[cfg(test)]
+#[path = "../tests/support/shared_port.rs"]
+mod shared_port;
 mod split_http;
 mod tcp_bbr;
 pub mod transport_policy;
