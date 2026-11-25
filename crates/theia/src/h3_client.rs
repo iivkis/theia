@@ -243,6 +243,13 @@ impl H3Client {
     }
 
     /// Reuse verified own-TLS connections within this immutable profile.
+    pub(crate) fn with_mode_cache_ttl(mut self, ttl: Duration) -> Self {
+        if let Some(mode) = self.auto_mode.as_mut() {
+            mode.set_ttl(ttl);
+        }
+        self
+    }
+
     pub fn with_connection_pool(mut self) -> Self {
         self.reuse_connections = true;
         self
@@ -287,13 +294,6 @@ impl H3Client {
         Ok(self)
     }
 
-    pub(crate) fn preferred_stream_up(&self) -> Result<bool, ClientError> {
-        match &self.auto_mode {
-            Some(mode) => Ok(mode.select()?.stream_up),
-            None => Ok(self.stream_up),
-        }
-    }
-
     pub(crate) fn remote(&self) -> SocketAddr {
         self.remote
     }
@@ -307,15 +307,6 @@ impl H3Client {
     }
 
     pub async fn open(&self, address: Address, port: u16) -> Result<H3Tunnel, ClientError> {
-        self.open_preferred(address, port, None).await
-    }
-
-    pub(crate) async fn open_preferred(
-        &self,
-        address: Address,
-        port: u16,
-        preferred: Option<bool>,
-    ) -> Result<H3Tunnel, ClientError> {
         let operation = diagnostics::next_id();
         crate::diag!(
             Debug,
@@ -325,7 +316,7 @@ impl H3Client {
         );
         let open = Frame::OpenTcp { address, port };
         protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation, preferred))
+        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation))
             .await
             .map_err(|_| ClientError::Timeout)
             .and_then(|result| result);
@@ -388,7 +379,6 @@ impl H3Client {
         &self,
         open: Frame,
         operation: u64,
-        preferred: Option<bool>,
     ) -> Result<H3Tunnel, ClientError> {
         use crate::split_http::HelloOutcome;
         let mut stage = HelloOutcome::Pending;
@@ -398,23 +388,18 @@ impl H3Client {
                 .await;
         };
         let ticket = mode.select()?;
-        let stream_up = preferred.unwrap_or(ticket.stream_up);
+        let stream_up = ticket.stream_up;
         let result = self
             .open_inner(&open, operation, stream_up, &mut stage)
             .await;
-        if stream_up && stage == HelloOutcome::Acked {
-            mode.remember(ticket)?;
-        }
-        if stream_up || stage != HelloOutcome::Silent || !mode.current(ticket)? {
+        if !mode.after_attempt(ticket, stream_up, stage)? {
             return result;
         }
         // The first attempt is fully dropped and never sent OPEN_TCP.
         crate::diag!(Debug, "client.h3", "xhttp_pre_open_stream_up_retry");
         let mut stage = HelloOutcome::Pending;
         let result = self.open_inner(&open, operation, true, &mut stage).await;
-        if stage == HelloOutcome::Acked {
-            mode.remember(ticket)?;
-        }
+        mode.after_attempt(ticket, true, stage)?;
         // The original H3 attempt already completed HTTP admission.
         // UDP silence in the second attempt must not authorize H2 fallback.
         match result {

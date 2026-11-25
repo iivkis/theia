@@ -157,7 +157,7 @@ impl AutoMode {
         ))
     }
 
-    pub(crate) fn current(&self, ticket: ModeTicket) -> Result<bool, ClientError> {
+    fn current(&self, ticket: ModeTicket) -> Result<bool, ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
         cache.observe(
             crate::network_scope::observe(self.remote),
@@ -166,7 +166,23 @@ impl AutoMode {
         Ok(cache.current(ticket))
     }
 
-    pub(crate) fn remember(&self, ticket: ModeTicket) -> Result<(), ClientError> {
+    /// Shared H2/H3 decision: retry only the first silent admitted HELLO.
+    /// A successful split ACK is the only evidence that can cache split.
+    /// Never import a different transport's decision or retry after OPEN.
+    pub(crate) fn after_attempt(
+        &self, ticket: ModeTicket, stream_up: bool, outcome: HelloOutcome,
+    ) -> Result<bool, ClientError> {
+        if stream_up && outcome == HelloOutcome::Acked {
+            self.remember(ticket)?;
+        }
+        Ok(!stream_up && outcome == HelloOutcome::Silent && self.current(ticket)?)
+    }
+
+    pub(crate) fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
+    fn remember(&self, ticket: ModeTicket) -> Result<(), ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
         let now = Instant::now();
         cache.observe(crate::network_scope::observe(self.remote), now);

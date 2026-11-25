@@ -112,7 +112,8 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 &cert,
             )
             .map(Arc::new)
-            .map(ProxyClient::H2);
+            .map(Carrier::H2)
+            .map(ProxyClient::Direct);
         }
         #[cfg(not(feature = "experimental-btls-h2"))]
         {
@@ -146,7 +147,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             } else {
                 client
             };
-            Ok(ProxyClient::H2(Arc::new(client.with_connection_pool())))
+            Ok(ProxyClient::Direct(Carrier::H2(Arc::new(client.with_connection_pool()))))
         }
         Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
@@ -164,7 +165,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 h3
             });
             if profile.transport == Transport::H3 {
-                return Ok(ProxyClient::H3(h3));
+                return Ok(ProxyClient::Direct(Carrier::H3(h3)));
             }
             // Both carriers use the same resolved endpoint. Do not resolve
             // the hostname again during fallback; retain the configured SNI,
@@ -178,13 +179,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             } else {
                 h2
             });
-            Ok(ProxyClient::Auto(Arc::new(AutoClient {
-                h2,
-                h3,
-                ttl,
-                negative: Mutex::new(NegativeCache::default()),
-                cache_changed: Notify::new(),
-            })))
+            Ok(ProxyClient::Direct(Carrier::from_options(Some(h2), Some(h3), ttl)?))
         }
     }
 }
@@ -200,9 +195,7 @@ async fn resolve_server(profile: &Profile) -> Result<SocketAddr, ClientError> {
 
 #[derive(Clone)]
 enum ProxyClient {
-    H2(Arc<H2Client>),
-    H3(Arc<H3Client>),
-    Auto(Arc<AutoClient>),
+    Direct(Carrier),
     Reality(Arc<RealityClient>),
 }
 
@@ -210,14 +203,15 @@ enum ProxyClient {
 /// New logical tunnels re-read the persistent trust floor. A changed
 /// descriptor creates new carrier pools and an independent fallback cache;
 /// established tunnels retain their own transport leases.
-enum RealityCarrier {
+#[derive(Clone)]
+enum Carrier {
     H2(Arc<H2Client>),
     H3(Arc<H3Client>),
     Auto(Arc<AutoClient>),
 }
 struct RealityGeneration {
     value: crate::descriptor::Verified,
-    carrier: RealityCarrier,
+    carrier: Carrier,
     credential_digest: [u8; 32],
     last_transport: std::sync::atomic::AtomicU8,
     last_refresh: std::sync::atomic::AtomicU8,
@@ -272,6 +266,7 @@ impl RealityClient {
         let h2 = if modes.h2 {
             Some(Arc::new(
                 H2Client::admitted_runtime(remote, &token, &value, secret.clone())?
+                    .with_mode_cache_ttl(ttl)
                     .with_connection_pool(),
             ))
         } else {
@@ -280,24 +275,14 @@ impl RealityClient {
         let h3 = if modes.h3 {
             Some(Arc::new(
                 H3Client::admitted_runtime(remote, &token, &value, secret)?
+                    .with_mode_cache_ttl(ttl)
                     .with_connect_timeout(timeout)?
                     .with_connection_pool(),
             ))
         } else {
             None
         };
-        let carrier = match (h2, h3) {
-            (Some(h2), Some(h3)) => RealityCarrier::Auto(Arc::new(AutoClient {
-                h2,
-                h3,
-                ttl,
-                negative: Mutex::new(NegativeCache::default()),
-                cache_changed: Notify::new(),
-            })),
-            (Some(h2), None) => RealityCarrier::H2(h2),
-            (None, Some(h3)) => RealityCarrier::H3(h3),
-            _ => return Err(ClientError::Configuration),
-        };
+        let carrier = Carrier::from_options(h2, h3, ttl)?;
         Ok(RealityGeneration {
             value,
             carrier,
@@ -347,19 +332,7 @@ impl RealityClient {
     }
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let generation = self.generation().await?;
-        let result = match &generation.carrier {
-            RealityCarrier::H2(h2) => h2
-                .open(address, port)
-                .await
-                .map(Box::new)
-                .map(ProxyTunnel::H2),
-            RealityCarrier::H3(h3) => h3
-                .open(address, port)
-                .await
-                .map(Box::new)
-                .map(ProxyTunnel::H3),
-            RealityCarrier::Auto(auto) => auto.open(address, port).await,
-        };
+        let result = generation.carrier.open(address, port).await;
         if let Ok(tunnel) = &result {
             generation.last_transport.store(
                 match tunnel {
@@ -378,12 +351,12 @@ impl RealityClient {
         let value = &generation.value;
         let valid = Self::now().is_ok_and(|now| value.check_time(now).is_ok());
         let policy = match &generation.carrier {
-            RealityCarrier::H2(_) => "h2",
-            RealityCarrier::H3(_) => "h3",
-            RealityCarrier::Auto(_) => "auto",
+            Carrier::H2(_) => "h2",
+            Carrier::H3(_) => "h3",
+            Carrier::Auto(_) => "auto",
         };
         let fallback = match &generation.carrier {
-            RealityCarrier::Auto(auto) => auto.negative.lock().ok().map(|cache| {
+            Carrier::Auto(auto) => auto.negative.lock().ok().map(|cache| {
                 cache.route.is_some()
                     && cache.route == crate::network_scope::observe(auto.h3.remote())
                     && cache.expires.is_some_and(|until| until > Instant::now())
@@ -423,13 +396,7 @@ impl RealityClient {
         let enrollment = crate::reality_config::pinned_client(&self.profile)
             .map_err(|_| ClientError::Configuration)?;
         let store = enrollment.store().map_err(|_| ClientError::Tls)?;
-        let signed = match &generation.carrier {
-            RealityCarrier::H2(h2) => h2.fetch_identity_descriptor().await?,
-            RealityCarrier::H3(h3) => h3.fetch_identity_descriptor().await?,
-            // Same route-generation and two-silent-attempt policy as the
-            // ordinary auto tunnel. Authentication/HTTP errors are terminal.
-            RealityCarrier::Auto(auto) => auto.fetch_identity_document(false).await?,
-        };
+        let signed = generation.carrier.fetch_identity_document(false).await?;
         store
             .update_matching(&signed, &generation.value, Self::now()?)
             .map_err(|_| ClientError::Tls)?;
@@ -438,11 +405,7 @@ impl RealityClient {
             // Read the successor only on the still-authenticated old
             // identity. Its key must match the signed announcement and
             // its operational parameters must match exactly.
-            let successor = match &generation.carrier {
-                RealityCarrier::H2(h2) => h2.fetch_identity_document(true).await?,
-                RealityCarrier::H3(h3) => h3.fetch_identity_document(true).await?,
-                RealityCarrier::Auto(auto) => auto.fetch_identity_document(true).await?,
-            };
+            let successor = generation.carrier.fetch_identity_document(true).await?;
             let now = Self::now()?;
             let preview = enrollment
                 .preview_promotion(&successor, now)
@@ -466,11 +429,7 @@ impl RealityClient {
                 candidate,
                 Some(generation.credential_digest),
             )?;
-            let seen = match &next.carrier {
-                RealityCarrier::H2(h2) => h2.fetch_identity_descriptor().await?,
-                RealityCarrier::H3(h3) => h3.fetch_identity_descriptor().await?,
-                RealityCarrier::Auto(auto) => auto.fetch_identity_document(false).await?,
-            };
+            let seen = next.carrier.fetch_identity_document(false).await?;
             if seen != successor {
                 return Err(ClientError::Tls);
             }
@@ -500,7 +459,7 @@ impl RealityClient {
             };
             let background = async {
                 match &generation.carrier {
-                    RealityCarrier::Auto(auto) => auto.maintain().await,
+                    Carrier::Auto(auto) => auto.maintain().await,
                     _ => std::future::pending::<Result<(), ClientError>>().await,
                 }
             };
@@ -757,18 +716,14 @@ impl AutoClient {
             "generation" = Value::Count(generation),
             "negative_cache_hit" = Value::Flag(cached)
         );
-        // Keep the actual initial XHTTP mode across a fresh H3-to-H2
-        // fallback. Cached H2-only requests may use their own carrier cache.
-        let preferred = if cached {
-            None
-        } else {
-            Some(self.h3.preferred_stream_up()?)
-        };
+        // XHTTP observations belong to their carrier, not to the endpoint
+        // alone. H2 fallback retains the configured mode restriction but
+        // never inherits a cached H3 stream-up preference.
         if !cached {
             for attempt in 0..AUTO_QUIC_ATTEMPTS {
                 match self
                     .h3
-                    .open_preferred(address.clone(), port, preferred)
+                    .open(address.clone(), port)
                     .await
                 {
                     Ok(tunnel) => {
@@ -835,7 +790,7 @@ impl AutoClient {
             return Err(ClientError::QuicUnreachable);
         }
         self.h2
-            .open_preferred(address, port, preferred)
+            .open(address, port)
             .await
             .map(Box::new)
             .map(ProxyTunnel::H2)
@@ -847,21 +802,54 @@ enum ProxyTunnel {
     H3(Box<H3Tunnel>),
 }
 
+impl Carrier {
+    fn from_options(h2: Option<Arc<H2Client>>, h3: Option<Arc<H3Client>>, ttl: Duration) -> Result<Self, ClientError> {
+        match (h2, h3) {
+            (Some(h2), Some(h3)) => Ok(Self::Auto(Arc::new(AutoClient {
+                h2, h3, ttl, negative: Mutex::new(NegativeCache::default()),
+                cache_changed: Notify::new(),
+            }))),
+            (Some(h2), None) => Ok(Self::H2(h2)),
+            (None, Some(h3)) => Ok(Self::H3(h3)),
+            _ => Err(ClientError::Configuration),
+        }
+    }
+
+    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+        match self {
+            Self::H2(client) => client.open(address, port).await.map(Box::new).map(ProxyTunnel::H2),
+            Self::H3(client) => client.open(address, port).await.map(Box::new).map(ProxyTunnel::H3),
+            Self::Auto(client) => client.open(address, port).await,
+        }
+    }
+
+    async fn fetch_identity_document(&self, successor: bool) -> Result<String, ClientError> {
+        match self {
+            Self::H2(client) => client.fetch_identity_document(successor).await,
+            Self::H3(client) => client.fetch_identity_document(successor).await,
+            Self::Auto(client) => client.fetch_identity_document(successor).await,
+        }
+    }
+
+    async fn maintain(&self) -> Result<(), ClientError> {
+        match self {
+            Self::Auto(client) => client.maintain().await,
+            _ => std::future::pending().await,
+        }
+    }
+}
+
 impl ProxyClient {
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
-            Self::H2(client) => client
-                .open(address, port)
-                .await
-                .map(Box::new)
-                .map(ProxyTunnel::H2),
-            Self::H3(client) => client
-                .open(address, port)
-                .await
-                .map(Box::new)
-                .map(ProxyTunnel::H3),
-            Self::Auto(client) => client.open(address, port).await,
+            Self::Direct(client) => client.open(address, port).await,
             Self::Reality(client) => client.open(address, port).await,
+        }
+    }
+    async fn maintain(&self) -> Result<(), ClientError> {
+        match self {
+            Self::Direct(client) => client.maintain().await,
+            Self::Reality(client) => client.maintain().await,
         }
     }
 }
@@ -929,7 +917,7 @@ impl ClientRuntime {
             ProxyClient::Reality(r) => {
                 let g = r.current.lock().await.clone();
                 let fallback = match &g.carrier {
-                    RealityCarrier::Auto(a) => a.negative.lock().ok().is_some_and(|c| {
+                    Carrier::Auto(a) => a.negative.lock().ok().is_some_and(|c| {
                         c.route.is_some()
                             && c.route == crate::network_scope::observe(a.h3.remote())
                             && c.expires.is_some_and(|t| t > Instant::now())
@@ -1030,7 +1018,7 @@ impl ClientRuntime {
             let view = changes.borrow_and_update().clone();
             let maintenance = async {
                 match &view.client {
-                    ProxyClient::Auto(a) => a.maintain().await,
+                    ProxyClient::Direct(a) => a.maintain().await,
                     ProxyClient::Reality(r) => r.maintain().await,
                     _ => std::future::pending::<Result<(), ClientError>>().await,
                 }
@@ -1284,7 +1272,7 @@ pub async fn serve(
     socks: TcpListener,
     client: Arc<H2Client>,
 ) -> Result<(), ClientError> {
-    serve_proxy(http, socks, ProxyClient::H2(client)).await
+    serve_proxy(http, socks, ProxyClient::Direct(Carrier::H2(client))).await
 }
 
 async fn serve_proxy(
@@ -1294,7 +1282,7 @@ async fn serve_proxy(
 ) -> Result<(), ClientError> {
     let maintenance = async {
         match &client {
-            ProxyClient::Auto(a) => a.maintain().await,
+            ProxyClient::Direct(a) => a.maintain().await,
             ProxyClient::Reality(r) => r.maintain().await,
             _ => std::future::pending::<Result<(), ClientError>>().await,
         }
@@ -1864,7 +1852,7 @@ mod selector_tests {
                 assert!(report.contains("last_open=ещё нет подтверждённого OPEN"));
                 assert!(report.contains(if socks_mode { "policy=h3" } else { "policy=h2" }));
                 managed_clients.push(managed.clone());
-                if let RealityCarrier::H3(h3) = &current.carrier {
+                if let Carrier::H3(h3) = &current.carrier {
                     // Use the production dispatcher and a real OPEN_OK
                     // tunnel. Rebind the same Quinn endpoint, not a new
                     // connection or a new admission handshake.
@@ -1896,7 +1884,7 @@ mod selector_tests {
                 }
                 assert!(matches!(
                     (&current.carrier, socks_mode),
-                    (RealityCarrier::H2(_), false) | (RealityCarrier::H3(_), true)
+                    (Carrier::H2(_), false) | (Carrier::H3(_), true)
                 ));
                 let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2475,24 +2463,24 @@ mod selector_tests {
             invalid.transport = Transport::H2;
             assert!(matches!(
                 load_client(&invalid).await,
-                Ok(ProxyClient::H2(_))
+                Ok(ProxyClient::Direct(Carrier::H2(_)))
             ));
         }
         let mut pinned = profile.clone();
         pinned.xhttp_mode = None;
         pinned.tls_profile =
             crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
-        assert!(matches!(load_client(&pinned).await, Ok(ProxyClient::H2(_))));
+        assert!(matches!(load_client(&pinned).await, Ok(ProxyClient::Direct(Carrier::H2(_)))));
         let mut automatic_mode = profile.clone();
         automatic_mode.xhttp_mode = Some(XhttpMode::Auto);
         assert!(matches!(
             load_client(&automatic_mode).await,
-            Ok(ProxyClient::H2(_))
+            Ok(ProxyClient::Direct(Carrier::H2(_)))
         ));
         automatic_mode.transport = Transport::Auto;
         assert!(matches!(
             load_client(&automatic_mode).await,
-            Ok(ProxyClient::Auto(_))
+            Ok(ProxyClient::Direct(Carrier::Auto(_)))
         ));
 
         let inbound = Inbound {
