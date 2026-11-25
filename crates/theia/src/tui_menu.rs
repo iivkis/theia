@@ -444,6 +444,7 @@ impl Menu {
 pub(crate) struct ConfigDialog {
     pub(crate) role: Role,
     input: String,
+    choice: usize,
     error: Option<&'static str>,
     loading: Option<std::sync::mpsc::Receiver<Result<crate::tui_editor::Editor, &'static str>>>,
     setup: Option<FirstSetup>,
@@ -468,6 +469,7 @@ impl ConfigDialog {
         Self {
             role,
             input,
+            choice: 0,
             error: None,
             loading: None,
             setup: None,
@@ -541,7 +543,20 @@ impl ConfigDialog {
                 }
             }
         }
-        match key.code {
+        let code = match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                self.choice = (self.choice + 2) % 3;
+                return false;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.choice = (self.choice + 1) % 3;
+                return false;
+            }
+            KeyCode::Enter if self.choice == 1 => KeyCode::F(4),
+            KeyCode::Enter if self.choice == 2 => KeyCode::F(2),
+            code => code,
+        };
+        match code {
             KeyCode::Esc => return true,
             KeyCode::F(2) => {
                 if self.input.is_empty() {
@@ -684,11 +699,24 @@ impl ConfigDialog {
             "Клиент"
         };
         let reality = if self.role == Role::Server {
-            "\n  F4    SmartTheia REALITY  ·  мастер подбора, без своего сертификата"
+            "SmartTheia REALITY  ·  мастер подбора, без своего сертификата"
         } else {
-            "\n  F4    Импорт REALITY  ·  создать TOML из приглашения"
+            "Импорт REALITY  ·  создать TOML из приглашения"
         };
-        format!("{role} • открытие или создание конфигурации\n\nПуть к TOML\n> {}\n\nВЫБЕРИТЕ ДЕЙСТВИЕ\n  Enter Открыть существующий TOML\n  F2    Own-TLS  ·  собственный сертификат{reality}\n\n{}\nCtrl+U очистить путь · Esc назад", self.input, self.error.unwrap_or(""))
+        let choices = [
+            ("Enter", "Открыть существующий TOML"),
+            ("F4", reality),
+            ("F2", "Own-TLS  ·  собственный сертификат / ручная настройка"),
+        ];
+        let mut body = format!("{role} • открытие или создание конфигурации\n\nПУТЬ К TOML\n  {}\n\nВЫБЕРИТЕ ДЕЙСТВИЕ\n", self.input);
+        for (i, (shortcut, label)) in choices.iter().enumerate() {
+            body.push_str(&format!("{} {shortcut:5} {label}\n", if i == self.choice { ">" } else { " " }));
+        }
+        body.push_str("\n↑↓ / Tab выбрать · Enter продолжить\nПуть можно вводить сразу. Ctrl+U очистить · Esc назад");
+        if let Some(error) = self.error {
+            body.push_str(&format!("\nОшибка: {error}"));
+        }
+        body
 
     }
 }
@@ -926,7 +954,8 @@ impl FirstSetup {
 fn default_config(filename: &str) -> std::path::PathBuf {
     #[cfg(target_os = "linux")]
     if filename == "server.toml" {
-        return std::path::PathBuf::from("/etc/theia/server.toml");
+        let system = std::path::Path::new("/etc/theia");
+        return if system.is_dir() { system.join(filename) } else { std::path::PathBuf::from(filename) };
     }
     #[cfg(windows)]
     let root = std::env::var_os("APPDATA").map(|p| std::path::PathBuf::from(p).join("Theia"));
@@ -936,7 +965,7 @@ fn default_config(filename: &str) -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
         .map(|p| p.join("theia"));
-    root.map(|p| p.join(filename))
+    root.filter(|p| p.is_dir()).map(|p| p.join(filename))
         .unwrap_or_else(|| std::path::PathBuf::from(filename))
 }
 
