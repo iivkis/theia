@@ -100,8 +100,9 @@ impl Lease {
         let active = publication.active().verified();
         let active_usable = active.check_time(self.1).is_ok();
         let successor_usable = publication.next().is_some_and(|entry| entry.verified().check_time(self.1).is_ok());
-        Status { generation: publication.generation(), revision: active.descriptor().revision,
-            health_revision: generation.health_revision, active_reference: active.descriptor().active_reference,
+        let effective=if !active_usable{publication.next().map(|v|v.verified()).unwrap_or(active)}else{active};
+        Status { generation: publication.generation(), revision: effective.descriptor().revision,
+            health_revision: generation.health_revision, active_reference: effective.descriptor().active_reference,
             overlap: active_usable && successor_usable, active_usable, successor_usable }
     }
 }
@@ -250,7 +251,7 @@ impl Manager {
         let due=health.next_active_check_at(value.descriptor(),now).map_err(|_|Error::Health)?;
         let status=publication.inspect(now)?;
         if status.snapshot_sha256!=stamp.publication || status.plan_sha256!=approved{return Err(Error::Approval);}
-        let expiry_due=status.valid_now && status.next_fingerprint.is_none()
+        let expiry_due=status.valid_now && (status.next_fingerprint.is_none() || status.overlap_ends_at.is_some_and(|end|now>=end))
             && status.not_after.saturating_sub(now)<=24*60*60;
         let (active,_)=health.active_status(value.descriptor(),now).map_err(|_|Error::Health)?;
         // A suspect/unavailable reference stops new admissions; previously
@@ -283,7 +284,7 @@ impl Manager {
                 crate::diag!(Info,"server.reality","approved_reference_switched");
             }
         }else if active==PrimaryStatus::Healthy && fresh && status.valid_now
-            && status.next_fingerprint.is_none() && status.not_after.saturating_sub(now)<=24*60*60 {
+            && (status.next_fingerprint.is_none() || status.overlap_ends_at.is_some_and(|end|now>=end)) && status.not_after.saturating_sub(now)<=24*60*60 {
             let (_,_,exact)=self.maintenance_snapshot(now)?;
             if exact!=stamp{return Err(Error::Approval);}
             publication.refresh(&health,stamp.publication,now)?;

@@ -32,6 +32,8 @@ struct Pending {
     ends_at: u64,
     announcement: String,
     successor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor_live: Option<String>,
 }
 
 /// Retain both signed documents after old key retirement. A list of old
@@ -44,6 +46,8 @@ struct CompletedRotation {
     retired_at: u64,
     announcement: String,
     successor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor_live: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -131,6 +135,30 @@ fn check_rotation_pair(announcement: &Verified, successor: &Verified, started: u
     Ok(())
 }
 
+// Only operational reference/validity/revision changes are permitted after
+// overlap. The old signed transition is frozen, not re-signed.
+fn successor_live(pair:&Verified, raw:&str, ends:u64)->Result<Verified,Error>{
+    let next=verify_public(&pair.descriptor().scope,pair.signer(),raw,
+        pair.descriptor().revision.checked_add(1).ok_or(Error::Descriptor)?)?;
+    let mut normalized=next.descriptor().clone();
+    if normalized.not_before<ends{return Err(Error::Descriptor);}
+    normalized.revision=pair.descriptor().revision;
+    normalized.not_before=pair.descriptor().not_before;
+    normalized.not_after=pair.descriptor().not_after;
+    normalized.active_reference=pair.descriptor().active_reference;
+    if &normalized!=pair.descriptor(){return Err(Error::Descriptor);}
+    Ok(next)
+}
+
+impl Checked {
+    fn effective(&self,now:u64)->&Verified{
+        if self.current.check_time(now).is_err(){
+            if let Some((_,next))=&self.next{return next;}
+        }
+        &self.current
+    }
+}
+
 impl Record {
     /// Verify the whole completed server rotation lineage without reading
     /// retired private keys. Retirement occurs after overlap; verify the
@@ -162,13 +190,17 @@ impl Record {
             let minimum = announcement.descriptor().revision.checked_add(1).ok_or(Error::Descriptor)?;
             let successor = verify_public(&self.scope, next_key, &transition.successor, minimum)?;
             check_rotation_pair(&announcement, &successor, transition.started_at, transition.ends_at)?;
+            let successor=match &transition.successor_live{
+                Some(raw)=>successor_live(&successor,raw,transition.ends_at)?,
+                None=>successor,
+            };
             successor.check_time(transition.retired_at).map_err(|_| Error::Descriptor)?;
             floor = successor;
             clock = transition.retired_at;
         }
         let current = verify_public(&self.scope, floor.signer(), &self.active_document, floor.descriptor().revision)?;
         floor.compare(&current).map_err(|_| Error::Descriptor)?;
-        if self.clock_floor < clock || self.generation != current.descriptor().revision {
+        if self.clock_floor < clock {
             return Err(Error::Descriptor);
         }
         Ok((root, initial, current))
@@ -200,9 +232,11 @@ impl Record {
         }
         let (_, _, current) = self.lineage()?;
         if current.signer() != active.public_key() { return Err(Error::Identity); }
-        current
-            .check_time(self.clock_floor)
-            .map_err(|_| Error::Descriptor)?;
+        // A pending historical announcement may be expired, but may never
+        // be used as the active signer outside its original interval.
+        if self.pending.is_none(){
+            current.check_time(self.clock_floor).map_err(|_|Error::Descriptor)?;
+        }
         let next = if let Some(pending) = &self.pending {
             if pending.key_file == self.active_key
                 || pending.started_at > self.clock_floor
@@ -230,9 +264,20 @@ impl Record {
                 .ok_or(Error::Descriptor)?;
             let successor = verified(&successor_key, &pending.successor, minimum)?;
             check_rotation_pair(&current, &successor, pending.started_at, pending.ends_at)?;
+            let successor=if let Some(raw)=&pending.successor_live{
+                if self.clock_floor<pending.ends_at{return Err(Error::Clock);}
+                let latest=successor_live(&successor,raw,pending.ends_at)?;
+                latest.check_time(self.clock_floor).map_err(|_|Error::Descriptor)?;
+                if self.generation!=latest.descriptor().revision{return Err(Error::Descriptor);}
+                latest
+            }else{
+                current.check_time(self.clock_floor).map_err(|_|Error::Descriptor)?;
+                if self.generation!=current.descriptor().revision{return Err(Error::Descriptor);}
+                successor
+            };
             Some((successor_key, successor))
         } else {
-            if current.descriptor().next_identity.is_some() {
+            if current.descriptor().next_identity.is_some() || self.generation!=current.descriptor().revision {
                 return Err(Error::Descriptor);
             }
             None
@@ -384,15 +429,16 @@ impl Publication {
     pub fn inspect(&self, now: u64) -> Result<Status, Error> {
         let (raw, record, checked) = self.snapshot()?;
         record.check_clock(now)?;
+        let effective=checked.effective(now);
         Ok(Status {
             generation: record.generation,
             plan_sha256: record.plan_sha256,
             snapshot_sha256: bootstrap::digest(&raw),
-            revision: checked.current.descriptor().revision,
-            active_reference: checked.current.descriptor().active_reference,
+            revision: effective.descriptor().revision,
+            active_reference: effective.descriptor().active_reference,
             active_fingerprint: bootstrap::fingerprint(checked.active.public_key()),
-            valid_now: checked.current.check_time(now).is_ok(),
-            not_after: checked.current.descriptor().not_after,
+            valid_now: effective.check_time(now).is_ok(),
+            not_after: effective.descriptor().not_after,
             next_fingerprint: checked
                 .next
                 .as_ref()
@@ -438,7 +484,8 @@ impl Publication {
         let (raw, record, checked) = self.snapshot()?;
         record.check_clock(now)?;
         Self::check_root(&record, scope, expected_root, expected_initial, expected_plan)?;
-        Ok((checked.current, record.generation, bootstrap::digest(&raw)))
+        let value=if checked.current.check_time(now).is_err(){checked.next.map(|(_,v)|v).unwrap_or(checked.current)}else{checked.current};
+        Ok((value, record.generation, bootstrap::digest(&raw)))
     }
 
     /// Capture both signing generations from the same verified file
@@ -487,12 +534,12 @@ impl Publication {
             now >= pending.ends_at && now >= checked.current.descriptor().not_before) {
             return Err(Error::Descriptor);
         }
-        state.validate_active(checked.current.descriptor(), now).map_err(|_| Error::Health)?;
+        if old_valid{state.validate_active(checked.current.descriptor(), now).map_err(|_| Error::Health)?;}
         let next = match (checked.next, record.pending) {
             (Some((identity, verified)), Some(pending)) => {
                 verified.check_time(now).map_err(|_| Error::Descriptor)?;
                 state.validate_active(verified.descriptor(), now).map_err(|_| Error::Health)?;
-                Some(PublishedIdentity { identity, verified, signed: pending.successor })
+                Some(PublishedIdentity { identity, verified, signed: pending.successor_live.unwrap_or(pending.successor) })
             }
             (None, None) => None,
             _ => return Err(Error::Descriptor),
@@ -532,16 +579,25 @@ impl Publication {
         now: u64,
     ) -> Result<(), Error> {
         let (old, mut record, checked) = self.snapshot()?;
-        if bootstrap::digest(&old) != expected || record.pending.is_some() {
+        if bootstrap::digest(&old) != expected {
             return Err(Error::Approval);
         }
         record.check_clock(now)?;
         if state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256 {
             return Err(Error::Approval);
         }
-        record.active_document =
-            bootstrap::refresh_descriptor(state, &checked.active, &record.active_document, now)?;
-        record.advance(now)?;
+        if let Some(pending)=record.pending.as_mut(){
+            if now<pending.ends_at{return Err(Error::Approval);}
+            let (key,value)=checked.next.ok_or(Error::Identity)?;
+            value.check_time(now).map_err(|_|Error::Descriptor)?;
+            let raw=bootstrap::refresh_descriptor(state,&key,pending.successor_live.as_deref().unwrap_or(&pending.successor),now)?;
+            pending.successor_live=Some(raw);
+            record.generation=value.descriptor().revision.checked_add(1).ok_or(Error::Descriptor)?;
+            record.clock_floor=now;
+        }else{
+            record.active_document=bootstrap::refresh_descriptor(state,&checked.active,&record.active_document,now)?;
+            record.advance(now)?;
+        }
         self.write(&record, Some(&old))
     }
 
@@ -552,7 +608,7 @@ impl Publication {
         now: u64,
     ) -> Result<u8, Error> {
         record.check_clock(now)?;
-        if checked.current.check_time(now).is_err()
+        if checked.effective(now).check_time(now).is_err()
             || state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256
         {
             return Err(Error::Approval);
@@ -561,7 +617,7 @@ impl Publication {
             return Err(Error::Health);
         }
         let index = state
-            .failover_candidate(checked.current.descriptor(), now)
+            .failover_candidate(checked.effective(now).descriptor(), now)
             .map_err(|_| Error::Health)?;
         u8::try_from(index).map_err(|_| Error::Health)
     }
@@ -577,13 +633,10 @@ impl Publication {
         Ok(FailoverPreview {
             publication_sha256: bootstrap::digest(&old),
             health_sha256: state.snapshot_sha256().map_err(|_| Error::Health)?,
-            current_reference: checked.current.descriptor().active_reference,
+            current_reference: checked.effective(now).descriptor().active_reference,
             selected_reference: selected,
-            next_revision: checked
-                .current
-                .descriptor()
-                .revision
-                .checked_add(if record.pending.is_some(){2}else{1})
+            next_revision: checked.effective(now).descriptor().revision
+                .checked_add(if record.pending.as_ref().is_some_and(|p|now<p.ends_at){2}else{1})
                 .ok_or(Error::Descriptor)?,
         })
     }
@@ -611,6 +664,20 @@ impl Publication {
         let mut next = checked.current.descriptor().clone();
         next.active_reference = selected;
         if let Some(pending)=record.pending.as_mut(){
+            if now>=pending.ends_at{
+                let (key,previous)=checked.next.ok_or(Error::Identity)?;
+                previous.check_time(now).map_err(|_|Error::Descriptor)?;
+                let mut successor=previous.descriptor().clone();
+                successor.active_reference=selected;
+                successor.revision=successor.revision.checked_add(1).ok_or(Error::Descriptor)?;
+                successor.not_before=now;
+                successor.not_after=now.checked_add(VALIDITY).ok_or(Error::Clock)?;
+                state.validate_active(&successor,now).map_err(|_|Error::Health)?;
+                pending.successor_live=Some(key.sign_descriptor(&successor).map_err(|_|Error::Descriptor)?);
+                record.generation=successor.revision;
+                record.clock_floor=now;
+                return self.write(&record,Some(&old));
+            }
             // Preserve the original overlap and both validity intervals.
             // Skip the already issued successor revision; neither signer
             // may ever publish different content at an existing revision.
@@ -698,6 +765,7 @@ impl Publication {
             ends_at,
             announcement: signed_announcement,
             successor: signed_successor,
+            successor_live:None,
         });
         record.advance(now)?;
         self.write(&record, Some(&old))
@@ -727,9 +795,18 @@ impl Publication {
         record.transitions.push(CompletedRotation {
             started_at: pending.started_at, ends_at: pending.ends_at, retired_at: now,
             announcement: pending.announcement, successor: pending.successor.clone(),
+            successor_live:pending.successor_live.clone(),
         });
         record.active_key = pending.key_file;
-        record.active_document = pending.successor;
+        if pending.successor_live.is_some(){
+            // Retirement is a distinct durable mutation, even if the
+            // successor was already serving alone.
+            let mut value=next.descriptor().clone();
+            value.revision=value.revision.checked_add(1).ok_or(Error::Descriptor)?;
+            record.active_document=next_key.sign_descriptor(&value).map_err(|_|Error::Descriptor)?;
+        }else{
+            record.active_document=pending.successor;
+        }
         record.advance(now)?;
         self.write(&record, Some(&old))
     }
@@ -844,8 +921,21 @@ mod tests {
             assert_eq!(value.descriptor().active_reference,1);
         }
         let ends=status.overlap_ends_at.unwrap();
+        let healthy=vec![good,reference_health::Evidence::default()];
+        let state=state.record(healthy.clone(),ends-10).unwrap().record(healthy,ends).unwrap();
+        let preview=publication.preview_failover(&state,ends).unwrap();
+        assert_eq!(preview.next_revision,6);
+        publication.apply_failover(&state,FailoverApproval{publication_sha256:preview.publication_sha256,
+            health_sha256:preview.health_sha256,selected_reference:0},ends).unwrap();
+        let status=publication.inspect(ends).unwrap();
+        assert_eq!(status.revision,6);
+        let captured=publication.capture(&state,status.snapshot_sha256,ends).unwrap();
+        assert!(captured.select(old.public_key(),ends).is_err());
+        let value=captured.select(next.public_key(),ends).unwrap();
+        assert_eq!(value.verified().descriptor().active_reference,0);
+        b.update_at(value.signed(),5,ends).unwrap();
         publication.promote(status.snapshot_sha256,bootstrap::fingerprint(next.public_key()),ends).unwrap();
-        assert_eq!(publication.inspect(ends).unwrap().revision,5);
+        assert_eq!(publication.inspect(ends).unwrap().revision,7);
     }
 
     #[test]

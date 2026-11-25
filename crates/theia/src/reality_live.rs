@@ -146,7 +146,9 @@ impl Live {
         status.successor_usable=p.next().is_some_and(|m|m.verified().check_time(now).is_ok());
         status.overlap=status.active_usable&&status.successor_usable;
         if !status.active_usable{
-            status.revision=p.next()?.verified().descriptor().revision;
+            let next=p.next()?.verified().descriptor();
+            status.revision=next.revision;
+            status.active_reference=next.active_reference;
         }
         Some(status)
     }
