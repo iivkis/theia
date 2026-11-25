@@ -83,6 +83,7 @@ mod tui_reality_review;
 mod tui_reality_status;
 pub(crate) mod tui_runtime;
 mod tui_share;
+mod qr_import;
 mod tui_staged_material;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;

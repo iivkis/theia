@@ -323,6 +323,7 @@ struct Interaction {
     issue_kind: IssueKind,
     revocation: Option<DisableFlow>,
     importing: Option<ImportFlow>,
+    qr_scan: Option<(Zeroizing<String>, mpsc::Receiver<Result<Zeroizing<String>, &'static str>>)>,
     records: Option<RecordFlow>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
@@ -357,6 +358,7 @@ impl Interaction {
             issue_kind: IssueKind::NewUser,
             revocation: None,
             importing: None,
+            qr_scan: None,
             records: None,
             discovery: None,
             candidates: None,
@@ -586,7 +588,28 @@ impl Interaction {
         self.config_dialog = Some(ConfigDialog::new(role, self.editor_for(role).map(Editor::saved_path)));
     }
 
-    fn poll_navigation(&mut self) {
+    fn poll_navigation(&mut self, model: &mut Model) {
+        if let Some((_, rx)) = self.qr_scan.as_ref() {
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("Чтение QR не подтверждено.")),
+            };
+            if let Some(result) = result {
+                if let Some((source, _)) = self.qr_scan.take() {
+                    match result {
+                        Ok(uri) => {
+                            self.importing = Some(ImportFlow::Input(uri));
+                            self.update(model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                        }
+                        Err(message) => {
+                            if let Some(editor) = self.editor.as_mut() { editor.error = Some(message.into()); }
+                            self.importing = Some(ImportFlow::Input(source));
+                        }
+                    }
+                }
+            }
+        }
         self.server_process.poll();
         if let Some(monitor) = self.traffic_monitor.as_mut() { monitor.poll(); }
         if let Some(background) = self.client_background.as_mut() { background.poll(); }
@@ -607,6 +630,10 @@ impl Interaction {
             || self.sharing.is_some()
             || self.clipboard.is_some()
         {
+            return false;
+        }
+        if self.qr_scan.is_some() {
+            if key.code == KeyCode::Esc { self.qr_scan = None; }
             return false;
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
@@ -1205,6 +1232,20 @@ impl Interaction {
                 ImportFlow::Input(mut source) => match key.code {
                     KeyCode::Esc => {}
                     KeyCode::Enter if !source.is_empty() => {
+                        if crate::qr_import::image_path(source.trim()) {
+                            let path = Zeroizing::new(source.trim().to_owned());
+                            let (tx, rx) = mpsc::channel();
+                            match std::thread::Builder::new().name("theia-qr-import".into()).spawn(move || {
+                                let _ = tx.send(crate::qr_import::scan_file(&path));
+                            }) {
+                                Ok(_) => self.qr_scan = Some((source, rx)),
+                                Err(_) => {
+                                    editor.error = Some("Не удалось запустить сканирование QR.".into());
+                                    self.importing = Some(ImportFlow::Input(source));
+                                }
+                            }
+                            return false;
+                        }
                         match client_import::read_product_source(source.trim()) {
                             Ok(client_import::ProductSource::Reality) => {
                                 let value = Zeroizing::new(source.trim().to_owned());
@@ -1873,7 +1914,10 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         ),
     }
-    if let Some(dialog) = interaction.and_then(|ui| ui.config_dialog.as_ref()) {
+    if interaction.is_some_and(|ui| ui.qr_scan.is_some()) {
+        frame.render_widget(Clear, parts[1]);
+        panel(frame, parts[1], "Чтение QR", "Локальное декодирование изображения. Никакой сети или записи. Esc: отменить.", true);
+    } else if let Some(dialog) = interaction.and_then(|ui| ui.config_dialog.as_ref()) {
         frame.render_widget(Clear, parts[1]);
         panel(frame, parts[1], "Открыть конфигурацию", &dialog.body(), true);
     } else if let Some(menu) = interaction.and_then(|ui| ui.menu.as_ref()) {
@@ -2217,7 +2261,7 @@ fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Opt
         ImportFlow::Input(source) => (
             "F-14: импорт подключения",
             format!(
-                "Введите или вставьте theia://v1/... (новый SmartTheia XHTTP) либо абсолютный путь локального файла.\nИсточник и bearer НИКОГДА не показываются в TUI.\nВведено {} байт (скрыто).\n\nEnter: проверить  Esc: отменить\n\n{}",
+                "Введите или вставьте theia://v1/... (новый SmartTheia XHTTP) либо абсолютный путь локального URI-файла / защищённого PNG или SVG QR.\nИсточник и bearer НИКОГДА не показываются в TUI.\nВведено {} байт (скрыто).\n\nEnter: проверить  Esc: отменить\n\n{}",
                 source.len(),
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
@@ -2334,7 +2378,7 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
     let mut model = Model::new(role);
     let mut interaction = Interaction::new(editor);
     loop {
-        interaction.poll_navigation();
+        interaction.poll_navigation(&mut model);
         if interaction.poll_save(&mut model)? {
             crate::diag!(Info, "tui", "saved_and_closed");
             return Ok(());

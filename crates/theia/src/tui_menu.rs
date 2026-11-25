@@ -77,7 +77,7 @@ const CLIENT: &[Group] = &[
         entry("Системный прокси Windows", key('p')),
     ]},
     Group { title: "Профили и приглашения", entries: &[
-        entry("Импорт приглашения или файла", key('i')),
+        entry("Импорт ссылки, URI-файла или изображения QR", key('i')),
         entry("Создать профиль", key('N')),
         entry("Выбрать активный профиль", key('A')),
         entry("Изменить выбранное поле профиля", Action::Shortcut(KeyCode::Enter, KeyModifiers::NONE)),
