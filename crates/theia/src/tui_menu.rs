@@ -667,6 +667,8 @@ impl FileBrowser {
 
 // First-run input is independent of the security mode and contains no
 // editable protocol parameters. Only the existing validated backends save.
+type FirstInviteRead = Result<(Zeroizing<String>, crate::client_import::ProductSource), &'static str>;
+
 struct FirstInvite {
     source: Zeroizing<String>,
     own: Option<crate::invite::Invitation>,
@@ -676,11 +678,7 @@ struct FirstInvite {
     review: bool,
     error: Option<&'static str>,
     browser: Option<FileBrowser>,
-    reading: Option<
-        std::sync::mpsc::Receiver<
-            Result<(Zeroizing<String>, crate::client_import::ProductSource), &'static str>,
-        >,
-    >,
+    reading: Option<std::sync::mpsc::Receiver<FirstInviteRead>>,
 }
 
 enum FirstInviteAction {
@@ -2062,7 +2060,7 @@ mod tests {
         m.key(KeyCode::End);
         assert_eq!(m.key(KeyCode::Enter), None);
         assert!(m.body(10).contains("Сначала откройте"));
-        assert!(m.body(6).contains("Системный прокси"));
+        assert!(m.body(6).contains("Режим подключения (прокси / TUN)"));
         m.key(KeyCode::Esc);
         m.key(KeyCode::End);
         m.key(KeyCode::Enter);

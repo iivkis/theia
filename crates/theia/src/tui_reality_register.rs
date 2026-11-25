@@ -522,7 +522,7 @@ impl RegistrationPanel {
                     || (self.role == Role::Client && id == 2);
                 Field {
                     id,
-                    label: *label,
+                    label,
                     value: if public {
                         value.clone()
                     } else if value.is_empty() {

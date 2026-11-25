@@ -311,7 +311,7 @@ impl ProcessPanel {
         }
         let report = match &self.worker {
             Some(w) if w.stop.is_none() => {
-                "Остановка: admission закрывается, ожидается завершение задач.".into()
+                "Остановка: новые подключения не принимаются, ожидается завершение задач.".into()
             }
             Some(w) if w.inbounds.is_some() => format!(
                 "Сервер запущен. Inbound: {}.\nСостояние относится только к этому экземпляру.",
