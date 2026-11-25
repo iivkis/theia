@@ -72,10 +72,7 @@ pub(crate) fn probe(
     Config::Server(candidate.clone())
         .validate()
         .map_err(|_| RestartError::InvalidConfig)?;
-    if !candidate.server.enabled || candidate.server.inbounds.iter().any(|i|
-        i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
-        return Err(RestartError::InvalidConfig);
-    }
+    if !candidate.server.enabled {return Err(RestartError::InvalidConfig);}
     // Advisory readiness is NOT a reservation, pin, or Apply. However it
     // uses the same bounded validated PEM capture as the Apply path.
     let captured =
@@ -95,10 +92,7 @@ pub(crate) fn probe_captured(
     Config::Server(candidate.clone())
         .validate()
         .map_err(|_| RestartError::InvalidConfig)?;
-    if !candidate.server.enabled || candidate.server.inbounds.iter().any(|i|
-        i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
-        return Err(RestartError::InvalidConfig);
-    }
+    if !candidate.server.enabled {return Err(RestartError::InvalidConfig);}
     let candidate_identities = captured.identities();
     let identities_unchanged = loaded_identities.len() == candidate_identities.len()
         && active.server.inbounds.len() == candidate.server.inbounds.len()
@@ -187,7 +181,8 @@ pub(crate) fn probe_captured(
 /// Compare *every* typed field and blank only the two PEM references.
 /// A PEM file changed in place also qualifies when identity digests drift.
 pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocument) -> bool {
-    if active.server.inbounds.len() != candidate.server.inbounds.len() {
+    if active.server.inbounds.len()!=candidate.server.inbounds.len()
+        || active.server.inbounds.iter().chain(&candidate.server.inbounds).any(|i|i.reality.is_some()){
         return false;
     }
     let mut normalized = candidate.clone();

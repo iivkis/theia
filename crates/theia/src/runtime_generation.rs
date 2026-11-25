@@ -22,13 +22,15 @@ pub(crate) struct View {
     pub(crate) live: Arc<LiveAuthorization>,
 }
 
+pub(crate) type RealityMap=std::collections::HashMap<String,([u8;32],Arc<crate::reality_live::Live>)>;
+
 pub(crate) struct State {
     current: RwLock<Arc<View>>,
     // Only advisory metadata crosses IPC; the actual previous TLS private
     // configs live exclusively in the single supervisor, never in replies.
     rollback_until: RwLock<Option<Instant>>,
     auth_rollback: RwLock<Option<AuthRollback>>,
-    reality: std::collections::HashMap<String,([u8;32],Arc<crate::reality_live::Live>)>,
+    reality:RwLock<RealityMap>,
     reality_ledger:Option<Arc<crate::quota::Ledger>>,
 }
 
@@ -44,13 +46,13 @@ impl State {
             current: RwLock::new(Arc::new(initial)),
             rollback_until: RwLock::new(None),
             auth_rollback: RwLock::new(None),
-            reality:std::collections::HashMap::new(),
+            reality:RwLock::new(RealityMap::new()),
             reality_ledger:None,
         }
     }
 
-    pub(crate) fn with_reality(mut self,entries:std::collections::HashMap<String,([u8;32],Arc<crate::reality_live::Live>)>)->Self{
-        self.reality=entries;
+    pub(crate) fn with_reality(mut self,entries:RealityMap)->Self{
+        self.reality=RwLock::new(entries);
         self
     }
     pub(crate) fn with_reality_ledger(mut self,ledger:Arc<crate::quota::Ledger>)->Self{
@@ -69,7 +71,9 @@ impl State {
         self.commit_quota(previous,expected,next,stage,ledger)
     }
     pub(crate) fn reality_status(&self,id:&str,manifest:[u8;32])->Option<Option<crate::reality_generation::Status>>{
-        let (expected,live)=self.reality.get(id)?;
+        let _current=self.current.read().ok()?;
+        let reality=self.reality.read().ok()?;
+        let (expected,live)=reality.get(id)?;
         if *expected!=manifest{return None;}
         Some(live.status())
     }
@@ -258,8 +262,13 @@ impl State {
         &self,
         previous: &Arc<View>,
         expected: u64,
-        next: View,
-    ) -> Result<(), LiveAuthError> {
+        next:View,
+    )->Result<(),LiveAuthError>{
+        self.commit_restart_with_reality(previous,expected,next,RealityMap::new())
+    }
+
+    pub(crate) fn commit_restart_with_reality(&self,previous:&Arc<View>,expected:u64,
+        next:View,reality:RealityMap)->Result<(),LiveAuthError>{
         let mut guard = self
             .current
             .write()
@@ -274,7 +283,12 @@ impl State {
         {
             return Err(LiveAuthError::StaleRevision);
         }
+        let mut old_reality=self.reality.write().map_err(|_|LiveAuthError::Unavailable)?;
+        let mut rollback=self.auth_rollback.write().map_err(|_|LiveAuthError::Unavailable)?;
         previous.live.close_new_admission()?;
+        for (_,carrier) in old_reality.values(){carrier.retire();}
+        *old_reality=reality;
+        *rollback=None;
         *guard = Arc::new(next);
         Ok(())
     }

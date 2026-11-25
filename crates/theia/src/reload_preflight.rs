@@ -301,16 +301,7 @@ impl ReloadPreflight {
             Ok(Config::Server(document)) => document,
             _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
         };
-        if self.active.server.inbounds.iter().any(|i|i.reality.is_some()){
-            if self.validate_candidate(candidate.clone()).is_ok(){
-                return Ok(crate::restart_guard::RestartVerdict::AuthorizationOnly);
-            }
-            // No claim of same-port PEM rotation or fresh-port staging for
-            // a structural REALITY replacement through the own-TLS path.
-            Config::Server(candidate).validate().map_err(|_|crate::restart_guard::RestartError::InvalidConfig)?;
-            return Ok(crate::restart_guard::RestartVerdict::RequiresMaintenance);
-        }
-        crate::restart_guard::probe(&self.active, &self.identities, &candidate)
+        crate::restart_guard::probe(&self.active,&self.identities,&candidate)
     }
 
     /// Still a read-only check, never an implicit Apply.

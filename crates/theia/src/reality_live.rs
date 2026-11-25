@@ -11,7 +11,7 @@ use crate::{
     reality_generation::Lease,
     server::{ServerContext, ServerError},
 };
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc,RwLock,atomic::{AtomicBool,Ordering}};
 use tokio_rustls::TlsAcceptor;
 
 pub(crate) struct Route {
@@ -119,6 +119,7 @@ pub(crate) struct Live {
     pub(crate) guard: Arc<ReplayGuard>,
     handshake: Arc<ReplayGuard>,
     h3: bool,
+    retired:AtomicBool,
 }
 impl Live {
     pub(crate) fn new(lease:Arc<Lease>,base:Arc<ServerContext>,now:u64)->Result<Arc<Self>,ServerError>{
@@ -129,9 +130,10 @@ impl Live {
         let handshake=Arc::new(ReplayGuard::new(65536,guard_start).map_err(|_|ServerError::Config)?);
         let initial=Arc::new(Generation::prepare(lease,&base,&handshake,now)?);
         let h3=initial.default_quic().is_some();
-        Ok(Arc::new(Self{base,slot:RwLock::new(Some(initial)),guard,handshake,h3}))
+        Ok(Arc::new(Self{base,slot:RwLock::new(Some(initial)),guard,handshake,h3,retired:AtomicBool::new(false)}))
     }
     pub(crate) fn current(&self)->Option<Arc<Generation>>{
+        if self.retired.load(Ordering::Acquire){return None;}
         self.slot.read().ok()?.clone()
     }
     pub(crate) fn status(&self)->Option<crate::reality_generation::Status>{
@@ -158,8 +160,14 @@ impl Live {
         // A transport policy change requires structural Apply, not an
         // implicit rebind. The publication rotation/failover contract retains modes.
         if candidate.default_quic().is_some()!=self.h3 { return Err(ServerError::Config); }
-        *self.slot.write().map_err(|_|ServerError::Config)?=Some(candidate);
+        let mut slot=self.slot.write().map_err(|_|ServerError::Config)?;
+        if self.retired.load(Ordering::Acquire){return Err(ServerError::Config);}
+        *slot=Some(candidate);
         Ok(())
+    }
+    pub(crate) fn retire(&self){
+        self.retired.store(true,Ordering::Release);
+        self.suspend();
     }
     pub(crate) fn suspend(&self){
         if let Ok(mut slot)=self.slot.write(){*slot=None;}

@@ -1583,11 +1583,17 @@ fn tls_material_from_bytes(
 /// stderr or logs; raw buffers are zeroized when the request/snapshot drops.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) struct CapturedTls {
-    pairs: Vec<CapturedPem>,
-    fingerprint: [u8; 32],
+    pairs:Vec<CapturedMaterial>,
+    fingerprint:[u8;32],
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+enum CapturedMaterial {
+    Pem(CapturedPem),
+    Reality(crate::reality_generation::Candidate,crate::reload_preflight::IdentityHash),
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 struct CapturedPem {
     cert: zeroize::Zeroizing<Vec<u8>>,
     key: zeroize::Zeroizing<Vec<u8>>,
@@ -1600,14 +1606,21 @@ impl CapturedTls {
     /// IDs in document order. This prevents a reordered pair or ambiguous
     /// PEM concatenation from sharing an operator approval fingerprint.
     pub(crate) fn capture(document: &ServerDocument) -> Result<Self, ServerError> {
-        if document.server.inbounds.iter().any(|i| i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
-            return Err(ServerError::Config);
-        }
         let mut hash = Sha256::new();
         hash.update(b"theia-tls-pem-snapshot-v1\0");
         hash.update((document.server.inbounds.len() as u64).to_be_bytes());
         let mut pairs = Vec::with_capacity(document.server.inbounds.len());
         for inbound in &document.server.inbounds {
+            if let Some(binding)=&inbound.reality{
+                let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+                let candidate=crate::reality_generation::Candidate::capture(inbound,now).map_err(|_|ServerError::Config)?;
+                let fingerprint=candidate.fingerprint();
+                for chunk in [inbound.id.as_bytes(),b"Theia/REALITY/v1".as_slice(),fingerprint.as_slice()]{
+                    hash.update((chunk.len() as u64).to_be_bytes());hash.update(chunk);
+                }
+                pairs.push(CapturedMaterial::Reality(candidate,crate::reload_preflight::IdentityHash::reality(binding)));
+                continue;
+            }
             let cert = pem_data(&inbound.tls_cert, false)?;
             let key = pem_data(&inbound.tls_key, true)?;
             // A successful fingerprint is proof of a usable TLS1.3 identity,
@@ -1622,11 +1635,7 @@ impl CapturedTls {
                 hash.update(chunk);
             }
             let identity = crate::reload_preflight::IdentityHash::from_pem(&cert, &key);
-            pairs.push(CapturedPem {
-                cert,
-                key,
-                identity,
-            });
+            pairs.push(CapturedMaterial::Pem(CapturedPem{cert,key,identity}));
         }
         Ok(Self {
             pairs,
@@ -1641,13 +1650,17 @@ impl CapturedTls {
     pub(crate) fn identities(&self) -> Vec<crate::reload_preflight::IdentityHash> {
         self.pairs
             .iter()
-            .map(|pair| pair.identity.clone())
+            .map(|pair|match pair{CapturedMaterial::Pem(p)=>p.identity.clone(),CapturedMaterial::Reality(_,id)=>id.clone()})
             .collect()
     }
 
     fn material(&self, inbound: &Inbound, index: usize) -> Result<TlsMaterial, ServerError> {
-        let pair = self.pairs.get(index).ok_or(ServerError::Config)?;
-        tls_material_from_bytes(inbound, &pair.cert, &pair.key)
+        let Some(CapturedMaterial::Pem(pair))=self.pairs.get(index) else{return Err(ServerError::Config);};
+        tls_material_from_bytes(inbound,&pair.cert,&pair.key)
+    }
+    fn reality(&self,index:usize)->Result<&crate::reality_generation::Candidate,ServerError>{
+        let Some(CapturedMaterial::Reality(candidate,_))=self.pairs.get(index)else{return Err(ServerError::Config);};
+        Ok(candidate)
     }
 }
 
@@ -1701,9 +1714,6 @@ pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
         "config_valid",
         "inbounds" = Value::Count(document.server.inbounds.len() as u64)
     );
-    if has_reality(&document) {
-        return run_reality_document_inner(document,None,Some(config_path)).await;
-    }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         run_supervised_file(document, config_path).await
@@ -1751,19 +1761,18 @@ impl GenerationLimits {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-type ReadyListener = (
-    TcpListener,
-    TlsAcceptor,
-    quinn::Endpoint,
-    Arc<ServerContext>,
-    quinn::ServerConfig,
-);
+enum ReadyListener {
+    Plain(TcpListener,TlsAcceptor,quinn::Endpoint,Arc<ServerContext>,quinn::ServerConfig),
+    Reality(crate::reality_tcp::PreparedTcp,Option<crate::reality_quic::PreparedQuic>,
+        Option<tokio::net::UdpSocket>,crate::reality_generation::Manager,Arc<crate::reality_live::Live>),
+}
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct PreparedGeneration {
     listeners: Vec<ReadyListener>,
     identities: Vec<crate::reload_preflight::IdentityHash>,
     live: Arc<LiveAuthorization>,
+    reality:crate::runtime_generation::RealityMap,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1773,21 +1782,49 @@ async fn prepare_generation(
     limits: &GenerationLimits,
     captured: Option<&CapturedTls>,
 ) -> Result<PreparedGeneration, ServerError> {
-    if document.server.inbounds.iter().any(|i| i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some()) {
-        return Err(ServerError::Config);
-    }
     let live = Arc::new(
         LiveAuthorization::new_at_revision(document.clone(), revision)
             .map_err(|_| ServerError::Config)?,
     );
     let mut listeners = Vec::with_capacity(document.server.inbounds.len());
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
+    let mut reality=HashMap::new();
+    let config=Config::Server(document.clone());
     for (index, inbound) in document.server.inbounds.iter().enumerate() {
         let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
         let udp_addr: SocketAddr = inbound
             .quic_listen
             .parse()
             .map_err(|_| ServerError::Config)?;
+        if let Some(binding)=&inbound.reality{
+            let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+            let (manager,lease)=if let Some(snapshot)=captured{
+                snapshot.reality(index)?.activate(inbound,now).map_err(|_|ServerError::Config)?
+            }else{
+                let manager=crate::reality_generation::Manager::new_live(&config,&inbound.id,now).await.map_err(|_|ServerError::Config)?;
+                let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+                let lease=manager.refresh(now).map_err(|_|ServerError::Config)?;
+                (manager,lease)
+            };
+            let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+            let h3=lease.publication().active().verified().descriptor().h3;
+            let mut context=ServerContext::with_limits(inbound,&document.server.policy,live.shared(),
+                limits.global.clone(),limits.per_user.clone(),limits.connections.clone(),limits.peer_budget.clone());
+            context.live_quota=Some(limits.ledger.clone());
+            let carrier=crate::reality_live::Live::new(Arc::new(lease),Arc::new(context),now)?;
+            let listener=crate::tcp_bbr::bind(tcp_addr).map_err(|e|match e{
+                crate::tcp_bbr::Error::Network=>ServerError::Io,
+                crate::tcp_bbr::Error::Unavailable=>ServerError::TcpControllerUnavailable,
+            })?;
+            let tcp=crate::reality_tcp::PreparedTcp::from_live(listener,carrier.clone())?;
+            let udp=tokio::net::UdpSocket::bind(udp_addr).await.map_err(|_|ServerError::Io)?;
+            let (quic,silent)=if h3{(Some(crate::reality_quic::PreparedQuic::from_live(udp,carrier.clone())?),None)}
+                else{(None,Some(udp))};
+            identities.push(crate::reload_preflight::IdentityHash::reality(binding));
+            reality.insert(inbound.id.clone(),(binding.manifest_sha256,carrier.clone()));
+            listeners.push(ReadyListener::Reality(tcp,quic,silent,manager,carrier));
+            continue;
+        }
         let material = match captured {
             Some(snapshot) => snapshot.material(inbound, index)?,
             None => tls_material(inbound)?,
@@ -1815,12 +1852,13 @@ async fn prepare_generation(
             limits.peer_budget.clone(),
         );
         context.live_quota = Some(limits.ledger.clone());
-        listeners.push((listener, acceptor, endpoint, Arc::new(context), h3_config));
+        listeners.push(ReadyListener::Plain(listener,acceptor,endpoint,Arc::new(context),h3_config));
     }
     Ok(PreparedGeneration {
         listeners,
         identities,
         live,
+        reality,
     })
 }
 
@@ -1885,6 +1923,7 @@ struct RunningGeneration {
     // Exact QUIC configs installed on the endpoints. Saved previous configs
     // support a one-shot TLS undo without reading external PEM files again.
     active_h3: Vec<quinn::ServerConfig>,
+    reality:Vec<Arc<crate::reality_live::Live>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1894,7 +1933,64 @@ impl RunningGeneration {
         let mut tasks = JoinSet::new();
         let mut identities = Vec::with_capacity(listeners.len());
         let mut active_h3 = Vec::with_capacity(listeners.len());
-        for (tcp, acceptor, udp, context, h3_config) in listeners {
+        let mut reality=Vec::new();
+        for listener in listeners {
+            let (tcp,acceptor,udp,context,h3_config)=match listener{
+                ReadyListener::Plain(tcp,acceptor,udp,context,h3_config)=>(tcp,acceptor,udp,context,h3_config),
+                ReadyListener::Reality(tcp,quic,silent,manager,carrier)=>{
+                    reality.push(carrier.clone());
+                    let mut phase=receiver.clone();
+                    tasks.spawn(async move{
+                        if !await_generation_activation(&mut phase).await{return Ok(());}
+                        tcp.serve().await
+                    });
+                    if let Some(quic)=quic{
+                        let mut phase=receiver.clone();
+                        tasks.spawn(async move{
+                            if !await_generation_activation(&mut phase).await{return Ok(());}
+                            quic.serve().await
+                        });
+                    }
+                    if let Some(socket)=silent{
+                        let mut phase=receiver.clone();
+                        tasks.spawn(async move{
+                            let _socket=socket;
+                            if !await_generation_activation(&mut phase).await{return Ok(());}
+                            while phase.changed().await.is_ok(){
+                                if *phase.borrow()==GenerationPhase::Drain{break;}
+                            }
+                            Ok(())
+                        });
+                    }
+                    let mut phase=receiver.clone();
+                    tasks.spawn(async move{
+                        if !await_generation_activation(&mut phase).await{return Ok(());}
+                        loop{
+                            tokio::select!{
+                                changed=phase.changed()=>{
+                                    if changed.is_err()||*phase.borrow()==GenerationPhase::Drain{return Ok(());}
+                                }
+                                _=tokio::time::sleep(Duration::from_secs(5))=>{
+                                    let result=tokio::select!{
+                                        result=manager.maintain(&carrier)=>result,
+                                        _=phase.changed()=>return Ok(()),
+                                    };
+                                    match result{
+                                        Ok(lease)=>{
+                                            if let Ok(now)=crate::reference_health::unix_now(){
+                                                if carrier.publish(Arc::new(lease),now).is_ok(){continue;}
+                                            }
+                                            carrier.suspend();
+                                        }
+                                        Err(_)=>carrier.suspend(),
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
+            };
             active_h3.push(h3_config);
             let h2 = Arc::new(RwLock::new(acceptor));
             identities.push(HotIdentity {
@@ -1918,6 +2014,7 @@ impl RunningGeneration {
             phase: sender,
             identities,
             active_h3,
+            reality,
         }
     }
 
@@ -1932,6 +2029,7 @@ impl RunningGeneration {
     }
 
     fn drain(&self) {
+        for carrier in &self.reality{carrier.retire();}
         self.phase.send_replace(GenerationPhase::Drain);
     }
 }
@@ -1960,6 +2058,7 @@ async fn stage_fresh_generation(
         RunningGeneration,
         crate::runtime_generation::View,
         Vec<crate::reload_preflight::IdentityHash>,
+        crate::runtime_generation::RealityMap,
         u64,
     ),
     (),
@@ -1994,7 +2093,7 @@ async fn stage_fresh_generation(
     if !running.is_healthy_before_activation() {
         return Err(());
     }
-    Ok((running, next, prepared.identities, next_revision))
+    Ok((running,next,prepared.identities,prepared.reality,next_revision))
 }
 
 /// Only identity material may change. All PEM/cert/key/QUIC/H2 builders
@@ -2219,7 +2318,7 @@ async fn run_supervised_file(
             )),
             live: initial.live,
         },
-    ));
+    ).with_reality(initial.reality));
 
     // Only the original, protected management listener survives cutover.
     // Never expose a new administrative TCP port or loosen Named Pipe DACL.
@@ -2332,7 +2431,7 @@ async fn run_supervised_file(
                     config_path,
                 )
                 .await;
-                let Ok((next_running, next_view, next_identities, revision)) = staged else {
+                let Ok((next_running,next_view,next_identities,next_reality,revision))=staged else {
                     let _ = request.complete.send(Err(()));
                     continue;
                 };
@@ -2341,10 +2440,10 @@ async fn run_supervised_file(
                 if request.complete.is_closed() {
                     continue;
                 }
-                if runtime.commit_restart(
+                if runtime.commit_restart_with_reality(
                     &request.previous,
                     request.expected_revision,
-                    next_view,
+                    next_view,next_reality,
                 ).is_err() {
                     let _ = request.complete.send(Err(()));
                     continue;

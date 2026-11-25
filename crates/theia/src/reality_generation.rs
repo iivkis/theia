@@ -106,6 +106,50 @@ impl Lease {
     }
 }
 
+/// Read-only capture for content-bound structural Apply. Its immutable
+/// generation is exactly the one later used to construct both transports.
+pub(crate) struct Candidate {
+    inbound:Inbound,
+    scope:Scope,
+    generation:Arc<Generation>,
+    stamp:Stamp,
+}
+impl Candidate {
+    pub(crate) fn capture(inbound:&Inbound,now:u64)->Result<Self,Error>{
+        let addr:SocketAddr=inbound.h2_listen.parse().map_err(|_|Error::Scope)?;
+        let scope=Scope{inbound:inbound.id.clone(),endpoint:format!("{}:{}",inbound.server_name,addr.port())};
+        let generation=Arc::new(Generation::load(inbound,&scope,now)?);
+        let stamp=generation.stamp(inbound)?;
+        let binding=inbound.reality.as_ref().ok_or(Error::Format)?;
+        reality_checkpoint::verify(Path::new(&binding.bundle),stamp,now)?;
+        Ok(Self{inbound:inbound.clone(),scope,generation,stamp})
+    }
+    pub(crate) fn fingerprint(&self)->[u8;32]{
+        use sha2::{Digest,Sha256};
+        let mut hash=Sha256::new();
+        hash.update(b"Theia/REALITY/restart-material/v1\0");
+        hash.update(self.stamp.manifest);hash.update(self.stamp.publication);hash.update(self.stamp.health);
+        hash.finalize().into()
+    }
+    pub(crate) fn activate(&self,inbound:&Inbound,now:u64)->Result<(Manager,Lease),Error>{
+        if &self.inbound!=inbound{return Err(Error::Approval);}
+        let binding=inbound.reality.as_ref().ok_or(Error::Format)?;
+        // Re-read only the verified stamp, not the accepted key objects.
+        // If maintenance changed health or publication after the preview,
+        // reject the stale candidate and require a new explicit approval.
+        let observed=Store::new(Path::new(&binding.health_store)).and_then(|s|s.inspect()).map_err(|_|Error::Health)?;
+        let (_,stamp)=crate::reality_provision::inspect_registered_snapshot(
+            Path::new(&binding.bundle),binding,&observed,&self.scope,now)?;
+        if stamp!=self.stamp{return Err(Error::Approval);}
+        let lease=Lease(self.generation.clone(),now);
+        if crate::reality_live::relay_value(&lease,now).is_none(){return Err(Error::Health);}
+        reality_checkpoint::accept(Path::new(&binding.bundle),stamp,now)?;
+        Ok((Manager{inbound:inbound.clone(),scope:self.scope.clone(),slot:Mutex::new(Slot{
+            last:self.generation.clone(),last_checked_at:now,
+        })},lease))
+    }
+}
+
 pub struct Manager {
     inbound: Inbound,
     scope: Scope,
