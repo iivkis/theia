@@ -91,6 +91,12 @@ fn visual_review_gallery() {
         review_capture(&format!("{prefix}-focus-navigation"), &model, &ui);
         ui.update(&mut model, press(KeyCode::Enter));
         assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+        // Show a different focused row than the default overview screenshot.
+        // Moving focus must not open a workflow or change saved configuration.
+        let before = std::fs::read(path).unwrap();
+        ui.update(&mut model, press(KeyCode::Down));
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+        assert_eq!(std::fs::read(path).unwrap(), before);
         review_capture(&format!("{prefix}-focus-actions"), &model, &ui);
 
         // Only passive/input paths; no live operation confirmation.
@@ -98,7 +104,7 @@ fn visual_review_gallery() {
             &[('N',"new-connection"),('G',"grant-picker"),('u',"new-user"),('b',"recover-user"),
               ('t',"rotate-token"),('x',"disable-user"),('D',"delete-connection"),('U',"delete-user"),
               ('Q',"limits"),('E',"certificate"),('W',"reality-wizard"),('s',"server-process"),
-              ('v',"runtime-status"),('p',"network-diagnostics"),('V',"reality-status")]
+              ('v',"runtime-status"),('p',"network-diagnostics"),('V',"reality-status-unavailable")]
         } else {
             &[('N',"new-profile"),('i',"invitation-import"),('I',"reality-import"),('E',"trust-material"),
               ('A',"active-profile"),('D',"delete-profile"),('V',"connection-status")]
