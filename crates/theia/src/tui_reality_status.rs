@@ -1,9 +1,9 @@
 //! Guarded server identity controls plus separate saved/runtime status.
-use crate::{reality_bootstrap::Error,reality_config::{self,RotationReview,TrustReview},reference_health,tui_editor::Editor,Role};
+use crate::{reality_bootstrap::Error,reality_config::{self,RotationReview,TrustReview,ExpiryReview},reference_health,tui_editor::Editor,Role};
 use crossterm::event::{KeyCode,KeyEvent};
 use std::{path::PathBuf,sync::mpsc::{self,Receiver,TryRecvError}};
 
-enum Update { Report(String), Review(RotationReview), Trust(TrustReview) }
+enum Update { Report(String), Review(RotationReview), Trust(TrustReview), Expiry(ExpiryReview) }
 struct ClientRun{
     stop:Option<tokio::sync::oneshot::Sender<()>>,
     done:Receiver<Result<(),crate::client::ClientError>>,
@@ -23,13 +23,14 @@ pub(crate) struct StatusPanel {
     client_run:Option<ClientRun>,
     trust_input:Option<(bool,String)>,
     trust_review:Option<TrustReview>,
+    expiry_review:Option<ExpiryReview>,
 }
 impl StatusPanel{
     pub(crate) fn open(editor:&Editor)->Self{
         let mut panel=Self{path:editor.saved_path().to_owned(),digest:editor.saved_sha256(),
             id:editor.selected_record_id().to_owned(),server:editor.role()==Role::Server,
             pending:None,review:None,committing:false,report:String::new(),
-            client_active:editor.selected_record_is_active(),client_confirm:None,client_run:None,trust_input:None,trust_review:None};
+            client_active:editor.selected_record_is_active(),client_confirm:None,client_run:None,trust_input:None,trust_review:None,expiry_review:None};
         panel.start(None);
         panel
     }
@@ -88,6 +89,26 @@ impl StatusPanel{
         });
     }
     fn apply_trust(&mut self,review:TrustReview){
+        let path=self.path.clone();let digest=self.digest;let id=self.id.clone();
+        let (tx,rx)=mpsc::channel();self.pending=Some(rx);self.committing=true;
+        let _worker=std::thread::spawn(move||{
+            let result=std::path::absolute(path).map_err(|_|Error::Storage)
+                .and_then(|path|reference_health::unix_now().map_err(|_|Error::Clock)
+                    .and_then(|now|review.apply(&path,digest,&id,now))).map(Update::Report);
+            let _=tx.send(result);
+        });
+    }
+    fn start_expiry(&mut self){
+        let path=self.path.clone();let digest=self.digest;let id=self.id.clone();
+        let (tx,rx)=mpsc::channel();self.pending=Some(rx);
+        let _worker=std::thread::spawn(move||{
+            let result=std::path::absolute(path).map_err(|_|Error::Storage)
+                .and_then(|path|reference_health::unix_now().map_err(|_|Error::Clock)
+                    .and_then(|now|ExpiryReview::prepare(&path,digest,&id,now))).map(Update::Expiry);
+            let _=tx.send(result);
+        });
+    }
+    fn apply_expiry(&mut self,review:ExpiryReview){
         let path=self.path.clone();let digest=self.digest;let id=self.id.clone();
         let (tx,rx)=mpsc::channel();self.pending=Some(rx);self.committing=true;
         let _worker=std::thread::spawn(move||{
@@ -164,6 +185,14 @@ impl StatusPanel{
         }
         if self.committing{return false;}
         if self.pending.is_some(){return key.code==KeyCode::Esc;}
+        if self.expiry_review.is_some(){
+            match key.code{
+                KeyCode::Char('y')=>{if let Some(review)=self.expiry_review.take(){self.apply_expiry(review);}},
+                KeyCode::Char('n')|KeyCode::Esc=>self.expiry_review=None,
+                _=>{},
+            }
+            return false;
+        }
         if self.review.is_some(){
             match key.code{
                 KeyCode::Char('y')=>{if let Some(review)=self.review.take(){self.apply(review);}false}
@@ -174,6 +203,7 @@ impl StatusPanel{
             match key.code{
                 KeyCode::Esc=>true,
                 KeyCode::Char('r')=>{self.start(None);false}
+                KeyCode::Char('e') if self.server=>{self.start_expiry();false}
                 KeyCode::Char('t') if self.server=>{self.start(Some(false));false}
                 KeyCode::Char('p') if self.server=>{self.start(Some(true));false}
                 _=>false,
@@ -194,6 +224,7 @@ impl StatusPanel{
             Ok(Update::Report(report))=>self.report=report,
             Ok(Update::Review(review))=>self.review=Some(review),
             Ok(Update::Trust(review))=>self.trust_review=Some(review),
+            Ok(Update::Expiry(review))=>self.expiry_review=Some(review),
             Err(error)=>self.report=format!("Операция не подтверждена: {error}\nПри неопределённой записи сначала перечитайте сохранённый и runtime статус. Не повторяйте вслепую."),
         }
     }
@@ -209,9 +240,10 @@ impl StatusPanel{
         }
         if self.committing{return "Подтверждённая запись публикации выполняется. Не закрывайте экран.".into();}
         if self.pending.is_some(){return "Проверка сохранённых материалов/локального IPC. Ничего не применяется.\nEsc: закрыть.".into();}
+        if let Some(review)=&self.expiry_review{return format!("{}\n\ny: подтвердить | n/Esc: отменить",review.report());}
         if let Some(review)=&self.review{return format!("{}\n\ny: подтвердить запись | n/Esc: отменить",review.report());}
         format!("{}\n\nr: перечитать | {}Esc: закрыть",self.report,
-            if self.server{"t: начать ротацию | p: отозвать старый ключ после overlap | "}else if self.client_active{"s: запустить локальный runtime | o: recovery | k: promotion | "}else{"o: recovery | k: promotion | для запуска выберите активный профиль | "})
+            if self.server{"t: начать ротацию | p: отозвать старый ключ после overlap | e: восстановить истёкший descriptor | "}else if self.client_active{"s: запустить локальный runtime | o: recovery | k: promotion | "}else{"o: recovery | k: promotion | для запуска выберите активный профиль | "})
     }
 }
 
@@ -223,7 +255,7 @@ mod tests{
     fn panel(active:bool)->StatusPanel{
         StatusPanel{path:PathBuf::new(),digest:[1;32],id:"test".into(),server:false,
             pending:None,review:None,committing:false,report:String::new(),
-            client_active:active,client_confirm:None,client_run:None,trust_input:None,trust_review:None}
+            client_active:active,client_confirm:None,client_run:None,trust_input:None,trust_review:None,expiry_review:None}
     }
     #[test]
     fn runtime_and_trust_inputs_never_implicitly_apply(){

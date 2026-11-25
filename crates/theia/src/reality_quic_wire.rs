@@ -100,7 +100,8 @@ pub(crate) fn coherent_datagram(bytes:&[u8])->bool{
 }
 
 pub(crate) fn short_matches(bytes: &[u8], cid: &[u8]) -> bool {
-    !cid.is_empty() && bytes.first().is_some_and(|b| b & 0x80 == 0)
+    !cid.is_empty() && bytes.first().is_some_and(|b| b & 0xc0 == 0x40)
+        && bytes.len() >= 1 + cid.len() + 17
         && bytes.get(1..1 + cid.len()) == Some(cid)
 }
 

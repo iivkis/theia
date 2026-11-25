@@ -355,6 +355,43 @@ fn rotation_snapshot(path:&Path,expected:[u8;32],id:&str,now:u64)
     Ok((directory,scope,status))
 }
 
+pub(crate) struct ExpiryReview{
+    approval:crate::identity_publication::ExpiredRecovery,
+    directory:PathBuf,
+    report:String,
+}
+impl ExpiryReview{
+    pub(crate) fn report(&self)->&str{&self.report}
+    fn snapshot(path:&Path,digest:[u8;32],id:&str,now:u64)
+        ->Result<(PathBuf,reference_health::State,crate::reality_checkpoint::Stamp),Error>{
+        let inbound=exact_server_record(path,digest,id)?;
+        let binding=inbound.reality.as_ref().ok_or(Error::Format)?;
+        let addr:SocketAddr=inbound.h2_listen.parse().map_err(|_|Error::Scope)?;
+        let scope=crate::descriptor::Scope{inbound:id.to_owned(),endpoint:format!("{}:{}",inbound.server_name,addr.port())};
+        let state=reference_health::Store::new(Path::new(&binding.health_store)).and_then(|s|s.inspect()).map_err(|_|Error::Health)?;
+        let directory=PathBuf::from(&binding.bundle);
+        let (_,stamp)=crate::reality_provision::inspect_registered_snapshot(&directory,binding,&state,&scope,now)?;
+        Ok((directory,state,stamp))
+    }
+    pub(crate) fn prepare(path:&Path,digest:[u8;32],id:&str,now:u64)->Result<Self,Error>{
+        let (directory,state,stamp)=Self::snapshot(path,digest,id,now)?;
+        let publication=crate::identity_publication::Publication::new(&directory.join("publication.toml"))?;
+        let approval=publication.preview_expired(&state,now)?;
+        if approval.publication_sha256!=stamp.publication||approval.health_sha256!=stamp.health{return Err(Error::Approval);}
+        let report=format!("Восстановление истёкшей identity без смены ключа\nFingerprint={}\nrevision {} -> {}\nТребуется свежая проверка одобренного reference (до 60 с). Сверьте fingerprint. Старый signer не активируется. Клиенты с истёкшим descriptor требуют offline recovery; компрометация требует независимого enrollment.",
+            hex(approval.identity_sha256),approval.previous_revision,approval.next_revision);
+        Ok(Self{approval,directory,report})
+    }
+    pub(crate) fn apply(self,path:&Path,digest:[u8;32],id:&str,now:u64)->Result<String,Error>{
+        let (directory,state,stamp)=Self::snapshot(path,digest,id,now)?;
+        if directory!=self.directory||stamp.publication!=self.approval.publication_sha256||stamp.health!=self.approval.health_sha256{return Err(Error::Approval);}
+        let publication=crate::identity_publication::Publication::new(&directory.join("publication.toml"))?;
+        crate::reality_checkpoint::accept(&directory,stamp,now)?;
+        publication.recover_expired(&state,self.approval,now)?;
+        Ok("Новый дескриптор опубликован под тем же ключом. Runtime проверит новое поколение; истёкшие клиенты восстанавливаются отдельно.".into())
+    }
+}
+
 pub(crate) struct RotationReview{
     directory:PathBuf,
     expected:[u8;32],

@@ -291,20 +291,17 @@ fn unique<I: Iterator<Item=SessionId>>(mut ids: I) -> Option<SessionId> {
 }
 fn route(sessions: &HashMap<SessionId, Session>, peer: SocketAddr, bytes: &[u8], admitted_peer: bool) -> Option<SessionId> {
     let known = || sessions.iter().filter(|(_, s)| s.known(bytes));
-    let mut matches = known().filter(|(_, s)| s.paths.contains_key(&peer));
-    if let Some((&id, _)) = matches.next() {
-        return matches.next().is_none().then_some(id);
-    }
-    let mut global = known();
-    if let Some((&id, _)) = global.next() {
-        // A client-selected Initial DCID is not sufficient to attach a
-        // different source address. Only observed short-header CIDs migrate.
-        return (global.next().is_none() && bytes[0] & 0x80 == 0).then_some(id);
+    let mut global=known();
+    if let Some((&id,session))=global.next(){
+        // Even on an existing tuple, prefix collisions are ambiguous.
+        // A tuple is not proof of association with one of several CIDs.
+        if global.next().is_some(){return None;}
+        return (session.paths.contains_key(&peer)||bytes[0]&0x80==0).then_some(id);
     }
     // On an existing, unambiguous physical tuple the reference can decrypt
     // packets carrying an encrypted, newly issued CID. Do not learn it from
     // unauthenticated bytes or guess which of several connections owns it.
-    if admitted_peer || !bytes.first().is_some_and(|b| b & 0x80 == 0) { return None; }
+    if admitted_peer || bytes.len()<18 || !bytes.first().is_some_and(|b| b & 0xc0 == 0x40) { return None; }
     unique(sessions.iter().filter(|(_, s)| s.paths.contains_key(&peer)).map(|(&id, _)| id))
 }
 
@@ -563,6 +560,7 @@ impl PreparedQuic {
                     let data = &buf[..n];
                     let header = wire::long(data);
                     let short = data[0] & 0x80 == 0;
+                    if short && (n<18||data[0]&0xc0!=0x40){continue;}
                     if !short && (header.is_none()||!wire::coherent_datagram(data)){continue;}
                     let local_peer = admitted.keys().any(|(addr, _)| *addr == peer);
                     let local_known = if short {
@@ -689,8 +687,8 @@ mod tests {
         let old = peer(1); let new = peer(2);
         let mut table = HashMap::new();
         table.insert(1, session(old, &[3;8]));
-        let known = [0x40,3,3,3,3,3,3,3,3,0];
-        let rotated = [0x40,4,4,4,4,4,4,4,4,0];
+        let known = [0x40,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+        let rotated = [0x40,4,4,4,4,4,4,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
         assert_eq!(route(&table, new, &known, false), Some(1));
         assert_eq!(route(&table, old, &rotated, false), Some(1));
         assert_eq!(route(&table, new, &rotated, false), None);
@@ -699,7 +697,7 @@ mod tests {
         assert_eq!(route(&table, old, &rotated, false), None);
         table.insert(3, session(peer(3), &[3;8]));
         assert_eq!(route(&table, new, &known, false), None);
-        assert_eq!(route(&table, old, &known, false), Some(1));
+        assert_eq!(route(&table, old, &known, false), None);
     }
     #[test]
     fn quotas_expiry_and_queue_failure_do_not_create_credit() {
@@ -812,7 +810,7 @@ mod tests {
         assert!(s.paths.is_empty());
         assert!(s.closed_paths.contains(&p));
         let retired = Retired::from_session(s,now);
-        let known = [0x40,3,3,3,3,3,3,3,3,0];
+        let known = [0x40,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
         assert!(retired.blocks(p,&known,now));
         assert!(retired.blocks(peer(20),&known,now));
         assert!(!retired.blocks(p,&known,now+RETIRED_TTL));

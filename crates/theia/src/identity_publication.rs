@@ -601,6 +601,48 @@ impl Publication {
         self.write(&record, Some(&old))
     }
 
+    /// Explicit recovery of an expired *current* signer. Unlike renewal
+    /// this requires exact fresh health evidence and an independently
+    /// confirmed fingerprint. No expired predecessor may be reactivated.
+    pub(crate) fn preview_expired(&self,state:&reference_health::State,now:u64)->Result<ExpiredRecovery,Error>{
+        let (raw,record,checked)=self.snapshot()?;
+        record.check_clock(now)?;
+        let value=checked.effective(now);
+        if now<value.descriptor().not_after ||
+            record.pending.as_ref().is_some_and(|p|now<p.ends_at) ||
+            state.plan().digest().map_err(|_|Error::Health)?!=record.plan_sha256 ||
+            now.checked_sub(state.last_checked_at()).ok_or(Error::Clock)?>60 {
+            return Err(Error::Approval);
+        }
+        state.validate_active(value.descriptor(),now).map_err(|_|Error::Health)?;
+        Ok(ExpiredRecovery{
+            publication_sha256:bootstrap::digest(&raw),
+            health_sha256:state.snapshot_sha256().map_err(|_|Error::Health)?,
+            identity_sha256:bootstrap::fingerprint(value.signer()),
+            previous_revision:value.descriptor().revision,
+            next_revision:value.descriptor().revision.checked_add(1).ok_or(Error::Descriptor)?,
+        })
+    }
+
+    pub(crate) fn recover_expired(&self,state:&reference_health::State,approval:ExpiredRecovery,now:u64)->Result<(),Error>{
+        if self.preview_expired(state,now)?!=approval{return Err(Error::Approval);}
+        let (raw,mut record,checked)=self.snapshot()?;
+        if bootstrap::digest(&raw)!=approval.publication_sha256{return Err(Error::Approval);}
+        if let Some(pending)=record.pending.as_mut(){
+            let (key,value)=checked.next.ok_or(Error::Identity)?;
+            if bootstrap::fingerprint(key.public_key())!=approval.identity_sha256 ||
+                value.descriptor().revision!=approval.previous_revision{return Err(Error::Approval);}
+            let signed=bootstrap::refresh_descriptor(state,&key,pending.successor_live.as_deref().unwrap_or(&pending.successor),now)?;
+            pending.successor_live=Some(signed);
+        }else{
+            if bootstrap::fingerprint(checked.active.public_key())!=approval.identity_sha256{return Err(Error::Approval);}
+            record.active_document=bootstrap::refresh_descriptor(state,&checked.active,&record.active_document,now)?;
+        }
+        record.clock_floor=now;
+        record.generation=approval.next_revision;
+        self.write(&record,Some(&raw))
+    }
+
     fn reference_change(
         state: &reference_health::State,
         record: &Record,
@@ -812,6 +854,15 @@ impl Publication {
     }
 }
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub(crate) struct ExpiredRecovery{
+    pub(crate) publication_sha256:[u8;32],
+    pub(crate) health_sha256:[u8;32],
+    pub(crate) identity_sha256:[u8;32],
+    pub(crate) previous_revision:u64,
+    pub(crate) next_revision:u64,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct FailoverPreview {
     pub publication_sha256: [u8; 32],
@@ -944,9 +995,23 @@ mod tests {
         let captured=publication.capture(&state,status.snapshot_sha256,later).unwrap();
         assert!(captured.select(old.public_key(),later).is_err());
         b.update_at(captured.select(next.public_key(),later).unwrap().signed(),6,later).unwrap();
-        publication.promote(status.snapshot_sha256,bootstrap::fingerprint(next.public_key()),later).unwrap();
-        assert_eq!(publication.inspect(later).unwrap().revision,8);
-        assert_eq!(publication.inspect(later).unwrap().next_fingerprint,None);
+        let expired=status.not_after;
+        assert!(publication.preview_expired(&state,expired).is_err());
+        let fresh=reference_health::State::new(state.plan().clone(),
+            vec![good,good],expired).unwrap();
+        let recovery=publication.preview_expired(&fresh,expired).unwrap();
+        assert_eq!(recovery.identity_sha256,bootstrap::fingerprint(next.public_key()));
+        assert_eq!(recovery.next_revision,8);
+        assert!(publication.recover_expired(&fresh,ExpiredRecovery{identity_sha256:bootstrap::fingerprint(old.public_key()),..recovery},expired).is_err());
+        publication.recover_expired(&fresh,recovery,expired).unwrap();
+        assert!(publication.recover_expired(&fresh,recovery,expired).is_err());
+        let status=publication.inspect(expired).unwrap();
+        let capture=publication.capture(&fresh,status.snapshot_sha256,expired).unwrap();
+        assert!(capture.select(old.public_key(),expired).is_err());
+        b.update_at(capture.select(next.public_key(),expired).unwrap().signed(),7,expired).unwrap();
+        publication.promote(status.snapshot_sha256,bootstrap::fingerprint(next.public_key()),expired).unwrap();
+        assert_eq!(publication.inspect(expired).unwrap().revision,9);
+        assert_eq!(publication.inspect(expired).unwrap().next_fingerprint,None);
     }
 
     #[test]
