@@ -1125,9 +1125,10 @@ impl Editor {
     }
 
     pub fn selection_summary(&self) -> String {
+        if self.record_count() == 0 { return "Нет записей".into(); }
         if self.selected_reality() {
             return format!(
-                "REALITY {}/{}: {} [сохранённый профиль, runtime: V]",
+                "REALITY {}/{}: {} [защищённое подключение]",
                 self.selected_record + 1,
                 self.record_count(),
                 self.selected_record_id()
@@ -1135,7 +1136,7 @@ impl Editor {
         }
         match self.role {
             Role::Server => format!(
-                "Inbound {}/{}: {}",
+                "Подключение {}/{}: {}",
                 self.selected_record + 1,
                 self.record_count(),
                 self.selected_record_id(),

@@ -115,10 +115,10 @@ impl Form {
         let lead_h = if self.lead.is_empty() || inner.height < 5 { 0 }
             else if inner.height >= 9 { 2 } else { 1 };
         let side = inner.width >= 96 && inner.height >= 12;
-        let help_h = if side || inner.height < 6 { 0 } else if inner.height >= 10 { 3 } else { 1 };
+        let help_h = if side { 0 } else if !self.error.is_empty() && inner.height >= 3 { if inner.height >= 8 { 3 } else { 1 } } else if inner.height < 6 { 0 } else if inner.height >= 10 { 3 } else { 1 };
         let room = inner.height.saturating_sub(title_h + lead_h + help_h);
         let stride = if usize::from(room) >= count.saturating_mul(3) && inner.width >= 42 { 3 }
-            else if usize::from(room) >= count.saturating_mul(2) { 2 } else { 1 };
+            else if room >= 2 && inner.width >= 42 { 2 } else { 1 };
         let capacity = usize::from(room / stride);
         let selected = self.fields.iter().position(|f| f.id == self.selected).unwrap_or(0);
         let start = selected.saturating_sub(capacity.saturating_sub(1)).min(count.saturating_sub(capacity));
