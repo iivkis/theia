@@ -363,26 +363,27 @@ impl PreparedTcp {
     pub(crate) async fn serve_generation(self, mut phase: watch::Receiver<server::GenerationPhase>) -> Result<(), ServerError> {
         crate::tcp_bbr::select(&self.listener)
             .map_err(|_| ServerError::TcpControllerUnavailable)?;
-        let shared = Arc::new(self);
+        let Self { listener, live, relay, inspection_slots } = self;
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
                 biased;
                 _ = server::await_generation_drain(&mut phase) => break,
                 _ = tasks.join_next(), if !tasks.is_empty() => {}
-                result = shared.listener.accept() => {
+                result = listener.accept() => {
                     let (socket, peer) = result.map_err(|_| ServerError::Io)?;
-                    let Ok(slot) = shared.inspection_slots.clone().try_acquire_owned() else { continue; };
+                    let Ok(slot) = inspection_slots.clone().try_acquire_owned() else { continue; };
                     if crate::tcp_bbr::select(&socket).is_err() { continue; }
-                    let backend = shared.clone();
+                    let live = live.clone();
+                    let relay = relay.clone();
                     let connection_phase = phase.clone();
                     tasks.spawn(async move {
                         let Ok(inspected) = inspect(socket).await else { return; };
                         if server::generation_draining(&connection_phase) { return; }
                         let Ok(now) = crate::reference_health::unix_now() else { return; };
-                        let Some(generation)=backend.live.current() else { return; };
+                        let Some(generation)=live.current() else { return; };
                         let selected=inspected.hello.as_ref().and_then(|hello|
-                            generation.select(&backend.live.guard,Branch::H2,hello,now));
+                            generation.select(&live.guard,Branch::H2,hello,now));
                         if let Some(route)=selected {
                             let Some(connection)=route.context.connection_slot() else { return; };
                             drop(slot);
@@ -391,14 +392,14 @@ impl PreparedTcp {
                         } else {
                             let Some(value)=generation.relay_value(now) else { return; };
                             let Ok(lease)=generation.lease.health().relay_lease(value,generation.lease.publication().plan_sha256()).await else { return; };
-                            let _=backend.relay.relay(inspected.io,&lease).await;
+                            let _=relay.relay(inspected.io,&lease).await;
                             drop(slot);
                         }
                     });
                 }
             }
         }
-        drop(shared);
+        drop(listener);
         let _ = timeout(server::GENERATION_DRAIN, async {
             while tasks.join_next().await.is_some() {}
         }).await;
