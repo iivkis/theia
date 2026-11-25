@@ -17,7 +17,46 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
+#[path = "support/shared_port.rs"]
+mod shared_port;
+
 const TOKEN: [u8; 32] = [0x42; 32];
+
+// QUIC owns its actual UDP socket from the start. Keep each rejected endpoint
+// alive until selection completes so an unavailable TCP port cannot recur.
+async fn shared_quic_listener(
+    der: rustls::pki_types::CertificateDer<'static>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> (TcpListener, quinn::Endpoint) {
+    let mut rejected = Vec::new();
+    let mut last_error = None;
+    for _ in 0..64 {
+        let udp = theia::quic_transport::server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![der.clone()],
+            key.clone_key(),
+        )
+        .expect("create native QUIC endpoint on an ephemeral UDP port");
+        match TcpListener::bind(udp.local_addr().unwrap()).await {
+            Ok(tcp) => return (tcp, udp),
+            Err(error) => {
+                last_error = Some(error);
+                rejected.push(udp);
+            }
+        }
+    }
+    panic!("reserve common native TCP/QUIC loopback port: {last_error:?}");
+}
+
+fn shared_async_listeners() -> (tokio::net::UdpSocket, TcpListener) {
+    let (tcp, udp) = shared_port::reserve_shared_port();
+    tcp.set_nonblocking(true).unwrap();
+    udp.set_nonblocking(true).unwrap();
+    (
+        tokio::net::UdpSocket::from_std(udp).unwrap(),
+        TcpListener::from_std(tcp).unwrap(),
+    )
+}
 
 type ServerTask = JoinHandle<Result<(), theia::server::ServerError>>;
 
@@ -921,13 +960,7 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
         }
         // The v1 server issuer requires a common TCP/UDP port. Reserve both
         // before starting the binary; retry only local fixture allocation.
-        let (tcp_reservation, udp_reservation) = (0..32)
-            .find_map(|_| {
-                let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-                let udp = std::net::UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
-                Some((tcp, udp))
-            })
-            .expect("reserve common TCP/UDP port");
+        let (tcp_reservation, udp_reservation) = shared_port::reserve_shared_port();
         let tcp = tcp_reservation.local_addr().unwrap();
         let udp = udp_reservation.local_addr().unwrap();
         let source = include_str!("../../../examples/server.toml").replace(
@@ -1070,15 +1103,7 @@ async fn auto_falls_back_only_after_udp_silence_and_uses_negative_cache() {
         // Reserve an available UDP port first, then bind the TCP server to
         // that *same* port. On Windows a random TCP ephemeral port may be
         // excluded for UDP (WSAEACCES/10013), so blind second bind is flaky.
-        let mut pair = None;
-        for _ in 0..64 {
-            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
-                pair = Some((udp, tcp));
-                break;
-            }
-        }
-        let (udp, tcp) = pair.expect("native CI must provide one shared TCP/UDP loopback port");
+        let (udp, tcp) = shared_async_listeners();
         let (endpoint, _roots, pem, server) = listener_with_pem_bound(true, tcp);
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = probes.clone();
@@ -1132,18 +1157,13 @@ async fn auto_falls_back_only_after_udp_silence_and_uses_negative_cache() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_wrong_h3_certificate_never_retries_working_h2() {
     timeout(Duration::from_secs(20), async {
-        let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
         // H2 is trusted by the CLI fixture. H3 uses a different certificate
         // with the same SAN, so only chain validation distinguishes it.
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let udp = theia::quic_transport::server_endpoint(
-            endpoint.parse().unwrap(),
-            vec![der],
-            key.into(),
-        )
-        .unwrap();
+        let (tcp, udp) = shared_quic_listener(der, key.into()).await;
+        let (endpoint, _roots, pem, server) = listener_with_pem_bound(true, tcp);
         let quic = tokio::spawn(async move {
             let incoming = udp.accept().await.unwrap();
             assert!(theia::quic_transport::accept(incoming).await.is_err());
@@ -1188,21 +1208,8 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
         // Random Windows TCP ephemeral ports are not necessarily available
         // for UDP/QUIC (WSAEACCES/10013). Keep both real sockets reserved
         // before starting either transport, retrying only local port choice.
-        let mut pair = None;
-        for _ in 0..64 {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let remote = listener.local_addr().unwrap();
-            if let Ok(udp) = theia::quic_transport::server_endpoint(
-                remote,
-                vec![der.clone()],
-                key.clone_key().into(),
-            ) {
-                pair = Some((listener, remote, udp));
-                break;
-            }
-        }
-        let (listener, remote, udp) =
-            pair.expect("CI must provide a TCP/QUIC port available on native OS");
+        let (listener, udp) = shared_quic_listener(der, key.into()).await;
+        let remote = listener.local_addr().unwrap();
         let mut inbound = Inbound {
             id: "h2-test".into(),
             allowed_user_ids: vec!["client".into()],
@@ -1262,15 +1269,7 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
 async fn pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_silence() {
     use theia::security_profile::{CertificatePin, SecurityMode};
     timeout(Duration::from_secs(35), async {
-        let mut pair = None;
-        for _ in 0..64 {
-            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
-                pair = Some((udp, tcp));
-                break;
-            }
-        }
-        let (reserved, tcp) = pair.expect("shared native port");
+        let (reserved, tcp) = shared_async_listeners();
         let (endpoint, _roots, pem, server) =
             listener_with_pem_bound_mode(true, tcp, SecurityMode::PinnedCertV1);
         let pin = CertificatePin::from_der(
