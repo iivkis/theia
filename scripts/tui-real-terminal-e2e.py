@@ -197,8 +197,8 @@ def drive(binary, config, scenario, expected):
                 # cancel without touching the exact TOML or server revision.
                 with open(config, "rb") as file:
                     original = file.read()
-                for choice, label in [("1", "Создать inbound (собственный TLS)"),
-                                      ("2", "Новый REALITY inbound")]:
+                for choice, label in [("1", "Создать подключение (собственный TLS)"),
+                                      ("2", "Мастер REALITY")]:
                     since = tty.snapshot()
                     tty.send("N")
                     tty.wait("SmartTheia REALITY", since=since)
@@ -213,7 +213,7 @@ def drive(binary, config, scenario, expected):
             if scenario == "dirty":
                 since = tty.snapshot()
                 tty.send("\r")
-                tty.wait("Ввод ·", since=since)
+                tty.wait("Изменение параметра", since=since)
                 tty.send("x\r")  # valid but unsaved changed TLS DNS
                 tty.wait("Не сохранено")
                 since = tty.snapshot()
@@ -334,23 +334,16 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     def review(tty, key, message):
         tty.send(key)
         tty.wait(message)
-        tty.wait("y: подтвердить")
+        tty.wait("Подтвердить")
 
     def confirm(tty, message):
         tty.send("y")
         tty.wait(message)
-        tty.wait("s: local start")
-
-    def local_start(tty):
-        review(tty, "s", "Запустить только локальные")
-        confirm(tty, "Оба локальных listener привязаны")
-        proxy_status(binary, "NoJournal")
-        test_tunnels(http_port, socks_port, echo_port)
 
     def apply(tty):
-        review(tty, "a", "Сохранить снимок")
+        review(tty, "e", "Запустить локальный прокси при необходимости")
         proxy_status(binary, "NoJournal")
-        confirm(tty, "WinINet применён")
+        confirm(tty, "Системный прокси включён")
         proxy_status(binary, "PendingOwned")
 
     proxy_status(binary, "NoJournal")
@@ -358,12 +351,18 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     try:
         tty.send("y")
         proxy_status(binary, "NoJournal")
-        local_start(tty)
-        review(tty, "a", "Сохранить снимок")
+        review(tty, "e", "Запустить локальный прокси при необходимости")
         tty.send("n")
         tty.wait("Отменено")
         proxy_status(binary, "NoJournal")
-        apply(tty)
+        for port in (http_port, socks_port):
+            with socket.socket() as sock:
+                sock.settimeout(2)
+                assert sock.connect_ex(("127.0.0.1", port)) != 0, "listener started without consent"
+        review(tty, "e", "Запустить локальный прокси при необходимости")
+        proxy_status(binary, "NoJournal")
+        confirm(tty, "Системный прокси включён")
+        proxy_status(binary, "PendingOwned")
         test_tunnels(http_port, socks_port, echo_port)
         review(tty, "r", "Восстановить только собственные")
         confirm(tty, "Восстановление WinINet: Restored")
@@ -388,8 +387,8 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     # A killed compiled TUI (not a unit-test surrogate) leaves the journal.
     tty = open_panel()
     try:
-        local_start(tty)
         apply(tty)
+        test_tunnels(http_port, socks_port, echo_port)
         # Explicit process termination, never a graceful Ctrl+C/close request.
         killed = subprocess.run(
             ["taskkill", "/PID", str(tty.win.pid), "/F"],
@@ -469,7 +468,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Параметры · Enter")
         own_link = issue(tty, "own-user")
         tty.send("j")
-        tty.wait("REALITY 2/2:")
+        tty.wait("• REALITY reality")
         reality_link = issue(tty, "reality-user")
         saved = read_config(server)["server"]
         assert "own-user" in saved["inbounds"][0]["allowed_user_ids"]
@@ -515,14 +514,14 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.send("i")
         tty.wait("Импорт подключения")
         tty.send(str(own_link) + "\r")
-        tty.wait("F-14: безопасный предпросмотр подключения")
+        tty.wait("Проверка ключа · собственный TLS")
         tty.send("c")
-        tty.wait("F-14: отдельный TLS trust")
+        tty.wait("Проверка сертификата")
         tty.send("file:" + cert + "\r")
         tty.wait("CA указан")
         assert client.read_bytes() == original
         tty.send("y")
-        tty.wait("Импорт сохранён")
+        tty.wait("Профиль сохранён")
         assert read_config(client)["client"]["active_profile"] == "home"
         assert client_revision(1)
         tty.send("\x1b")
@@ -558,6 +557,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             tty.send(str(reality_link) + "\r")
             tty.wait("Файл допуска (admission)")
             tty.send(admission + "\t")
+            tty.wait("Отпечаток сервера")
             tty.send(fingerprint + "\r")
             tty.wait("ПРЕДПРОСМОТР: fingerprint совпал")
             tty.send("y")
