@@ -718,7 +718,7 @@ impl Editor {
                     .get(self.selected_record)
                     .ok_or("Inbound missing")?;
                 if !inbound.security_mode.is_plain() {
-                    return Err("Для pinned identity требуется отдельная процедура доверия.");
+                    return Err("Для REALITY требуется отдельная процедура управления доверием.");
                 }
                 Ok(vec![String::new(), String::new()])
             }
@@ -729,7 +729,7 @@ impl Editor {
                     .get(self.selected_record)
                     .ok_or("Profile missing")?;
                 if profile.tls_profile != "default" {
-                    return Err("Для pinned identity требуется отдельная процедура доверия.");
+                    return Err("Для REALITY требуется отдельная процедура управления доверием.");
                 }
                 Ok(vec![String::new(), String::new()])
             }
@@ -877,7 +877,7 @@ impl Editor {
                     .get_mut(self.selected_record)
                     .ok_or("Inbound missing")?;
                 if !inbound.security_mode.is_plain() {
-                    return Err("Для pinned identity требуется отдельная процедура доверия.");
+                    return Err("Для REALITY требуется отдельная процедура управления доверием.");
                 }
                 inbound.tls_cert.clone_from(&fields[0]);
                 inbound.tls_key.clone_from(&fields[1]);
@@ -929,6 +929,12 @@ impl Editor {
         self.error = None;
         self.notice = "Подтверждено. Требуется guarded save; runtime не изменён.";
         Ok(())
+    }
+
+    /// Validated SNI of the selected server inbound.
+    pub fn selected_server_name(&self) -> Option<&str> {
+        let Config::Server(doc) = &self.draft else { return None; };
+        doc.server.inbounds.get(self.selected_record).map(|inbound| inbound.server_name.as_str())
     }
 
     pub fn selected_record_is_active(&self) -> bool {

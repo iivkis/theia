@@ -5,9 +5,8 @@ edition = "2021"
 publish = false
 
 [features]
-# F-13: ship a BoringSSL backend on Linux and Windows so the explicit
-# browser-h2-btls-v1 profile is available in ordinary client binaries.
-# The default profile remains strict rustls; no automatic fingerprint change.
+# F-13 laboratory backend remains compiled for independent tests.
+# The product config does not expose a selectable browser security mode.
 default = ["experimental-btls-h2"]
 experimental-btls-h2 = ["dep:btls", "dep:tokio-btls"]
 

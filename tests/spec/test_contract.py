@@ -526,7 +526,7 @@ class SpecContractTests(unittest.TestCase):
         self.assertIsNotNone(wire_security)
         self.assertEqual(
             [item.strip() for item in wire_security.group(1).split(",") if item.strip()],
-            ["OwnTls", "PinnedTls"],
+            ["OwnTls"],
         )
         self.assertRegex(
             invite,
@@ -564,10 +564,10 @@ class SpecContractTests(unittest.TestCase):
             self.assertIn(name, tests)
         self.assertIn('profile.tls_profile == "default"', config)
         self.assertIn('wire.carrier != "smarttheia-xhttp"', invite)
-        self.assertIn("replacement_v1_roundtrips_all_supported_profiles_and_refuses_legacy", invite)
+        self.assertIn("replacement_v1_roundtrips_own_tls_and_rejects_retired_profiles", invite)
         self.assertNotIn("PREFIX_V2", invite)
         self.assertNotIn("portable_from_profile", invite)
-        self.assertIn("leaf_sha256: Option<String>", invite)
+        self.assertNotIn("leaf_sha256: Option<String>", invite)
 
 
 if __name__ == "__main__":

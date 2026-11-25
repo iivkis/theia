@@ -221,38 +221,22 @@ impl Fixture {
             profile.server = if h3 { self.h3 } else { self.h2 }.to_string();
             profile.server_name = "localhost".into();
             profile.transport = if h3 { Transport::H3 } else { Transport::H2 };
-            profile.tls_profile = pin.map_or_else(
-                || "default".into(),
-                |pin| {
-                    if self.stream_up {
-                        pin.stream_up_profile()
-                    } else {
-                        pin.profile()
-                    }
-                },
-            );
-            if pin.is_none() {
-                profile.xhttp_mode = Some(if self.stream_up {
-                    config::XhttpMode::StreamUp
-                } else {
-                    config::XhttpMode::StreamOne
-                });
-            }
-            let invite = Invitation::public_from_profile(&profile)
-                .unwrap()
-                .encode()
-                .unwrap();
-            let received = Invitation::decode(&invite)
-                .unwrap()
-                .to_profile("env:TEST_TOKEN", None)
-                .unwrap();
-            assert_eq!(received.tls_profile, profile.tls_profile);
+            profile.xhttp_mode = Some(if self.stream_up {
+                config::XhttpMode::StreamUp
+            } else {
+                config::XhttpMode::StreamOne
+            });
+            // Only supported Own-TLS profiles are serialized. Additional
+            // certificate pins below are laboratory-only API inputs.
+            let received = if pin.is_none() {
+                let invite = Invitation::public_from_profile(&profile).unwrap().encode().unwrap();
+                Invitation::decode(&invite).unwrap().to_profile("env:TEST_TOKEN", None).unwrap()
+            } else {
+                profile.clone()
+            };
             assert_eq!(received.transport, profile.transport);
-            let imported_pin = CertificatePin::parse_profile(&received.tls_profile);
-            assert_eq!(
-                received.effective_xhttp_mode(),
-                profile.effective_xhttp_mode()
-            );
+            assert_eq!(received.effective_xhttp_mode(), profile.effective_xhttp_mode());
+            let imported_pin = pin;
             let stream_up = received.effective_xhttp_mode() == config::XhttpMode::StreamUp;
             let token = URL_SAFE_NO_PAD.encode(TOKEN);
             let (mut app, local) = tokio::io::duplex(4096);

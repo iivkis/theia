@@ -423,7 +423,7 @@ impl H3Client {
         // The original H3 attempt already completed HTTP admission.
         // UDP silence in the second attempt must not authorize H2 fallback.
         match result {
-            Err(ClientError::QuicUnreachable) => Err(ClientError::Timeout),
+            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => Err(ClientError::Timeout),
             other => other,
         }
     }

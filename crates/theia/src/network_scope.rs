@@ -3,7 +3,7 @@
 //! DNS, packet payload, network names or identifiers in diagnostics.
 use std::net::SocketAddr;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Scope {
     source: SocketAddr,
     epoch: u64,
