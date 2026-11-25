@@ -120,7 +120,7 @@ const CLIENT: &[Group] = &[
         entries: &[
             always("Состояние / подключить / отключить / Apply", key('V')),
             always("Монитор трафика этого процесса", Action::Traffic),
-            entry("Системный прокси Windows", key('p')),
+            entry("Режим подключения (прокси / TUN)", key('P')),
         ],
     },
     Group {

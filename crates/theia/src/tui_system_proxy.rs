@@ -426,14 +426,24 @@ impl Panel {
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
         if self.phase != Phase::Idle || self.unavailable { return Vec::new(); }
-        vec![
-            ActionItem { key:'s', label:"Запустить локальный прокси" },
-            ActionItem { key:'a', label:"Включить системный прокси" },
-            ActionItem { key:'r', label:"Восстановить настройки" },
-            ActionItem { key:'c', label:"Восстановить после сбоя" },
-            ActionItem { key:'x', label:"Остановить" },
-            ActionItem { key:'v', label:"Обновить состояние" },
-        ]
+        let mut items = Vec::new();
+        if !self.view.running && !self.view.owned {
+            items.push(ActionItem { key:'s', label:"Подготовить подключение" });
+        }
+        if self.view.running && self.view.manual && !self.view.owned {
+            items.push(ActionItem { key:'a', label:"Включить системный прокси" });
+        }
+        if self.view.owned {
+            items.push(ActionItem { key:'r', label:"Выключить системный прокси" });
+        }
+        if self.view.running {
+            items.push(ActionItem { key:'x', label:"Отключить и восстановить" });
+        }
+        if !self.view.owned {
+            items.push(ActionItem { key:'c', label:"Восстановить после сбоя" });
+        }
+        items.push(ActionItem { key:'v', label:"Обновить состояние" });
+        items
     }
 
     pub(crate) fn body(&self) -> String {
@@ -445,10 +455,12 @@ impl Panel {
         let controls = match self.phase {
             Phase::Busy => "Ожидается результат worker.",
             Phase::Confirm => "y: подтвердить  n/Esc: отменить",
-            Phase::Idle => "s: запустить локальный прокси\na: включить системный прокси\nr: восстановить прежние настройки\nc: восстановление после сбоя\nx: остановить\nv: обновить состояние\nEsc: назад",
+            Phase::Idle if self.view.owned => "Прокси Windows настроен. Проверка удалённого туннеля выполняется отдельно.\nEsc: запросить остановку и восстановление.",
+            Phase::Idle if self.view.running => "Локальный прокси подготовлен. Выберите «Включить системный прокси» и подтвердите.",
+            Phase::Idle => "Выберите «Подготовить подключение», затем отдельно включите системный прокси.\nEsc: назад.",
         };
         format!(
-            "Системный прокси (WinINet): {status}\nЛокальный слушатель: {} | ручной режим: {}\nСостояние туннеля проверяется отдельно. Этот экран не подтверждает подключение.\n{}\n{controls}",
+            "Системный HTTP(S)-прокси Windows: {status}\nЛокальный прокси: {} | разрешение управления: {}\nСостояние туннеля проверяется отдельно. Это не VPN.\n\n{}\n\n{controls}",
             if self.unavailable || self.phase == Phase::Busy {
                 "неизвестно"
             } else if self.view.running {

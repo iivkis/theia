@@ -401,7 +401,7 @@ enum WorkspaceFocus { Fields, Navigation, Actions, Users }
 fn pages(role: Role) -> &'static [&'static str] {
     match role {
         Role::Server => &["Обзор", "Подключения", "Пользователи", "Приглашения", "Статистика", "Настройки", "Диагностика"],
-        Role::Client => &["Обзор", "Профили", "Импорт", "Прокси", "Статистика", "Настройки", "Диагностика"],
+        Role::Client => &["Обзор", "Профили", "Импорт", "Подключение", "Статистика", "Настройки", "Диагностика"],
     }
 }
 
@@ -414,10 +414,11 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
         (_, 4) => &[('4',"Открыть монитор трафика")],
         (Role::Server, 5) => &[('S',"Сохранить файл"),('a',"Применить права доступа"),('v',"Состояние / другие изменения"),('Q',"Лимиты подключений"),('o',"Открыть файл"),('R',"Проверить перезапуск"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
         (Role::Server, 6) => &[('p',"Сетевая диагностика"),('V',"Состояние (только REALITY)")],
-        (Role::Client, 0) => &[('i',"Импорт ключа Theia"),('V',"Подключить / отключить"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
+        (Role::Client, 0) => &[('P',"Режим подключения"),('i',"Импорт ключа Theia"),('V',"Локальный прокси"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
         (Role::Client, 1) => &[('V',"Подключить / отключить"),('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт приглашения"),('E',"Сертификат Own-TLS"),('D',"Удалить профиль")],
         (Role::Client, 2) => &[('i',"Импорт ключа, файла или QR"),('I',"Расширенный импорт REALITY")],
-        (Role::Client, 3) if cfg!(windows) => &[('p',"Управление системным прокси")],
+        (Role::Client, 3) if cfg!(windows) => &[('p',"Системный прокси"),('V',"Локальный HTTP / SOCKS5"),('A',"Выбрать активный профиль"),('i',"Добавить ключ")],
+        (Role::Client, 3) => &[('V',"Локальный HTTP / SOCKS5"),('A',"Выбрать активный профиль"),('i',"Добавить ключ")],
         (Role::Client, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('V',"Состояние и применение"),('K',"Подтвердить доверие"),('M',"Регистрация материалов")],
         (Role::Client, 6) => &[('V',"Диагностика подключения")],
         _ => &[],
@@ -449,6 +450,8 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
             (Role::Server, 'E') => "Свой TLS-сертификат",
             (Role::Client, 'E') => "Доверенный сертификат и ключ",
             (Role::Client, 'V') if !active && page == 1 => "Состояние профиля",
+            (Role::Client, 'p') if !editor.system_proxy_allowed() => "Настроить системный прокси",
+            (Role::Client, 'V') if page == 3 && !active => "Состояние выбранного профиля",
             _ => label,
         };
         available.then_some(ActionItem { key, label })
@@ -480,7 +483,7 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
     } else if !editor.selected_record_is_active() {
         ('A', "Выберите этот профиль активным, если хотите подключаться через него.")
     } else {
-        ('V', "Откройте подключение и подтвердите запуск. Системный прокси не включается автоматически.")
+        ('P', "Выберите режим подключения: системный или локальный прокси. Запуск требует подтверждения.")
     }
 }
 
@@ -505,6 +508,7 @@ struct Interaction {
     workspace_focus: WorkspaceFocus,
     workspace_action: usize,
     workspace_user: usize,
+    proxy_permission_pending: bool,
     value_preview: bool,
     preview_text: Option<String>,
     modal_action: usize,
@@ -547,10 +551,11 @@ struct Interaction {
 impl Interaction {
     fn new(editor: Option<Editor>) -> Self {
         Self {
-            workspace_page: usize::from(editor.is_some()),
+            workspace_page: if editor.as_ref().is_some_and(|e| e.role() == Role::Client) { 3 } else { usize::from(editor.is_some()) },
             workspace_focus: WorkspaceFocus::Fields,
             workspace_action: 0,
             workspace_user: 0,
+            proxy_permission_pending: false,
             value_preview: false,
             preview_text: None,
             modal_action: 0,
@@ -729,6 +734,17 @@ impl Interaction {
             Ok((editor, saved)) => {
                 self.saving = None;
                 self.editor = Some(editor);
+                if std::mem::take(&mut self.proxy_permission_pending) {
+                    #[cfg(windows)]
+                    if saved {
+                        if let Some(editor) = self.editor.as_mut() {
+                            match crate::tui_system_proxy::Panel::open(editor.saved_path().to_owned(), editor.saved_sha256()) {
+                                Ok(panel) => { self.system_proxy = Some(panel); self.modal_action = 0; }
+                                Err(message) => editor.error = Some(message.into()),
+                            }
+                        }
+                    }
+                }
                 if matches!(self.issuance, Some(IssueFlow::Saving)) {
                     self.modal_action=0;
                     self.issuance = Some(if saved {
@@ -762,7 +778,9 @@ impl Interaction {
                     if saved {
                         self.importing = None;
                         self.client_background = None;
-                        self.reality_status = self.editor.as_ref().map(StatusPanel::open);
+                        self.workspace_page = 3;
+                        self.workspace_action = 0;
+                        self.workspace_focus = WorkspaceFocus::Actions;
                     } else {
                         self.importing = Some(ImportFlow::ActivationFailed);
                     }
@@ -896,10 +914,10 @@ impl Interaction {
                 self.editor = Some(editor);
                 self.config_dialog = None;
                 self.menu = None;
-                self.workspace_page=0;
+                self.workspace_page=if self.editor.as_ref().is_some_and(|e| e.role() == Role::Client) {3} else {0};
                 self.workspace_focus=WorkspaceFocus::Actions;
                 if let Some(role) = Self::panel_role(model) {
-                    self.workspace_action = self.recommended_action(role);
+                    self.workspace_action = if self.workspace_page == 0 { self.recommended_action(role) } else { 0 };
                 }
                 self.last_apply=None;
             }
@@ -1544,6 +1562,11 @@ impl Interaction {
                 self.reality_status = self.client_background.take();
                 return false;
             }
+            if role == Some(Role::Client) && key.code == KeyCode::Char('P') && self.editor_for(Role::Client).is_some() {
+                self.select_workspace_page(Role::Client, 3);
+                self.workspace_focus = WorkspaceFocus::Actions;
+                return false;
+            }
             if let Some(role) = role {
                 let configured = self.editor_for(role).is_some();
                 if !configured {
@@ -1575,7 +1598,7 @@ impl Interaction {
                     // A connection is the scope of user rights and invitations. The
                     // same shortcut works in every server workspace, even when
                     // the sidebar is hidden on a compact terminal.
-                    if role == Role::Server && key.modifiers.is_empty()
+                    if (role == Role::Server || self.workspace_page == 3) && key.modifiers.is_empty()
                         && matches!(key.code, KeyCode::Char('j' | 'k'))
                     {
                         if let Some(editor) = self.editor.as_mut() {
@@ -1863,10 +1886,10 @@ impl Interaction {
                     KeyCode::Char('y') if key.modifiers.is_empty() => {
                         match editor.stage_record(*review) {
                             Ok(()) => self.start_save(),
-                            Err(message) => editor.error = Some(message.into()),
+                            Err(message) => { self.proxy_permission_pending = false; editor.error = Some(message.into()); }
                         }
                     }
-                    KeyCode::Esc | KeyCode::Char('n') => {}
+                    KeyCode::Esc | KeyCode::Char('n') => { self.proxy_permission_pending = false; }
                     _ => self.records = Some(RecordFlow::Confirm(review)),
                 },
                 RecordFlow::Input {
@@ -2453,7 +2476,9 @@ impl Interaction {
                     }
                     KeyCode::Enter if editor.selected_record_is_active() && !editor.dirty() && !editor.write_uncertain() => {
                         self.client_background = None;
-                        self.reality_status = Some(StatusPanel::open(editor));
+                        self.workspace_page = 3;
+                        self.workspace_action = 0;
+                        self.workspace_focus = WorkspaceFocus::Actions;
                     }
                     KeyCode::Enter => self.importing = Some(ImportFlow::ActivateConfirm),
                     KeyCode::Esc => {}
@@ -2635,23 +2660,38 @@ impl Interaction {
                 && key.code == KeyCode::Char('p')
                 && key.modifiers.is_empty()
             {
-                if editor.dirty() {
-                    editor.error = Some("Сохраните или отмените черновик перед запуском.".into());
+                if let Err(message) = editor.require_clean_records() {
+                    editor.error = Some(message.into());
+                } else if editor.write_uncertain() {
+                    editor.error = Some("Откройте настройки заново.".into());
+                } else if !editor.selected_record_is_active() {
+                    editor.error = Some("Сначала выберите этот профиль активным (A).".into());
                 } else {
                     #[cfg(windows)]
-                    match crate::tui_system_proxy::Panel::open(
-                        editor.saved_path().to_owned(),
-                        editor.saved_sha256(),
-                    ) {
-                        Ok(panel) => {
-                            self.system_proxy = Some(panel);
-                            editor.error = None;
+                    {
+                        if !editor.system_proxy_allowed() {
+                            match editor.review_system_proxy_permission() {
+                                Ok(review) => {
+                                    self.proxy_permission_pending = true;
+                                    self.records = Some(RecordFlow::Confirm(Box::new(review)));
+                                    editor.error = None;
+                                }
+                                Err(message) => editor.error = Some(message.into()),
+                            }
+                        } else {
+                            match crate::tui_system_proxy::Panel::open(editor.saved_path().to_owned(), editor.saved_sha256()) {
+                                Ok(panel) => {
+                                    self.system_proxy = Some(panel);
+                                    self.modal_action = 0;
+                                    editor.error = None;
+                                }
+                                Err(message) => editor.error = Some(message.into()),
+                            }
                         }
-                        Err(message) => editor.error = Some(message.into()),
                     }
                     #[cfg(not(windows))]
                     {
-                        editor.error = Some("Системный прокси: только Windows.".into());
+                        editor.error = Some("Системный прокси Linux пока не реализован. Выберите локальный HTTP/SOCKS5.".into());
                     }
                 }
                 return false;
@@ -3846,7 +3886,7 @@ fn draw_import(
             "Старый файл сохранён. Проверьте доступ отдельно; соединение и системный прокси не менялись. Enter/Esc: закрыть.".into(),
         ),
         ImportFlow::Saving => ("Сохранение профиля", "Создание нового приватного bearer и guarded TOML commit. Секрет не отображается.\nНикакого подключения или системного прокси.".into()),
-        ImportFlow::Done => ("Профиль сохранён", format!("Профиль: {}\n{}\nИмпорт не запустил новое соединение и не изменил системный прокси.\n\nEnter: перейти к подключению\nEsc: закончить без запуска\n\n{}",
+        ImportFlow::Done => ("Профиль сохранён", format!("Профиль: {}\n{}\nИмпорт не запустил новое соединение и не изменил системный прокси.\n\nEnter: выбрать режим подключения\nEsc: закончить без запуска\n\n{}",
             editor.map_or("Новый профиль", Editor::selected_record_id),
             if editor.is_some_and(Editor::selected_record_is_active) { "Профиль активен в настройках." } else { "Активный профиль не изменён. Перед подключением подтвердите выбор нового профиля." },
             editor.and_then(|e| e.error.as_deref()).unwrap_or(""))),
@@ -3864,7 +3904,7 @@ fn draw_import(
     match flow {
         ImportFlow::Preview { .. } => draw_guided(frame, area, title, &body, (3, 5, "Параметры и доверие", "Enter следующий шаг · c сертификат · y сохранить · Esc отменить"), viewport, (None, None)),
         ImportFlow::Saving => draw_guided(frame, area, title, &body, (4, 5, "Сохранение профиля", "Идёт запись · новое подключение не запускается"), viewport, (None, None)),
-        ImportFlow::Done => draw_guided(frame, area, title, &body, (5, 5, "Подключение", "Enter перейти к подключению · Esc закончить"), viewport, (None, None)),
+        ImportFlow::Done => draw_guided(frame, area, title, &body, (5, 5, "Подключение", "Enter выбрать режим · Esc закончить"), viewport, (None, None)),
         ImportFlow::ActivateConfirm => draw_guided(frame, area, title, &body, (5, 5, "Выбор профиля", "y подтвердить · n/Esc назад"), viewport, (None, None)),
         _ => panel_at(frame, area, title, &body, true, viewport),
     }
@@ -3897,7 +3937,7 @@ fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> 
     if count == 0 || area.height < 10 || (page == 1 && area.height < 25) { return None; }
     let action_height = (count as u16).saturating_add(2);
     // Actions stay near the information they operate on.
-    if area.width >= 76 && page != 1 && !(role == Role::Server && matches!(page, 2 | 3)) {
+    if area.width >= 76 && page != 1 && !(role == Role::Server && matches!(page, 2 | 3)) && !(role == Role::Client && page == 3) {
         let controls_width = (area.width / 2).clamp(36, 43);
         let parts = Layout::horizontal([Constraint::Min(36), Constraint::Length(controls_width)]).split(area);
         let height = area.height.min(action_height.max(15));
@@ -3908,7 +3948,7 @@ fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> 
     if area.height < 14 { return None; }
     let minimum = if page == 1 { 10 } else { 6 };
     let height = action_height.min(area.height.saturating_sub(minimum)).max(3);
-    let preferred = if page == 1 { 20 } else if role == Role::Server && matches!(page, 2 | 3) { 12 } else { 10 };
+    let preferred = if page == 1 { 20 } else if role == Role::Client && page == 3 { 17 } else if role == Role::Server && matches!(page, 2 | 3) { 12 } else { 10 };
     let content_height = preferred.min(area.height.saturating_sub(height));
     let content = Rect::new(area.x, area.y, area.width, content_height);
     let controls = Rect::new(area.x, content.bottom(), area.width, height);
@@ -3918,6 +3958,38 @@ fn user_table_start(selected: usize, count: usize, area: Rect) -> usize {
     let capacity = usize::from(area.height.saturating_sub(3)).max(1);
     selected.min(count.saturating_sub(1)).saturating_sub(capacity-1).min(count.saturating_sub(capacity))
 }
+fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Option<&Interaction>) {
+    let active = editor.workspace_records().into_iter().find(|(_, active, _)| *active)
+        .map(|(id, _, _)| id).unwrap_or_else(|| "Нет профиля".into());
+    let running = ui.is_some_and(|u| u.owned_running(Role::Client));
+    let (http, socks) = editor.client_proxy_addresses().unwrap_or(("—", "—"));
+    let mut lines = vec![
+        Line::styled(if running { "● Локальный процесс запущен / запускается" } else { "○ Локальный процесс не запущен" },
+            Style::default().fg(if running { ACCENT } else { MUTED }).add_modifier(Modifier::BOLD)),
+        Line::raw(format!("Активный профиль: {active}")),
+        Line::raw(format!("Выбран: {} · {}", editor.selected_record_id(), if editor.selected_reality() { "REALITY" } else { "Own-TLS" })),
+        Line::styled("j/k или мышь — выбрать профиль; A — активировать.", Style::default().fg(MUTED)),
+        Line::raw(""),
+        Line::styled("Системный прокси", Style::default().fg(if cfg!(windows) {TEXT} else {MUTED}).add_modifier(Modifier::BOLD)),
+        Line::raw(if cfg!(windows) {
+            if editor.system_proxy_allowed() { "Windows · разрешён в настройках; состояние ОС проверяется отдельно." } else { "Windows · требуется разрешение и подтверждение запуска." }
+        } else { "Недоступен на Linux · системная интеграция не реализована." }),
+        Line::styled("TUN / VPN", Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
+        Line::styled("Недоступен · backend не реализован.", Style::default().fg(MUTED)),
+        Line::raw(""),
+        Line::styled("Локальный прокси", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+        Line::raw(format!("HTTP {http}")),
+        Line::raw(format!("SOCKS5 {socks}")),
+        Line::styled("Для приложений с ручной настройкой прокси.", Style::default().fg(MUTED)),
+        Line::raw(""),
+        Line::styled("Выберите доступное действие справа или ниже. Enter открывает управление.", Style::default().fg(ACCENT)),
+    ];
+    if !editor.selected_record_is_active() {
+        lines.insert(4, Line::styled("Перед запуском подтвердите выбор профиля (A).", Style::default().fg(WARNING)));
+    }
+    frame.render_widget(Paragraph::new(lines).block(tui_widgets::section("Режим подключения", true)).wrap(Wrap { trim: true }), area);
+}
+
 fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui: Option<&Interaction>, compact: bool) {
     let page = ui.map_or(0, |u| u.workspace_page.min(6));
     let items = page_actions(role, page, Some(editor));
@@ -3964,6 +4036,8 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
             Line::raw("Enter — открыть действие. Сохранение не запускает процесс.")];
         frame.render_widget(Paragraph::new(lines).block(tui_widgets::section(title,true)).wrap(Wrap{trim:true}),content);
         }
+    } else if role == Role::Client && page == 3 {
+        draw_client_modes(frame, content, editor, ui);
     } else if page == 1 {
         draw_editor(frame, content, editor, focus == WorkspaceFocus::Fields);
     } else if role == Role::Server && matches!(page, 2 | 3) {
@@ -5395,8 +5469,9 @@ mod tests {
         capture("client-first-key-saved", &model, &ui);
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(ui.importing.is_none());
-        assert!(ui.reality_status.is_some());
-        assert!(!ui.reality_status.as_ref().unwrap().local_running());
+        assert!(ui.reality_status.is_none());
+        assert_eq!(ui.workspace_page, 3);
+        assert!(!ui.owned_running(Role::Client));
         capture("client-first-key-connect", &model, &ui);
     }
 
@@ -5494,8 +5569,9 @@ mod tests {
         }
         assert!(ui.importing.is_none());
         assert!(ui.editor.as_ref().unwrap().selected_record_is_active());
-        assert!(ui.reality_status.is_some());
-        assert!(!ui.reality_status.as_ref().unwrap().local_running());
+        assert!(ui.reality_status.is_none());
+        assert_eq!(ui.workspace_page, 3);
+        assert!(!ui.owned_running(Role::Client));
         fs::remove_file(ca).unwrap();
         fs::remove_file(config::lock_path(&path).unwrap()).unwrap();
         fs::remove_file(path).unwrap();

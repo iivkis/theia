@@ -1172,6 +1172,38 @@ impl Editor {
             .map(|inbound| inbound.server_name.as_str())
     }
 
+    /// Display the saved permission, never infer the operating-system state.
+    pub(crate) fn system_proxy_allowed(&self) -> bool {
+        matches!(&self.original, Config::Client(doc)
+            if doc.client.proxy.system_proxy == config::SystemProxy::Manual)
+    }
+
+    pub(crate) fn review_system_proxy_permission(&self) -> Result<RecordReview, &'static str> {
+        self.require_clean_records()?;
+        if self.write_uncertain { return Err("Откройте настройки заново."); }
+        let mut candidate = self.original.clone();
+        let Config::Client(doc) = &mut candidate else { return Err("Требуется клиентский профиль."); };
+        if doc.client.active_profile != self.selected_record_id() {
+            return Err("Сначала выберите активный профиль.");
+        }
+        doc.client.proxy.system_proxy = config::SystemProxy::Manual;
+        candidate.validate().map_err(|_| "Настройки клиента не прошли проверку.")?;
+        Ok(RecordReview {
+            source: self.saved_sha256(),
+            selected: self.selected_record_id().to_owned(),
+            candidate,
+            next_selection: self.selected_record,
+            body: "Разрешить управление системным прокси?\n\nTheia сможет менять HTTP(S)-прокси текущего пользователя Windows только после отдельного подтверждения.\nСейчас сохраняется только разрешение в файле настроек. Прокси Windows и соединение не изменятся.\n\ny: сохранить разрешение · n/Esc: отменить".into(),
+        })
+    }
+
+    pub(crate) fn client_proxy_addresses(&self) -> Option<(&str, &str)> {
+        match &self.original {
+            Config::Client(doc) => Some((&doc.client.proxy.http_listen, &doc.client.proxy.socks5_listen)),
+            _ => None,
+        }
+    }
+
     pub fn selected_record_is_active(&self) -> bool {
         match &self.draft {
             Config::Client(doc) => doc.client.active_profile == self.selected_record_id(),
