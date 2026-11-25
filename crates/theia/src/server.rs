@@ -3638,6 +3638,115 @@ mod hardening_tests {
         assert_eq!(result, Ok(second));
     }
 
+    #[tokio::test]
+    async fn generation_drain_observes_late_receivers_and_controller_loss() {
+        let (owner, mut receiver) = watch::channel(GenerationPhase::Prepared);
+        owner.send_replace(GenerationPhase::Active);
+        assert!(!generation_draining(&receiver));
+        owner.send_replace(GenerationPhase::Drain);
+        let mut late = owner.subscribe();
+        await_generation_drain(&mut receiver).await;
+        await_generation_drain(&mut late).await;
+        assert!(generation_draining(&receiver));
+        assert!(generation_draining(&late));
+
+        let (owner, mut receiver) = watch::channel(GenerationPhase::Active);
+        drop(owner);
+        await_generation_drain(&mut receiver).await;
+        assert!(generation_draining(&receiver));
+    }
+
+    async fn production_listener_drain(h3: bool, split: bool) {
+        let mut document = live_auth_fixture();
+        document.server.policy.allow_private_ips = true;
+        document.server.policy.max_connections_per_user = 4;
+        document.server.policy.max_connections_total = 8;
+        let context = Arc::new(ServerContext::new(
+            &document.server.inbounds[0], &document.server.users, &document.server.policy,
+        ));
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = signed.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(signed.key_pair.serialize_der());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let (owner, phase) = watch::channel(GenerationPhase::Active);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = if h3 {
+            let endpoint = crate::quic_transport::server_endpoint(remote, vec![cert], key.into()).unwrap();
+            drop(listener);
+            tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase))
+        } else {
+            let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
+                .with_no_client_auth().with_single_cert(vec![cert], key.into()).unwrap();
+            tls.alpn_protocols = vec![b"h2".to_vec()];
+            tokio::spawn(serve_generation(listener, TlsAcceptor::from(Arc::new(tls)), context, phase))
+        };
+        let token = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let address = Address::V4([127, 0, 0, 1]);
+
+        async fn exchange(app: &mut tokio::io::DuplexStream, data: &[u8]) {
+            app.write_all(data).await.unwrap();
+            let mut reply = vec![0; data.len()];
+            app.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, data);
+        }
+
+        macro_rules! exercise {
+            ($client:expr) => {{
+                let client = $client.with_stream_up(split).unwrap().with_connection_pool();
+                let tunnel = client.open(address.clone(), target_port).await.unwrap();
+                let (mut upstream, _) = target.accept().await.unwrap();
+                let echo = tokio::spawn(async move {
+                    let (mut read, mut write) = upstream.split();
+                    tokio::io::copy(&mut read, &mut write).await.unwrap();
+                    write.shutdown().await.unwrap();
+                });
+                let (mut app, local) = tokio::io::duplex(4096);
+                let relay = tokio::spawn(tunnel.relay(local));
+                exchange(&mut app, b"before drain").await;
+                owner.send_replace(GenerationPhase::Drain);
+                exchange(&mut app, b"existing stream after drain").await;
+                // Allow the native GOAWAY control exchange to be driven;
+                // new admission must fail while the old tunnel still works.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(client.open(address.clone(), target_port).await.is_err());
+                assert!(timeout(Duration::from_millis(50), target.accept()).await.is_err());
+                exchange(&mut app, b"existing stream after rejected admission").await;
+                app.shutdown().await.unwrap();
+                let mut tail = Vec::new();
+                app.read_to_end(&mut tail).await.unwrap();
+                assert!(tail.is_empty());
+                relay.await.unwrap().unwrap();
+                echo.await.unwrap();
+                drop(client);
+            }};
+        }
+
+        if h3 {
+            exercise!(crate::h3_client::H3Client::new(remote, "localhost", &token, roots)
+                .unwrap().with_connect_timeout(Duration::from_millis(500)).unwrap());
+        } else {
+            exercise!(crate::client::H2Client::new(&remote.to_string(), "localhost", &token, roots).unwrap());
+        }
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_generation_drain_preserves_admitted_h2_h3_tunnels() {
+        timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                production_listener_drain(false, false),
+                production_listener_drain(false, true),
+                production_listener_drain(true, false),
+                production_listener_drain(true, true),
+            );
+        }).await.expect("bounded production drain matrix");
+    }
+
     fn live_auth_fixture() -> ServerDocument {
         use crate::config::{Management, ServerSettings, Ui};
         let digest = |byte: u8| -> String {
