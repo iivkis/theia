@@ -1695,6 +1695,9 @@ async fn handle(
                 };
                 let _ = timeout(REPLY_TIMEOUT, socks_reply(&mut socket, code)).await;
             }
+            // Send an orderly FIN after the terminal denial. Never reopen a
+            // tunnel or retry the rejected remote request.
+            let _ = timeout(REPLY_TIMEOUT, socket.shutdown()).await;
             Err(error)
         }
     }
