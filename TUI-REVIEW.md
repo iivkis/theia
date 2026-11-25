@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (3b210f224a7e096297cf45a59a919d437891c5a4) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (b27e7d37000a93be9215e43a90f54c3ae71a2631) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -21,3 +21,5 @@ The local proxy gallery waits for the actual status result and captures the expl
 Both REALITY and Own-TLS local proxy status and start confirmation are captured after the read-only check, with assertions for clear Russian labels, no internal profile ID in the connection view and the common confirmation layout.
 
 The navigation review captures both horizontal role selections and the section, record, field and action focus reached through actual arrow keys, with independent tests for menu boundaries and no implicit execution. Shortcut aliases remain available but are not printed next to ordinary actions.
+
+This review pins the unified vertical action layout and explicit confirmation choices (cancel selected initially), tests confirmation focus versus execution, direct profile selection and wrapped long addresses, and checks opt-in technical server status. The gallery captures actual keyboard-driven choices without starting real network listeners.

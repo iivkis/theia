@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: 3b210f224a7e096297cf45a59a919d437891c5a4
+          ref: b27e7d37000a93be9215e43a90f54c3ae71a2631
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -84,6 +84,11 @@ jobs:
             workspace_navigation_and_actions_do_not_write_on_focus \
             opens_existing_actions_without_requiring_shortcuts \
             action_selection_matches_rendered_rows_and_enter_dispatches_only_one_key \
+            confirmation_choices_default_to_cancel_and_never_execute_on_focus \
+            direct_profile_selection_wraps_long_addresses_without_activating \
+            technical_status_is_opt_in_and_never_starts_a_worker \
+            review_layout_keeps_actions_near_content_at_120_columns \
+            dirty_draft_guards_quit_and_navigation_while_editing_is_isolated \
             visual_review_gallery
           do
             echo "::group::$test"
@@ -133,7 +138,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "3b210f224a7e096297cf45a59a919d437891c5a4"
+          assert manifest["source_sha"] == "b27e7d37000a93be9215e43a90f54c3ae71a2631"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:

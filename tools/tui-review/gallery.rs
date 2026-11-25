@@ -70,8 +70,13 @@ fn visual_review_gallery() {
         let screen = rendered_interaction(120, 40, &model, &ui);
         assert!(!screen.contains(uri.as_str()));
         assert!(!screen.contains("Файл допуска (admission)"));
+        assert!(screen.contains("› Отменить"));
         review_capture("client-reality-key-trust-review", &model, &ui);
-        ui.update(&mut model, press(KeyCode::Char('y')));
+        ui.update(&mut model, press(KeyCode::Right));
+        assert!(ui.confirm_selected);
+        assert!(!path.exists());
+        review_capture("client-reality-key-trust-selected", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Enter));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while ui.config_dialog.is_some() {
             ui.poll_navigation(&mut model);
@@ -115,8 +120,13 @@ fn visual_review_gallery() {
         assert!(screen.contains("ШАГ 1/1"));
         assert!(screen.contains("Следующее действие"));
         assert!(!ui.owned_running(Role::Client));
+        assert!(screen.contains("› Отменить"));
         review_capture("client-reality-local-proxy-start-confirm", &model, &ui);
-        ui.update(&mut model, press(KeyCode::Char('n')));
+        ui.update(&mut model, press(KeyCode::Right));
+        assert!(!ui.owned_running(Role::Client));
+        review_capture("client-reality-local-proxy-start-selected", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Left));
+        ui.update(&mut model, press(KeyCode::Enter));
         assert!(!ui.owned_running(Role::Client));
     }
     let mut modes = Interaction::new(Some(Editor::load(Role::Client, &client).unwrap()));
@@ -142,9 +152,36 @@ fn visual_review_gallery() {
     let screen = rendered_interaction(120, 40, &client_model, &modes);
     assert!(screen.contains("ШАГ 1/1"));
     assert!(screen.contains("Следующее действие"));
+    assert!(screen.contains("› Отменить"));
     review_capture("client-local-proxy-start-confirm", &client_model, &modes);
-    modes.update(&mut client_model, press(KeyCode::Char('n')));
+    modes.update(&mut client_model, press(KeyCode::Enter));
     assert!(!modes.owned_running(Role::Client));
+    {
+        use crate::config::{self, Config};
+        let path = root.join("multiple-profiles.toml");
+        let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else { panic!("client fixture") };
+        let mut profile = doc.client.profiles[0].clone();
+        profile.id = "backup".into();
+        profile.server = "long-label-for-testing-profile-address.example.org:443".into();
+        doc.client.profiles.push(profile);
+        let original = Config::Client(doc).to_toml().unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Char('P')));
+        let items = page_actions(Role::Client, 3, ui.editor.as_ref());
+        ui.workspace_action = items.iter().position(|a| a.key == 'L').unwrap();
+        review_capture("client-direct-profile-action", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Down));
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
+        assert!(!ui.editor.as_ref().unwrap().selected_record_is_active());
+        review_capture("client-direct-profile-selection", &model, &ui);
+        ui.update(&mut model, press(KeyCode::F(7)));
+        review_capture("client-direct-profile-full-address", &model, &ui);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!ui.owned_running(Role::Client));
+    }
     let mut model = Model::new(None);
     let mut ui = Interaction::new(None);
     review_capture("home-role-selection", &model, &ui);
@@ -218,6 +255,8 @@ fn visual_review_gallery() {
         review_capture(&format!("{prefix}-focus-navigation"), &model, &ui);
         ui.update(&mut model, press(KeyCode::Down));
         assert_eq!(ui.workspace_page, 1);
+        ui.update(&mut model, press(KeyCode::Right));
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
         ui.update(&mut model, press(KeyCode::Right));
         assert_eq!(ui.workspace_focus, WorkspaceFocus::Fields);
         review_capture(&format!("{prefix}-focus-fields"), &model, &ui);
