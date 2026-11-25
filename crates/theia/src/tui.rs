@@ -1376,6 +1376,15 @@ impl Interaction {
         None
     }
 
+    fn diagnostic_actions(&self) -> Vec<ActionItem> {
+        if let Some(p) = &self.domain { return p.report_actions(); }
+        if let Some(p) = &self.candidate_batch { return p.report_actions(); }
+        if let Some(p) = &self.candidates { return p.report_actions(); }
+        if let Some(p) = &self.probe { return p.report_actions(); }
+        if let Some(p) = &self.discovery { return p.report_actions(); }
+        Vec::new()
+    }
+
     fn active_form(&self) -> Option<Form> {
         if let Some(browser) = &self.import_browser {
             return Some(browser.form());
@@ -1562,6 +1571,16 @@ impl Interaction {
                 .hit(controls, event.column, event.row)
                 {
                     self.modal_action = i;
+                }
+            }
+            return;
+        }
+        let diagnostic_items = self.diagnostic_actions();
+        if !diagnostic_items.is_empty() {
+            if let Some(controls) = self.viewport.action_rect.get() {
+                if let Some(index) = (Actions { items: &diagnostic_items, selected: self.modal_action })
+                    .hit(controls, event.column, event.row) {
+                    self.modal_action = index;
                 }
             }
             return;
@@ -2057,6 +2076,14 @@ impl Interaction {
                 self.modal_action = 0;
             }
             return false;
+        }
+        let diagnostic_items = self.diagnostic_actions();
+        if !diagnostic_items.is_empty() && key.modifiers.is_empty() {
+            let Some(code) = tui_widgets::action_key(&diagnostic_items, &mut self.modal_action, key.code) else {
+                return false;
+            };
+            key.code = code;
+            self.modal_action = 0;
         }
         if let Some(domain) = self.domain.as_mut() {
             if domain.is_manual_input() {
@@ -4164,6 +4191,15 @@ fn report_action_layout(area: Rect, count: usize, body: &str) -> Option<[Rect; 2
     tui_widgets::action_layout_rows(area, count, rows)
 }
 
+fn diagnostic_report(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, items: &[ActionItem], selected: usize, viewport: Option<&Viewport>) {
+    tui_widgets::canvas(frame, area);
+    if let Some([report, controls]) = report_action_layout(area, items.len(), body) {
+        if let Some(v) = viewport { v.action_rect.set(Some(controls)); }
+        panel_at(frame, report, title, body, false, viewport);
+        Actions { items, selected }.render(frame, controls);
+    } else { panel_at(frame, area, title, body, true, viewport); }
+}
+
 fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bool) {
     panel_at(frame, area, title, body, focused, None);
 }
@@ -4780,19 +4816,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                     1,
                     2,
                     "Выбор адреса",
-                    "↑↓ выбрать · Space отметить IP · Enter предпросмотр · m домен · Esc назад",
+                    "↑↓ выбрать · Пробел отметить IP · Enter предпросмотр · Esc назад",
                 ),
                 viewport,
                 (Some(form), None),
             );
         } else {
-            modal_panel!(
-                frame,
-                parts[1],
-                "Каталог TLS-референсов",
-                &domain.body(),
-                true
-            );
+            diagnostic_report(frame, parts[1], "Каталог TLS-референсов", &domain.body(), &domain.report_actions(), interaction.map_or(0, |u| u.modal_action), viewport);
         }
     } else if let Some(batch) = interaction.and_then(|ui| ui.candidate_batch.as_ref()) {
         if let Some(form) = batch.form() {
@@ -4811,38 +4841,14 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 (Some(form), None),
             );
         } else {
-            modal_panel!(
-                frame,
-                parts[1],
-                "Проверка выбранных IP",
-                &batch.body(),
-                true
-            );
+            diagnostic_report(frame, parts[1], "Проверка выбранных IP", &batch.body(), &batch.report_actions(), interaction.map_or(0, |u| u.modal_action), viewport);
         }
     } else if let Some(review) = interaction.and_then(|ui| ui.candidates.as_ref()) {
-        modal_panel!(
-            frame,
-            parts[1],
-            "Области поиска референсов (офлайн)",
-            &review.body(),
-            true,
-        );
+        diagnostic_report(frame, parts[1], "Области поиска референсов (офлайн)", &review.body(), &review.report_actions(), interaction.map_or(0, |u| u.modal_action), viewport);
     } else if let Some(probe) = interaction.and_then(|ui| ui.probe.as_ref()) {
-        modal_panel!(
-            frame,
-            parts[1],
-            "TLS/H2 + QUIC/H3: только один разрешённый IP:443",
-            &probe.body(),
-            true,
-        );
+        diagnostic_report(frame, parts[1], "TLS/H2 + QUIC/H3: только один разрешённый IP:443", &probe.body(), &probe.report_actions(), interaction.map_or(0, |u| u.modal_action), viewport);
     } else if let Some(discovery) = interaction.and_then(|ui| ui.discovery.as_ref()) {
-        modal_panel!(
-            frame,
-            parts[1],
-            "Публичный IP и план кандидатов (без сканирования)",
-            &discovery.body(),
-            true,
-        );
+        diagnostic_report(frame, parts[1], "Публичный IP и план кандидатов (без сканирования)", &discovery.body(), &discovery.report_actions(), interaction.map_or(0, |u| u.modal_action), viewport);
     }
     #[cfg(windows)]
     if let Some(proxy) = interaction.and_then(|ui| ui.system_proxy.as_ref()) {
@@ -4873,6 +4879,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     let footer = if viewport.is_some_and(|v| v.guided.get()) {
         ""
+    } else if viewport.is_some_and(|v| v.action_rect.get().is_some()) {
+        "↑ ↓ выбор · Enter открыть · Esc назад · Shift+PgUp/PgDn прокрутка"
     } else if interaction.is_some_and(|ui| !ui.workspace_visible()) {
         "Esc назад · Shift+PgUp/PgDn прокрутка · F7 детали"
     } else {
@@ -8761,7 +8769,7 @@ mod tests {
         assert!(matches!(ui.issuance, Some(IssueFlow::Confirm(_))));
         let review = rendered_interaction(120, 40, &model, &ui);
         assert!(review.contains("всех подключений"));
-        assert!(review.contains("Ctrl+R"));
+        assert!(review.contains("отдельного применения прав"));
         assert!(!review.contains("theia://v1/"));
         let Config::Server(before) = config::read_file(&path).unwrap() else {
             panic!("server");
@@ -9028,6 +9036,30 @@ mod tests {
         assert!(!ui.update(&mut model, press(KeyCode::Esc)));
         assert!(ui.probe.is_none());
         assert!(ui.discovery.is_some());
+    }
+
+    #[test]
+    fn diagnostics_menu_navigation_never_grants_network_consent() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        ui.update(&mut model, press(KeyCode::Char('p')));
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Узнать внешний IP"));
+        assert!(screen.contains("Посмотреть области поиска"));
+        ui.update(&mut model, press(KeyCode::Down));
+        assert!(!ui.discovery.as_ref().unwrap().is_consent_pending());
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.candidates.is_some());
+        assert!(!ui.candidates.as_ref().unwrap().has_scope());
+        ui.update(&mut model, press(KeyCode::End));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.domain.is_some());
+        assert!(!ui.domain.as_ref().unwrap().is_running());
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.domain.as_ref().unwrap().is_dns_confirming());
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(!ui.domain.as_ref().unwrap().is_running());
+        assert!(!ui.domain.as_ref().unwrap().is_dns_confirming());
     }
 
     #[test]
