@@ -456,7 +456,13 @@ fn create_first_server(input: WizardInput, state: reference_health::State) -> Re
         listen: input.listen,
         grants: input.grants,
     };
-    let candidate = reality_config::first_server_candidate(&request, now)?;
+    let candidate = match reality_config::first_server_candidate(&request, now) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            owned.cleanup()?;
+            return Err(error);
+        }
+    };
     match config::guarded_create(&input.config, &candidate) {
         Ok(()) => owned.preserve(),
         Err(config::WriteFailure::BeforeReplace(_)) => {
@@ -500,8 +506,13 @@ fn rank_checked(
     let (targets, observed): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
     let plan = input.plan(targets)?;
     let state = reference_health::State::new(plan, observed, now).map_err(|_| Error::Health)?;
-    report.push_str(&state.plan().preview().map_err(|_| Error::Health)?);
-    report.push_str("\nОсновной — первый; остальные — резервы. Создать health и private bundle? Runtime не меняется.\ny: создать; n/Esc: отменить.");
+    report.push_str("\nПРЕДЛОЖЕННЫЙ НАБОР\n");
+    for (index, target) in state.plan().references.iter().enumerate() {
+        let role = if index == 0 { "Основной".to_owned() } else { format!("Резерв {index}") };
+        report.push_str(&format!("{role}: {}  ({})\n", target.server_name, target.address));
+    }
+    report.push_str(&format!("\nСервер: {}\nПорт: {}\nПользователи: {}\n", input.endpoint, input.listen.port(), input.grants.join(", ")));
+    report.push_str("\nСоздать защищённые материалы? Сервер не будет запущен.\ny: создать; n/Esc: назад.");
     Ok((state, report))
 }
 
@@ -1138,6 +1149,58 @@ impl ProvisionPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_server_wizard_publishes_only_after_review_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("first-reality-server").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut wizard = Wizard::first(path.clone()).unwrap();
+        wizard.fields[2] = "edge.example.org".into();
+        wizard.fields[3] = "93.184.216.1".into();
+        wizard.fields[4] = "reference.example.org=93.184.216.2".into();
+        wizard.fields[5] = "owner".into();
+        let input = WizardInput::parse(path.clone(), None, &wizard.fields).unwrap();
+        let plan = input.plan(vec![Target {
+            server_name: "reference.example.org".into(),
+            address: "93.184.216.2:443".parse().unwrap(),
+        }]).unwrap();
+        let now = reference_health::unix_now().unwrap();
+        let (state, report) = rank_checked(&input, plan, vec![Evidence {
+            h2_status: Some(200), h3_status: None,
+        }], now).unwrap();
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        wizard.stage = WizardStage::CreateConfirm(Box::new((input.clone(), state.clone(), report.clone())));
+        assert!(!path.exists() && !input.bundle.exists());
+        assert!(!wizard.key(press(KeyCode::Esc)));
+        assert!(matches!(wizard.stage, WizardStage::Input));
+        assert!(!path.exists() && !input.health.exists());
+        wizard.stage = WizardStage::CreateConfirm(Box::new((input.clone(), state.clone(), report)));
+        assert!(!wizard.key(press(KeyCode::Char('y'))));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let editor = loop {
+            if let Some(editor) = wizard.poll() {
+                break editor;
+            }
+            assert!(std::time::Instant::now() < deadline, "{}", wizard.body());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(editor.selected_reality());
+        let before = std::fs::read(&path).unwrap();
+        let Config::Server(doc) = config::parse(std::str::from_utf8(&before).unwrap()).unwrap() else {
+            panic!("server expected");
+        };
+        assert_eq!(doc.server.inbounds.len(), 1);
+        assert_eq!(doc.server.users.len(), 1);
+        assert!(doc.server.users[0].disabled);
+        assert_eq!(doc.server.inbounds[0].allowed_user_ids, vec!["owner"]);
+        assert!(doc.server.inbounds[0].tls_cert.is_empty());
+        assert!(doc.server.inbounds[0].tls_key.is_empty());
+        assert!(input.bundle.exists() && input.health.exists());
+        assert!(create_first_server(input, state).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn bound_wizard_keeps_dns_probe_creation_and_registration_separate() {
