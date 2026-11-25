@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: b27e7d37000a93be9215e43a90f54c3ae71a2631
+Source: 8ea9f17a47d147ace551dee09f5c7f1f68be653b
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -254,9 +254,21 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-command-menu](server-command-menu.png)
 
+## server-discovery-actions
+
+![server-discovery-actions](server-discovery-actions.png)
+
 ## server-discovery-consent
 
 ![server-discovery-consent](server-discovery-consent.png)
+
+## server-domain-catalog
+
+![server-domain-catalog](server-domain-catalog.png)
+
+## server-domain-dns-confirm
+
+![server-domain-dns-confirm](server-domain-dns-confirm.png)
 
 ## server-file-picker
 
@@ -309,6 +321,14 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-page-users
 
 ![server-page-users](server-page-users.png)
+
+## server-reality-status-summary
+
+![server-reality-status-summary](server-reality-status-summary.png)
+
+## server-reality-status-technical
+
+![server-reality-status-technical](server-reality-status-technical.png)
 
 ## server-reference-candidate-groups
 
@@ -370,6 +390,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-issuance-new-offer](state-issuance-new-offer.png)
 
+## state-issuance-new-reveal-confirm
+
+![state-issuance-new-reveal-confirm](state-issuance-new-reveal-confirm.png)
+
 ## state-issuance-recover-confirm
 
 ![state-issuance-recover-confirm](state-issuance-recover-confirm.png)
@@ -386,6 +410,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-issuance-recover-offer](state-issuance-recover-offer.png)
 
+## state-issuance-recover-reveal-confirm
+
+![state-issuance-recover-reveal-confirm](state-issuance-recover-reveal-confirm.png)
+
 ## state-issuance-rotate-confirm
 
 ![state-issuance-rotate-confirm](state-issuance-rotate-confirm.png)
@@ -401,3 +429,7 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## state-issuance-rotate-offer
 
 ![state-issuance-rotate-offer](state-issuance-rotate-offer.png)
+
+## state-issuance-rotate-reveal-confirm
+
+![state-issuance-rotate-reveal-confirm](state-issuance-rotate-reveal-confirm.png)
