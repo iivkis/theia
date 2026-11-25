@@ -2350,7 +2350,7 @@ fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bo
 fn guided_layout(area: Rect, count: Option<usize>, review_rows: usize) -> [Rect; 3] {
     let mut area = centered_column(area, 132);
     let preferred = count.map_or_else(
-        || review_rows.saturating_add(7).clamp(10, 40),
+        || review_rows.saturating_add(8).clamp(10, 40),
         |count| count.saturating_mul(3).saturating_add(10).clamp(18, 36),
     ) as u16;
     let height = area.height.min(preferred);
@@ -2359,7 +2359,8 @@ fn guided_layout(area: Rect, count: Option<usize>, review_rows: usize) -> [Rect;
     if area.height < 10 {
         return [Rect::new(area.x, area.y, area.width, 0), area, Rect::new(area.x, area.bottom(), area.width, 0)];
     }
-    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(2)]).split(area);
+    let footer = if area.width < 72 { 3 } else { 2 };
+    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(footer)]).split(area);
     [parts[0], parts[1], parts[2]]
 }
 
@@ -2383,8 +2384,7 @@ fn draw_guided(
     let review_lines = if form.is_none() {
         Some(match &review {
             Some(review) => review.lines(width),
-            None => visual_rows(body, usize::from(width)).0.into_iter()
-                .map(|line| Line::from(line.spans.into_iter().map(|span| Span::styled(span.content.into_owned(), span.style)).collect::<Vec<_>>())).collect(),
+            None => visual_rows(body, usize::from(width)).0,
         })
     } else {
         None
