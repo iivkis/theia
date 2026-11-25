@@ -754,6 +754,99 @@ pub async fn run_file_with_system_proxy(config_path: &Path) -> Result<(), Client
     run_file_inner(config_path, true).await
 }
 
+// The process-level generation owns the exact saved config. Old accepted
+// sockets retain their carrier clone; only new accepts use the new snapshot.
+#[cfg(any(target_os="linux",target_os="windows"))]
+struct ClientView{
+    document:config::ClientDocument,
+    digest:[u8;32],
+    revision:u64,
+    client:ProxyClient,
+}
+#[cfg(any(target_os="linux",target_os="windows"))]
+pub(crate) struct ClientRuntime{
+    path:std::path::PathBuf,
+    slot:tokio::sync::watch::Sender<Arc<ClientView>>,
+    // Bound one staging operation per process, with no commit on cancellation.
+    stage:tokio::sync::Mutex<()>,
+}
+#[cfg(any(target_os="linux",target_os="windows"))]
+impl ClientRuntime{
+    fn new(path:std::path::PathBuf,document:config::ClientDocument,digest:[u8;32],client:ProxyClient)->Arc<Self>{
+        let (slot,_)=tokio::sync::watch::channel(Arc::new(ClientView{document,digest,revision:1,client}));
+        Arc::new(Self{path,slot,stage:tokio::sync::Mutex::new(())})
+    }
+    pub(crate) async fn status(&self)->(u64,[u8;32],u64,u8,bool){
+        let view=self.slot.borrow().clone();
+        let (desc,transport,fallback)=match &view.client{
+            ProxyClient::Reality(r)=>{
+                let g=r.current.lock().await.clone();
+                let fallback=match &g.carrier{
+                    RealityCarrier::Auto(a)=>a.negative.lock().ok().is_some_and(|c|c.route.is_some()
+                        && c.route==route_source(a.h3.remote()) && c.expires.is_some_and(|t|t>Instant::now())),
+                    _=>false,
+                };
+                (g.value.descriptor().revision,g.last_transport.load(std::sync::atomic::Ordering::Relaxed),fallback)
+            }
+            _=>(0,0,false),
+        };
+        (view.revision,view.digest,desc,transport,fallback)
+    }
+    async fn candidate(&self,previous:&ClientView,digest:[u8;32])->Result<(config::ClientDocument,ProxyClient),ClientError>{
+        let raw=saved_client_bytes(&self.path,digest)?;
+        let Config::Client(candidate)=config::parse(std::str::from_utf8(&raw).map_err(|_|ClientError::Configuration)?)
+            .map_err(|_|ClientError::Configuration)? else{return Err(ClientError::Configuration);};
+        // Structural loopback and OS proxy changes require explicit stop/start.
+        if candidate.client.proxy!=previous.document.client.proxy ||
+            candidate.management!=previous.document.management{return Err(ClientError::Configuration);}
+        let old=previous.document.client.profiles.iter().find(|p|p.id==previous.document.client.active_profile)
+            .ok_or(ClientError::Configuration)?;
+        let next=candidate.client.profiles.iter().find(|p|p.id==candidate.client.active_profile)
+            .ok_or(ClientError::Configuration)?;
+        // No in-place replacement of any existing independently enrolled root.
+        for prior in &previous.document.client.profiles{
+            if let Some(new)=candidate.client.profiles.iter().find(|p|p.id==prior.id){
+                if prior.reality_profile!=new.reality_profile||prior.tls_profile!=new.tls_profile{
+                    return Err(ClientError::Configuration);
+                }
+            }
+        }
+        if old.tls_profile!=next.tls_profile{return Err(ClientError::Configuration);}
+        let client=load_client(next).await?;
+        saved_client_bytes(&self.path,digest)?;
+        Ok((candidate,client))
+    }
+    pub(crate) async fn change(&self,expected:u64,digest:[u8;32],apply:bool)->Result<u64,ClientError>{
+        let _stage=self.stage.try_lock().map_err(|_|ClientError::Configuration)?;
+        let previous=self.slot.borrow().clone();
+        if previous.revision!=expected || previous.digest==digest{return Err(ClientError::Configuration);}
+        let (document,client)=self.candidate(&previous,digest).await?;
+        if !apply{return Ok(expected);}
+        let revision=expected.checked_add(1).ok_or(ClientError::Configuration)?;
+        // No await between final exact-byte recheck and publication.
+        saved_client_bytes(&self.path,digest)?;
+        self.slot.send_replace(Arc::new(ClientView{document,digest,revision,client}));
+        Ok(revision)
+    }
+    async fn maintain(&self)->Result<(),ClientError>{
+        let mut changes=self.slot.subscribe();
+        loop{
+            let view=changes.borrow_and_update().clone();
+            let maintenance=async{
+                match &view.client{
+                    ProxyClient::Auto(a)=>a.maintain().await,
+                    ProxyClient::Reality(r)=>r.maintain().await,
+                    _=>std::future::pending::<Result<(),ClientError>>().await,
+                }
+            };
+            tokio::select!{
+                result=maintenance=>return result,
+                result=changes.changed()=>if result.is_err(){return Err(ClientError::Io);},
+            }
+        }
+    }
+}
+
 async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result<(), ClientError> {
     crate::diag!(
         Info,
@@ -761,12 +854,34 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
         "config_read_begin",
         "system_proxy_requested" = Value::Flag(enable_system_proxy)
     );
-    let Config::Client(document) =
-        config::read_file(config_path).map_err(|_| ClientError::Configuration)?
-    else {
-        return Err(ClientError::Configuration);
+    let raw=zeroize::Zeroizing::new(config::editor_bytes(config_path).map_err(|_|ClientError::Configuration)?);
+    let Config::Client(document)=config::parse(std::str::from_utf8(&raw).map_err(|_|ClientError::Configuration)?)
+        .map_err(|_|ClientError::Configuration)? else{return Err(ClientError::Configuration);};
+    let (http,socks,client)=prepare_proxy(&document).await?;
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let managed={
+        use sha2::{Digest,Sha256};
+        let digest:[u8;32]=Sha256::digest(raw.as_slice()).into();
+        saved_client_bytes(config_path,digest)?;
+        ClientRuntime::new(std::path::absolute(config_path).map_err(|_|ClientError::Configuration)?,document.clone(),digest,client.clone())
     };
-    let (http, socks, client) = prepare_proxy(&document).await?;
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let control=crate::management::client_server(managed.clone()).map_err(|_|ClientError::Configuration)?;
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let serving=async move{
+        let management=async move{
+            match control{
+                Some(server)=>server.serve().await.map_err(|_|ClientError::Io),
+                None=>std::future::pending::<Result<(),ClientError>>().await,
+            }
+        };
+        tokio::select!{
+            result=serve_managed_proxy(http,socks,managed)=>result,
+            result=management=>result,
+        }
+    };
+    #[cfg(not(any(target_os="linux",target_os="windows")))]
+    let serving=serve_proxy(http,socks,client);
     #[cfg(windows)]
     if enable_system_proxy {
         // A config declaration is insufficient by itself: this branch
@@ -781,7 +896,7 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
         // destructors; persistent registry journal permits explicit recovery
         // on the next invocation, without overwriting a foreign proxy change.
         let result = tokio::select! {
-            result = serve_proxy(http, socks, client) => result,
+            result = serving => result,
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|_| ClientError::SystemProxy)
             }
@@ -793,7 +908,7 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     if enable_system_proxy {
         return Err(ClientError::SystemProxy);
     }
-    serve_proxy(http, socks, client).await
+    serving.await
 }
 
 /// Shared startup preflight: never changes the OS proxy or claims an
@@ -931,11 +1046,27 @@ pub async fn serve(
     serve_proxy(http, socks, ProxyClient::H2(client)).await
 }
 
-async fn serve_proxy(
-    http: TcpListener,
-    socks: TcpListener,
-    client: ProxyClient,
-) -> Result<(), ClientError> {
+async fn serve_proxy(http:TcpListener,socks:TcpListener,client:ProxyClient)->Result<(),ClientError>{
+    let maintenance=async{
+        match &client{
+            ProxyClient::Auto(a)=>a.maintain().await,
+            ProxyClient::Reality(r)=>r.maintain().await,
+            _=>std::future::pending::<Result<(),ClientError>>().await,
+        }
+    };
+    serve_proxy_loop(http,socks,||client.clone(),maintenance).await
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
+async fn serve_managed_proxy(http:TcpListener,socks:TcpListener,runtime:Arc<ClientRuntime>)->Result<(),ClientError>{
+    serve_proxy_loop(http,socks,||runtime.slot.borrow().client.clone(),runtime.maintain()).await
+}
+
+async fn serve_proxy_loop(
+    http:TcpListener,socks:TcpListener,
+    current:impl Fn()->ProxyClient,
+    maintenance:impl std::future::Future<Output=Result<(),ClientError>>,
+)->Result<(),ClientError>{
     // Preserve the boundary even for callers bypassing TOML validation.
     for listener in [&http, &socks] {
         let addr = listener.local_addr().map_err(|_| ClientError::Io)?;
@@ -956,13 +1087,6 @@ async fn serve_proxy(
     let mut tasks = JoinSet::new();
     // Tied to this accept loop: shutdown or cancellation drops maintenance,
     // including any in-flight QUIC probe, before releasing the profile.
-    let maintenance = async {
-        match &client {
-            ProxyClient::Auto(auto) => auto.maintain().await,
-            ProxyClient::Reality(reality) => reality.maintain().await,
-            _ => std::future::pending::<Result<(), ClientError>>().await,
-        }
-    };
     tokio::pin!(maintenance);
     loop {
         let (socket, is_http) = tokio::select! {
@@ -988,7 +1112,7 @@ async fn serve_proxy(
             );
             continue;
         };
-        let client = client.clone();
+        let client=current();
         tasks.spawn(async move {
             let _slot = slot;
             let result = handle(socket, is_http, &client, session_id).await;

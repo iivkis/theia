@@ -67,6 +67,26 @@ async fn main() {
                 Err(CliError::NotImplemented("Windows user proxy"))
             }
         }
+        Ok(Command::ClientStatus)=>{
+            match management::query_client_environment(management::StatusCommand::ClientStatus).await{
+                Ok(management::StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,fallback})=>{
+                    let digest=config_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                    Ok(format!("client running; revision={revision}; config_sha256={digest}; descriptor_revision={descriptor_revision}; last_open_transport={transport}; h3_negative_cache={fallback}"))
+                }
+                Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error)=>Err(CliError::Management(error)),
+            }
+        }
+        Ok(Command::ClientApply{expected_revision,candidate_sha256,apply})=>{
+            let command=if apply{management::StatusCommand::ClientApply{expected_revision,candidate_sha256}}
+                else{management::StatusCommand::ClientPreview{expected_revision,candidate_sha256}};
+            match management::query_client_environment(command).await{
+                Ok(management::StatusReply::ClientReady{revision})=>Ok(format!("client candidate ready; revision={revision}; nothing applied")),
+                Ok(management::StatusReply::ClientApplied{revision})=>Ok(format!("client carrier applied; revision={revision}; existing tunnels retained")),
+                Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error)=>Err(CliError::Management(error)),
+            }
+        }
         Ok(Command::ClientProxyStatus) => {
             #[cfg(windows)]
             {

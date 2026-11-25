@@ -35,10 +35,12 @@ use tokio::{
 const SOCKET_NAME: &str = "theia-server.sock";
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os="linux",target_os="windows"))]
+pub(crate) const CLIENT_TIMEOUT:Duration=Duration::from_secs(15);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_COMMAND_BYTES: usize = 256;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) const MAX_RESPONSE_BYTES: u64 = 128;
+pub(crate) const MAX_RESPONSE_BYTES: u64 = 256;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_CLIENTS: usize = 8;
 
@@ -76,6 +78,9 @@ impl std::error::Error for ManagementError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCommand {
+    ClientStatus,
+    ClientPreview{expected_revision:u64,candidate_sha256:[u8;32]},
+    ClientApply{expected_revision:u64,candidate_sha256:[u8;32]},
     Health,
     Status,
     /// Explicitly rejected in this read-only slice. Never reload implicitly.
@@ -125,6 +130,9 @@ pub enum StatusCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusReply {
+    ClientRunning{revision:u64,config_sha256:[u8;32],descriptor_revision:u64,transport:u8,fallback:bool},
+    ClientReady{revision:u64},
+    ClientApplied{revision:u64},
     Healthy,
     Running {
         inbounds: usize,
@@ -218,6 +226,7 @@ pub struct StatusServer {
     live: Option<Arc<crate::live_auth::LiveAuthorization>>,
     runtime: Option<Arc<crate::runtime_generation::State>>,
     restarts: Option<mpsc::Sender<crate::runtime_generation::RestartRequest>>,
+    client:Option<Arc<crate::local_proxy::ClientRuntime>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -248,6 +257,7 @@ impl StatusServer {
             live: None,
             runtime: None,
             restarts: None,
+            client:None,
         })
     }
 
@@ -269,6 +279,9 @@ impl StatusServer {
         self
     }
 
+    pub(crate) fn with_client(mut self,client:Arc<crate::local_proxy::ClientRuntime>)->Self{
+        self.client=Some(client);self
+    }
     pub(crate) fn with_runtime(mut self,state:Arc<crate::runtime_generation::State>)->Self{
         self.runtime=Some(state);
         self
@@ -312,14 +325,15 @@ impl StatusServer {
                         let live = self.live.clone();
                         let runtime = self.runtime.clone();
                         let restarts = self.restarts.clone();
+                        let client=self.client.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
                             // Only the live supervisor owns generation commits.
-                            let _ = timeout(
-                                IO_TIMEOUT,
-                                handle_internal(stream, inbounds, preflight, live, runtime, restarts),
-                            )
-                            .await;
+                            if let Some(client)=client{
+                                let _=timeout(CLIENT_TIMEOUT,handle_client(stream,client)).await;
+                            }else{
+                                let _=timeout(IO_TIMEOUT,handle_internal(stream,inbounds,preflight,live,runtime,restarts)).await;
+                            }
                         });
                     }
                     // Over budget: close socket immediately, never build a
@@ -829,6 +843,36 @@ fn parse_bound_command(command: &[u8], prefix: &[u8]) -> Option<(u64, [u8; 32])>
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) async fn handle_client<S>(mut stream:S,client:Arc<crate::local_proxy::ClientRuntime>)->Result<(),ManagementError>
+where S:AsyncRead+AsyncWrite+Unpin{
+    let mut command=Vec::new();
+    let mut newline=false;
+    for _ in 0..MAX_COMMAND_BYTES{
+        let mut byte=[0u8;1];
+        if stream.read_exact(&mut byte).await.is_err(){break;}
+        if byte[0]==b'\n'{newline=true;break;}
+        command.push(byte[0]);
+    }
+    let response=if !newline{"ERR unsupported\n".into()}else if command==b"client-status"{
+        let (revision,digest,descriptor,transport,fallback)=client.status().await;
+        let hex=digest.iter().map(|b|format!("{b:02x}")).collect::<String>();
+        format!("theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} f={}\n",u8::from(fallback))
+    }else{
+        let candidate=parse_bound_command(&command,b"client-preview rev=").map(|(r,d)|(r,d,false))
+            .or_else(||parse_bound_command(&command,b"client-apply rev=").map(|(r,d)|(r,d,true)));
+        match candidate{
+            Some((r,d,apply))=>match client.change(r,d,apply).await{
+                Ok(revision)=>format!("theia-client-v1 {} r={revision}\n",if apply{"applied"}else{"ready"}),
+                Err(_)=>"theia-client-v1 rejected\n".into(),
+            },
+            None=>"ERR unsupported\n".into(),
+        }
+    };
+    stream.write_all(response.as_bytes()).await.map_err(|_|ManagementError::Io)?;
+    stream.shutdown().await.map_err(|_|ManagementError::Io)
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 pub(crate) async fn exchange<S>(
     mut stream: S,
     command: StatusCommand,
@@ -837,6 +881,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request = match command {
+        StatusCommand::ClientStatus=>b"client-status\n".to_vec(),
+        StatusCommand::ClientPreview{expected_revision,candidate_sha256}|StatusCommand::ClientApply{expected_revision,candidate_sha256}=>{
+            if expected_revision==0{return Err(ManagementError::InvalidReply);}
+            let action=if matches!(command,StatusCommand::ClientApply{..}){"apply"}else{"preview"};
+            let hex=candidate_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
+            format!("client-{action} rev={expected_revision} sha256={hex}\n").into_bytes()
+        }
         StatusCommand::Health => b"health\n".to_vec(),
         StatusCommand::Status => b"status\n".to_vec(),
         StatusCommand::Reload => b"reload\n".to_vec(),
@@ -936,6 +987,35 @@ where
         .map_err(|_| ManagementError::Io)?;
     if reply.len() as u64 > MAX_RESPONSE_BYTES {
         return Err(ManagementError::InvalidReply);
+    }
+    if matches!(command,StatusCommand::ClientStatus|StatusCommand::ClientPreview{..}|StatusCommand::ClientApply{..}){
+        let raw=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
+        if raw=="ERR unsupported\n"{return Err(ManagementError::Unsupported);}
+        if raw=="theia-client-v1 rejected\n"{return Err(ManagementError::CandidateRejected);}
+        let line=raw.strip_prefix("theia-client-v1 ").and_then(|s|s.strip_suffix('\n')).ok_or(ManagementError::InvalidReply)?;
+        let parsed=(||match command{
+            StatusCommand::ClientStatus=>{
+                let mut fields=line.split(' ');
+                let revision=positive_decimal(fields.next()?.strip_prefix("r=")?)?;
+                let config_sha256=decode_digest(fields.next()?.strip_prefix("sha256=")?)?;
+                let d=fields.next()?.strip_prefix("d=")?;
+                let descriptor_revision=if d=="0"{0}else{positive_decimal(d)?};
+                let transport=match fields.next()?.strip_prefix("t=")?{"0"=>0,"2"=>2,"3"=>3,_=>return None};
+                let fallback=match fields.next()?.strip_prefix("f=")?{"0"=>false,"1"=>true,_=>return None};
+                if fields.next().is_some()||(descriptor_revision==0&&(transport!=0||fallback)){return None;}
+                Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,fallback})
+            }
+            StatusCommand::ClientPreview{expected_revision,..}=>{
+                let revision=positive_decimal(line.strip_prefix("ready r=")?)?;
+                (revision==expected_revision).then_some(StatusReply::ClientReady{revision})
+            }
+            StatusCommand::ClientApply{expected_revision,..}=>{
+                let revision=positive_decimal(line.strip_prefix("applied r=")?)?;
+                (Some(revision)==expected_revision.checked_add(1)).then_some(StatusReply::ClientApplied{revision})
+            }
+            _=>None
+        })();
+        return parsed.ok_or(ManagementError::InvalidReply);
     }
     if reply == b"theia-health-v1 ok\n" && command == StatusCommand::Health {
         return Ok(StatusReply::Healthy);
@@ -1187,8 +1267,44 @@ pub async fn query_in(
     .map_err(|_| ManagementError::TimedOut)?
 }
 
+#[cfg(target_os="linux")]
+pub(crate) fn client_server(client:Arc<crate::local_proxy::ClientRuntime>)->Result<Option<StatusServer>,ManagementError>{
+    let Some(directory)=std::env::var_os("THEIA_CLIENT_CONTROL_DIR")else{return Ok(None);};
+    StatusServer::bind_in(Path::new(&directory),1).map(|s|Some(s.with_client(client)))
+}
+#[cfg(target_os="windows")]
+pub(crate) fn client_server(client:Arc<crate::local_proxy::ClientRuntime>)->Result<Option<crate::windows_control::WindowsServer>,ManagementError>{
+    let Some(id)=std::env::var_os("THEIA_CLIENT_CONTROL_PIPE")else{return Ok(None);};
+    let id=id.into_string().map_err(|_|ManagementError::UnsafeEndpoint)?;
+    crate::windows_control::WindowsServer::bind(&id,1).map(|s|Some(s.with_client(client)))
+}
+
+pub async fn query_client_environment(command:StatusCommand)->Result<StatusReply,ManagementError>{
+    if !matches!(command,StatusCommand::ClientStatus|StatusCommand::ClientPreview{..}|StatusCommand::ClientApply{..}){
+        return Err(ManagementError::Unsupported);
+    }
+    #[cfg(target_os="linux")]
+    {
+        let directory=std::env::var_os("THEIA_CLIENT_CONTROL_DIR").ok_or(ManagementError::NotConfigured)?;
+        let path=endpoint_path(Path::new(&directory))?;
+        return timeout(CLIENT_TIMEOUT,async{
+            let stream=UnixStream::connect(path).await.map_err(|_|ManagementError::SocketUnavailable)?;
+            exchange(stream,command).await
+        }).await.map_err(|_|ManagementError::TimedOut)?;
+    }
+    #[cfg(target_os="windows")]
+    {
+        let id=std::env::var_os("THEIA_CLIENT_CONTROL_PIPE").ok_or(ManagementError::NotConfigured)?
+            .into_string().map_err(|_|ManagementError::UnsafeEndpoint)?;
+        return crate::windows_control::query_client_pipe(&id,command).await;
+    }
+    #[cfg(not(any(target_os="linux",target_os="windows")))]
+    Err(ManagementError::Unsupported)
+}
+
 pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, ManagementError> {
     let kind = match command {
+        StatusCommand::ClientStatus|StatusCommand::ClientPreview{..}|StatusCommand::ClientApply{..}=>return Err(ManagementError::Unsupported),
         StatusCommand::Health => "health",
         StatusCommand::Status => "status",
         StatusCommand::Reload => "reload_rejected",
