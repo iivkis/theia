@@ -709,6 +709,7 @@ impl H3Client {
                 lease.admitted();
                 Ok(H3Tunnel {
                     operation,
+                    stream_up,
                     tx,
                     rx,
                     decoder,
@@ -762,6 +763,7 @@ impl Drop for Driver {
 /// Its constructor is private and reachable only after valid OPEN_OK.
 pub struct H3Tunnel {
     operation: u64,
+    stream_up: bool,
     tx: Tx,
     rx: Rx,
     decoder: Incoming,
@@ -770,6 +772,7 @@ pub struct H3Tunnel {
 }
 
 impl H3Tunnel {
+    pub(crate) fn opened_stream_up(&self) -> bool { self.stream_up }
     #[cfg(test)]
     pub(crate) fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), ClientError> {
         self._lease

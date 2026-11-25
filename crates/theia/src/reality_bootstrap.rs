@@ -774,6 +774,10 @@ impl Invitation {
         self.bearer.is_some()
     }
 
+    pub(crate) fn token_bytes(&self) -> Option<[u8; 32]> {
+        self.bearer.as_ref().map(|value| **value)
+    }
+
     pub(crate) fn admission_preview(&self, path: &Path) -> Result<[u8; 32], Error> {
         crate::reality_admission::Secret::load(&self.scope, path)
             .map(|secret| secret.commitment())

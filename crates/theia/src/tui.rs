@@ -213,6 +213,9 @@ enum IssueFlow {
     ExportFailed,
     Showing(Zeroizing<String>),
     Public(String),
+    ShareConfirm { action: crate::tui_share::Action, public: Option<String> },
+    Sharing,
+    ShareDone(String),
 }
 
 /// Client-only F-14 local file/pasted URI import. Only safe fields may render.
@@ -257,6 +260,7 @@ enum DisableFlow {
 type ExportResult = (Editor, Result<PathBuf, &'static str>);
 
 enum RecordFlow {
+    ChooseMode(Role),
     Input {
         action: RecordAction,
         fields: Vec<String>,
@@ -268,6 +272,7 @@ enum RecordFlow {
 impl RecordFlow {
     fn body(&self) -> String {
         match self {
+            Self::ChooseMode(role) => format!("Создать {}\n1: собственный TLS (cert/key или CA)\n2: SmartTheia REALITY (мастер / импорт)\nEsc: отменить. Runtime не меняется.", if *role == Role::Server {"inbound"} else {"профиль"}),
             Self::Confirm(review) => review.body().to_owned(),
             Self::Input {
                 action,
@@ -319,6 +324,8 @@ struct Interaction {
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
     exporting: Option<mpsc::Receiver<ExportResult>>,
+    sharing: Option<mpsc::Receiver<Result<(PathBuf, bool), &'static str>>>,
+    clipboard: Option<Zeroizing<String>>,
 }
 
 impl Interaction {
@@ -345,6 +352,8 @@ impl Interaction {
             pending: None,
             saving: None,
             exporting: None,
+            sharing: None,
+            clipboard: None,
         }
     }
 
@@ -435,13 +444,25 @@ impl Interaction {
     fn paste_import_source(&mut self, text: &str) {
         if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
             let input = text.trim_end_matches(['\r', '\n']);
-            if source.len().saturating_add(input.len()) <= 4096 && !input.contains('\0') {
+            if source.len().saturating_add(input.len()) <= crate::invite::MAX_URI && !input.contains('\0') {
                 source.push_str(input);
             }
         }
     }
 
     fn poll_save(&mut self, model: &mut Model) -> Result<bool, TuiError> {
+        if let Some(rx) = self.sharing.as_ref() {
+            let message = match rx.try_recv() {
+                Ok(Ok((path,true))) => format!("Защищённый QR SVG сохранён: {path:?}. QR содержит само приглашение; храните как исходную ссылку."),
+                Ok(Ok((path,false))) => format!("Приглашение превышает вместимость одного QR. Сохранён полный защищённый URI-файл: {path:?}. Ничего не обрезано."),
+                Ok(Err(error)) => format!("{error} Для конфиденциальной ссылки повторная выдача требует ротации."),
+                Err(TryRecvError::Empty) => return Ok(false),
+                Err(TryRecvError::Disconnected) => "Результат записи не подтверждён. Проверьте файлы; не повторяйте вслепую.".into(),
+            };
+            self.sharing = None;
+            self.issuance = Some(IssueFlow::ShareDone(message));
+            return Ok(false);
+        }
         if let Some(receiver) = self.exporting.as_ref() {
             match receiver.try_recv() {
                 Ok((mut editor, result)) => {
@@ -512,7 +533,7 @@ impl Interaction {
     }
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
-        if key.kind != KeyEventKind::Press || self.saving.is_some() || self.exporting.is_some() {
+        if key.kind != KeyEventKind::Press || self.saving.is_some() || self.exporting.is_some() || self.sharing.is_some() || self.clipboard.is_some() {
             return false;
         }
         #[cfg(windows)]
@@ -721,6 +742,25 @@ impl Interaction {
         };
         if let Some(flow) = self.records.take() {
             match flow {
+                RecordFlow::ChooseMode(role) => match key.code {
+                    KeyCode::Char('1') => {
+                        let action = if role == Role::Server { RecordAction::NewInbound } else { RecordAction::NewProfile };
+                        match editor.record_fields(action) {
+                            Ok(fields) => self.records = Some(RecordFlow::Input { action, fields, focus: 0 }),
+                            Err(message) => editor.error = Some(message.into()),
+                        }
+                    }
+                    KeyCode::Char('2') if role == Role::Server => match ProvisionPanel::bound(editor) {
+                        Ok(panel) => self.reality_provision = Some(panel),
+                        Err(message) => editor.error = Some(message.into()),
+                    },
+                    KeyCode::Char('2') => match EnrollmentPanel::bound(editor) {
+                        Ok(panel) => self.reality_enrollment = Some(panel),
+                        Err(message) => editor.error = Some(message.into()),
+                    },
+                    KeyCode::Esc => {},
+                    _ => self.records = Some(RecordFlow::ChooseMode(role)),
+                },
                 RecordFlow::Confirm(review) => match key.code {
                     KeyCode::Char('y') if key.modifiers.is_empty() => {
                         match editor.stage_record(*review) {
@@ -821,6 +861,10 @@ impl Interaction {
                     _ => self.issuance = Some(IssueFlow::SaveFailed),
                 },
                 IssueFlow::Offer => match key.code {
+                    KeyCode::Char('Q' | 'c') => {
+                        let action = if key.code == KeyCode::Char('Q') { crate::tui_share::Action::Qr } else { crate::tui_share::Action::Clipboard };
+                        self.issuance = Some(IssueFlow::ShareConfirm { action, public: None });
+                    }
                     KeyCode::Char('f') => {
                         self.issuance = Some(IssueFlow::ConfirmExport);
                     }
@@ -862,9 +906,49 @@ impl Interaction {
                     }
                 }
                 IssueFlow::Public(link) => {
-                    if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                        self.issuance = Some(IssueFlow::Public(link));
+                    match key.code {
+                        KeyCode::Char('Q' | 'c') => {
+                            let action = if key.code == KeyCode::Char('Q') { crate::tui_share::Action::Qr } else { crate::tui_share::Action::Clipboard };
+                            self.issuance = Some(IssueFlow::ShareConfirm { action, public: Some(link) });
+                        }
+                        KeyCode::Esc | KeyCode::Enter => {}
+                        _ => self.issuance = Some(IssueFlow::Public(link)),
                     }
+                }
+                IssueFlow::ShareConfirm { action, public } => match key.code {
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        self.issuance = Some(public.map_or(IssueFlow::Offer, IssueFlow::Public));
+                    }
+                    KeyCode::Char('y') if key.modifiers.is_empty() => {
+                        let link = match public {
+                            Some(link) => Some(Zeroizing::new(link)),
+                            None => editor.take_issued().and_then(|invitation| invitation.encode().ok()).map(Zeroizing::new),
+                        };
+                        if let Some(link) = link {
+                            match action {
+                                crate::tui_share::Action::Qr => {
+                                    let path = editor.saved_path().to_owned();
+                                    let (tx,rx) = mpsc::channel();
+                                    self.sharing = Some(rx);
+                                    self.issuance = Some(IssueFlow::Sharing);
+                                    let _worker = std::thread::spawn(move || {
+                                        let _ = tx.send(crate::tui_share::export_qr(&path, &link));
+                                    });
+                                }
+                                crate::tui_share::Action::Clipboard => {
+                                    self.clipboard = Some(link);
+                                    self.issuance = Some(IssueFlow::Sharing);
+                                }
+                            }
+                        } else {
+                            self.issuance = Some(IssueFlow::ShareDone("Приглашение больше недоступно. Необходимо перевыпустить credential.".into()));
+                        }
+                    }
+                    _ => self.issuance = Some(IssueFlow::ShareConfirm { action, public }),
+                },
+                IssueFlow::Sharing => self.issuance = Some(IssueFlow::Sharing),
+                IssueFlow::ShareDone(message) => {
+                    if key.code != KeyCode::Esc { self.issuance = Some(IssueFlow::ShareDone(message)); }
                 }
                 IssueFlow::Showing(link) => {
                     if key.code == KeyCode::Esc {
@@ -933,8 +1017,21 @@ impl Interaction {
                 ImportFlow::Input(mut source) => match key.code {
                     KeyCode::Esc => {}
                     KeyCode::Enter if !source.is_empty() => {
-                        match client_import::read_source(source.trim()) {
-                            Ok(invitation) => {
+                        match client_import::read_product_source(source.trim()) {
+                            Ok(client_import::ProductSource::Reality) => {
+                                let value = Zeroizing::new(source.trim().to_owned());
+                                match EnrollmentPanel::from_source(editor, value) {
+                                    Ok(panel) => {
+                                        editor.error = None;
+                                        self.reality_enrollment = Some(panel);
+                                    }
+                                    Err(message) => {
+                                        editor.error = Some(message.into());
+                                        self.importing = Some(ImportFlow::Input(source));
+                                    }
+                                }
+                            }
+                            Ok(client_import::ProductSource::OwnTls(invitation)) => {
                                 editor.error = None;
                                 self.importing = Some(ImportFlow::Preview {
                                     invitation,
@@ -956,7 +1053,7 @@ impl Interaction {
                     KeyCode::Char(ch)
                         if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                             && !ch.is_control()
-                            && source.len() + ch.len_utf8() <= 4096 =>
+                            && source.len() + ch.len_utf8() <= crate::invite::MAX_URI =>
                     {
                         source.push(ch);
                         self.importing = Some(ImportFlow::Input(source));
@@ -1189,7 +1286,7 @@ impl Interaction {
             if key.code == KeyCode::Char('V')
                 && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
             {
-                if !editor.selected_reality() {
+                if editor.role() == Role::Server && !editor.selected_reality() {
                     editor.error =
                         Some("Выберите зарегистрированный REALITY inbound/профиль.".into());
                 } else {
@@ -1233,14 +1330,20 @@ impl Interaction {
                 }
                 return false;
             }
+            if key.code == KeyCode::Char('N') && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+                match editor.require_clean_records() {
+                    Ok(()) => self.records = Some(RecordFlow::ChooseMode(editor.role())),
+                    Err(message) => editor.error = Some(message.into()),
+                }
+                return false;
+            }
             let record_action = if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT
             {
                 match (editor.role(), key.code) {
-                    (Role::Server, KeyCode::Char('N')) => Some(RecordAction::NewInbound),
-                    (Role::Client, KeyCode::Char('N')) => Some(RecordAction::NewProfile),
                     (_, KeyCode::Char('D')) => Some(RecordAction::DeleteRecord),
                     (Role::Client, KeyCode::Char('A')) => Some(RecordAction::ActivateProfile),
                     (Role::Server, KeyCode::Char('G')) => Some(RecordAction::SetGrants),
+                    (Role::Server, KeyCode::Char('Q')) => Some(RecordAction::SetQuota),
                     (Role::Server, KeyCode::Char('U')) => Some(RecordAction::DeleteUser),
                     (Role::Server, KeyCode::Char('E')) => Some(RecordAction::EditTls),
                     (Role::Client, KeyCode::Char('E')) => Some(RecordAction::EditTrust),
@@ -1568,7 +1671,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: общий импорт URI/локального файла: own-TLS CA или REALITY fingerprint/admission, без запуска; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
             true,
         ),
     }
@@ -1709,9 +1812,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     }
     let footer = if model.screen == Screen::Client {
-        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  M: регистрация  K: re-enroll  V: REALITY status  Ctrl+S: сохранить"
+        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  M: регистрация  K: re-enroll  V: статус/Apply  Ctrl+S: сохранить"
     } else {
-        "N/D/G/U/E: записи  W: REALITY  M: регистрация  K: замена bundle  V: REALITY status  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
+        "N/D/G/U/E/Q: записи  W: REALITY  M: регистрация  K: замена bundle  V: REALITY status  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
     };
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
@@ -1805,6 +1908,17 @@ fn draw_issuance(
                     .into()
             },
         ),
+        IssueFlow::ShareConfirm { action, public } => (
+            "Подтвердить передачу приглашения",
+            format!("{}\n{}\ny: подтвердить | n/Esc: назад",
+                match action {
+                    crate::tui_share::Action::Qr => "Создать защищённый SVG QR. Если полный URI не помещается, создать защищённый URI-файл без усечения.",
+                    crate::tui_share::Action::Clipboard => "Отправить запрос OSC 52 в доверенный терминал. Терминал может отказать; история clipboard или синхронизация могут сохранить ссылку. Очистите буфер самостоятельно.",
+                },
+                if public.is_none() { "КОНФИДЕНЦИАЛЬНО: будет использован одноразовый bearer; не передавайте недоверенному терминалу или получателю." } else { "Публичное приглашение без bearer." })
+        ),
+        IssueFlow::Sharing => ("Передача приглашения", "Операция выполняется; URI скрыт.".into()),
+        IssueFlow::ShareDone(message) => ("Результат передачи", format!("{message}\nEsc: закрыть. Runtime не изменён.")),
         IssueFlow::ConfirmExport => (
             "Подтверждение конфиденциального экспорта",
             "Создать новый защищённый файл рядом с конфигурацией сервера? Ссылка не будет показана. Файл содержит bearer; храните и передавайте его только доверенным способом. Повторная выдача недоступна.\n\ny: сохранить  n/Esc: назад"
@@ -1828,7 +1942,7 @@ fn draw_issuance(
         IssueFlow::Public(link) => (
             "Публичное приглашение без токена",
             format!(
-                "Только данные профиля. Не содержит bearer, CA или grant. Получателю нужны отдельные доверенные credentials и CA.\n\n{link}\n\nEnter/Esc: закрыть."
+                "Только данные профиля. Не содержит bearer, CA или grant. Получателю нужны независимое доверие (CA или REALITY fingerprint/admission) и отдельный credential.\nQ: защищённый QR | c: буфер обмена | Enter/Esc: закрыть.\n\n{link}"
             ),
         ),
         IssueFlow::Showing(link) => (
@@ -1839,6 +1953,9 @@ fn draw_issuance(
             ),
         ),
     };
+    let body = if matches!(flow, IssueFlow::Offer | IssueFlow::Public(_)) {
+        format!("{body}\nQ: защищённый QR | c: буфер обмена (отдельное подтверждение)")
+    } else { body };
     panel(frame, area, title, &body, true);
 }
 
@@ -1954,7 +2071,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (URI/локальный файл, скрытый ввод). N: создать запись; D: удалить; A: активировать профиль; G: grants; U: удалить пользователя; E: TLS/CA и credential. Ctrl+S только сохраняет; runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (оба режима, URI/локальный файл, скрытый ввод). N: создать запись; D: удалить; A: активировать профиль; G: grants; U: удалить пользователя; E: TLS/CA и credential. Ctrl+S только сохраняет; runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
@@ -2025,7 +2142,7 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
             batch.poll();
         }
         if let Some(provision) = interaction.reality_provision.as_mut() {
-            provision.poll();
+            if let Some(editor) = provision.poll() { interaction.editor = Some(editor); }
         }
         if let Some(enrollment) = interaction.reality_enrollment.as_mut() {
             if let Some(editor) = enrollment.poll() {
@@ -2045,6 +2162,12 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(domain) = interaction.domain.as_mut() {
             domain.poll();
+        }
+        if let Some(link) = interaction.clipboard.take() {
+            let message = if crate::tui_share::send_clipboard(io::stdout().lock(), &link).is_ok() {
+                "Запрос копирования отправлен терминалу; фактическое содержимое буфера не подтверждено. Проверьте вставкой в доверенное приложение."
+            } else { "Запрос копирования не подтверждён. Для конфиденциальной ссылки потребуется новая выдача." };
+            interaction.issuance = Some(IssueFlow::ShareDone(message.into()));
         }
         terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
         if event::poll(Duration::from_millis(50))? {
@@ -2501,6 +2624,42 @@ mod tests {
     }
 
     #[test]
+    fn common_import_dispatches_reality_uri_to_masked_independent_enrollment() {
+        use crate::reference_health::{Evidence, Plan, State, Target};
+        let now = crate::reference_health::unix_now().unwrap();
+        let state = State::new(Plan {
+            schema_version: 1, inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
+            own_ips: vec!["93.184.216.1".parse().unwrap()],
+            references: vec![Target {
+                server_name: "reference.example.org".into(),
+                address: "93.184.216.2:443".parse().unwrap(),
+            }],
+        }, vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+        let identity = crate::identity_tls::Identity::generate(crate::descriptor::Scope {
+            inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
+        }).unwrap();
+        let signed = crate::reality_bootstrap::initial_descriptor(&state, &identity, now).unwrap();
+        let uri = crate::reality_bootstrap::Invitation::public(&identity, &signed, now).unwrap().encode().unwrap();
+        let path = std::env::temp_dir().join(format!("theia-tui-common-import-{}.toml", std::process::id()));
+        std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        ui.update(&mut model, press(KeyCode::Char('i')));
+        ui.paste_import_source(&uri);
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.importing.is_none());
+        let panel = ui.reality_enrollment.as_ref().unwrap();
+        let body = panel.body();
+        assert!(body.contains("Fingerprint"));
+        assert!(!body.contains(uri.as_str()));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.reality_enrollment.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn client_import_modal_masks_pasted_link_and_requires_explicit_confirmation() {
         use crate::{
             config::{self, Config},
@@ -2794,6 +2953,34 @@ mod tests {
         assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
         assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clipboard_and_qr_offer_require_separate_confirmation_and_never_render_secret() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("theia-share-ui").unwrap()).with_extension("toml");
+        std::fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        editor.issue_user("share-device").unwrap();
+        assert!(editor.save());
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+        ui.issuance = Some(IssueFlow::Offer);
+        for key in ['Q','c'] {
+            ui.update(&mut model, press(KeyCode::Char(key)));
+            assert!(matches!(ui.issuance, Some(IssueFlow::ShareConfirm { .. })));
+            assert!(ui.clipboard.is_none() && ui.sharing.is_none());
+            assert!(!rendered_interaction(120,40,&model,&ui).contains("theia://v1/"));
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(ui.editor.as_ref().unwrap().issued_ready());
+        }
+        ui.update(&mut model, press(KeyCode::Char('c')));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        let link = ui.clipboard.take().unwrap();
+        assert!(Invitation::decode(&link).unwrap().has_token());
+        assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
+        assert!(!rendered_interaction(120,40,&model,&ui).contains("theia://v1/"));
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(crate::config::lock_path(&path).unwrap());
     }
 
     #[test]

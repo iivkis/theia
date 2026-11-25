@@ -42,6 +42,7 @@ const MAX_FIELD: usize = 1024;
 
 struct Review {
     request: Request,
+    selected_id: String,
     approval: [u8; 32],
     body: String,
 }
@@ -66,6 +67,8 @@ pub(crate) struct RegistrationPanel {
     focus: usize,
     stage: Stage,
     error: Option<String>,
+    owned: Option<crate::tui_staged_material::StagedMaterial>,
+    staged_save: Option<PathBuf>,
 }
 
 fn labels(role: Role) -> &'static [&'static str] {
@@ -140,7 +143,14 @@ fn preview(path: &Path, original: [u8; 32], request: Request, now: u64) -> Resul
     } else {
         "y: сохранить; n/Esc: отменить."
     };
-    Ok(Review { request, approval: prepared.approval_sha256(),
+    let selected_id = match (&request, prepared.candidate()) {
+        (Request::Server(_), config::Config::Server(doc)) => doc.server.inbounds.last()
+            .ok_or(Error::Scope)?.id.clone(),
+        (Request::ReplaceServer(request), _) => request.id.clone(),
+        (Request::Client(request) | Request::Reenroll(request), _) => request.id.clone(),
+        _ => return Err(Error::Scope),
+    };
+    Ok(Review { request, selected_id, approval: prepared.approval_sha256(),
         body: format!("{}\n\nСохранить только TOML? {consent}\nРаботающие listener/системный proxy не меняются.", prepared.report()) })
 }
 
@@ -165,6 +175,26 @@ impl RegistrationPanel {
             focus: 0,
             stage: Stage::Input,
             error: None,
+            owned: None, staged_save: None,
+        })
+    }
+
+    pub(crate) fn from_provision(
+        config: PathBuf, original: [u8; 32], request: ServerRequest,
+    ) -> Result<Self, Error> {
+        if !crate::bounded_input::explicit_file_path(&config) {
+            return Err(Error::Storage);
+        }
+        let hex = |bytes: [u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let fields = vec![
+            request.health.to_str().ok_or(Error::Storage)?.to_owned(),
+            request.bundle.to_str().ok_or(Error::Storage)?.to_owned(),
+            hex(request.health_sha256), hex(request.identity_sha256),
+            request.listen.to_string(), request.grants.join(","),
+        ];
+        Ok(Self {
+            role: Role::Server, reenroll_id: None, config, original, fields,
+            focus: 5, stage: Stage::Input, error: None, owned: None, staged_save: None,
         })
     }
 
@@ -194,6 +224,7 @@ impl RegistrationPanel {
             focus: 2,
             stage: Stage::Input,
             error: None,
+            owned: None, staged_save: None,
         })
     }
 
@@ -212,6 +243,22 @@ impl RegistrationPanel {
             }
         ];
         Ok(panel)
+    }
+
+    pub(crate) fn own_material(mut self, owned: crate::tui_staged_material::StagedMaterial) -> Self {
+        if self.role == Role::Client && self.fields[2].is_empty() {
+            if let Ok(id) = crate::tui_editor::generated_id("profile") { self.fields[2] = id; }
+        }
+        self.owned = Some(owned);
+        self
+    }
+    fn cancel_owned(&mut self) -> bool {
+        let Some(mut owned) = self.owned.take() else { return true; };
+        if owned.cleanup().is_err() {
+            self.stage = Stage::Done(format!("Очистка не подтверждена. Проверьте каталог {:?} и TOML; не повторяйте вслепую. Для целых материалов используйте M после независимой проверки. Esc: закрыть.", owned.root()));
+            return false;
+        }
+        true
     }
 
     fn request(&self) -> Result<Request, Error> {
@@ -239,6 +286,7 @@ impl RegistrationPanel {
         if !matches!(self.stage, Stage::Input) {
             return;
         }
+        if self.owned.is_some() && (self.role == Role::Server || self.focus != 2) { return; }
         let value = text.trim_end_matches(['\r', '\n']);
         let field = &mut self.fields[self.focus];
         if !value.chars().any(char::is_control)
@@ -254,6 +302,7 @@ impl RegistrationPanel {
             Stage::Done(_) => return key.code == KeyCode::Esc,
             Stage::Confirm(_) => {
                 match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') if self.owned.is_some() => return self.cancel_owned(),
                     KeyCode::Esc | KeyCode::Char('n') => self.stage = Stage::Input,
                     KeyCode::Char('y')
                         if self.reenroll_id.is_none() && key.modifiers.is_empty() =>
@@ -273,6 +322,11 @@ impl RegistrationPanel {
             }
             Stage::Input => {}
         }
+        if self.owned.is_some() {
+            if key.code == KeyCode::Esc { return self.cancel_owned(); }
+            if self.role == Role::Server && key.code != KeyCode::Enter { return false; }
+            if self.role == Role::Client && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) { return false; }
+        }
         self.input_key(key)
     }
 
@@ -284,12 +338,31 @@ impl RegistrationPanel {
         let path = self.config.clone();
         let (tx, rx) = mpsc::channel();
         self.stage = Stage::Saving(rx);
+        let mut owned = self.owned.take();
+        self.staged_save = owned.as_ref().map(|guard| guard.root().to_owned());
         let _worker = std::thread::spawn(move || {
-            let result = reference_health::unix_now()
+            // Once publication starts, a panic or lost result must retain
+            // material. Only a definite pre-replacement refusal permits cleanup.
+            if let Some(guard) = &mut owned { guard.preserve(); }
+            let applied = reference_health::unix_now()
                 .map_err(|_| Error::Clock)
-                .and_then(|now| reality_config::apply(&path, &review.request, review.approval, now))
+                .and_then(|now| reality_config::apply(&path, &review.request, review.approval, now));
+            let applied = match applied {
+                Err(error) if error != Error::Indeterminate => {
+                    if let Some(guard) = &mut owned {
+                        guard.refuse();
+                        guard.cleanup().map_err(|_| Error::Indeterminate).and(Err(error))
+                    } else { Err(error) }
+                }
+                other => other,
+            };
+            let result = applied
                 .map_err(SaveError::Refused)
-                .and_then(|()| Editor::load(role, &path).map_err(|_| SaveError::SavedReloadFailed));
+                .and_then(|()| {
+                    let mut editor = Editor::load(role, &path).map_err(|_| SaveError::SavedReloadFailed)?;
+                    editor.select_id(&review.selected_id);
+                    Ok(editor)
+                });
             let _ = tx.send(result);
         });
     }
@@ -357,14 +430,18 @@ impl RegistrationPanel {
                     }
                     Ok(Err(SaveError::Refused(Error::Indeterminate)))
                     | Err(TryRecvError::Disconnected) => {
-                        self.stage = Stage::Done("Неопределённая запись. Проверьте файл и заново откройте редактор, не повторяйте автоматически.\nEsc: закрыть.".into());
+                        self.stage = Stage::Done(format!("Неопределённая запись. Проверьте файл и заново откройте редактор, не повторяйте автоматически.\nПодготовленный каталог: {:?}\nEsc: закрыть.", self.staged_save));
                     }
                     Ok(Err(SaveError::SavedReloadFailed)) => {
                         self.stage = Stage::Done("TOML сохранён, перечитать редактор не удалось. Откройте заново; runtime не изменён.\nEsc: закрыть.".into());
                     }
                     Ok(Err(SaveError::Refused(error))) => {
-                        self.error = Some(format!("ОТКАЗ: {error}"));
-                        self.stage = Stage::Input;
+                        if self.staged_save.is_some() {
+                            self.stage = Stage::Done(format!("ОТКАЗ: {error}. Подготовленные материалы удалены; откройте новый мастер. Esc: закрыть."));
+                        } else {
+                            self.error = Some(format!("ОТКАЗ: {error}"));
+                            self.stage = Stage::Input;
+                        }
                     }
                     Err(TryRecvError::Empty) => {}
                 }
@@ -519,12 +596,14 @@ mod tests {
             focus: 0,
             stage: Stage::Input,
             error: None,
+            owned: None, staged_save: None,
         };
         let request = p.request().unwrap();
         assert!(matches!(&request, Request::ReplaceServer(r) if r.id == "selected"));
         assert!(p.body().contains("Независимая замена"));
         p.stage = Stage::Confirm(Box::new(Review {
             request,
+            selected_id: "selected".into(),
             approval: [0; 32],
             body: "review".into(),
         }));

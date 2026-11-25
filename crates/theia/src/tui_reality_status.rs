@@ -38,6 +38,7 @@ pub(crate) struct StatusPanel {
     digest: [u8; 32],
     id: String,
     server: bool,
+    reality: bool,
     pending: Option<Receiver<Result<Update, Error>>>,
     review: Option<RotationReview>,
     committing: bool,
@@ -61,6 +62,7 @@ impl StatusPanel {
             digest: editor.saved_sha256(),
             id: editor.selected_record_id().to_owned(),
             server: editor.role() == Role::Server,
+            reality: editor.selected_reality(),
             pending: None,
             review: None,
             committing: false,
@@ -88,6 +90,8 @@ impl StatusPanel {
         let digest = self.digest;
         let id = self.id.clone();
         let server = self.server;
+        let reality = self.reality;
+        let selected_active = self.client_active;
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
         let _worker = std::thread::spawn(move || {
@@ -98,7 +102,18 @@ impl StatusPanel {
                     return RotationReview::prepare(&path, digest, &id, retire, now)
                         .map(Update::Review);
                 }
-                let mut report = reality_config::status_expected(&path, digest, &id, now)?;
+                let mut report = if reality {
+                    reality_config::status_expected(&path, digest, &id, now)?
+                } else {
+                    let raw = crate::local_proxy::saved_client_bytes(&path, digest)
+                        .map_err(|_| Error::Approval)?;
+                    let crate::config::Config::Client(doc) = crate::config::parse(
+                        std::str::from_utf8(&raw).map_err(|_| Error::Storage)?
+                    ).map_err(|_| Error::Storage)? else { return Err(Error::Storage); };
+                    let p = doc.client.profiles.iter().find(|p| p.id == id)
+                        .ok_or(Error::Storage)?;
+                    format!("Сохранённый профиль: {} (Own-TLS)\nEndpoint={}\nTransport={:?}; XHTTP={:?}\nАктивный в TOML: {}\nCA/credential: проверяются при запуске", p.id, p.server, p.transport, p.effective_xhttp_mode(), doc.client.active_profile == id)
+                };
                 if server {
                     use crate::management::StatusReply;
                     let command = reality_config::runtime_status_command(&path, digest, &id)?;
@@ -131,9 +146,10 @@ impl StatusPanel {
                             .ok()
                         });
                     let live=match response{
-                        Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,fallback})=>
-                            format!("Headless runtime: revision={revision}; saved TOML совпадает={}\ndescriptor_revision={descriptor_revision}; last_open={}; H3 fallback={fallback}",
-                                config_sha256==digest,match transport{2=>"H2",3=>"H3",_=>"не подтверждён"}),
+                        Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback}) if config_sha256 == digest && selected_active =>
+                            format!("Headless runtime: revision={revision}; saved TOML совпадает={}\ndescriptor_revision={descriptor_revision}; last_open={}; XHTTP={}; H3 negative cache={}",
+                                config_sha256==digest,match transport{2=>"H2",3=>"H3",_=>"не подтверждён"}, crate::local_proxy::xhttp_observation(xhttp), if fallback {"активен: временная сетевая недоступность QUIC"} else {"не активен"}),
+                        Some(StatusReply::ClientRunning{revision,..})=>format!("Headless runtime: revision={revision}; выбранный профиль не подтверждён для этого TOML."),
                         _=>"Headless runtime: защищённый IPC не подтверждён.".into(),
                     };
                     report.push_str("\n\n");
@@ -357,10 +373,10 @@ impl StatusPanel {
                     runtime.block_on(async move {
                         let mut rx = rx;
                         let prepared = tokio::select! {
-                            result=PreparedLocalProxy::start_reality(&path,digest,&id)=>result?,
+                            result=PreparedLocalProxy::start_selected(&path,digest,&id)=>result?,
                             _=&mut rx=>return Ok(()),
                         };
-                        prepared.serve_reality_observed(rx, monitor).await
+                        prepared.serve_selected_observed(rx, monitor).await
                     })
                 });
             let _ = tx.send(result);
@@ -472,11 +488,11 @@ impl StatusPanel {
                 }
                 return false;
             }
-            if self.pending.is_none() && !self.committing && key.code == KeyCode::Char('c') {
+            if self.reality && self.pending.is_none() && !self.committing && key.code == KeyCode::Char('c') {
                 self.credential_input = Some(String::new());
                 return false;
             }
-            if self.pending.is_none()
+            if self.reality && self.pending.is_none()
                 && !self.committing
                 && matches!(key.code, KeyCode::Char('o' | 'k'))
             {
@@ -612,7 +628,7 @@ impl StatusPanel {
         }
         if let Some(start) = self.client_confirm {
             return if start {
-                "Запустить сохранённый активный REALITY-профиль с двумя loopback listeners? OS proxy не изменяется.\ny: подтвердить | n/Esc: отменить".into()
+                "Запустить сохранённый активный профиль с двумя loopback listeners? OS proxy не изменяется.\ny: подтвердить | n/Esc: отменить".into()
             } else {
                 "Остановить локальный runtime? Открытые туннели будут закрыты.\ny: подтвердить | n/Esc: отменить".into()
             };
@@ -650,6 +666,9 @@ impl StatusPanel {
             self.report,
             if self.server {
                 "t: начать ротацию | p: отозвать старый ключ после overlap | e: восстановить истёкший descriptor | "
+            } else if !self.reality {
+                if self.client_active { "s: запустить локальный runtime | h: headless Apply | " }
+                else { "для запуска выберите активный профиль | " }
             } else if self.client_active {
                 "s: запустить локальный runtime | h: headless Apply | o: recovery | k: promotion | c: сменить credential | "
             } else {
@@ -672,6 +691,7 @@ mod tests {
             digest: [1; 32],
             id: "test".into(),
             server: false,
+            reality: true,
             pending: None,
             review: None,
             committing: false,
@@ -689,6 +709,25 @@ mod tests {
             reopen_required: false,
         }
     }
+    #[test]
+    fn own_tls_status_only_offers_common_runtime_controls() {
+        let mut p = panel(true);
+        p.reality = false;
+        assert!(!p.body().contains("promotion"));
+        assert!(p.body().contains("headless Apply"));
+        for ch in ['c', 'o', 'k'] {
+            assert!(!p.key(key(KeyCode::Char(ch))));
+            assert!(p.credential_input.is_none());
+            assert!(p.trust_input.is_none());
+            assert!(p.pending.is_none());
+        }
+        assert!(!p.key(key(KeyCode::Char('s'))));
+        assert_eq!(p.client_confirm, Some(true));
+        assert!(!p.key(key(KeyCode::Char('n'))));
+        assert!(p.client_run.is_none());
+        assert!(p.client_confirm.is_none());
+    }
+
     #[test]
     fn credential_input_is_hidden_and_cancel_does_not_start_a_worker() {
         let mut p = panel(true);

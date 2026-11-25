@@ -7,14 +7,14 @@ use crate::{
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
 };
 use zeroize::Zeroizing;
 
 const LIMIT: usize = 1024;
 const LABELS: [&str; 6] = [
-    "Файл приглашения",
+    "URI или защищённый файл приглашения",
     "Отдельный admission-файл",
     "Новый файл профиля",
     "Новый trust store",
@@ -24,6 +24,7 @@ const LABELS: [&str; 6] = [
 
 struct Input {
     source: PathBuf,
+    inline: Option<Zeroizing<String>>,
     admission: PathBuf,
     profile: PathBuf,
     trust: PathBuf,
@@ -37,13 +38,21 @@ struct Review {
     body: String,
 }
 
+fn source_uri(input: &Input) -> Result<Zeroizing<String>, Error> {
+    if let Some(uri) = &input.inline {
+        if uri.len() > bootstrap::MAX_URI || !uri.starts_with(crate::invite::PREFIX) {
+            return Err(Error::Format);
+        }
+        return Ok(uri.clone());
+    }
+    if !crate::bounded_input::explicit_file_path(&input.source) {
+        return Err(Error::Storage);
+    }
+    bootstrap::read_text(&input.source, bootstrap::MAX_URI, true)
+}
+
 fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
-    for path in [
-        &input.source,
-        &input.admission,
-        &input.profile,
-        &input.trust,
-    ] {
+    for path in [&input.admission, &input.profile, &input.trust] {
         if !crate::bounded_input::explicit_file_path(path) {
             return Err(Error::Storage);
         }
@@ -57,7 +66,7 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
             _ => return Err(Error::Storage),
         }
     }
-    let uri = bootstrap::read_text(&input.source, bootstrap::MAX_URI, true)?;
+    let uri = source_uri(input)?;
     let invitation = Invitation::decode(&uri, now)?;
     if invitation.fingerprint() != input.identity {
         return Err(Error::Approval);
@@ -85,7 +94,7 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
 }
 
 fn apply(input: &Input, review: Review, now: u64) -> Result<String, Error> {
-    let uri = bootstrap::read_text(&input.source, bootstrap::MAX_URI, true)?;
+    let uri = source_uri(input)?;
     bootstrap::import(
         &uri,
         review.approval,
@@ -106,7 +115,7 @@ enum Stage {
     Input,
     Loading(Receiver<Result<Review, Error>>),
     Confirm(Review),
-    Applying(Receiver<Result<String, Error>>),
+    Applying(Receiver<Result<(String, Option<crate::tui_staged_material::StagedMaterial>), Error>>),
     Done(String),
 }
 
@@ -117,6 +126,7 @@ pub(crate) struct EnrollmentPanel {
     error: Option<String>,
     config: Option<(PathBuf, [u8; 32])>,
     registration: Option<crate::tui_reality_register::RegistrationPanel>,
+    owned: Option<crate::tui_staged_material::StagedMaterial>,
 }
 
 impl EnrollmentPanel {
@@ -128,17 +138,33 @@ impl EnrollmentPanel {
             error: None,
             config: None,
             registration: None,
+            owned: None,
         }
     }
 
     pub(crate) fn bound(editor: &crate::tui_editor::Editor) -> Result<Self, &'static str> {
         editor.require_clean_records()?;
         let mut panel = Self::new();
-        panel.config = Some((
-            std::path::absolute(editor.saved_path()).map_err(|_| "Недопустимый путь TOML")?,
-            editor.saved_sha256(),
-        ));
+        let path = std::path::absolute(editor.saved_path()).map_err(|_| "Недопустимый путь TOML")?;
+        let root = path.parent().ok_or("Недопустимый путь TOML")?.join(crate::tui_editor::generated_id(".theia-enroll")?);
+        panel.fields[2] = Zeroizing::new(root.join("profile.toml").to_str().ok_or("Недопустимый путь")?.to_owned());
+        panel.fields[3] = Zeroizing::new(root.join("trust.toml").to_str().ok_or("Недопустимый путь")?.to_owned());
+        panel.config = Some((path, editor.saved_sha256()));
         Ok(panel)
+    }
+
+    pub(crate) fn from_source(editor: &crate::tui_editor::Editor, source: Zeroizing<String>) -> Result<Self, &'static str> {
+        if source.len() > bootstrap::MAX_URI {
+            return Err("Приглашение превышает лимит v1.");
+        }
+        let mut panel = Self::bound(editor)?;
+        panel.fields[0] = source;
+        panel.focus = 1;
+        Ok(panel)
+    }
+
+    fn limit(&self) -> usize {
+        if self.focus == 0 { bootstrap::MAX_URI } else { LIMIT }
     }
 
     fn input(&self) -> Result<Input, Error> {
@@ -146,7 +172,8 @@ impl EnrollmentPanel {
         let identity = crate::parse_restart_digest(&self.fields[4]).ok_or(Error::Approval)?;
         let token = (!self.fields[5].is_empty()).then(|| self.fields[5].clone());
         Ok(Input {
-            source: path(0),
+            source: if self.fields[0].starts_with("theia://") { PathBuf::new() } else { path(0) },
+            inline: self.fields[0].starts_with("theia://").then(|| self.fields[0].clone()),
             admission: path(1),
             profile: path(2),
             trust: path(3),
@@ -163,9 +190,11 @@ impl EnrollmentPanel {
         if !matches!(self.stage, Stage::Input) {
             return;
         }
+        if self.config.is_some() && matches!(self.focus, 2 | 3) { return; }
         let value = value.trim_end_matches(['\r', '\n']);
+        let limit = self.limit();
         let field = &mut self.fields[self.focus];
-        if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= LIMIT
+        if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= limit
         {
             field.push_str(value);
         }
@@ -178,7 +207,7 @@ impl EnrollmentPanel {
         match &self.stage {
             Stage::Loading(_) | Stage::Applying(_) => return false,
             Stage::Done(_) => {
-                if key.code == KeyCode::Char('g') {
+                if key.code == KeyCode::Char('g') && (self.config.is_none() || self.owned.is_some()) {
                     if let (Some((path, digest)), Ok(input)) = (&self.config, self.input()) {
                         match crate::tui_reality_register::RegistrationPanel::from_enrollment(
                             path.clone(),
@@ -186,12 +215,24 @@ impl EnrollmentPanel {
                             &input.profile,
                             input.identity,
                         ) {
-                            Ok(panel) => self.registration = Some(panel),
+                            Ok(panel) => self.registration = Some(match self.owned.take() {
+                                Some(owned) => panel.own_material(owned),
+                                None => panel,
+                            }),
                             Err(error) => self.error = Some(error.to_string()),
                         }
                     }
                 }
-                return key.code == KeyCode::Esc;
+                if key.code == KeyCode::Esc {
+                    if let Some(mut owned) = self.owned.take() {
+                        if owned.cleanup().is_err() {
+                            self.stage = Stage::Done(format!("Очистка не подтверждена; проверьте каталог {:?}. Для полного enrollment используйте M после независимой проверки. Esc: закрыть.", owned.root()));
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                return false;
             }
             Stage::Confirm(_) => {
                 match key.code {
@@ -208,10 +249,26 @@ impl EnrollmentPanel {
                         };
                         let (tx, rx) = mpsc::channel();
                         self.stage = Stage::Applying(rx);
+                        let config = self.config.clone();
                         let _worker = std::thread::spawn(move || {
-                            let result = reference_health::unix_now()
-                                .map_err(|_| Error::Clock)
-                                .and_then(|now| apply(&input, review, now));
+                            let result = (|| {
+                                let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
+                                let mut owned = config.as_ref().map(|(path, digest)| {
+                                    crate::tui_staged_material::StagedMaterial::create(
+                                        input.profile.parent().ok_or(Error::Storage)?, path, *digest)
+                                }).transpose()?;
+                                match apply(&input, review, now) {
+                                    Ok(message) => Ok((message, owned)),
+                                    Err(Error::Indeterminate) => {
+                                        if let Some(guard) = &mut owned { guard.preserve(); }
+                                        Err(Error::Indeterminate)
+                                    }
+                                    Err(error) => {
+                                        if let Some(guard) = &mut owned { guard.cleanup()?; }
+                                        Err(error)
+                                    }
+                                }
+                            })();
                             let _ = tx.send(result);
                         });
                     }
@@ -223,8 +280,14 @@ impl EnrollmentPanel {
         }
         match key.code {
             KeyCode::Esc => return true,
-            KeyCode::Tab => self.focus = (self.focus + 1) % LABELS.len(),
-            KeyCode::BackTab => self.focus = (self.focus + LABELS.len() - 1) % LABELS.len(),
+            KeyCode::Tab => {
+                self.focus = (self.focus + 1) % LABELS.len();
+                if self.config.is_some() && self.focus == 2 { self.focus = 4; }
+            }
+            KeyCode::BackTab => {
+                self.focus = (self.focus + LABELS.len() - 1) % LABELS.len();
+                if self.config.is_some() && self.focus == 3 { self.focus = 1; }
+            }
             KeyCode::Backspace => {
                 self.fields[self.focus].pop();
             }
@@ -248,7 +311,7 @@ impl EnrollmentPanel {
             KeyCode::Char(ch)
                 if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                     && !ch.is_control()
-                    && self.fields[self.focus].len() + ch.len_utf8() <= LIMIT =>
+                    && self.fields[self.focus].len() + ch.len_utf8() <= self.limit() =>
             {
                 self.fields[self.focus].push(ch);
             }
@@ -268,7 +331,7 @@ impl EnrollmentPanel {
                 Err(TryRecvError::Disconnected) => Err(Error::Storage),
             },
             Stage::Applying(rx) => match rx.try_recv() {
-                Ok(result) => result.map(Stage::Done),
+                Ok(result) => result.map(|(message, owned)| { self.owned = owned; Stage::Done(message) }),
                 Err(TryRecvError::Empty) => return None,
                 Err(TryRecvError::Disconnected) => Err(Error::Indeterminate),
             },
@@ -280,7 +343,7 @@ impl EnrollmentPanel {
                 self.error = Some(format!(
                     "ОТКАЗ: {error}. При неопределённой записи проверьте файлы перед повтором."
                 ));
-                self.stage = Stage::Input;
+                self.stage = if error == Error::Indeterminate { Stage::Done(format!("ОТКАЗ: неопределённая запись. Проверьте подготовленный профиль {:?}; повтор заблокирован.", Path::new(self.fields[2].as_str()))) } else { Stage::Input };
             }
         }
         None
@@ -294,6 +357,7 @@ impl EnrollmentPanel {
             Stage::Input => {
                 let mut out = String::from("Локальные абсолютные пути; значения скрыты.\n");
                 for (i, label) in LABELS.iter().enumerate() {
+                    if self.config.is_some() && matches!(i, 2 | 3) { continue; }
                     out.push_str(&format!(
                         "{} {label}: {} ({} bytes)\n",
                         if i == self.focus { ">" } else { " " },
@@ -315,7 +379,7 @@ impl EnrollmentPanel {
             Stage::Confirm(review) => review.body.clone(),
             Stage::Applying(_) => "Сохранение защищённого профиля; runtime не меняется.".into(),
             Stage::Done(body) => {
-                if self.config.is_some() {
+                if self.config.is_some() && self.owned.is_some() {
                     format!("{body}\nСледующий шаг: g — зарегистрировать созданный enrollment в сохранённом TOML (отдельный preview/confirm).\n{}",self.error.as_deref().unwrap_or(""))
                 } else {
                     body.clone()
@@ -373,6 +437,7 @@ mod tests {
         let uri = invite.encode().unwrap();
         let mut input = Input {
             source: dir.join("invitation"),
+            inline: None,
             admission: dir.join("admission"),
             profile: dir.join("profile"),
             trust: dir.join("trust"),
@@ -388,6 +453,11 @@ mod tests {
         input.identity = invite.fingerprint();
         let review = inspect(&input, 1000).unwrap();
         assert!(!review.body.contains(uri.as_str()));
+        input.inline = Some(uri.clone());
+        let inline = inspect(&input, 1000).unwrap();
+        assert_eq!(inline.approval.document_sha256, review.approval.document_sha256);
+        assert_eq!(inline.admission, review.admission);
+        input.inline = None;
         assert!(!review.body.contains("env:TEST_BEARER"));
         assert!(!input.profile.exists() && !input.trust.exists());
         std::fs::remove_file(&input.admission).unwrap();
@@ -410,20 +480,24 @@ mod tests {
     #[test]
     fn wizard_handoff_keeps_original_config_binding_and_requires_profile_id() {
         let mut panel = EnrollmentPanel::new();
-        let cfg = std::env::temp_dir().join("client.toml");
-        panel.config = Some((cfg.clone(), [3; 32]));
-        panel.fields[2] = Zeroizing::new(
-            std::env::temp_dir()
-                .join("enrollment")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        use sha2::{Digest, Sha256};
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("enroll-handoff").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let cfg = dir.join("client.toml");
+        std::fs::write(&cfg, include_str!("../../../examples/client.toml")).unwrap();
+        let digest = Sha256::digest(std::fs::read(&cfg).unwrap()).into();
+        let root = dir.join("enrollment");
+        panel.owned = Some(crate::tui_staged_material::StagedMaterial::create(&root, &cfg, digest).unwrap());
+        panel.config = Some((cfg.clone(), digest));
+        panel.fields[2] = Zeroizing::new(root.join("profile.toml").to_string_lossy().into_owned());
         panel.fields[4] = Zeroizing::new("ab".repeat(32));
         panel.stage = Stage::Done("saved".into());
         panel.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         assert!(panel.registration.is_some());
         assert!(panel.body().contains("ID профиля"));
         assert!(panel.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!root.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

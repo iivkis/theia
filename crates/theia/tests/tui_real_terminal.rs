@@ -377,6 +377,124 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
     drop(running);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
+    use theia::{
+        client_import::PrivateBearer,
+        reality_config::{self, Request, ServerRequest},
+        reference_health::{self, Evidence, Plan, State, Store, Target},
+    };
+    let base = std::env::temp_dir().join(format!("theia-dual-ui-{}", std::process::id()));
+    fs::create_dir(&base).unwrap();
+    let _cleanup = TempDir(base.clone());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let cert = base.join("cert.pem");
+    let key = base.join("key.pem");
+    let server_file = base.join("server.toml");
+    let client_file = base.join("client.toml");
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    fs::write(&cert, generated.cert.pem()).unwrap();
+    private_pem::write_new_key(&key, generated.key_pair.serialize_pem());
+    let localhost = tokio::net::lookup_host(("localhost", 0)).await.unwrap().next().unwrap().ip();
+    let reserve = |ip| {
+        (0..16).find_map(|_| {
+            let tcp = TcpListener::bind(std::net::SocketAddr::new(ip, 0)).ok()?;
+            let udp = UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
+            Some((tcp, udp))
+        }).unwrap()
+    };
+    let own = reserve(localhost);
+    let smart = reserve(std::net::Ipv4Addr::LOCALHOST.into());
+    let own_addr = own.0.local_addr().unwrap();
+    let smart_addr = smart.0.local_addr().unwrap();
+    let Config::Server(mut document) = theia::config::parse(&include_str!("../../../examples/server.toml")
+        .replace("REPLACE_WITH_64_LOWERCASE_HEX", &digest(42))).unwrap() else { panic!("server"); };
+    let inbound = &mut document.server.inbounds[0];
+    inbound.h2_listen = own_addr.to_string();
+    inbound.quic_listen = own_addr.to_string();
+    inbound.server_name = "localhost".into();
+    inbound.tls_cert = format!("file:{}", cert.display());
+    inbound.tls_key = format!("file:{}", key.display());
+    document.server.policy.allow_private_ips = true;
+    save(&server_file, &document);
+    let now = reference_health::unix_now().unwrap();
+    let state = State::new(Plan {
+        schema_version: 1, inbound: "reality".into(), endpoint: smart_addr.to_string(),
+        own_ips: vec![smart_addr.ip()], references: vec![Target {
+            server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap(),
+        }],
+    }, vec![Evidence {h2_status: Some(200), h3_status: Some(200)}], now).unwrap();
+    let health = base.join("health.toml");
+    Store::new(&health).unwrap().enroll(&state).unwrap();
+    let bundle = base.join("bundle");
+    let health_sha256 = state.snapshot_sha256().unwrap();
+    let record = theia::reality_provision::create(&state, health_sha256, &bundle, now).unwrap();
+    let request = Request::Server(ServerRequest {
+        health, bundle: bundle.clone(), health_sha256, identity_sha256: record.identity_sha256,
+        listen: smart_addr, grants: vec!["device-a".into()],
+    });
+    let review = reality_config::prepare(&server_file, &request, now).unwrap();
+    reality_config::apply(&server_file, &request, review.approval_sha256(), now).unwrap();
+    let fingerprint = record.identity_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let Config::Client(mut client) = theia::config::parse(include_str!("../../../examples/client.toml")).unwrap() else { panic!("client"); };
+    let mut credential = PrivateBearer::create(&client_file, &[42;32]).unwrap();
+    let profile = &mut client.client.profiles[0];
+    profile.server = own_addr.to_string();
+    profile.server_name = "localhost".into();
+    profile.tls_ca = Some(format!("file:{}", cert.display()));
+    profile.auth_token = credential.reference().unwrap();
+    let http = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = http.local_addr().unwrap().port();
+    let socks_port = socks.local_addr().unwrap().port();
+    client.client.proxy.http_listen = format!("127.0.0.1:{http_port}");
+    client.client.proxy.socks5_listen = format!("127.0.0.1:{socks_port}");
+    fs::write(&client_file, Config::Client(client).to_toml().unwrap()).unwrap();
+    credential.commit();
+    let binary = env!("CARGO_BIN_EXE_theia");
+    #[cfg(target_os = "linux")]
+    let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
+    #[cfg(target_os = "windows")]
+    let (env_key, endpoint) = ("THEIA_CONTROL_PIPE", format!("dual-ui-{}-{}",std::process::id(),own_addr.port()));
+    drop((own, smart, http, socks));
+    let mut running = Running(Command::new(binary).args(["server","run","--config"]).arg(&server_file)
+        .env(env_key, &endpoint).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    timeout(Duration::from_secs(8), async {
+        loop {
+            if cli_status(binary, env_key, &endpoint, 1) { break; }
+            assert!(running.0.try_wait().unwrap().is_none());
+            sleep(Duration::from_millis(25)).await;
+        }
+    }).await.unwrap();
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(async move {
+        while let Ok((socket,_)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = socket.into_split();
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tui-real-terminal-e2e.py");
+    let interpreter = if cfg!(target_os = "windows") { "python" } else { "python3" };
+    let output = timeout(Duration::from_secs(50), tokio::task::spawn_blocking(move || {
+        Command::new(interpreter).arg(script).args(["--binary",binary,"--scenario","dual-product","--revision","1"])
+            .arg("--config").arg(server_file).arg("--client").arg(client_file)
+            .arg("--cert").arg(cert).arg("--admission").arg(bundle.join("admission.key"))
+            .arg("--fingerprint").arg(fingerprint)
+            .arg("--http-port").arg(http_port.to_string()).arg("--socks-port").arg(socks_port.to_string())
+            .arg("--echo-port").arg(echo_port.to_string()).env(env_key, endpoint).output()
+    })).await.expect("dual-mode PTY/ConPTY deadline").unwrap().unwrap();
+    echo_task.abort();
+    assert!(output.status.success(), "dual-mode terminal scenario failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("REAL_TUI_PTY_E2E_OK: dual-product"));
+}
+
 // Test-only cleanup: server Child must be dropped before directory.
 struct TempDir(std::path::PathBuf);
 impl Drop for TempDir {

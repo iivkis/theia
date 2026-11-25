@@ -675,6 +675,46 @@ pub(crate) fn runtime_status_command(
     .map_err(|_| Error::Format)
 }
 
+/// Issue from the registered, rooted publication, never from an arbitrary
+/// supplied signing key or unregistered bundle. This is a local operation.
+pub(crate) fn registered_invitation(
+    document: &config::ServerDocument,
+    id: &str,
+    credential: Option<(&str, &[u8; 32])>,
+    now: u64,
+) -> Result<bootstrap::Invitation, Error> {
+    let inbound = document.server.inbounds.iter().find(|i| i.id == id).ok_or(Error::Scope)?;
+    if !document.server.enabled || inbound.security_mode != SecurityMode::SmartReality {
+        return Err(Error::Grant);
+    }
+    let binding = inbound.reality.as_ref().ok_or(Error::Format)?;
+    let listen: SocketAddr = inbound.h2_listen.parse().map_err(|_| Error::Scope)?;
+    let scope = crate::descriptor::Scope {
+        inbound: id.into(),
+        endpoint: format!("{}:{}", inbound.server_name, listen.port()),
+    };
+    let state = reference_health::Store::new(Path::new(&binding.health_store))
+        .and_then(|s| s.inspect()).map_err(|_| Error::Health)?;
+    let (publication, _admission) = crate::reality_provision::capture_registered(
+        Path::new(&binding.bundle), binding, &state, &scope, now,
+    )?;
+    // Prefer the active signer while it remains valid. The successor can
+    // be used after expiration, but its fingerprint must be verified
+    // independently by a new client just like any other enrollment.
+    let active = publication.active();
+    let material = if active.verified().check_time(now).is_ok() {
+        active
+    } else {
+        publication.next().ok_or(Error::Descriptor)?
+    };
+    match credential {
+        Some((user, bearer)) => bootstrap::Invitation::issued(
+            material.identity(), material.signed(), document, user, bearer, now,
+        ),
+        None => bootstrap::Invitation::public(material.identity(), material.signed(), now),
+    }
+}
+
 fn rotation_snapshot(
     path: &Path,
     expected: [u8; 32],
