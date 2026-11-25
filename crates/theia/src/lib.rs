@@ -54,6 +54,7 @@ pub mod reference_health;
 pub mod reference_maintenance;
 mod relay_batch;
 mod relay_liveness;
+mod traffic;
 pub mod reload_preflight;
 pub mod restart_guard;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -67,6 +68,8 @@ mod split_http;
 mod tcp_bbr;
 pub mod transport_policy;
 pub mod tui;
+mod tui_menu;
+mod tui_server_process;
 pub(crate) mod tui_candidate_batch;
 pub(crate) mod tui_candidates;
 pub(crate) mod tui_discovery;
@@ -80,6 +83,7 @@ mod tui_reality_review;
 mod tui_reality_status;
 pub(crate) mod tui_runtime;
 mod tui_share;
+mod qr_import;
 mod tui_staged_material;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;

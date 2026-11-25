@@ -715,6 +715,45 @@ impl Editor {
         self.role
     }
 
+
+    /// Safe summary for the workspace record list. Only IDs and mode are exposed;
+    /// active indicates saved/draft selection, never an authenticated connection.
+    pub(crate) fn workspace_records(&self) -> Vec<(String, bool, bool)> {
+        match &self.draft {
+            Config::Server(doc) => doc.server.inbounds.iter().map(|entry| (
+                entry.id.clone(),
+                false,
+                entry.security_mode == crate::security_profile::SecurityMode::SmartReality,
+            )).collect(),
+            Config::Client(doc) => doc.client.profiles.iter().map(|entry| (
+                entry.id.clone(),
+                doc.client.active_profile == entry.id,
+                entry.security_mode == crate::security_profile::SecurityMode::SmartReality,
+            )).collect(),
+        }
+    }
+
+    /// IDs, disabled state and membership in the current inbound are safe to
+    /// display. Never expose password/token digests or credential references.
+    pub(crate) fn workspace_users(&self) -> Vec<(String, bool, bool)> {
+        let Config::Server(doc) = &self.draft else { return Vec::new(); };
+        let grants = doc.server.inbounds.get(self.selected_record)
+            .map(|entry| entry.allowed_user_ids.as_slice()).unwrap_or(&[]);
+        doc.server.users.iter().map(|user| (
+            user.id.clone(), user.disabled, grants.iter().any(|id| id == &user.id),
+        )).collect()
+    }
+
+    pub(crate) fn workspace_selected(&self) -> usize { self.selected_record }
+
+    pub(crate) fn workspace_select(&mut self, index: usize) {
+        if !self.editing && self.issued.is_none() && index < self.record_count() {
+            self.selected_record = index;
+            self.selected_field = 0;
+            self.error = None;
+        }
+    }
+
     pub fn record_count(&self) -> usize {
         match &self.draft {
             Config::Server(doc) => doc.server.inbounds.len(),

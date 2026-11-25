@@ -1,0 +1,228 @@
+//! Privacy-preserving, process-local application DATA accounting.
+//! Counts complete relay writes/accepted frames, not IP/wire bytes or peer ACKs.
+//! No per-destination state, payload, credentials, unbounded history or I/O.
+use crate::Role;
+use ratatui::{Frame, layout::{Constraint, Layout, Rect}, style::{Color, Style, Modifier}, widgets::{Block, Borders, Clear, Paragraph, Sparkline, Wrap}};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub active: u64,
+    pub opened: u64,
+    pub upload: u64,
+    pub download: u64,
+}
+
+struct Counters {
+    active: AtomicU64,
+    opened: AtomicU64,
+    upload: AtomicU64,
+    download: AtomicU64,
+}
+impl Counters {
+    const fn new() -> Self {
+        Self {
+            active: AtomicU64::new(0),
+            opened: AtomicU64::new(0),
+            upload: AtomicU64::new(0),
+            download: AtomicU64::new(0),
+        }
+    }
+
+    fn enter(&self) -> Relay<'_> {
+        self.opened.fetch_add(1, Ordering::Relaxed);
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Relay(self)
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            active: self.active.load(Ordering::Relaxed),
+            opened: self.opened.load(Ordering::Relaxed),
+            upload: self.upload.load(Ordering::Relaxed),
+            download: self.download.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub(crate) struct Relay<'a>(&'a Counters);
+impl Relay<'_> {
+    pub(crate) fn upload(&self, bytes: usize) {
+        self.0.upload.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    pub(crate) fn download(&self, bytes: usize) {
+        self.0.download.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+impl Drop for Relay<'_> {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+static SERVER_H2: Counters = Counters::new();
+static SERVER_H3: Counters = Counters::new();
+static CLIENT_H2: Counters = Counters::new();
+static CLIENT_H3: Counters = Counters::new();
+
+fn counters(role: Role, h3: bool) -> &'static Counters {
+    match (role, h3) {
+        (Role::Server, false) => &SERVER_H2,
+        (Role::Server, true) => &SERVER_H3,
+        (Role::Client, false) => &CLIENT_H2,
+        (Role::Client, true) => &CLIENT_H3,
+    }
+}
+pub(crate) fn enter(role: Role, h3: bool) -> Relay<'static> {
+    counters(role, h3).enter()
+}
+pub(crate) fn snapshot(role: Role) -> [Snapshot; 2] {
+    [counters(role, false).snapshot(), counters(role, true).snapshot()]
+}
+
+fn bytes(n: u64) -> String {
+    if n >= 1024 * 1024 * 1024 {
+        format!("{:.2} ГиБ", n as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if n >= 1024 * 1024 {
+        format!("{:.2} МиБ", n as f64 / (1024.0 * 1024.0))
+    } else if n >= 1024 {
+        format!("{:.1} КиБ", n as f64 / 1024.0)
+    } else {
+        format!("{n} Б")
+    }
+}
+
+/// Refresh no faster than once a second, with a fixed-size sample.
+pub(crate) struct Monitor {
+    role: Role,
+    previous: [Snapshot; 2],
+    current: [Snapshot; 2],
+    rate: [(u64, u64); 2],
+    sampled: Instant,
+    history: VecDeque<[u64; 2]>,
+}
+impl Monitor {
+    pub(crate) fn new(role: Role) -> Self {
+        let current = snapshot(role);
+        Self {
+            role, previous: current, current, rate: [(0, 0); 2], sampled: Instant::now(), history: VecDeque::with_capacity(60),
+        }
+    }
+    pub(crate) fn poll(&mut self) {
+        let elapsed = self.sampled.elapsed().as_secs_f64();
+        if elapsed < 1.0 { return; }
+        self.current = snapshot(self.role);
+        for (i, (now, old)) in self.current.iter().zip(self.previous.iter()).enumerate() {
+            self.rate[i] = (
+                (now.upload.saturating_sub(old.upload) as f64 / elapsed) as u64,
+                (now.download.saturating_sub(old.download) as f64 / elapsed) as u64,
+            );
+        }
+        if self.history.len() == 60 { self.history.pop_front(); }
+        self.history.push_back(self.rate.map(|(up, down)| up.saturating_add(down)));
+        self.previous = self.current;
+        self.sampled = Instant::now();
+    }
+    /// Render only measured process-local aggregates. Each transport uses
+    /// the same chart scale; the history is bounded to 60 sampled intervals.
+    pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(Clear, area);
+        let border = Style::default().fg(Color::DarkGray);
+        if area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
+            frame.render_widget(Paragraph::new(self.body()).wrap(Wrap { trim: false })
+                .block(Block::default().title(" Монитор трафика ").borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))), area);
+            return;
+        }
+        let layout = Layout::vertical([Constraint::Length(4), Constraint::Min(1), Constraint::Length(3)]).split(area);
+        let active = self.current.iter().map(|s| s.active).fold(0u64, u64::saturating_add);
+        let opened = self.current.iter().map(|s| s.opened).fold(0u64, u64::saturating_add);
+        let scope = format!("Активные relay: {active}   •   Всего открыто: {opened}\nТолько DATA текущего процесса, не сетевые байты и не подтверждение доставки.");
+        frame.render_widget(Paragraph::new(scope).wrap(Wrap {trim:true})
+            .block(Block::default().title(" Обзор ").borders(Borders::ALL).border_style(border)), layout[0]);
+        let panels = if area.width >= 86 {
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(layout[1])
+        } else {
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(layout[1])
+        };
+        let max = self.history.iter().flat_map(|v| v.iter().copied()).max().unwrap_or(0).max(1);
+        for (i, panel) in panels.iter().copied().enumerate() {
+            let color = if i == 0 { Color::Cyan } else { Color::LightBlue };
+            let title = if i == 0 { " H2 · TCP " } else { " H3 · QUIC " };
+            let block = Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(color));
+            let inner = block.inner(panel);
+            frame.render_widget(block, panel);
+            let regions = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(inner);
+            let s = self.current[i];
+            let (up, down) = self.rate[i];
+            let (up_rate, down_rate) = if self.history.is_empty() { ("…".into(), "…".into()) }
+                else { (format!("{} /с", bytes(up)), format!("{} /с", bytes(down))) };
+            frame.render_widget(Paragraph::new(format!("Активно: {}  •  Всего: {}\n↑ {up_rate}  ·  {}\n↓ {down_rate}  ·  {}",
+                s.active, s.opened, bytes(s.upload), bytes(s.download))).wrap(Wrap {trim:true}), regions[0]);
+            let history: Vec<_> = self.history.iter().map(|sample| sample[i]).collect();
+            let chart = Sparkline::default().data(&history).max(max)
+                .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+                .block(Block::default().title(" ↑+↓ DATA/с · 60 отсчётов ").borders(Borders::TOP));
+            frame.render_widget(chart, regions[1]);
+        }
+        let note = format!("Общая шкала: {} /с  •  1 с  •  внешние сервисы не измеряются  •  Esc назад", bytes(max));
+        frame.render_widget(Paragraph::new(note).wrap(Wrap {trim:true})
+            .block(Block::default().borders(Borders::ALL).border_style(border)), layout[2]);
+    }
+
+    pub(crate) fn body(&self) -> String {
+        let mut result = String::from("Только трафик текущего процесса Theia; внешние сервисы не измеряются.\nDATA после OPEN_OK, без TLS/HTTP/QUIC overhead. Не подтверждение доставки peer.\n");
+        for (i, s) in self.current.iter().enumerate() {
+            let transport = if i == 0 { "H2" } else { "H3" };
+            let (up, down) = self.rate[i];
+            result.push_str(&format!(
+                "\n{transport} • открыто сейчас: {} • всего relay: {}\n↑ {} ({} /с)   ↓ {} ({} /с)\n",
+                s.active, s.opened, bytes(s.upload), bytes(up), bytes(s.download), bytes(down)
+            ));
+        }
+        if self.history.is_empty() { result.push_str("\nСбор первого интервала скорости; нулевой отсчёт не означает отсутствие трафика."); }
+        result.push_str("\nОбновление 1 с • Esc: назад");
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn counts_two_directions_and_cancellation_without_leaking_active() {
+        let c = Counters::new();
+        {
+            let a = c.enter();
+            let b = c.enter();
+            a.upload(12);
+            b.download(23);
+            assert_eq!(c.snapshot(), Snapshot { active: 2, opened: 2, upload: 12, download: 23 });
+            drop(a);
+            assert_eq!(c.snapshot().active, 1);
+        }
+        assert_eq!(c.snapshot(), Snapshot { active: 0, opened: 2, upload: 12, download: 23 });
+    }
+    #[test]
+    fn history_is_bounded_and_waits_for_first_sample() {
+        let mut monitor = Monitor::new(Role::Client);
+        assert!(monitor.history.is_empty());
+        for _ in 0..80 {
+            monitor.sampled -= std::time::Duration::from_secs(1);
+            monitor.poll();
+        }
+        assert_eq!(monitor.history.len(), 60);
+    }
+
+    #[test]
+    fn monitor_has_two_transports_and_truthful_scope() {
+        let mut m = Monitor::new(Role::Client);
+        m.poll();
+        let body = m.body();
+        assert!(body.contains("H2") && body.contains("H3"));
+        assert!(body.contains("внешние сервисы не измеряются"));
+        assert_eq!(bytes(1024), "1.0 КиБ");
+    }
+}

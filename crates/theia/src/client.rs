@@ -974,6 +974,7 @@ impl Tunnel {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let traffic = crate::traffic::enter(crate::Role::Client, false);
         let operation = self.operation;
         crate::diag!(
             Debug,
@@ -1022,6 +1023,7 @@ impl Tunnel {
                     return Ok::<(), ClientError>(());
                 }
                 self._lease.record_data(size);
+                traffic.upload(size);
                 activity.data(size);
             }
         };
@@ -1046,6 +1048,7 @@ impl Tunnel {
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
                         self._lease.record_data(data.len());
+                        traffic.download(data.len());
                         activity.data(data.len());
                     }
                     Frame::Fin => {
