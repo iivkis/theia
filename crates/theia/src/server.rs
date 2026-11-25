@@ -2964,7 +2964,9 @@ async fn run_supervised_file(
         .map_err(|_| ServerError::Config)?;
     let limits = GenerationLimits::new(&document);
     let initial = prepare_generation(&document, 1, &limits, None).await?;
-    root_history.advance(&document).map_err(|_| ServerError::Config)?;
+    root_history
+        .advance(&document)
+        .map_err(|_| ServerError::Config)?;
     root_history.committed();
     crate::diag!(
         Info,
@@ -3006,7 +3008,9 @@ async fn run_supervised_file(
     .map(|service| service.with_supervisor(runtime.clone(), requests.clone()));
 
     let mut management_task = management.map(|service| {
-        SupervisorTask(tokio::spawn(async move { service.serve().await.map_err(|_| ServerError::Io) }))
+        SupervisorTask(tokio::spawn(async move {
+            service.serve().await.map_err(|_| ServerError::Io)
+        }))
     });
     let mut running = RunningGeneration::launch(initial.listeners, GenerationPhase::Active);
     crate::diag!(Info, "server.supervisor", "generation_active");
@@ -4194,7 +4198,6 @@ mod hardening_tests {
         assert!(check_certificate_name(cert.cert.der(), "other.example").is_err());
     }
 
-
     /// Required native CI fixture: Python/OpenSSL+h2 and aioquic are
     /// independent implementations on both ends of the passive relay.
     /// No marker or bearer is supplied by the independent client.
@@ -4202,12 +4205,19 @@ mod hardening_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "required independent reference CI installs pinned h2/aioquic"]
     async fn independent_external_reference_through_registered_reality_dispatchers() {
-        use crate::reference_health::{Evidence, Plan, State, Store, Target};
         use crate::reality_config::{self, Request, ServerRequest};
-        use std::{fs, path::PathBuf, process::{Child, Command}, sync::atomic::{AtomicU64, Ordering}};
+        use crate::reference_health::{Evidence, Plan, State, Store, Target};
+        use std::{
+            fs,
+            path::PathBuf,
+            process::{Child, Command},
+            sync::atomic::{AtomicU64, Ordering},
+        };
         struct Scratch(PathBuf);
         impl Drop for Scratch {
-            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
         }
         struct Process(Child);
         impl Drop for Process {
@@ -4218,7 +4228,8 @@ mod hardening_tests {
         }
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let directory = Scratch(std::env::temp_dir().join(format!(
-            "theia-independent-reference-{}-{}", std::process::id(),
+            "theia-independent-reference-{}-{}",
+            std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         )));
         fs::create_dir(&directory.0).unwrap();

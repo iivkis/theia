@@ -864,11 +864,23 @@ impl State {
         }
         verified.check_time(now).map_err(|_| Error::NotEligible)?;
         self.validate_active(verified.descriptor(), now)?;
-        let target = self.plan.references.get(usize::from(verified.descriptor().active_reference))
+        let target = self
+            .plan
+            .references
+            .get(usize::from(verified.descriptor().active_reference))
             .ok_or(Error::Format)?;
-        if target.address != approved { return Err(Error::Approval); }
-        let remaining = verified.descriptor().not_after.checked_sub(now).ok_or(Error::Clock)?.min(60);
-        if remaining == 0 { return Err(Error::NotEligible); }
+        if target.address != approved {
+            return Err(Error::Approval);
+        }
+        let remaining = verified
+            .descriptor()
+            .not_after
+            .checked_sub(now)
+            .ok_or(Error::Clock)?
+            .min(60);
+        if remaining == 0 {
+            return Err(Error::NotEligible);
+        }
         Ok(RelayLease {
             address: fixture,
             expires: tokio::time::Instant::now() + Duration::from_secs(remaining),

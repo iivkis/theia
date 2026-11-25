@@ -25,7 +25,11 @@ struct History {
 }
 impl Default for History {
     fn default() -> Self {
-        Self { schema_version: 1, last: BTreeMap::new(), retired: BTreeSet::new() }
+        Self {
+            schema_version: 1,
+            last: BTreeMap::new(),
+            retired: BTreeSet::new(),
+        }
     }
 }
 impl History {
@@ -34,9 +38,13 @@ impl History {
             || self.last.len().saturating_add(self.retired.len()) > MAX_ROOTS
             || self.retired.contains(&[0; 32])
             || self.last.iter().any(|(id, root)| {
-                id.is_empty() || id.len() > 64
-                    || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                    || *root == [0; 32] || self.retired.contains(root)
+                id.is_empty()
+                    || id.len() > 64
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    || *root == [0; 32]
+                    || self.retired.contains(root)
             })
             || self.last.values().collect::<BTreeSet<_>>().len() != self.last.len()
         {
@@ -71,7 +79,9 @@ impl History {
     fn encode(&self) -> Result<String, ()> {
         self.validate()?;
         let raw = toml::to_string(self).map_err(|_| ())?;
-        if raw.len() > MAX_BYTES { return Err(()); }
+        if raw.len() > MAX_BYTES {
+            return Err(());
+        }
         Ok(raw)
     }
 }
@@ -156,7 +166,9 @@ impl RootHistory {
     /// be recorded exactly; concurrent publication is rejected by the
     /// caller's revision CAS and the supervisor's exact-byte disk CAS.
     pub(crate) fn preview(
-        config_path: &Path, active: &ServerDocument, candidate: &ServerDocument,
+        config_path: &Path,
+        active: &ServerDocument,
+        candidate: &ServerDocument,
     ) -> Result<(), ()> {
         let path = Self::path_for(config_path)?;
         let history = if Self::exists_at(&path)? {
@@ -165,9 +177,9 @@ impl RootHistory {
             History::default()
         };
         if active.server.inbounds.iter().any(|inbound| {
-            inbound.reality.as_ref().is_some_and(|binding|
+            inbound.reality.as_ref().is_some_and(|binding| {
                 history.last.get(&inbound.id) != Some(&binding.identity_sha256)
-            )
+            })
         }) {
             return Err(());
         }
@@ -181,7 +193,9 @@ impl RootHistory {
     /// Validate and durably advance only after candidate resources have
     /// been prepared. Unchanged state still uses the exact-byte disk CAS.
     pub(crate) fn advance(&mut self, document: &ServerDocument) -> Result<(), ()> {
-        if self.pending { return Err(()); }
+        if self.pending {
+            return Err(());
+        }
         let next = self.current.next(document)?;
         if self.raw.is_none() && next == History::default() {
             return Ok(());
@@ -193,7 +207,11 @@ impl RootHistory {
         }
         let encoded = next.encode()?;
         let retiring = next.retired != self.current.retired;
-        match config::guarded_trust_write(&self.path, &encoded, self.raw.as_deref().map(str::as_bytes)) {
+        match config::guarded_trust_write(
+            &self.path,
+            &encoded,
+            self.raw.as_deref().map(str::as_bytes),
+        ) {
             Ok(()) => {
                 self.current = next;
                 self.raw = Some(encoded);
@@ -209,9 +227,16 @@ impl RootHistory {
         }
     }
 
-    pub(crate) fn pending(&self) -> bool { self.pending }
-    pub(crate) fn retiring(&self) -> bool { self.retiring }
-    pub(crate) fn committed(&mut self) { self.pending = false; self.retiring = false; }
+    pub(crate) fn pending(&self) -> bool {
+        self.pending
+    }
+    pub(crate) fn retiring(&self) -> bool {
+        self.retiring
+    }
+    pub(crate) fn committed(&mut self) {
+        self.pending = false;
+        self.retiring = false;
+    }
 }
 
 #[cfg(test)]
@@ -223,10 +248,14 @@ mod tests {
     fn document(root: Option<u8>) -> ServerDocument {
         let raw = include_str!("../../../examples/server.toml")
             .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
-        let Config::Server(mut doc) = config::parse(&raw).unwrap() else { panic!() };
+        let Config::Server(mut doc) = config::parse(&raw).unwrap() else {
+            panic!()
+        };
         doc.server.inbounds[0].reality = root.map(|value| RealityBinding {
-            health_store: "health".into(), bundle: "bundle".into(),
-            initial_health_sha256: [1; 32], identity_sha256: [value; 32],
+            health_store: "health".into(),
+            bundle: "bundle".into(),
+            initial_health_sha256: [1; 32],
+            identity_sha256: [value; 32],
             manifest_sha256: [value; 32],
         });
         doc
@@ -235,7 +264,11 @@ mod tests {
     #[test]
     fn restart_remove_readd_and_stale_root_are_not_rollbacks() {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("theia-root-history-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "theia-root-history-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         fs::write(&path, b"fixture").unwrap();

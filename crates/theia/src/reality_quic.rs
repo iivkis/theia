@@ -428,11 +428,7 @@ async fn reference_path(
         return;
     };
     let value = material.verified();
-    let Ok(Ok(lease)) = timeout(
-        DNS_DEADLINE,
-        live.reference_lease(&generation, value),
-    )
-    .await
+    let Ok(Ok(lease)) = timeout(DNS_DEADLINE, live.reference_lease(&generation, value)).await
     else {
         return;
     };
