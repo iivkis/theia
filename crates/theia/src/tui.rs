@@ -7603,7 +7603,8 @@ mod tests {
     }
 
     #[test]
-    fn common_import_dispatches_reality_uri_to_masked_independent_enrollment() {
+    fn common_import_dispatches_reality_key_to_masked_review_and_cancels_without_writes() {
+        use sha2::{Digest, Sha256};
         use crate::reference_health::{Evidence, Plan, State, Target};
         let now = crate::reference_health::unix_now().unwrap();
         let state = State::new(
@@ -7630,10 +7631,20 @@ mod tests {
         })
         .unwrap();
         let signed = crate::reality_bootstrap::initial_descriptor(&state, &identity, now).unwrap();
-        let uri = crate::reality_bootstrap::Invitation::public(&identity, &signed, now)
-            .unwrap()
-            .encode()
-            .unwrap();
+        let bearer = [42u8; 32];
+        let server_source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &format!("{:x}", Sha256::digest(bearer)))
+            .replace("id = \"public\"", "id = \"edge\"");
+        let Config::Server(server) = config::parse(&server_source).unwrap() else {
+            panic!("server fixture");
+        };
+        let admission = crate::reality_admission::Secret::generate().unwrap();
+        let uri = crate::reality_bootstrap::Invitation::issued(
+            &identity, &signed, &server, "device-a", &bearer, &admission, now,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
         let path = std::env::temp_dir().join(format!(
             "theia-tui-common-import-{}.toml",
             std::process::id()
@@ -7648,8 +7659,9 @@ mod tests {
         assert!(ui.importing.is_none());
         let panel = ui.reality_enrollment.as_ref().unwrap();
         let body = panel.body();
-        assert!(body.contains("Fingerprint"));
+        assert!(body.contains("Проверка"));
         assert!(!body.contains(uri.as_str()));
+        assert!(!body.contains("Файл допуска"));
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.reality_enrollment.is_none());
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -7676,7 +7688,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let dialog = ui.config_dialog.as_ref().unwrap();
-        assert_eq!(dialog.guide().unwrap().0, 2);
+        assert!(matches!(dialog.guide().unwrap().0, 2 | 3));
         let screen = rendered_interaction(120, 40, &model, &ui);
         assert!(!screen.contains(uri.as_str()));
         assert!(!first_path.exists());

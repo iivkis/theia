@@ -342,10 +342,13 @@ impl EnrollmentPanel {
         let value = value.trim_end_matches(['\r', '\n']);
         let limit = self.limit();
         let field = &mut self.fields[self.focus];
-        if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= limit
-        {
-            field.push_str(value);
+        if value.chars().any(char::is_control) || field.len().saturating_add(value.len()) > limit {
+            *field = Zeroizing::new(String::new());
+            self.error = Some("Ввод отклонён: превышен лимит или есть недопустимые символы. Вставьте значение целиком.".into());
+            return;
         }
+        field.push_str(value);
+        self.error = None;
     }
 
     fn begin_review(&mut self) {
@@ -393,7 +396,10 @@ impl EnrollmentPanel {
             return panel.key(key);
         }
         match &self.stage {
-            Stage::Loading(_) | Stage::Applying(_) | Stage::Creating(_) => return false,
+            // The review worker performs reads only. Dropping its receiver
+            // cancels the UI immediately; no late result can authorize a save.
+            Stage::Loading(_) => return key.code == KeyCode::Esc,
+            Stage::Applying(_) | Stage::Creating(_) => return false,
             Stage::Done(_) => {
                 if key.code == KeyCode::Char('g') && (self.config.is_none() || self.owned.is_some())
                 {
@@ -926,6 +932,11 @@ mod tests {
         }
         assert!(!panel.body().contains("Файл допуска"));
         assert!(!panel.body().contains("Отпечаток сервера"));
+        panel.paste("theia://v1/test");
+        panel.paste(&"A".repeat(bootstrap::MAX_URI));
+        assert!(panel.fields[0].is_empty());
+        assert!(panel.error.is_some());
+        assert!(!panel.body().contains("theia://v1/test"));
         assert!(panel.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(!path.exists());
         std::fs::remove_dir_all(dir).unwrap();

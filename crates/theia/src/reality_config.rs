@@ -1481,6 +1481,18 @@ mod tests {
             bootstrap::Invitation::issued(&identity, &signed, &server, &user, &token,
                 &Secret::load(&scope, &admission).unwrap(), 1000)
                 .unwrap();
+        // Credential-only refresh must not silently ignore a different
+        // admission key, even with the exact same signer, scope and bearer.
+        let different = Secret::generate().unwrap();
+        let wrong_admission = bootstrap::Invitation::issued(
+            &identity, &signed, &server, &user, &token, &different, 1000,
+        )
+        .unwrap();
+        std::fs::write(&invite_path, wrong_admission.encode().unwrap().as_bytes()).unwrap();
+        assert!(preview_credential_refresh(&client, "reality-client", &invite_path, 1000).is_err());
+        assert_eq!(std::fs::read(&client).unwrap(), before);
+        assert_eq!(std::fs::read(&enrollment).unwrap(), old_enrollment);
+        assert_eq!(std::fs::read(&trust).unwrap(), before_trust);
         std::fs::write(&invite_path, issued.encode().unwrap().as_bytes()).unwrap();
         let (approval, revision) =
             preview_credential_refresh(&client, "reality-client", &invite_path, 1000).unwrap();

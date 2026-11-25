@@ -364,7 +364,19 @@ impl Invitation {
             .map(token)
             .transpose()?
             .map(Zeroizing::new);
-        let admission = wire.admission.as_deref().map(key).transpose()?.map(Zeroizing::new);
+        // Admission is secret material, not a public identity key. Keep both
+        // decoded bytes and the canonical encoding in zeroizing storage.
+        let admission = wire
+            .admission
+            .as_deref()
+            .map(|raw| {
+                let secret = Zeroizing::new(token(raw)?);
+                if *secret == [0; 32] {
+                    return Err(Error::Credential);
+                }
+                Ok(secret)
+            })
+            .transpose()?;
         Ok(Self {
             scope,
             public,

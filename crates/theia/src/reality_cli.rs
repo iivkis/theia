@@ -911,7 +911,23 @@ pub fn run(command: Command) -> Result<String, Error> {
             let admission = crate::reality_admission::Secret::load(identity.scope(), Path::new(&admission))
                 .map_err(|_| Error::Credential)?;
             let invite = Invitation::issued(&identity, &raw, &document, &user, &token, &admission, now)?;
-            publish(&output, &invite.encode()?)
+            // Independently supplied offline material must match the actual
+            // registered inbound, including its admission secret and signer.
+            // Otherwise a syntactically valid key may never authenticate.
+            use subtle::ConstantTimeEq;
+            let registered = reality_config::registered_invitation(
+                &document,
+                &identity.scope().inbound,
+                Some((&user, &token)),
+                now,
+            )
+            .map_err(|_| Error::Grant)?;
+            let encoded = invite.encode()?;
+            let expected = registered.encode()?;
+            if !bool::from(encoded.as_bytes().ct_eq(expected.as_bytes())) {
+                return Err(Error::Approval);
+            }
+            publish(&output, &encoded)
         }
         Command::Preview { invitation } => {
             let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, true)?;
