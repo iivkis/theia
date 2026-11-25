@@ -19,7 +19,7 @@ use crate::{
     tui_runtime::RuntimePanel,
     tui_server_process::ProcessPanel,
     tui_widgets::{
-        self, action_layout, ActionItem, Actions, Field, Form, ReferenceReview, ACCENT, BG, ERROR,
+        self, ActionItem, Actions, Field, Form, ReferenceReview, ACCENT, BG, ERROR,
         FOCUS, INPUT, MUTED, SURFACE, TEXT, WARNING,
     },
     Role,
@@ -4248,6 +4248,10 @@ fn draw_guided(
     let (form, review) = content;
     let (step, total, heading, keys) = guide;
     if let Some(v) = viewport { v.guided.set(true); }
+    if total == 1 && form.is_none() && review.is_none() {
+        panel_at(frame, area, title, body, true, viewport);
+        return;
+    }
     tui_widgets::canvas(frame, area);
     let width = area.width.min(108).saturating_sub(4);
     let cleaned;
@@ -4853,7 +4857,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     #[cfg(windows)]
     if let Some(proxy) = interaction.and_then(|ui| ui.system_proxy.as_ref()) {
         tui_widgets::canvas(frame, parts[1]);
-        let items = proxy.actions();
+        let items = if proxy.confirmation_choice().is_some() { Vec::new() } else { proxy.actions() };
         if let Some([report, controls]) = report_action_layout(parts[1], items.len(), &proxy.body()) {
             modal_panel!(
                 frame,
@@ -5580,7 +5584,12 @@ fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> 
     if count == 0 || area.height < minimum + 3 { return None; }
     let height = (count as u16).saturating_add(2).min(area.height - minimum).max(3);
     let preferred = if page == 1 { 20 }
-        else if role == Role::Client && page == 3 { 19 }
+        else if role == Role::Client && page == 3 {
+            editor.map_or(16, |e| {
+                let body = client_mode_lines(e, true).iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n");
+                (visual_rows(&body, usize::from(area.width.saturating_sub(2))).0.len().saturating_add(2)).min(u16::MAX as usize) as u16
+            })
+        }
         else if role == Role::Server && matches!(page, 2 | 3) {
             editor.map_or(6, |e| (e.workspace_users().len() as u16).saturating_add(3).clamp(6, 12))
         } else if page == 0 { 10 } else { 6 };
@@ -5596,14 +5605,13 @@ fn user_table_start(selected: usize, count: usize, area: Rect) -> usize {
         .saturating_sub(capacity - 1)
         .min(count.saturating_sub(capacity))
 }
-fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Option<&Interaction>) {
+fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
     let active = editor
         .workspace_records()
         .into_iter()
         .find(|(_, active, _)| *active)
         .and_then(|(id, _, _)| editor.client_profile_label(&id))
         .unwrap_or_else(|| "Нет профиля".into());
-    let running = ui.is_some_and(|u| u.owned_running(Role::Client));
     let (http, socks) = editor.client_proxy_addresses().unwrap_or(("—", "—"));
     let mut lines = vec![
         Line::styled(
@@ -5668,6 +5676,11 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
             ),
         );
     }
+    lines
+}
+
+fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Option<&Interaction>) {
+    let lines = client_mode_lines(editor, ui.is_some_and(|u| u.owned_running(Role::Client)));
     frame.render_widget(
         Paragraph::new(lines)
             .block(tui_widgets::section("Режим подключения", true))
@@ -7396,6 +7409,18 @@ mod tests {
         assert_eq!(flow.form(None).unwrap().selected, 0);
         flow.select_field(99);
         assert_eq!(flow.form(None).unwrap().selected, 0);
+    }
+
+    #[test]
+    fn compact_report_actions_follow_the_visible_text() {
+        let area = Rect::new(0, 2, 120, 36);
+        let [short, controls] = report_action_layout(area, 3, "Одна строка").unwrap();
+        assert_eq!(short.height, 3);
+        assert_eq!(controls.y, short.bottom());
+        let [long, controls] = report_action_layout(area, 3, &"Длинный отчёт\n".repeat(100)).unwrap();
+        assert!(long.height > short.height);
+        assert_eq!(controls.y, long.bottom());
+        assert!(controls.bottom() <= area.bottom());
     }
 
     #[test]

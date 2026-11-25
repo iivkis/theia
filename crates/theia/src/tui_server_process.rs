@@ -171,7 +171,7 @@ impl ProcessPanel {
                         thread: Some(thread),
                         inbounds: None,
                     });
-                    self.notice = "Проверяются TOML, TLS, права и слушатели...".into();
+                    self.notice = "Проверяем настройки, сертификаты, права и сетевые порты...".into();
                 }
                 Err(_) => self.notice = "Не удалось запустить рабочий поток сервера.".into(),
             }
@@ -246,7 +246,7 @@ impl ProcessPanel {
                         if let Some(editor) = editor {
                             self.start(editor);
                         } else {
-                            self.notice = "Сначала откройте серверный TOML (F3).".into();
+                            self.notice = "Сначала откройте файл настроек сервера.".into();
                         }
                     } else if let Some(worker) = self.worker.as_mut() {
                         worker.request_stop();
@@ -266,7 +266,7 @@ impl ProcessPanel {
                     self.confirm = Some(true);
                 } else {
                     self.notice =
-                        "Нужен сохранённый серверный TOML; F3 открыть, Ctrl+S сохранить.".into();
+                        "Сначала откройте и сохраните настройки сервера.".into();
                 }
                 false
             }
@@ -298,7 +298,7 @@ impl ProcessPanel {
             ),
             _ => self.notice.clone(),
         };
-        format!("{}\n\n{report}\n\nEsc — назад, не останавливает сервер.\nВнешний сервис управляется отдельно через IPC.", self.status())
+        format!("{}\n\n{report}\n\nВозврат не останавливает сервер.\nВнешний сервис управляется отдельно.", self.status())
     }
 
     pub(crate) fn body(&self) -> String {
@@ -324,7 +324,7 @@ impl ProcessPanel {
         } else {
             "s: запустить (подтверждение)"
         };
-        format!("{report}\n\n{actions} • Esc: назад (не останавливает сервер)\nДля внешнего headless сервиса: статус v / локальный IPC.\nВыход из TUI требует предварительной остановки принадлежащего ему сервера.")
+        format!("{report}\n\n{actions} • Esc: назад (не останавливает сервер)\nДля внешнего сервиса откройте отдельный экран состояния.\nВыход из TUI требует предварительной остановки принадлежащего ему сервера.")
     }
 }
 
@@ -383,7 +383,7 @@ mod tests {
         assert!(panel.confirm.is_none());
         panel.confirm = Some(true);
         panel.key(KeyCode::Char('y'), None);
-        assert!(panel.body().contains("Сначала откройте серверный TOML"));
+        assert!(panel.body().contains("Сначала откройте файл настроек сервера"));
         panel.worker = Some(Worker {
             endpoint: None,
             stop: Some(stop),
@@ -426,7 +426,7 @@ mod tests {
     fn no_config_means_no_start_and_no_confirm() {
         let mut p = ProcessPanel::new();
         assert!(!p.key(KeyCode::Char('s'), None));
-        assert!(p.body().contains("Нужен сохранённый"));
+        assert!(p.body().contains("Сначала откройте и сохраните настройки"));
         assert!(!p.running());
         assert!(p.key(KeyCode::Esc, None));
         assert_eq!(p.status(), "Не запущен этой панелью");
