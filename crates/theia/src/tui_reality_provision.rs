@@ -224,7 +224,7 @@ const WIZARD_LABELS: [&str; 7] = [
 #[derive(Clone)]
 struct WizardInput {
     config: PathBuf,
-    source: [u8; 32],
+    source: Option<[u8; 32]>,
     id: String,
     listen: SocketAddr,
     endpoint: String,
@@ -238,9 +238,21 @@ struct WizardInput {
 impl WizardInput {
     fn check_source(&self) -> Result<(), Error> {
         use sha2::{Digest, Sha256};
+        if self.source.is_none() {
+            if self.grants.len() != 1 || !config::valid_id(&self.grants[0]) {
+                return Err(Error::Grant);
+            }
+            new_health_path(&self.config)?;
+            if !self.config.parent().is_some_and(Path::is_dir)
+                || self.health.parent().is_none_or(|p| p.exists()) {
+                return Err(Error::Storage);
+            }
+            validate_paths(&self.health, &self.bundle)?;
+            return new_health_path(&self.health);
+        }
         let raw = config::editor_bytes(&self.config).map_err(|_| Error::Storage)?;
         let actual: [u8; 32] = Sha256::digest(&raw).into();
-        if actual != self.source {
+        if Some(actual) != self.source {
             return Err(Error::Approval);
         }
         let Config::Server(doc) =
@@ -279,7 +291,7 @@ impl WizardInput {
         new_health_path(&self.health)?;
         Ok(())
     }
-    fn parse(config: PathBuf, source: [u8; 32], fields: &[String; 7]) -> Result<Self, Error> {
+    fn parse(config: PathBuf, source: Option<[u8; 32]>, fields: &[String; 7]) -> Result<Self, Error> {
         if !config::valid_id(&fields[0]) {
             return Err(Error::Scope);
         }
@@ -408,6 +420,57 @@ impl WizardInput {
         self.plan(references)
     }
 }
+/// Publish a first-run configuration only after an explicit reviewed save.
+fn create_first_server(input: WizardInput, state: reference_health::State) -> Result<Editor, Error> {
+    input.check_source()?;
+    let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
+    let preview = reality_provision::preview(&state, now)?;
+    let mut owned = crate::tui_staged_material::StagedMaterial::create_for_new_config(
+        input.health.parent().ok_or(Error::Storage)?, &input.config,
+    )?;
+    let enrolled = reference_health::Store::new(&input.health).and_then(|s| s.enroll(&state));
+    if let Err(error) = enrolled {
+        if matches!(error, reference_health::Error::Indeterminate) {
+            owned.preserve();
+            return Err(Error::Indeterminate);
+        }
+        owned.cleanup()?;
+        return Err(Error::Storage);
+    }
+    let record = match reality_provision::create(&state, preview.health_sha256, &input.bundle, now) {
+        Ok(record) => record,
+        Err(Error::Indeterminate) => {
+            owned.preserve();
+            return Err(Error::Indeterminate);
+        }
+        Err(error) => {
+            owned.cleanup()?;
+            return Err(error);
+        }
+    };
+    let request = ServerRequest {
+        health: input.health,
+        bundle: input.bundle,
+        health_sha256: preview.health_sha256,
+        identity_sha256: record.identity_sha256,
+        listen: input.listen,
+        grants: input.grants,
+    };
+    let candidate = reality_config::first_server_candidate(&request, now)?;
+    match config::guarded_create(&input.config, &candidate) {
+        Ok(()) => owned.preserve(),
+        Err(config::WriteFailure::BeforeReplace(_)) => {
+            owned.cleanup()?;
+            return Err(Error::Storage);
+        }
+        Err(config::WriteFailure::AfterReplace(_)) => {
+            owned.preserve();
+            return Err(Error::Indeterminate);
+        }
+    }
+    Editor::load(Role::Server, &input.config).map_err(|_| Error::Indeterminate)
+}
+
 fn rank_checked(
     input: &WizardInput,
     plan: reference_health::Plan,
@@ -456,11 +519,12 @@ enum WizardStage {
     ),
     CreateConfirm(Box<(WizardInput, reference_health::State, String)>),
     Saving(Receiver<Result<RegistrationPanel, Error>>, PathBuf),
+    SavingInitial(Receiver<Result<Editor, Error>>, PathBuf),
     Done(String),
 }
 struct Wizard {
     config: PathBuf,
-    source: [u8; 32],
+    source: Option<[u8; 32]>,
     fields: [String; 7],
     focus: usize,
     advanced: bool,
@@ -480,7 +544,7 @@ impl Wizard {
         let id = crate::tui_editor::generated_id("inbound")?;
         Ok(Self {
             config,
-            source: editor.saved_sha256(),
+            source: Some(editor.saved_sha256()),
             fields: [
                 id,
                 "443".into(),
@@ -495,6 +559,33 @@ impl Wizard {
             users: editor
                 .record_user_catalog(crate::tui_editor::RecordAction::NewInbound)
                 .unwrap_or_default(),
+            stage: WizardStage::Input,
+            error: String::new(),
+            registration: None,
+        })
+    }
+    fn first(path: PathBuf) -> Result<Self, &'static str> {
+        let config = std::path::absolute(path).map_err(|_| "Недопустимый путь TOML.")?;
+        if !crate::bounded_input::explicit_file_path(&config)
+            || new_health_path(&config).is_err()
+            || !config.parent().is_some_and(Path::is_dir) {
+            return Err("Укажите новый TOML в существующем каталоге.");
+        }
+        Ok(Self {
+            config,
+            source: None,
+            fields: [
+                crate::tui_editor::generated_id("inbound")?,
+                "443".into(),
+                String::new(),
+                String::new(),
+                crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[..3].join(","),
+                String::new(),
+                "auto".into(),
+            ],
+            focus: 1,
+            advanced: false,
+            users: "Введите ID первого пользователя. Он будет отключён до явного выпуска токена.".into(),
             stage: WizardStage::Input,
             error: String::new(),
             registration: None,
@@ -545,8 +636,8 @@ impl Wizard {
                             self.focus = 1;
                         }
                     }
-                    KeyCode::Tab => self.move_focus(true),
-                    KeyCode::BackTab => self.move_focus(false),
+                    KeyCode::Tab | KeyCode::Down => self.move_focus(true),
+                    KeyCode::BackTab | KeyCode::Up => self.move_focus(false),
                     KeyCode::Backspace => {
                         self.fields[self.focus].pop();
                     }
@@ -631,16 +722,25 @@ impl Wizard {
                     .parent()
                     .map(Path::to_owned)
                     .unwrap_or_default();
+                if input.source.is_none() {
+                    let (tx, rx) = mpsc::channel();
+                    let _worker = std::thread::spawn(move || {
+                        let _ = tx.send(create_first_server(input, state));
+                    });
+                    self.stage = WizardStage::SavingInitial(rx, root);
+                    return false;
+                }
                 let (tx, rx) = mpsc::channel();
                 let _worker = std::thread::spawn(move || {
                     let result = (|| {
+                        let source = input.source.ok_or(Error::Approval)?;
                         input.check_source()?;
                         let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
                         let preview = reality_provision::preview(&state, now)?;
                         let mut owned = crate::tui_staged_material::StagedMaterial::create(
                             input.health.parent().ok_or(Error::Storage)?,
                             &input.config,
-                            input.source,
+                            source,
                         )?;
                         // No external reference can exist before registration.
                         // Keep an uncertain write for explicit inspection.
@@ -685,7 +785,7 @@ impl Wizard {
                             &reality_config::Request::Server(request.clone()),
                             now,
                         )?;
-                        RegistrationPanel::from_provision(input.config, input.source, request)
+                        RegistrationPanel::from_provision(input.config, source, request)
                             .map(|panel| panel.own_material(owned))
                     })();
                     let _ = tx.send(result);
@@ -725,6 +825,12 @@ impl Wizard {
                 Ok(value) => value.map(|v| WizardStage::CreateConfirm(Box::new(v))),
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
             },
+            WizardStage::SavingInitial(rx, root) => match rx.try_recv() {
+                Ok(Ok(editor)) => return Some(editor),
+                Ok(Err(error)) => Ok(WizardStage::Done(format!("Не удалось сохранить первый TOML: {error}. При неопределённой записи проверьте {root:?}. Сервер не запущен."))),
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => Ok(WizardStage::Done(format!("Запись не подтверждена. Проверьте TOML и {root:?}; не повторяйте вслепую."))),
+            },
             WizardStage::Saving(rx, root) => match rx.try_recv() {
                 Ok(Ok(panel)) => { self.registration = Some(panel); return None; }
                 Ok(Err(error)) => Ok(WizardStage::Done(format!("ОТКАЗ: {error}. При неопределённой записи проверьте каталог {root:?}; для целых материалов доступна регистрация M. Runtime не изменён. Esc: закрыть."))),
@@ -750,7 +856,7 @@ impl Wizard {
             WizardStage::Input => {
                 let mut out = String::from("Новый REALITY inbound. Без TLS cert/key.\n");
                 for &i in self.visible_fields() {
-                    let label = if i == 1 && !self.advanced { "Порт (или bind)" } else { WIZARD_LABELS[i] };
+                    let label = if i == 1 && !self.advanced { "Порт (или bind)" } else if i == 5 && self.source.is_none() { "ID первого пользователя" } else { WIZARD_LABELS[i] };
                     out.push_str(&format!("{} {label}: {}\n", if i == self.focus { ">" } else { " " }, self.fields[i]));
                 }
                 out.push_str(if self.advanced { "auto: подобрать по оценкам; manual: сохранить порядок.\nF2: скрыть расширенные.\n" } else { "ID создаётся автоматически; референсы подбираются из каталога.\nУкажите все собственные IP, включая публичный/NAT: это обязательная защита от self-reference.\nF2: расширенные (ID, домены/IP, manual).\n" });
@@ -765,8 +871,14 @@ impl Wizard {
                 format!("Проверить только эти IP:443 и SNI (public PKI, H2/H3 HEAD):\n{}\nИсключены DNS/недопустимые/повторные IP: {}\nDNS будет повторно сверён, включая endpoint; запрещено подключение к собственным IP.\ny: проверить; n/Esc: отменить.", value.1.preview().unwrap_or_else(|_| "Неверный план".into()), skipped.join(", "))
             },
             WizardStage::Checking(_, _) => "Проверка согласованных IP; Esc: отменить без записи.".into(),
-            WizardStage::CreateConfirm(value) => value.2.clone(),
-            WizardStage::Saving(_, _) => "Создание локальных материалов; не закрывайте экран. Runtime не меняется.".into(),
+            WizardStage::CreateConfirm(value) => {
+                if value.0.source.is_none() {
+                    format!("{}\nПервый TOML: {}\nПервый пользователь: {} (отключён).\ny: создать материалы и сохранить новый TOML; n/Esc: назад.", value.2, value.0.config.display(), value.0.grants.join(", "))
+                } else {
+                    value.2.clone()
+                }
+            },
+            WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => "Создание локальных материалов; не закрывайте экран. Runtime не меняется.".into(),
             WizardStage::Done(message) => message.clone(),
         }
     }
@@ -781,6 +893,12 @@ impl ProvisionPanel {
             error: None,
             wizard: None,
         }
+    }
+
+    pub(crate) fn first(path: PathBuf) -> Result<Self, &'static str> {
+        let mut panel = Self::new();
+        panel.wizard = Some(Wizard::first(path)?);
+        Ok(panel)
     }
 
     pub(crate) fn bound(editor: &Editor) -> Result<Self, &'static str> {
@@ -1009,7 +1127,7 @@ mod tests {
         wizard.fields[4] = "first.example.org=93.184.216.2,second.example.org=93.184.216.3".into();
         wizard.fields[5] = "device-a".into();
         let input =
-            WizardInput::parse(path.clone(), editor.saved_sha256(), &wizard.fields).unwrap();
+            WizardInput::parse(path.clone(), Some(editor.saved_sha256()), &wizard.fields).unwrap();
         let plan = input
             .plan(vec![
                 reference_health::Target {
