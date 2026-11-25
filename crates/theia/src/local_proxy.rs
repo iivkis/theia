@@ -1241,12 +1241,13 @@ mod selector_tests {
                 }
                 selected.unwrap()
             };
-            let now = reference_health::unix_now().unwrap();
+            let now = reference_health::unix_now().unwrap().saturating_sub(3700);
             let state = State::new(Plan { schema_version: 1, inbound: "reality-native".into(),
                 endpoint: remote.to_string(), own_ips: vec![remote.ip()],
                 references: vec![Target { server_name: "ref.example.org".into(),
-                    address: "93.184.216.2:443".parse().unwrap() }] },
-                vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+                    address: "93.184.216.2:443".parse().unwrap() },
+                    Target {server_name:"reserve.example.org".into(),address:"93.184.216.3:443".parse().unwrap()}] },
+                vec![Evidence { h2_status: Some(200), h3_status: Some(200) };2], now).unwrap();
             let health = dir.0.join("health.toml");
             Store::new(&health).unwrap().enroll(&state).unwrap();
             let bundle = dir.0.join("bundle");
@@ -1257,7 +1258,7 @@ mod selector_tests {
             let source = include_str!("../../../examples/server.toml")
                 .replace("REPLACE_WITH_64_LOWERCASE_HEX",&format!("{:x}",Sha256::digest(token)));
             std::fs::write(&server_path,source).unwrap();
-            let request = Request::Server(ServerRequest { health, bundle:bundle.clone(),
+            let request = Request::Server(ServerRequest { health:health.clone(), bundle:bundle.clone(),
                 health_sha256:digest,identity_sha256:record.identity_sha256,listen:remote,
                 grants:vec!["device-a".into()] });
             let preview = reality_config::prepare(&server_path,&request,now).unwrap();
@@ -1365,7 +1366,30 @@ mod selector_tests {
             }
             let publication=crate::identity_publication::Publication::new(&bundle.join("publication.toml")).unwrap();
             let now=reference_health::unix_now().unwrap();
+            let store=Store::new(&health).unwrap();
+            let good=Evidence{h2_status:Some(200),h3_status:Some(200)};
+            store.fixture_record(vec![Evidence::default(),good.clone()],now-301).unwrap();
+            store.fixture_record(vec![Evidence::default(),good],now-1).unwrap();
+            // The maintenance worker, not the test, performs the failover.
+            // Both clients retain the original signed SNI until refresh.
+            for managed in &managed_clients{
+                for _ in 0..20{
+                    let generation=managed.generation().await.unwrap();
+                    if generation.value.descriptor().active_reference==1{break;}
+                    let _=managed.refresh(&generation).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                assert_eq!(managed.generation().await.unwrap().value.descriptor().active_reference,1);
+            }
+            for stream in &mut established{
+                stream.write_all(b"fail").await.unwrap();
+                let mut bytes=[0;4];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes,b"fail");
+            }
+            let now=reference_health::unix_now().unwrap();
             let status=publication.inspect(now).unwrap();
+            assert_eq!(status.active_reference,1);
             publication.begin_rotation(&successor_path,status.snapshot_sha256,
                 bootstrap::fingerprint(successor.public_key()),now).unwrap();
             for managed in &managed_clients {
@@ -1382,7 +1406,7 @@ mod selector_tests {
                 let new=managed.generation().await.unwrap();
                 assert_eq!(new.value.signer(),successor.public_key());
                 // An actual new tunnel must complete on the new signer.
-                let tunnel=managed.open(Address::Ip(target.ip()),target.port()).await.unwrap();
+                let tunnel=managed.open(Address::V4([127,0,0,1]),target.port()).await.unwrap();
                 drop(tunnel);
             }
             // Both already-established application tunnels still carry

@@ -135,8 +135,7 @@ impl Live {
         self.slot.read().ok()?.clone()
     }
     pub(crate) fn publish(&self,lease:Arc<Lease>,now:u64)->Result<(),ServerError>{
-        let mut slot=self.slot.write().map_err(|_|ServerError::Config)?;
-        if slot.as_ref().is_some_and(|old| {
+        if self.current().as_ref().is_some_and(|old| {
             let a=old.lease.status();let b=lease.status();
             a.generation==b.generation && a.health_revision==b.health_revision &&
                 a.active_usable==b.active_usable && a.successor_usable==b.successor_usable
@@ -145,7 +144,7 @@ impl Live {
         // A transport policy change requires structural Apply, not an
         // implicit rebind. The publication rotation/failover contract retains modes.
         if candidate.default_quic().is_some()!=self.h3 { return Err(ServerError::Config); }
-        *slot=Some(candidate);
+        *self.slot.write().map_err(|_|ServerError::Config)?=Some(candidate);
         Ok(())
     }
     pub(crate) fn suspend(&self){

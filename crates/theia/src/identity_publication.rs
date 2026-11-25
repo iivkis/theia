@@ -588,9 +588,9 @@ impl Publication {
         })
     }
 
-    /// Explicit offline publication after a separately confirmed client
-    /// recovery plan. The caller must distribute the new signed descriptor
-    /// through the authenticated recovery path; this changes no listeners.
+    /// Publication CAS after explicit offline recovery approval or the
+    /// live supervisor's independently rooted compatibility check. This
+    /// changes no listeners directly; the supervisor stages the result.
     /// The exact evidence is still required to be fresh at commit time.
     pub fn apply_failover(
         &self,

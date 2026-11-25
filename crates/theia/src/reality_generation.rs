@@ -287,6 +287,46 @@ mod tests {
     }
     impl Drop for Scratch { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
 
+
+    #[tokio::test]
+    async fn startup_recovery_switches_only_to_fresh_approved_reserve_and_keeps_floor(){
+        let dir=Scratch::new();
+        let now=crate::reference_health::unix_now().unwrap();
+        let initial=now-3700;
+        let good=Evidence{h2_status:Some(200),h3_status:Some(200)};
+        let state=State::new(Plan{schema_version:1,inbound:"edge".into(),
+            endpoint:"edge.example.org:9443".into(),own_ips:vec!["93.184.216.1".parse().unwrap()],
+            references:vec![Target{server_name:"ref.example.org".into(),address:"93.184.216.2:443".parse().unwrap()},
+                Target{server_name:"reserve.example.org".into(),address:"93.184.216.3:443".parse().unwrap()}]},
+            vec![good.clone(),good.clone()],initial).unwrap();
+        let health=dir.0.join("health");
+        let store=Store::new(&health).unwrap();
+        store.enroll(&state).unwrap();
+        let old=std::fs::read(&health).unwrap();
+        let bundle=dir.0.join("bundle");
+        let digest=state.snapshot_sha256().unwrap();
+        let record=crate::reality_provision::create(&state,digest,&bundle,initial).unwrap();
+        let cfg=dir.0.join("server.toml");
+        std::fs::write(&cfg,include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX",&"a".repeat(64))).unwrap();
+        let request=Request::Server(ServerRequest{health:health.clone(),bundle:bundle.clone(),health_sha256:digest,
+            identity_sha256:record.identity_sha256,listen:"127.0.0.1:9443".parse().unwrap(),grants:vec!["device-a".into()]});
+        let preview=reality_config::prepare(&cfg,&request,initial).unwrap();
+        reality_config::apply(&cfg,&request,preview.approval_sha256(),initial).unwrap();
+        let doc=config::read_file(&cfg).unwrap();
+        store.fixture_record(vec![Evidence::default(),good.clone()],now-301).unwrap();
+        store.fixture_record(vec![Evidence::default(),good],now-1).unwrap();
+        assert!(Manager::new(&doc,"edge",now).is_err());
+        let manager=Manager::new_live(&doc,"edge",now).await.unwrap();
+        let lease=manager.refresh(now).unwrap();
+        assert_eq!(lease.status().active_reference,1);
+        assert_eq!(lease.status().revision,2);
+        assert_eq!(lease.status().health_revision,3);
+        // A stale healthy snapshot cannot resurrect the old primary.
+        std::fs::write(&health,old).unwrap();
+        assert!(Manager::new(&doc,"edge",now).is_err());
+    }
+
     #[test]
     fn generation_rejects_rollback_and_retains_existing_lease() {
         let dir = Scratch::new();

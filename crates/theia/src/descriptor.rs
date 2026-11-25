@@ -718,9 +718,11 @@ impl Store {
         Ok(change)
     }
 
-    /// Explicit, revision-guarded normal rotation, NOT compromise recovery.
+    /// Revision-guarded normal rotation, NOT compromise recovery.
     /// Caller must independently confirm the intended key and current
-    /// revision; never call from an automatic descriptor download.
+    /// revision, or establish continuity through the authenticated live
+    /// successor protocol (announcement + successor handshake + bound CAS).
+    /// A raw automatic descriptor download alone is insufficient.
     /// Both signatures and both validity intervals must be verified before
     /// publication. The current signer is retired only at the CAS commit.
     pub fn promote(
