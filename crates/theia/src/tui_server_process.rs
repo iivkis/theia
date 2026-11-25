@@ -130,7 +130,7 @@ impl ProcessPanel {
         use crate::tui_widgets::ActionItem;
         if self.confirm.is_some() { return Vec::new(); }
         match &self.worker {
-            None => vec![ActionItem { key: 's', label: "Запустить сервер" }],
+            None => vec![ActionItem { key: 's', label: "Запустить сервер по сохранённому файлу" }],
             Some(worker) if worker.stop.is_some() => vec![ActionItem { key: 'x', label: "Остановить сервер" }],
             Some(_) => Vec::new(),
         }

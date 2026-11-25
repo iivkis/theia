@@ -35,6 +35,33 @@ pub(crate) fn section(title: &str, active: bool) -> Block<'_> {
         .style(Style::default().fg(TEXT).bg(SURFACE))
 }
 
+/// Reports share semantic title and key styling without interpreting their
+/// contents as commands. In particular, an invitation can never trigger an action.
+pub(crate) fn report_section(title: &str, active: bool) -> Block<'_> {
+    let color = if title.contains("Ошибка") || title.contains("НЕ удалось") || title.contains("не выполнен") || title.contains("заблокирована") {
+        ERROR
+    } else if title.contains("Подтверждение") || title.contains("СЕКРЕТ") || title.contains("Не сохранено") {
+        WARNING
+    } else if active { ACCENT } else { MUTED };
+    section(title, active).title_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
+pub(crate) fn report_row<'a>(value: &'a str, style: Style, first: bool) -> Line<'a> {
+    if first {
+        if let Some((key, rest)) = value.split_once(':') {
+            if matches!(key, "Enter" | "Esc" | "Enter/Esc" | "y" | "n/Esc" | "r" | "s" | "d" | "x" | "c" | "f" | "Q" | "F2" | "F3" | "Ctrl+R") {
+                let color = if key == "y" { WARNING } else { TEXT };
+                return Line::from(vec![
+                    Span::styled(key, Style::default().fg(color).bg(INPUT).add_modifier(Modifier::BOLD)),
+                    Span::styled(":", style),
+                    Span::styled(rest, style),
+                ]);
+            }
+        }
+    }
+    Line::styled(value, style)
+}
+
 pub(crate) fn key_line(keys: &str) -> Line<'_> {
     let mut spans = Vec::new();
     for (i, part) in keys.split(" · ").enumerate() {

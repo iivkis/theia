@@ -282,7 +282,7 @@ enum DisableFlow {
 type ExportResult = (Editor, Result<PathBuf, &'static str>);
 
 enum RecordFlow {
-    ChooseMode(Role),
+    ChooseMode(Role, usize),
     Input {
         action: RecordAction,
         fields: Vec<String>,
@@ -293,6 +293,18 @@ enum RecordFlow {
 
 impl RecordFlow {
     fn form(&self, editor: Option<&Editor>) -> Option<Form> {
+        if let Self::ChooseMode(role, selected) = self {
+            let server = *role == Role::Server;
+            return Some(Form {
+                fields: vec![
+                    Field { id: 0, label: "Own-TLS · свой сертификат", value: if server { "У меня есть сертификат и закрытый ключ" } else { "Ввести адрес и параметры доверия вручную" }.into(), hint: "Выбирайте, если у вас есть собственная TLS-инфраструктура." },
+                    Field { id: 1, label: "SmartTheia REALITY", value: if server { "Мастер настройки без собственного сертификата" } else { "Импорт приглашения и проверка доверия" }.into(), hint: "Enter — открыть мастер. Запись и запуск потребуют отдельных действий." },
+                ],
+                selected: *selected,
+                lead: "Выберите способ защиты подключения. Стрелки или мышь — выбор; Enter — продолжить.".into(),
+                error: String::new(),
+            });
+        }
         let Self::Input { action, fields, focus } = self else { return None; };
         Some(Form {
             fields: action.fields().iter().zip(fields).enumerate().map(|(id, ((label, hidden), value))| Field {
@@ -305,13 +317,15 @@ impl RecordFlow {
         })
     }
     fn select_field(&mut self, id: usize) {
-        if let Self::Input { fields, focus, .. } = self {
-            if id < fields.len() { *focus = id; }
+        match self {
+            Self::ChooseMode(_, selected) if id < 2 => *selected = id,
+            Self::Input { fields, focus, .. } if id < fields.len() => *focus = id,
+            _ => {}
         }
     }
     fn body(&self) -> String {
         match self {
-            Self::ChooseMode(role) => format!("ВЫБЕРИТЕ РЕЖИМ\n\n  1   Own-TLS\n      {}\n\n  2   SmartTheia REALITY\n      {}\n\nEsc: назад. Сохранение не запускает runtime.", if *role == Role::Server {"Свой сертификат и ключ"} else {"Ручные параметры TLS"}, if *role == Role::Server {"Мастер проверки референсов, без своего сертификата"} else {"Импорт с независимым подтверждением доверия"}),
+            Self::ChooseMode(role, _) => format!("ВЫБЕРИТЕ РЕЖИМ\n\n  1   Own-TLS\n      {}\n\n  2   SmartTheia REALITY\n      {}\n\nEsc: назад. Сохранение не запускает runtime.", if *role == Role::Server {"Свой сертификат и ключ"} else {"Ручные параметры TLS"}, if *role == Role::Server {"Мастер проверки референсов, без своего сертификата"} else {"Импорт с независимым подтверждением доверия"}),
             Self::Confirm(review) => review.body().to_owned(),
             Self::Input {
                 action,
@@ -1253,7 +1267,12 @@ impl Interaction {
         };
         if let Some(flow) = self.records.take() {
             match flow {
-                RecordFlow::ChooseMode(role) => match key.code {
+                RecordFlow::ChooseMode(role, selected) => match if key.code == KeyCode::Enter {
+                    KeyCode::Char(if selected == 0 { '1' } else { '2' })
+                } else { key.code } {
+                    KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                        self.records = Some(RecordFlow::ChooseMode(role, 1 - selected));
+                    }
                     KeyCode::Char('1') => {
                         let action = if role == Role::Server {
                             RecordAction::NewInbound
@@ -1282,7 +1301,7 @@ impl Interaction {
                         Err(message) => editor.error = Some(message.into()),
                     },
                     KeyCode::Esc => {}
-                    _ => self.records = Some(RecordFlow::ChooseMode(role)),
+                    _ => self.records = Some(RecordFlow::ChooseMode(role, selected)),
                 },
                 RecordFlow::Confirm(review) => match key.code {
                     KeyCode::Char('y') if key.modifiers.is_empty() => {
@@ -1917,7 +1936,7 @@ impl Interaction {
                 && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
             {
                 match editor.require_clean_records() {
-                    Ok(()) => self.records = Some(RecordFlow::ChooseMode(editor.role())),
+                    Ok(()) => self.records = Some(RecordFlow::ChooseMode(editor.role(), 1)),
                     Err(message) => editor.error = Some(message.into()),
                 }
                 return false;
@@ -2269,11 +2288,11 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
                 .fg(ACCENT)
                 .bg(FOCUS)
                 .add_modifier(Modifier::BOLD)
-        } else if line.starts_with("Ошибка:") || line.starts_with("ОТКАЗ:") {
+        } else if line.starts_with("Ошибка") || line.starts_with("ОТКАЗ") || line.starts_with("Отказ:") {
             Style::default().fg(ERROR).add_modifier(Modifier::BOLD)
         } else if line.starts_with("ШАГ ") || line.starts_with("ПРЕДЛОЖЕННЫЙ ") || line.starts_with("ПУТЬ К TOML") || line.starts_with("ВЫБЕРИТЕ ") || line.starts_with("НАЧАЛО РАБОТЫ") || line.starts_with("SMARTTHEIA REALITY") || line.starts_with("СЕТЬ ") || line == "ДОСТУП" || line == "OWN-TLS" || line == "ПРОФИЛИ" {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("КОНФИДЕНЦИАЛЬНО")
+        } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("КОНФИДЕНЦИАЛЬНО") || line.starts_with("СЕКРЕТ:")
         {
             Style::default()
                 .fg(WARNING)
@@ -2290,7 +2309,7 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
             let cw = Span::raw(encoded).width();
             if used + cw > width && i > start {
                 let end = break_at.filter(|&p| p > start).unwrap_or(i);
-                rows.push(Line::styled(&line[start..end], style));
+                rows.push(tui_widgets::report_row(&line[start..end], style, start == 0));
                 start = end;
                 used = Span::raw(&line[start..i]).width();
                 break_at = None;
@@ -2300,7 +2319,7 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
                 break_at = Some(i + ch.len_utf8());
             }
         }
-        rows.push(Line::styled(&line[start..], style));
+        rows.push(tui_widgets::report_row(&line[start..], style, start == 0));
     }
     (rows, focus)
 }
@@ -2336,7 +2355,7 @@ fn panel_at(
     let area = if viewport.is_some() { Rect::new(area.x, area.y, area.width, area.height.min((visible.len() as u16).saturating_add(2))) } else { area };
     frame.render_widget(
         Paragraph::new(visible).block(
-            tui_widgets::section(&caption, focused),
+            tui_widgets::report_section(&caption, focused),
         ),
         area,
     );
@@ -2405,7 +2424,7 @@ fn draw_guided(
     }
     if let Some(form) = form {
         let title = if parts[0].height == 0 { caption.as_str() } else { "Параметры" };
-        if heading == "Выбор пользователей" { form.render_picker(frame, parts[1], title); }
+        if matches!(heading, "Выбор пользователей" | "Выбор защиты") { form.render_picker(frame, parts[1], title); }
         else { form.render(frame, parts[1], title); }
     } else if let Some(lines) = review_lines {
         // Same width as stepper and key bar: never re-center a nested report.
@@ -2597,8 +2616,12 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         }
         let form = flow.form(interaction.and_then(|ui| ui.editor.as_ref()));
         if form.is_some() {
-            draw_guided(frame, parts[1], "Настройка записи", &body,
-                (1, 2, "Параметры", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад"), viewport, (form, None));
+            let guide = if matches!(flow, RecordFlow::ChooseMode(..)) {
+                (1, 2, "Выбор защиты", "↑↓ выбрать · Enter продолжить · Esc назад")
+            } else {
+                (1, 2, "Параметры", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад")
+            };
+            draw_guided(frame, parts[1], "Настройка подключения", &body, guide, viewport, (form, None));
         } else {
             modal_panel!(frame, parts[1], "Настройка записи", &body, true);
         }
@@ -2762,6 +2785,18 @@ fn draw_issuance(
 ) {
     let rotating = kind == IssueKind::Rotation;
     let recovering = kind == IssueKind::Reenable;
+    if let IssueFlow::Input(id) = flow {
+        if !rotating && !recovering {
+            let form = Form {
+                fields: vec![Field { id: 0, label: "Имя пользователя", value: id.clone(), hint: "Введите уникальное имя, например phone или laptop. Enter — проверить." }],
+                selected: 0,
+                lead: "Создаётся новый токен и доступ только к выбранному подключению. Сервер не перезапускается.".into(),
+                error: editor.and_then(|e| e.error.clone()).unwrap_or_default(),
+            };
+            draw_guided(frame, area, "Новый пользователь", "", (1, 2, "Доступ", "Enter продолжить · Backspace удалить · Esc отменить"), viewport, (Some(form), None));
+            return;
+        }
+    }
     let (title, body) = match flow {
         IssueFlow::Input(id) => (
             if recovering {
@@ -2956,6 +2991,20 @@ fn draw_import(
     editor: Option<&Editor>,
     viewport: Option<&Viewport>,
 ) {
+    if let ImportFlow::Input(source) = flow {
+        let form = Form {
+            fields: vec![Field {
+                id: 0, label: "Приглашение или локальный файл",
+                value: if source.is_empty() { String::new() } else { format!("Введено {} байт (скрыто)", source.len()) },
+                hint: "Вставьте ссылку theia:// или абсолютный путь к URI-файлу, PNG или SVG QR. Содержимое скрыто.",
+            }],
+            selected: 0,
+            lead: "Проверка не запускает подключение и не меняет системный прокси.".into(),
+            error: editor.and_then(|e| e.error.clone()).unwrap_or_default(),
+        };
+        draw_guided(frame, area, "Импорт подключения", "", (1, 2, "Источник приглашения", "Enter проверить · Esc отменить"), viewport, (Some(form), None));
+        return;
+    }
     let (title, body) = match flow {
         ImportFlow::Input(source) => (
             "F-14: импорт подключения",
@@ -3256,7 +3305,11 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         Line::raw(editor.selection_summary()),
         Line::styled(users, Style::default().fg(MUTED)),
     ];
-    frame.render_widget(Paragraph::new(status).block(tui_widgets::section(heading, false)), overview);
+    if overview.height >= 5 {
+        frame.render_widget(Paragraph::new(status).block(tui_widgets::section(heading, false)), overview);
+    } else {
+        frame.render_widget(Paragraph::new(status).style(Style::default().bg(SURFACE)), overview);
+    }
 
     let (start, rows, header) = editor_table_window(table_area, editor);
     let labels = if server { ["Домен TLS", "Адрес TCP (H2)", "Адрес UDP (H3)", ""] }
@@ -3569,6 +3622,18 @@ mod tests {
         let (rows, _) = visual_rows("one two three four", 5);
         assert!(rows.len() >= 4);
         assert!(rows.iter().all(|row| row.width() <= 5));
+    }
+
+    #[test]
+    fn mode_picker_focus_is_a_choice_not_a_commit() {
+        let mut flow = RecordFlow::ChooseMode(Role::Server, 1);
+        let initial = flow.form(None).unwrap();
+        assert_eq!(initial.selected, 1);
+        assert_eq!(initial.fields.len(), 2);
+        flow.select_field(0);
+        assert_eq!(flow.form(None).unwrap().selected, 0);
+        flow.select_field(99);
+        assert_eq!(flow.form(None).unwrap().selected, 0);
     }
 
     #[test]
