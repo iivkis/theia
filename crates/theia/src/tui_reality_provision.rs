@@ -477,18 +477,32 @@ fn create_first_server(input: WizardInput, state: reference_health::State) -> Re
     Editor::load(Role::Server, &input.config).map_err(|_| Error::Indeterminate)
 }
 
+#[derive(Clone)]
+struct RankedReview {
+    text: String,
+    rows: Vec<crate::tui_widgets::ReferenceRow>,
+}
+
 fn rank_checked(
     input: &WizardInput,
     plan: reference_health::Plan,
     evidence: Vec<reference_health::Evidence>,
     now: u64,
-) -> Result<(reference_health::State, String), Error> {
+) -> Result<(reference_health::State, RankedReview), Error> {
     if plan.references.len() != evidence.len() {
         return Err(Error::Health);
     }
     let mut entries: Vec<_> = plan.references.into_iter().zip(evidence).collect();
     let mut report =
         String::from("Оценки: 100 = стабильные H2+H3, 80 = стабильный H2, 0 = отказ.\n");
+    let mut rows: Vec<_> = entries.iter().map(|(target, item)| crate::tui_widgets::ReferenceRow {
+        name: target.server_name.clone(),
+        address: target.address.to_string(),
+        score: item.score(),
+        h2: item.eligible(),
+        h3: item.h3(),
+        selected: None,
+    }).collect();
     for (target, item) in &entries {
         report.push_str(&format!(
             "{} {}: {}\n",
@@ -508,12 +522,16 @@ fn rank_checked(
     let state = reference_health::State::new(plan, observed, now).map_err(|_| Error::Health)?;
     report.push_str("\nПРЕДЛОЖЕННЫЙ НАБОР\n");
     for (index, target) in state.plan().references.iter().enumerate() {
+        if let Some(row) = rows.iter_mut().find(|row| row.name == target.server_name && row.address == target.address.to_string()) {
+            row.selected = Some(index);
+        }
         let role = if index == 0 { "Основной".to_owned() } else { format!("Резерв {index}") };
         report.push_str(&format!("{role}: {}  ({})\n", target.server_name, target.address));
     }
     report.push_str(&format!("\nСервер: {}\nПорт: {}\nПользователи: {}\n", input.endpoint, input.listen.port(), input.grants.join(", ")));
     report.push_str("\nСоздать защищённые материалы? Сервер не будет запущен.\ny: создать; n/Esc: назад.");
-    Ok((state, report))
+    rows.sort_by_key(|row| row.selected.unwrap_or(usize::MAX));
+    Ok((state, RankedReview { text: report, rows }))
 }
 
 enum WizardStage {
@@ -525,10 +543,10 @@ enum WizardStage {
     ),
     ProbeConfirm(Box<(WizardInput, reference_health::Plan)>),
     Checking(
-        Receiver<Result<(WizardInput, reference_health::State, String), Error>>,
+        Receiver<Result<(WizardInput, reference_health::State, RankedReview), Error>>,
         tokio::sync::oneshot::Sender<()>,
     ),
-    CreateConfirm(Box<(WizardInput, reference_health::State, String)>),
+    CreateConfirm(Box<(WizardInput, reference_health::State, RankedReview)>),
     Saving(Receiver<Result<RegistrationPanel, Error>>, PathBuf),
     SavingInitial(Receiver<Result<Editor, Error>>, PathBuf),
     Done(String),
@@ -932,9 +950,9 @@ impl Wizard {
             WizardStage::Checking(_, _) => "Проверка согласованных IP; Esc: отменить без записи.".into(),
             WizardStage::CreateConfirm(value) => {
                 if value.0.source.is_none() {
-                    format!("{}\nПервый TOML: {}\nПервый пользователь: {} (отключён).\ny: создать материалы и сохранить новый TOML; n/Esc: назад.", value.2, value.0.config.display(), value.0.grants.join(", "))
+                    format!("{}\nПервый TOML: {}\nПервый пользователь: {} (отключён).\ny: создать материалы и сохранить новый TOML; n/Esc: назад.", value.2.text, value.0.config.display(), value.0.grants.join(", "))
                 } else {
-                    value.2.clone()
+                    value.2.text.clone()
                 }
             },
             WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => "Создание локальных материалов; не закрывайте экран. Runtime не меняется.".into(),
@@ -1188,6 +1206,36 @@ impl ProvisionPanel {
         }
     }
 
+    pub(crate) fn reference_review(&self) -> Option<crate::tui_widgets::ReferenceReview> {
+        let wizard = self.wizard.as_ref()?;
+        if wizard.registration.is_some() { return None; }
+        let WizardStage::CreateConfirm(value) = &wizard.stage else { return None; };
+        let (input, _, review) = value.as_ref();
+        let first = input.source.is_none();
+        let details = vec![
+            ("Адрес сервера", input.endpoint.clone()),
+            ("TCP/UDP bind", input.listen.to_string()),
+            ("Пользователи", if first { format!("{} (отключён до выпуска токена)", input.grants.join(", ")) } else { input.grants.join(", ") }),
+            ("TOML", input.config.display().to_string()),
+        ];
+        let mut note = if first {
+            "Создание защищённых материалов и нового TOML. Сервер не запускается.".to_owned()
+        } else {
+            "Создание защищённых материалов. TOML сохраняется после отдельного подтверждения; сервер не запускается.".to_owned()
+        };
+        if input.endpoint.parse::<SocketAddr>().is_ok_and(|address| match address.ip() {
+            IpAddr::V4(ip) => ip.is_documentation(),
+            IpAddr::V6(ip) => ip.segments()[..2] == [0x2001, 0xdb8],
+        }) {
+            note.push_str("\nВнимание: адрес из диапазона для документации, не публичный адрес вашего VPS. Вернитесь назад и замените его перед реальным использованием.");
+        }
+        Some(crate::tui_widgets::ReferenceReview {
+            rows: review.rows.clone(),
+            details,
+            note,
+        })
+    }
+
     pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
         let wizard = self.wizard.as_ref()?;
         if wizard.registration.is_some() {
@@ -1200,7 +1248,7 @@ impl ProvisionPanel {
             WizardStage::Resolving(_, _) => (2, 5, "Получение адресов", "Esc отменить"),
             WizardStage::ProbeConfirm(_) => (3, 5, "Проверка референсов", "Y проверить перечисленные адреса · N / Esc назад"),
             WizardStage::Checking(_, _) => (3, 5, "Проверка TLS / QUIC", "Esc отменить"),
-            WizardStage::CreateConfirm(_) => (4, 5, "Результат подбора", "Y создать · N / Esc назад"),
+            WizardStage::CreateConfirm(value) => (4, 5, "Результат подбора", if value.0.source.is_none() { "Y создать TOML · N / Esc назад" } else { "Y создать материалы · N / Esc назад" }),
             WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => (5, 5, "Сохранение", "Идёт запись; сервер не запускается"),
             WizardStage::Done(_) => (5, 5, "Результат записи", "Esc закрыть"),
         })
@@ -1371,7 +1419,10 @@ mod tests {
             h3_status: None,
         };
         assert!(rank_checked(&manual, plan.clone(), failed.clone(), now).is_err());
-        let (filtered, _) = rank_checked(&input, plan.clone(), failed, now).unwrap();
+        let (filtered, filtered_review) = rank_checked(&input, plan.clone(), failed, now).unwrap();
+        assert_eq!(filtered_review.rows.len(), 2);
+        assert_eq!(filtered_review.rows[1].selected, None);
+        assert_eq!(filtered_review.rows[1].score, 0);
         assert_eq!(filtered.plan().references.len(), 1);
         assert!(rank_checked(&input, plan.clone(), Vec::new(), now).is_err());
         let resolved = tokio::runtime::Builder::new_current_thread()
@@ -1382,7 +1433,10 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.digest().unwrap(), plan.digest().unwrap());
         assert_eq!(state.plan().references[0].server_name, "second.example.org");
-        assert!(report.contains("100") && report.contains("80"));
+        assert!(report.text.contains("100") && report.text.contains("80"));
+        assert_eq!(report.rows[0].selected, Some(0));
+        assert_eq!(report.rows[0].score, 100);
+        assert_eq!(report.rows[1].selected, Some(1));
         assert!(!input.bundle.exists() && !input.health.exists());
         wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(wizard.stage, WizardStage::DnsConfirm(_)));

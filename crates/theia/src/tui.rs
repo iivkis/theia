@@ -18,7 +18,7 @@ use crate::{
     tui_reality_status::StatusPanel,
     tui_runtime::RuntimePanel,
     tui_server_process::ProcessPanel,
-    tui_widgets::{self, action_layout, Actions, Field, Form, ACCENT, BG, ERROR, FOCUS, MUTED, SURFACE, TEXT, WARNING},
+    tui_widgets::{self, action_layout, Actions, Field, Form, ReferenceReview, ACCENT, BG, ERROR, FOCUS, MUTED, SURFACE, TEXT, WARNING},
     Role,
 };
 use crossterm::{
@@ -2347,23 +2347,25 @@ fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bo
 
 /// A persistent step header and action strip separate guidance from the
 /// scrollable form/review. No display-only shortcut may commit a transaction.
-fn guided_layout(area: Rect, count: Option<usize>) -> [Rect; 3] {
+fn guided_layout(area: Rect, count: Option<usize>, review_rows: usize) -> [Rect; 3] {
     let mut area = centered_column(area, 132);
-    if let Some(count) = count {
-        let preferred = (count.saturating_mul(3).saturating_add(10)).clamp(18, 36) as u16;
-        let height = area.height.min(preferred);
-        area.y += (area.height - height).min(8) / 2;
-        area.height = height;
-    }
+    let preferred = count.map_or_else(
+        || review_rows.saturating_add(8).clamp(10, 40),
+        |count| count.saturating_mul(3).saturating_add(10).clamp(18, 36),
+    ) as u16;
+    let height = area.height.min(preferred);
+    area.y += (area.height - height).min(8) / 2;
+    area.height = height;
     if area.height < 10 {
         return [Rect::new(area.x, area.y, area.width, 0), area, Rect::new(area.x, area.bottom(), area.width, 0)];
     }
-    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(2)]).split(area);
+    let footer = if area.width < 72 { 3 } else { 2 };
+    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(footer)]).split(area);
     [parts[0], parts[1], parts[2]]
 }
 
 fn guided_form_area(area: Rect, count: usize) -> Rect {
-    guided_layout(area, Some(count))[1]
+    guided_layout(area, Some(count), 0)[1]
 }
 
 fn draw_guided(
@@ -2373,11 +2375,21 @@ fn draw_guided(
     body: &str,
     guide: (usize, usize, &'static str, &'static str),
     viewport: Option<&Viewport>,
-    form: Option<Form>,
+    content: (Option<Form>, Option<ReferenceReview>),
 ) {
+    let (form, review) = content;
     let (step, total, heading, keys) = guide;
     tui_widgets::canvas(frame, area);
-    let parts = guided_layout(area, form.as_ref().map(|f| f.fields.len()));
+    let width = area.width.min(132).saturating_sub(4);
+    let review_lines = if form.is_none() {
+        Some(match &review {
+            Some(review) => review.lines(width),
+            None => visual_rows(body, usize::from(width)).0,
+        })
+    } else {
+        None
+    };
+    let parts = guided_layout(area, form.as_ref().map(|f| f.fields.len()), review_lines.as_ref().map_or(0, Vec::len));
     let caption = format!("{title} · ШАГ {step}/{total}");
     if parts[0].height > 0 {
         let mut segments = vec![Span::styled(format!(" {step}/{total} "), Style::default().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD)), Span::raw("  ")];
@@ -2394,8 +2406,24 @@ fn draw_guided(
         let title = if parts[0].height == 0 { caption.as_str() } else { "Параметры" };
         if heading == "Выбор пользователей" { form.render_picker(frame, parts[1], title); }
         else { form.render(frame, parts[1], title); }
-    } else {
-        panel_at(frame, parts[1], &caption, body, true, viewport);
+    } else if let Some(lines) = review_lines {
+        // Same width as stepper and key bar: never re-center a nested report.
+        let body_area = Rect::new(parts[1].x + 2, parts[1].y, width, parts[1].height);
+        let page = usize::from(body_area.height.saturating_sub(1)).max(1);
+        let count = lines.len();
+        let offset = viewport.map_or(0, |v| v.position(&caption, count, page, None));
+        let status = if count > page {
+            format!("{}–{}/{} · Shift+PgUp/PgDn или колесо", offset + 1, (offset + page).min(count), count)
+        } else if parts[0].height == 0 {
+            caption.clone()
+        } else {
+            String::new()
+        };
+        let mut visible: Vec<_> = lines.into_iter().skip(offset).take(page).collect();
+        if !status.is_empty() {
+            visible.push(Line::styled(status, Style::default().fg(MUTED)));
+        }
+        frame.render_widget(Paragraph::new(visible).style(Style::default().fg(TEXT).bg(BG)), body_area);
     }
     if parts[2].height > 0 {
         frame.render_widget(Paragraph::new(vec![
@@ -2491,7 +2519,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     } else if let Some(dialog) = interaction.and_then(|ui| ui.config_dialog.as_ref()) {
         tui_widgets::canvas(frame, parts[1]);
         if let Some(guide) = dialog.guide() {
-            draw_guided(frame, parts[1], dialog.title(), &dialog.body(), guide, viewport, dialog.form());
+            draw_guided(frame, parts[1], dialog.title(), &dialog.body(), guide, viewport, (dialog.form(), dialog.reference_review()));
         } else if let Some(form) = dialog.form() {
             form.render_picker(frame, centered_column(parts[1], 108), dialog.title());
         } else {
@@ -2537,10 +2565,10 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         );
     } else if let Some(enrollment) = interaction.and_then(|ui| ui.reality_enrollment.as_ref()) {
-        draw_guided(frame, parts[1], "Импорт REALITY", &enrollment.body(), enrollment.guide(), viewport, enrollment.form());
+        draw_guided(frame, parts[1], "Импорт REALITY", &enrollment.body(), enrollment.guide(), viewport, (enrollment.form(), None));
     } else if let Some(provision) = interaction.and_then(|ui| ui.reality_provision.as_ref()) {
         if let Some(guide) = provision.guide() {
-            draw_guided(frame, parts[1], "Мастер REALITY", &provision.body(), guide, viewport, provision.form());
+            draw_guided(frame, parts[1], "Мастер REALITY", &provision.body(), guide, viewport, (provision.form(), provision.reference_review()));
         } else {
             modal_panel!(frame, parts[1], "Мастер REALITY", &provision.body(), true);
         }
@@ -2569,7 +2597,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         let form = flow.form(interaction.and_then(|ui| ui.editor.as_ref()));
         if form.is_some() {
             draw_guided(frame, parts[1], "Настройка записи", &body,
-                (1, 2, "Параметры", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад"), viewport, form);
+                (1, 2, "Параметры", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад"), viewport, (form, None));
         } else {
             modal_panel!(frame, parts[1], "Настройка записи", &body, true);
         }
@@ -3546,6 +3574,26 @@ mod tests {
         assert_eq!(model.selected, Role::Client);
         assert!(!ui.server_process.running());
         assert!(ui.config_dialog.is_none());
+    }
+
+    #[test]
+    fn wizard_review_uses_same_width_and_keeps_actions_near_content() {
+        for (w, h) in [(80, 24), (132, 65), (240, 90)] {
+            let area = Rect::new(0, 0, w, h);
+            let [header, body, footer] = guided_layout(area, None, 12);
+            assert_eq!(header.x, body.x);
+            assert_eq!(body.x, footer.x);
+            assert_eq!(header.width, footer.width);
+            assert!(footer.bottom() <= area.bottom());
+            assert!(footer.bottom() <= area.y + 24);
+            let mut terminal = Terminal::new(TestBackend::new(w,h)).unwrap();
+            let viewport = Viewport::default();
+            terminal.draw(|frame| draw_guided(frame, area, "Мастер REALITY", "Короткий результат",
+                (4, 5, "Результат подбора", "Y создать · N / Esc назад"), Some(&viewport), (None, None))).unwrap();
+            let screen = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
+            assert!(screen.contains("Короткий результат"));
+            assert!(screen.contains("Следующее действие"));
+        }
     }
 
     #[test]

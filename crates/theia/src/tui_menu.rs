@@ -715,6 +715,10 @@ impl ConfigDialog {
         }
     }
 
+    pub(crate) fn reference_review(&self) -> Option<crate::tui_widgets::ReferenceReview> {
+        self.reality.as_ref()?.reference_review()
+    }
+
     pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
         if let Some(panel) = &self.reality {
             return panel.guide();

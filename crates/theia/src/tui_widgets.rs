@@ -40,7 +40,8 @@ pub(crate) fn key_line(keys: &str) -> Line<'_> {
     for (i, part) in keys.split(" · ").enumerate() {
         if i > 0 { spans.push(Span::raw("  ")); }
         let (key, label) = part.split_once(' ').unwrap_or((part, ""));
-        spans.push(Span::styled(format!(" {key} "), Style::default().fg(BG).bg(MUTED).add_modifier(Modifier::BOLD)));
+        let primary = matches!(key, "Enter" | "Y" | "y");
+        spans.push(Span::styled(format!(" {key} "), Style::default().fg(BG).bg(if primary { ACCENT } else { MUTED }).add_modifier(Modifier::BOLD)));
         if !label.is_empty() { spans.push(Span::styled(format!(" {label}"), Style::default().fg(TEXT))); }
     }
     Line::from(spans)
@@ -177,6 +178,93 @@ impl Form {
     }
 }
 
+/// Read-only confirmation data, separate from the operation and its approval.
+/// Every candidate is shown, including those not selected by the existing plan.
+#[derive(Clone)]
+pub(crate) struct ReferenceRow {
+    pub name: String,
+    pub address: String,
+    pub score: u8,
+    pub h2: bool,
+    pub h3: bool,
+    pub selected: Option<usize>,
+}
+
+pub(crate) struct ReferenceReview {
+    pub rows: Vec<ReferenceRow>,
+    pub details: Vec<(&'static str, String)>,
+    pub note: String,
+}
+
+impl ReferenceReview {
+    pub(crate) fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::styled("Результаты проверки", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))];
+        let wide = width >= 96;
+        if wide {
+            lines.push(Line::styled(format!("{:<30} {:<25} {:<13} {}", "Референс", "Адрес", "H2 / H3", "Результат"), Style::default().fg(MUTED)));
+        }
+        for row in &self.rows {
+            let status = match row.selected {
+                Some(0) => "Основной".into(),
+                Some(index) => format!("Резерв {index}"),
+                None => "Исключён".into(),
+            };
+            let color = if row.selected == Some(0) { ACCENT } else if row.selected.is_some() { WARNING } else { ERROR };
+            let transports = format!("{} H2  {} H3", if row.h2 { "✓" } else { "×" }, if row.h3 { "✓" } else { "×" });
+            // Long names and IPv6 addresses must remain visible, not elided.
+            if wide && Span::raw(row.name.as_str()).width() <= 28 && row.address.len() <= 23 {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:<30} {:<25} ", row.name, row.address), Style::default().fg(TEXT)),
+                    Span::styled(format!("{transports:<13} "), Style::default().fg(MUTED)),
+                    Span::styled(format!("{status} · {}", row.score), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                ]));
+            } else {
+                append_wrapped(&mut lines, &row.name, width, Style::default().fg(TEXT).add_modifier(Modifier::BOLD));
+                append_wrapped(&mut lines, &format!("  {}", row.address), width, Style::default().fg(MUTED));
+                append_wrapped(&mut lines, &format!("  {transports} · {status} · {}", row.score), width, Style::default().fg(color));
+            }
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Конфигурация к сохранению", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        for (label, value) in &self.details {
+            if wide && Span::raw(value.as_str()).width() + 24 <= usize::from(width) {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{label:<24}"), Style::default().fg(MUTED)),
+                    Span::styled(value.clone(), Style::default().fg(TEXT)),
+                ]));
+            } else {
+                lines.push(Line::styled(*label, Style::default().fg(MUTED)));
+                append_wrapped(&mut lines, value, width, Style::default().fg(TEXT));
+            }
+        }
+        lines.push(Line::raw(""));
+        append_wrapped(&mut lines, &self.note, width, Style::default().fg(WARNING));
+        lines
+    }
+}
+
+/// Wrap by terminal-cell width, never hide confirmation details behind ellipses.
+fn append_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: u16, style: Style) {
+    let width = usize::from(width.max(1));
+    for paragraph in text.split('\n') {
+        let mut row = String::new();
+        let mut used = 0;
+        for c in paragraph.chars() {
+            let c = if c.is_control() { '�' } else { c };
+            let mut buf = [0; 4];
+            let encoded: &str = c.encode_utf8(&mut buf);
+            let cells = Span::raw(encoded).width();
+            if !row.is_empty() && used + cells > width {
+                lines.push(Line::styled(std::mem::take(&mut row), style));
+                used = 0;
+            }
+            row.push(c);
+            used += cells;
+        }
+        lines.push(Line::styled(row, style));
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ActionItem {
     pub key: char,
@@ -298,6 +386,28 @@ mod tests {
             term.draw(|frame| actions.render(frame, controls)).unwrap();
             let screen = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
             assert!(screen.contains("Остановка"));
+        }
+    }
+
+    #[test]
+    fn reference_review_keeps_rejected_rows_and_long_values_visible() {
+        let review = ReferenceReview {
+            rows: vec![
+                ReferenceRow { name: "example.org".into(), address: "192.0.2.1:443".into(), score: 100, h2: true, h3: true, selected: Some(0) },
+                ReferenceRow { name: "backup.example.org".into(), address: "192.0.2.2:443".into(), score: 80, h2: true, h3: false, selected: Some(1) },
+                ReferenceRow { name: "failed.example.org".into(), address: "192.0.2.3:443".into(), score: 0, h2: false, h3: false, selected: None },
+            ],
+            details: vec![("TOML", "a".repeat(150))],
+            note: "Сервер не запускается.".into(),
+        };
+        for width in [32, 80, 120] {
+            let lines = review.lines(width);
+            assert!(lines.iter().all(|l| l.width() <= usize::from(width)));
+            let text = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref()).collect::<String>();
+            for expected in ["example.org", "Основной", "Резерв 1", "Исключён", "100", "80", "Сервер не запускается."] {
+                assert!(text.contains(expected), "{expected}");
+            }
+            assert!(text.contains(&"a".repeat(150)));
         }
     }
 
