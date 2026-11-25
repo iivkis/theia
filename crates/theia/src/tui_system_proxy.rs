@@ -14,6 +14,7 @@ use tokio::{sync::mpsc as async_mpsc, task::JoinHandle};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Start,
+    Enable,
     Apply,
     Restore,
     Recover,
@@ -30,6 +31,7 @@ enum Command {
 
 enum Pending {
     Start,
+    Enable(SocketAddr, ApplyReview),
     Apply(ApplyReview),
     Restore,
     Recover(RecoveryReview),
@@ -55,7 +57,9 @@ struct Worker {
 struct View {
     running: bool,
     owned: bool,
-    manual: bool,
+    applied: bool,
+    recovery: bool,
+    known: bool,
     status: String,
 }
 
@@ -85,7 +89,23 @@ impl Worker {
     }
 
     fn view(&self) -> View {
-        let status = match native::observed_proxy() {
+        let observed = native::observed_proxy();
+        let known = observed.is_ok();
+        let applied = self.lease.is_some()
+            && matches!(
+                &observed,
+                Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned))
+            );
+        let recovery = self.lease.is_none()
+            && matches!(
+                &observed,
+                Ok(ObservedProxy::Journal(
+                    ProxyStatus::PendingOwned
+                        | ProxyStatus::PendingAlreadyRestored
+                        | ProxyStatus::PendingConflict
+                ))
+            );
+        let status = match observed {
             Ok(ObservedProxy::Direct) => "Выключен: прямое подключение".into(),
             Ok(ObservedProxy::External) => "Настроен вне этой TUI".into(),
             Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned)) if self.lease.is_some() => {
@@ -104,9 +124,14 @@ impl Worker {
             Err(error) => format!("Неизвестно: {error}"),
         };
         View {
-            running: self.local.is_some(),
+            running: self
+                .local
+                .as_ref()
+                .is_some_and(|local| !local.task.is_finished()),
             owned: self.lease.is_some(),
-            manual: self.local.as_ref().is_some_and(|local| local.manual),
+            applied,
+            recovery,
+            known,
             status,
         }
     }
@@ -118,6 +143,40 @@ impl Worker {
                 self.unchanged()?;
                 let message = "Запустить только локальные HTTP CONNECT/SOCKS5 listeners? WinINet не меняется.";
                 (Pending::Start, message.into())
+            }
+            Action::Enable if self.lease.is_none() => {
+                let bytes = saved_client_bytes(&self.path, self.digest)
+                    .map_err(|error| error.to_string())?;
+                let source =
+                    std::str::from_utf8(&bytes).map_err(|_| "Некорректный файл клиента.")?;
+                let crate::config::Config::Client(document) =
+                    crate::config::parse(source).map_err(|_| "Некорректные настройки клиента.")?
+                else {
+                    return Err("Требуется клиентский профиль.".into());
+                };
+                if document.client.proxy.system_proxy != crate::config::SystemProxy::Manual {
+                    return Err(
+                        "Сначала разрешите управление системным прокси в настройках клиента."
+                            .into(),
+                    );
+                }
+                let address: SocketAddr = document
+                    .client
+                    .proxy
+                    .http_listen
+                    .parse()
+                    .map_err(|_| "Некорректный адрес локального HTTP-прокси.")?;
+                if self.local.as_ref().is_some_and(|local| {
+                    !local.manual || local.task.is_finished() || local.address != address
+                }) {
+                    return Err("Остановите старое локальное подключение и повторите.".into());
+                }
+                let review = native::review_apply(address).map_err(|error| error.to_string())?;
+                let message = format!(
+                    "{}\nЗапустить локальный прокси при необходимости и направить приложения Windows на {address}? Исходные настройки будут сохранены для восстановления.",
+                    review.description()
+                );
+                (Pending::Enable(address, review), message)
             }
             Action::Apply if self.lease.is_none() => {
                 let local = self
@@ -154,25 +213,68 @@ impl Worker {
         Ok(message)
     }
 
+    async fn start_local(&mut self) -> Result<(), String> {
+        let prepared = PreparedLocalProxy::start(&self.path, self.digest)
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = prepared.http_address().map_err(|error| error.to_string())?;
+        self.unchanged()?;
+        let manual = prepared.manual;
+        let reality = prepared.reality_monitor();
+        let task = tokio::spawn(prepared.serve());
+        self.local = Some(Local {
+            address,
+            manual,
+            task,
+            reality,
+        });
+        Ok(())
+    }
+
+    async fn enable(&mut self, address: SocketAddr, review: ApplyReview) -> Result<String, String> {
+        let started_here = self.local.is_none();
+        if started_here {
+            self.start_local().await?;
+        }
+        let result = (|| {
+            self.unchanged()?;
+            self.local
+                .as_ref()
+                .filter(|local| {
+                    local.manual && !local.task.is_finished() && local.address == address
+                })
+                .ok_or("Локальный клиент не готов.")?;
+            OwnedProxy::apply_reviewed(address, review).map_err(|error| error.to_string())
+        })();
+        match result {
+            Ok(lease) => {
+                self.lease = Some(lease);
+                Ok("Системный прокси включён. Удалённый туннель проверяется отдельно.".into())
+            }
+            Err(error) => {
+                // If native apply may have written a journal, preserve the
+                // listeners until the user reviews recovery. Never claim success.
+                if started_here
+                    && matches!(
+                        native::observed_proxy(),
+                        Ok(ObservedProxy::Direct | ObservedProxy::External)
+                    )
+                {
+                    self.stop().await?;
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn confirm(&mut self) -> Result<String, String> {
         let pending = self.pending.take().ok_or("Нет подтверждаемой операции.")?;
         match pending {
             Pending::Start => {
-                let prepared = PreparedLocalProxy::start(&self.path, self.digest)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let address = prepared.http_address().map_err(|error| error.to_string())?;
-                let manual = prepared.manual;
-                let reality = prepared.reality_monitor();
-                let task = tokio::spawn(prepared.serve());
-                self.local = Some(Local {
-                    address,
-                    manual,
-                    task,
-                    reality,
-                });
+                self.start_local().await?;
                 Ok("Оба локальных listener привязаны; удалённый транспорт не проверен.".into())
             }
+            Pending::Enable(address, review) => self.enable(address, review).await,
             Pending::Apply(review) => {
                 let local = self
                     .local
@@ -355,7 +457,8 @@ impl Panel {
         }
     }
 
-    pub(crate) fn poll(&mut self) {
+    pub(crate) fn poll(&mut self) -> bool {
+        let previous = self.phase;
         loop {
             match self.events.try_recv() {
                 Ok(event) => {
@@ -378,6 +481,7 @@ impl Panel {
                 }
             }
         }
+        previous != self.phase
     }
 
     /// Return true only when the modal may close; a live local client must
@@ -413,6 +517,7 @@ impl Panel {
         let command = match key.code {
             KeyCode::Char('v') => Command::Refresh,
             KeyCode::Char('s') => Command::Review(Action::Start),
+            KeyCode::Char('e') => Command::Review(Action::Enable),
             KeyCode::Char('a') => Command::Review(Action::Apply),
             KeyCode::Char('r') => Command::Review(Action::Restore),
             KeyCode::Char('c') => Command::Review(Action::Recover),
@@ -425,15 +530,53 @@ impl Panel {
 
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
-        if self.phase != Phase::Idle || self.unavailable { return Vec::new(); }
-        vec![
-            ActionItem { key:'s', label:"Запустить локальный прокси" },
-            ActionItem { key:'a', label:"Включить системный прокси" },
-            ActionItem { key:'r', label:"Восстановить настройки" },
-            ActionItem { key:'c', label:"Восстановить после сбоя" },
-            ActionItem { key:'x', label:"Остановить" },
-            ActionItem { key:'v', label:"Обновить состояние" },
-        ]
+        if self.unavailable || self.phase == Phase::Busy {
+            return Vec::new();
+        }
+        if self.phase == Phase::Confirm {
+            return vec![
+                ActionItem {
+                    key: 'n',
+                    label: "Отменить",
+                },
+                ActionItem {
+                    key: 'y',
+                    label: "Подтвердить",
+                },
+            ];
+        }
+        let mut items = Vec::new();
+        if self.view.owned {
+            items.push(ActionItem {
+                key: 'x',
+                label: "Выключить системный прокси и отключиться",
+            });
+            items.push(ActionItem {
+                key: 'r',
+                label: "Выключить, оставить локальный прокси",
+            });
+        } else if self.view.recovery {
+            items.push(ActionItem {
+                key: 'c',
+                label: "Восстановить после сбоя",
+            });
+        } else if self.view.known {
+            items.push(ActionItem {
+                key: 'e',
+                label: "Включить системный прокси",
+            });
+        }
+        if self.view.running && !self.view.owned {
+            items.push(ActionItem {
+                key: 'x',
+                label: "Остановить локальный прокси",
+            });
+        }
+        items.push(ActionItem {
+            key: 'v',
+            label: "Обновить состояние",
+        });
+        items
     }
 
     pub(crate) fn body(&self) -> String {
@@ -442,22 +585,37 @@ impl Panel {
         } else {
             &self.view.status
         };
+        let headline = if self.unavailable || self.phase == Phase::Busy {
+            "Состояние уточняется"
+        } else if !self.view.known {
+            "Состояние системного прокси неизвестно"
+        } else if self.view.applied && self.view.running {
+            "Системный прокси включён"
+        } else if self.view.owned || self.view.recovery {
+            "Требуется проверка / восстановление"
+        } else {
+            "Системный прокси Theia не включён"
+        };
         let controls = match self.phase {
-            Phase::Busy => "Ожидается результат worker.",
-            Phase::Confirm => "y: подтвердить  n/Esc: отменить",
-            Phase::Idle => "s: запустить локальный прокси\na: включить системный прокси\nr: восстановить прежние настройки\nc: восстановление после сбоя\nx: остановить\nv: обновить состояние\nEsc: назад",
+            Phase::Busy => "Выполняется операция…",
+            Phase::Confirm => "Выберите подтверждение или отмену (y / n, Esc).",
+            Phase::Idle if self.view.owned => "Выключение восстановит исходные параметры Windows.",
+            Phase::Idle if self.view.recovery => {
+                "Сначала проверьте восстановление исходных параметров."
+            }
+            Phase::Idle if !self.view.known => "Обновите состояние. Изменения не подтверждены.",
+            Phase::Idle => "Выберите «Включить системный прокси». Esc — назад.",
         };
         format!(
-            "Системный прокси (WinINet): {status}\nЛокальный слушатель: {} | ручной режим: {}\nСостояние туннеля проверяется отдельно. Этот экран не подтверждает подключение.\n{}\n{controls}",
+            "{headline}\n{}\n{controls}\n\nWindows: {status}\nЛокальный прокси: {}\nУдалённый туннель проверяется отдельно. Это не VPN.",
+            self.message,
             if self.unavailable || self.phase == Phase::Busy {
                 "неизвестно"
             } else if self.view.running {
-                "слушает"
+                "запущен"
             } else {
                 "не запущен"
-            },
-            if self.view.manual { "да" } else { "нет" },
-            self.message
+            }
         )
     }
 }
@@ -559,8 +717,9 @@ pub(crate) mod tests {
 
         // Failed second bind must release the first and never touch WinINet.
         drop(first);
-        action(&mut panel, 's');
+        action(&mut panel, 'e');
         assert!(!panel.view.running);
+        assert!(!panel.view.owned);
         assert_original();
         drop(second);
 
@@ -569,6 +728,22 @@ pub(crate) mod tests {
         wait(&mut panel);
         assert!(!panel.view.running);
         assert_original();
+        review(&mut panel, 'e');
+        panel.key(key('n'));
+        wait(&mut panel);
+        assert!(!panel.view.running);
+        assert_original();
+
+        action(&mut panel, 'e');
+        assert!(panel.view.running);
+        assert!(panel.view.applied);
+        assert!(panel.view.owned);
+        assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
+        action(&mut panel, 'x');
+        assert!(!panel.view.running);
+        assert!(!panel.view.owned);
+        assert_original();
+
         action(&mut panel, 's');
         assert!(panel.view.running);
         assert!(!panel.view.owned);
@@ -616,7 +791,7 @@ pub(crate) mod tests {
         wait(&mut panel);
         action(&mut panel, 's');
         assert!(panel.view.running);
-        panel.key(key('a'));
+        panel.key(key('e'));
         wait(&mut panel);
         assert!(panel.phase == Phase::Idle);
         assert!(!panel.view.owned);
@@ -645,14 +820,18 @@ pub(crate) mod tests {
             events: incoming,
             thread: None,
             phase: Phase::Idle,
-            view: View::default(),
+            view: View {
+                known: true,
+                ..View::default()
+            },
             message: String::new(),
             unavailable: false,
         };
         assert!(!panel.key(key('y')));
         assert!(receiver.try_recv().is_err());
-        panel.key(key('a'));
-        assert_eq!(receiver.try_recv(), Ok(Command::Review(Action::Apply)));
+        assert_eq!(panel.actions()[0].key, 'e');
+        panel.key(key('e'));
+        assert_eq!(receiver.try_recv(), Ok(Command::Review(Action::Enable)));
         panel.key(key('y'));
         assert!(receiver.try_recv().is_err());
         events
@@ -663,6 +842,8 @@ pub(crate) mod tests {
             })
             .unwrap();
         panel.poll();
+        assert_eq!(panel.actions()[0].key, 'n');
+        assert_eq!(panel.actions()[1].key, 'y');
         panel.key(key('n'));
         assert_eq!(receiver.try_recv(), Ok(Command::Cancel));
         events

@@ -19,7 +19,9 @@ impl StagedMaterial {
     }
     fn create_for(root: &Path, config: &Path, source: Option<[u8; 32]>) -> Result<Self, Error> {
         if !crate::bounded_input::explicit_file_path(config)
-            || !crate::bounded_input::explicit_file_path(root) || root.parent() != config.parent() {
+            || !crate::bounded_input::explicit_file_path(root)
+            || root.parent() != config.parent()
+        {
             return Err(Error::Storage);
         }
         if !Self::unchanged(config, source) {

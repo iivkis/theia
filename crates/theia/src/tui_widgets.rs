@@ -22,14 +22,22 @@ pub(crate) const ERROR: Color = Color::Rgb(255, 146, 152);
 
 pub(crate) fn canvas(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(Style::default().fg(TEXT).bg(BG)), area);
+    frame.render_widget(
+        Block::default().style(Style::default().fg(TEXT).bg(BG)),
+        area,
+    );
 }
 
 /// A flat section with an inset header, preserving the traditional one-cell
 /// inner geometry used by lists and tables. No visible rectangular outline.
 pub(crate) fn section(title: &str, active: bool) -> Block<'_> {
     Block::default()
-        .title(Span::styled(title, Style::default().fg(if active { ACCENT } else { MUTED }).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(if active { ACCENT } else { MUTED })
+                .add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(SURFACE).bg(SURFACE))
         .style(Style::default().fg(TEXT).bg(SURFACE))
@@ -38,13 +46,29 @@ pub(crate) fn section(title: &str, active: bool) -> Block<'_> {
 /// Reports share semantic title and key styling without interpreting their
 /// contents as commands. In particular, an invitation can never trigger an action.
 pub(crate) fn report_section(title: &str, active: bool) -> Block<'_> {
-    let color = if title.contains("Ошибка") || title.contains("НЕ удалось") || title.contains("не выполнен") || title.contains("заблокирована") {
+    let lower = title.to_lowercase();
+    let color = if lower.contains("ошибка")
+        || lower.contains("не удалось")
+        || lower.contains("не выполнен")
+        || lower.contains("заблокирована")
+        || lower.contains("не подтверждён")
+    {
         ERROR
-    } else if title.contains("Подтверждение") || title.contains("СЕКРЕТ") || title.contains("Не сохранено") {
+    } else if lower.contains("подтверждение")
+        || lower.contains("секрет")
+        || lower.contains("не сохранено")
+    {
         WARNING
-    } else if active { ACCENT } else { MUTED };
+    } else if active {
+        ACCENT
+    } else {
+        MUTED
+    };
     Block::default()
-        .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(SURFACE).bg(SURFACE))
         .style(Style::default().fg(TEXT).bg(SURFACE))
@@ -53,10 +77,33 @@ pub(crate) fn report_section(title: &str, active: bool) -> Block<'_> {
 pub(crate) fn report_row<'a>(value: &'a str, style: Style, first: bool) -> Line<'a> {
     if first {
         if let Some((key, rest)) = value.split_once(':') {
-            if matches!(key, "Enter" | "Esc" | "Enter/Esc" | "y" | "n/Esc" | "r" | "s" | "d" | "x" | "c" | "f" | "Q" | "F2" | "F3" | "Ctrl+R") {
+            if matches!(
+                key,
+                "Enter"
+                    | "Esc"
+                    | "Enter/Esc"
+                    | "y"
+                    | "n/Esc"
+                    | "r"
+                    | "s"
+                    | "d"
+                    | "x"
+                    | "c"
+                    | "f"
+                    | "Q"
+                    | "F2"
+                    | "F3"
+                    | "Ctrl+R"
+            ) {
                 let color = if key == "y" { WARNING } else { TEXT };
                 return Line::from(vec![
-                    Span::styled(key, Style::default().fg(color).bg(INPUT).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        key,
+                        Style::default()
+                            .fg(color)
+                            .bg(INPUT)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(":", style),
                     Span::styled(rest, style),
                 ]);
@@ -69,14 +116,26 @@ pub(crate) fn report_row<'a>(value: &'a str, style: Style, first: bool) -> Line<
 pub(crate) fn key_line(keys: &str) -> Line<'_> {
     let mut spans = Vec::new();
     for (i, part) in keys.split(" · ").enumerate() {
-        if i > 0 { spans.push(Span::raw("  ")); }
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
         let part = part.trim();
-        if part.is_empty() { continue; }
+        if part.is_empty() {
+            continue;
+        }
         let (key, label) = part.split_once(' ').unwrap_or((part, ""));
         let key = key.trim_end_matches(':');
         let primary = matches!(key, "Enter" | "Y" | "y");
-        spans.push(Span::styled(format!(" {key} "), Style::default().fg(if primary { BG } else { TEXT }).bg(if primary { ACCENT } else { INPUT }).add_modifier(Modifier::BOLD)));
-        if !label.is_empty() { spans.push(Span::styled(format!(" {label}"), Style::default().fg(TEXT))); }
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .fg(if primary { BG } else { TEXT })
+                .bg(if primary { ACCENT } else { INPUT })
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !label.is_empty() {
+            spans.push(Span::styled(format!(" {label}"), Style::default().fg(TEXT)));
+        }
     }
     Line::from(spans)
 }
@@ -109,30 +168,81 @@ impl Form {
     fn geometry(&self, area: Rect) -> Geometry {
         let count = self.fields.len();
         let margin = u16::from(area.width >= 36);
-        let inner = Rect::new(area.x.saturating_add(margin), area.y,
-            area.width.saturating_sub(2 * margin), area.height);
+        let inner = Rect::new(
+            area.x.saturating_add(margin),
+            area.y,
+            area.width.saturating_sub(2 * margin),
+            area.height,
+        );
         let title_h = u16::from(inner.height >= 3);
-        let lead_h = if self.lead.is_empty() || inner.height < 5 { 0 }
-            else if inner.height >= 9 { 2 } else { 1 };
+        let lead_h = if self.lead.is_empty() || inner.height < 5 {
+            0
+        } else if inner.height >= 9 {
+            2
+        } else {
+            1
+        };
         let side = inner.width >= 96 && inner.height >= 12;
-        let help_h = if side { 0 } else if !self.error.is_empty() && inner.height >= 3 { if inner.height >= 8 { 3 } else { 1 } } else if inner.height < 6 { 0 } else if inner.height >= 10 { 3 } else { 1 };
+        let help_h = if side {
+            0
+        } else if !self.error.is_empty() && inner.height >= 3 {
+            if inner.height >= 8 {
+                3
+            } else {
+                1
+            }
+        } else if inner.height < 6 {
+            0
+        } else if inner.height >= 10 {
+            3
+        } else {
+            1
+        };
         let room = inner.height.saturating_sub(title_h + lead_h + help_h);
-        let stride = if usize::from(room) >= count.saturating_mul(3) && inner.width >= 42 { 3 }
-            else if room >= 2 && inner.width >= 42 { 2 } else { 1 };
+        let stride = if usize::from(room) >= count.saturating_mul(3) && inner.width >= 42 {
+            3
+        } else if room >= 2 && inner.width >= 42 {
+            2
+        } else {
+            1
+        };
         let capacity = usize::from(room / stride);
-        let selected = self.fields.iter().position(|f| f.id == self.selected).unwrap_or(0);
-        let start = selected.saturating_sub(capacity.saturating_sub(1)).min(count.saturating_sub(capacity));
+        let selected = self
+            .fields
+            .iter()
+            .position(|f| f.id == self.selected)
+            .unwrap_or(0);
+        let start = selected
+            .saturating_sub(capacity.saturating_sub(1))
+            .min(count.saturating_sub(capacity));
         let end = (start + capacity).min(count);
         let title = Rect::new(inner.x, inner.y, inner.width, title_h);
         let lead = Rect::new(inner.x, title.bottom(), inner.width, lead_h);
-        let rows_width = if side { inner.width.saturating_sub(34).min(80) } else { inner.width };
-        let rows = Rect::new(inner.x, lead.bottom(), rows_width, (end - start) as u16 * stride);
+        let rows_width = if side {
+            inner.width.saturating_sub(34).min(80)
+        } else {
+            inner.width
+        };
+        let rows = Rect::new(
+            inner.x,
+            lead.bottom(),
+            rows_width,
+            (end - start) as u16 * stride,
+        );
         let help = if side {
             Rect::new(rows.right().saturating_add(3), rows.y, 31, room.min(12))
         } else {
             Rect::new(inner.x, rows.bottom(), inner.width, help_h)
         };
-        Geometry { title, lead, rows, help, stride, start, end }
+        Geometry {
+            title,
+            lead,
+            rows,
+            help,
+            stride,
+            start,
+            end,
+        }
     }
 
     pub(crate) fn hit(&self, area: Rect, x: u16, y: u16) -> Option<usize> {
@@ -141,7 +251,9 @@ impl Form {
             return None;
         }
         let index = g.start + usize::from((y - g.rows.y) / g.stride);
-        if index >= g.end { return None; }
+        if index >= g.end {
+            return None;
+        }
         self.fields.get(index).map(|f| f.id)
     }
 
@@ -157,56 +269,157 @@ impl Form {
         canvas(frame, area);
         let g = self.geometry(area);
         let title = if g.end - g.start < self.fields.len() {
-            format!("{title}  ·  {}–{}/{}", g.start + 1, g.end, self.fields.len())
-        } else { title.to_owned() };
-        frame.render_widget(Paragraph::new(title).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)), g.title);
+            format!(
+                "{title}  ·  {}–{}/{}",
+                g.start + 1,
+                g.end,
+                self.fields.len()
+            )
+        } else {
+            title.to_owned()
+        };
+        frame.render_widget(
+            Paragraph::new(title).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            g.title,
+        );
         if g.lead.height > 0 {
-            frame.render_widget(Paragraph::new(self.lead.as_str()).style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), g.lead);
+            frame.render_widget(
+                Paragraph::new(self.lead.as_str())
+                    .style(Style::default().fg(MUTED))
+                    .wrap(Wrap { trim: true }),
+                g.lead,
+            );
         }
         for (offset, field) in self.fields[g.start..g.end].iter().enumerate() {
             let selected = field.id == self.selected;
-            let rect = Rect::new(g.rows.x, g.rows.y + (offset as u16) * g.stride, g.rows.width, g.stride);
+            let rect = Rect::new(
+                g.rows.x,
+                g.rows.y + (offset as u16) * g.stride,
+                g.rows.width,
+                g.stride,
+            );
             let marker = if selected { "▎ " } else { "  " };
-            let label = if picker && !field.label.starts_with('[') { format!("{marker}{}  {}", if selected { "●" } else { "○" }, field.label) } else { format!("{marker}{}", field.label) };
-            let value = if field.value.is_empty() { "Введите значение" } else { field.value.as_str() };
-            let label_style = Style::default().fg(if selected { ACCENT } else { TEXT }).add_modifier(Modifier::BOLD);
-            let value_style = Style::default().fg(if field.value.is_empty() || picker { MUTED } else { TEXT })
-                .bg(if selected { FOCUS } else if picker { BG } else { INPUT });
+            let label = if picker && !field.label.starts_with('[') {
+                format!(
+                    "{marker}{}  {}",
+                    if selected { "●" } else { "○" },
+                    field.label
+                )
+            } else {
+                format!("{marker}{}", field.label)
+            };
+            let value = if field.value.is_empty() {
+                if picker {
+                    "Выбрать"
+                } else {
+                    "Введите значение"
+                }
+            } else {
+                field.value.as_str()
+            };
+            let label_style = Style::default()
+                .fg(if selected { ACCENT } else { TEXT })
+                .add_modifier(Modifier::BOLD);
+            let value_style = Style::default()
+                .fg(if field.value.is_empty() || picker {
+                    MUTED
+                } else {
+                    TEXT
+                })
+                .bg(if selected {
+                    FOCUS
+                } else if picker {
+                    BG
+                } else {
+                    INPUT
+                });
             if picker && g.stride >= 2 {
                 let style = label_style.bg(if selected { FOCUS } else { SURFACE });
-                frame.render_widget(Paragraph::new(label).style(style), Rect::new(rect.x, rect.y, rect.width, 1));
-                frame.render_widget(Paragraph::new(format!("  {}", fit_value(value, rect.width.saturating_sub(2), false))).style(value_style),
-                    Rect::new(rect.x, rect.y + 1, rect.width, 1));
+                frame.render_widget(
+                    Paragraph::new(label).style(style),
+                    Rect::new(rect.x, rect.y, rect.width, 1),
+                );
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "  {}",
+                        fit_value(value, rect.width.saturating_sub(2), false)
+                    ))
+                    .style(value_style),
+                    Rect::new(rect.x, rect.y + 1, rect.width, 1),
+                );
                 continue;
             }
             if g.stride >= 2 {
-                frame.render_widget(Paragraph::new(label).style(label_style), Rect::new(rect.x, rect.y, rect.width, 1));
-                let input = Rect::new(rect.x.saturating_add(2), rect.y + 1, rect.width.saturating_sub(4), 1);
+                frame.render_widget(
+                    Paragraph::new(label).style(label_style),
+                    Rect::new(rect.x, rect.y, rect.width, 1),
+                );
+                let input = Rect::new(
+                    rect.x.saturating_add(2),
+                    rect.y + 1,
+                    rect.width.saturating_sub(4),
+                    1,
+                );
                 let shown = fit_value(value, input.width.saturating_sub(3), selected);
-                let content = if selected && !picker { format!(" {shown} ▏") } else { format!(" {shown}") };
+                let content = if selected && !picker {
+                    format!(" {shown} ▏")
+                } else {
+                    format!(" {shown}")
+                };
                 frame.render_widget(Paragraph::new(content).style(value_style), input);
             } else {
                 let label_width = rect.width / 2;
-                let columns = Layout::horizontal([Constraint::Length(label_width), Constraint::Min(0)]).split(rect);
+                let columns =
+                    Layout::horizontal([Constraint::Length(label_width), Constraint::Min(0)])
+                        .split(rect);
                 frame.render_widget(Paragraph::new(label).style(label_style), columns[0]);
-                frame.render_widget(Paragraph::new(fit_value(value, columns[1].width, selected)).style(value_style), columns[1]);
+                frame.render_widget(
+                    Paragraph::new(fit_value(value, columns[1].width, selected)).style(value_style),
+                    columns[1],
+                );
             }
         }
         let field = self.fields.iter().find(|f| f.id == self.selected);
-        let hint = field.map_or("", |f| f.hint);
-        let (message, color) = if self.error.is_empty() { (hint, MUTED) } else { (self.error.as_str(), ERROR) };
+        let hint = field.map_or("Выберите строку стрелками или мышью.", |f| f.hint);
+        let (message, color) = if self.error.is_empty() {
+            (hint, MUTED)
+        } else {
+            (self.error.as_str(), ERROR)
+        };
         if g.help.height > 0 {
             if g.help.x >= g.rows.right() {
-                let label = if self.error.is_empty() { "ПОДСКАЗКА" } else { "ПРОВЕРЬТЕ ПОЛЕ" };
+                let label = if self.error.is_empty() {
+                    "ПОДСКАЗКА"
+                } else {
+                    "ПРОВЕРЬТЕ ПОЛЕ"
+                };
                 let lines = vec![
-                    Line::styled(label, Style::default().fg(if self.error.is_empty() { ACCENT } else { ERROR }).add_modifier(Modifier::BOLD)),
+                    Line::styled(
+                        label,
+                        Style::default()
+                            .fg(if self.error.is_empty() { ACCENT } else { ERROR })
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Line::raw(""),
-                    Line::styled(field.map_or("", |f| f.label), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+                    Line::styled(
+                        field.map_or("", |f| f.label),
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
                     Line::styled(message, Style::default().fg(color)),
                 ];
-                frame.render_widget(Paragraph::new(lines).style(Style::default().bg(SURFACE)).wrap(Wrap { trim: true }), g.help);
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .style(Style::default().bg(SURFACE))
+                        .wrap(Wrap { trim: true }),
+                    g.help,
+                );
             } else {
-                frame.render_widget(Paragraph::new(message).style(Style::default().fg(color).bg(SURFACE)).wrap(Wrap { trim: true }), g.help);
+                frame.render_widget(
+                    Paragraph::new(message)
+                        .style(Style::default().fg(color).bg(SURFACE))
+                        .wrap(Wrap { trim: true }),
+                    g.help,
+                );
             }
         }
     }
@@ -232,10 +445,19 @@ pub(crate) struct ReferenceReview {
 
 impl ReferenceReview {
     pub(crate) fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::styled("Результаты проверки", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))];
+        let mut lines = vec![Line::styled(
+            "Результаты проверки",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )];
         let wide = width >= 96;
         if wide {
-            lines.push(Line::styled(format!("{:<30} {:<25} {:<13} {}", "Референс", "Адрес", "H2 / H3", "Результат"), Style::default().fg(MUTED)));
+            lines.push(Line::styled(
+                format!(
+                    "{:<30} {:<25} {:<13} {}",
+                    "Референс", "Адрес", "H2 / H3", "Результат"
+                ),
+                Style::default().fg(MUTED),
+            ));
         }
         for row in &self.rows {
             let status = match row.selected {
@@ -243,23 +465,57 @@ impl ReferenceReview {
                 Some(index) => format!("Резерв {index}"),
                 None => "Исключён".into(),
             };
-            let color = if row.selected == Some(0) { ACCENT } else if row.selected.is_some() { WARNING } else { ERROR };
-            let transports = format!("{} H2  {} H3", if row.h2 { "✓" } else { "×" }, if row.h3 { "✓" } else { "×" });
+            let color = if row.selected == Some(0) {
+                ACCENT
+            } else if row.selected.is_some() {
+                WARNING
+            } else {
+                ERROR
+            };
+            let transports = format!(
+                "{} H2  {} H3",
+                if row.h2 { "✓" } else { "×" },
+                if row.h3 { "✓" } else { "×" }
+            );
             // Long names and IPv6 addresses must remain visible, not elided.
             if wide && Span::raw(row.name.as_str()).width() <= 28 && row.address.len() <= 23 {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{:<30} {:<25} ", row.name, row.address), Style::default().fg(TEXT)),
+                    Span::styled(
+                        format!("{:<30} {:<25} ", row.name, row.address),
+                        Style::default().fg(TEXT),
+                    ),
                     Span::styled(format!("{transports:<13} "), Style::default().fg(MUTED)),
-                    Span::styled(format!("{status} · {}", row.score), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{status} · {}", row.score),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
                 ]));
             } else {
-                append_wrapped(&mut lines, &row.name, width, Style::default().fg(TEXT).add_modifier(Modifier::BOLD));
-                append_wrapped(&mut lines, &format!("  {}", row.address), width, Style::default().fg(MUTED));
-                append_wrapped(&mut lines, &format!("  {transports} · {status} · {}", row.score), width, Style::default().fg(color));
+                append_wrapped(
+                    &mut lines,
+                    &row.name,
+                    width,
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                );
+                append_wrapped(
+                    &mut lines,
+                    &format!("  {}", row.address),
+                    width,
+                    Style::default().fg(MUTED),
+                );
+                append_wrapped(
+                    &mut lines,
+                    &format!("  {transports} · {status} · {}", row.score),
+                    width,
+                    Style::default().fg(color),
+                );
             }
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled("Конфигурация к сохранению", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        lines.push(Line::styled(
+            "Конфигурация к сохранению",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
         for (label, value) in &self.details {
             if wide && Span::raw(value.as_str()).width() + 24 <= usize::from(width) {
                 lines.push(Line::from(vec![
@@ -314,43 +570,102 @@ pub(crate) struct Actions<'a> {
 impl Actions<'_> {
     fn start(&self, area: Rect) -> usize {
         let rows = usize::from(area.height.saturating_sub(2)).max(1);
-        self.selected.min(self.items.len().saturating_sub(1))
+        self.selected
+            .min(self.items.len().saturating_sub(1))
             .saturating_sub(rows.saturating_sub(1))
             .min(self.items.len().saturating_sub(rows))
     }
     pub(crate) fn hit(&self, area: Rect, x: u16, y: u16) -> Option<usize> {
-        if x <= area.x || x >= area.right().saturating_sub(1)
-            || y <= area.y || y >= area.bottom().saturating_sub(1) {
+        if x <= area.x
+            || x >= area.right().saturating_sub(1)
+            || y <= area.y
+            || y >= area.bottom().saturating_sub(1)
+        {
             return None;
         }
         let i = self.start(area) + usize::from(y - area.y - 1);
         (i < self.items.len()).then_some(i)
     }
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        self.render_with_focus(frame, area, true);
+    }
+
+    pub(crate) fn render_with_focus(&self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
         use ratatui::widgets::{List, ListItem};
+        canvas(frame, area);
         let selected = self.selected.min(self.items.len().saturating_sub(1));
         let rows = usize::from(area.height.saturating_sub(2));
-        let items = self.items.iter().enumerate().skip(self.start(area)).take(rows).map(|(i, item)| {
-            let style = if i == selected {
-                Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD)
-            } else { Style::default().fg(TEXT) };
-            ListItem::new(Line::from(vec![
-                Span::raw(if i == selected { " › " } else { "   " }),
-                Span::styled(format!(" {} ", item.key), Style::default().fg(if i == selected { BG } else { TEXT }).bg(if i == selected { ACCENT } else { INPUT })),
-                Span::raw(format!("  {}", item.label)),
-            ])).style(style)
-        }).collect::<Vec<_>>();
-        frame.render_widget(List::new(items).block(
-            section(" Действия · ↑↓ Enter ", true)
-        ), area);
+        let items = self
+            .items
+            .iter()
+            .enumerate()
+            .skip(self.start(area))
+            .take(rows)
+            .map(|(i, item)| {
+                let active = focused && i == selected;
+                let style = if active {
+                    Style::default()
+                        .fg(ACCENT)
+                        .bg(FOCUS)
+                        .add_modifier(Modifier::BOLD)
+                } else if i == selected {
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT)
+                };
+                let shortcut = if item.key == '4' {
+                    "F4".to_owned()
+                } else {
+                    item.key.to_string()
+                };
+                let label = fit_value(item.label, area.width.saturating_sub(9), false);
+                ListItem::new(Line::from(vec![
+                    Span::raw(if active {
+                        " › "
+                    } else if i == selected {
+                        " · "
+                    } else {
+                        "   "
+                    }),
+                    Span::raw(label),
+                    Span::styled(
+                        format!("  {shortcut}"),
+                        Style::default().fg(if active { ACCENT } else { MUTED }),
+                    ),
+                ]))
+                .style(style)
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(items).block(section(
+                if focused {
+                    " Действия · ↑↓ Enter "
+                } else {
+                    " Действия · Tab "
+                },
+                focused,
+            )),
+            area,
+        );
     }
 }
 
 pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
-    if count == 0 || area.height < 8 { return None; }
+    if count == 0 || area.height < 8 {
+        return None;
+    }
     if area.width >= 104 {
-        let parts = Layout::horizontal([Constraint::Min(44), Constraint::Length((area.width / 3).clamp(42, 64))]).split(area);
-        let controls = Rect::new(parts[1].x, parts[1].y, parts[1].width, parts[1].height.min((count as u16).saturating_add(2)));
+        let parts = Layout::horizontal([
+            Constraint::Min(44),
+            Constraint::Length((area.width / 3).clamp(42, 64)),
+        ])
+        .split(area);
+        let controls = Rect::new(
+            parts[1].x,
+            parts[1].y,
+            parts[1].width,
+            parts[1].height.min((count as u16).saturating_add(2)),
+        );
         Some([parts[0], controls])
     } else {
         let height = (count as u16).saturating_add(2).min(area.height / 2).max(3);
@@ -359,15 +674,33 @@ pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
     }
 }
 
-pub(crate) fn action_key(items: &[ActionItem], focus: &mut usize, code: crossterm::event::KeyCode) -> Option<crossterm::event::KeyCode> {
+pub(crate) fn action_key(
+    items: &[ActionItem],
+    focus: &mut usize,
+    code: crossterm::event::KeyCode,
+) -> Option<crossterm::event::KeyCode> {
     use crossterm::event::KeyCode;
-    if items.is_empty() { return Some(code); }
+    if items.is_empty() {
+        return Some(code);
+    }
     *focus = (*focus).min(items.len() - 1);
     match code {
-        KeyCode::Up | KeyCode::BackTab => { *focus = (*focus + items.len() - 1) % items.len(); None }
-        KeyCode::Down | KeyCode::Tab => { *focus = (*focus + 1) % items.len(); None }
-        KeyCode::Home => { *focus = 0; None }
-        KeyCode::End => { *focus = items.len() - 1; None }
+        KeyCode::Up | KeyCode::BackTab => {
+            *focus = (*focus + items.len() - 1) % items.len();
+            None
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            *focus = (*focus + 1) % items.len();
+            None
+        }
+        KeyCode::Home => {
+            *focus = 0;
+            None
+        }
+        KeyCode::End => {
+            *focus = items.len() - 1;
+            None
+        }
         KeyCode::Enter => Some(KeyCode::Char(items[*focus].key)),
         other => Some(other),
     }
@@ -375,27 +708,44 @@ pub(crate) fn action_key(items: &[ActionItem], focus: &mut usize, code: crosster
 
 /// Keep the typed end visible for long inputs without splitting Unicode.
 pub(crate) fn fit_value(value: &str, width: u16, tail: bool) -> String {
-    let clean: String = value.chars().map(|c| if c.is_control() { '�' } else { c }).collect();
+    let clean: String = value
+        .chars()
+        .map(|c| if c.is_control() { '�' } else { c })
+        .collect();
     let width = usize::from(width);
-    if Span::raw(clean.as_str()).width() <= width { return clean; }
-    if width <= 1 { return "…".chars().take(width).collect(); }
+    if Span::raw(clean.as_str()).width() <= width {
+        return clean;
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
     let mut used = 1;
     let mut out = Vec::new();
     let mut add = |c: char| {
         let mut encoded = [0; 4];
         let encoded: &str = c.encode_utf8(&mut encoded);
         let w = Span::raw(encoded).width();
-        if used + w > width { return false; }
+        if used + w > width {
+            return false;
+        }
         used += w;
         out.push(c);
         true
     };
     if tail {
-        for c in clean.chars().rev() { if !add(c) { break; } }
+        for c in clean.chars().rev() {
+            if !add(c) {
+                break;
+            }
+        }
         out.reverse();
         out.insert(0, '…');
     } else {
-        for c in clean.chars() { if !add(c) { break; } }
+        for c in clean.chars() {
+            if !add(c) {
+                break;
+            }
+        }
         out.push('…');
     }
     out.into_iter().collect()
@@ -406,24 +756,85 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
     #[test]
+    fn inactive_action_list_has_no_active_focus_background() {
+        let items = [ActionItem {
+            key: 's',
+            label: "Запустить сервер",
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(42, 6)).unwrap();
+        for focused in [false, true] {
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    Actions {
+                        items: &items,
+                        selected: 0,
+                    }
+                    .render_with_focus(f, area, focused);
+                })
+                .unwrap();
+            assert_eq!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .any(|c| c.bg == FOCUS),
+                focused
+            );
+        }
+    }
+
+    #[test]
     fn action_selection_matches_rendered_rows_and_enter_dispatches_only_one_key() {
         use crossterm::event::KeyCode;
-        let items = [ActionItem { key: 's', label: "Запуск" }, ActionItem { key: 'x', label: "Остановка" }, ActionItem { key: 'r', label: "Обновить" }];
+        let items = [
+            ActionItem {
+                key: 's',
+                label: "Запуск",
+            },
+            ActionItem {
+                key: 'x',
+                label: "Остановка",
+            },
+            ActionItem {
+                key: 'r',
+                label: "Обновить",
+            },
+        ];
         let mut focus = 0;
         assert_eq!(action_key(&items, &mut focus, KeyCode::Down), None);
         assert_eq!(focus, 1);
-        assert_eq!(action_key(&items, &mut focus, KeyCode::Enter), Some(KeyCode::Char('x')));
-        assert_eq!(action_key(&[], &mut focus, KeyCode::Enter), Some(KeyCode::Enter));
+        assert_eq!(
+            action_key(&items, &mut focus, KeyCode::Enter),
+            Some(KeyCode::Char('x'))
+        );
+        assert_eq!(
+            action_key(&[], &mut focus, KeyCode::Enter),
+            Some(KeyCode::Enter)
+        );
         for (w, h) in [(60, 12), (120, 30)] {
             let area = Rect::new(0, 0, w, h);
             let [_, controls] = action_layout(area, items.len()).unwrap();
-            let actions = Actions { items: &items, selected: focus };
+            let actions = Actions {
+                items: &items,
+                selected: focus,
+            };
             let first = actions.start(controls);
-            assert_eq!(actions.hit(controls, controls.x + 1, controls.y + 1), Some(first));
+            assert_eq!(
+                actions.hit(controls, controls.x + 1, controls.y + 1),
+                Some(first)
+            );
             assert_eq!(actions.hit(controls, controls.x, controls.y), None);
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|frame| actions.render(frame, controls)).unwrap();
-            let screen = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
+            let screen = term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
             assert!(screen.contains("Остановка"));
         }
     }
@@ -432,9 +843,30 @@ mod tests {
     fn reference_review_keeps_rejected_rows_and_long_values_visible() {
         let review = ReferenceReview {
             rows: vec![
-                ReferenceRow { name: "example.org".into(), address: "192.0.2.1:443".into(), score: 100, h2: true, h3: true, selected: Some(0) },
-                ReferenceRow { name: "backup.example.org".into(), address: "192.0.2.2:443".into(), score: 80, h2: true, h3: false, selected: Some(1) },
-                ReferenceRow { name: "failed.example.org".into(), address: "192.0.2.3:443".into(), score: 0, h2: false, h3: false, selected: None },
+                ReferenceRow {
+                    name: "example.org".into(),
+                    address: "192.0.2.1:443".into(),
+                    score: 100,
+                    h2: true,
+                    h3: true,
+                    selected: Some(0),
+                },
+                ReferenceRow {
+                    name: "backup.example.org".into(),
+                    address: "192.0.2.2:443".into(),
+                    score: 80,
+                    h2: true,
+                    h3: false,
+                    selected: Some(1),
+                },
+                ReferenceRow {
+                    name: "failed.example.org".into(),
+                    address: "192.0.2.3:443".into(),
+                    score: 0,
+                    h2: false,
+                    h3: false,
+                    selected: None,
+                },
             ],
             details: vec![("TOML", "a".repeat(150))],
             note: "Сервер не запускается.".into(),
@@ -442,8 +874,20 @@ mod tests {
         for width in [32, 80, 120] {
             let lines = review.lines(width);
             assert!(lines.iter().all(|l| l.width() <= usize::from(width)));
-            let text = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref()).collect::<String>();
-            for expected in ["example.org", "Основной", "Резерв 1", "Исключён", "100", "80", "Сервер не запускается."] {
+            let text = lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect::<String>();
+            for expected in [
+                "example.org",
+                "Основной",
+                "Резерв 1",
+                "Исключён",
+                "100",
+                "80",
+                "Сервер не запускается.",
+            ] {
                 assert!(text.contains(expected), "{expected}");
             }
             assert!(text.contains(&"a".repeat(150)));
@@ -454,11 +898,28 @@ mod tests {
     fn large_terminal_forms_keep_help_near_fields_and_labels_visible() {
         let form = Form {
             fields: vec![
-                Field { id: 1, label: "Порт TCP/UDP", value: "443".into(), hint: "Порт сервера." },
-                Field { id: 2, label: "Адрес", value: String::new(), hint: "Введите домен." },
-                Field { id: 3, label: "Пользователь", value: String::new(), hint: "ID пользователя." },
+                Field {
+                    id: 1,
+                    label: "Порт TCP/UDP",
+                    value: "443".into(),
+                    hint: "Порт сервера.",
+                },
+                Field {
+                    id: 2,
+                    label: "Адрес",
+                    value: String::new(),
+                    hint: "Введите домен.",
+                },
+                Field {
+                    id: 3,
+                    label: "Пользователь",
+                    value: String::new(),
+                    hint: "ID пользователя.",
+                },
             ],
-            selected: 1, lead: "Настройка сервера".into(), error: String::new(),
+            selected: 1,
+            lead: "Настройка сервера".into(),
+            error: String::new(),
         };
         for (w, h) in [(80, 60), (132, 65), (240, 90)] {
             let area = Rect::new(0, 0, w, h);
@@ -466,11 +927,19 @@ mod tests {
             assert!(geometry.rows.height <= 9);
             assert!(geometry.help.y <= geometry.rows.bottom());
             assert_eq!(form.hit(area, geometry.rows.x, geometry.rows.y), Some(1));
-            assert_eq!(form.hit(area, geometry.rows.x, geometry.rows.bottom()), None);
-            let mut term = Terminal::new(TestBackend::new(w,h)).unwrap();
-            term.draw(|frame| form.render(frame, area, "Параметры")).unwrap();
+            assert_eq!(
+                form.hit(area, geometry.rows.x, geometry.rows.bottom()),
+                None
+            );
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|frame| form.render(frame, area, "Параметры"))
+                .unwrap();
             let buffer = term.backend().buffer();
-            let screen = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            let screen = buffer
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
             assert!(screen.contains("Порт TCP/UDP"));
             assert!(screen.contains("443"));
             assert!(screen.contains("Порт сервера."));
@@ -482,18 +951,36 @@ mod tests {
     #[test]
     fn controls_keep_focus_and_hit_regions_in_sync() {
         let form = Form {
-            fields: (0..7).map(|id| Field { id, label: "Поле", value: format!("value-{id}"), hint: "Подсказка" }).collect(),
-            selected: 6, lead: "Настройка".into(), error: String::new(),
+            fields: (0..7)
+                .map(|id| Field {
+                    id,
+                    label: "Поле",
+                    value: format!("value-{id}"),
+                    hint: "Подсказка",
+                })
+                .collect(),
+            selected: 6,
+            lead: "Настройка".into(),
+            error: String::new(),
         };
-        for (w,h) in [(32,4),(60,12),(100,30)] {
-            let area = Rect::new(0,0,w,h);
+        for (w, h) in [(32, 4), (60, 12), (100, 30)] {
+            let area = Rect::new(0, 0, w, h);
             let g = form.geometry(area);
             assert!(g.start <= 6 && 6 < g.end);
-            assert_eq!(form.hit(area, g.rows.x, g.rows.y + (6-g.start) as u16*g.stride), Some(6));
+            assert_eq!(
+                form.hit(area, g.rows.x, g.rows.y + (6 - g.start) as u16 * g.stride),
+                Some(6)
+            );
             assert_eq!(form.hit(area, 0, 0), None);
-            let mut term = Terminal::new(TestBackend::new(w,h)).unwrap();
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| form.render(f, area, "Параметры")).unwrap();
-            let screen = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
+            let screen = term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
             assert!(screen.contains("value-6"));
         }
         assert_eq!(fit_value("abcdef", 4, true), "…def");

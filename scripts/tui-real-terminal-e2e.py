@@ -191,14 +191,14 @@ def drive(binary, config, scenario, expected):
             tty.send("y")  # never mutates even when the candidate is feasible
             revision(binary, expected)
         else:
-            tty.wait("Параметры · Enter")
+            tty.wait("Режим подключения" if scenario == "client" else "Параметры · Enter")
             if scenario == "apply":
                 # Both actual terminal creation paths must be reachable and
                 # cancel without touching the exact TOML or server revision.
                 with open(config, "rb") as file:
                     original = file.read()
-                for choice, label in [("1", "Создать inbound (собственный TLS)"),
-                                      ("2", "Новый REALITY inbound")]:
+                for choice, label in [("1", "Создать подключение (собственный TLS)"),
+                                      ("2", "Мастер REALITY")]:
                     since = tty.snapshot()
                     tty.send("N")
                     tty.wait("SmartTheia REALITY", since=since)
@@ -213,7 +213,7 @@ def drive(binary, config, scenario, expected):
             if scenario == "dirty":
                 since = tty.snapshot()
                 tty.send("\r")
-                tty.wait("Ввод ·", since=since)
+                tty.wait("Изменение параметра", since=since)
                 tty.send("x\r")  # valid but unsaved changed TLS DNS
                 tty.wait("Не сохранено")
                 since = tty.snapshot()
@@ -323,7 +323,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     def open_panel():
         tty = Terminal(command)
         try:
-            tty.wait("Параметры · Enter")
+            tty.wait("Режим подключения")
             tty.send("p")
             tty.wait("Состояние прочитано")
             return tty
@@ -334,23 +334,16 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     def review(tty, key, message):
         tty.send(key)
         tty.wait(message)
-        tty.wait("y: подтвердить")
+        tty.wait("Подтвердить")
 
     def confirm(tty, message):
         tty.send("y")
         tty.wait(message)
-        tty.wait("s: local start")
-
-    def local_start(tty):
-        review(tty, "s", "Запустить только локальные")
-        confirm(tty, "Оба локальных listener привязаны")
-        proxy_status(binary, "NoJournal")
-        test_tunnels(http_port, socks_port, echo_port)
 
     def apply(tty):
-        review(tty, "a", "Сохранить снимок")
+        review(tty, "e", "Запустить локальный прокси при необходимости")
         proxy_status(binary, "NoJournal")
-        confirm(tty, "WinINet применён")
+        confirm(tty, "Системный прокси включён")
         proxy_status(binary, "PendingOwned")
 
     proxy_status(binary, "NoJournal")
@@ -358,12 +351,18 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     try:
         tty.send("y")
         proxy_status(binary, "NoJournal")
-        local_start(tty)
-        review(tty, "a", "Сохранить снимок")
+        review(tty, "e", "Запустить локальный прокси при необходимости")
         tty.send("n")
         tty.wait("Отменено")
         proxy_status(binary, "NoJournal")
-        apply(tty)
+        for port in (http_port, socks_port):
+            with socket.socket() as sock:
+                sock.settimeout(2)
+                assert sock.connect_ex(("127.0.0.1", port)) != 0, "listener started without consent"
+        review(tty, "e", "Запустить локальный прокси при необходимости")
+        proxy_status(binary, "NoJournal")
+        confirm(tty, "Системный прокси включён")
+        proxy_status(binary, "PendingOwned")
         test_tunnels(http_port, socks_port, echo_port)
         review(tty, "r", "Восстановить только собственные")
         confirm(tty, "Восстановление WinINet: Restored")
@@ -378,7 +377,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
                 sock.settimeout(2)
                 assert sock.connect_ex(("127.0.0.1", port)) != 0, "listener leaked after stop"
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         tty.send("q")
         tty.close()
     finally:
@@ -388,8 +387,8 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     # A killed compiled TUI (not a unit-test surrogate) leaves the journal.
     tty = open_panel()
     try:
-        local_start(tty)
         apply(tty)
+        test_tunnels(http_port, socks_port, echo_port)
         # Explicit process termination, never a graceful Ctrl+C/close request.
         killed = subprocess.run(
             ["taskkill", "/PID", str(tty.win.pid), "/F"],
@@ -416,7 +415,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
         confirm(tty, "Восстановление журнала: Restored")
         proxy_status(binary, "NoJournal")
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         tty.send("q")
         tty.close()
     finally:
@@ -460,7 +459,11 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             # The actual confidential URI must not be in the terminal stream.
             assert path.read_text(encoding="utf-8") not in tty.raw
         revision(binary, 1)
+        # Do not concatenate ESC and the next navigation key: real terminals
+        # may interpret the resulting sequence as an Alt-modified key.
         tty.send("\x1b")
+        tty.wait("Параметры · Enter" if name == "own-user" else
+                 "Защищённое подключение · только просмотр")
         return path
 
     server_cmd = [binary, "tui", "--role", "server", "--config", str(server)]
@@ -469,7 +472,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Параметры · Enter")
         own_link = issue(tty, "own-user")
         tty.send("j")
-        tty.wait("REALITY 2/2:")
+        tty.wait("Защищённое подключение · только просмотр")
         reality_link = issue(tty, "reality-user")
         saved = read_config(server)["server"]
         assert "own-user" in saved["inbounds"][0]["allowed_user_ids"]
@@ -510,27 +513,27 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             time.sleep(0.05)
         client_cmd = [binary, "tui", "--role", "client", "--config", str(client)]
         tty = Terminal(client_cmd)
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         original = client.read_bytes()
         tty.send("i")
         tty.wait("Импорт подключения")
         tty.send(str(own_link) + "\r")
-        tty.wait("F-14: безопасный предпросмотр подключения")
+        tty.wait("Проверка ключа · собственный TLS")
         tty.send("c")
-        tty.wait("F-14: отдельный TLS trust")
+        tty.wait("Проверка сертификата")
         tty.send("file:" + cert + "\r")
         tty.wait("CA указан")
         assert client.read_bytes() == original
         tty.send("y")
-        tty.wait("Импорт сохранён")
+        tty.wait("Профиль сохранён")
         assert read_config(client)["client"]["active_profile"] == "home"
         assert client_revision(1)
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Параметры · Enter")
+        tty.wait("Активный профиль: public")
         assert read_config(client)["client"]["active_profile"] == "public"
         assert client_revision(1)
         tty.send("V")
@@ -548,7 +551,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         assert client_revision(2)
         test_tunnels(http_port, socks_port, echo_port)
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         headless.terminate()
         headless.wait(timeout=3)
 
@@ -558,10 +561,12 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             tty.send(str(reality_link) + "\r")
             tty.wait("Файл допуска (admission)")
             tty.send(admission + "\t")
+            tty.wait("Отпечаток сервера")
             tty.send(fingerprint + "\r")
             tty.wait("ПРЕДПРОСМОТР: fingerprint совпал")
             tty.send("y")
-            tty.wait("Следующий шаг: g")
+            # Successful managed enrollment opens registration automatically.
+            tty.wait("Материалы подготовлены")
 
         # First complete local enrollment, cancel before TOML registration.
         before = set(base.glob(".theia-enroll-*"))
@@ -569,29 +574,25 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         enroll()
         assert client.read_bytes() == saved
         assert len(set(base.glob(".theia-enroll-*")) - before) == 1
-        tty.send("g")
-        tty.wait("Материалы подготовлены")
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         assert set(base.glob(".theia-enroll-*")) == before
         assert client.read_bytes() == saved
 
         # Re-run and actually register: still no implicit activation.
         enroll()
-        tty.send("g")
-        tty.wait("Материалы подготовлены")
         tty.send("\x15reality-profile\r")
         tty.wait("Register REALITY profile")
         assert client.read_bytes() == saved
         tty.send("y")
-        tty.wait("Запись сохранена, редактор перечитан")
+        tty.wait("Профиль сохранён")
         assert read_config(client)["client"]["active_profile"] == "public"
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Защищённое подключение")
+        tty.wait("Активный профиль: reality-profile")
         assert read_config(client)["client"]["active_profile"] == "reality-profile"
         tty.send("V")
         tty.wait("Запустить подключение")

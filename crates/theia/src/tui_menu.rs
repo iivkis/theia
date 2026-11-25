@@ -120,14 +120,14 @@ const CLIENT: &[Group] = &[
         entries: &[
             always("Состояние / подключить / отключить / Apply", key('V')),
             always("Монитор трафика этого процесса", Action::Traffic),
-            entry("Системный прокси Windows", key('p')),
+            entry("Режим подключения (прокси / TUN)", key('P')),
         ],
     },
     Group {
         title: "Профили и приглашения",
         entries: &[
-            entry("Импорт ссылки, URI-файла или изображения QR", key('i')),
-            always("Импорт первого REALITY-профиля", key('I')),
+            always("Импорт ключа, файла или изображения QR", key('i')),
+            always("Расширенный импорт REALITY", key('I')),
             entry("Создать профиль", key('N')),
             entry("Выбрать активный профиль", key('A')),
             entry(
@@ -269,12 +269,20 @@ impl Menu {
         if area.width < 76 || area.height < 8 {
             let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
             let rect = parts[0];
-            if x > rect.x && x < rect.right().saturating_sub(1)
-                && y > rect.y && y < rect.bottom().saturating_sub(1) {
+            if x > rect.x
+                && x < rect.right().saturating_sub(1)
+                && y > rect.y
+                && y < rect.bottom().saturating_sub(1)
+            {
                 let height = usize::from(rect.height.saturating_sub(2));
-                let index = Self::visible_start(self.selected(), self.count(), height) + usize::from(y - rect.y - 1);
+                let index = Self::visible_start(self.selected(), self.count(), height)
+                    + usize::from(y - rect.y - 1);
                 if index < self.count() {
-                    if self.item.is_some() { self.item = Some(index); } else { self.group = index; }
+                    if self.item.is_some() {
+                        self.item = Some(index);
+                    } else {
+                        self.group = index;
+                    }
                     self.notice = None;
                 }
             }
@@ -315,18 +323,55 @@ impl Menu {
             let selected = self.selected();
             let height = usize::from(parts[0].height.saturating_sub(2));
             let start = Self::visible_start(selected, count, height);
-            let items = (start..(start + height).min(count)).map(|i| {
-                let (label, enabled) = if self.item.is_some() {
-                    let entry = self.groups()[self.group].entries[i];
-                    (entry.label, self.configured || !entry.requires_config)
-                } else { (self.groups()[i].title, true) };
-                let style = if i == selected { Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD) }
-                    else if !enabled { Style::default().fg(MUTED) } else { Style::default() };
-                ListItem::new(format!("{} {label}{}", if i == selected { "›" } else { " " }, if enabled { "" } else { " [нужен файл]" })).style(style)
-            }).collect::<Vec<_>>();
-            let title = if self.item.is_some() { self.groups()[self.group].title } else { self.title() };
-            frame.render_widget(List::new(items).block(tui_widgets::section(&format!("{title} · {}/{}", selected + 1, count), true)), parts[0]);
-            frame.render_widget(Paragraph::new(self.notice.unwrap_or("↑↓ выбрать · Enter открыть · Esc назад")), parts[1]);
+            let items = (start..(start + height).min(count))
+                .map(|i| {
+                    let (label, enabled) = if self.item.is_some() {
+                        let entry = self.groups()[self.group].entries[i];
+                        (entry.label, self.configured || !entry.requires_config)
+                    } else {
+                        (self.groups()[i].title, true)
+                    };
+                    let style = if i == selected {
+                        Style::default()
+                            .fg(ACCENT)
+                            .bg(FOCUS)
+                            .add_modifier(Modifier::BOLD)
+                    } else if !enabled {
+                        Style::default().fg(MUTED)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(format!(
+                        "{} {label}{}",
+                        if i == selected { "›" } else { " " },
+                        if enabled {
+                            ""
+                        } else {
+                            " [нужен файл]"
+                        }
+                    ))
+                    .style(style)
+                })
+                .collect::<Vec<_>>();
+            let title = if self.item.is_some() {
+                self.groups()[self.group].title
+            } else {
+                self.title()
+            };
+            frame.render_widget(
+                List::new(items).block(tui_widgets::section(
+                    &format!("{title} · {}/{}", selected + 1, count),
+                    true,
+                )),
+                parts[0],
+            );
+            frame.render_widget(
+                Paragraph::new(
+                    self.notice
+                        .unwrap_or("↑↓ выбрать · Enter открыть · Esc назад"),
+                ),
+                parts[1],
+            );
             return;
         }
         let content = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
@@ -348,11 +393,7 @@ impl Menu {
                 .map(|(i, (label, enabled))| {
                     let style = if i == selected {
                         Style::default()
-                            .fg(if enabled {
-                                ACCENT
-                            } else {
-                                MUTED
-                            })
+                            .fg(if enabled { ACCENT } else { MUTED })
                             .bg(if focused { FOCUS } else { SURFACE })
                             .add_modifier(Modifier::BOLD)
                     } else if enabled {
@@ -363,15 +404,17 @@ impl Menu {
                     ListItem::new(Line::from(vec![
                         Span::raw(if i == selected { " › " } else { "   " }),
                         Span::raw(label),
-                        Span::raw(if enabled { "" } else { " [нужен файл]" }),
+                        Span::raw(if enabled {
+                            ""
+                        } else {
+                            " [нужен файл]"
+                        }),
                     ]))
                     .style(style)
                 })
                 .collect();
             frame.render_widget(
-                List::new(rows).block(
-                    tui_widgets::section(title, focused),
-                ),
+                List::new(rows).block(tui_widgets::section(title, focused)),
                 rect,
             );
         };
@@ -456,7 +499,8 @@ impl Menu {
 }
 
 /// Read-only local chooser. Picking a path never opens, creates or overwrites a configuration.
-struct FileBrowser {
+pub(crate) struct FileBrowser {
+    config_only: bool,
     directory: std::path::PathBuf,
     entries: Vec<(std::path::PathBuf, bool)>,
     focus: usize,
@@ -464,10 +508,36 @@ struct FileBrowser {
 }
 impl FileBrowser {
     fn new(input: &str) -> Self {
+        Self::with_mode(input, true)
+    }
+    pub(crate) fn files(input: &str) -> Self {
+        Self::with_mode(
+            if input.starts_with("theia://") {
+                ""
+            } else {
+                input
+            },
+            false,
+        )
+    }
+    fn with_mode(input: &str, config_only: bool) -> Self {
         let path = std::path::PathBuf::from(input);
-        let directory = if path.is_dir() { path } else { path.parent().filter(|p| p.is_dir()).map(std::path::Path::to_path_buf).unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into())) };
+        let directory = if path.is_dir() {
+            path
+        } else {
+            path.parent()
+                .filter(|p| p.is_dir())
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
+        };
         let directory = std::path::absolute(&directory).unwrap_or(directory);
-        let mut browser = Self { directory, entries: Vec::new(), focus: 0, error: String::new() };
+        let mut browser = Self {
+            config_only,
+            directory,
+            entries: Vec::new(),
+            focus: 0,
+            error: String::new(),
+        };
         browser.refresh();
         browser
     }
@@ -478,47 +548,425 @@ impl FileBrowser {
         match std::fs::read_dir(&self.directory) {
             Ok(entries) => {
                 for entry in entries.take(2048).flatten() {
-                    let Ok(kind) = entry.file_type() else { continue; };
+                    let Ok(kind) = entry.file_type() else {
+                        continue;
+                    };
                     let path = entry.path();
-                    if path.to_str().is_none_or(|s| s.len() > 4096 || s.chars().any(char::is_control)) { continue; }
-                    if kind.is_dir() || (kind.is_file() && path.extension().is_some_and(|s| s.eq_ignore_ascii_case("toml"))) {
+                    if path
+                        .to_str()
+                        .is_none_or(|s| s.len() > 4096 || s.chars().any(char::is_control))
+                    {
+                        continue;
+                    }
+                    if kind.is_dir()
+                        || (kind.is_file()
+                            && (!self.config_only
+                                || path
+                                    .extension()
+                                    .is_some_and(|s| s.eq_ignore_ascii_case("toml"))))
+                    {
                         self.entries.push((path, kind.is_dir()));
                     }
                 }
-                self.entries.sort_by(|(a,ad),(b,bd)| bd.cmp(ad).then_with(|| a.cmp(b)));
+                self.entries
+                    .sort_by(|(a, ad), (b, bd)| bd.cmp(ad).then_with(|| a.cmp(b)));
             }
-            Err(_) => self.error = "Каталог недоступен. Выберите родительский каталог или вернитесь к ручному вводу.".into(),
+            Err(_) => self.error =
+                "Каталог недоступен. Выберите родительский каталог или вернитесь к ручному вводу."
+                    .into(),
         }
     }
-    fn form(&self) -> crate::tui_widgets::Form {
-        use crate::tui_widgets::{Field, Form};
-        let mut fields = vec![
-            Field { id:0, label:"Родительский каталог", value:"..".into(), hint:"Enter — подняться на уровень выше." },
-            Field { id:1, label:"Выбрать этот каталог", value:self.directory.display().to_string(), hint:"Enter — использовать каталог и вернуться к имени файла." },
-        ];
-        fields.extend(self.entries.iter().enumerate().map(|(i,(path,dir))| Field {
-            id:i+2, label:if *dir {"Каталог"} else {"Конфигурация TOML"}, value:path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-            hint:if *dir {"Enter — открыть каталог."} else {"Enter — выбрать путь без загрузки файла."},
-        }));
-        Form { fields, selected:self.focus, lead:format!("Каталог: {} · до 2048 записей",self.directory.display()), error:self.error.clone() }
+    fn entry_offset(&self) -> usize {
+        if self.config_only {
+            2
+        } else {
+            1
+        }
     }
-    fn key(&mut self, key: KeyCode, filename: &str) -> Option<std::path::PathBuf> {
-        let count = self.entries.len()+2;
-        match key {
-            KeyCode::Up | KeyCode::BackTab => self.focus = (self.focus+count-1)%count,
-            KeyCode::Down | KeyCode::Tab => self.focus = (self.focus+1)%count,
-            KeyCode::Home => self.focus=0,
-            KeyCode::End => self.focus=count-1,
-            KeyCode::Enter => match self.focus {
-                0 => if let Some(parent)=self.directory.parent() { self.directory=parent.to_path_buf(); self.refresh(); },
-                1 => return Some(self.directory.join(filename)),
-                i => if let Some((path,dir))=self.entries.get(i-2).cloned() {
-                    if dir { self.directory=path; self.refresh(); } else { return Some(path); }
+    pub(crate) fn select_field(&mut self, id: usize) {
+        if id < self.entries.len() + self.entry_offset() {
+            self.focus = id;
+        }
+    }
+    pub(crate) fn form(&self) -> crate::tui_widgets::Form {
+        use crate::tui_widgets::{Field, Form};
+        let mut fields = vec![Field {
+            id: 0,
+            label: "Родительский каталог",
+            value: "..".into(),
+            hint: "Enter — подняться на уровень выше.",
+        }];
+        if self.config_only {
+            fields.push(Field {
+                id: 1,
+                label: "Выбрать этот каталог",
+                value: self.directory.display().to_string(),
+                hint: "Enter — использовать каталог и вернуться к имени файла.",
+            });
+        }
+        fields.extend(self.entries.iter().enumerate().map(|(i, (path, dir))| {
+            Field {
+                id: i + self.entry_offset(),
+                label: if *dir {
+                    "Каталог"
+                } else if self.config_only {
+                    "Конфигурация TOML"
+                } else {
+                    "Файл"
                 },
+                value: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                hint: if *dir {
+                    "Enter — открыть каталог."
+                } else {
+                    "Enter — выбрать путь без загрузки файла."
+                },
+            }
+        }));
+        Form {
+            fields,
+            selected: self.focus,
+            lead: format!("Каталог: {} · до 2048 записей", self.directory.display()),
+            error: self.error.clone(),
+        }
+    }
+    pub(crate) fn key(&mut self, key: KeyCode, filename: &str) -> Option<std::path::PathBuf> {
+        let count = self.entries.len() + self.entry_offset();
+        match key {
+            KeyCode::Up | KeyCode::BackTab => self.focus = (self.focus + count - 1) % count,
+            KeyCode::Down | KeyCode::Tab => self.focus = (self.focus + 1) % count,
+            KeyCode::Home => self.focus = 0,
+            KeyCode::End => self.focus = count - 1,
+            KeyCode::Enter => match self.focus {
+                0 => {
+                    if let Some(parent) = self.directory.parent() {
+                        self.directory = parent.to_path_buf();
+                        self.refresh();
+                    }
+                }
+                1 if self.config_only => return Some(self.directory.join(filename)),
+                i => {
+                    if let Some((path, dir)) = self.entries.get(i - self.entry_offset()).cloned() {
+                        if dir {
+                            self.directory = path;
+                            self.refresh();
+                        } else {
+                            return Some(path);
+                        }
+                    }
+                }
             },
             _ => {}
         }
         None
+    }
+}
+
+// First-run input is independent of the security mode and contains no
+// editable protocol parameters. Only the existing validated backends save.
+type FirstInviteRead =
+    Result<(Zeroizing<String>, crate::client_import::ProductSource), &'static str>;
+
+struct FirstInvite {
+    source: Zeroizing<String>,
+    own: Option<crate::invite::Invitation>,
+    ca: String,
+    reference: String,
+    focus: usize,
+    review: bool,
+    error: Option<&'static str>,
+    browser: Option<FileBrowser>,
+    reading: Option<std::sync::mpsc::Receiver<FirstInviteRead>>,
+}
+
+enum FirstInviteAction {
+    Stay,
+    Back,
+    Save(crate::invite::Invitation, String, Option<String>),
+}
+
+impl FirstInvite {
+    fn new() -> Self {
+        Self {
+            source: Zeroizing::new(String::new()),
+            own: None,
+            ca: String::new(),
+            reference: String::new(),
+            focus: 0,
+            review: false,
+            error: None,
+            browser: None,
+            reading: None,
+        }
+    }
+    fn paste(&mut self, value: &str) {
+        if self.browser.is_some() || self.review || self.reading.is_some() {
+            return;
+        }
+        let value = value.trim_end_matches(['\r', '\n']);
+        if value.chars().any(char::is_control) {
+            return;
+        }
+        if self.own.is_none() {
+            if self.source.len().saturating_add(value.len()) <= crate::invite::MAX_URI {
+                self.source.push_str(value);
+            }
+        } else {
+            let field = if self.focus == 0 {
+                &mut self.ca
+            } else {
+                &mut self.reference
+            };
+            if field.len().saturating_add(value.len()) <= 4096 {
+                field.push_str(value);
+            }
+        }
+    }
+    fn select_field(&mut self, id: usize) {
+        if let Some(browser) = self.browser.as_mut() {
+            browser.select_field(id);
+        } else if !self.review && self.reading.is_none() {
+            self.focus = if self.own.as_ref().is_some_and(|i| !i.has_token()) {
+                id.min(1)
+            } else {
+                0
+            };
+        }
+    }
+    fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        if let Some(browser) = &self.browser {
+            return Some(browser.form());
+        }
+        if self.review || self.reading.is_some() {
+            return None;
+        }
+        let (fields, lead) = if let Some(invite) = &self.own {
+            let mut fields = vec![Field {
+                id: 0,
+                label: "Доверенный сертификат (CA)",
+                value: if self.ca.is_empty() {
+                    String::new()
+                } else {
+                    "Файл выбран".into()
+                },
+                hint: "F6 — выбрать PEM-сертификат, полученный отдельно от администратора.",
+            }];
+            if !invite.has_token() {
+                fields.push(Field {
+                    id: 1,
+                    label: "Ссылка на отдельный ключ",
+                    value: if self.reference.is_empty() {
+                        String::new()
+                    } else {
+                        "Ссылка указана".into()
+                    },
+                    hint: "Для публичного приглашения укажите env:ИМЯ. Сам секрет не вставляйте.",
+                });
+            }
+            (fields, format!("Тип определён: собственный TLS\nСервер: {} · {}\nПодтвердите доверие к серверу.", invite.endpoint, invite.server_name))
+        } else {
+            (
+                vec![Field {
+                    id: 0,
+                    label: "Ключ Theia",
+                    value: if self.source.is_empty() {
+                        String::new()
+                    } else {
+                        format!("Введено {} байт (скрыто)", self.source.len())
+                    },
+                    hint:
+                        "Вставьте theia:// или выберите файл приглашения / изображение QR через F6.",
+                }],
+                "Получите личный ключ у администратора. Тип подключения определится автоматически."
+                    .into(),
+            )
+        };
+        Some(Form {
+            fields,
+            selected: self.focus,
+            lead,
+            error: self.error.unwrap_or_default().into(),
+        })
+    }
+    fn guide(&self) -> (usize, usize, &'static str, &'static str) {
+        if self.browser.is_some() {
+            return (
+                1,
+                5,
+                "Выбор файла",
+                "↑↓ выбрать · Enter принять · Esc назад",
+            );
+        }
+        if self.reading.is_some() {
+            return (2, 5, "Определение типа", "Локальная проверка");
+        }
+        if self.review {
+            return (4, 5, "Сохранение профиля", "y сохранить · n/Esc назад");
+        }
+        if self.own.is_some() {
+            (
+                3,
+                5,
+                "Параметры и доверие",
+                "↑↓ поле · F6 файл · Enter проверить · Esc назад",
+            )
+        } else {
+            (
+                1,
+                5,
+                "Вставить ключ",
+                "Enter проверить · F6 файл/QR · Ctrl+U очистить · Esc назад",
+            )
+        }
+    }
+    fn body(&self, path: &str) -> String {
+        if self.reading.is_some() {
+            return "Проверяем приглашение локально. Сеть не используется.".into();
+        }
+        if self.review {
+            if let Some(invite) = &self.own {
+                return format!("Тип: собственный TLS\nПрофиль: {}\nСервер: {}\nИмя TLS: {}\nДоверенный сертификат выбран и проверен локально.\nЛичный ключ будет сохранён защищённо; публичное приглашение использует указанную ссылку.\n\nФайл настроек: {path}\nСоздаётся первый активный профиль. Соединение и системный прокси не запускаются.", invite.id, invite.endpoint, invite.server_name);
+            }
+        }
+        String::new()
+    }
+    fn key(&mut self, key: KeyEvent) -> FirstInviteAction {
+        if self.reading.is_some() {
+            if key.code == KeyCode::Esc {
+                self.reading = None;
+                self.error = None;
+            }
+            return FirstInviteAction::Stay;
+        }
+        if let Some(browser) = self.browser.as_mut() {
+            if key.code == KeyCode::Esc {
+                self.browser = None;
+            } else if let Some(path) = browser.key(key.code, "") {
+                if let Some(path) = path
+                    .to_str()
+                    .filter(|p| p.len() <= 4090 && !p.chars().any(char::is_control))
+                {
+                    if self.own.is_some() {
+                        self.ca = format!("file:{path}");
+                    } else {
+                        self.source = Zeroizing::new(path.to_owned());
+                    }
+                    self.error = None;
+                } else {
+                    self.error = Some("Недопустимый путь файла.");
+                }
+                self.browser = None;
+            }
+            return FirstInviteAction::Stay;
+        }
+        if self.review {
+            match key.code {
+                KeyCode::Char('y') if key.modifiers.is_empty() => {
+                    if let Some(invite) = self.own.take() {
+                        return FirstInviteAction::Save(
+                            invite,
+                            std::mem::take(&mut self.ca),
+                            (!self.reference.is_empty())
+                                .then(|| std::mem::take(&mut self.reference)),
+                        );
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => self.review = false,
+                _ => {}
+            }
+            return FirstInviteAction::Stay;
+        }
+        self.error = None;
+        match key.code {
+            KeyCode::Esc => {
+                if self.own.take().is_some() {
+                    self.ca.clear();
+                    self.reference.clear();
+                    self.focus = 0;
+                } else {
+                    return FirstInviteAction::Back;
+                }
+            }
+            KeyCode::F(6) if self.focus == 0 => {
+                self.browser = Some(FileBrowser::files(if self.own.is_some() {
+                    self.ca.strip_prefix("file:").unwrap_or(&self.ca)
+                } else {
+                    self.source.as_str()
+                }));
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab
+                if self.own.as_ref().is_some_and(|i| !i.has_token()) =>
+            {
+                self.focus = 1 - self.focus
+            }
+            KeyCode::Enter => {
+                if let Some(invite) = &self.own {
+                    if !self.ca.is_empty() && !self.ca.starts_with("file:") {
+                        self.ca = format!("file:{}", self.ca);
+                    }
+                    if crate::client_import::checked_ca_ref(Some(&self.ca)).is_err() {
+                        self.error = Some("Выберите доверенный PEM-сертификат через F6.");
+                    } else if !invite.has_token()
+                        && !crate::client_import::valid_explicit_reference(&self.reference)
+                    {
+                        self.error = Some("Укажите отдельную ссылку env:ИМЯ.");
+                    } else {
+                        self.review = true;
+                    }
+                } else if !self.source.is_empty() {
+                    let source = self.source.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let worker = std::thread::Builder::new().name("theia-first-invite".into()).spawn(move || {
+                        let result = (|| {
+                            let source = if crate::qr_import::image_path(source.trim()) {
+                                crate::qr_import::scan_file(source.trim())?
+                            } else { source };
+                            let product = crate::client_import::read_product_source(source.trim())
+                                .map_err(|_| "Не удалось прочитать ключ. Проверьте ссылку целиком или выберите файл.")?;
+                            Ok((source, product))
+                        })();
+                        let _ = tx.send(result);
+                    });
+                    if worker.is_ok() {
+                        self.reading = Some(rx);
+                    } else {
+                        self.error = Some("Не удалось начать проверку ключа.");
+                    }
+                } else {
+                    self.error = Some("Вставьте ключ или выберите файл.");
+                }
+            }
+            KeyCode::Backspace => {
+                if self.own.is_none() {
+                    self.source.pop();
+                } else if self.focus == 0 {
+                    self.ca.pop();
+                } else {
+                    self.reference.pop();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                if self.own.is_none() {
+                    self.source = Zeroizing::new(String::new());
+                } else if self.focus == 0 {
+                    self.ca.clear();
+                } else {
+                    self.reference.clear();
+                }
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                let mut buf = [0; 4];
+                self.paste(ch.encode_utf8(&mut buf));
+            }
+            _ => {}
+        }
+        FirstInviteAction::Stay
     }
 }
 
@@ -531,6 +979,9 @@ pub(crate) struct ConfigDialog {
     setup: Option<FirstSetup>,
     reality: Option<crate::tui_reality_provision::ProvisionPanel>,
     enrollment: Option<crate::tui_reality_enroll::EnrollmentPanel>,
+    first_invite: Option<FirstInvite>,
+    imported: bool,
+    import_after_load: bool,
     creating: bool,
     browser: Option<FileBrowser>,
 }
@@ -557,8 +1008,45 @@ impl ConfigDialog {
             setup: None,
             reality: None,
             enrollment: None,
+            first_invite: None,
+            imported: false,
+            import_after_load: false,
             creating: false,
             browser: None,
+        }
+    }
+    pub(crate) fn imported(&self) -> bool {
+        self.imported
+    }
+
+    pub(crate) fn import_after_load(&self) -> bool {
+        self.import_after_load
+    }
+
+    pub(crate) fn begin_client_import(&mut self) {
+        if self.role != Role::Client {
+            return;
+        }
+        if std::path::Path::new(&self.input).is_file() {
+            self.choice = 0;
+            self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            self.import_after_load = self.loading.is_some();
+        } else {
+            self.choice = 1;
+            self.key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        }
+    }
+
+    pub(crate) fn suggested_mode(role: Role) -> usize {
+        let filename = if role == Role::Server {
+            "server.toml"
+        } else {
+            "client.toml"
+        };
+        if default_config(filename).is_file() {
+            0
+        } else {
+            1
         }
     }
     pub(crate) fn prefer_reality(&mut self) {
@@ -568,7 +1056,13 @@ impl ConfigDialog {
         self.choice = choice.min(2);
     }
     pub(crate) fn paste(&mut self, text: &str) {
-        if self.browser.is_some() { return; }
+        if self.browser.is_some() {
+            return;
+        }
+        if let Some(panel) = self.first_invite.as_mut() {
+            panel.paste(text);
+            return;
+        }
         if let Some(panel) = self.enrollment.as_mut() {
             panel.paste(text);
             return;
@@ -590,6 +1084,41 @@ impl ConfigDialog {
     }
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.loading.is_some() {
+            return false;
+        }
+        if let Some(panel) = self.first_invite.as_mut() {
+            match panel.key(key) {
+                FirstInviteAction::Stay => {}
+                FirstInviteAction::Back => {
+                    self.first_invite = None;
+                }
+                FirstInviteAction::Save(invite, ca, reference) => {
+                    let path = std::path::PathBuf::from(&self.input);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    match std::thread::Builder::new()
+                        .name("theia-first-own-tls".into())
+                        .spawn(move || {
+                            let result = crate::tui_editor::Editor::create_first_invitation(
+                                &path,
+                                &invite,
+                                &ca,
+                                reference.as_deref(),
+                            );
+                            let _ = tx.send(result);
+                        }) {
+                        Ok(_) => {
+                            self.loading = Some(rx);
+                            self.creating = true;
+                            self.imported = true;
+                            self.first_invite = None;
+                        }
+                        Err(_) => {
+                            self.first_invite = None;
+                            self.error = Some("Не удалось начать сохранение. Повторите импорт.");
+                        }
+                    }
+                }
+            }
             return false;
         }
         if let Some(panel) = self.enrollment.as_mut() {
@@ -634,15 +1163,32 @@ impl ConfigDialog {
             }
         }
         if let Some(browser) = self.browser.as_mut() {
-            if key.code == KeyCode::Esc { self.browser = None; return false; }
-            let filename = std::path::Path::new(&self.input).file_name().and_then(|n| n.to_str()).unwrap_or(if self.role == Role::Server { "server.toml" } else { "client.toml" });
+            if key.code == KeyCode::Esc {
+                self.browser = None;
+                return false;
+            }
+            let filename = std::path::Path::new(&self.input)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(if self.role == Role::Server {
+                    "server.toml"
+                } else {
+                    "client.toml"
+                });
             if let Some(path) = browser.key(key.code, filename) {
-                if let Some(path) = path.to_str().filter(|s| s.len() <= 4096 && !s.chars().any(char::is_control)) {
+                if let Some(path) = path
+                    .to_str()
+                    .filter(|s| s.len() <= 4096 && !s.chars().any(char::is_control))
+                {
                     self.input = path.to_owned();
                     self.error = None;
                     self.browser = None;
-                    if self.choice==3{self.choice=0;}
-                } else { browser.error = "Недопустимый путь".into(); }
+                    if self.choice == 3 {
+                        self.choice = 0;
+                    }
+                } else {
+                    browser.error = "Недопустимый путь".into();
+                }
             }
             return false;
         }
@@ -661,7 +1207,10 @@ impl ConfigDialog {
             }
             KeyCode::Enter if self.choice == 1 => KeyCode::F(4),
             KeyCode::Enter if self.choice == 2 => KeyCode::F(2),
-            KeyCode::Enter if self.choice == 3 => {self.browser=Some(FileBrowser::new(&self.input));return false;}
+            KeyCode::Enter if self.choice == 3 => {
+                self.browser = Some(FileBrowser::new(&self.input));
+                return false;
+            }
             code => code,
         };
         match code {
@@ -678,10 +1227,14 @@ impl ConfigDialog {
                 if self.input.is_empty() {
                     self.error = Some("Укажите путь нового TOML.");
                 } else if self.role == Role::Client {
-                    match crate::tui_reality_enroll::EnrollmentPanel::first(std::path::PathBuf::from(&self.input)) {
-                        Ok(panel) => { self.enrollment = Some(panel); self.error = None; }
-                        Err(error) => self.error = Some(error),
-                    }
+                    let path = std::path::absolute(&self.input);
+                    if path.as_ref().is_ok_and(|p| crate::bounded_input::explicit_file_path(p)
+                        && matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                        && p.parent().is_some_and(std::path::Path::is_dir)) {
+                        self.first_invite = Some(FirstInvite::new());
+                        self.error = None;
+                        self.imported = false;
+                    } else { self.error = Some("Выберите новый файл настроек в существующем каталоге."); }
                 } else {
                     match crate::tui_reality_provision::ProvisionPanel::first(
                         std::path::PathBuf::from(&self.input),
@@ -733,8 +1286,42 @@ impl ConfigDialog {
         false
     }
     pub(crate) fn poll(&mut self) -> Option<crate::tui_editor::Editor> {
+        if let Some(panel) = self.first_invite.as_mut() {
+            use std::sync::mpsc::TryRecvError;
+            let result = match panel.reading.as_ref()?.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => Err("Проверка ключа прервана."),
+            };
+            panel.reading = None;
+            match result {
+                Ok((_, crate::client_import::ProductSource::OwnTls(invite))) => {
+                    panel.source = Zeroizing::new(String::new());
+                    panel.own = Some(invite);
+                    panel.focus = 0;
+                }
+                Ok((source, crate::client_import::ProductSource::Reality)) => {
+                    match crate::tui_reality_enroll::EnrollmentPanel::first_from_source(
+                        std::path::PathBuf::from(&self.input),
+                        source,
+                    ) {
+                        Ok(enrollment) => {
+                            self.enrollment = Some(enrollment);
+                            self.first_invite = None;
+                        }
+                        Err(error) => panel.error = Some(error),
+                    }
+                }
+                Err(error) => panel.error = Some(error),
+            }
+            return None;
+        }
         if let Some(panel) = self.enrollment.as_mut() {
-            return panel.poll();
+            let result = panel.poll();
+            if result.is_some() {
+                self.imported = true;
+            }
+            return result;
         }
         if let Some(panel) = self.reality.as_mut() {
             return panel.poll();
@@ -752,6 +1339,8 @@ impl ConfigDialog {
         match result {
             Ok(editor) => Some(editor),
             Err(reason) => {
+                self.imported = false;
+                self.import_after_load = false;
                 self.error = Some(reason);
                 None
             }
@@ -759,53 +1348,106 @@ impl ConfigDialog {
     }
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
-        if self.loading.is_some() { return None; }
-        if let Some(browser) = &self.browser { return Some(browser.form()); }
-        if let Some(panel) = &self.reality { return panel.form(); }
-        if let Some(panel) = &self.enrollment { return panel.form(); }
+        if self.loading.is_some() {
+            return None;
+        }
+        if let Some(panel) = &self.first_invite {
+            return panel.form();
+        }
+        if let Some(browser) = &self.browser {
+            return Some(browser.form());
+        }
+        if let Some(panel) = &self.reality {
+            return panel.form();
+        }
+        if let Some(panel) = &self.enrollment {
+            return panel.form();
+        }
         if let Some(setup) = &self.setup {
-            if setup.review.is_some() { return None; }
+            if setup.review.is_some() {
+                return None;
+            }
             let hints = match setup.role {
-                Role::Server => ["Уникальный ID.", "Один адрес для TCP и UDP.", "DNS-имя сертификата.", "Абсолютная file: ссылка на PEM.", "Абсолютная file: ссылка; не вставляйте ключ.", "Пользователь будет отключён до восстановления доступа."],
-                Role::Client => ["Имя профиля.", "Публичный адрес и порт.", "DNS-имя сервера.", "Абсолютная file: ссылка на доверенный CA.", "Ссылка на токен, не сам токен.", "Путь /v1/... из конфигурации сервера."],
+                Role::Server => [
+                    "Уникальный ID.",
+                    "Один адрес для TCP и UDP.",
+                    "DNS-имя сертификата.",
+                    "Абсолютная file: ссылка на PEM.",
+                    "Абсолютная file: ссылка; не вставляйте ключ.",
+                    "Пользователь будет отключён до восстановления доступа.",
+                ],
+                Role::Client => [
+                    "Имя профиля.",
+                    "Публичный адрес и порт.",
+                    "DNS-имя сервера.",
+                    "Абсолютная file: ссылка на доверенный CA.",
+                    "Ссылка на токен, не сам токен.",
+                    "Путь /v1/... из конфигурации сервера.",
+                ],
             };
             return Some(Form {
-                fields: setup.labels().iter().enumerate().map(|(id, label)| Field {
-                    id, label, hint: hints[id],
-                    value: if matches!(id, 3 | 4) && !setup.fields[id].is_empty() {
-                        "Скрыто · ссылка введена".into()
-                    } else { setup.fields[id].to_string() },
-                }).collect(),
+                fields: setup
+                    .labels()
+                    .iter()
+                    .enumerate()
+                    .map(|(id, label)| Field {
+                        id,
+                        label,
+                        hint: hints[id],
+                        value: if matches!(id, 3 | 4) && !setup.fields[id].is_empty() {
+                            "Скрыто · ссылка введена".into()
+                        } else {
+                            setup.fields[id].to_string()
+                        },
+                    })
+                    .collect(),
                 selected: setup.focus,
                 lead: format!("Новый файл: {}", self.input),
                 error: setup.error.unwrap_or_default().to_owned(),
             });
         }
-        let reality = if self.role == Role::Server { "SmartTheia REALITY" } else { "Импорт REALITY" };
+        let reality = if self.role == Role::Server {
+            "SmartTheia REALITY"
+        } else {
+            "Импорт ключа Theia"
+        };
         let fields = vec![
-            Field { id: 0, label: "Открыть TOML", value: "Enter · существующий файл".into(), hint: "Введите путь к существующему файлу." },
-            Field { id: 1, label: reality, value: "F4 · создать через мастер".into(), hint: "Новый TOML, без собственного сертификата." },
-            Field { id: 2, label: "Own-TLS", value: "F2 · создать вручную".into(), hint: "Новый TOML с собственным TLS." },
+            Field { id: 0, label: "Открыть сохранённые настройки", value: "Для уже настроенной Theia".into(), hint: "Выберите существующий файл .toml через F6 или введите его путь." },
+            Field { id: 1, label: reality, value: "Рекомендуемый мастер для новой настройки".into(), hint: "Оставьте предложенный путь, если файл ещё не существует. Существующий файл не заменяется." },
+            Field { id: 2, label: "Own-TLS", value: "Расширенная ручная настройка".into(), hint: "Требуются собственный сертификат или данные доверия от администратора." },
             Field { id: 3, label: "Выбрать файл или каталог", value: "F6 · файловый браузер".into(), hint: "Выбор пути не открывает и не создаёт файл." },
         ];
         Some(Form {
             fields,
             selected: self.choice,
-            lead: format!("Путь к TOML: {}\nF6 выбрать файл/каталог · Ctrl+U очистить · путь можно ввести", self.input),
+            lead: format!(
+                "Файл настроек: {}\nEnter продолжить · F6 выбрать файл · Ctrl+U изменить путь",
+                self.input
+            ),
             error: self.error.unwrap_or_default().to_owned(),
         })
     }
 
     pub(crate) fn select_field(&mut self, id: usize) {
-        if self.loading.is_some() { return; }
-        if let Some(browser) = self.browser.as_mut() {
-            if id < browser.entries.len()+2 { browser.focus = id; }
+        if self.loading.is_some() {
             return;
         }
-        if let Some(panel) = self.reality.as_mut() { panel.select_field(id); }
-        else if let Some(panel) = self.enrollment.as_mut() { panel.select_field(id); }
-        else if let Some(setup) = self.setup.as_mut() {
-            if setup.review.is_none() && id < setup.fields.len() { setup.focus = id; }
+        if let Some(panel) = self.first_invite.as_mut() {
+            panel.select_field(id);
+            return;
+        }
+        if let Some(browser) = self.browser.as_mut() {
+            browser.select_field(id);
+            return;
+        }
+        if let Some(panel) = self.reality.as_mut() {
+            panel.select_field(id);
+        } else if let Some(panel) = self.enrollment.as_mut() {
+            panel.select_field(id);
+        } else if let Some(setup) = self.setup.as_mut() {
+            if setup.review.is_none() && id < setup.fields.len() {
+                setup.focus = id;
+            }
         } else if id < 4 {
             self.choice = id;
         }
@@ -816,6 +1458,9 @@ impl ConfigDialog {
     }
 
     pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
+        if let Some(panel) = &self.first_invite {
+            return Some(panel.guide());
+        }
         if let Some(panel) = &self.reality {
             return panel.guide();
         }
@@ -826,13 +1471,22 @@ impl ConfigDialog {
             if setup.review.is_some() {
                 (2, 2, "Подтверждение", "Y создать · N / Esc назад")
             } else {
-                (1, 2, "Параметры Own-TLS", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад")
+                (
+                    1,
+                    2,
+                    "Параметры Own-TLS",
+                    "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад",
+                )
             }
         })
     }
     pub(crate) fn title(&self) -> &'static str {
-        if self.browser.is_some() { return "Выбор файла · ↑↓ Enter Esc"; }
-        if self.enrollment.is_some() {
+        if self.browser.is_some() {
+            return "Выбор файла · ↑↓ Enter Esc";
+        }
+        if self.first_invite.is_some() {
+            "Импорт ключа Theia"
+        } else if self.enrollment.is_some() {
             "Импорт REALITY"
         } else if self.reality.is_some() {
             "Мастер REALITY"
@@ -851,6 +1505,9 @@ impl ConfigDialog {
                 "Проверяется существующий TOML; ничего не записывается.".into()
             };
         }
+        if let Some(panel) = &self.first_invite {
+            return panel.body(&self.input);
+        }
         if let Some(panel) = &self.enrollment {
             return panel.body();
         }
@@ -868,23 +1525,28 @@ impl ConfigDialog {
         let reality = if self.role == Role::Server {
             "SmartTheia REALITY  ·  мастер подбора, без своего сертификата"
         } else {
-            "Импорт REALITY  ·  создать TOML из приглашения"
+            "Импорт ключа Theia · Own-TLS или REALITY"
         };
         let choices = [
             ("Enter", "Открыть существующий TOML"),
             ("F4", reality),
-            ("F2", "Own-TLS  ·  собственный сертификат / ручная настройка"),
+            (
+                "F2",
+                "Own-TLS  ·  собственный сертификат / ручная настройка",
+            ),
         ];
         let mut body = format!("{role} • открытие или создание конфигурации\n\nПУТЬ К TOML\n  {}\n\nВЫБЕРИТЕ ДЕЙСТВИЕ\n", self.input);
         for (i, (shortcut, label)) in choices.iter().enumerate() {
-            body.push_str(&format!("{} {shortcut:5} {label}\n", if i == self.choice { ">" } else { " " }));
+            body.push_str(&format!(
+                "{} {shortcut:5} {label}\n",
+                if i == self.choice { ">" } else { " " }
+            ));
         }
         body.push_str("\n↑↓ / Tab выбрать · Enter продолжить\nПуть можно вводить сразу. Ctrl+U очистить · Esc назад");
         if let Some(error) = self.error {
             body.push_str(&format!("\nОшибка: {error}"));
         }
         body
-
     }
 }
 
@@ -1122,7 +1784,11 @@ fn default_config(filename: &str) -> std::path::PathBuf {
     #[cfg(target_os = "linux")]
     if filename == "server.toml" {
         let system = std::path::Path::new("/etc/theia");
-        return if system.is_dir() { system.join(filename) } else { std::path::PathBuf::from(filename) };
+        return if system.is_dir() {
+            system.join(filename)
+        } else {
+            std::path::PathBuf::from(filename)
+        };
     }
     #[cfg(windows)]
     let root = std::env::var_os("APPDATA").map(|p| std::path::PathBuf::from(p).join("Theia"));
@@ -1132,7 +1798,8 @@ fn default_config(filename: &str) -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
         .map(|p| p.join("theia"));
-    root.filter(|p| p.is_dir()).map(|p| p.join(filename))
+    root.filter(|p| p.is_dir())
+        .map(|p| p.join(filename))
         .unwrap_or_else(|| std::path::PathBuf::from(filename))
 }
 
@@ -1293,20 +1960,42 @@ mod tests {
     }
 
     #[test]
-    fn file_browser_selects_path_without_opening_or_creating() {
-        let root=std::env::temp_dir().join(crate::tui_editor::generated_id("browser").unwrap());
+    fn general_file_browser_selects_invite_without_reading_contents() {
+        let root =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("invite-browser").unwrap());
         std::fs::create_dir(&root).unwrap();
-        let existing=root.join("existing.toml");
-        std::fs::write(&existing,"sentinel").unwrap();
-        let new=root.join("new.toml");
-        let mut dialog=ConfigDialog::new(Role::Server,Some(&new));
+        let invite = root.join("invite.theia");
+        std::fs::write(&invite, "PRIVATE-INVITATION-TEST").unwrap();
+        let mut browser = FileBrowser::files(root.to_str().unwrap());
+        let form = browser.form();
+        assert!(form
+            .fields
+            .iter()
+            .all(|f| !f.value.contains("PRIVATE-INVITATION-TEST")));
+        browser.select_field(1);
+        assert_eq!(browser.key(KeyCode::Enter, "").unwrap(), invite);
+        assert_eq!(
+            std::fs::read_to_string(&invite).unwrap(),
+            "PRIVATE-INVITATION-TEST"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_browser_selects_path_without_opening_or_creating() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("browser").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let existing = root.join("existing.toml");
+        std::fs::write(&existing, "sentinel").unwrap();
+        let new = root.join("new.toml");
+        let mut dialog = ConfigDialog::new(Role::Server, Some(&new));
         dialog.key(press(KeyCode::F(6)));
         assert!(dialog.browser.is_some());
         dialog.select_field(2);
         dialog.key(press(KeyCode::Enter));
-        assert_eq!(std::path::Path::new(&dialog.input),existing.as_path());
+        assert_eq!(std::path::Path::new(&dialog.input), existing.as_path());
         assert!(dialog.loading.is_none());
-        assert_eq!(std::fs::read_to_string(&existing).unwrap(),"sentinel");
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "sentinel");
         assert!(!new.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1363,6 +2052,60 @@ mod tests {
     }
 
     #[test]
+    fn compact_menu_preserves_selection_and_configuration_guards() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let area = Rect::new(0, 0, 68, 22);
+        for role in [Role::Server, Role::Client] {
+            for configured in [false, true] {
+                let mut menu = Menu::new(role, configured);
+                assert_eq!(Menu::categories(role).len(), menu.groups().len());
+                let group_count = menu.groups().len();
+                for group in 0..group_count {
+                    menu.click(area, 2, 1 + group as u16);
+                    assert_eq!(menu.group, group);
+                    assert!(menu.item.is_none());
+                    let mut terminal =
+                        Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+                    terminal.draw(|frame| menu.render(frame, area)).unwrap();
+                    let rendered = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    assert!(rendered.contains(menu.groups()[group].title));
+                    assert_eq!(menu.key(KeyCode::Enter), None);
+                    assert_eq!(menu.item, Some(0));
+                    let entries = menu.groups()[group].entries;
+                    for (index, entry) in entries.iter().enumerate() {
+                        menu.click(area, 2, 1 + index as u16);
+                        assert_eq!(menu.item, Some(index));
+                        terminal.draw(|frame| menu.render(frame, area)).unwrap();
+                        let allowed = configured || !entry.requires_config;
+                        assert_eq!(menu.key(KeyCode::Enter), allowed.then_some(entry.action));
+                        assert_eq!(menu.notice.is_some(), !allowed);
+                        if !allowed {
+                            terminal.draw(|frame| menu.render(frame, area)).unwrap();
+                            let rendered = terminal
+                                .backend()
+                                .buffer()
+                                .content()
+                                .iter()
+                                .map(|cell| cell.symbol())
+                                .collect::<String>();
+                            assert!(rendered.contains("Сначала откройте конфигурацию"));
+                        }
+                    }
+                    assert_eq!(menu.key(KeyCode::Esc), None);
+                    assert!(menu.item.is_none());
+                }
+                assert_eq!(menu.key(KeyCode::F(10)), Some(Action::Close));
+            }
+        }
+    }
+
+    #[test]
     fn unconfigured_actions_do_not_mutate_and_selection_is_visible() {
         let mut m = Menu::new(Role::Client, false);
         m.key(KeyCode::Enter);
@@ -1372,7 +2115,7 @@ mod tests {
         m.key(KeyCode::End);
         assert_eq!(m.key(KeyCode::Enter), None);
         assert!(m.body(10).contains("Сначала откройте"));
-        assert!(m.body(6).contains("Системный прокси"));
+        assert!(m.body(6).contains("Режим подключения (прокси / TUN)"));
         m.key(KeyCode::Esc);
         m.key(KeyCode::End);
         m.key(KeyCode::Enter);

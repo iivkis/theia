@@ -75,7 +75,6 @@ pub(crate) mod tui_discovery;
 pub(crate) mod tui_domain;
 pub mod tui_editor;
 mod tui_menu;
-mod tui_widgets;
 pub(crate) mod tui_probe;
 mod tui_reality_enroll;
 mod tui_reality_provision;
@@ -88,6 +87,7 @@ mod tui_share;
 mod tui_staged_material;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;
+mod tui_widgets;
 #[cfg(target_os = "windows")]
 pub mod windows_control;
 #[cfg(target_os = "windows")]

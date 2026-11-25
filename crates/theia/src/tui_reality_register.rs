@@ -355,7 +355,12 @@ impl RegistrationPanel {
             if self.role == Role::Server && key.code != KeyCode::Enter {
                 return false;
             }
-            if self.role == Role::Client && matches!(key.code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down) {
+            if self.role == Role::Client
+                && matches!(
+                    key.code,
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
+                )
+            {
                 return false;
             }
         }
@@ -492,21 +497,66 @@ impl RegistrationPanel {
     }
 
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
-        use crate::tui_widgets::{Field,Form};
-        if !matches!(self.stage,Stage::Input) || (self.owned.is_some() && self.role==Role::Server) {return None;}
-        let labels=if self.reenroll_id.is_some() {
-            if self.role==Role::Server {REPLACE_SERVER_FIELDS.as_slice()} else {REENROLL_FIELDS.as_slice()}
-        }else{labels(self.role)};
-        let fields=labels.iter().enumerate().filter(|(id,_)|self.owned.is_none()||*id==2).map(|(id,label)| {
-            let value=&self.fields[id];
-            let public=(self.role==Role::Server&&id>=4)||(self.role==Role::Client&&id==2);
-            Field{id,label:*label,value:if public{value.clone()}else if value.is_empty(){String::new()}else{format!("Введено · {} символов",value.chars().count())},
-                hint:if public{"Введите значение. Enter — локальная проверка."}else{"Укажите подготовленный файл или проверенный отпечаток. Содержимое скрыто."}}
-        }).collect();
-        Some(Form{fields,selected:self.focus,lead:if self.owned.is_some(){"Материалы подготовлены. Укажите имя профиля; сохранение и подключение раздельны.".into()}else{"Регистрация уже подготовленных материалов. Сначала проверка, затем отдельное подтверждение записи.".into()},error:self.error.clone().unwrap_or_default()})
+        use crate::tui_widgets::{Field, Form};
+        if !matches!(self.stage, Stage::Input)
+            || (self.owned.is_some() && self.role == Role::Server)
+        {
+            return None;
+        }
+        let labels = if self.reenroll_id.is_some() {
+            if self.role == Role::Server {
+                REPLACE_SERVER_FIELDS.as_slice()
+            } else {
+                REENROLL_FIELDS.as_slice()
+            }
+        } else {
+            labels(self.role)
+        };
+        let fields = labels
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| self.owned.is_none() || *id == 2)
+            .map(|(id, label)| {
+                let value = &self.fields[id];
+                let public = (self.role == Role::Server && id >= 4)
+                    || (self.role == Role::Client && id == 2);
+                Field {
+                    id,
+                    label,
+                    value: if public {
+                        value.clone()
+                    } else if value.is_empty() {
+                        String::new()
+                    } else {
+                        format!("Введено · {} символов", value.chars().count())
+                    },
+                    hint: if public {
+                        "Введите значение. Enter — локальная проверка."
+                    } else {
+                        "Укажите подготовленный файл или проверенный отпечаток. Содержимое скрыто."
+                    },
+                }
+            })
+            .collect();
+        Some(Form {
+            fields,
+            selected: self.focus,
+            lead: if self.owned.is_some() {
+                "Материалы подготовлены. Укажите имя профиля; сохранение и подключение раздельны."
+                    .into()
+            } else {
+                "Регистрация уже подготовленных материалов. Сначала проверка, затем отдельное подтверждение записи.".into()
+            },
+            error: self.error.clone().unwrap_or_default(),
+        })
     }
-    pub(crate) fn select_field(&mut self,id:usize) {
-        if matches!(self.stage,Stage::Input)&&id<self.fields.len()&&(self.owned.is_none()||(self.role==Role::Client&&id==2)){self.focus=id;}
+    pub(crate) fn select_field(&mut self, id: usize) {
+        if matches!(self.stage, Stage::Input)
+            && id < self.fields.len()
+            && (self.owned.is_none() || (self.role == Role::Client && id == 2))
+        {
+            self.focus = id;
+        }
     }
 
     pub(crate) fn body(&self) -> String {

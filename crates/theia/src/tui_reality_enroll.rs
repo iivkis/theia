@@ -111,10 +111,16 @@ fn apply(input: &Input, review: Review, now: u64) -> Result<String, Error> {
     Ok("Профиль REALITY и доверие сохранены. Runtime НЕ изменён.\nEsc: закрыть.".into())
 }
 
-fn create_first_client(path: &Path, input: &Input, review: Review, now: u64) -> Result<crate::tui_editor::Editor, Error> {
+fn create_first_client(
+    path: &Path,
+    input: &Input,
+    review: Review,
+    now: u64,
+) -> Result<crate::tui_editor::Editor, Error> {
     use crate::{config, reality_config, Role};
     let mut owned = crate::tui_staged_material::StagedMaterial::create_for_new_config(
-        input.profile.parent().ok_or(Error::Storage)?, path,
+        input.profile.parent().ok_or(Error::Storage)?,
+        path,
     )?;
     match apply(input, review, now) {
         Ok(_) => {}
@@ -171,6 +177,7 @@ pub(crate) struct EnrollmentPanel {
     new_config: Option<PathBuf>,
     registration: Option<crate::tui_reality_register::RegistrationPanel>,
     owned: Option<crate::tui_staged_material::StagedMaterial>,
+    browser: Option<crate::tui_menu::FileBrowser>,
 }
 
 impl EnrollmentPanel {
@@ -184,6 +191,7 @@ impl EnrollmentPanel {
             new_config: None,
             registration: None,
             owned: None,
+            browser: None,
         }
     }
 
@@ -191,15 +199,41 @@ impl EnrollmentPanel {
         let path = std::path::absolute(path).map_err(|_| "Недопустимый путь TOML")?;
         if !crate::bounded_input::explicit_file_path(&path)
             || !matches!(std::fs::symlink_metadata(&path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-            || !path.parent().is_some_and(Path::is_dir) {
+            || !path.parent().is_some_and(Path::is_dir)
+        {
             return Err("Укажите новый клиентский TOML в существующем каталоге.");
         }
-        let root = path.parent().ok_or("Недопустимый путь TOML")?
+        let root = path
+            .parent()
+            .ok_or("Недопустимый путь TOML")?
             .join(crate::tui_editor::generated_id(".theia-enroll")?);
         let mut panel = Self::new();
-        panel.fields[2] = Zeroizing::new(root.join("profile.toml").to_str().ok_or("Недопустимый путь")?.to_owned());
-        panel.fields[3] = Zeroizing::new(root.join("trust.toml").to_str().ok_or("Недопустимый путь")?.to_owned());
+        panel.fields[2] = Zeroizing::new(
+            root.join("profile.toml")
+                .to_str()
+                .ok_or("Недопустимый путь")?
+                .to_owned(),
+        );
+        panel.fields[3] = Zeroizing::new(
+            root.join("trust.toml")
+                .to_str()
+                .ok_or("Недопустимый путь")?
+                .to_owned(),
+        );
         panel.new_config = Some(path);
+        Ok(panel)
+    }
+
+    pub(crate) fn first_from_source(
+        path: PathBuf,
+        source: Zeroizing<String>,
+    ) -> Result<Self, &'static str> {
+        if source.len() > bootstrap::MAX_URI {
+            return Err("Приглашение превышает лимит v1.");
+        }
+        let mut panel = Self::first(path)?;
+        panel.fields[0] = source;
+        panel.focus = 1;
         Ok(panel)
     }
 
@@ -275,6 +309,9 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn paste(&mut self, value: &str) {
+        if self.browser.is_some() {
+            return;
+        }
         if let Some(panel) = self.registration.as_mut() {
             panel.paste(value);
             return;
@@ -295,6 +332,29 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
+        if let Some(browser) = self.browser.as_mut() {
+            if key.code == KeyCode::Esc {
+                self.browser = None;
+                return false;
+            }
+            if let Some(path) = browser.key(key.code, "") {
+                if let Some(path) = path.to_str().filter(|s| !s.chars().any(char::is_control)) {
+                    let limit = if self.focus == 0 {
+                        bootstrap::MAX_URI
+                    } else {
+                        LIMIT
+                    };
+                    if path.len() <= limit {
+                        self.fields[self.focus] = Zeroizing::new(path.to_owned());
+                        self.error = None;
+                    } else {
+                        self.error = Some("Путь слишком длинный. Выберите другой файл.".into());
+                    }
+                }
+                self.browser = None;
+            }
+            return false;
+        }
         if let Some(panel) = self.registration.as_mut() {
             return panel.key(key);
         }
@@ -350,7 +410,9 @@ impl EnrollmentPanel {
                             let _worker = std::thread::spawn(move || {
                                 let result = reference_health::unix_now()
                                     .map_err(|_| Error::Clock)
-                                    .and_then(|now| create_first_client(&path, &input, review, now));
+                                    .and_then(|now| {
+                                        create_first_client(&path, &input, review, now)
+                                    });
                                 let _ = tx.send(result);
                             });
                             return false;
@@ -398,8 +460,13 @@ impl EnrollmentPanel {
         }
         match key.code {
             KeyCode::Esc => return true,
+            KeyCode::F(6) if self.focus <= 1 => {
+                self.browser = Some(crate::tui_menu::FileBrowser::files(
+                    self.fields[self.focus].as_str(),
+                ));
+            }
             KeyCode::F(8) => {
-                self.focus = if self.focus < 4 {4} else {0};
+                self.focus = if self.focus < 4 { 4 } else { 0 };
             }
             KeyCode::Tab | KeyCode::Down => {
                 self.focus = (self.focus + 1) % LABELS.len();
@@ -415,13 +482,37 @@ impl EnrollmentPanel {
             }
             KeyCode::Backspace => {
                 self.fields[self.focus].pop();
+                self.error = None;
             }
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
                 self.fields[self.focus] = Zeroizing::new(String::new());
+                self.error = None;
             }
-            KeyCode::Enter if self.managed_paths() && self.focus < 4 && !self.fields[0].is_empty() && !self.fields[1].is_empty() && self.fields[4].is_empty() => {
-                self.focus=4;
-                self.error=None;
+            KeyCode::Enter
+                if self.managed_paths()
+                    && self.focus < 4
+                    && !self.fields[0].is_empty()
+                    && !self.fields[1].is_empty()
+                    && self.fields[4].is_empty() =>
+            {
+                self.focus = 4;
+                self.error = None;
+            }
+            KeyCode::Enter if self.fields[0].is_empty() => {
+                self.focus = 0;
+                self.error = Some(
+                    "Нет приглашения. Вставьте ссылку или выберите присланный файл (F6).".into(),
+                );
+            }
+            KeyCode::Enter if self.fields[1].is_empty() => {
+                self.focus = 1;
+                self.error = Some(
+                    "Нет файла допуска. Попросите его у администратора и выберите через F6.".into(),
+                );
+            }
+            KeyCode::Enter if crate::parse_restart_digest(&self.fields[4]).is_none() => {
+                self.focus = 4;
+                self.error=Some("Отпечаток должен состоять из 64 шестнадцатеричных символов. Сверьте его с администратором отдельно от приглашения.".into());
             }
             KeyCode::Enter => match self.input() {
                 Ok(input) => {
@@ -476,7 +567,26 @@ impl EnrollmentPanel {
             _ => return None,
         };
         match result {
-            Ok(stage) => self.stage = stage,
+            Ok(stage) => {
+                self.stage = stage;
+                if matches!(&self.stage, Stage::Done(_)) && self.owned.is_some() {
+                    if let (Some((path, digest)), Ok(input)) = (&self.config, self.input()) {
+                        match crate::tui_reality_register::RegistrationPanel::from_enrollment(
+                            path.clone(),
+                            *digest,
+                            &input.profile,
+                            input.identity,
+                        ) {
+                            Ok(panel) => {
+                                if let Some(owned) = self.owned.take() {
+                                    self.registration = Some(panel.own_material(owned));
+                                }
+                            }
+                            Err(error) => self.error = Some(error.to_string()),
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 self.error = Some(format!(
                     "ОТКАЗ: {error}. При неопределённой записи проверьте файлы перед повтором."
@@ -493,50 +603,129 @@ impl EnrollmentPanel {
 
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
-        if let Some(panel)=&self.registration {return panel.form();}
+        if let Some(browser) = &self.browser {
+            return Some(browser.form());
+        }
+        if let Some(panel) = &self.registration {
+            return panel.form();
+        }
         if !matches!(self.stage, Stage::Input) {
             return None;
         }
         let hints = [
-            "Вставьте theia:// приглашение или абсолютный путь к защищённому URI-файлу.",
-            "Попросите администратора прислать файл допуска отдельно от ссылки. Укажите путь к этому файлу.",
+            "Вставьте ссылку theia:// или нажмите F6, чтобы выбрать присланный файл приглашения.",
+            "Попросите администратора прислать файл допуска отдельно от ссылки. F6 — выбрать этот файл.",
             "Абсолютный путь нового файла профиля.",
             "Абсолютный путь нового хранилища доверия.",
             "Сверьте отпечаток (64 шестнадцатеричных символа) с администратором по другому доверенному каналу.",
             "Только env:/file: ссылка, если в приглашении нет токена.",
         ];
         Some(Form {
-            fields: LABELS.iter().enumerate().filter(|(id, _)| !self.managed_paths() || (if self.focus<4 {*id<2} else {*id>=4})).map(|(id, label)| Field {
-                id, label, hint: hints[id],
-                value: if self.fields[id].is_empty() { String::new() } else { format!("Скрыто · {} байт", self.fields[id].len()) },
-            }).collect(),
+            fields: LABELS
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| {
+                    !self.managed_paths() || (if self.focus < 4 { *id < 2 } else { *id >= 4 })
+                })
+                .map(|(id, label)| Field {
+                    id,
+                    label,
+                    hint: hints[id],
+                    value: if self.fields[id].is_empty() {
+                        String::new()
+                    } else {
+                        format!("Скрыто · {} байт", self.fields[id].len())
+                    },
+                })
+                .collect(),
             selected: self.focus,
-            lead: if self.managed_paths() && self.focus<4 {"1. Получите приглашение и отдельный файл допуска у администратора. Далее — проверка отпечатка (F8 или Tab).".into()} else {"Отпечаток сверяется независимо от приглашения. Ссылка на токен нужна только при его отсутствии в приглашении. Значения скрыты.".into()},
+            lead: if self.managed_paths() && self.focus < 4 {
+                "1. Получите приглашение и отдельный файл допуска у администратора. Далее — проверка отпечатка (F8 или Tab).".into()
+            } else {
+                "Отпечаток сверяется независимо от приглашения. Ссылка на токен нужна только при его отсутствии в приглашении. Значения скрыты.".into()
+            },
             error: self.error.clone().unwrap_or_default(),
         })
     }
 
     pub(crate) fn select_field(&mut self, id: usize) {
-        if let Some(panel)=self.registration.as_mut(){panel.select_field(id);return;}
+        if let Some(browser) = self.browser.as_mut() {
+            browser.select_field(id);
+            return;
+        }
+        if let Some(panel) = self.registration.as_mut() {
+            panel.select_field(id);
+            return;
+        }
         if matches!(self.stage, Stage::Input)
-            && id < LABELS.len() && (!self.managed_paths() || !matches!(id, 2 | 3)) {
+            && id < LABELS.len()
+            && (!self.managed_paths() || !matches!(id, 2 | 3))
+        {
             self.focus = id;
         }
     }
 
     pub(crate) fn guide(&self) -> (usize, usize, &'static str, &'static str) {
-        let total=if self.managed_paths(){4}else{3};
+        let total = if self.managed_paths() { 5 } else { 3 };
+        if self.browser.is_some() {
+            return (
+                1,
+                total,
+                "Выбор локального файла",
+                "↑↓ выбрать · Enter выбрать путь · Esc назад",
+            );
+        }
         if self.registration.is_some() {
-            return (total,total,"Регистрация в TOML","Enter предпросмотр · Y сохранить · Esc назад");
+            return (
+                4,
+                total,
+                "Сохранение профиля",
+                "Enter предпросмотр · y сохранить · Esc отменить",
+            );
         }
         match &self.stage {
-            Stage::Input if self.managed_paths() && self.focus<4 => (1,4,"Приглашение и файл допуска","↑↓ поле · F8 далее · Enter продолжить · Ctrl+U очистить · Esc назад"),
-            Stage::Input if self.managed_paths() => (2,4,"Проверка доверия и токена","↑↓ поле · F8 назад · Enter проверить · Ctrl+U очистить · Esc отменить"),
-            Stage::Input => (1,3,"Приглашение и доверие","↑↓ поле · F8 раздел · Enter проверить · Ctrl+U очистить · Esc назад"),
-            Stage::Loading(_) => (total-1,total,"Проверка приглашения","Идёт локальная проверка"),
-            Stage::Confirm(_) => (total-1,total,"Подтверждение доверия","Y сохранить · N / Esc назад"),
-            Stage::Applying(_) | Stage::Creating(_) => (total,total,"Сохранение","Идёт запись; подключения нет"),
-            Stage::Done(_) => (total,total,"Результат","G зарегистрировать, если доступно · Esc назад"),
+            Stage::Input if self.managed_paths() && self.focus < 4 => (
+                2,
+                5,
+                "REALITY · приглашение и файл допуска",
+                "↑↓ поле · F6 файл · F8 далее · Enter продолжить · Esc назад",
+            ),
+            Stage::Input if self.managed_paths() => (
+                3,
+                5,
+                "Проверка доверия и ключа",
+                "↑↓ поле · F8 назад · Enter проверить · Ctrl+U очистить · Esc отменить",
+            ),
+            Stage::Input => (
+                1,
+                3,
+                "Приглашение и доверие",
+                "↑↓ поле · F8 раздел · Enter проверить · Ctrl+U очистить · Esc назад",
+            ),
+            Stage::Loading(_) => (
+                if self.managed_paths() { 3 } else { total - 1 },
+                total,
+                "Проверка приглашения",
+                "Идёт локальная проверка",
+            ),
+            Stage::Confirm(_) => (
+                if self.managed_paths() { 3 } else { total - 1 },
+                total,
+                "Подтверждение доверия",
+                "Y сохранить · N / Esc назад",
+            ),
+            Stage::Applying(_) | Stage::Creating(_) => (
+                if self.managed_paths() { 4 } else { total },
+                total,
+                "Сохранение",
+                "Идёт запись; подключения нет",
+            ),
+            Stage::Done(_) => (
+                total,
+                total,
+                "Результат",
+                "G зарегистрировать, если доступно · Esc назад",
+            ),
         }
     }
 
@@ -575,8 +764,10 @@ impl EnrollmentPanel {
                 } else {
                     review.body.clone()
                 }
-            },
-            Stage::Applying(_) | Stage::Creating(_) => "Сохранение защищённого профиля; runtime не меняется.".into(),
+            }
+            Stage::Applying(_) | Stage::Creating(_) => {
+                "Сохранение защищённого профиля; runtime не меняется.".into()
+            }
             Stage::Done(body) => {
                 if self.config.is_some() && self.owned.is_some() {
                     format!("{body}\nСледующий шаг: g — зарегистрировать созданный enrollment в сохранённом TOML (отдельный preview/confirm).\n{}",self.error.as_deref().unwrap_or(""))
@@ -688,14 +879,25 @@ mod tests {
         let editor = create_first_client(&cfg, &input, review, 1000).unwrap();
         assert!(editor.selected_reality());
         let bytes = std::fs::read(&cfg).unwrap();
-        let crate::config::Config::Client(doc) = crate::config::parse(std::str::from_utf8(&bytes).unwrap()).unwrap() else {
+        let crate::config::Config::Client(doc) =
+            crate::config::parse(std::str::from_utf8(&bytes).unwrap()).unwrap()
+        else {
             panic!("client expected");
         };
         assert_eq!(doc.client.profiles.len(), 1);
         assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
-        assert_eq!(doc.client.proxy.system_proxy, crate::config::SystemProxy::Off);
+        assert_eq!(
+            doc.client.proxy.system_proxy,
+            crate::config::SystemProxy::Off
+        );
         assert!(!String::from_utf8_lossy(&bytes).contains(uri.as_str()));
-        assert!(crate::tui_staged_material::StagedMaterial::create_for_new_config(&dir.join("second-material"), &cfg).is_err());
+        assert!(
+            crate::tui_staged_material::StagedMaterial::create_for_new_config(
+                &dir.join("second-material"),
+                &cfg
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(&cfg).unwrap(), bytes);
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -44,15 +44,15 @@ pub(crate) enum RecordAction {
 impl RecordAction {
     pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::NewInbound => "Создать inbound (собственный TLS)",
+            Self::NewInbound => "Создать подключение (собственный TLS)",
             Self::NewProfile => "Создать клиентский профиль (собственный TLS)",
             Self::DeleteRecord => "Удалить выбранную запись",
             Self::ActivateProfile => "Выбрать активный профиль",
-            Self::SetGrants => "Заменить список grants",
+            Self::SetGrants => "Изменить список пользователей с доступом",
             Self::SetQuota => "Изменить лимиты соединений",
-            Self::DeleteUser => "Удалить пользователя без grants",
-            Self::EditTls => "Изменить ссылки cert/key",
-            Self::EditTrust => "Изменить CA и ссылку credential",
+            Self::DeleteUser => "Удалить пользователя без прав доступа",
+            Self::EditTls => "Настроить сертификат и закрытый ключ",
+            Self::EditTrust => "Настроить доверие и токен",
         }
     }
 
@@ -74,11 +74,17 @@ impl RecordAction {
                 ("Ссылка на токен (env:/file:)", true),
                 ("Путь XHTTP", false),
             ],
-            Self::SetGrants => &[("Grants (ID через запятую)", false)],
+            Self::SetGrants => &[("ID пользователей через запятую", false)],
             Self::SetQuota => &[("На пользователя", false), ("Всего", false)],
             Self::DeleteUser => &[("ID пользователя", false)],
-            Self::EditTls => &[("cert (file:)", true), ("key (file:)", true)],
-            Self::EditTrust => &[("CA (file:)", true), ("Credential (env:/file:)", true)],
+            Self::EditTls => &[
+                ("Сертификат (file:)", true),
+                ("Закрытый ключ (file:)", true),
+            ],
+            Self::EditTrust => &[
+                ("Доверенный CA (file:)", true),
+                ("Ссылка на токен (env:/file:)", true),
+            ],
             Self::DeleteRecord | Self::ActivateProfile => &[],
         }
     }
@@ -217,7 +223,7 @@ impl Editor {
             input: String::new(),
             editing: false,
             error: None,
-            notice: "Загружено. Изменения не применяются к runtime.",
+            notice: "Настройки открыты. Работающий процесс не изменён.",
         })
     }
 
@@ -225,6 +231,91 @@ impl Editor {
     /// The source's bearer is never written to TOML; the file is protected by
     /// a fresh owner-only directory and private ACL/mode on both platforms.
     /// Caller must explicitly review ID/endpoint/SNI/transport and CA trust.
+    /// First Own-TLS import: create only a real, fully reviewed profile.
+    /// A conflicting destination is never replaced; credentials survive an
+    /// indeterminate publication but are removed after a pre-commit refusal.
+    pub(crate) fn create_first_invitation(
+        path: &Path,
+        invite: &Invitation,
+        ca_ref: &str,
+        public_ref: Option<&str>,
+    ) -> Result<Self, &'static str> {
+        let path = std::path::absolute(path).map_err(|_| "Недопустимый путь настроек.")?;
+        if !crate::bounded_input::explicit_file_path(&path)
+            || !matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            || !path.parent().is_some_and(Path::is_dir)
+        {
+            return Err("Выберите новый файл настроек в существующем каталоге.");
+        }
+        let ca = client_import::checked_ca_ref(Some(ca_ref))
+            .map_err(|_| "Не удалось проверить доверенный сертификат.")?;
+        let mut secret = if let Some(bytes) = invite.token_bytes() {
+            let token = Zeroizing::new(bytes);
+            Some(
+                PrivateBearer::create(&path, &token)
+                    .map_err(|_| "Не удалось сохранить личный ключ.")?,
+            )
+        } else {
+            None
+        };
+        let credential = match secret.as_ref() {
+            Some(saved) => saved
+                .reference()
+                .map_err(|_| "Не удалось создать ссылку на личный ключ.")?,
+            None => public_ref
+                .filter(|r| client_import::valid_explicit_reference(r))
+                .ok_or("Публичному приглашению нужен отдельный ключ (env:ИМЯ).")?
+                .to_owned(),
+        };
+        let profile = invite
+            .to_profile(&credential, ca)
+            .map_err(|_| "Приглашение содержит недопустимые параметры.")?;
+        let candidate = Config::Client(config::ClientDocument {
+            schema_version: 1,
+            management: config::Management {
+                ipc: "auto".into(),
+                log_level: "info".into(),
+            },
+            ui: config::Ui {
+                language: "ru".into(),
+            },
+            client: config::ClientSettings {
+                active_profile: profile.id.clone(),
+                profiles: vec![profile],
+                proxy: config::LocalProxy {
+                    http_listen: "127.0.0.1:7890".into(),
+                    socks5_listen: "127.0.0.1:7891".into(),
+                    system_proxy: config::SystemProxy::Off,
+                },
+            },
+        });
+        candidate
+            .validate()
+            .map_err(|_| "Профиль не прошёл проверку настроек.")?;
+        match config::guarded_create(&path, &candidate) {
+            Ok(()) => {
+                if let Some(secret) = secret.as_mut() {
+                    secret.commit();
+                }
+            }
+            Err(config::WriteFailure::BeforeReplace(_)) => {
+                return Err(
+                    "Файл не создан. Проверьте путь, права и отсутствие существующего файла.",
+                )
+            }
+            Err(config::WriteFailure::AfterReplace(_)) => {
+                if let Some(secret) = secret.as_mut() {
+                    secret.commit();
+                }
+                return Err(
+                    "Создание не подтверждено. Откройте файл заново; не повторяйте импорт вслепую.",
+                );
+            }
+        }
+        Self::load(Role::Client, &path)
+            .map_err(|_| "Файл записан, но открыть его не удалось. Откройте настройки заново.")
+    }
+
     pub fn import_invitation(
         &mut self,
         invite: &Invitation,
@@ -968,7 +1059,7 @@ impl Editor {
             }
             (Config::Server(doc), RecordAction::DeleteRecord) => {
                 if doc.server.inbounds.len() <= 1 {
-                    return Err("Нельзя удалить последний inbound в текущей схеме.");
+                    return Err("Нельзя удалить последнее подключение. Сначала создайте другое.");
                 }
                 if self.selected_record >= doc.server.inbounds.len() {
                     return Err("Inbound missing");
@@ -982,7 +1073,7 @@ impl Editor {
             }
             (Config::Client(doc), RecordAction::DeleteRecord) => {
                 if doc.client.active_profile == selected {
-                    return Err("Сначала явно выберите другой активный профиль.");
+                    return Err("Выберите другой активный профиль (A), затем повторите удаление.");
                 }
                 if self.selected_record >= doc.client.profiles.len() {
                     return Err("Profile missing");
@@ -993,7 +1084,7 @@ impl Editor {
             }
             (Config::Client(doc), RecordAction::ActivateProfile) => {
                 if doc.client.active_profile == selected {
-                    return Err("Профиль уже активен в TOML.");
+                    return Err("Этот профиль уже выбран. Откройте «Подключить / отключить» (V).");
                 }
                 let previous = std::mem::replace(&mut doc.client.active_profile, selected.clone());
                 format!(
@@ -1117,6 +1208,48 @@ impl Editor {
             .map(|inbound| inbound.server_name.as_str())
     }
 
+    /// Display the saved permission, never infer the operating-system state.
+    pub(crate) fn system_proxy_allowed(&self) -> bool {
+        matches!(&self.original, Config::Client(doc)
+            if doc.client.proxy.system_proxy == config::SystemProxy::Manual)
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn review_system_proxy_permission(&self) -> Result<RecordReview, &'static str> {
+        self.require_clean_records()?;
+        if self.write_uncertain {
+            return Err("Откройте настройки заново.");
+        }
+        let mut candidate = self.original.clone();
+        let Config::Client(doc) = &mut candidate else {
+            return Err("Требуется клиентский профиль.");
+        };
+        if doc.client.active_profile != self.selected_record_id() {
+            return Err("Сначала выберите активный профиль.");
+        }
+        doc.client.proxy.system_proxy = config::SystemProxy::Manual;
+        candidate
+            .validate()
+            .map_err(|_| "Настройки клиента не прошли проверку.")?;
+        Ok(RecordReview {
+            source: self.saved_sha256(),
+            selected: self.selected_record_id().to_owned(),
+            candidate,
+            next_selection: self.selected_record,
+            body: "Разрешить управление системным прокси?\n\nTheia сможет менять HTTP(S)-прокси текущего пользователя Windows только после отдельного подтверждения.\nСейчас сохраняется только разрешение в файле настроек. Прокси Windows и соединение не изменятся.\n\ny: сохранить разрешение · n/Esc: отменить".into(),
+        })
+    }
+
+    pub(crate) fn client_proxy_addresses(&self) -> Option<(&str, &str)> {
+        match &self.original {
+            Config::Client(doc) => Some((
+                &doc.client.proxy.http_listen,
+                &doc.client.proxy.socks5_listen,
+            )),
+            _ => None,
+        }
+    }
+
     pub fn selected_record_is_active(&self) -> bool {
         match &self.draft {
             Config::Client(doc) => doc.client.active_profile == self.selected_record_id(),
@@ -1125,7 +1258,9 @@ impl Editor {
     }
 
     pub fn selection_summary(&self) -> String {
-        if self.record_count() == 0 { return "Нет записей".into(); }
+        if self.record_count() == 0 {
+            return "Нет записей".into();
+        }
         if self.selected_reality() {
             return format!(
                 "REALITY {}/{}: {} [защищённое подключение]",
@@ -1296,11 +1431,21 @@ impl Editor {
                 })
                 .unwrap_or_default(),
         };
-        labels.iter().copied().zip(values).enumerate().map(|(index, (label, value))| {
-            let selected = self.selected_field == index;
-            let value = if self.editing && selected { self.input.clone() } else { value };
-            (label, value, selected)
-        }).collect()
+        labels
+            .iter()
+            .copied()
+            .zip(values)
+            .enumerate()
+            .map(|(index, (label, value))| {
+                let selected = self.selected_field == index;
+                let value = if self.editing && selected {
+                    self.input.clone()
+                } else {
+                    value
+                };
+                (label, value, selected)
+            })
+            .collect()
     }
 
     pub fn fields_overview(&self) -> String {
@@ -1383,8 +1528,12 @@ impl Editor {
 
     pub(crate) fn cycle_choice(&mut self, forward: bool) {
         let options = self.choice_options();
-        if !self.editing || options.is_empty() { return; }
-        let index = options.iter().position(|value| *value == self.input.as_str());
+        if !self.editing || options.is_empty() {
+            return;
+        }
+        let index = options
+            .iter()
+            .position(|value| *value == self.input.as_str());
         let next = match index {
             Some(i) if forward => (i + 1) % options.len(),
             Some(i) => (i + options.len() - 1) % options.len(),

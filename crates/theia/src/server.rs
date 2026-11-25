@@ -2950,6 +2950,7 @@ impl<T> Drop for SupervisorTask<T> {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct TuiServerControl {
     expected: [u8; 32],
+    management_endpoint: Option<std::path::PathBuf>,
     ready: Option<tokio::sync::oneshot::Sender<usize>>,
     stop: tokio::sync::oneshot::Receiver<()>,
 }
@@ -2977,6 +2978,7 @@ pub(crate) async fn run_tui_file(
     expected: [u8; 32],
     ready: tokio::sync::oneshot::Sender<usize>,
     stop: tokio::sync::oneshot::Receiver<()>,
+    management_endpoint: Option<std::path::PathBuf>,
 ) -> Result<(), ServerError> {
     let bytes = saved_server_bytes(path, expected)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| ServerError::Config)?;
@@ -2992,6 +2994,7 @@ pub(crate) async fn run_tui_file(
         path,
         Some(TuiServerControl {
             expected,
+            management_endpoint,
             ready: Some(ready),
             stop,
         }),
@@ -3056,16 +3059,28 @@ async fn run_supervised_file(
     // Never expose a new administrative TCP port or loosen Named Pipe DACL.
     let (requests, mut queue) =
         tokio::sync::mpsc::channel::<crate::runtime_generation::RestartRequest>(1);
+    let inbounds = runtime.snapshot().map_err(|_| ServerError::Io)?.inbounds;
+    let owned_endpoint = control
+        .as_ref()
+        .and_then(|c| c.management_endpoint.as_deref());
+    // A TUI-started server binds its own private endpoint, never an unrelated
+    // headless endpoint from process environment. Headless behavior is unchanged.
     #[cfg(target_os = "linux")]
-    let management = crate::management::StatusServer::from_environment(
-        runtime.snapshot().map_err(|_| ServerError::Io)?.inbounds,
-    )
+    let management = match owned_endpoint {
+        Some(directory) => crate::management::StatusServer::bind_in(directory, inbounds).map(Some),
+        None => crate::management::StatusServer::from_environment(inbounds),
+    }
     .map_err(|_| ServerError::Io)?
     .map(|service| service.with_supervisor(runtime.clone(), requests.clone()));
     #[cfg(target_os = "windows")]
-    let management = crate::windows_control::WindowsServer::from_environment(
-        runtime.snapshot().map_err(|_| ServerError::Io)?.inbounds,
-    )
+    let management = match owned_endpoint {
+        Some(endpoint) => crate::windows_control::WindowsServer::bind(
+            endpoint.to_str().ok_or(ServerError::Io)?,
+            inbounds,
+        )
+        .map(Some),
+        None => crate::windows_control::WindowsServer::from_environment(inbounds),
+    }
     .map_err(|_| ServerError::Io)?
     .map(|service| service.with_supervisor(runtime.clone(), requests.clone()));
 
@@ -3813,7 +3828,7 @@ mod hardening_tests {
         let (bad_ready, _) = tokio::sync::oneshot::channel();
         let (_bad_stop, bad_rx) = tokio::sync::oneshot::channel();
         assert!(matches!(
-            run_tui_file(&path, [0; 32], bad_ready, bad_rx).await,
+            run_tui_file(&path, [0; 32], bad_ready, bad_rx, None).await,
             Err(ServerError::Config)
         ));
         drop(tcp);
@@ -3821,8 +3836,20 @@ mod hardening_tests {
         let (ready, ready_rx) = tokio::sync::oneshot::channel();
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
         let run_path = path.clone();
-        let task =
-            tokio::spawn(async move { run_tui_file(&run_path, expected, ready, stop_rx).await });
+        #[cfg(target_os = "linux")]
+        let endpoint = {
+            use std::os::unix::fs::DirBuilderExt;
+            let endpoint = directory.join("ipc");
+            fs::DirBuilder::new().mode(0o700).create(&endpoint).unwrap();
+            endpoint
+        };
+        #[cfg(target_os = "windows")]
+        let endpoint =
+            std::path::PathBuf::from(crate::tui_editor::generated_id("tui-ipc").unwrap());
+        let run_endpoint = endpoint.clone();
+        let task = tokio::spawn(async move {
+            run_tui_file(&run_path, expected, ready, stop_rx, Some(run_endpoint)).await
+        });
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx)
                 .await
@@ -3832,6 +3859,14 @@ mod hardening_tests {
         );
         assert!(std::net::TcpListener::bind(tcp_addr).is_err());
         assert!(std::net::UdpSocket::bind(udp_addr).is_err());
+        use crate::management::{StatusCommand, StatusReply};
+        let status = crate::tui_runtime::query_endpoint(&endpoint, StatusCommand::Status)
+            .await
+            .unwrap();
+        assert!(matches!(
+            status,
+            StatusReply::RunningRevision { inbounds: 1, .. }
+        ));
         stop.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(30), task)
             .await
@@ -3840,6 +3875,11 @@ mod hardening_tests {
             .unwrap();
         assert!(std::net::TcpListener::bind(tcp_addr).is_ok());
         assert!(std::net::UdpSocket::bind(udp_addr).is_ok());
+        assert!(
+            crate::tui_runtime::query_endpoint(&endpoint, StatusCommand::Status)
+                .await
+                .is_err()
+        );
         assert_eq!(fs::read(&path).unwrap(), contents.as_bytes());
     }
 

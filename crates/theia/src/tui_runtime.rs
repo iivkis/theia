@@ -11,6 +11,31 @@ use std::{
     sync::mpsc::{self, Receiver, TryRecvError},
 };
 
+/// Use the explicitly selected endpoint on both platforms. Do not consult
+/// environment again after the operator has selected an owned runtime.
+pub(crate) async fn query_endpoint(
+    endpoint: &std::path::Path,
+    command: StatusCommand,
+) -> Result<StatusReply, ManagementError> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::management::query_in(endpoint, command).await
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_control::query_pipe(
+            endpoint.to_str().ok_or(ManagementError::UnsafeEndpoint)?,
+            command,
+        )
+        .await
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (endpoint, command);
+        Err(ManagementError::Unsupported)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Checking,
@@ -128,7 +153,7 @@ impl RuntimePanel {
         Self::open_restart_at(endpoint)
     }
 
-    fn open_restart_at(directory: Option<PathBuf>) -> Self {
+    pub(crate) fn open_restart_at(directory: Option<PathBuf>) -> Self {
         let mut panel = Self {
             phase: Phase::RestartChecking,
             directory,
@@ -145,7 +170,7 @@ impl RuntimePanel {
         panel
     }
 
-    fn open_at(
+    pub(crate) fn open_at(
         directory: Option<PathBuf>,
         saved_sha256: Option<[u8; 32]>,
         start_with_review: bool,
@@ -180,34 +205,11 @@ impl RuntimePanel {
         // One thread per explicitly requested operation. Network and OS I/O
         // cannot freeze the UI; the underlying IPC still has its 2s deadline.
         let _worker = std::thread::spawn(move || {
-            let result = {
-                #[cfg(target_os = "linux")]
-                {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|_| ManagementError::Io)
-                        .and_then(|runtime| {
-                            runtime.block_on(crate::management::query_in(&directory, command))
-                        })
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = directory;
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|_| ManagementError::Io)
-                        .and_then(|runtime| {
-                            runtime.block_on(crate::management::query_environment(command))
-                        })
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-                {
-                    let _ = (directory, command);
-                    Err(ManagementError::Unsupported)
-                }
-            };
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| ManagementError::Io)
+                .and_then(|runtime| runtime.block_on(query_endpoint(&directory, command)));
             let _ = sender.send(result);
         });
     }
@@ -569,37 +571,96 @@ impl RuntimePanel {
         }
     }
 
-    pub(crate) fn apply_observation(&self) -> Option<([u8;32], &'static str, u64)> {
-        let (kind,revision)=match self.phase {
-            Phase::Applied{revision}=>("права доступа",revision),
-            Phase::QuotaApplied{revision}=>("лимиты",revision),
-            Phase::CutoverApplied{revision}=>("структура",revision),
-            _=>return None,
+    pub(crate) fn apply_observation(&self) -> Option<([u8; 32], &'static str, u64)> {
+        let (kind, revision) = match self.phase {
+            Phase::Applied { revision } => ("права доступа", revision),
+            Phase::QuotaApplied { revision } => ("лимиты", revision),
+            Phase::CutoverApplied { revision } => ("структура", revision),
+            _ => return None,
         };
-        Some((self.saved_sha256?,kind,revision))
+        Some((self.saved_sha256?, kind, revision))
     }
 
     pub(crate) fn invalidates_apply_observation(&self) -> bool {
-        matches!(self.phase,Phase::RollbackApplying|Phase::RollbackApplied{..}|Phase::TlsRollbackApplying|Phase::TlsRollbackApplied{..}|Phase::RestartRollbackApplying|Phase::RestartRollbackApplied{..}|Phase::Indeterminate|Phase::Unavailable|Phase::LegacyStatus)
+        matches!(
+            self.phase,
+            Phase::RollbackApplying
+                | Phase::RollbackApplied { .. }
+                | Phase::TlsRollbackApplying
+                | Phase::TlsRollbackApplied { .. }
+                | Phase::RestartRollbackApplying
+                | Phase::RestartRollbackApplied { .. }
+                | Phase::Indeterminate
+                | Phase::Unavailable
+                | Phase::LegacyStatus
+        )
     }
 
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
         let mut items = Vec::new();
-        if matches!(self.phase, Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. }) && self.saved_sha256.is_some() {
-            if matches!(self.phase, Phase::Viewing { .. }) { items.push(ActionItem { key:'a', label:"Применить права доступа" }); }
+        if matches!(
+            self.phase,
+            Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. }
+        ) && self.saved_sha256.is_some()
+        {
+            if matches!(self.phase, Phase::Viewing { .. }) {
+                items.push(ActionItem {
+                    key: 'a',
+                    label: "Применить права доступа",
+                });
+            }
             if matches!(self.phase, Phase::Viewing { .. } | Phase::Applied { .. }) {
-                items.push(ActionItem { key:'b', label:"Откатить права доступа" });
-                items.push(ActionItem { key:'c', label:"Применить лимиты" });
+                items.push(ActionItem {
+                    key: 'b',
+                    label: "Откатить права доступа",
+                });
+                items.push(ActionItem {
+                    key: 'c',
+                    label: "Применить лимиты",
+                });
             }
             items.extend([
-                ActionItem { key:'s', label:"Применить структуру сервера" },
-                ActionItem { key:'z', label:"Откатить структуру" },
-                ActionItem { key:'t', label:"Откатить TLS" },
+                ActionItem {
+                    key: 's',
+                    label: "Применить структуру сервера",
+                },
+                ActionItem {
+                    key: 'z',
+                    label: "Откатить структуру",
+                },
+                ActionItem {
+                    key: 't',
+                    label: "Откатить TLS",
+                },
             ]);
         }
-        if !matches!(self.phase, Phase::Checking | Phase::Applying | Phase::Confirming { .. } | Phase::RollbackChecking | Phase::RollbackConfirming { .. } | Phase::RollbackApplying | Phase::QuotaChecking { .. } | Phase::QuotaConfirming { .. } | Phase::QuotaApplying | Phase::CutoverChecking { .. } | Phase::CutoverConfirming { .. } | Phase::CutoverApplying | Phase::TlsRollbackChecking | Phase::TlsRollbackConfirming { .. } | Phase::TlsRollbackApplying | Phase::RestartRollbackChecking | Phase::RestartRollbackConfirming { .. } | Phase::RestartRollbackApplying | Phase::RestartChecking) {
-            items.push(ActionItem { key:'r', label:"Обновить состояние" });
+        if !matches!(
+            self.phase,
+            Phase::Checking
+                | Phase::Applying
+                | Phase::Confirming { .. }
+                | Phase::RollbackChecking
+                | Phase::RollbackConfirming { .. }
+                | Phase::RollbackApplying
+                | Phase::QuotaChecking { .. }
+                | Phase::QuotaConfirming { .. }
+                | Phase::QuotaApplying
+                | Phase::CutoverChecking { .. }
+                | Phase::CutoverConfirming { .. }
+                | Phase::CutoverApplying
+                | Phase::TlsRollbackChecking
+                | Phase::TlsRollbackConfirming { .. }
+                | Phase::TlsRollbackApplying
+                | Phase::RestartRollbackChecking
+                | Phase::RestartRollbackConfirming { .. }
+                | Phase::RestartRollbackApplying
+                | Phase::RestartChecking
+        ) {
+            items.push(ActionItem {
+                key: 'r',
+                label: "Обновить состояние",
+            });
         }
         items
     }
@@ -680,7 +741,7 @@ impl RuntimePanel {
             ),
             Phase::Rejected => "Сервер отклонил кандидат или ревизию. Авторизация не применена.\nПроверьте, что TOML не менялся с момента сохранения, сервер использует тот же файл, а TLS PEM/политика неизменны.\nr: запросить фактический статус | Esc: закрыть".into(),
             Phase::Indeterminate => "Ответ IPC потерян или повреждён. Применение МОГЛО произойти.\nПовторять Apply наугад нельзя. Сначала проверьте текущую revision по r: статус, затем перепроверьте TOML.\nEsc: закрыть".into(),
-            Phase::Unavailable => "Нет проверенного локального IPC с revision (Linux: THEIA_CONTROL_DIR; Windows: THEIA_CONTROL_PIPE).\nНичего не применено через эту панель.\nr: повторить проверку | Esc: закрыть".into(),
+            Phase::Unavailable => "Связь с сервером не подтверждена. Запустите сервер в TUI и дождитесь готовности. Для внешнего сервиса нужен настроенный локальный IPC (Linux: THEIA_CONTROL_DIR; Windows: THEIA_CONTROL_PIPE).\nНичего не применено.\nr: повторить проверку | Esc: закрыть".into(),
         }
     }
 }
