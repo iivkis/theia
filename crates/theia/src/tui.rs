@@ -289,6 +289,10 @@ enum RecordFlow {
         focus: usize,
     },
     Confirm(Box<RecordReview>),
+    GrantPicker {
+        selected: Vec<String>,
+        focus: usize,
+    },
 }
 
 impl RecordFlow {
@@ -305,6 +309,22 @@ impl RecordFlow {
                 error: String::new(),
             });
         }
+        if let Self::GrantPicker { selected, focus } = self {
+            let editor = editor?;
+            let users = editor.workspace_users();
+            let fields = users.iter().enumerate().map(|(id, (name, disabled, _))| Field {
+                id,
+                label: if selected.contains(name) { "[x] Доступ разрешён" } else { "[ ] Нет доступа" },
+                value: if *disabled { format!("{name} (отключён)") } else { name.clone() },
+                hint: "Пробел меняет право на это подключение. Отключённый пользователь не включается.",
+            }).collect();
+            return Some(Form {
+                fields,
+                selected: *focus,
+                lead: format!("Подключение: {} · выбрано: {}. Отметьте пользователей. Enter проверит изменения, Esc отменит.", editor.selected_record_id(), selected.len()),
+                error: editor.error.clone().unwrap_or_default(),
+            });
+        }
         let Self::Input { action, fields, focus } = self else { return None; };
         Some(Form {
             fields: action.fields().iter().zip(fields).enumerate().map(|(id, ((label, hidden), value))| Field {
@@ -319,6 +339,7 @@ impl RecordFlow {
     fn select_field(&mut self, id: usize) {
         match self {
             Self::ChooseMode(_, selected) if id < 2 => *selected = id,
+            Self::GrantPicker { focus, .. } => *focus = id,
             Self::Input { fields, focus, .. } if id < fields.len() => *focus = id,
             _ => {}
         }
@@ -327,6 +348,7 @@ impl RecordFlow {
         match self {
             Self::ChooseMode(role, _) => format!("ВЫБЕРИТЕ РЕЖИМ\n\n  1   Own-TLS\n      {}\n\n  2   SmartTheia REALITY\n      {}\n\nEsc: назад. Сохранение не запускает runtime.", if *role == Role::Server {"Свой сертификат и ключ"} else {"Ручные параметры TLS"}, if *role == Role::Server {"Мастер проверки референсов, без своего сертификата"} else {"Импорт с независимым подтверждением доверия"}),
             Self::Confirm(review) => review.body().to_owned(),
+            Self::GrantPicker { .. } => "Выберите пользователей, которым разрешено это подключение. Изменения сначала проверяются и подтверждаются.".into(),
             Self::Input {
                 action,
                 fields,
@@ -373,12 +395,12 @@ fn pages(role: Role) -> &'static [&'static str] {
 
 fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
     let entries: &[(char, &str)] = match (role, page) {
-        (Role::Server, 0) => &[('s',"Запустить / остановить сервер"),('W',"Создать REALITY"),('N',"Новое подключение"),('v',"Проверить / применить изменения"),('u',"Добавить пользователя и приглашение"),('b',"Выдать доступ отключённому"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
-        (Role::Server, 1) => &[('N',"Создать подключение"),('W',"Мастер REALITY"),('V',"Состояние REALITY"),('G',"Настроить доступ"),('Q',"Лимиты"),('E',"Сертификат TLS"),('D',"Удалить подключение")],
-        (Role::Server, 2) => &[('u',"Добавить пользователя"),('x',"Отключить"),('b',"Восстановить доступ"),('t',"Обновить токен"),('G',"Назначить доступ"),('U',"Удалить пользователя")],
-        (Role::Server, 3) => &[('u',"Создать пользователя и приглашение"),('b',"Выдать приглашение отключённому"),('t',"Обновить приглашение"),('l',"Публичная ссылка")],
+        (Role::Server, 0) => &[('N',"Создать подключение"),('u',"Добавить пользователя"),('b',"Выдать доступ"),('G',"Выбрать пользователей"),('s',"Запуск / остановка"),('S',"Сохранить файл"),('a',"Применить к серверу"),('v',"Проверить состояние"),('o',"Открыть другой файл")],
+        (Role::Server, 1) => &[('N',"Создать подключение"),('G',"Кому разрешён доступ"),('V',"Состояние REALITY"),('E',"Сертификат Own-TLS"),('D',"Удалить подключение")],
+        (Role::Server, 2) => &[('u',"Добавить пользователя"),('G',"Выбрать права доступа"),('b',"Восстановить доступ"),('x',"Отключить пользователя"),('t',"Заменить приглашение"),('U',"Удалить пользователя")],
+        (Role::Server, 3) => &[('u',"Новый пользователь и ссылка"),('b',"Восстановить доступ"),('t',"Заменить приглашение"),('l',"Ссылка без секрета")],
         (_, 4) => &[('4',"Открыть монитор трафика")],
-        (Role::Server, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('v',"Статус и применение изменений"),('R',"Проверить готовность перезапуска"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
+        (Role::Server, 5) => &[('S',"Сохранить файл"),('a',"Применить к серверу"),('v',"Состояние сервера"),('Q',"Лимиты подключений"),('o',"Открыть файл"),('R',"Проверить перезапуск"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
         (Role::Server, 6) => &[('p',"Сетевая диагностика"),('V',"Состояние REALITY")],
         (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
         (Role::Client, 1) => &[('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт"),('E',"Доверие Own-TLS"),('D',"Удалить профиль")],
@@ -396,16 +418,19 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
     if editor.write_uncertain() { return ('o', "Запись не подтверждена. Проверьте файл и откройте его заново (F3)."); }
     if editor.dirty() { return ('S', "Сохраните изменения. Работающий процесс не изменится автоматически."); }
     if editor.role() == Role::Server {
-        if editor.record_count() == 0 { return ('W', "Создайте первое подключение."); }
+        if editor.record_count() == 0 { return ('N', "Создайте первое подключение."); }
         let users = editor.workspace_users();
         if !users.iter().any(|(_, disabled, granted)| !*disabled && *granted) {
             if users.iter().any(|(_, disabled, granted)| *disabled && *granted) {
                 return ('b', "Выдайте приглашение первому пользователю: сейчас его доступ отключён.");
             }
+            if users.iter().any(|(_, disabled, granted)| !*disabled && !*granted) {
+                return ('G', "Разрешите доступ существующему пользователю или создайте нового.");
+            }
             return ('u', "Создайте пользователя и получите его личное приглашение.");
         }
         if !owned_running { return ('s', "Запустите сервер, если он ещё не работает как внешний сервис."); }
-        ('v', "Проверьте, применены ли сохранённые права доступа. Передайте приглашение клиенту безопасным способом.")
+        ('v', "Проверьте состояние работающего сервера. Если файл изменился, примените его отдельно.")
     } else if editor.record_count() == 0 {
         ('i', "Получите приглашение у администратора и импортируйте его.")
     } else if owned_running {
@@ -1073,6 +1098,10 @@ impl Interaction {
             if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
                 let start = record_start(editor, records);
                 editor.workspace_select(start + usize::from(event.row - records.y - 1));
+                self.workspace_user = 0;
+            }
+            if self.workspace_page == 0 {
+                self.workspace_action = self.recommended_action(role);
             }
             return;
         }
@@ -1470,6 +1499,21 @@ impl Interaction {
                 }
                 if configured && self.workspace_visible() {
                     self.workspace_page = self.workspace_page.min(pages(role).len() - 1);
+                    // A connection is the scope of user rights and invitations. The
+                    // same shortcut works in every server workspace, even when
+                    // the sidebar is hidden on a compact terminal.
+                    if role == Role::Server && key.modifiers.is_empty()
+                        && matches!(key.code, KeyCode::Char('j' | 'k'))
+                    {
+                        if let Some(editor) = self.editor.as_mut() {
+                            editor.select_record(key.code == KeyCode::Char('j'));
+                        }
+                        self.workspace_user = 0;
+                        if self.workspace_page == 0 {
+                            self.workspace_action = self.recommended_action(role);
+                        }
+                        return false;
+                    }
                     if key.code == KeyCode::F(7) && self.workspace_page == 1 {
                         self.value_preview = true;
                         return false;
@@ -1549,6 +1593,7 @@ impl Interaction {
                                 } else { None };
                                 self.workspace_focus = WorkspaceFocus::Fields;
                                 let command = match ch {
+                                    'a' if role == Role::Server => KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
                                     '4' => KeyEvent::new(KeyCode::F(4),KeyModifiers::NONE),
                                     's' if role == Role::Server => KeyEvent::new(KeyCode::F(5),KeyModifiers::NONE),
                                     'o' => KeyEvent::new(KeyCode::F(3),KeyModifiers::NONE),
@@ -1558,6 +1603,11 @@ impl Interaction {
                                 let result = self.update(model, command);
                                 if let Some(id) = selected {
                                     if ch == 'x' { if let Some(DisableFlow::Input(value)) = self.revocation.as_mut() { *value = id.clone(); } }
+                                    if ch == 'U' {
+                                        if let Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) = self.records.as_mut() {
+                                            if let Some(value) = fields.first_mut() { *value = id.clone(); }
+                                        }
+                                    }
                                     if matches!(ch, 'b' | 't') { if let Some(IssueFlow::Input(value)) = self.issuance.as_mut() { *value = id; } }
                                 }
                                 return result;
@@ -1574,6 +1624,16 @@ impl Interaction {
                         if key.code == KeyCode::BackTab && index==0 {
                             self.workspace_focus=WorkspaceFocus::Navigation; return false;
                         }
+                    }
+                    if role == Role::Server && self.workspace_page == 0
+                        && self.workspace_focus == WorkspaceFocus::Fields
+                        && key.modifiers.is_empty()
+                        && matches!(key.code, KeyCode::Enter | KeyCode::Up | KeyCode::Down)
+                    {
+                        self.workspace_action = self.recommended_action(role);
+                        self.workspace_focus = WorkspaceFocus::Actions;
+                        // Open the reviewed workflow, not its confirmation.
+                        return self.update(model, key);
                     }
                     if self.workspace_page != 1 && matches!(key.code, KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab) {
                         if self.workspace_page==0 && self.workspace_focus==WorkspaceFocus::Fields {self.workspace_action=self.recommended_action(role);}
@@ -1678,6 +1738,45 @@ impl Interaction {
                     KeyCode::Esc => {}
                     _ => self.records = Some(RecordFlow::ChooseMode(role, selected)),
                 },
+                RecordFlow::GrantPicker { mut selected, mut focus } => {
+                    let users = editor.workspace_users();
+                    focus = focus.min(users.len().saturating_sub(1));
+                    match key.code {
+                        KeyCode::Esc => { editor.error = None; return false; }
+                        KeyCode::Up | KeyCode::BackTab if !users.is_empty() => {
+                            focus = (focus + users.len() - 1) % users.len();
+                        }
+                        KeyCode::Down | KeyCode::Tab if !users.is_empty() => {
+                            focus = (focus + 1) % users.len();
+                        }
+                        KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                            if let Some((id, _, _)) = users.get(focus) {
+                                if let Some(i) = selected.iter().position(|value| value == id) {
+                                    selected.remove(i);
+                                } else {
+                                    selected.push(id.clone());
+                                }
+                                editor.error = None;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if selected.is_empty() {
+                                editor.error = Some("Выберите хотя бы одного пользователя. Для полного запрета доступа отключите пользователя.".into());
+                            } else {
+                                match editor.review_record(RecordAction::SetGrants, &[selected.join(",")]) {
+                                    Ok(review) => {
+                                        editor.error = None;
+                                        self.records = Some(RecordFlow::Confirm(Box::new(review)));
+                                        return false;
+                                    }
+                                    Err(message) => editor.error = Some(message.into()),
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.records = Some(RecordFlow::GrantPicker { selected, focus });
+                }
                 RecordFlow::Confirm(review) => match key.code {
                     KeyCode::Char('y') if key.modifiers.is_empty() => {
                         match editor.stage_record(*review) {
@@ -2378,6 +2477,16 @@ impl Interaction {
             };
             if let Some(action) = record_action {
                 match editor.record_fields(action) {
+                    Ok(_) if matches!(action, RecordAction::SetGrants) => {
+                        editor.error = None;
+                        let users = editor.workspace_users();
+                        let selected = users.iter().filter(|(_, _, granted)| *granted)
+                            .map(|(id, _, _)| id.clone()).collect();
+                        let focus = if self.workspace_page == 2 {
+                            self.workspace_user.min(users.len().saturating_sub(1))
+                        } else { 0 };
+                        self.records = Some(RecordFlow::GrantPicker { selected, focus });
+                    }
                     Ok(fields) if fields.is_empty() => {
                         match editor.review_record(action, &fields) {
                             Ok(review) => {
@@ -3073,6 +3182,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         if form.is_some() {
             let guide = if matches!(flow, RecordFlow::ChooseMode(..)) {
                 (1, 2, "Выбор защиты", "↑↓ выбрать · Enter продолжить · Esc назад")
+            } else if matches!(flow, RecordFlow::GrantPicker { .. }) {
+                (1, 2, "Выбор пользователей", "↑↓ выбрать · Space изменить · Enter проверить · Esc отменить")
             } else {
                 (1, 2, "Параметры", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад")
             };
@@ -3169,7 +3280,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 "↑↓ выбрать · Enter продолжить · F2 все действия · Esc назад"
             }
             Screen::Server => {
-                "Tab / F6 Фокус · Alt+←/→ Раздел · F7 Значение · F3 Файл · F2 Меню · F5 Сервер · Ctrl+S Сохранить"
+                "↑↓ выбор · Enter открыть · Tab / F6 фокус · Alt+←/→ раздел · j/k подключение · F2 все команды · Ctrl+S сохранить"
             }
             Screen::Client => {
                 "Tab / F6 Фокус · Alt+←/→ Раздел · F7 Значение · F3 Файл · F2 Меню · Ctrl+S Сохранить"
@@ -3595,6 +3706,16 @@ fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool)
 
 fn page_layout(area: Rect, role: Role, page: usize) -> Option<[Rect; 2]> {
     let count = page_actions(role, page).len();
+    if role == Role::Server && page == 0 && area.height >= 10 {
+        // Keep the next action visible without a separate focus screen.
+        if area.width >= 90 {
+            let split = Layout::horizontal([Constraint::Min(43), Constraint::Length(43)]).split(area);
+            return Some([split[0], split[1]]);
+        }
+        let height = (count as u16 + 2).min(area.height.saturating_sub(6)).max(4);
+        let split = Layout::vertical([Constraint::Min(6), Constraint::Length(height)]).split(area);
+        return Some([split[0], split[1]]);
+    }
     if area.height < 14 || count == 0 { return None; }
     if area.width >= 120 {
         let split = Layout::horizontal([Constraint::Min(50), Constraint::Length(43)]).split(area);
@@ -3613,7 +3734,11 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
     let page = ui.map_or(0, |u| u.workspace_page.min(6));
     let items = page_actions(role, page);
     let focus = ui.map_or(WorkspaceFocus::Fields, |u| u.workspace_focus);
-    let selected = ui.map_or(0, |u| u.workspace_action);
+    let selected = ui.map_or(0, |u| {
+        if role == Role::Server && page == 0 && focus == WorkspaceFocus::Fields {
+            u.recommended_action(role)
+        } else { u.workspace_action }
+    });
     if compact && focus==WorkspaceFocus::Navigation {
         let rows=pages(role).iter().enumerate().map(|(i,label)|ListItem::new(format!("{} {label}",if i==page{"›"}else{" "})).style(Style::default().fg(if i==page{ACCENT}else{TEXT}).bg(if i==page{FOCUS}else{SURFACE})));
         frame.render_widget(List::new(rows.collect::<Vec<_>>()).block(tui_widgets::section("Разделы · ↑↓ Enter",true)),area);
@@ -3629,6 +3754,24 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         let status=if editor.write_uncertain(){"Запись не подтверждена"}else if editor.dirty(){"Есть несохранённые изменения"}else{"Файл сохранён"};
         let (next_key, help) = recommended_step(editor, ui.is_some_and(|u| u.owned_running(role)));
         let next_label = items.iter().find(|item| item.key == next_key).map_or("Открыть файл (F3)", |item| item.label);
+        if role == Role::Server {
+            let allowed = users.iter().filter(|(_, disabled, granted)| !*disabled && *granted).count();
+            let selection = if editor.record_count() == 0 { "Подключений пока нет".to_owned() }
+                else { format!("{} · {} из {} пользователей имеют доступ", editor.selected_record_id(), allowed, users.len()) };
+            let color = if editor.write_uncertain() { ERROR } else if editor.dirty() { WARNING } else { TEXT };
+            let mut lines = vec![
+                Line::styled(selection, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Line::styled(status, Style::default().fg(color)),
+                Line::raw(format!("Сервер: {local}")),
+                Line::styled(format!("Далее: {next_label}"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            ];
+            if content.height >= 9 {
+                lines.push(Line::raw(""));
+                lines.push(Line::raw(help));
+                lines.push(Line::raw("Сохранение файла не применяет изменения к серверу."));
+            }
+            frame.render_widget(Paragraph::new(lines).block(tui_widgets::section("Настройка сервера", true)).wrap(Wrap { trim: true }), content);
+        } else {
         let lines=vec![Line::styled(format!("{records}: {}",editor.record_count()),Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
             Line::raw(if role==Role::Server{format!("Пользователи в файле: {}",users.len())}else{editor.selection_summary()}),
             Line::raw(format!("Конфигурация: {status}")),Line::raw(format!("Процесс: {local}")),
@@ -3636,6 +3779,7 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
             Line::styled(next_label,Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
             Line::raw("Tab — к действиям, Enter — открыть. Сохранение не запускает процесс.")];
         frame.render_widget(Paragraph::new(lines).block(tui_widgets::section(title,true)).wrap(Wrap{trim:true}),content);
+        }
     } else if page == 1 {
         draw_editor(frame, content, editor);
     } else if role == Role::Server && page == 2 {
@@ -3649,7 +3793,7 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         });
         frame.render_widget(Table::new(rows,[Constraint::Percentage(50),Constraint::Percentage(20),Constraint::Percentage(30)])
             .header(Row::new(["Пользователь","Доступ","В файле"]).style(Style::default().fg(MUTED)))
-            .block(tui_widgets::section("Пользователи выбранного подключения", focus == WorkspaceFocus::Users)),content);
+            .block(tui_widgets::section(&format!("Доступ к: {}", editor.selected_record_id()), focus == WorkspaceFocus::Users)),content);
         if users.is_empty() && content.height > 3 {
             frame.render_widget(Paragraph::new("Нет пользователей. Добавьте первого через действия."), Rect::new(content.x+1,content.y+2,content.width.saturating_sub(2),1));
         }
@@ -3662,7 +3806,12 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
             (_,5) => "F3 — открыть файл; Ctrl+S — сохранить. Применение к работающему процессу выполняется отдельно.",
             _ => "Проверки состояния и диагностика. Сетевые операции требуют отдельного согласия.",
         };
-        panel(frame, content, pages(role)[page], description, true);
+        if role == Role::Server && page == 3 {
+            let body = format!("Подключение: {}\n\n{}\n\nСуществующий токен не восстанавливается. Замена приглашения создаёт новый токен; примените изменение отдельно.", editor.selected_record_id(), description);
+            panel(frame, content, pages(role)[page], &body, true);
+        } else {
+            panel(frame, content, pages(role)[page], description, true);
+        }
     }
     if controls.height > 0 {
         Actions { items: &items, selected }.render(frame, controls);
@@ -3727,7 +3876,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
             })
             .collect();
         let title = if role == Role::Server {
-            " Подключения · ↑↓ "
+            " Подключения · j/k "
         } else {
             " Профили · ↑↓ "
         };
@@ -4219,6 +4368,48 @@ mod tests {
         let (rows, _) = visual_rows("one two three four", 5);
         assert!(rows.len() >= 4);
         assert!(rows.iter().all(|row| row.width() <= 5));
+    }
+
+    #[test]
+    fn server_grant_picker_is_explicit_and_cancel_is_read_only() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("grant-picker").unwrap());
+        let original = server_issuance_fixture();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.update(&mut model, press(KeyCode::Char('G')));
+        assert!(matches!(&ui.records, Some(RecordFlow::GrantPicker { selected, .. }) if selected == &vec!["device-a".to_owned()]));
+        let screen = rendered_interaction(80, 24, &model, &ui);
+        assert!(screen.contains("device-a"));
+        ui.update(&mut model, press(KeyCode::Char(' ')));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(&ui.records, Some(RecordFlow::GrantPicker { selected, .. }) if selected.is_empty()));
+        ui.update(&mut model, press(KeyCode::Char(' ')));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(&ui.records, Some(RecordFlow::Confirm(_))));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        assert!(!ui.server_process.running());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn server_overview_opens_recommended_workflow_without_starting() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("server-overview").unwrap());
+        let original = server_issuance_fixture();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.select_workspace_page(Role::Server, 0);
+        ui.workspace_focus = WorkspaceFocus::Fields;
+        let screen = rendered_interaction(80, 24, &model, &ui);
+        assert!(screen.contains("Запуск / остановка"));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.show_server_process);
+        assert!(!ui.server_process.running());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
