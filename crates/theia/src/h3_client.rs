@@ -11,7 +11,7 @@ use http::{header, HeaderValue, Request, StatusCode, Uri};
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     task::JoinHandle,
     time::timeout,
 };
@@ -810,9 +810,10 @@ impl H3Tunnel {
         let activity = crate::relay_liveness::Activity::new();
         let (upload_done, upload_finished) = tokio::sync::oneshot::channel();
         let upload = async {
-            let mut buffer = [0; 4096];
+            let mut buffer = [0; crate::relay_batch::MAX_BATCH];
+            let mut batch = crate::relay_batch::ReadyBatch::default();
             loop {
-                let n = read.read(&mut buffer).await.map_err(|_| ClientError::Io)?;
+                let n = batch.read(&mut read, &mut buffer).await.map_err(|_| ClientError::Io)?;
                 let frame = if n == 0 {
                     Frame::Fin
                 } else {
