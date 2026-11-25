@@ -1108,6 +1108,42 @@ impl ProvisionPanel {
         None
     }
 
+    pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        let wizard = self.wizard.as_ref()?;
+        if wizard.registration.is_some() || !matches!(wizard.stage, WizardStage::Input) {
+            return None;
+        }
+        let first = wizard.source.is_none();
+        let labels = [
+            ("ID подключения", "Уникальное имя подключения, создаётся автоматически."),
+            ("Порт TCP/UDP", "443 по умолчанию. Можно указать конкретный адрес:порт."),
+            ("Адрес сервера для клиентов", "Публичный домен или IP без порта. Не домен референса."),
+            ("Собственные IP сервера", "Все адреса сервера, включая публичный/NAT, через запятую."),
+            ("Домены референсов", "До трёх доменов или домен=IP, через запятую."),
+            (if first { "ID первого пользователя" } else { "Пользователи с доступом" },
+             if first { "Пользователь отключён до явного выпуска токена." } else { "ID через запятую; F6 выбирает одного из активных пользователей." }),
+            ("Режим подбора", "auto — по результатам проверок; manual — в заданном порядке."),
+        ];
+        Some(Form {
+            fields: wizard.visible_fields().iter().map(|&id| Field {
+                id, label: labels[id].0, hint: labels[id].1, value: wizard.fields[id].clone(),
+            }).collect(),
+            selected: wizard.focus,
+            lead: if wizard.advanced { "Расширенные параметры · F2 скрыть".into() } else { "Без собственного TLS-сертификата · F2 расширенные".into() },
+            error: wizard.error.clone(),
+        })
+    }
+
+    pub(crate) fn select_field(&mut self, id: usize) {
+        if let Some(wizard) = self.wizard.as_mut() {
+            if wizard.registration.is_none() && matches!(wizard.stage, WizardStage::Input)
+                && wizard.visible_fields().contains(&id) {
+                wizard.focus = id;
+            }
+        }
+    }
+
     pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
         let wizard = self.wizard.as_ref()?;
         if wizard.registration.is_some() {
