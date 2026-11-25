@@ -1120,10 +1120,16 @@ impl Interaction {
         if self.editor.is_none() || inactive_editor {
             if model.screen == Screen::Client && key.code == KeyCode::Char('I') {
                 self.open_config(Role::Client);
+                if let Some(dialog) = self.config_dialog.as_mut() { dialog.prefer_reality(); }
                 return false;
             }
             if model.screen == Screen::Server && key.code == KeyCode::Char('W') {
                 self.open_config(Role::Server);
+                if let Some(dialog) = self.config_dialog.as_mut() { dialog.prefer_reality(); }
+                return false;
+            }
+            if model.screen == Screen::Server && key.code == KeyCode::Char('w') {
+                self.reality_provision = Some(ProvisionPanel::new());
                 return false;
             }
             if model.screen == Screen::Server && key.code == KeyCode::Char('R') {
@@ -1906,6 +1912,15 @@ impl Interaction {
                 }
                 return false;
             }
+            if editor.role() == Role::Server && key.code == KeyCode::Char('w') {
+                if editor.dirty() {
+                    editor.error = Some("Сохраните или отмените черновик перед подготовкой материалов.".into());
+                } else {
+                    editor.error = None;
+                    self.reality_provision = Some(ProvisionPanel::new());
+                }
+                return false;
+            }
             if editor.role() == Role::Server && key.code == KeyCode::Char('W') {
                 if editor.dirty() {
                     editor.error =
@@ -2150,7 +2165,7 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
                 .add_modifier(Modifier::BOLD)
         } else if line.starts_with("Ошибка:") || line.starts_with("ОТКАЗ:") {
             Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
-        } else if line.starts_with("ШАГ ") || line.starts_with("ВЫБЕРИТЕ ") || line.starts_with("НАЧАЛО РАБОТЫ") || line.starts_with("SMARTTHEIA REALITY") || line.starts_with("СЕТЬ ") || line == "ДОСТУП" || line == "OWN-TLS" || line == "ПРОФИЛИ" {
+        } else if line.starts_with("ШАГ ") || line.starts_with("ПРЕДЛОЖЕННЫЙ ") || line.starts_with("ПУТЬ К TOML") || line.starts_with("ВЫБЕРИТЕ ") || line.starts_with("НАЧАЛО РАБОТЫ") || line.starts_with("SMARTTHEIA REALITY") || line.starts_with("СЕТЬ ") || line == "ДОСТУП" || line == "OWN-TLS" || line == "ПРОФИЛИ" {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("КОНФИДЕНЦИАЛЬНО")
         {
@@ -2246,7 +2261,7 @@ fn draw_guided(
     let (step, total, heading, keys) = guide;
     let title = format!("{title} · ШАГ {step}/{total} · {heading}");
     frame.render_widget(Clear, area);
-    if area.height < 12 || area.width < 48 {
+    if area.height < 18 || area.width < 48 {
         panel_at(frame, area, &title, body, true, viewport);
         return;
     }
