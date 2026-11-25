@@ -435,7 +435,7 @@ impl Interaction {
     fn paste_import_source(&mut self, text: &str) {
         if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
             let input = text.trim_end_matches(['\r', '\n']);
-            if source.len().saturating_add(input.len()) <= 4096 && !input.contains('\0') {
+            if source.len().saturating_add(input.len()) <= crate::invite::MAX_URI && !input.contains('\0') {
                 source.push_str(input);
             }
         }
@@ -933,8 +933,21 @@ impl Interaction {
                 ImportFlow::Input(mut source) => match key.code {
                     KeyCode::Esc => {}
                     KeyCode::Enter if !source.is_empty() => {
-                        match client_import::read_source(source.trim()) {
-                            Ok(invitation) => {
+                        match client_import::read_product_source(source.trim()) {
+                            Ok(client_import::ProductSource::Reality) => {
+                                let value = Zeroizing::new(source.trim().to_owned());
+                                match EnrollmentPanel::from_source(editor, value) {
+                                    Ok(panel) => {
+                                        editor.error = None;
+                                        self.reality_enrollment = Some(panel);
+                                    }
+                                    Err(message) => {
+                                        editor.error = Some(message.into());
+                                        self.importing = Some(ImportFlow::Input(source));
+                                    }
+                                }
+                            }
+                            Ok(client_import::ProductSource::OwnTls(invitation)) => {
                                 editor.error = None;
                                 self.importing = Some(ImportFlow::Preview {
                                     invitation,
@@ -956,7 +969,7 @@ impl Interaction {
                     KeyCode::Char(ch)
                         if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                             && !ch.is_control()
-                            && source.len() + ch.len_utf8() <= 4096 =>
+                            && source.len() + ch.len_utf8() <= crate::invite::MAX_URI =>
                     {
                         source.push(ch);
                         self.importing = Some(ImportFlow::Input(source));
@@ -1568,7 +1581,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: общий импорт URI/локального файла: own-TLS CA или REALITY fingerprint/admission, без запуска; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
             true,
         ),
     }
@@ -1954,7 +1967,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (URI/локальный файл, скрытый ввод). N: создать запись; D: удалить; A: активировать профиль; G: grants; U: удалить пользователя; E: TLS/CA и credential. Ctrl+S только сохраняет; runtime не меняет.",
+        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (оба режима, URI/локальный файл, скрытый ввод). N: создать запись; D: удалить; A: активировать профиль; G: grants; U: удалить пользователя; E: TLS/CA и credential. Ctrl+S только сохраняет; runtime не меняет.",
         editor.selection_summary(),
         editor.fields_overview(),
         editor.field_name(),
@@ -2498,6 +2511,42 @@ mod tests {
         );
         fs::remove_file(&path).unwrap();
         let _ = fs::remove_file(config::lock_path(&path).unwrap());
+    }
+
+    #[test]
+    fn common_import_dispatches_reality_uri_to_masked_independent_enrollment() {
+        use crate::reference_health::{Evidence, Plan, State, Target};
+        let now = crate::reference_health::unix_now().unwrap();
+        let state = State::new(Plan {
+            schema_version: 1, inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
+            own_ips: vec!["93.184.216.1".parse().unwrap()],
+            references: vec![Target {
+                server_name: "reference.example.org".into(),
+                address: "93.184.216.2:443".parse().unwrap(),
+            }],
+        }, vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+        let identity = crate::identity_tls::Identity::generate(crate::descriptor::Scope {
+            inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
+        }).unwrap();
+        let signed = crate::reality_bootstrap::initial_descriptor(&state, &identity, now).unwrap();
+        let uri = crate::reality_bootstrap::Invitation::public(&identity, &signed, now).unwrap().encode().unwrap();
+        let path = std::env::temp_dir().join(format!("theia-tui-common-import-{}.toml", std::process::id()));
+        std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        ui.update(&mut model, press(KeyCode::Char('i')));
+        ui.paste_import_source(&uri);
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.importing.is_none());
+        let panel = ui.reality_enrollment.as_ref().unwrap();
+        let body = panel.body();
+        assert!(body.contains("Fingerprint"));
+        assert!(!body.contains(uri.as_str()));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.reality_enrollment.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

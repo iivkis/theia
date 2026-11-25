@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 const LIMIT: usize = 1024;
 const LABELS: [&str; 6] = [
-    "Файл приглашения",
+    "URI или защищённый файл приглашения",
     "Отдельный admission-файл",
     "Новый файл профиля",
     "Новый trust store",
@@ -24,6 +24,7 @@ const LABELS: [&str; 6] = [
 
 struct Input {
     source: PathBuf,
+    inline: Option<Zeroizing<String>>,
     admission: PathBuf,
     profile: PathBuf,
     trust: PathBuf,
@@ -37,13 +38,21 @@ struct Review {
     body: String,
 }
 
+fn source_uri(input: &Input) -> Result<Zeroizing<String>, Error> {
+    if let Some(uri) = &input.inline {
+        if uri.len() > bootstrap::MAX_URI || !uri.starts_with(crate::invite::PREFIX) {
+            return Err(Error::Format);
+        }
+        return Ok(uri.clone());
+    }
+    if !crate::bounded_input::explicit_file_path(&input.source) {
+        return Err(Error::Storage);
+    }
+    bootstrap::read_text(&input.source, bootstrap::MAX_URI, true)
+}
+
 fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
-    for path in [
-        &input.source,
-        &input.admission,
-        &input.profile,
-        &input.trust,
-    ] {
+    for path in [&input.admission, &input.profile, &input.trust] {
         if !crate::bounded_input::explicit_file_path(path) {
             return Err(Error::Storage);
         }
@@ -57,7 +66,7 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
             _ => return Err(Error::Storage),
         }
     }
-    let uri = bootstrap::read_text(&input.source, bootstrap::MAX_URI, true)?;
+    let uri = source_uri(input)?;
     let invitation = Invitation::decode(&uri, now)?;
     if invitation.fingerprint() != input.identity {
         return Err(Error::Approval);
@@ -85,7 +94,7 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
 }
 
 fn apply(input: &Input, review: Review, now: u64) -> Result<String, Error> {
-    let uri = bootstrap::read_text(&input.source, bootstrap::MAX_URI, true)?;
+    let uri = source_uri(input)?;
     bootstrap::import(
         &uri,
         review.approval,
@@ -141,12 +150,27 @@ impl EnrollmentPanel {
         Ok(panel)
     }
 
+    pub(crate) fn from_source(editor: &crate::tui_editor::Editor, source: Zeroizing<String>) -> Result<Self, &'static str> {
+        if source.len() > bootstrap::MAX_URI {
+            return Err("Приглашение превышает лимит v1.");
+        }
+        let mut panel = Self::bound(editor)?;
+        panel.fields[0] = source;
+        panel.focus = 1;
+        Ok(panel)
+    }
+
+    fn limit(&self) -> usize {
+        if self.focus == 0 { bootstrap::MAX_URI } else { LIMIT }
+    }
+
     fn input(&self) -> Result<Input, Error> {
         let path = |i: usize| PathBuf::from(self.fields[i].as_str());
         let identity = crate::parse_restart_digest(&self.fields[4]).ok_or(Error::Approval)?;
         let token = (!self.fields[5].is_empty()).then(|| self.fields[5].clone());
         Ok(Input {
             source: path(0),
+            inline: self.fields[0].starts_with("theia://").then(|| self.fields[0].clone()),
             admission: path(1),
             profile: path(2),
             trust: path(3),
@@ -164,8 +188,9 @@ impl EnrollmentPanel {
             return;
         }
         let value = value.trim_end_matches(['\r', '\n']);
+        let limit = self.limit();
         let field = &mut self.fields[self.focus];
-        if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= LIMIT
+        if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= limit
         {
             field.push_str(value);
         }
@@ -248,7 +273,7 @@ impl EnrollmentPanel {
             KeyCode::Char(ch)
                 if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                     && !ch.is_control()
-                    && self.fields[self.focus].len() + ch.len_utf8() <= LIMIT =>
+                    && self.fields[self.focus].len() + ch.len_utf8() <= self.limit() =>
             {
                 self.fields[self.focus].push(ch);
             }
@@ -373,6 +398,7 @@ mod tests {
         let uri = invite.encode().unwrap();
         let mut input = Input {
             source: dir.join("invitation"),
+            inline: None,
             admission: dir.join("admission"),
             profile: dir.join("profile"),
             trust: dir.join("trust"),
@@ -388,6 +414,11 @@ mod tests {
         input.identity = invite.fingerprint();
         let review = inspect(&input, 1000).unwrap();
         assert!(!review.body.contains(uri.as_str()));
+        input.inline = Some(uri.clone());
+        let inline = inspect(&input, 1000).unwrap();
+        assert_eq!(inline.approval.document_sha256, review.approval.document_sha256);
+        assert_eq!(inline.admission, review.admission);
+        input.inline = None;
         assert!(!review.body.contains("env:TEST_BEARER"));
         assert!(!input.profile.exists() && !input.trust.exists());
         std::fs::remove_file(&input.admission).unwrap();
