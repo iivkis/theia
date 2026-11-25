@@ -191,7 +191,7 @@ def drive(binary, config, scenario, expected):
             tty.send("y")  # never mutates even when the candidate is feasible
             revision(binary, expected)
         else:
-            tty.wait("Параметры · Enter")
+            tty.wait("Режим подключения" if scenario == "client" else "Параметры · Enter")
             if scenario == "apply":
                 # Both actual terminal creation paths must be reachable and
                 # cancel without touching the exact TOML or server revision.
@@ -323,7 +323,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     def open_panel():
         tty = Terminal(command)
         try:
-            tty.wait("Параметры · Enter")
+            tty.wait("Режим подключения")
             tty.send("p")
             tty.wait("Состояние прочитано")
             return tty
@@ -377,7 +377,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
                 sock.settimeout(2)
                 assert sock.connect_ex(("127.0.0.1", port)) != 0, "listener leaked after stop"
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         tty.send("q")
         tty.close()
     finally:
@@ -415,7 +415,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
         confirm(tty, "Восстановление журнала: Restored")
         proxy_status(binary, "NoJournal")
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         tty.send("q")
         tty.close()
     finally:
@@ -509,7 +509,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             time.sleep(0.05)
         client_cmd = [binary, "tui", "--role", "client", "--config", str(client)]
         tty = Terminal(client_cmd)
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         original = client.read_bytes()
         tty.send("i")
         tty.wait("Импорт подключения")
@@ -525,11 +525,11 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         assert read_config(client)["client"]["active_profile"] == "home"
         assert client_revision(1)
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         assert read_config(client)["client"]["active_profile"] == "public"
         assert client_revision(1)
         tty.send("V")
@@ -547,7 +547,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         assert client_revision(2)
         test_tunnels(http_port, socks_port, echo_port)
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         headless.terminate()
         headless.wait(timeout=3)
 
@@ -572,7 +572,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.send("g")
         tty.wait("Материалы подготовлены")
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         assert set(base.glob(".theia-enroll-*")) == before
         assert client.read_bytes() == saved
 
@@ -584,14 +584,14 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Register REALITY profile")
         assert client.read_bytes() == saved
         tty.send("y")
-        tty.wait("Запись сохранена, редактор перечитан")
+        tty.wait("Профиль сохранён")
         assert read_config(client)["client"]["active_profile"] == "public"
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
+        tty.wait("Режим подключения")
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Защищённое подключение")
+        tty.wait("Активный профиль: reality-profile")
         assert read_config(client)["client"]["active_profile"] == "reality-profile"
         tty.send("V")
         tty.wait("Запустить подключение")
