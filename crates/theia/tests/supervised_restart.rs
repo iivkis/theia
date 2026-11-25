@@ -221,7 +221,11 @@ fn write_identity(cert: &Path, key: &Path, generated: &rcgen::CertifiedKey) {
     // Substitution/restore cases deliberately change the same fixture path.
     // Preserve the protected ACL/mode of an existing test-owned regular file.
     if key.exists() {
-        let mut file = fs::OpenOptions::new().write(true).truncate(true).open(key).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(key)
+            .unwrap();
         file.write_all(pem.as_bytes()).unwrap();
         file.sync_all().unwrap();
     } else {
@@ -305,8 +309,10 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
             },
         };
         save(&config_path, &document);
-        assert!(theia::server::tls_fingerprint_file(&config_path).is_ok(),
-            "initial fixture must pass protected PEM validation and production TLS builders");
+        assert!(
+            theia::server::tls_fingerprint_file(&config_path).is_ok(),
+            "initial fixture must pass protected PEM validation and production TLS builders"
+        );
         #[cfg(target_os = "linux")]
         let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
         #[cfg(target_os = "windows")]
@@ -587,8 +593,10 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             },
         };
         save(&config_path, &document);
-        assert!(theia::server::tls_fingerprint_file(&config_path).is_ok(),
-            "initial fixture must pass protected PEM validation and production TLS builders");
+        assert!(
+            theia::server::tls_fingerprint_file(&config_path).is_ok(),
+            "initial fixture must pass protected PEM validation and production TLS builders"
+        );
         #[cfg(target_os = "linux")]
         let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
         #[cfg(target_os = "windows")]
@@ -953,8 +961,10 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
             },
         };
         save(&config, &document);
-        assert!(theia::server::tls_fingerprint_file(&config).is_ok(),
-            "quota fixture must pass protected PEM validation and production TLS builders");
+        assert!(
+            theia::server::tls_fingerprint_file(&config).is_ok(),
+            "quota fixture must pass protected PEM validation and production TLS builders"
+        );
         #[cfg(target_os = "linux")]
         let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
         #[cfg(target_os = "windows")]

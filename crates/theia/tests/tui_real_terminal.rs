@@ -202,8 +202,10 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
         },
     };
     save(&server_file, &doc);
-    assert!(theia::server::tls_fingerprint_file(&server_file).is_ok(),
-        "TUI fixture must pass protected PEM validation and production TLS builders");
+    assert!(
+        theia::server::tls_fingerprint_file(&server_file).is_ok(),
+        "TUI fixture must pass protected PEM validation and production TLS builders"
+    );
     let binary = env!("CARGO_BIN_EXE_theia");
     #[cfg(target_os = "linux")]
     let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
@@ -450,8 +452,10 @@ async fn compiled_client_proxy_conpty_lifecycle() {
         },
     };
     save(&server_file, &server);
-    assert!(theia::server::tls_fingerprint_file(&server_file).is_ok(),
-        "ConPTY fixture must pass protected PEM validation and production TLS builders");
+    assert!(
+        theia::server::tls_fingerprint_file(&server_file).is_ok(),
+        "ConPTY fixture must pass protected PEM validation and production TLS builders"
+    );
     let binary = env!("CARGO_BIN_EXE_theia");
     let pipe = format!("proxyconpty{}", std::process::id());
     drop(reservations);

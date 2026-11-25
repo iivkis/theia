@@ -4,8 +4,8 @@
 use std::{io::Write, path::Path};
 
 pub fn write_new_key(path: &Path, bytes: impl AsRef<[u8]>) {
-    let mut file = theia::client_import::create_private_file(path)
-        .expect("create protected TLS test key");
+    let mut file =
+        theia::client_import::create_private_file(path).expect("create protected TLS test key");
     file.write_all(bytes.as_ref()).unwrap();
     file.sync_all().unwrap();
 }
