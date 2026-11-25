@@ -95,7 +95,7 @@ impl RecordReview {
     }
 }
 
-fn generated_id(prefix: &str) -> Result<String, &'static str> {
+pub(crate) fn generated_id(prefix: &str) -> Result<String, &'static str> {
     let mut random = [0u8; 8];
     rustls::crypto::ring::default_provider()
         .secure_random
@@ -1052,6 +1052,17 @@ impl Editor {
     }
 
     /// Record and field focus never change the typed configuration.
+    pub(crate) fn select_id(&mut self, id: &str) {
+        let index = match &self.draft {
+            Config::Server(doc) => doc.server.inbounds.iter().position(|entry| entry.id == id),
+            Config::Client(doc) => doc.client.profiles.iter().position(|entry| entry.id == id),
+        };
+        if let Some(index) = index {
+            self.selected_record = index;
+            self.selected_field = 0;
+        }
+    }
+
     pub fn select_record(&mut self, forward: bool) {
         if self.editing || self.issued.is_some() {
             return;

@@ -168,6 +168,25 @@ impl RegistrationPanel {
         })
     }
 
+    pub(crate) fn from_provision(
+        config: PathBuf, original: [u8; 32], request: ServerRequest,
+    ) -> Result<Self, Error> {
+        if !crate::bounded_input::explicit_file_path(&config) {
+            return Err(Error::Storage);
+        }
+        let hex = |bytes: [u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let fields = vec![
+            request.health.to_str().ok_or(Error::Storage)?.to_owned(),
+            request.bundle.to_str().ok_or(Error::Storage)?.to_owned(),
+            hex(request.health_sha256), hex(request.identity_sha256),
+            request.listen.to_string(), request.grants.join(","),
+        ];
+        Ok(Self {
+            role: Role::Server, reenroll_id: None, config, original, fields,
+            focus: 5, stage: Stage::Input, error: None,
+        })
+    }
+
     pub(crate) fn from_enrollment(
         config: PathBuf,
         original: [u8; 32],
@@ -289,7 +308,16 @@ impl RegistrationPanel {
                 .map_err(|_| Error::Clock)
                 .and_then(|now| reality_config::apply(&path, &review.request, review.approval, now))
                 .map_err(SaveError::Refused)
-                .and_then(|()| Editor::load(role, &path).map_err(|_| SaveError::SavedReloadFailed));
+                .and_then(|()| {
+                    let mut editor = Editor::load(role, &path).map_err(|_| SaveError::SavedReloadFailed)?;
+                    let selected = match &review.request {
+                        Request::Server(_) => None,
+                        Request::Client(request) | Request::Reenroll(request) => Some(request.id.as_str()),
+                        Request::ReplaceServer(request) => Some(request.id.as_str()),
+                    };
+                    if let Some(id) = selected { editor.select_id(id); }
+                    Ok(editor)
+                });
             let _ = tx.send(result);
         });
     }

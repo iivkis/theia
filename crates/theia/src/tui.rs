@@ -257,6 +257,7 @@ enum DisableFlow {
 type ExportResult = (Editor, Result<PathBuf, &'static str>);
 
 enum RecordFlow {
+    ChooseMode(Role),
     Input {
         action: RecordAction,
         fields: Vec<String>,
@@ -268,6 +269,7 @@ enum RecordFlow {
 impl RecordFlow {
     fn body(&self) -> String {
         match self {
+            Self::ChooseMode(role) => format!("Создать {}\n1: собственный TLS (cert/key или CA)\n2: SmartTheia REALITY (мастер / импорт)\nEsc: отменить. Runtime не меняется.", if *role == Role::Server {"inbound"} else {"профиль"}),
             Self::Confirm(review) => review.body().to_owned(),
             Self::Input {
                 action,
@@ -721,6 +723,25 @@ impl Interaction {
         };
         if let Some(flow) = self.records.take() {
             match flow {
+                RecordFlow::ChooseMode(role) => match key.code {
+                    KeyCode::Char('1') => {
+                        let action = if role == Role::Server { RecordAction::NewInbound } else { RecordAction::NewProfile };
+                        match editor.record_fields(action) {
+                            Ok(fields) => self.records = Some(RecordFlow::Input { action, fields, focus: 0 }),
+                            Err(message) => editor.error = Some(message.into()),
+                        }
+                    }
+                    KeyCode::Char('2') if role == Role::Server => match ProvisionPanel::bound(editor) {
+                        Ok(panel) => self.reality_provision = Some(panel),
+                        Err(message) => editor.error = Some(message.into()),
+                    },
+                    KeyCode::Char('2') => match EnrollmentPanel::bound(editor) {
+                        Ok(panel) => self.reality_enrollment = Some(panel),
+                        Err(message) => editor.error = Some(message.into()),
+                    },
+                    KeyCode::Esc => {},
+                    _ => self.records = Some(RecordFlow::ChooseMode(role)),
+                },
                 RecordFlow::Confirm(review) => match key.code {
                     KeyCode::Char('y') if key.modifiers.is_empty() => {
                         match editor.stage_record(*review) {
@@ -1246,11 +1267,16 @@ impl Interaction {
                 }
                 return false;
             }
+            if key.code == KeyCode::Char('N') && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+                match editor.require_clean_records() {
+                    Ok(()) => self.records = Some(RecordFlow::ChooseMode(editor.role())),
+                    Err(message) => editor.error = Some(message.into()),
+                }
+                return false;
+            }
             let record_action = if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT
             {
                 match (editor.role(), key.code) {
-                    (Role::Server, KeyCode::Char('N')) => Some(RecordAction::NewInbound),
-                    (Role::Client, KeyCode::Char('N')) => Some(RecordAction::NewProfile),
                     (_, KeyCode::Char('D')) => Some(RecordAction::DeleteRecord),
                     (Role::Client, KeyCode::Char('A')) => Some(RecordAction::ActivateProfile),
                     (Role::Server, KeyCode::Char('G')) => Some(RecordAction::SetGrants),
@@ -2038,7 +2064,7 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
             batch.poll();
         }
         if let Some(provision) = interaction.reality_provision.as_mut() {
-            provision.poll();
+            if let Some(editor) = provision.poll() { interaction.editor = Some(editor); }
         }
         if let Some(enrollment) = interaction.reality_enrollment.as_mut() {
             if let Some(editor) = enrollment.poll() {
