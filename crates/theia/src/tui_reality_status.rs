@@ -390,6 +390,9 @@ impl StatusPanel {
             let _ = tx.send(result);
         });
     }
+    pub(crate) fn local_running(&self) -> bool { self.client_run.is_some() }
+    pub(crate) fn can_minimize(&self) -> bool { self.client_run.is_some() && self.client_confirm.is_none() }
+
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.reopen_required {
             return key.code == KeyCode::Esc;
@@ -656,7 +659,7 @@ impl StatusPanel {
                 .map(|s| s.clone())
                 .unwrap_or_else(|_| "Статус недоступен".into());
             return format!(
-                "{status}\n\nx: остановить (подтверждение). Esc не закрывает работающий runtime."
+                "{status}\n\nx: остановить (подтверждение). Esc: свернуть экран, runtime продолжает работу; V: вернуться."
             );
         }
         if self.committing {

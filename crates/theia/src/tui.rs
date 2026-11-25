@@ -10,6 +10,8 @@ use crate::{
     tui_discovery::DiscoveryPanel,
     tui_domain::DomainPanel,
     tui_editor::{Editor, RecordAction, RecordReview},
+    tui_menu::{Action as MenuAction, ConfigDialog, Menu},
+    tui_server_process::ProcessPanel,
     tui_probe::ProbePanel,
     tui_reality_enroll::EnrollmentPanel,
     tui_reality_provision::ProvisionPanel,
@@ -31,7 +33,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::{
@@ -164,6 +166,10 @@ impl Model {
             KeyCode::Char('2') if self.screen != Screen::Help => {
                 self.selected = Role::Client;
                 self.screen = Screen::Client;
+                false
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down if self.screen == Screen::Home => {
+                self.selected = if self.selected == Role::Server { Role::Client } else { Role::Server };
                 false
             }
             KeyCode::Tab | KeyCode::BackTab if self.screen != Screen::Help => {
@@ -307,6 +313,12 @@ impl RecordFlow {
 
 struct Interaction {
     editor: Option<Editor>,
+    menu: Option<Menu>,
+    config_dialog: Option<ConfigDialog>,
+    server_process: ProcessPanel,
+    show_server_process: bool,
+    traffic_monitor: Option<crate::traffic::Monitor>,
+    client_background: Option<StatusPanel>,
     issuance: Option<IssueFlow>,
     issue_kind: IssueKind,
     revocation: Option<DisableFlow>,
@@ -335,6 +347,12 @@ impl Interaction {
     fn new(editor: Option<Editor>) -> Self {
         Self {
             editor,
+            menu: None,
+            config_dialog: None,
+            server_process: ProcessPanel::new(),
+            show_server_process: false,
+            traffic_monitor: None,
+            client_background: None,
             issuance: None,
             issue_kind: IssueKind::NewUser,
             revocation: None,
@@ -417,6 +435,10 @@ impl Interaction {
     }
 
     fn paste_record_field(&mut self, text: &str) {
+        if let Some(dialog) = self.config_dialog.as_mut() {
+            dialog.paste(text.trim_end_matches(['\r', '\n']));
+            return;
+        }
         if let Some(panel) = self.reality_status.as_mut() {
             panel.paste(text);
             return;
@@ -537,6 +559,47 @@ impl Interaction {
         self.editor.as_ref().filter(|edit| edit.role() == role)
     }
 
+
+    fn panel_role(model: &Model) -> Option<Role> {
+        match model.screen {
+            Screen::Server => Some(Role::Server),
+            Screen::Client => Some(Role::Client),
+            _ => None,
+        }
+    }
+    fn open_config(&mut self, role: Role) {
+        if self.editor.as_ref().is_some_and(|e| e.dirty() || e.write_uncertain()) {
+            if let Some(editor) = self.editor.as_mut() {
+                editor.error = Some("Сначала сохраните черновик; при неопределённой записи проверьте файл.".into());
+            }
+            return;
+        }
+        if (role == Role::Server && self.server_process.running())
+            || (role == Role::Client && self.client_background.as_ref().is_some_and(StatusPanel::local_running)) {
+            if role == Role::Server {
+                self.show_server_process = true;
+            } else {
+                self.reality_status = self.client_background.take();
+            }
+            return;
+        }
+        self.config_dialog = Some(ConfigDialog::new(role, self.editor_for(role).map(Editor::saved_path)));
+    }
+
+    fn poll_navigation(&mut self) {
+        self.server_process.poll();
+        if let Some(monitor) = self.traffic_monitor.as_mut() { monitor.poll(); }
+        if let Some(background) = self.client_background.as_mut() { background.poll(); }
+        if let Some(dialog) = self.config_dialog.as_mut() {
+            let role = dialog.role;
+            if let Some(editor) = dialog.poll() {
+                self.editor = Some(editor);
+                self.config_dialog = None;
+                self.menu = Some(Menu::new(role, true));
+            }
+        }
+    }
+
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press
             || self.saving.is_some()
@@ -546,10 +609,48 @@ impl Interaction {
         {
             return false;
         }
+        if let Some(dialog) = self.config_dialog.as_mut() {
+            if dialog.key(key) { self.config_dialog = None; }
+            return false;
+        }
+        if self.show_server_process {
+            if self.server_process.key(key.code, self.editor.as_ref()) { self.show_server_process = false; }
+            return false;
+        }
+        if self.traffic_monitor.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::F(10)) { self.traffic_monitor = None; }
+            return false;
+        }
+        if let Some(menu) = self.menu.as_mut() {
+            let Some(action) = menu.key(key.code) else { return false; };
+            self.menu = None;
+            match action {
+                MenuAction::Close => {}
+                MenuAction::Config => {
+                    if let Some(role) = Self::panel_role(model) { self.open_config(role); }
+                }
+                MenuAction::ServerProcess => self.show_server_process = true,
+                MenuAction::Traffic => {
+                    if let Some(role) = Self::panel_role(model) {
+                        self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
+                    }
+                }
+                MenuAction::Shortcut(code, modifiers) => return self.update(model, KeyEvent::new(code, modifiers)),
+            }
+            return false;
+        }
         #[cfg(windows)]
         if let Some(proxy) = self.system_proxy.as_mut() {
             if proxy.key(key) {
                 self.system_proxy = None;
+            }
+            return false;
+        }
+        if self.reality_status.as_ref().is_some_and(StatusPanel::can_minimize)
+            && matches!(key.code, KeyCode::Esc | KeyCode::F(10)) {
+            self.client_background = self.reality_status.take();
+            if key.code == KeyCode::F(10) {
+                self.menu = Some(Menu::new(Role::Client, self.editor_for(Role::Client).is_some()));
             }
             return false;
         }
@@ -727,7 +828,54 @@ impl Interaction {
             }
             return false;
         }
-        let Some(editor) = self.editor.as_mut() else {
+        let base = self.records.is_none() && self.issuance.is_none() && self.revocation.is_none()
+            && self.importing.is_none() && self.pending.is_none()
+            && !self.editor.as_ref().is_some_and(|e| e.editing);
+        if base {
+            let role = Self::panel_role(model);
+            let exiting = key.code == KeyCode::Char('q')
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+            if exiting && self.server_process.running() {
+                self.show_server_process = true;
+                return false;
+            }
+            if exiting && self.client_background.as_ref().is_some_and(StatusPanel::local_running) {
+                self.reality_status = self.client_background.take();
+                return false;
+            }
+            if role == Some(Role::Client) && key.code == KeyCode::Char('V') && self.client_background.is_some() {
+                self.reality_status = self.client_background.take();
+                return false;
+            }
+            if role == Some(Role::Client) && key.code == KeyCode::Char('p')
+                && self.client_background.as_ref().is_some_and(StatusPanel::local_running) {
+                self.reality_status = self.client_background.take();
+                return false;
+            }
+            if let Some(role) = role {
+                let configured = self.editor_for(role).is_some();
+                if key.code == KeyCode::F(3) || (!configured && key.code == KeyCode::Enter) {
+                    self.open_config(role);
+                    return false;
+                }
+                if key.code == KeyCode::F(10) {
+                    self.menu = Some(Menu::new(role, configured));
+                    return false;
+                }
+                if key.code == KeyCode::F(4) {
+                    self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
+                    return false;
+                }
+                if role == Role::Server && key.code == KeyCode::F(5) {
+                    self.show_server_process = true;
+                    return false;
+                }
+            }
+        }
+        // Keep the editor for the other role intact; read-only actions are
+        // routed without silently borrowing its saved path or credentials.
+        let inactive_editor = base && Self::panel_role(model).is_some_and(|role| self.editor_for(role).is_none());
+        if self.editor.is_none() || inactive_editor {
             if model.screen == Screen::Client && key.code == KeyCode::Char('I') {
                 self.reality_enrollment = Some(EnrollmentPanel::new());
                 return false;
@@ -749,7 +897,8 @@ impl Interaction {
                 return false;
             }
             return model.update(key);
-        };
+        }
+        let Some(editor) = self.editor.as_mut() else { return false; };
         if let Some(flow) = self.records.take() {
             match flow {
                 RecordFlow::ChooseMode(role) => match key.code {
@@ -1651,9 +1800,17 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             Constraint::Length(3),
         ])
         .split(area);
+    let header = match model.screen {
+        Screen::Server => format!("THEIA  •  Сервер  |  {}", interaction.map(|ui| ui.server_process.status()).unwrap_or("Состояние неизвестно")),
+        Screen::Client => {
+            let local = interaction.is_some_and(|ui| ui.reality_status.as_ref().is_some_and(StatusPanel::local_running)
+                || ui.client_background.as_ref().is_some_and(StatusPanel::local_running));
+            format!("THEIA  •  Клиент  |  {}", if local { "Локальный runtime активен/запускается" } else { "Локальный runtime не запущен этой панелью" })
+        }
+        _ => "THEIA  •  Локальное управление".into(),
+    };
     frame.render_widget(
-        Paragraph::new("THEIA 0.1  |  Локальное управление  |  Состояние сервиса: неизвестно")
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(header).block(Block::default().borders(Borders::ALL)),
         parts[0],
     );
     match model.screen {
@@ -1690,7 +1847,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                     frame,
                     parts[1],
                     "Для сервера",
-                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: v запрашивает настоящий статус через native IPC; R проверяет готовность restart без применения\n\nЭтот экран только для чтения. Нужен явный --role server --config FILE для редактирования и подтверждаемого Apply; без него здесь только статус.",
+                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: v запрашивает настоящий статус через native IPC; R проверяет готовность restart без применения\n\nEnter/F3: открыть серверный TOML\nF10: меню действий • F5: запуск/остановка\nБез файла изменения недоступны.",
                     true,
                 );
             }
@@ -1703,7 +1860,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                     frame,
                     parts[1],
                     "Для клиента",
-                    "Профиль: не выбран\nЛокальный прокси: состояние неизвестно\nТранспорт: не проверялся\nСистемный прокси Windows: не изменён\n\nЭтот экран только для чтения. С --role client --config FILE можно импортировать приглашение клавишей i. Подключение и системный прокси не запускаются автоматически.",
+                    "Профиль: не выбран\nЛокальный прокси: состояние неизвестно\nТранспорт: не проверялся\nСистемный прокси Windows: не изменён\n\nEnter/F3: открыть клиентский TOML\nF10: меню действий\nПодключение и системный прокси не запускаются автоматически.",
                     true,
                 );
             }
@@ -1716,7 +1873,19 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         ),
     }
-    if let Some(status) = interaction.and_then(|ui| ui.reality_status.as_ref()) {
+    if let Some(dialog) = interaction.and_then(|ui| ui.config_dialog.as_ref()) {
+        frame.render_widget(Clear, parts[1]);
+        panel(frame, parts[1], "Открыть конфигурацию", &dialog.body(), true);
+    } else if let Some(menu) = interaction.and_then(|ui| ui.menu.as_ref()) {
+        frame.render_widget(Clear, parts[1]);
+        panel(frame, parts[1], menu.title(), &menu.body(usize::from(parts[1].height)), true);
+    } else if let Some(ui) = interaction.filter(|ui| ui.show_server_process) {
+        frame.render_widget(Clear, parts[1]);
+        panel(frame, parts[1], "Сервер • запуск и остановка", &ui.server_process.body(), true);
+    } else if let Some(monitor) = interaction.and_then(|ui| ui.traffic_monitor.as_ref()) {
+        frame.render_widget(Clear, parts[1]);
+        panel(frame, parts[1], "Монитор трафика", &monitor.body(), true);
+    } else if let Some(status) = interaction.and_then(|ui| ui.reality_status.as_ref()) {
         panel(
             frame,
             parts[1],
@@ -1852,10 +2021,11 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         );
     }
-    let footer = if model.screen == Screen::Client {
-        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  M: регистрация  K: re-enroll  V: статус/Apply  Ctrl+S: сохранить"
-    } else {
-        "N/D/G/U/E/Q: записи  W: REALITY  M: регистрация  K: замена bundle  V: REALITY status  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
+    let footer = match model.screen {
+        Screen::Home => "↑↓ / Tab: роль • Enter: открыть • F1: помощь • q: выход",
+        Screen::Help => "Esc: назад",
+        Screen::Server => "F10: действия • F3: открыть TOML • F4: трафик • F5: сервер • Ctrl+S: сохранить",
+        Screen::Client => "F10: действия • F3: открыть TOML • F4: трафик • Ctrl+S: сохранить • Esc: назад",
     };
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
@@ -2114,11 +2284,11 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         "Сохранено"
     };
     let message = format!(
-        "{}\n\n{}\nВыбрано: {}\n{}\n\n{}\n{}\n\n{}\n\nRuntime: v — проверить статус; Ctrl+R — отдельно подтвердить auth-only Apply; R — read-only restart readiness (не выполняет restart).\nНовый пользователь: u. Ротация токена активного пользователя: t (глобально по всем inbound). Отключение: x. Восстановление с новым токеном: b. Публичная ссылка без токена: l. Клиентский импорт: i (оба режима, URI/локальный файл, скрытый ввод). N: создать запись; D: удалить; A: активировать профиль; G: grants; U: удалить пользователя; E: TLS/CA и credential. Ctrl+S только сохраняет; runtime не меняет.",
+        "{}  |  {}\n\n{}\nВыбранное поле: {}\n{}\n{}\n{}\n\nF10: меню всех действий. Сохранение не меняет runtime.",
         editor.selection_summary(),
+        dirty,
         editor.fields_overview(),
         editor.field_name(),
-        dirty,
         if editor.editing {
             "Ввод: символы/Backspace | Enter: проверить | Esc: отменить"
         } else {
@@ -2130,7 +2300,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     panel(
         frame,
         area,
-        "Редактор TOML (указанный файл)",
+        if editor.role() == Role::Server { "Сервер • входящие подключения" } else { "Клиент • профили" },
         &message,
         true,
     );
@@ -2164,6 +2334,7 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
     let mut model = Model::new(role);
     let mut interaction = Interaction::new(editor);
     loop {
+        interaction.poll_navigation();
         if interaction.poll_save(&mut model)? {
             crate::diag!(Info, "tui", "saved_and_closed");
             return Ok(());

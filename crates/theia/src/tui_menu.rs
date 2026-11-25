@@ -189,6 +189,87 @@ impl Menu {
     }
 }
 
+
+pub(crate) struct ConfigDialog {
+    pub(crate) role: Role,
+    input: String,
+    error: Option<&'static str>,
+    loading: Option<std::sync::mpsc::Receiver<Result<crate::tui_editor::Editor, &'static str>>>,
+}
+impl ConfigDialog {
+    pub(crate) fn new(role: Role, existing: Option<&std::path::Path>) -> Self {
+        let filename = match role { Role::Server => "server.toml", Role::Client => "client.toml" };
+        let path = existing.map(std::path::Path::to_path_buf).unwrap_or_else(|| default_config(filename));
+        let input = path.to_str().filter(|p| p.len() <= 4096 && !p.chars().any(char::is_control))
+            .unwrap_or(filename).to_owned();
+        Self { role, input, error: None, loading: None }
+    }
+    pub(crate) fn paste(&mut self, text: &str) {
+        if self.loading.is_none() && self.input.len().saturating_add(text.len()) <= 4096 && !text.chars().any(char::is_control) {
+            self.input.push_str(text);
+        }
+    }
+    pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
+        if self.loading.is_some() { return false; }
+        match key.code {
+            KeyCode::Esc => return true,
+            KeyCode::Enter => {
+                if self.input.is_empty() {
+                    self.error = Some("Укажите путь к существующему файлу.");
+                    return false;
+                }
+                let path = std::path::PathBuf::from(&self.input);
+                let role = self.role;
+                let (tx, rx) = std::sync::mpsc::channel();
+                match std::thread::Builder::new().name("theia-tui-config".into()).spawn(move || {
+                    let loaded = std::path::absolute(path).map_err(|_| "Неверный путь")
+                        .and_then(|path| crate::tui_editor::Editor::load(role, &path));
+                    let _ = tx.send(loaded);
+                }) {
+                    Ok(_) => { self.loading = Some(rx); self.error = None; }
+                    Err(_) => self.error = Some("Не удалось запустить чтение файла."),
+                }
+            }
+            KeyCode::Backspace => { self.input.pop(); }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => self.input.clear(),
+            KeyCode::Char(ch) if !ch.is_control() && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) => {
+                if self.input.len().saturating_add(ch.len_utf8()) <= 4096 { self.input.push(ch); }
+            }
+            _ => {}
+        }
+        false
+    }
+    pub(crate) fn poll(&mut self) -> Option<crate::tui_editor::Editor> {
+        use std::sync::mpsc::TryRecvError;
+        let result = match self.loading.as_ref()?.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => Err("Чтение файла не подтверждено"),
+        };
+        self.loading = None;
+        match result {
+            Ok(editor) => Some(editor),
+            Err(reason) => { self.error = Some(reason); None }
+        }
+    }
+    pub(crate) fn body(&self) -> String {
+        if self.loading.is_some() { return "Проверяется существующий TOML; ничего не записывается.".into(); }
+        let role = if self.role == Role::Server { "Сервер" } else { "Клиент" };
+        format!("{role} • существующий файл конфигурации\n\nПуть: {}\n\n{}\nCtrl+U очистить • Backspace удалить • Enter открыть • Esc отменить\nЗагрузка не запускает runtime, не делает сетевых запросов и не изменяет файл.", self.input, self.error.unwrap_or(""))
+    }
+}
+
+fn default_config(filename: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    let root = std::env::var_os("APPDATA").map(|p| std::path::PathBuf::from(p).join("Theia"));
+    #[cfg(not(windows))]
+    let root = std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
+        .map(|p| p.join("theia"));
+    root.map(|p| p.join(filename)).unwrap_or_else(|| std::path::PathBuf::from(filename))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
