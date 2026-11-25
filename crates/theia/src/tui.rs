@@ -213,6 +213,9 @@ enum IssueFlow {
     ExportFailed,
     Showing(Zeroizing<String>),
     Public(String),
+    ShareConfirm { action: crate::tui_share::Action, public: Option<String> },
+    Sharing,
+    ShareDone(String),
 }
 
 /// Client-only F-14 local file/pasted URI import. Only safe fields may render.
@@ -321,6 +324,8 @@ struct Interaction {
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
     exporting: Option<mpsc::Receiver<ExportResult>>,
+    sharing: Option<mpsc::Receiver<Result<(PathBuf, bool), &'static str>>>,
+    clipboard: Option<Zeroizing<String>>,
 }
 
 impl Interaction {
@@ -347,6 +352,8 @@ impl Interaction {
             pending: None,
             saving: None,
             exporting: None,
+            sharing: None,
+            clipboard: None,
         }
     }
 
@@ -444,6 +451,18 @@ impl Interaction {
     }
 
     fn poll_save(&mut self, model: &mut Model) -> Result<bool, TuiError> {
+        if let Some(rx) = self.sharing.as_ref() {
+            let message = match rx.try_recv() {
+                Ok(Ok((path,true))) => format!("Защищённый QR SVG сохранён: {path:?}. QR содержит само приглашение; храните как исходную ссылку."),
+                Ok(Ok((path,false))) => format!("Приглашение превышает вместимость одного QR. Сохранён полный защищённый URI-файл: {path:?}. Ничего не обрезано."),
+                Ok(Err(error)) => format!("{error} Для конфиденциальной ссылки повторная выдача требует ротации."),
+                Err(TryRecvError::Empty) => return Ok(false),
+                Err(TryRecvError::Disconnected) => "Результат записи не подтверждён. Проверьте файлы; не повторяйте вслепую.".into(),
+            };
+            self.sharing = None;
+            self.issuance = Some(IssueFlow::ShareDone(message));
+            return Ok(false);
+        }
         if let Some(receiver) = self.exporting.as_ref() {
             match receiver.try_recv() {
                 Ok((mut editor, result)) => {
@@ -514,7 +533,7 @@ impl Interaction {
     }
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
-        if key.kind != KeyEventKind::Press || self.saving.is_some() || self.exporting.is_some() {
+        if key.kind != KeyEventKind::Press || self.saving.is_some() || self.exporting.is_some() || self.sharing.is_some() || self.clipboard.is_some() {
             return false;
         }
         #[cfg(windows)]
@@ -842,6 +861,10 @@ impl Interaction {
                     _ => self.issuance = Some(IssueFlow::SaveFailed),
                 },
                 IssueFlow::Offer => match key.code {
+                    KeyCode::Char('Q' | 'c') => {
+                        let action = if key.code == KeyCode::Char('Q') { crate::tui_share::Action::Qr } else { crate::tui_share::Action::Clipboard };
+                        self.issuance = Some(IssueFlow::ShareConfirm { action, public: None });
+                    }
                     KeyCode::Char('f') => {
                         self.issuance = Some(IssueFlow::ConfirmExport);
                     }
@@ -883,9 +906,49 @@ impl Interaction {
                     }
                 }
                 IssueFlow::Public(link) => {
-                    if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                        self.issuance = Some(IssueFlow::Public(link));
+                    match key.code {
+                        KeyCode::Char('Q' | 'c') => {
+                            let action = if key.code == KeyCode::Char('Q') { crate::tui_share::Action::Qr } else { crate::tui_share::Action::Clipboard };
+                            self.issuance = Some(IssueFlow::ShareConfirm { action, public: Some(link) });
+                        }
+                        KeyCode::Esc | KeyCode::Enter => {}
+                        _ => self.issuance = Some(IssueFlow::Public(link)),
                     }
+                }
+                IssueFlow::ShareConfirm { action, public } => match key.code {
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        self.issuance = Some(public.map_or(IssueFlow::Offer, IssueFlow::Public));
+                    }
+                    KeyCode::Char('y') if key.modifiers.is_empty() => {
+                        let link = match public {
+                            Some(link) => Some(Zeroizing::new(link)),
+                            None => editor.take_issued().and_then(|invitation| invitation.encode().ok()).map(Zeroizing::new),
+                        };
+                        if let Some(link) = link {
+                            match action {
+                                crate::tui_share::Action::Qr => {
+                                    let path = editor.saved_path().to_owned();
+                                    let (tx,rx) = mpsc::channel();
+                                    self.sharing = Some(rx);
+                                    self.issuance = Some(IssueFlow::Sharing);
+                                    let _worker = std::thread::spawn(move || {
+                                        let _ = tx.send(crate::tui_share::export_qr(&path, &link));
+                                    });
+                                }
+                                crate::tui_share::Action::Clipboard => {
+                                    self.clipboard = Some(link);
+                                    self.issuance = Some(IssueFlow::Sharing);
+                                }
+                            }
+                        } else {
+                            self.issuance = Some(IssueFlow::ShareDone("Приглашение больше недоступно. Необходимо перевыпустить credential.".into()));
+                        }
+                    }
+                    _ => self.issuance = Some(IssueFlow::ShareConfirm { action, public }),
+                },
+                IssueFlow::Sharing => self.issuance = Some(IssueFlow::Sharing),
+                IssueFlow::ShareDone(message) => {
+                    if key.code != KeyCode::Esc { self.issuance = Some(IssueFlow::ShareDone(message)); }
                 }
                 IssueFlow::Showing(link) => {
                     if key.code == KeyCode::Esc {
@@ -1845,6 +1908,17 @@ fn draw_issuance(
                     .into()
             },
         ),
+        IssueFlow::ShareConfirm { action, public } => (
+            "Подтвердить передачу приглашения",
+            format!("{}\n{}\ny: подтвердить | n/Esc: назад",
+                match action {
+                    crate::tui_share::Action::Qr => "Создать защищённый SVG QR. Если полный URI не помещается, создать защищённый URI-файл без усечения.",
+                    crate::tui_share::Action::Clipboard => "Отправить запрос OSC 52 в доверенный терминал. Терминал может отказать; история clipboard или синхронизация могут сохранить ссылку. Очистите буфер самостоятельно.",
+                },
+                if public.is_none() { "КОНФИДЕНЦИАЛЬНО: будет использован одноразовый bearer; не передавайте недоверенному терминалу или получателю." } else { "Публичное приглашение без bearer." })
+        ),
+        IssueFlow::Sharing => ("Передача приглашения", "Операция выполняется; URI скрыт.".into()),
+        IssueFlow::ShareDone(message) => ("Результат передачи", format!("{message}\nEsc: закрыть. Runtime не изменён.")),
         IssueFlow::ConfirmExport => (
             "Подтверждение конфиденциального экспорта",
             "Создать новый защищённый файл рядом с конфигурацией сервера? Ссылка не будет показана. Файл содержит bearer; храните и передавайте его только доверенным способом. Повторная выдача недоступна.\n\ny: сохранить  n/Esc: назад"
@@ -1879,6 +1953,9 @@ fn draw_issuance(
             ),
         ),
     };
+    let body = if matches!(flow, IssueFlow::Offer | IssueFlow::Public(_)) {
+        format!("{body}\nQ: защищённый QR | c: буфер обмена (отдельное подтверждение)")
+    } else { body };
     panel(frame, area, title, &body, true);
 }
 
@@ -2085,6 +2162,12 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(domain) = interaction.domain.as_mut() {
             domain.poll();
+        }
+        if let Some(link) = interaction.clipboard.take() {
+            let message = if crate::tui_share::send_clipboard(io::stdout().lock(), &link).is_ok() {
+                "Запрос копирования отправлен терминалу; фактическое содержимое буфера не подтверждено. Проверьте вставкой в доверенное приложение."
+            } else { "Запрос копирования не подтверждён. Для конфиденциальной ссылки потребуется новая выдача." };
+            interaction.issuance = Some(IssueFlow::ShareDone(message.into()));
         }
         terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
         if event::poll(Duration::from_millis(50))? {
@@ -2870,6 +2953,34 @@ mod tests {
         assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
         assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clipboard_and_qr_offer_require_separate_confirmation_and_never_render_secret() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("theia-share-ui").unwrap()).with_extension("toml");
+        std::fs::write(&path, server_issuance_fixture()).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        editor.issue_user("share-device").unwrap();
+        assert!(editor.save());
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+        ui.issuance = Some(IssueFlow::Offer);
+        for key in ['Q','c'] {
+            ui.update(&mut model, press(KeyCode::Char(key)));
+            assert!(matches!(ui.issuance, Some(IssueFlow::ShareConfirm { .. })));
+            assert!(ui.clipboard.is_none() && ui.sharing.is_none());
+            assert!(!rendered_interaction(120,40,&model,&ui).contains("theia://v1/"));
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(ui.editor.as_ref().unwrap().issued_ready());
+        }
+        ui.update(&mut model, press(KeyCode::Char('c')));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        let link = ui.clipboard.take().unwrap();
+        assert!(Invitation::decode(&link).unwrap().has_token());
+        assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
+        assert!(!rendered_interaction(120,40,&model,&ui).contains("theia://v1/"));
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(crate::config::lock_path(&path).unwrap());
     }
 
     #[test]
