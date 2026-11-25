@@ -1157,7 +1157,8 @@ impl ProvisionPanel {
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
         let wizard = self.wizard.as_ref()?;
-        if wizard.registration.is_some() || !matches!(wizard.stage, WizardStage::Input) {
+        if let Some(panel)=&wizard.registration{return panel.form();}
+        if !matches!(wizard.stage, WizardStage::Input) {
             return None;
         }
         if let Some(picker) = &wizard.grant_picker {
@@ -1195,6 +1196,7 @@ impl ProvisionPanel {
 
     pub(crate) fn select_field(&mut self, id: usize) {
         if let Some(wizard) = self.wizard.as_mut() {
+            if let Some(panel)=wizard.registration.as_mut(){panel.select_field(id);return;}
             if let Some(picker) = wizard.grant_picker.as_mut() {
                 if id < picker.selected.len() { picker.focus = id; }
                 return;

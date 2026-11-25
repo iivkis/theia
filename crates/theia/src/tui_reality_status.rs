@@ -416,7 +416,7 @@ impl StatusPanel {
         let mut items = Vec::new();
         if !self.server && self.client_active {
             items.push(ActionItem { key: 's', label: "Запустить подключение" });
-            items.push(ActionItem { key: 'h', label: "Применить настройки внешнего клиента" });
+            items.push(ActionItem { key: 'h', label: "Настройки внешнего клиента" });
         }
         items.push(ActionItem { key: 'r', label: "Обновить состояние" });
         if self.server {

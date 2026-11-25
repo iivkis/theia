@@ -493,7 +493,8 @@ impl EnrollmentPanel {
 
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
-        if self.registration.is_some() || !matches!(self.stage, Stage::Input) {
+        if let Some(panel)=&self.registration {return panel.form();}
+        if !matches!(self.stage, Stage::Input) {
             return None;
         }
         let hints = [
@@ -516,7 +517,8 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn select_field(&mut self, id: usize) {
-        if self.registration.is_none() && matches!(self.stage, Stage::Input)
+        if let Some(panel)=self.registration.as_mut(){panel.select_field(id);return;}
+        if matches!(self.stage, Stage::Input)
             && id < LABELS.len() && (!self.managed_paths() || !matches!(id, 2 | 3)) {
             self.focus = id;
         }

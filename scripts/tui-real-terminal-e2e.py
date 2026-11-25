@@ -539,7 +539,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Headless Apply: revision=1")
         assert client_revision(1)
         tty.send("n")
-        tty.wait("Применить настройки внешнего клиента")
+        tty.wait("Настройки внешнего клиента")
         assert client_revision(1)
         tty.send("h")
         tty.wait("Headless Apply: revision=1")
@@ -591,7 +591,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Параметры · Enter")
+        tty.wait("Защищённое подключение")
         assert read_config(client)["client"]["active_profile"] == "reality-profile"
         tty.send("V")
         tty.wait("Запустить подключение")

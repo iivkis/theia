@@ -382,7 +382,7 @@ fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
         (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль")],
         (Role::Client, 1) => &[('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт"),('E',"Доверие Own-TLS"),('D',"Удалить профиль")],
         (Role::Client, 2) => &[('i',"Импорт ссылки или QR"),('I',"Импорт REALITY")],
-        (Role::Client, 3) => &[('p',"Управление системным прокси")],
+        (Role::Client, 3) if cfg!(windows) => &[('p',"Управление системным прокси")],
         (Role::Client, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('V',"Состояние и применение"),('K',"Подтвердить доверие"),('M',"Регистрация материалов")],
         (Role::Client, 6) => &[('V',"Диагностика подключения")],
         _ => &[],
@@ -753,6 +753,7 @@ impl Interaction {
         if let Some(d)=&self.config_dialog {return d.form();}
         if let Some(p)=&self.reality_provision {return p.form();}
         if let Some(p)=&self.reality_enrollment {return p.form();}
+        if let Some(p)=&self.reality_registration {return p.form();}
         if let Some(p)=&self.domain {return p.form();}
         if let Some(p)=&self.candidate_batch {return p.form();}
         if let Some(f)=&self.records {return f.form(self.editor.as_ref());}
@@ -873,6 +874,12 @@ impl Interaction {
         if let Some(batch)=self.candidate_batch.as_mut() {
             if let Some(form)=batch.form() {
                 if let Some(i)=form.hit(guided_form_area(body,form.fields.len()),event.column,event.row){batch.select_field(i);}
+            }
+            return;
+        }
+        if let Some(panel)=self.reality_registration.as_mut() {
+            if let Some(form)=panel.form(){
+                if let Some(id)=form.hit(guided_form_area(body,form.fields.len()),event.column,event.row){panel.select_field(id);}
             }
             return;
         }
@@ -1443,7 +1450,8 @@ impl Interaction {
                             self.workspace_focus = if key.code == KeyCode::Tab { WorkspaceFocus::Navigation } else if role == Role::Server && self.workspace_page == 2 { WorkspaceFocus::Users } else { WorkspaceFocus::Fields };
                             return false;
                         }
-                        if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::Enter) {
+                        if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::Enter)
+                            || (key.modifiers.is_empty() && matches!(key.code,KeyCode::Char(ch) if items.iter().any(|item|item.key==ch))) {
                             if self.workspace_page == 4 && key.code == KeyCode::Enter {
                                 self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
                                 return false;
@@ -2890,13 +2898,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             modal_panel!(frame, parts[1], "Подключение и состояние REALITY", &status.body(), true);
         }
     } else if let Some(registration) = interaction.and_then(|ui| ui.reality_registration.as_ref()) {
-        modal_panel!(
-            frame,
-            parts[1],
-            "Регистрация материалов",
-            &registration.body(),
-            true,
-        );
+        if let Some(form)=registration.form() {
+            draw_guided(frame,parts[1],"Регистрация материалов",&registration.body(),(1,2,"Параметры доверия","↑↓ поле · Enter проверить · Ctrl+U очистить · Esc назад"),viewport,(Some(form),None));
+        }else{modal_panel!(frame,parts[1],"Регистрация материалов",&registration.body(),true);}
     } else if let Some(enrollment) = interaction.and_then(|ui| ui.reality_enrollment.as_ref()) {
         draw_guided(frame, parts[1], "Импорт REALITY", &enrollment.body(), enrollment.guide(), viewport, (enrollment.form(), None));
     } else if let Some(provision) = interaction.and_then(|ui| ui.reality_provision.as_ref()) {
