@@ -354,4 +354,5 @@ require("test_native_performance.py" in spec
         and "--require-smoke" in browser
         and "native-performance-" in browser,
         "native paired performance smoke and evidence must remain mandatory")
+require("test_classifier_evidence.py" in spec, "independent score evidence regressions remain mandatory")
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")
