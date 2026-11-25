@@ -2872,9 +2872,9 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
                 .add_modifier(Modifier::BOLD)
         } else if line.starts_with("Ошибка") || line.starts_with("ОТКАЗ") || line.starts_with("Отказ:") {
             Style::default().fg(ERROR).add_modifier(Modifier::BOLD)
-        } else if line.starts_with("ШАГ ") || line.starts_with("ПРЕДЛОЖЕННЫЙ ") || line.starts_with("ПУТЬ К TOML") || line.starts_with("ВЫБЕРИТЕ ") || line.starts_with("НАЧАЛО РАБОТЫ") || line.starts_with("SMARTTHEIA REALITY") || line.starts_with("СЕТЬ ") || line == "ДОСТУП" || line == "OWN-TLS" || line == "ПРОФИЛИ" {
+        } else if line.starts_with("ШАГ ") || line.starts_with("ПРЕДЛОЖЕННЫЙ ") || line.starts_with("ПУТЬ К TOML") || line.starts_with("ВЫБЕРИТЕ ") || line.starts_with("НАЧАЛО РАБОТЫ") || line.starts_with("SMARTTHEIA REALITY") || line.starts_with("СЕТЬ ") || matches!(line, "ДОСТУП" | "OWN-TLS" | "ПРОФИЛИ" | "НАВИГАЦИЯ" | "СЕРВЕР" | "КЛИЕНТ" | "БЕЗОПАСНОСТЬ") {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("КОНФИДЕНЦИАЛЬНО") || line.starts_with("СЕКРЕТ:")
+        } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("СОГЛАСИЕ НА ") || line.starts_with("КОНФИДЕНЦИАЛЬНО") || line.starts_with("СЕКРЕТ:")
         {
             Style::default()
                 .fg(WARNING)
@@ -3383,7 +3383,7 @@ fn user_picker(editor: Option<&Editor>, current: &str, disabled: bool) -> Option
             value, hint: "Enter — проверить выбранного пользователя. Изменение требует отдельного подтверждения.",
         }).collect(),
         selected,
-        lead: if current.is_empty() { "Выберите пользователя стрелками или мышью.".into() }
+        lead: if selected == usize::MAX { "Выберите пользователя стрелками или мышью.".into() }
             else { format!("Выбран: {current}") },
         error: editor.error.clone().unwrap_or_default(),
     })
@@ -3433,7 +3433,7 @@ fn draw_issuance(
             return;
         }
         if let Some(form) = user_picker(editor, id, recovering) {
-            let title = if recovering { "Восстановление отключённого пользователя" } else { "Ротация токена" };
+            let title = if recovering { "Восстановление отключённого пользователя" } else { "Заменить личный ключ" };
             draw_guided(frame, area, title, "", (1, 2, "Выбор пользователя", "↑↓ выбрать · Enter проверить · Esc отменить"), viewport, (Some(form), None));
             return;
         }
@@ -3450,9 +3450,9 @@ fn draw_issuance(
             format!(
                 "ID пользователя: {id}\n\n{}\n\nEnter: продолжить  Backspace: удалить  Esc: отменить\n\n{}",
                 if recovering {
-                    "Только отключённый пользователь с grant на выбранном inbound. Будет создан новый bearer."
+                    "Восстановление доступно только отключённым пользователям с правом на это подключение. Будет создан новый ключ."
                 } else if rotating {
-                    "Только активный пользователь с grant на выбранном inbound. Новый bearer будет выдан однократно."
+                    "Выберите включённого пользователя с правом на это подключение. Новый ключ выдаётся один раз."
                 } else {
                     "Сгенерировать 256-битный токен и назначить доступ только к выбранному inbound."
                 },
@@ -3468,7 +3468,7 @@ fn draw_issuance(
                 "Подтверждение нового пользователя"
             },
             format!(
-                "Пользователь: {id}\nInbound: {}\n\n{}\n\ny: подтвердить и сохранить  n/Esc: отменить",
+                "Пользователь: {id}\nПодключение: {}\n\n{}\n\ny: подтвердить и сохранить  n/Esc: отменить",
                 editor.map_or("", |e| e.selected_record_id()),
                 if recovering {
                     "ВНИМАНИЕ: доступ восстановится для всех ранее разрешённых подключений.\nБудет создан новый ключ; старый восстановить нельзя.\nЧтобы изменить работающий сервер, отдельно примените права (CAS Apply)."
@@ -3496,7 +3496,7 @@ fn draw_issuance(
                 if recovering {
                     "Восстановление НЕ сохранено. Новый токен не показывался."
                 } else if rotating {
-                    "Новый digest НЕ сохранён. Старый токен остаётся в файле; runtime не меняется."
+                    "Новый ключ НЕ сохранён. Старый ключ остаётся в файле; работающий сервер не изменён."
                 } else {
                     "Новый пользователь НЕ записан. Токен не показывался."
                 },
@@ -3604,7 +3604,7 @@ fn draw_revocation(
         DisableFlow::Confirm(id) => (
             "Подтверждение отзыва доступа",
             format!(
-                "Пользователь: {id}\nВыбранный inbound: {}\n\nВНИМАНИЕ: отключение действует для всех подключений пользователя.\nКлюч и права останутся в файле. Новые сеансы будут запрещены после отдельного применения прав.\nТекущие сеансы продолжатся.\n\ny: подтвердить и сохранить  n/Esc: отменить",
+                "Пользователь: {id}\nВыбранное подключение: {}\n\nВНИМАНИЕ: отключение действует для всех подключений пользователя.\nКлюч и права останутся в файле. Новые сеансы будут запрещены после отдельного применения прав.\nТекущие сеансы продолжатся.\n\ny: подтвердить и сохранить  n/Esc: отменить",
                 editor.map_or("", |e| e.selected_record_id())
             ),
         ),
@@ -3724,7 +3724,7 @@ fn draw_import(
         ImportFlow::Failed => (
             "Импорт НЕ подтверждён",
             format!(
-                "Перед повторной попыткой проверьте файл настроек. При отказе до завершения записи новый ключ удалён.\nПодключение не запущено; системный прокси не изменён.\n\n{}\n\nEnter/Esc: закрыть",
+                "Перед повторной попыткой проверьте файл настроек. При отказе до фиксации изменений новый ключ удалён.\nПодключение не запущено; системный прокси не изменён.\n\n{}\n\nEnter/Esc: закрыть",
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
         ),
@@ -3833,15 +3833,24 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         let selected = ui.map_or(0, |u| u.workspace_user).min(users.len().saturating_sub(1));
         let start = user_table_start(selected, users.len(), content);
         let rows = users.iter().enumerate().skip(start).take(usize::from(content.height.saturating_sub(3))).map(|(i,(id,disabled,granted))| {
+            let active = i == selected && focus == WorkspaceFocus::Users;
             let color = if *disabled { WARNING } else { TEXT };
-            Row::new(vec![format!("{} {id}", if i == selected { "›" } else { " " }), if *granted { "Выдан" } else { "Нет" }.into(), if *disabled { "Отключён" } else if *granted { "Разрешён" } else { "Нет доступа" }.into()])
-                .style(Style::default().fg(color).bg(if i == selected { FOCUS } else { SURFACE }))
+            Row::new(vec![format!("{} {id}", if active { "›" } else if i == selected { "•" } else { " " }), if *granted { "Разрешено" } else { "Нет права" }.into(), if *disabled { "Отключён" } else { "Включён" }.into()])
+                .style(Style::default().fg(color).bg(if active { FOCUS } else { SURFACE }))
         });
         frame.render_widget(Table::new(rows,[Constraint::Percentage(50),Constraint::Percentage(20),Constraint::Percentage(30)])
-            .header(Row::new(["Пользователь","Доступ","В файле"]).style(Style::default().fg(MUTED)))
+            .header(Row::new(["Пользователь","Право доступа","Учётная запись"]).style(Style::default().fg(MUTED)))
             .block(tui_widgets::section(&format!("{}: {}", if page == 3 { "Приглашения для" } else { "Доступ к" }, editor.selected_record_id()), focus == WorkspaceFocus::Users)),content);
         if users.is_empty() && content.height > 3 {
-            frame.render_widget(Paragraph::new("Нет пользователей. Добавьте первого через действия."), Rect::new(content.x+1,content.y+2,content.width.saturating_sub(2),1));
+            frame.render_widget(Paragraph::new("Нет пользователей. Выберите «Добавить пользователя»."), Rect::new(content.x+1,content.y+2,content.width.saturating_sub(2),1));
+        }
+        // Render explanatory text only in unused table rows. Mouse selection
+        // still uses the same row geometry and cannot select the help text.
+        if page == 3 && users.len() <= 3 && content.height >= 9 {
+            let y = content.y + 2 + users.len() as u16 + 1;
+            let hint = "Личная ссылка показывается один раз.\nЕсли потеряли её, выберите пользователя и «Заменить приглашение».\nСтарый ключ перестанет работать для новых сеансов после применения прав.";
+            frame.render_widget(Paragraph::new(hint).style(Style::default().fg(MUTED)).wrap(Wrap {trim:true}),
+                Rect::new(content.x+1, y, content.width.saturating_sub(2), content.bottom().saturating_sub(y+1)));
         }
     } else {
         let description = match (role,page) {
@@ -4531,6 +4540,23 @@ mod tests {
                 assert!(controls.bottom() <= workspace.bottom());
             }
         }
+    }
+
+    #[test]
+    fn review_client_import_opens_directly_from_page_without_writing() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("review-import").unwrap());
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.select_workspace_page(Role::Client, 2);
+        ui.workspace_focus = WorkspaceFocus::Fields;
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.importing, Some(ImportFlow::Input(_))));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -6055,7 +6081,7 @@ mod tests {
             ),
             (
                 DisableFlow::Confirm("device-a".into()),
-                "отдельного auth-only Apply",
+                "отдельного применения прав",
             ),
             (DisableFlow::Saving, "Runtime не изменяется"),
             (DisableFlow::SaveFailed, "TOML НЕ сохранён"),

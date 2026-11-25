@@ -416,6 +416,16 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
     #[test]
+    fn inactive_action_list_has_no_active_focus_background() {
+        let items = [ActionItem { key: 's', label: "Запустить сервер" }];
+        let mut terminal = Terminal::new(TestBackend::new(42, 6)).unwrap();
+        for focused in [false, true] {
+            terminal.draw(|f| Actions { items: &items, selected: 0 }.render_with_focus(f, f.area(), focused)).unwrap();
+            assert_eq!(terminal.backend().buffer().content().iter().any(|c| c.bg == FOCUS), focused);
+        }
+    }
+
+    #[test]
     fn action_selection_matches_rendered_rows_and_enter_dispatches_only_one_key() {
         use crossterm::event::KeyCode;
         let items = [ActionItem { key: 's', label: "Запуск" }, ActionItem { key: 'x', label: "Остановка" }, ActionItem { key: 'r', label: "Обновить" }];
