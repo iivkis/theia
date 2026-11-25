@@ -18,6 +18,8 @@ enum Update {
     Trust(TrustReview),
     Expiry(ExpiryReview),
     HeadlessReview(u64),
+    CredentialReview(PathBuf, [u8; 32], u64),
+    CredentialSaved(Editor),
 }
 struct ClientRun {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -47,6 +49,10 @@ pub(crate) struct StatusPanel {
     trust_review: Option<TrustReview>,
     expiry_review: Option<ExpiryReview>,
     headless_review: Option<u64>,
+    credential_input: Option<String>,
+    credential_review: Option<(PathBuf, [u8; 32], u64)>,
+    refreshed_editor: Option<Editor>,
+    reopen_required: bool,
 }
 impl StatusPanel {
     pub(crate) fn open(editor: &Editor) -> Self {
@@ -66,6 +72,10 @@ impl StatusPanel {
             trust_review: None,
             expiry_review: None,
             headless_review: None,
+            credential_input: None,
+            credential_review: None,
+            refreshed_editor: None,
+            reopen_required: false,
         };
         panel.start(None);
         panel
@@ -154,6 +164,13 @@ impl StatusPanel {
         });
     }
     pub(crate) fn paste(&mut self, text: &str) {
+        if let Some(field) = &mut self.credential_input {
+            let text = text.trim_end_matches(['\r', '\n']);
+            if !text.chars().any(char::is_control) && field.len() + text.len() <= 1024 {
+                field.push_str(text);
+            }
+            return;
+        }
         if let Some((_, field)) = &mut self.trust_input {
             let text = text.trim_end_matches(['\r', '\n']);
             if !text.chars().any(char::is_control) && field.len() + text.len() <= 1024 {
@@ -161,6 +178,44 @@ impl StatusPanel {
             }
         }
     }
+    fn start_credential(&mut self, source: PathBuf, approval: Option<[u8; 32]>) {
+        let path = self.path.clone();
+        let digest = self.digest;
+        let id = self.id.clone();
+        let (tx, rx) = mpsc::channel();
+        self.pending = Some(rx);
+        self.committing = approval.is_some();
+        let _worker = std::thread::spawn(move || {
+            let result = (|| {
+                let path = std::path::absolute(path).map_err(|_| Error::Storage)?;
+                let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
+                if let Some(approval) = approval {
+                    reality_config::save_credential_refresh(&path, &id, &source, approval, now)?;
+                    let mut editor = Editor::load(Role::Client, &path).map_err(|_| Error::Indeterminate)?;
+                    for _ in 0..editor.record_count() {
+                        if editor.selected_record_id() == id {
+                            break;
+                        }
+                        editor.select_record(true);
+                    }
+                    if editor.selected_record_id() != id {
+                        return Err(Error::Indeterminate);
+                    }
+                    Ok(Update::CredentialSaved(editor))
+                } else {
+                    let (approval, revision) = reality_config::preview_credential_refresh_for_editor(
+                        &path, digest, &id, &source, now)?;
+                    Ok(Update::CredentialReview(source, approval, revision))
+                }
+            })();
+            let _ = tx.send(result);
+        });
+    }
+
+    pub(crate) fn take_refreshed_editor(&mut self) -> Option<Editor> {
+        self.refreshed_editor.take()
+    }
+
     fn start_trust(&mut self, promote: bool, source: PathBuf) {
         let path = self.path.clone();
         let digest = self.digest;
@@ -309,7 +364,33 @@ impl StatusPanel {
         });
     }
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
+        if self.reopen_required {
+            return key.code == KeyCode::Esc;
+        }
         if !self.server {
+            if let Some((source, approval, revision)) = self.credential_review.take() {
+                match key.code {
+                    KeyCode::Char('y') => self.start_credential(source, Some(approval)),
+                    KeyCode::Char('n') | KeyCode::Esc => {},
+                    _ => self.credential_review = Some((source, approval, revision)),
+                }
+                return false;
+            }
+            if let Some(field) = self.credential_input.as_mut() {
+                match key.code {
+                    KeyCode::Esc => self.credential_input = None,
+                    KeyCode::Enter => {
+                        let source = PathBuf::from(field.as_str());
+                        self.credential_input = None;
+                        self.start_credential(source, None);
+                    }
+                    KeyCode::Backspace => { field.pop(); }
+                    KeyCode::Char(ch) if !ch.is_control() && field.len() + ch.len_utf8() <= 1024
+                        && (key.modifiers.is_empty() || key.modifiers == crossterm::event::KeyModifiers::SHIFT) => field.push(ch),
+                    _ => {},
+                }
+                return false;
+            }
             if let Some(revision) = self.headless_review {
                 match key.code {
                     KeyCode::Char('y') => {
@@ -378,6 +459,10 @@ impl StatusPanel {
                 if key.code == KeyCode::Char('x') {
                     self.client_confirm = Some(false);
                 }
+                return false;
+            }
+            if self.pending.is_none() && !self.committing && key.code == KeyCode::Char('c') {
+                self.credential_input = Some(String::new());
                 return false;
             }
             if self.pending.is_none()
@@ -480,10 +565,30 @@ impl StatusPanel {
             Ok(Update::Trust(review))=>self.trust_review=Some(review),
             Ok(Update::Expiry(review))=>self.expiry_review=Some(review),
             Ok(Update::HeadlessReview(revision))=>self.headless_review=Some(revision),
+            Ok(Update::CredentialReview(source, approval, revision))=>self.credential_review=Some((source, approval, revision)),
+            Ok(Update::CredentialSaved(editor))=>{
+                self.digest=editor.saved_sha256();
+                self.client_active=editor.selected_record_is_active();
+                self.refreshed_editor=Some(editor);
+                self.report="Credential сохранён, trust не изменён. Для новых соединений требуется отдельный Apply или запуск.".into();
+            }
+            Err(Error::Indeterminate)=>{
+                self.reopen_required=true;
+                self.report="Запись могла состояться. Закройте экран и перечитайте конфигурацию с диска, не повторяйте операцию вслепую.".into();
+            }
             Err(error)=>self.report=format!("Операция не подтверждена: {error}\nПри неопределённой записи сначала перечитайте сохранённый и runtime статус. Не повторяйте вслепую."),
         }
     }
     pub(crate) fn body(&self) -> String {
+        if self.reopen_required {
+            return format!("{}\nEsc: закрыть", self.report);
+        }
+        if let Some(field) = &self.credential_input {
+            return format!("Обновить credential, не меняя trust.\nАбсолютный путь к приватному приглашению: [скрыто, {} bytes]\nEnter: предпросмотр | Esc: отменить", field.len());
+        }
+        if let Some((_, _, revision)) = &self.credential_review {
+            return format!("Credential-only refresh: revision={revision}.\nБудут созданы новые приватные файлы; trust, runtime и OS proxy не изменяются.\ny: сохранить | n/Esc: отменить");
+        }
         if let Some(revision) = self.headless_review {
             return format!("Headless Apply: revision={revision}; точный сохранённый TOML проверен. Меняются только будущие локальные соединения, OS proxy и listeners сохраняются.\ny: применить | n/Esc: отменить");
         }
@@ -535,9 +640,9 @@ impl StatusPanel {
             if self.server {
                 "t: начать ротацию | p: отозвать старый ключ после overlap | e: восстановить истёкший descriptor | "
             } else if self.client_active {
-                "s: запустить локальный runtime | h: headless Apply | o: recovery | k: promotion | "
+                "s: запустить локальный runtime | h: headless Apply | o: recovery | k: promotion | c: сменить credential | "
             } else {
-                "o: recovery | k: promotion | для запуска выберите активный профиль | "
+                "o: recovery | k: promotion | c: сменить credential | для запуска выберите активный профиль | "
             }
         )
     }
@@ -567,8 +672,25 @@ mod tests {
             trust_review: None,
             expiry_review: None,
             headless_review: None,
+            credential_input: None,
+            credential_review: None,
+            refreshed_editor: None,
+            reopen_required: false,
         }
     }
+    #[test]
+    fn credential_input_is_hidden_and_cancel_does_not_start_a_worker() {
+        let mut p = panel(true);
+        assert!(!p.key(key(KeyCode::Char('c'))));
+        p.paste("private-invitation");
+        assert!(!p.body().contains("private-invitation"));
+        assert!(p.pending.is_none());
+        assert!(!p.key(key(KeyCode::Esc)));
+        assert!(p.credential_input.is_none());
+        assert!(p.pending.is_none());
+        assert!(p.credential_review.is_none());
+    }
+
     #[test]
     fn runtime_and_trust_inputs_never_implicitly_apply() {
         let mut p = panel(true);

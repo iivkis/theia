@@ -404,6 +404,16 @@ pub(crate) fn preview_credential_refresh(
     Ok((p.approval, p.revision))
 }
 
+pub(crate) fn preview_credential_refresh_for_editor(
+    path: &Path, digest: [u8; 32], id: &str, source: &Path, now: u64,
+) -> Result<([u8; 32], u64), Error> {
+    let p = prepare_credential(path, id, source, now)?;
+    if <[u8; 32]>::from(Sha256::digest(&p.original)) != digest {
+        return Err(Error::Approval);
+    }
+    Ok((p.approval, p.revision))
+}
+
 pub(crate) fn save_credential_refresh(
     path: &Path, id: &str, source: &Path, expected: [u8; 32], now: u64,
 ) -> Result<(), Error> {

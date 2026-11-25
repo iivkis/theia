@@ -2105,6 +2105,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(status) = interaction.reality_status.as_mut() {
             status.poll();
+            if let Some(editor) = status.take_refreshed_editor() {
+                interaction.editor = Some(editor);
+            }
         }
         if let Some(registration) = interaction.reality_registration.as_mut() {
             if let Some(editor) = registration.poll() {
