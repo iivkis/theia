@@ -325,11 +325,10 @@ impl RegistrationPanel {
             },
             KeyCode::Char(ch)
                 if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-                    && !ch.is_control() =>
+                    && !ch.is_control()
+                    && self.fields[self.focus].len() + ch.len_utf8() <= MAX_FIELD =>
             {
-                if self.fields[self.focus].len() + ch.len_utf8() <= MAX_FIELD {
-                    self.fields[self.focus].push(ch);
-                }
+                self.fields[self.focus].push(ch);
             }
             _ => {}
         }

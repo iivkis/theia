@@ -1713,7 +1713,7 @@ pub(crate) struct CapturedTls {
 enum CapturedMaterial {
     Pem(CapturedPem),
     Reality(
-        crate::reality_generation::Candidate,
+        Box<crate::reality_generation::Candidate>,
         crate::reload_preflight::IdentityHash,
     ),
 }
@@ -1750,7 +1750,7 @@ impl CapturedTls {
                     hash.update(chunk);
                 }
                 pairs.push(CapturedMaterial::Reality(
-                    candidate,
+                    Box::new(candidate),
                     crate::reload_preflight::IdentityHash::reality(binding),
                 ));
                 continue;
@@ -1922,7 +1922,7 @@ enum ReadyListener {
         crate::reality_tcp::PreparedTcp,
         Option<crate::reality_quic::PreparedQuic>,
         Option<tokio::net::UdpSocket>,
-        crate::reality_generation::Manager,
+        Box<crate::reality_generation::Manager>,
         Arc<crate::reality_live::Live>,
     ),
 }
@@ -2023,7 +2023,7 @@ async fn prepare_selected_listeners(
                 inbound.id.clone(),
                 (binding.manifest_sha256, carrier.clone()),
             );
-            listeners.push(ReadyListener::Reality(tcp, quic, silent, manager, carrier));
+            listeners.push(ReadyListener::Reality(tcp, quic, silent, Box::new(manager), carrier));
             continue;
         }
         let material = match captured {
@@ -2202,7 +2202,7 @@ impl RunningGeneration {
                 }
                 ReadyListener::Reality(tcp, quic, silent, manager, carrier) => {
                     let root = manager.root_fingerprint();
-                    let manager = Arc::new(tokio::sync::Mutex::new(Arc::new(manager)));
+                    let manager = Arc::new(tokio::sync::Mutex::new(Arc::new(*manager)));
                     self.reality.push(HotReality {
                         id: id.clone(),
                         carrier: carrier.clone(),
@@ -2558,9 +2558,7 @@ fn commit_same_port_reality(
                 request.expected_revision,
                 next,
                 auth,
-                &inbound.id,
-                old.manifest_sha256,
-                binding.manifest_sha256,
+                (&inbound.id, old.manifest_sha256, binding.manifest_sha256),
                 || {
                     publish();
                     *manager = Arc::new(next_manager);
@@ -3123,10 +3121,7 @@ fn has_reality(document: &ServerDocument) -> bool {
 /// captured once for both transports, and every inbound shares accounting.
 /// The current REALITY generation is immutable; ordinary own-TLS hot
 /// replacement cannot mutate it. Management is status-only in this mode.
-async fn run_reality_document(document: ServerDocument) -> Result<(), ServerError> {
-    run_reality_document_inner(document, None, None).await
-}
-
+#[cfg(test)]
 pub(crate) async fn run_reality_document_with_ready(
     document: ServerDocument,
     started: Option<tokio::sync::oneshot::Sender<()>>,
@@ -3174,7 +3169,7 @@ async fn run_reality_document_inner(
             crate::reality_tcp::PreparedTcp,
             Option<crate::reality_quic::PreparedQuic>,
             Option<tokio::net::UdpSocket>,
-            crate::reality_generation::Manager,
+            Box<crate::reality_generation::Manager>,
             Arc<crate::reality_live::Live>,
         ),
     }
@@ -3259,7 +3254,7 @@ async fn run_reality_document_inner(
                     live_generation.clone(),
                 ),
             );
-            ready.push(Ready::Reality(tcp, quic, silent, manager, live_generation));
+            ready.push(Ready::Reality(tcp, quic, silent, Box::new(manager), live_generation));
         } else {
             let material = tls_material(inbound)?;
             #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -3837,7 +3832,10 @@ mod hardening_tests {
             STANDARD.encode(generated.key_pair.serialize_der())
         );
         std::fs::write(&cert_path, &cert_pem).unwrap();
+        #[cfg(not(windows))]
         std::fs::write(&key_path, &key_pem).unwrap();
+        #[cfg(windows)]
+        crate::bounded_input::write_test_private(&key_path, &key_pem);
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3911,7 +3909,10 @@ mod hardening_tests {
             let cert = directory.join(format!("{name}.pem"));
             let key = directory.join(format!("{name}.key"));
             fs::write(&cert, generated.cert.pem()).unwrap();
+            #[cfg(not(windows))]
             fs::write(&key, generated.key_pair.serialize_pem()).unwrap();
+            #[cfg(windows)]
+            crate::bounded_input::write_test_private(&key, generated.key_pair.serialize_pem());
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

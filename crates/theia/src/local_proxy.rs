@@ -1883,10 +1883,9 @@ mod selector_tests {
                     task.abort();
                     let _ = task.await;
                 }
-                assert!(match (&current.carrier, socks_mode) {
-                    (RealityCarrier::H2(_), false) | (RealityCarrier::H3(_), true) => true,
-                    _ => false,
-                });
+                assert!(matches!((&current.carrier, socks_mode),
+                    (RealityCarrier::H2(_), false) | (RealityCarrier::H3(_), true)
+                ));
                 let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let listen = if socks_mode {
@@ -2038,7 +2037,7 @@ mod selector_tests {
                 h3_status: Some(200),
             };
             store
-                .fixture_record(vec![Evidence::default(), good.clone()], now - 301)
+                .fixture_record(vec![Evidence::default(), good], now - 301)
                 .unwrap();
             store
                 .fixture_record(vec![Evidence::default(), good], now - 1)

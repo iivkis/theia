@@ -265,9 +265,7 @@ impl Live {
     pub(crate) fn status(&self) -> Option<crate::reality_generation::Status> {
         let now = crate::reference_health::unix_now().ok()?;
         let generation = self.current()?;
-        if generation.relay_value(now).is_none() {
-            return None;
-        }
+        generation.relay_value(now)?;
         let mut status = generation.lease.status();
         let p = generation.lease.publication();
         status.active_usable = p.active().verified().check_time(now).is_ok();
