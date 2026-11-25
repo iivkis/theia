@@ -7,12 +7,19 @@ use std::path::{Path, PathBuf};
 pub(crate) struct StagedMaterial {
     root: PathBuf,
     config: PathBuf,
-    source: [u8; 32],
+    source: Option<[u8; 32]>,
     armed: bool,
 }
 impl StagedMaterial {
     pub(crate) fn create(root: &Path, config: &Path, source: [u8; 32]) -> Result<Self, Error> {
-        if !crate::bounded_input::explicit_file_path(root) || root.parent() != config.parent() {
+        Self::create_for(root, config, Some(source))
+    }
+    pub(crate) fn create_for_new_config(root: &Path, config: &Path) -> Result<Self, Error> {
+        Self::create_for(root, config, None)
+    }
+    fn create_for(root: &Path, config: &Path, source: Option<[u8; 32]>) -> Result<Self, Error> {
+        if !crate::bounded_input::explicit_file_path(config)
+            || !crate::bounded_input::explicit_file_path(root) || root.parent() != config.parent() {
             return Err(Error::Storage);
         }
         if !Self::unchanged(config, source) {
@@ -26,8 +33,13 @@ impl StagedMaterial {
             armed: true,
         })
     }
-    fn unchanged(path: &Path, source: [u8; 32]) -> bool {
-        config::editor_bytes(path).is_ok_and(|raw| <[u8; 32]>::from(Sha256::digest(raw)) == source)
+    fn unchanged(path: &Path, source: Option<[u8; 32]>) -> bool {
+        match source {
+            Some(source) => config::editor_bytes(path)
+                .is_ok_and(|raw| <[u8; 32]>::from(Sha256::digest(raw)) == source),
+            None => matches!(std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+        }
     }
     pub(crate) fn root(&self) -> &Path {
         &self.root
