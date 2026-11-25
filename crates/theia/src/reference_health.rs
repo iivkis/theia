@@ -1277,8 +1277,17 @@ mod tests {
         .unwrap();
         config.alpn_protocols = vec![b"h2".to_vec()];
         let acceptor = TlsAcceptor::from(Arc::new(config));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (listener, udp_socket) = crate::shared_port::reserve_shared_port();
         let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        udp_socket.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(crate::quic_transport::server_config(vec![cert], key.into()).unwrap()),
+            udp_socket,
+            Arc::new(quinn::TokioRuntime),
+        ).unwrap();
         let tcp = Driver(tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let Ok(tls) = acceptor.accept(socket).await else {
@@ -1299,8 +1308,6 @@ mod tests {
                     .unwrap();
             }
         }));
-        let endpoint =
-            crate::quic_transport::server_endpoint(address, vec![cert], key.into()).unwrap();
         let udp = Driver(tokio::spawn(async move {
             let incoming = endpoint.accept().await.unwrap();
             let Ok(connection) = crate::quic_transport::accept(incoming).await else {
