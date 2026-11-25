@@ -152,6 +152,7 @@ pub enum StatusReply {
         config_sha256: [u8; 32],
         descriptor_revision: u64,
         transport: u8,
+        xhttp: u8,
         fallback: bool,
     },
     ClientReady {
@@ -1014,13 +1015,13 @@ where
     let response = if !newline {
         "ERR unsupported\n".into()
     } else if command == b"client-status" {
-        let (revision, digest, descriptor, transport, fallback) = client.status().await;
+        let (revision, digest, descriptor, transport, xhttp, fallback) = client.status().await;
         let hex = digest
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         format!(
-            "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} f={}\n",
+            "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} x={xhttp} f={}\n",
             u8::from(fallback)
         )
     } else {
@@ -1228,13 +1229,16 @@ where
                     "3" => 3,
                     _ => return None,
                 };
+                let xhttp = match fields.next()?.strip_prefix("x=")? {
+                    "0" => 0, "1" => 1, "2" => 2, _ => return None,
+                };
                 let fallback = match fields.next()?.strip_prefix("f=")? {
                     "0" => false,
                     "1" => true,
                     _ => return None,
                 };
                 if fields.next().is_some()
-                    || (descriptor_revision == 0 && (transport != 0 || fallback))
+                    || ((transport == 0) != (xhttp == 0))
                 {
                     return None;
                 }
@@ -1243,6 +1247,7 @@ where
                     config_sha256,
                     descriptor_revision,
                     transport,
+                    xhttp,
                     fallback,
                 })
             }
@@ -1868,9 +1873,9 @@ mod strict_wire_matrix_tests {
     async fn client_status_requires_canonical_fields_and_exact_revision_cas() {
         let hex = "ab".repeat(32);
         let status = StatusCommand::ClientStatus;
-        for (d, t, f) in [(0, 0, false), (3, 2, true), (4, 3, false)] {
+        for (d, t, x, f) in [(0, 0, 0, false), (0, 2, 1, true), (0, 3, 2, false), (3, 2, 2, true), (4, 3, 1, false)] {
             let response = format!(
-                "theia-client-v1 r=7 sha256={hex} d={d} t={t} f={}\n",
+                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={}\n",
                 u8::from(f)
             );
             assert_eq!(
@@ -1880,19 +1885,20 @@ mod strict_wire_matrix_tests {
                     config_sha256: [0xab; 32],
                     descriptor_revision: d,
                     transport: t,
+                    xhttp: x,
                     fallback: f
                 })
             );
         }
         for response in [
-            format!("theia-client-v1 r=07 sha256={hex} d=0 t=0 f=0\n"),
-            format!("theia-client-v1 r=7 sha256={hex} d=0 t=3 f=0\n"),
-            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 f=1\n"),
-            format!("theia-client-v1 r=7 sha256={hex} d=1 t=1 f=0\n"),
-            format!("theia-client-v1 r=7 sha256={hex} d=1 t=2 f=2\n"),
-            format!("theia-client-v1 r=7 sha256={hex} d=1 t=2 f=0 extra\n"),
+            format!("theia-client-v1 r=07 sha256={hex} d=0 t=0 x=0 f=0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=3 x=0 f=0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=1 f=1\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=1 t=1 x=1 f=0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=1 t=2 x=1 f=2\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=1 t=2 x=2 f=0 extra\n"),
             format!(
-                "theia-client-v1 r=7 sha256={} d=1 t=2 f=0\n",
+                "theia-client-v1 r=7 sha256={} d=1 t=2 x=1 f=0\n",
                 hex.to_uppercase()
             ),
         ] {

@@ -208,7 +208,7 @@ enum Carrier {
 }
 struct DirectClient {
     carrier: Carrier,
-    last_transport: std::sync::atomic::AtomicU8,
+    last_open: std::sync::atomic::AtomicU8,
 }
 impl DirectClient {
     fn fallback(&self) -> bool {
@@ -221,15 +221,16 @@ impl DirectClient {
             _ => false,
         }
     }
+    fn last_xhttp(&self) -> u8 { self.last_open.load(std::sync::atomic::Ordering::Relaxed) & 3 }
     fn last_transport(&self) -> u8 {
-        self.last_transport.load(std::sync::atomic::Ordering::Relaxed)
+        self.last_open.load(std::sync::atomic::Ordering::Relaxed) >> 2
     }
 }
 struct RealityGeneration {
     value: crate::descriptor::Verified,
     carrier: Carrier,
     credential_digest: [u8; 32],
-    last_transport: std::sync::atomic::AtomicU8,
+    last_open: std::sync::atomic::AtomicU8,
     last_refresh: std::sync::atomic::AtomicU8,
 }
 pub(crate) struct RealityClient {
@@ -309,7 +310,7 @@ impl RealityClient {
             value,
             carrier,
             credential_digest,
-            last_transport: std::sync::atomic::AtomicU8::new(0),
+            last_open: std::sync::atomic::AtomicU8::new(0),
             last_refresh: std::sync::atomic::AtomicU8::new(0),
         })
     }
@@ -357,11 +358,8 @@ impl RealityClient {
         let generation = self.generation().await?;
         let result = generation.carrier.open(address, port).await;
         if let Ok(tunnel) = &result {
-            generation.last_transport.store(
-                match tunnel {
-                    ProxyTunnel::H2(_) => 2,
-                    ProxyTunnel::H3(_) => 3,
-                },
+            generation.last_open.store(
+                tunnel.open_code(),
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
@@ -386,7 +384,8 @@ impl RealityClient {
             }),
             _ => None,
         };
-        let transport = match generation.last_transport.load(Ordering::Relaxed) {
+        let observed = generation.last_open.load(Ordering::Relaxed);
+        let transport = match observed >> 2 {
             2 => "H2",
             3 => "H3",
             _ => "ещё нет подтверждённого OPEN",
@@ -411,9 +410,10 @@ impl RealityClient {
             Some(_) => "изменилось, новые запросы перепроверят",
             None => "не подтверждено, новые запросы могут быть отклонены",
         };
-        format!("Loopback listeners работают (не доказательство удалённого соединения)\nrevision={} reference_index={} valid_now={valid}\npolicy={policy} last_open={transport}\nH3 negative cache: {}\nDescriptor refresh: {refresh}\nSaved trust: {trust_state}",
+        format!("Loopback listeners работают (не доказательство удалённого соединения)\nrevision={} reference_index={} valid_now={valid}\npolicy={policy} last_open={transport}; XHTTP={}\nH3 negative cache: {}\nDescriptor refresh: {refresh}\nSaved trust: {trust_state}",
             value.descriptor().revision,value.descriptor().active_reference,
-            fallback.map_or("не применяется",|v|if v{"активен"}else{"не активен"}))
+            xhttp_observation(observed & 3),
+            fallback.map_or("не применяется",|v|if v{"активен: временная сетевая недоступность QUIC"}else{"не активен"}))
     }
     async fn refresh(&self, generation: &RealityGeneration) -> Result<(), ClientError> {
         let enrollment = crate::reality_config::pinned_client(&self.profile)
@@ -921,7 +921,7 @@ impl ProxyClient {
     fn direct(carrier: Carrier) -> Self {
         Self::Direct(Arc::new(DirectClient {
             carrier,
-            last_transport: std::sync::atomic::AtomicU8::new(0),
+            last_open: std::sync::atomic::AtomicU8::new(0),
         }))
     }
 
@@ -939,7 +939,7 @@ impl ProxyClient {
                     3 => "H3",
                     _ => "ещё нет подтверждённого OPEN",
                 };
-                format!("Loopback listeners работают (не доказательство удалённого соединения)\nOwn-TLS policy={policy}; last_open={opened}\nH3 negative cache: {}", d.fallback())
+                format!("Loopback listeners работают (не доказательство удалённого соединения)\nOwn-TLS policy={policy}; last_open={opened}; XHTTP={}\nH3 negative cache: {}", xhttp_observation(d.last_xhttp()), if d.fallback() { "активен: временная сетевая недоступность QUIC" } else { "не активен" })
             }
         }
     }
@@ -955,8 +955,8 @@ impl ProxyClient {
         match self {
             Self::Direct(client) => {
                 let tunnel = client.carrier.open(address, port).await?;
-                client.last_transport.store(
-                    match &tunnel { ProxyTunnel::H2(_) => 2, ProxyTunnel::H3(_) => 3 },
+                client.last_open.store(
+                    tunnel.open_code(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 Ok(tunnel)
@@ -972,7 +972,19 @@ impl ProxyClient {
     }
 }
 
+pub(crate) fn xhttp_observation(code: u8) -> &'static str {
+    match code { 1 => "stream-one", 2 => "stream-up", _ => "не подтверждён" }
+}
+
 impl ProxyTunnel {
+    fn open_code(&self) -> u8 {
+        let (transport, up) = match self {
+            Self::H2(t) => (2, t.opened_stream_up()),
+            Self::H3(t) => (3, t.opened_stream_up()),
+        };
+        (transport << 2) | if up { 2 } else { 1 }
+    }
+
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
         match self {
             Self::H2(tunnel) => tunnel.relay(socket).await,
@@ -1029,9 +1041,9 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, bool) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool) {
         let view = self.slot.borrow().clone();
-        let (desc, transport, fallback) = match &view.client {
+        let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
                 let g = r.current.lock().await.clone();
                 let fallback = match &g.carrier {
@@ -1044,13 +1056,13 @@ impl ClientRuntime {
                 };
                 (
                     g.value.descriptor().revision,
-                    g.last_transport.load(std::sync::atomic::Ordering::Relaxed),
+                    g.last_open.load(std::sync::atomic::Ordering::Relaxed),
                     fallback,
                 )
             }
-            ProxyClient::Direct(d) => (0, d.last_transport(), d.fallback()),
+            ProxyClient::Direct(d) => (0, d.last_open.load(std::sync::atomic::Ordering::Relaxed), d.fallback()),
         };
-        (view.revision, view.digest, desc, transport, fallback)
+        (view.revision, view.digest, desc, observed >> 2, observed & 3, fallback)
     }
     async fn candidate(
         &self,

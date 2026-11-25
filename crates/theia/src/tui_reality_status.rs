@@ -146,9 +146,9 @@ impl StatusPanel {
                             .ok()
                         });
                     let live=match response{
-                        Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,fallback}) if config_sha256 == digest && selected_active =>
-                            format!("Headless runtime: revision={revision}; saved TOML совпадает={}\ndescriptor_revision={descriptor_revision}; last_open={}; H3 fallback={fallback}",
-                                config_sha256==digest,match transport{2=>"H2",3=>"H3",_=>"не подтверждён"}),
+                        Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback}) if config_sha256 == digest && selected_active =>
+                            format!("Headless runtime: revision={revision}; saved TOML совпадает={}\ndescriptor_revision={descriptor_revision}; last_open={}; XHTTP={}; H3 negative cache={}",
+                                config_sha256==digest,match transport{2=>"H2",3=>"H3",_=>"не подтверждён"}, crate::local_proxy::xhttp_observation(xhttp), if fallback {"активен: временная сетевая недоступность QUIC"} else {"не активен"}),
                         Some(StatusReply::ClientRunning{revision,..})=>format!("Headless runtime: revision={revision}; выбранный профиль не подтверждён для этого TOML."),
                         _=>"Headless runtime: защищённый IPC не подтверждён.".into(),
                     };

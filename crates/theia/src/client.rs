@@ -883,6 +883,7 @@ impl H2Client {
                 lease.admitted();
                 Ok(Tunnel {
                     operation,
+                    stream_up,
                     incoming,
                     outgoing,
                     decoder,
@@ -959,6 +960,7 @@ impl Drop for Driver {
 /// A lease keeps the shared verified connection alive for this tunnel.
 pub struct Tunnel {
     operation: u64,
+    stream_up: bool,
     incoming: h2::RecvStream,
     outgoing: h2::SendStream<Bytes>,
     decoder: IncomingFrames,
@@ -967,6 +969,7 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    pub(crate) fn opened_stream_up(&self) -> bool { self.stream_up }
     /// True when both tunnels share one verified transport connection.
     /// Does not reveal peer addresses, credentials or connection identifiers.
     pub fn shares_transport_with(&self, other: &Self) -> bool {

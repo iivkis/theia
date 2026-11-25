@@ -556,6 +556,7 @@ mod tests {
         assert!(p.body().contains("Независимая замена"));
         p.stage = Stage::Confirm(Box::new(Review {
             request,
+            selected_id: "selected".into(),
             approval: [0; 32],
             body: "review".into(),
         }));
