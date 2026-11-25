@@ -18,7 +18,6 @@ use tokio::{
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_HEADERS: u64 = 8192;
 type Tx = RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 type Rx = RequestStream<h3_quinn::RecvStream, Bytes>;
 
@@ -489,7 +488,7 @@ impl H3Client {
             "op" = Value::Count(operation)
         );
         let mut builder = h3::client::builder();
-        builder.max_field_section_size(MAX_HEADERS);
+        builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
         let (mut driver, sender) = builder
             .build::<_, _, Bytes>(h3_quinn::Connection::new(connection))
             .await

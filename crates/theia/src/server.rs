@@ -32,8 +32,6 @@ use tokio_rustls::TlsAcceptor;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PEM_BYTES: u64 = 1024 * 1024;
-const MAX_H2_STREAMS: u32 = 32;
-const MAX_HEADER_BYTES: u32 = 8192;
 const AUTH_WINDOW: Duration = Duration::from_secs(60);
 const AUTH_ATTEMPTS: u32 = 120;
 const MAX_TRACKED_PEERS: usize = 4096;
@@ -1015,7 +1013,10 @@ pub(crate) async fn serve_h2_socket<S>(
             return;
         }
     };
-    if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+    if !crate::transport_policy::Carrier::H2.accepts_tls(
+        tls.get_ref().1.protocol_version(),
+        tls.get_ref().1.alpn_protocol(),
+    ) {
         crate::diag!(
             Warn,
             "server.h2",
@@ -1044,9 +1045,7 @@ pub(crate) async fn serve_h2_socket<S>(
     } else {
         None
     };
-    let mut builder = h2::server::Builder::new();
-    builder.max_concurrent_streams(MAX_H2_STREAMS);
-    builder.max_header_list_size(MAX_HEADER_BYTES);
+    let builder = crate::transport_policy::Carrier::H2.h2_server();
     let Ok(Ok(mut connection)) = timeout(HANDSHAKE_TIMEOUT, builder.handshake(tls)).await else {
         crate::diag!(
             Warn,
@@ -1886,16 +1885,9 @@ fn tls_acceptor(
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
 ) -> Result<TlsAcceptor, ServerError> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| ServerError::Tls)?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .map_err(|_| ServerError::Tls)?;
-    tls.alpn_protocols = vec![b"h2".to_vec()];
-    tls.max_early_data_size = 0;
+    let tls = crate::transport_policy::Carrier::H2
+        .server_tls(certs, key)
+        .map_err(|_| ServerError::Tls)?;
     Ok(TlsAcceptor::from(Arc::new(tls)))
 }
 

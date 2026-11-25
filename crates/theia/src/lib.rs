@@ -61,6 +61,7 @@ pub mod security_profile;
 pub mod server;
 mod split_http;
 mod tcp_bbr;
+pub mod transport_policy;
 pub mod tui;
 pub(crate) mod tui_candidate_batch;
 pub(crate) mod tui_candidates;

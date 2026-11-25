@@ -75,11 +75,15 @@ pub enum Branch {
 }
 
 impl Branch {
-    fn alpn(self) -> &'static [u8] {
+    fn carrier(self) -> crate::transport_policy::Carrier {
         match self {
-            Self::H2 => b"h2",
-            Self::H3 => b"h3",
+            Self::H2 => crate::transport_policy::Carrier::H2,
+            Self::H3 => crate::transport_policy::Carrier::H3,
         }
+    }
+
+    fn alpn(self) -> &'static [u8] {
+        self.carrier().alpn()
     }
 }
 
@@ -319,8 +323,7 @@ impl Identity {
                 .map_err(|_| Error::Tls)?
                 .with_no_client_auth()
                 .with_cert_resolver(resolver);
-        config.alpn_protocols = vec![branch.alpn().to_vec()];
-        config.max_early_data_size = 0;
+        branch.carrier().configure_server(&mut config);
         config.send_tls13_tickets = 0;
         Ok(config)
     }
@@ -340,8 +343,7 @@ impl Identity {
                 .with_no_client_auth()
                 .with_single_cert(vec![leaf], key)
                 .map_err(|_| Error::Tls)?;
-        config.alpn_protocols = vec![branch.alpn().to_vec()];
-        config.max_early_data_size = 0;
+        branch.carrier().configure_server(&mut config);
         config.send_tls13_tickets = 0;
         Ok(config)
     }
@@ -448,14 +450,9 @@ impl rustls::server::ResolvesServerCert for RenewingLeaf {
 /// Independent trust, reconstructed only from the enrolled key and scope.
 /// Do not append public/system roots or accept a root from the peer.
 pub fn client_tls(scope: &Scope, public: [u8; 32], branch: Branch) -> Result<ClientConfig, Error> {
-    let mut config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| Error::Tls)?
-            .with_root_certificates(pinned_roots(scope, public, branch)?)
-            .with_no_client_auth();
-    config.alpn_protocols = vec![branch.alpn().to_vec()];
-    config.enable_early_data = false;
+    let mut config = branch.carrier()
+        .client_tls(pinned_roots(scope, public, branch)?)
+        .map_err(|_| Error::Tls)?;
     config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
