@@ -551,7 +551,7 @@ struct Interaction {
 impl Interaction {
     fn new(editor: Option<Editor>) -> Self {
         Self {
-            workspace_page: if editor.as_ref().is_some_and(|e| e.role() == Role::Client) { 3 } else { usize::from(editor.is_some()) },
+            workspace_page: usize::from(editor.is_some()),
             workspace_focus: WorkspaceFocus::Fields,
             workspace_action: 0,
             workspace_user: 0,
@@ -3948,7 +3948,7 @@ fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> 
     if area.height < 14 { return None; }
     let minimum = if page == 1 { 10 } else { 6 };
     let height = action_height.min(area.height.saturating_sub(minimum)).max(3);
-    let preferred = if page == 1 { 20 } else if role == Role::Client && page == 3 { 17 } else if role == Role::Server && matches!(page, 2 | 3) { 12 } else { 10 };
+    let preferred = if page == 1 { 20 } else if role == Role::Client && page == 3 { 23 } else if role == Role::Server && matches!(page, 2 | 3) { 12 } else { 10 };
     let content_height = preferred.min(area.height.saturating_sub(height));
     let content = Rect::new(area.x, area.y, area.width, content_height);
     let controls = Rect::new(area.x, content.bottom(), area.width, height);
@@ -4067,8 +4067,6 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
     } else {
         let description = match (role,page) {
             (Role::Client,2) => "Получите приглашение у администратора.\n\n1. Вставьте ссылку или выберите файл / QR.\n2. Проверьте адрес и доверие.\n3. Сохраните профиль и отдельно подключитесь.\n\nИмпорт сам по себе не включает прокси.",
-            (Role::Client,3) if cfg!(windows) => "Системный HTTP-прокси Windows.\n\nВключается только по отдельному подтверждению. Это не VPN.",
-            (Role::Client,3) => "Системный прокси Windows недоступен на Linux.\n\nИспользуйте локальные HTTP/SOCKS-прокси клиента в настройках приложений.",
             (_,4) => "Монитор трафика\n\nИсточник: локальный процесс Theia.\nПоказывает объём, скорость и активные туннели H2/H3.\nВнешние процессы не измеряются этой панелью.\n\nF4 — открыть монитор.",
             (_,5) => "Настройки хранятся в файле TOML.\n\nСохранить — записать изменения на диск.\nПрименить — отдельно проверить и изменить работающий процесс.\n\nОткрытие другого файла не запускает сервис.",
             _ => "Проверка состояния\n\nНачните с локальной диагностики.\nСетевые запросы требуют отдельного согласия.\nРезультат проверки не означает, что туннель уже работает.",
@@ -4386,6 +4384,10 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut model = Model::new(role);
     let mut interaction = Interaction::new(editor);
+    if interaction.editor_for(Role::Client).is_some() {
+        interaction.workspace_page = 3;
+        interaction.workspace_focus = WorkspaceFocus::Actions;
+    }
     if interaction.editor.is_none() {
         interaction.welcome_choice = ConfigDialog::suggested_mode(model.selected);
     }
@@ -4565,6 +4567,42 @@ mod tests {
     }
 
     #[test]
+    fn client_connection_modes_are_visible_and_do_not_start_or_write_on_selection() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("connection-modes").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("client.toml");
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Char('P')));
+        assert_eq!(ui.workspace_page, 3);
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        for label in ["Системный прокси", "TUN / VPN", "Локальный прокси", "Активный профиль", "127.0.0.1"] {
+            assert!(screen.contains(label), "missing {label}");
+        }
+        assert!(!ui.owned_running(Role::Client));
+        assert!(ui.reality_status.is_none());
+        let keys = page_actions(Role::Client, 3, ui.editor.as_ref());
+        assert_eq!(keys.iter().any(|a| a.key == 'p'), cfg!(windows));
+        ui.update(&mut model, press(KeyCode::Down));
+        assert!(!ui.owned_running(Role::Client));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // The saved permission is separate from all operating-system effects.
+        let editor = ui.editor.as_mut().unwrap();
+        assert!(!editor.system_proxy_allowed());
+        let review = editor.review_system_proxy_permission().unwrap();
+        assert!(review.body().contains("Прокси Windows и соединение не изменятся"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        editor.stage_record(review).unwrap();
+        assert!(!editor.system_proxy_allowed());
+        assert!(editor.save());
+        assert!(editor.system_proxy_allowed());
+        assert!(!ui.owned_running(Role::Client));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn client_proxy_shortcut_refuses_dirty_or_unconfigured_editor() {
         let path =
             std::env::temp_dir().join(format!("theia-tui-proxy-{}.toml", std::process::id()));
@@ -4587,7 +4625,7 @@ mod tests {
             ui.update(&mut model, press(KeyCode::Char('p')));
             assert_eq!(
                 ui.editor.as_ref().unwrap().error.as_deref(),
-                Some("Системный прокси: только Windows.")
+                Some("Системный прокси Linux пока не реализован. Выберите локальный HTTP/SOCKS5.")
             );
         }
         std::fs::remove_file(path).unwrap();

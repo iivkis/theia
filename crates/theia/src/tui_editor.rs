@@ -1178,6 +1178,7 @@ impl Editor {
             if doc.client.proxy.system_proxy == config::SystemProxy::Manual)
     }
 
+    #[cfg(any(windows, test))]
     pub(crate) fn review_system_proxy_permission(&self) -> Result<RecordReview, &'static str> {
         self.require_clean_records()?;
         if self.write_uncertain { return Err("Откройте настройки заново."); }
