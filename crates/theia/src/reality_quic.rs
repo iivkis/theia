@@ -625,7 +625,10 @@ impl AsyncUdpSocket for LocalSocket {
         if transmit.segment_size.is_some() {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        let socket = self.socket.lock().map_err(|_| io::Error::other("QUIC send lock"))?;
+        let socket = self
+            .socket
+            .lock()
+            .map_err(|_| io::Error::other("QUIC send lock"))?;
         let socket = socket.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
         let result = socket.try_send_to(transmit.contents, transmit.destination);
         match result {
@@ -669,8 +672,12 @@ impl AsyncUdpSocket for LocalSocket {
         }
     }
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.lock().map_err(|_| io::Error::other("QUIC send lock"))?
-            .as_ref().ok_or(io::ErrorKind::BrokenPipe)?.local_addr()
+        self.socket
+            .lock()
+            .map_err(|_| io::Error::other("QUIC send lock"))?
+            .as_ref()
+            .ok_or(io::ErrorKind::BrokenPipe)?
+            .local_addr()
     }
     fn may_fragment(&self) -> bool {
         true
@@ -1067,7 +1074,10 @@ mod tests {
         assert_eq!(driver.local_addr().unwrap(), address);
         virtual_socket.detach();
         drop(physical);
-        assert_eq!(driver.local_addr().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            driver.local_addr().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
         let _replacement = UdpSocket::bind(address).await.unwrap();
     }
     fn peer(port: u16) -> SocketAddr {
