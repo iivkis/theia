@@ -147,8 +147,7 @@ impl State {
             return Err(LiveAuthError::StaleRevision);
         }
         let mut rollback=self.auth_rollback.write().map_err(|_|LiveAuthError::Unavailable)?;
-        let staged = view.live.stage(candidate, expected)?;
-        let revision = view.live.publish(staged)?;
+        let revision=self.publish_managed_auth(view,candidate,expected)?;
         *rollback=if view.document.server.inbounds.iter().any(|i|i.reality.is_some()){
             Some(AuthRollback{document:view.document.clone(),revision,
                 until:Instant::now()+std::time::Duration::from_secs(300)})
@@ -163,6 +162,22 @@ impl State {
             live: Arc::new(view.live.with_new_baseline(candidate.clone())),
         });
         Ok(revision)
+    }
+
+    // Caller owns the runtime writer lock. No live auth or quota change
+    // occurs until the entire candidate and occupancy transition are staged.
+    fn publish_managed_auth(&self,view:&Arc<View>,candidate:&ServerDocument,expected:u64)->Result<u64,LiveAuthError>{
+        if let Some(ledger)=&self.reality_ledger{
+            crate::reload_preflight::assess_managed_reload(&view.document,candidate)
+                .map_err(|_|LiveAuthError::RequiresRestart)?;
+            let (_,stage)=view.live.prepare_tls_rebase(candidate,expected)?;
+            let roster=ledger.prepare_roster(&candidate.server.users).map_err(|_|LiveAuthError::Unavailable)?;
+            let revision=view.live.publish(stage)?;
+            roster.commit();
+            Ok(revision)
+        }else{
+            view.live.stage(candidate,expected).and_then(|stage|view.live.publish(stage))
+        }
     }
 
     pub(crate) fn auth_rollback_status(&self)->Option<(u64,u64)>{
@@ -199,8 +214,7 @@ impl State {
         if item.revision!=expected || item.until<=Instant::now() || !Arc::ptr_eq(&item.document,candidate){
             return Err(LiveAuthError::StaleRevision);
         }
-        let staged=view.live.stage(candidate,expected)?;
-        let next=view.live.publish(staged)?;
+        let next=self.publish_managed_auth(view,candidate,expected)?;
         *current=Arc::new(View{document:candidate.clone(),inbounds:view.inbounds,
             preflight:Arc::new(view.preflight.rebased(candidate.as_ref().clone())),
             live:Arc::new(view.live.with_new_baseline(candidate.as_ref().clone()))});

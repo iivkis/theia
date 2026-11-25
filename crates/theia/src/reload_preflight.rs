@@ -82,6 +82,19 @@ pub fn assess_reload(
     Ok(())
 }
 
+/// Managed roster changes are allowed only on the shared dynamic ledger.
+/// Validate the real candidate first; normalize ONLY roster and grants to
+/// reuse the strict structural comparison. No listener/identity/quota edits.
+pub(crate) fn assess_managed_reload(running:&ServerDocument,candidate:&ServerDocument)->Result<(),ReloadCheckError>{
+    Config::Server(candidate.clone()).validate().map_err(|_|ReloadCheckError::InvalidConfig)?;
+    let mut normalized=candidate.clone();
+    normalized.server.users=running.server.users.clone();
+    for (before,after) in running.server.inbounds.iter().zip(&mut normalized.server.inbounds){
+        after.allowed_user_ids=before.allowed_user_ids.clone();
+    }
+    assess_reload(running,&normalized)
+}
+
 /// Digest of *loaded* PEM bytes, not the paths in TOML. Never log these
 /// digests: the private key itself is not captured in this snapshot.
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
@@ -177,6 +190,22 @@ impl ReloadPreflight {
         self.validate_candidate(candidate)
     }
 
+    pub(crate) fn load_managed_candidate_bound(&self,expected_sha256:[u8;32])->Result<ServerDocument,ReloadCheckError>{
+        let contents=crate::bounded_input::read(&self.config_path,1024*1024,false,false)
+            .map_err(|_|ReloadCheckError::InvalidConfig)?;
+        let observed:[u8;32]=Sha256::digest(contents.as_slice()).into();
+        if observed!=expected_sha256{return Err(ReloadCheckError::InvalidConfig);}
+        let Config::Server(candidate)=config::parse(std::str::from_utf8(&contents).map_err(|_|ReloadCheckError::InvalidConfig)?)
+            .map_err(|_|ReloadCheckError::InvalidConfig)? else{return Err(ReloadCheckError::InvalidConfig);};
+        self.validate_managed_candidate(candidate)
+    }
+
+    pub(crate) fn check_managed_file(&self)->Result<(),ReloadCheckError>{
+        let Config::Server(candidate)=config::read_file(&self.config_path).map_err(|_|ReloadCheckError::InvalidConfig)?
+            else{return Err(ReloadCheckError::InvalidConfig);};
+        self.validate_managed_candidate(candidate).map(|_|())
+    }
+
     pub(crate) fn preview_restart_bound(&self,digest:[u8;32])->Result<(bool,[u8;32]),crate::restart_guard::RestartError>{
         use crate::restart_guard::{RestartError,RestartVerdict};
         let _probe=self.restart_probe_lock.try_lock().map_err(|_|RestartError::ProbeBusy)?;
@@ -225,6 +254,15 @@ impl ReloadPreflight {
         candidate: ServerDocument,
     ) -> Result<ServerDocument, ReloadCheckError> {
         assess_reload(&self.active, &candidate)?;
+        self.verify_candidate_material(candidate)
+    }
+
+    pub(crate) fn validate_managed_candidate(&self,candidate:ServerDocument)->Result<ServerDocument,ReloadCheckError>{
+        assess_managed_reload(&self.active,&candidate)?;
+        self.verify_candidate_material(candidate)
+    }
+
+    fn verify_candidate_material(&self,candidate:ServerDocument)->Result<ServerDocument,ReloadCheckError>{
         if self.identities.len() != candidate.server.inbounds.len() {
             return Err(ReloadCheckError::IdentityDrift);
         }

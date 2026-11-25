@@ -574,7 +574,10 @@ where
                     if let Some(document)=runtime.auth_rollback_candidate(previous,expected){
                         let preflight=previous.preflight.clone();
                         let checked=document.clone();
-                        let valid=tokio::task::spawn_blocking(move||preflight.validate_candidate(checked.as_ref().clone())).await;
+                        let managed=runtime.has_reality_ledger();
+                        let valid=tokio::task::spawn_blocking(move||if managed{
+                            preflight.validate_managed_candidate(checked.as_ref().clone())
+                        }else{preflight.validate_candidate(checked.as_ref().clone())}).await;
                         if matches!(valid,Ok(Ok(_))){
                             match runtime.rollback_auth(previous,&document,expected){
                                 Ok(revision)=>format!("theia-auth-rollback-v1 applied revision={revision}\n"),
@@ -671,7 +674,8 @@ where
                 if let Some(preflight) = preflight {
                     // 1 MiB bounded config + PEM reads belong on a worker.
                     // A timed-out worker can NEVER apply, only return a verdict.
-                    match tokio::task::spawn_blocking(move || preflight.check_file()).await {
+                    let managed=runtime.as_ref().is_some_and(|r|r.has_reality_ledger());
+                    match tokio::task::spawn_blocking(move || if managed{preflight.check_managed_file()}else{preflight.check_file()}).await {
                         Ok(Ok(())) => "theia-check-v1 compatible\n".to_owned(),
                         _ => "theia-check-v1 rejected\n".to_owned(),
                     }
@@ -686,8 +690,9 @@ where
                     // Worker is read-only even after IPC cancellation.
                     // The exact same validated bytes are committed only from
                     // the live async task under CAS, never by the worker.
+                    let managed=runtime.as_ref().is_some_and(|r|r.has_reality_ledger());
                     match tokio::task::spawn_blocking(move || {
-                        preflight.load_candidate_bound(sha256)
+                        if managed{preflight.load_managed_candidate_bound(sha256)}else{preflight.load_candidate_bound(sha256)}
                     })
                     .await
                     {

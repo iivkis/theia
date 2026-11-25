@@ -587,7 +587,7 @@ impl ServerContext {
         // Admission and quota resize serialize through a single short
         // occupancy lock across old/new H2 and QUIC listener generations.
         if let Some(ledger) = &self.live_quota {
-            let permit = ledger.acquire_session(&user.id).ok_or(AuthFailure::Busy)?;
+            let permit=ledger.acquire_session_checked(&user.id,||self.authorization.load().is_ok_and(|current|Arc::ptr_eq(&current,&snapshot))).ok_or(AuthFailure::Busy)?;
             return Ok(SessionPermit {
                 _global: None,
                 _user: None,
@@ -2405,7 +2405,7 @@ async fn run_supervised_file(
             )),
             live: initial.live,
         },
-    ).with_reality(initial.reality));
+    ).with_reality(initial.reality).with_reality_ledger(limits.ledger.clone()));
 
     // Only the original, protected management listener survives cutover.
     // Never expose a new administrative TCP port or loosen Named Pipe DACL.

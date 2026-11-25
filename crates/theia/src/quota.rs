@@ -4,7 +4,7 @@
 use crate::config::{ServerPolicy, User};
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap,HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -23,6 +23,7 @@ struct Usage {
     sessions: usize,
     connections: usize,
     per_user: HashMap<String, usize>,
+    active:HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,9 @@ impl Drop for Lease {
                     if let Some(count) = usage.per_user.get_mut(user) {
                         *count -= 1;
                     }
+                    if !usage.active.contains(user)&&usage.per_user.get(user)==Some(&0){
+                        usage.per_user.remove(user);
+                    }
                 }
                 LeaseKind::Connection => usage.connections -= 1,
             }
@@ -68,15 +72,24 @@ impl Ledger {
                 sessions: 0,
                 connections: 0,
                 per_user: users.iter().map(|user| (user.id.clone(), 0)).collect(),
+                active:users.iter().map(|u|u.id.clone()).collect(),
             }),
         })
     }
 
     /// Admission is a single non-async decision across both transports and
     /// ALL inbounds. No new slot can sneak in while a quota cap is resized.
+    #[cfg(test)]
     pub(crate) fn acquire_session(self: &Arc<Self>, user: &str) -> Option<Lease> {
-        let mut usage = self.usage.lock().ok()?;
-        if usage.sessions >= usage.total_limit || *usage.per_user.get(user)? >= usage.per_user_limit
+        self.acquire_session_checked(user,||true)
+    }
+
+    // Lock order: occupancy, then a short authorization snapshot read.
+    // Every managed roster publication takes the same occupancy lock first.
+    pub(crate) fn acquire_session_checked(self:&Arc<Self>,user:&str,still_current:impl FnOnce()->bool)->Option<Lease>{
+        let mut usage=self.usage.lock().ok()?;
+        if !still_current() || !usage.active.contains(user) || usage.sessions >= usage.total_limit
+            || *usage.per_user.get(user)? >= usage.per_user_limit
         {
             return None;
         }
@@ -100,6 +113,18 @@ impl Ledger {
             ledger: Arc::clone(self),
             kind: LeaseKind::Connection,
         })
+    }
+
+    pub(crate) fn prepare_roster(&self,users:&[User])->Result<PreparedRoster<'_>,QuotaError>{
+        let active:HashSet<_>=users.iter().map(|u|u.id.clone()).collect();
+        if active.len()!=users.len(){return Err(QuotaError::InvalidLimit);}
+        let guard=self.usage.lock().map_err(|_|QuotaError::Unavailable)?;
+        // Retain only active IDs or IDs with outstanding leases. The
+        // latter are bounded by actual occupancy, not edit history.
+        let mut counts=guard.per_user.clone();
+        counts.retain(|id,n|*n!=0||active.contains(id));
+        for id in &active{counts.entry(id.clone()).or_insert(0);}
+        Ok(PreparedRoster{guard,active,counts})
     }
 
     fn validate_limits(policy: &ServerPolicy) -> Result<(), QuotaError> {
@@ -144,6 +169,18 @@ impl Ledger {
     }
 }
 
+pub(crate) struct PreparedRoster<'a>{
+    guard:std::sync::MutexGuard<'a,Usage>,
+    active:HashSet<String>,
+    counts:HashMap<String,usize>,
+}
+impl PreparedRoster<'_>{
+    pub(crate) fn commit(mut self){
+        self.guard.active=self.active;
+        self.guard.per_user=self.counts;
+    }
+}
+
 pub(crate) struct PreparedResize<'a> {
     guard: std::sync::MutexGuard<'a, Usage>,
     per_user_limit: usize,
@@ -178,6 +215,24 @@ mod tests {
                 disabled: false,
             })
             .collect()
+    }
+
+    #[test]
+    fn roster_commit_preserves_deleted_id_debt_and_aborted_stage(){
+        let ledger=Ledger::new(&policy(1,3),&people());
+        let held=ledger.acquire_session("alice").unwrap();
+        let bob=people().into_iter().filter(|u|u.id=="bob").collect::<Vec<_>>();
+        drop(ledger.prepare_roster(&bob).unwrap());
+        assert!(ledger.acquire_session("bob").is_some());
+        ledger.prepare_roster(&bob).unwrap().commit();
+        assert!(ledger.acquire_session("alice").is_none());
+        ledger.prepare_roster(&people()).unwrap().commit();
+        assert!(ledger.acquire_session("alice").is_none());
+        assert!(ledger.acquire_session_checked("bob",||false).is_none());
+        drop(held);
+        assert!(ledger.acquire_session("alice").is_some());
+        ledger.prepare_roster(&bob).unwrap().commit();
+        assert!(!ledger.usage.lock().unwrap().per_user.contains_key("alice"));
     }
 
     #[test]
