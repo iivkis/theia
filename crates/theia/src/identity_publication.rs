@@ -565,7 +565,8 @@ impl Publication {
             next.check_time(now).map_err(|_|Error::Descriptor)?;
             // Only the successor is exportable after overlap. Never export
             // the expired old announcement as the current document.
-            return Ok((pending.successor_live.unwrap_or(pending.successor),None));
+            let signed=pending.successor_live.unwrap_or(pending.successor);
+            return Ok((signed.clone(),Some(signed)));
         }
         if let Some((_,next))=&checked.next{next.check_time(now).map_err(|_|Error::Descriptor)?;}
         Ok((record.active_document,record.pending.map(|p|p.successor)))
@@ -933,8 +934,19 @@ mod tests {
         let value=captured.select(next.public_key(),ends).unwrap();
         assert_eq!(value.verified().descriptor().active_reference,0);
         b.update_at(value.signed(),5,ends).unwrap();
-        publication.promote(status.snapshot_sha256,bootstrap::fingerprint(next.public_key()),ends).unwrap();
-        assert_eq!(publication.inspect(ends).unwrap().revision,7);
+        let exported=publication.documents(ends).unwrap();
+        assert_eq!(exported.0,value.signed());
+        assert_eq!(exported.1.as_deref(),Some(value.signed()));
+        let later=ends+1;
+        publication.refresh(&state,status.snapshot_sha256,later).unwrap();
+        let status=publication.inspect(later).unwrap();
+        assert_eq!(status.revision,7);
+        let captured=publication.capture(&state,status.snapshot_sha256,later).unwrap();
+        assert!(captured.select(old.public_key(),later).is_err());
+        b.update_at(captured.select(next.public_key(),later).unwrap().signed(),6,later).unwrap();
+        publication.promote(status.snapshot_sha256,bootstrap::fingerprint(next.public_key()),later).unwrap();
+        assert_eq!(publication.inspect(later).unwrap().revision,8);
+        assert_eq!(publication.inspect(later).unwrap().next_fingerprint,None);
     }
 
     #[test]

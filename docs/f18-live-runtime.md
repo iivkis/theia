@@ -35,8 +35,11 @@ can perform the same bounded recovery of a persisted degraded reference.
 During a valid dual-signer overlap, failover atomically publishes a fresh
 pair of signed descriptors, skipping the already issued successor revision
 and preserving the original validity intervals and overlap deadline. Both
-old and promoted clients can refresh their own signer. After overlap expiry
-but before explicit promotion, automatic failover remains suspended. No eligible reserve, stale trust, or unrooted materials fail
+old and promoted clients can refresh their own signer. After overlap expiry and before explicit retirement, the original signed
+transition pair is frozen; only the valid successor signs operational
+failover and renewal. Its independent latest document is monotonic and
+rooted in the historical pair; retirement preserves this evidence and
+advances the successor revision. Old admission remains invalid. No eligible reserve, stale trust, or unrooted materials fail
 closed. If startup cannot recover a valid generation it refuses to bind.
 
 Recovery decision: allow a valid admission for any reference SNI in the

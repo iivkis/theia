@@ -33,9 +33,23 @@ REALITY. Management remains owner-protected local IPC, not a network API.
   state; t previews identity rotation; p previews retirement. y commits,
   n/Esc cancels. Root and publication are rechecked at commit.
   Runtime status is not a proof of a successful external handshake.
-* Client status is still based on the saved trust store, not live
-  carrier/fallback telemetry. The setup and enrollment panels remain
-  separate.
+* Client wizard (I) in an explicitly opened clean TOML: create enrollment,
+  then g opens registration prefilled with the verified identity and
+  enrollment path. The original TOML digest is retained. Registration is
+  a second explicit preview/confirmation; neither action activates the
+  profile. A canceled or rejected registration retains enrolled files.
+* Client V: saved trust status; s/y starts the exact active saved REALITY
+  profile with both loopback listeners, x/y stops it (closing tunnels).
+  Live local report includes descriptor revision, current signed reference,
+  transport policy, last successful OPEN transport, route-bound H3 negative
+  cache and descriptor-refresh result. This is process-local telemetry,
+  not remote proof or headless-process IPC. Windows WinINet panel exposes
+  the same runtime report when it owns a REALITY client.
+* Client V: o previews same-signer offline recovery; k previews a signed
+  planned successor promotion. Both bind the saved TOML, signed file,
+  current trust snapshot and expected revision; y explicitly commits
+  trust only. Missed overlap/compromise remains independent re-enrollment.
+  No action reveals bearer or changes OS proxy implicitly.
 
 CLI: server reload --apply --expected-revision N --sha256 HEX --confirm;
 server auth rollback --check / --apply --expected-revision N --confirm;

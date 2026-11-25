@@ -15,12 +15,18 @@ the native H3 application endpoint, and a byte-exact UDP reference relay.
   timeout or memory exhaustion drops incomplete flights. Only QUIC v1 is
   supported by this candidate; unsupported versions are dropped.
 * Reference: immutable approved plan and signed active reference; each
-  physical path obtains a fresh DNS-revalidated RelayLease. Connected UDP
+  physical path obtains a fresh DNS-revalidated RelayLease for the exact
+  signer selected at session creation; overlap expiry cannot redirect a
+  new path to a different reference. Connected UDP
   socket only; no arbitrary destination, no payload modification.
 * CID: track visible server-issued long-header CIDs; Retry integrity and
   exact opaque token continuity on the original tuple. A known CID on a
   new tuple creates an independent upstream socket; old tuple remains
-  intact. Unknown short CID can be forwarded only on a unique existing
+  intact. Retired visible server CIDs are quarantined across tuples for
+  the bounded cooldown; ambiguous known Initials cannot create a duplicate
+  session. Coalesced datagrams must agree on their destination CID before
+  forwarding; malformed or mixed-CID long-header datagrams are dropped.
+  Unknown short CID can be forwarded only on a unique existing
   physical tuple, never learned or used to migrate to another tuple.
 * Amplification: independent client payload accounting per physical path,
   output <= 3 * input, including Retry and migration. Neither a valid Retry

@@ -434,7 +434,7 @@ impl Panel {
             Phase::Idle => "s: local start  a: WinINet  r: restore  c: recovery  x: stop  v: status  Esc: назад",
         };
         format!(
-            "WinINet: {status}\nLocal: {} | manual: {}\nTransport/OPEN_OK: не проверялись\n{}\n{controls}",
+            "WinINet: {status}\nLocal: {} | manual: {}\nTransport/OPEN_OK: см. REALITY runtime выше; для own-TLS не проверяются этим экраном\n{}\n{controls}",
             if self.unavailable || self.phase == Phase::Busy {
                 "неизвестно"
             } else if self.view.running {

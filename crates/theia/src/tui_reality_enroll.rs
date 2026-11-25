@@ -266,6 +266,20 @@ mod tests {
     }
 
     #[test]
+    fn wizard_handoff_keeps_original_config_binding_and_requires_profile_id(){
+        let mut panel=EnrollmentPanel::new();
+        let cfg=std::env::temp_dir().join("client.toml");
+        panel.config=Some((cfg.clone(),[3;32]));
+        panel.fields[2]=Zeroizing::new(std::env::temp_dir().join("enrollment").to_string_lossy().into_owned());
+        panel.fields[4]=Zeroizing::new("ab".repeat(32));
+        panel.stage=Stage::Done("saved".into());
+        panel.key(KeyEvent::new(KeyCode::Char('g'),KeyModifiers::NONE));
+        assert!(panel.registration.is_some());
+        assert!(panel.body().contains("ID профиля"));
+        assert!(panel.key(KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE)));
+    }
+
+    #[test]
     fn source_fields_are_masked_and_cancel_is_read_only() {
         let mut panel = EnrollmentPanel::new();
         panel.paste("SECRET-NEVER-DISPLAY");

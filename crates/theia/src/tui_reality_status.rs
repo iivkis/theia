@@ -214,3 +214,32 @@ impl StatusPanel{
             if self.server{"t: начать ротацию | p: отозвать старый ключ после overlap | "}else if self.client_active{"s: запустить локальный runtime | o: recovery | k: promotion | "}else{"o: recovery | k: promotion | для запуска выберите активный профиль | "})
     }
 }
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    fn key(code:KeyCode)->KeyEvent{KeyEvent::new(code,KeyModifiers::NONE)}
+    fn panel(active:bool)->StatusPanel{
+        StatusPanel{path:PathBuf::new(),digest:[1;32],id:"test".into(),server:false,
+            pending:None,review:None,committing:false,report:String::new(),
+            client_active:active,client_confirm:None,client_run:None,trust_input:None,trust_review:None}
+    }
+    #[test]
+    fn runtime_and_trust_inputs_never_implicitly_apply(){
+        let mut p=panel(true);
+        assert!(!p.key(key(KeyCode::Char('s'))));
+        assert_eq!(p.client_confirm,Some(true));
+        assert!(p.client_run.is_none());
+        assert!(!p.key(key(KeyCode::Char('n'))));
+        assert!(p.client_confirm.is_none());
+        assert!(!p.key(key(KeyCode::Char('o'))));
+        p.paste("/secret/location");
+        assert!(!p.body().contains("/secret/location"));
+        assert!(!p.key(key(KeyCode::Esc)));
+        assert!(p.trust_input.is_none());
+        let mut inactive=panel(false);
+        inactive.key(key(KeyCode::Char('s')));
+        assert!(inactive.client_confirm.is_none()&&inactive.client_run.is_none());
+    }
+}
