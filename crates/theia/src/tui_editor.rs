@@ -1248,7 +1248,7 @@ impl Editor {
 
     /// Render only the explicitly whitelisted non-secret fields.
     /// Never include token refs, TLS key refs, grants, or config file paths.
-    pub fn fields_overview(&self) -> String {
+    pub(crate) fn workspace_fields(&self) -> Vec<(&'static str, String, bool)> {
         let labels: &[&str] = match self.role {
             Role::Server => &["TLS DNS", "H2 TCP", "H3 UDP"],
             Role::Client => &["Endpoint", "TLS SNI", "Transport", "XHTTP"],
@@ -1284,19 +1284,18 @@ impl Editor {
                 })
                 .unwrap_or_default(),
         };
+        labels.iter().copied().zip(values).enumerate().map(|(index, (label, value))| {
+            let selected = self.selected_field == index;
+            let value = if self.editing && selected { self.input.clone() } else { value };
+            (label, value, selected)
+        }).collect()
+    }
+
+    pub fn fields_overview(&self) -> String {
         let mut output = String::new();
-        for (index, (label, value)) in labels.iter().zip(values).enumerate() {
-            let marker = if self.selected_field == index {
-                '>'
-            } else {
-                ' '
-            };
-            let value = if self.editing && self.selected_field == index {
-                self.input.as_str()
-            } else {
-                value.as_str()
-            };
-            output.push_str(&format!("{marker} {}: {value}\n", label));
+        for (label, value, selected) in self.workspace_fields() {
+            let marker = if selected { '>' } else { ' ' };
+            output.push_str(&format!("{marker} {label}: {value}\n"));
         }
         output
     }
