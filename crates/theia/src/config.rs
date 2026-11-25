@@ -758,7 +758,7 @@ pub(crate) fn lock_path(path: &Path) -> Result<PathBuf, ConfigError> {
     Ok(path.with_file_name(lock))
 }
 
-fn editor_lock(path: &Path) -> Result<fs::File, ConfigError> {
+pub(crate) fn editor_lock(path: &Path) -> Result<fs::File, ConfigError> {
     let path = lock_path(path)?;
     let error = || ConfigError::new("config", "editor lock busy or unsafe; retry");
     let mut options = OpenOptions::new();

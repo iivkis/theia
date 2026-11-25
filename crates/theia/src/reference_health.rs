@@ -844,6 +844,37 @@ impl RelayLease {
 }
 
 impl State {
+    // The production reference selection and freshness checks are still
+    // exercised by controlled independent-server fixtures. Only the final
+    // public DNS/connect address is substituted, in a unit-test binary.
+    #[cfg(test)]
+    pub(crate) fn fixture_relay_lease(
+        &self,
+        verified: &crate::descriptor::Verified,
+        approved_plan_sha256: [u8; 32],
+        approved: SocketAddr,
+        fixture: SocketAddr,
+    ) -> Result<RelayLease, Error> {
+        let now = unix_now()?;
+        if self.plan.digest()? != approved_plan_sha256
+            || !fixture.ip().is_loopback()
+            || fixture.port() == 0
+        {
+            return Err(Error::Approval);
+        }
+        verified.check_time(now).map_err(|_| Error::NotEligible)?;
+        self.validate_active(verified.descriptor(), now)?;
+        let target = self.plan.references.get(usize::from(verified.descriptor().active_reference))
+            .ok_or(Error::Format)?;
+        if target.address != approved { return Err(Error::Approval); }
+        let remaining = verified.descriptor().not_after.checked_sub(now).ok_or(Error::Clock)?.min(60);
+        if remaining == 0 { return Err(Error::NotEligible); }
+        Ok(RelayLease {
+            address: fixture,
+            expires: tokio::time::Instant::now() + Duration::from_secs(remaining),
+        })
+    }
+
     pub async fn relay_lease(
         &self,
         verified: &crate::descriptor::Verified,

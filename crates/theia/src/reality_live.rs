@@ -218,6 +218,8 @@ pub(crate) struct Live {
     handshake: Arc<ReplayGuard>,
     h3: bool,
     retired: AtomicBool,
+    #[cfg(test)]
+    fixture_reference: RwLock<Option<(std::net::SocketAddr, std::net::SocketAddr)>>,
 }
 impl Live {
     pub(crate) fn new(
@@ -254,8 +256,35 @@ impl Live {
             handshake,
             h3,
             retired: AtomicBool::new(false),
+            #[cfg(test)]
+            fixture_reference: RwLock::new(None),
         }))
     }
+    #[cfg(test)]
+    pub(crate) fn set_fixture_reference(
+        &self, approved: std::net::SocketAddr, local: std::net::SocketAddr,
+    ) {
+        assert!(local.ip().is_loopback() && local.port() != 0);
+        let mut slot = self.fixture_reference.write().unwrap();
+        assert!(slot.is_none());
+        *slot = Some((approved, local));
+    }
+
+    pub(crate) async fn reference_lease(
+        &self, generation: &Lease, verified: &Verified,
+    ) -> Result<crate::reference_health::RelayLease, crate::reference_health::Error> {
+        #[cfg(test)]
+        {
+            let fixture = *self.fixture_reference.read().map_err(|_| crate::reference_health::Error::Approval)?;
+            if let Some((approved, local)) = fixture {
+                return generation.health().fixture_relay_lease(
+                    verified, generation.publication().plan_sha256(), approved, local,
+                );
+            }
+        }
+        generation.health().relay_lease(verified, generation.publication().plan_sha256()).await
+    }
+
     pub(crate) fn current(&self) -> Option<Arc<Generation>> {
         if self.retired.load(Ordering::Acquire) {
             return None;

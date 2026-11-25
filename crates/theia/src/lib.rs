@@ -39,6 +39,8 @@ pub(crate) mod quota;
 pub mod reality_admission;
 pub mod reality_bootstrap;
 mod reality_checkpoint;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod reality_root_history;
 pub mod reality_cli;
 pub mod reality_config;
 pub mod reality_generation;

@@ -287,6 +287,9 @@ impl ReloadPreflight {
         if !candidate.server.enabled {
             return Err(crate::restart_guard::RestartError::InvalidConfig);
         }
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        crate::reality_root_history::RootHistory::preview(&self.config_path, &self.active, &candidate)
+            .map_err(|_| crate::restart_guard::RestartError::InvalidTlsIdentity)?;
         Ok(candidate)
     }
 
@@ -419,6 +422,9 @@ impl ReloadPreflight {
             Ok(Config::Server(document)) => document,
             _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
         };
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        crate::reality_root_history::RootHistory::preview(&self.config_path, &self.active, &candidate)
+            .map_err(|_| crate::restart_guard::RestartError::InvalidTlsIdentity)?;
         crate::restart_guard::probe(&self.active, &self.identities, &candidate)
     }
 

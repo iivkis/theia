@@ -399,7 +399,7 @@ impl PreparedTcp {
                                 peer,connection,crate::diagnostics::next_id(),connection_phase).await;
                         } else {
                             let Some(value)=generation.relay_value(now) else { return; };
-                            let Ok(lease)=generation.lease.health().relay_lease(value,generation.lease.publication().plan_sha256()).await else { return; };
+                            let Ok(lease)=live.reference_lease(&generation.lease,value).await else { return; };
                             let _=relay.relay(inspected.io,&lease).await;
                             drop(slot);
                         }

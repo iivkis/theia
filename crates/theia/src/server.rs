@@ -2637,6 +2637,7 @@ fn commit_same_port_reality(
     request: &crate::runtime_generation::RestartRequest,
     loaded: &[crate::reload_preflight::IdentityHash],
     path: &Path,
+    root_history: &mut crate::reality_root_history::RootHistory,
 ) -> Result<(Vec<crate::reload_preflight::IdentityHash>, u64), ()> {
     use crate::restart_guard::{self, RestartVerdict};
     let previous = request.previous.document.as_ref();
@@ -2694,6 +2695,7 @@ fn commit_same_port_reality(
     if request.complete.is_closed() {
         return Err(());
     }
+    root_history.advance(candidate)?;
     let revision = hot.carrier.commit_replacement(prepared, |publish| {
         runtime
             .commit_reality_replacement(
@@ -2710,6 +2712,7 @@ fn commit_same_port_reality(
             .map_err(|_| ())
     })?;
     hot.used_roots.insert(binding.identity_sha256);
+    root_history.committed();
     Ok((identities, revision))
 }
 
@@ -2935,6 +2938,17 @@ fn commit_live_quota(
         .map_err(|_| ())
 }
 
+/// Supervisor-owned workers must never outlive a failed supervisor or
+/// report a stale management view after a fatal persistence error.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct SupervisorTask<T>(tokio::task::JoinHandle<T>);
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl<T> Drop for SupervisorTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn run_supervised_file(
     document: ServerDocument,
@@ -2946,8 +2960,12 @@ async fn run_supervised_file(
         "initial_generation_preflight_begin",
         "inbounds" = Value::Count(document.server.inbounds.len() as u64)
     );
+    let mut root_history = crate::reality_root_history::RootHistory::open(config_path, &document)
+        .map_err(|_| ServerError::Config)?;
     let limits = GenerationLimits::new(&document);
     let initial = prepare_generation(&document, 1, &limits, None).await?;
+    root_history.advance(&document).map_err(|_| ServerError::Config)?;
+    root_history.committed();
     crate::diag!(
         Info,
         "server.supervisor",
@@ -2988,18 +3006,16 @@ async fn run_supervised_file(
     .map(|service| service.with_supervisor(runtime.clone(), requests.clone()));
 
     let mut management_task = management.map(|service| {
-        tokio::spawn(async move { service.serve().await.map_err(|_| ServerError::Io) })
+        SupervisorTask(tokio::spawn(async move { service.serve().await.map_err(|_| ServerError::Io) }))
     });
     let mut running = RunningGeneration::launch(initial.listeners, GenerationPhase::Active);
     crate::diag!(Info, "server.supervisor", "generation_active");
     let mut identities = current_identities;
-    let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
+    let mut retiring: Option<SupervisorTask<()>> = None;
     let mut rollback: Option<RollbackSlot> = None;
     let mut structural_rollback: Option<StructuralRollbackSlot> = None;
-    // Independent replacement is irreversible within this supervisor,
-    // even after removal/re-addition or a subsequent fresh-port cutover.
-    let mut replaced_roots = std::collections::HashSet::<[u8; 32]>::new();
-    const MAX_REPLACED_ROOTS: usize = 4096;
+    // Root history is retained for the entire supervisor and persisted before
+    // publishing any structural generation or independent root replacement.
     loop {
         tokio::select! {
             request = queue.recv() => {
@@ -3008,12 +3024,12 @@ async fn run_supervised_file(
                 };
                 // No unbounded retired-generation backlog and no double
                 // admission during simultaneous restart attempts.
-                if running.has_draining()||retiring.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                if running.has_draining()||retiring.as_ref().is_some_and(|worker| !worker.0.is_finished()) {
                     let _ = request.complete.send(Err(()));
                     continue;
                 }
-                if let Some(worker) = retiring.take() {
-                    let _ = worker.await;
+                if let Some(mut worker) = retiring.take() {
+                    let _ = (&mut worker.0).await;
                 }
                 if !runtime.still_current(&request.previous, request.expected_revision) {
                     let _ = request.complete.send(Err(()));
@@ -3044,18 +3060,7 @@ async fn run_supervised_file(
                     request.candidate=previous.as_ref().clone();
                     request.material=Some(material);
                 }
-                if request.candidate.server.inbounds.iter().any(|i|i.reality.as_ref().is_some_and(|b|replaced_roots.contains(&b.identity_sha256))){
-                    let _=request.complete.send(Err(()));continue;
-                }
-                let replacing:Vec<_>=request.previous.document.server.inbounds.iter().filter_map(|old|{
-                    let root=old.reality.as_ref()?;
-                    request.candidate.server.inbounds.iter().any(|new|
-                        new.id==old.id && new.server_name==old.server_name &&
-                        new.h2_listen.parse::<SocketAddr>().ok().map(|v|v.port())==old.h2_listen.parse::<SocketAddr>().ok().map(|v|v.port()) &&
-                        new.reality.as_ref().map(|v|v.identity_sha256)!=Some(root.identity_sha256))
-                        .then_some(root.identity_sha256)
-                }).collect();
-                if replaced_roots.len().saturating_add(replacing.len())>MAX_REPLACED_ROOTS{
+                if root_history.check(&request.candidate).is_err() {
                     let _=request.complete.send(Err(()));continue;
                 }
                 if request.kind == crate::runtime_generation::ChangeKind::Rollback {
@@ -3089,19 +3094,21 @@ async fn run_supervised_file(
                     continue;
                 }
                 if crate::restart_guard::same_port_reality_only(request.previous.document.as_ref(),&request.candidate).is_some(){
-                    let result=commit_same_port_reality(&runtime,&mut running,&request,&identities,config_path);
+                    let result=commit_same_port_reality(&runtime,&mut running,&request,&identities,config_path,&mut root_history);
                     match result{
                         Ok((next,revision))=>{
                             identities=next;
-                            replaced_roots.extend(replacing.iter().copied());
-                            // Independent enrollment is not reversible TLS
+                             // Independent enrollment is not reversible TLS
                             // rotation; never resurrect the replaced root.
                             rollback=None;structural_rollback=None;
                             runtime.set_rollback_until(None);
                             runtime.set_restart_rollback(None);
                             let _=request.complete.send(Ok(revision));
                         }
-                        Err(())=>{let _=request.complete.send(Err(()));}
+                        Err(())=>{
+                            if root_history.pending() { return Err(ServerError::Io); }
+                            let _=request.complete.send(Err(()));
+                        }
                     }
                     continue;
                 }
@@ -3137,14 +3144,23 @@ async fn run_supervised_file(
                         let staged=stage_partial_generation(&request,&identities,&limits,config_path,&plan).await;
                         let Ok((prepared,next_view,auth))=staged else{let _=request.complete.send(Err(()));continue;};
                         if request.complete.is_closed(){continue;}
+                        if root_history.advance(&request.candidate).is_err() {
+                            if root_history.pending() { return Err(ServerError::Io); }
+                            let _=request.complete.send(Err(()));continue;
+                        }
+                        let root_changed=root_history.retiring();
                         let revision=runtime.commit_partial_layout(&request.previous,request.expected_revision,next_view,auth,&plan.removed,prepared.reality);
-                        let Ok(revision)=revision else{let _=request.complete.send(Err(()));continue;};
+                        let Ok(revision)=revision else{
+                            if root_history.pending() { return Err(ServerError::Io); }
+                            let _=request.complete.send(Err(()));continue;
+                        };
+                        root_history.committed();
                         running.remove_inbounds(&plan.removed);
                         running.append(prepared.listeners,GenerationPhase::Active);
                         running.order_plain(&request.candidate);
                         rollback=None;
                         runtime.set_rollback_until(None);
-                        if structural{
+                        if structural || root_changed{
                             structural_rollback=None;runtime.set_restart_rollback(None);
                         }else{
                             let now=Instant::now();
@@ -3174,14 +3190,21 @@ async fn run_supervised_file(
                 if request.complete.is_closed() {
                     continue;
                 }
+                if root_history.advance(&request.candidate).is_err() {
+                    if root_history.pending() { return Err(ServerError::Io); }
+                    let _=request.complete.send(Err(()));continue;
+                }
+                let root_changed=root_history.retiring();
                 if runtime.commit_restart_with_reality(
                     &request.previous,
                     request.expected_revision,
                     next_view,next_reality,
                 ).is_err() {
+                    if root_history.pending() { return Err(ServerError::Io); }
                     let _ = request.complete.send(Err(()));
                     continue;
                 }
+                root_history.committed();
                 next_running.start();
                 let previous=std::mem::replace(&mut running,next_running);
                 // No key or health rollback: previous own-TLS PEM digest
@@ -3190,9 +3213,7 @@ async fn run_supervised_file(
                 // An independent root replacement on the same logical endpoint
                 // is not a reversible listener operation. Never offer its old root
                 // as a structural rollback target.
-                let replaced_root=!replacing.is_empty();
-                replaced_roots.extend(replacing);
-                if structural || replaced_root{
+                if structural || root_changed{
                     structural_rollback=None;
                     runtime.set_restart_rollback(None);
                 }else{
@@ -3208,7 +3229,7 @@ async fn run_supervised_file(
                 identities=next_identities;
                 rollback=None;
                 runtime.set_rollback_until(None);
-                retiring = Some(tokio::spawn(reap_previous(previous)));
+                retiring = Some(SupervisorTask(tokio::spawn(reap_previous(previous))));
                 // This ACK is AFTER commit. Lost ACK is indeterminate:
                 // operator must query status; never retry blindly.
                 let _ = request.complete.send(Ok(revision));
@@ -3242,7 +3263,7 @@ async fn run_supervised_file(
             }
             result = async {
                 match &mut management_task {
-                    Some(task) => Some(task.await),
+                    Some(task) => Some((&mut task.0).await),
                     None => std::future::pending().await,
                 }
             } => {
@@ -3264,7 +3285,7 @@ fn has_reality(document: &ServerDocument) -> bool {
 /// captured once for both transports, and every inbound shares accounting.
 /// The current REALITY generation is immutable; ordinary own-TLS hot
 /// replacement cannot mutate it. Management is status-only in this mode.
-#[cfg(test)]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "windows"))))]
 pub(crate) async fn run_reality_document_with_ready(
     document: ServerDocument,
     started: Option<tokio::sync::oneshot::Sender<()>>,
@@ -4171,6 +4192,113 @@ mod hardening_tests {
         let cert = rcgen::generate_simple_self_signed(vec!["theia.example".into()]).unwrap();
         assert!(check_certificate_name(cert.cert.der(), "theia.example").is_ok());
         assert!(check_certificate_name(cert.cert.der(), "other.example").is_err());
+    }
+
+
+    /// Required native CI fixture: Python/OpenSSL+h2 and aioquic are
+    /// independent implementations on both ends of the passive relay.
+    /// No marker or bearer is supplied by the independent client.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "required independent reference CI installs pinned h2/aioquic"]
+    async fn independent_external_reference_through_registered_reality_dispatchers() {
+        use crate::reference_health::{Evidence, Plan, State, Store, Target};
+        use crate::reality_config::{self, Request, ServerRequest};
+        use std::{fs, path::PathBuf, process::{Child, Command}, sync::atomic::{AtomicU64, Ordering}};
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        struct Process(Child);
+        impl Drop for Process {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let directory = Scratch(std::env::temp_dir().join(format!(
+            "theia-independent-reference-{}-{}", std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        fs::create_dir(&directory.0).unwrap();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let address = (0..16).find_map(|_| {
+                let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+                let address = tcp.local_addr().ok()?;
+                let _udp = std::net::UdpSocket::bind(address).ok()?;
+                Some(address)
+            }).expect("fixture TCP/UDP address");
+            let now = crate::reference_health::unix_now().unwrap();
+            let approved: SocketAddr = "93.184.216.2:443".parse().unwrap();
+            let state = State::new(Plan {
+                schema_version: 1,
+                inbound: "independent-reference".into(),
+                endpoint: address.to_string(),
+                own_ips: vec![address.ip()],
+                references: vec![Target {
+                    server_name: "reference.example.org".into(), address: approved,
+                }],
+            }, vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+            let health = directory.0.join("health.toml");
+            Store::new(&health).unwrap().enroll(&state).unwrap();
+            let bundle = directory.0.join("bundle");
+            let digest = state.snapshot_sha256().unwrap();
+            let record = crate::reality_provision::create(&state, digest, &bundle, now).unwrap();
+            let config_path = directory.0.join("server.toml");
+            fs::write(&config_path, include_str!("../../../examples/server.toml")
+                .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))).unwrap();
+            let request = Request::Server(ServerRequest {
+                health, bundle, health_sha256: digest,
+                identity_sha256: record.identity_sha256, listen: address,
+                grants: vec!["device-a".into()],
+            });
+            let preview = reality_config::prepare(&config_path, &request, now).unwrap();
+            reality_config::apply(&config_path, &request, preview.approval_sha256(), now).unwrap();
+            let Config::Server(mut document) = config::read_file(&config_path).unwrap() else { panic!() };
+            document.server.inbounds.retain(|i| i.id == "independent-reference");
+            let limits = GenerationLimits::new(&document);
+            let auth = Arc::new(LiveAuthorization::new(document.clone()).unwrap());
+            let prepared = prepare_selected_listeners_inner(&document, &limits, None, auth, None, None)
+                .await.unwrap();
+            let cert = rcgen::generate_simple_self_signed(vec!["reference.example.org".into()]).unwrap();
+            fs::write(directory.0.join("cert.pem"), cert.cert.pem()).unwrap();
+            fs::write(directory.0.join("key.pem"), cert.key_pair.serialize_pem()).unwrap();
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/f18_independent_reference.py");
+            let mut child = Process(Command::new("python")
+                .arg(script).arg(&directory.0).arg(address.to_string()).spawn().unwrap());
+            let ready = directory.0.join("reference-port");
+            let fixture = loop {
+                if let Ok(raw) = fs::read_to_string(&ready) {
+                    let port = raw.trim().parse::<u16>().unwrap();
+                    break SocketAddr::from(([127, 0, 0, 1], port));
+                }
+                assert!(child.0.try_wait().unwrap().is_none(), "independent reference exited before readiness");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            let (_, carrier) = prepared.reality.get("independent-reference").unwrap();
+            carrier.set_fixture_reference(approved, fixture);
+            let mut running = RunningGeneration::launch(prepared.listeners, GenerationPhase::Active);
+            fs::write(directory.0.join("relay-ready"), b"ready").unwrap();
+            loop {
+                if let Some(exit) = child.0.try_wait().unwrap() {
+                    assert!(exit.success(), "independent direct/relay comparison failed");
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+                    result = running.tasks.join_next() => panic!("reference dispatcher exited: {result:?}"),
+                }
+            }
+            let removed = document.server.inbounds.iter().map(|i| i.id.clone()).collect();
+            running.remove_inbounds(&removed);
+            while let Some(result) = running.tasks.join_next().await {
+                let (id, result) = result.unwrap();
+                result.unwrap();
+                assert!(running.finish_draining(&id));
+            }
+            assert!(!running.has_draining());
+        }).await.expect("bounded independent reference fixture");
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
