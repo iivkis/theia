@@ -1444,16 +1444,17 @@ impl Interaction {
             return;
         }
         if self.confirmation_choice().is_some() {
-            let footer = shell_layout(area)[2];
-            if event.row == footer.bottom().saturating_sub(1)
-                && event.column >= footer.x && event.column < footer.right() {
-                self.confirm_selected = event.column >= footer.x + footer.width / 2;
-                return;
+            if let Some(rect) = self.viewport.confirm_rect.get() {
+                if event.row == rect.bottom().saturating_sub(1)
+                    && event.column >= rect.x && event.column < rect.right() {
+                    self.confirm_selected = event.column >= rect.x + rect.width / 2;
+                }
             }
+            return;
         }
         if self.pending.is_some() && self.saving.is_none() {
             let items = dirty_transition_actions();
-            if let Some([_, controls]) = action_layout(body, items.len()) {
+            if let Some([_, controls]) = report_action_layout(body, items.len(), DIRTY_TRANSITION_TEXT) {
                 if let Some(index) = (Actions { items: &items, selected: self.modal_action })
                     .hit(controls, event.column, event.row) {
                     self.modal_action = index;
@@ -1469,7 +1470,7 @@ impl Interaction {
         // changes focus. A click never dispatches Enter, y, or a shortcut.
         if self.show_server_process {
             let items = self.server_process.actions();
-            if let Some([_, rect]) = action_layout(body, items.len()) {
+            if let Some([_, rect]) = report_action_layout(body, items.len(), &self.server_process.summary()) {
                 let actions = Actions {
                     items: &items,
                     selected: self.server_process.action_focus(),
@@ -1482,7 +1483,7 @@ impl Interaction {
         }
         if let Some(panel) = self.reality_status.as_mut() {
             let items = panel.actions();
-            if let Some([_, rect]) = action_layout(body, items.len()) {
+            if let Some([_, rect]) = report_action_layout(body, items.len(), &panel.summary()) {
                 let actions = Actions {
                     items: &items,
                     selected: panel.action_focus(),
@@ -1519,7 +1520,7 @@ impl Interaction {
         }
         if let Some(runtime) = self.runtime.as_ref() {
             let items = runtime.actions();
-            if let Some([_, controls]) = action_layout(body, items.len()) {
+            if let Some([_, controls]) = report_action_layout(body, items.len(), &runtime.body()) {
                 if let Some(i) = (Actions {
                     items: &items,
                     selected: self.modal_action,
@@ -1534,7 +1535,7 @@ impl Interaction {
         #[cfg(windows)]
         if let Some(proxy) = self.system_proxy.as_ref() {
             let items = proxy.actions();
-            if let Some([_, controls]) = action_layout(body, items.len()) {
+            if let Some([_, controls]) = report_action_layout(body, items.len(), &proxy.body()) {
                 if let Some(i) = (Actions {
                     items: &items,
                     selected: self.modal_action,
@@ -3826,6 +3827,8 @@ impl Interaction {
     }
 }
 
+const DIRTY_TRANSITION_TEXT: &str = "Сохранить изменения перед выходом?\nРаботающий процесс не изменится.";
+
 fn dirty_transition_actions() -> [ActionItem; 3] {
     [
         ActionItem { key: 'n', label: "Остаться в редакторе" },
@@ -3916,6 +3919,7 @@ struct Viewport {
     signature: Cell<u64>,
     focused_row: Cell<Option<usize>>,
     confirmation: Cell<bool>,
+    confirm_rect: Cell<Option<Rect>>,
     guided: Cell<bool>,
 }
 impl Viewport {
@@ -4067,7 +4071,8 @@ fn panel_at(
     } else {
         area
     };
-    let page = usize::from(area.height.saturating_sub(2)).max(1);
+    let confirm = viewport.is_some_and(|v| v.confirmation.get());
+    let page = usize::from(area.height.saturating_sub(if confirm { 4 } else { 2 })).max(1);
     let cleaned;
     let body = if viewport.is_some_and(|v| v.confirmation.get()) {
         cleaned = confirmation_body(body);
@@ -4105,6 +4110,16 @@ fn panel_at(
         Paragraph::new(visible).block(tui_widgets::report_section(&caption, focused)),
         area,
     );
+    if confirm {
+        if let Some(v) = viewport {
+            v.confirm_rect.set(Some(Rect::new(area.x, area.bottom(), area.width.min(72), 2)));
+        }
+    }
+}
+
+fn report_action_layout(area: Rect, count: usize, body: &str) -> Option<[Rect; 2]> {
+    let rows = visual_rows(body, usize::from(area.width.min(132).saturating_sub(2))).0.len();
+    tui_widgets::action_layout_rows(area, count, rows)
 }
 
 fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bool) {
@@ -4175,8 +4190,10 @@ fn draw_guided(
         form.as_ref().map(|f| f.fields.len()),
         review_lines.as_ref().map_or(0, Vec::len),
     );
-    let caption = format!("{title} · ШАГ {step}/{total}");
-    if parts[0].height > 0 {
+    let caption = if total > 1 { format!("{title} · ШАГ {step}/{total}") } else { title.to_owned() };
+    if parts[0].height > 0 && total == 1 {
+        frame.render_widget(Paragraph::new(Line::styled(title, Style::default().fg(TEXT).add_modifier(Modifier::BOLD))), parts[0]);
+    } else if parts[0].height > 0 {
         let mut segments = vec![
             Span::styled(
                 format!(" {step}/{total} "),
@@ -4261,10 +4278,15 @@ fn draw_guided(
         if !status.is_empty() {
             visible.push(Line::styled(status, Style::default().fg(MUTED)));
         }
+        let used = (visible.len() as u16).min(body_area.height);
         frame.render_widget(
             Paragraph::new(visible).style(Style::default().fg(TEXT).bg(BG)),
             body_area,
         );
+        if let Some(v) = viewport.filter(|v| v.confirmation.get()) {
+            let y = (body_area.y + used).min(area.bottom().saturating_sub(2));
+            v.confirm_rect.set(Some(Rect::new(body_area.x, y, body_area.width.min(72), 2)));
+        }
     }
     if parts[2].height > 0 && !viewport.is_some_and(|v| v.confirmation.get()) {
         frame.render_widget(
@@ -4295,6 +4317,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     let confirmation = interaction.and_then(Interaction::confirmation_choice);
     if let Some(v) = viewport {
         v.confirmation.set(confirmation.is_some());
+        v.confirm_rect.set(None);
         v.guided.set(false);
     }
     macro_rules! modal_panel {
@@ -4446,7 +4469,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     } else if let Some(ui) = interaction.filter(|ui| ui.show_server_process) {
         tui_widgets::canvas(frame, parts[1]);
         let items = ui.server_process.actions();
-        if let Some([report, controls]) = action_layout(parts[1], items.len()) {
+        if let Some([report, controls]) = report_action_layout(parts[1], items.len(), &ui.server_process.summary()) {
             modal_panel!(
                 frame,
                 report,
@@ -4519,7 +4542,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                     if start { "y запустить · n/Esc отменить" } else { "y остановить · n/Esc отменить" }),
                 viewport, (None, None),
             );
-        } else if let Some([report, controls]) = action_layout(parts[1], items.len()) {
+        } else if let Some([report, controls]) = report_action_layout(parts[1], items.len(), &status.summary()) {
             modal_panel!(frame, report, status.title(), &status.summary(), false);
             Actions {
                 items: &items,
@@ -4581,7 +4604,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     } else if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
         tui_widgets::canvas(frame, parts[1]);
         let items = runtime.actions();
-        if let Some([report, controls]) = action_layout(parts[1], items.len()) {
+        if let Some([report, controls]) = report_action_layout(parts[1], items.len(), &runtime.body()) {
             modal_panel!(frame, report, runtime.title(), &runtime.body(), false);
             Actions {
                 items: &items,
@@ -4695,9 +4718,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     } else if let Some(ui) = interaction.filter(|ui| ui.pending.is_some()) {
         tui_widgets::canvas(frame, parts[1]);
         let items = dirty_transition_actions();
-        if let Some([report, controls]) = action_layout(parts[1], items.len()) {
+        if let Some([report, controls]) = report_action_layout(parts[1], items.len(), DIRTY_TRANSITION_TEXT) {
             modal_panel!(frame, report, "Есть несохранённые изменения",
-                "Сохранить изменения перед выходом?\nРаботающий процесс не изменится.", false);
+                DIRTY_TRANSITION_TEXT, false);
             Actions { items: &items, selected: ui.modal_action }.render(frame, controls);
         } else {
             Actions { items: &items, selected: ui.modal_action }.render(frame, parts[1]);
@@ -4781,7 +4804,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     if let Some(proxy) = interaction.and_then(|ui| ui.system_proxy.as_ref()) {
         tui_widgets::canvas(frame, parts[1]);
         let items = proxy.actions();
-        if let Some([report, controls]) = action_layout(parts[1], items.len()) {
+        if let Some([report, controls]) = report_action_layout(parts[1], items.len(), &proxy.body()) {
             modal_panel!(
                 frame,
                 report,
@@ -4837,8 +4860,17 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         let heading = error.map_or_else(
             || "Следующее действие · ← → выбор · Enter открыть · Esc назад".to_owned(),
             |e| format!("Ошибка: {e} · F7 детали"));
-        tui_widgets::confirmation_bar(frame, parts[2], &heading, error.is_some(),
+        let rect = viewport.and_then(|v| v.confirm_rect.get())
+            .filter(|r| r.bottom() <= parts[1].bottom()).unwrap_or(parts[2]);
+        if let Some(v) = viewport { v.confirm_rect.set(Some(rect)); }
+        tui_widgets::confirmation_bar(frame, rect, &heading, error.is_some(),
             label, interaction.is_some_and(|ui| ui.confirm_selected));
+        if rect != parts[2] {
+            if let Some(e) = error {
+                frame.render_widget(Paragraph::new(tui_widgets::fit_value(&format!("Ошибка: {e}"), parts[2].width, false))
+                    .style(Style::default().fg(ERROR)), parts[2]);
+            }
+        }
         return;
     }
     if let Some(error) = active_error.as_deref().or(editor_error) {
@@ -5490,8 +5522,9 @@ fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> 
     let height = (count as u16).saturating_add(2).min(area.height - minimum).max(3);
     let preferred = if page == 1 { 20 }
         else if role == Role::Client && page == 3 { 19 }
-        else if role == Role::Server && matches!(page, 2 | 3) { 12 }
-        else { 10 };
+        else if role == Role::Server && matches!(page, 2 | 3) {
+            editor.map_or(6, |e| (e.workspace_users().len() as u16).saturating_add(3).clamp(6, 12))
+        } else if page == 0 { 10 } else { 6 };
     let content_height = preferred.min(area.height - height);
     let content = Rect::new(area.x, area.y, area.width, content_height);
     let controls = Rect::new(area.x, content.bottom(), area.width, height);
@@ -5525,15 +5558,11 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(format!("Активный профиль: {active}")),
-        Line::raw(format!(
-            "Выбран: {} · {}",
-            editor.client_profile_label(editor.selected_record_id()).unwrap_or_else(|| "Нет профиля".into()),
-            if editor.selected_reality() {
-                "REALITY"
-            } else {
-                "Own-TLS"
-            }
-        )),
+        Line::raw(if editor.selected_record_is_active() {
+            format!("Защита: {}", if editor.selected_reality() { "REALITY" } else { "Own-TLS" })
+        } else {
+            format!("Выбран: {} · {}", editor.client_profile_label(editor.selected_record_id()).unwrap_or_else(|| "Нет профиля".into()), if editor.selected_reality() { "REALITY" } else { "Own-TLS" })
+        }),
         Line::raw(""),
         Line::styled(
             "Системный прокси",
@@ -6815,7 +6844,7 @@ mod tests {
         ui.update(&mut model, press(KeyCode::F(5)));
         assert!(ui.show_server_process);
         let items = ui.server_process.actions();
-        let controls = action_layout(body, items.len()).unwrap()[1];
+        let controls = report_action_layout(body, items.len(), &ui.server_process.summary()).unwrap()[1];
         ui.mouse(&mut model, click_at(controls.x + 2, controls.y + 1), area);
         assert_eq!(ui.server_process.action_focus(), 0);
         assert!(!ui.server_process.running());
@@ -7099,7 +7128,10 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Right));
         assert!(ui.confirm_selected);
         assert!(!ui.server_process.running());
-        ui.mouse(&mut model, click_at(90, area.bottom() - 1), area);
+        let rect = ui.viewport.confirm_rect.get().unwrap();
+        assert!(rect.y < area.y + 15);
+        assert!(!screen.contains("ШАГ 1/1"));
+        ui.mouse(&mut model, click_at(rect.x + rect.width / 2 + 1, rect.bottom() - 1), area);
         assert!(ui.confirm_selected);
         assert!(!ui.server_process.running());
         ui.update(&mut model, press(KeyCode::Left));

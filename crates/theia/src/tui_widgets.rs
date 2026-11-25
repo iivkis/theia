@@ -665,9 +665,16 @@ pub(crate) fn confirmation_bar(frame: &mut Frame<'_>, area: Rect, heading: &str,
 }
 
 pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
+    action_layout_rows(area, count, 20)
+}
+
+/// Fit actions immediately below the wrapped report, leaving room for
+/// scrolling long reports and selecting every action on compact terminals.
+pub(crate) fn action_layout_rows(area: Rect, count: usize, rows: usize) -> Option<[Rect; 2]> {
     if count == 0 || area.height < 8 { return None; }
     let height = (count as u16).saturating_add(2).min(area.height / 2).max(3);
-    let content_height = (area.height - height).min(22);
+    let preferred = rows.saturating_add(2).clamp(3, 22) as u16;
+    let content_height = (area.height - height).min(preferred);
     let report = Rect::new(area.x, area.y, area.width, content_height);
     let controls = Rect::new(area.x, report.bottom(), area.width, height);
     Some([report, controls])
