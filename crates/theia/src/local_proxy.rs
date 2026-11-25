@@ -69,8 +69,12 @@ fn read_token(profile: &Profile) -> Result<zeroize::Zeroizing<String>, ClientErr
 }
 
 async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
+    load_client_with_budget(profile, crate::connection_pool::profile_budget()).await
+}
+
+async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> Result<ProxyClient, ClientError> {
     if profile.tls_profile == "smart-reality" || profile.reality_profile.is_some() {
-        return RealityClient::prepare(profile)
+        return RealityClient::prepare_with_budget(profile, budget)
             .await
             .map(Arc::new)
             .map(ProxyClient::Reality);
@@ -111,8 +115,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 &token,
                 &cert,
             )
-            .map(Arc::new)
-            .map(Carrier::H2)
+            .and_then(|client| Carrier::from_options(Some(Arc::new(client)), None, Duration::ZERO, budget))
             .map(ProxyClient::Direct);
         }
         #[cfg(not(feature = "experimental-btls-h2"))]
@@ -147,7 +150,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             } else {
                 client
             };
-            Ok(ProxyClient::Direct(Carrier::H2(Arc::new(client.with_connection_pool()))))
+            Ok(ProxyClient::Direct(Carrier::from_options(Some(Arc::new(client.with_connection_pool())), None, ttl, budget)?))
         }
         Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
@@ -165,7 +168,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 h3
             });
             if profile.transport == Transport::H3 {
-                return Ok(ProxyClient::Direct(Carrier::H3(h3)));
+                return Ok(ProxyClient::Direct(Carrier::from_options(None, Some(h3), ttl, budget)?));
             }
             // Both carriers use the same resolved endpoint. Do not resolve
             // the hostname again during fallback; retain the configured SNI,
@@ -179,7 +182,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             } else {
                 h2
             });
-            Ok(ProxyClient::Direct(Carrier::from_options(Some(h2), Some(h3), ttl)?))
+            Ok(ProxyClient::Direct(Carrier::from_options(Some(h2), Some(h3), ttl, budget)?))
         }
     }
 }
@@ -219,6 +222,7 @@ struct RealityGeneration {
 pub(crate) struct RealityClient {
     profile: Profile,
     remote: SocketAddr,
+    budget: Arc<Semaphore>,
     current: tokio::sync::Mutex<Arc<RealityGeneration>>,
     changed: Notify,
 }
@@ -226,7 +230,7 @@ impl RealityClient {
     fn now() -> Result<u64, ClientError> {
         crate::reference_health::unix_now().map_err(|_| ClientError::Tls)
     }
-    async fn prepare(profile: &Profile) -> Result<Self, ClientError> {
+    async fn prepare_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> Result<Self, ClientError> {
         // No DNS/credential use before the enrollment and independent trust
         // anchor have been checked.
         let enrollment = crate::reality_config::pinned_client(profile)
@@ -235,10 +239,11 @@ impl RealityClient {
             .load(Self::now()?)
             .map_err(|_| ClientError::Tls)?;
         let remote = resolve_server(profile).await?;
-        let first = Self::build(profile, remote, &enrollment, value, None)?;
+        let first = Self::build(profile, remote, &enrollment, value, None, budget.clone())?;
         Ok(Self {
             profile: profile.clone(),
             remote,
+            budget,
             current: tokio::sync::Mutex::new(Arc::new(first)),
             changed: Notify::new(),
         })
@@ -249,6 +254,7 @@ impl RealityClient {
         enrollment: &crate::reality_bootstrap::Profile,
         value: crate::descriptor::Verified,
         expected_credential: Option<[u8; 32]>,
+        budget: Arc<Semaphore>,
     ) -> Result<RealityGeneration, ClientError> {
         if value.descriptor().scope.endpoint != profile.server {
             return Err(ClientError::Configuration);
@@ -282,7 +288,7 @@ impl RealityClient {
         } else {
             None
         };
-        let carrier = Carrier::from_options(h2, h3, ttl)?;
+        let carrier = Carrier::from_options(h2, h3, ttl, budget)?;
         Ok(RealityGeneration {
             value,
             carrier,
@@ -325,6 +331,7 @@ impl RealityClient {
             &enrollment,
             value,
             Some(slot.credential_digest),
+            self.budget.clone(),
         )?);
         *slot = next.clone();
         self.changed.notify_one();
@@ -428,6 +435,7 @@ impl RealityClient {
                 &enrollment,
                 candidate,
                 Some(generation.credential_digest),
+                self.budget.clone(),
             )?;
             let seen = next.carrier.fetch_identity_document(false).await?;
             if seen != successor {
@@ -635,7 +643,9 @@ impl AutoClient {
         Fut: std::future::Future<Output = Result<T, ClientError>>,
     {
         for index in 0..AUTO_QUIC_ATTEMPTS {
-            if !self.same_scope(generation)? {
+            // Unknown network scope disables reuse and fallback, not a
+            // first authenticated H3 connection attempt.
+            if index > 0 && !self.same_scope(generation)? {
                 return Err(ClientError::QuicUnreachable);
             }
             match attempt().await {
@@ -765,7 +775,21 @@ enum ProxyTunnel {
 }
 
 impl Carrier {
-    fn from_options(h2: Option<Arc<H2Client>>, h3: Option<Arc<H3Client>>, ttl: Duration) -> Result<Self, ClientError> {
+    fn profile_budget(&self) -> Arc<Semaphore> {
+        match self {
+            Self::H2(client) => client.profile_budget(),
+            Self::H3(client) => client.profile_budget(),
+            Self::Auto(client) => client.h2.profile_budget(),
+        }
+    }
+
+    fn from_options(mut h2: Option<Arc<H2Client>>, mut h3: Option<Arc<H3Client>>, ttl: Duration, budget: Arc<Semaphore>) -> Result<Self, ClientError> {
+        if let Some(client) = h2.as_mut() {
+            Arc::get_mut(client).ok_or(ClientError::Configuration)?.set_profile_budget(budget.clone());
+        }
+        if let Some(client) = h3.as_mut() {
+            Arc::get_mut(client).ok_or(ClientError::Configuration)?.set_profile_budget(budget);
+        }
         match (h2, h3) {
             (Some(h2), Some(h3)) => Ok(Self::Auto(Arc::new(AutoClient {
                 h2, h3, ttl, negative: Mutex::new(NegativeCache::default()),
@@ -803,6 +827,13 @@ impl Carrier {
 }
 
 impl ProxyClient {
+    fn profile_budget(&self) -> Arc<Semaphore> {
+        match self {
+            Self::Direct(client) => client.profile_budget(),
+            Self::Reality(client) => client.budget.clone(),
+        }
+    }
+
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
             Self::Direct(client) => client.open(address, port).await,
@@ -942,7 +973,11 @@ impl ClientRuntime {
         if old.tls_profile != next.tls_profile {
             return Err(ClientError::Configuration);
         }
-        let client = load_client(next).await?;
+        let client = if old.id == next.id {
+            load_client_with_budget(next, previous.client.profile_budget()).await?
+        } else {
+            load_client(next).await?
+        };
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
     }

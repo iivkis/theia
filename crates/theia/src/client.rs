@@ -412,6 +412,14 @@ impl H2Client {
 
     /// Opt in to an additional exact leaf certificate identity, retaining PKI.
     /// Reuse verified own-TLS connections within this immutable profile.
+    pub(crate) fn set_profile_budget(&mut self, budget: std::sync::Arc<tokio::sync::Semaphore>) {
+        self.pool.set_profile_budget(budget);
+    }
+
+    pub(crate) fn profile_budget(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        self.pool.profile_budget()
+    }
+
     pub(crate) fn with_mode_cache_ttl(mut self, ttl: Duration) -> Self {
         if let Some(mode) = self.auto_mode.as_mut() {
             mode.set_ttl(ttl);
@@ -637,12 +645,17 @@ impl H2Client {
             .pool
             .acquire(
                 route,
-                stream_up,
                 reusable,
                 |connection| !connection.driver.0.is_finished(),
                 self.connect_verified(operation),
             )
             .await?;
+        // A network transition during a queued/dialing admission invalidates
+        // reuse before any HTTP headers or bearer are sent.
+        if route.is_some() && self.endpoint.parse().ok().and_then(crate::network_scope::observe) != route {
+            lease.retire();
+            return Err(ClientError::Io);
+        }
         let connection = lease.connection();
         let binding = connection.binding.as_ref();
         let sender = connection

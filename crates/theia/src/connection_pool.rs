@@ -17,6 +17,11 @@ use tokio::{
 
 const MAX_CONNECTIONS: usize = 4;
 const MAX_TUNNELS: usize = 16;
+const MAX_PROFILE_CONNECTIONS: usize = 8;
+
+pub(crate) fn profile_budget() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(MAX_PROFILE_CONNECTIONS))
+}
 // Own-TLS defaults are provisional local policy. REALITY derives its
 // bounds from the verified descriptor of this immutable client generation.
 const MAX_REUSE_AGE: Duration = Duration::from_secs(20);
@@ -80,13 +85,14 @@ impl RotationPolicy {
 pub(crate) struct Pool<C> {
     entries: Arc<Mutex<Vec<Arc<Entry<C>>>>>,
     connections: Arc<Semaphore>,
+    profile: Arc<Semaphore>,
+    dial: Mutex<()>,
     policy: RotationPolicy,
     lifetime: watch::Sender<()>,
 }
 struct Entry<C> {
     connection: C,
     route: Option<crate::network_scope::Scope>,
-    split: bool,
     deadline: Instant,
     byte_limit: u64,
     bytes: AtomicU64,
@@ -95,6 +101,7 @@ struct Entry<C> {
     retired: AtomicBool,
     wake_cleanup: Arc<Notify>,
     _permit: OwnedSemaphorePermit,
+    _profile_permit: OwnedSemaphorePermit,
 }
 impl<C> Entry<C> {
     fn retire(&self) {
@@ -114,6 +121,9 @@ impl<C> Lease<C> {
     }
     pub(crate) fn id(&self) -> u32 {
         self.id
+    }
+    pub(crate) fn retire(&self) {
+        self.entry.retire();
     }
     pub(crate) fn admitted(&mut self) {
         self.admitted = true;
@@ -149,6 +159,8 @@ impl<C> Default for Pool<C> {
         Self {
             entries: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            profile: profile_budget(),
+            dial: Mutex::new(()),
             policy: RotationPolicy::default(),
             lifetime: watch::channel(()).0,
         }
@@ -167,15 +179,22 @@ impl<C: Send + Sync + 'static> Pool<C> {
         }
     }
 
-    pub(crate) async fn acquire(
-        &self,
+    /// Set before publishing the carrier. A generation never changes its
+    /// own budget; live leases keep a profile permit across replacement.
+    pub(crate) fn set_profile_budget(&mut self, budget: Arc<Semaphore>) {
+        self.profile = budget;
+    }
+
+    pub(crate) fn profile_budget(&self) -> Arc<Semaphore> {
+        self.profile.clone()
+    }
+
+    fn reuse(
+        entries: &mut Vec<Arc<Entry<C>>>,
         route: Option<crate::network_scope::Scope>,
-        split: bool,
         reusable: bool,
-        alive: impl Fn(&C) -> bool,
-        create: impl Future<Output = Result<C, ClientError>>,
-    ) -> Result<Lease<C>, ClientError> {
-        let mut entries = self.entries.lock().await;
+        alive: &impl Fn(&C) -> bool,
+    ) -> Option<Lease<C>> {
         entries.retain(|entry| {
             let retain = !entry.retired.load(Ordering::Acquire)
                 && entry.route == route
@@ -188,47 +207,65 @@ impl<C: Send + Sync + 'static> Pool<C> {
             }
             retain
         });
-        if reusable && route.is_some() {
-            for entry in entries.iter() {
-                if entry.split != split
-                    || entry.active.load(Ordering::Acquire) >= MAX_TUNNELS
-                    || entry.retired.load(Ordering::Acquire)
-                    || Instant::now() >= entry.deadline
-                    || entry.bytes.load(Ordering::Acquire) >= entry.byte_limit
-                {
-                    continue;
-                }
-                let id = entry.next_id.fetch_add(1, Ordering::AcqRel) as u32;
-                entry.active.fetch_add(1, Ordering::AcqRel);
-                return Ok(Lease {
-                    entry: entry.clone(),
-                    id,
-                    admitted: false,
-                });
-            }
+        if !reusable || route.is_none() {
+            return None;
         }
-        // Count draining connections as well as reusable ones; active
-        // leases retain the permit even after their entry is evicted.
-        if self.connections.available_permits() == 0 {
-            if let Some(index) = entries
-                .iter()
-                .position(|entry| entry.active.load(Ordering::Acquire) == 0)
+        for entry in entries.iter() {
+            if entry.active.load(Ordering::Acquire) >= MAX_TUNNELS
+                || entry.retired.load(Ordering::Acquire)
+                || Instant::now() >= entry.deadline
+                || entry.bytes.load(Ordering::Acquire) >= entry.byte_limit
             {
-                entries.remove(index).retire();
+                continue;
+            }
+            // The same connection owns a single namespace for both XHTTP
+            // modes. A stream-one admission burns an ID as well; no reuse
+            // of a pair ID is possible even after cancellation or expiry.
+            let id = entry.next_id.fetch_add(1, Ordering::AcqRel) as u32;
+            entry.active.fetch_add(1, Ordering::AcqRel);
+            return Some(Lease { entry: entry.clone(), id, admitted: false });
+        }
+        None
+    }
+
+    pub(crate) async fn acquire(
+        &self,
+        route: Option<crate::network_scope::Scope>,
+        reusable: bool,
+        alive: impl Fn(&C) -> bool,
+        create: impl Future<Output = Result<C, ClientError>>,
+    ) -> Result<Lease<C>, ClientError> {
+        {
+            let mut entries = self.entries.lock().await;
+            if let Some(lease) = Self::reuse(&mut entries, route, reusable, &alive) {
+                return Ok(lease);
             }
         }
-        let permit = self
-            .connections
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))?;
+        // Only connection creation is single-flight. A slow handshake
+        // cannot hold the entries lock or block reuse/retirement of a
+        // different already verified connection.
+        let _dial = self.dial.lock().await;
+        let (permit, profile_permit) = {
+            let mut entries = self.entries.lock().await;
+            if let Some(lease) = Self::reuse(&mut entries, route, reusable, &alive) {
+                return Ok(lease);
+            }
+            if self.connections.available_permits() == 0 || self.profile.available_permits() == 0 {
+                if let Some(index) = entries.iter().position(|entry| entry.active.load(Ordering::Acquire) == 0) {
+                    entries.remove(index).retire();
+                }
+            }
+            let limit = || ClientError::Open(crate::protocol::ErrorCode::ResourceLimit);
+            let permit = self.connections.clone().try_acquire_owned().map_err(|_| limit())?;
+            let profile_permit = self.profile.clone().try_acquire_owned().map_err(|_| limit())?;
+            (permit, profile_permit)
+        };
         let (age, byte_limit) = self.policy.sample()?;
         let connection = create.await?;
         let deadline = Instant::now().checked_add(age).ok_or(ClientError::Configuration)?;
         let entry = Arc::new(Entry {
             connection,
             route,
-            split,
             deadline,
             byte_limit,
             bytes: AtomicU64::new(0),
@@ -237,9 +274,10 @@ impl<C: Send + Sync + 'static> Pool<C> {
             retired: AtomicBool::new(false),
             wake_cleanup: Arc::new(Notify::new()),
             _permit: permit,
+            _profile_permit: profile_permit,
         });
         if reusable && route.is_some() {
-            entries.push(entry.clone());
+            self.entries.lock().await.push(entry.clone());
             // No traffic is necessary to clean up an idle expired carrier.
             // Keep only weak references across the timer; dropping the
             // profile or evicting a connection cannot extend its lifetime.
@@ -280,14 +318,22 @@ mod tests {
         let pool = Pool::default();
         let route = Some("127.0.0.1:0".parse().unwrap());
         let mut active = pool
-            .acquire(route, false, true, |_| true, async { Ok(1) })
+            .acquire(route, true, |_| true, async { Ok(1) })
             .await
             .unwrap();
         active.admitted();
+        let mut busy = Vec::new();
+        for _ in 1..MAX_TUNNELS {
+            let mut lease = pool.acquire(route, true, |_| true, async { Ok(1) }).await.unwrap();
+            lease.admitted();
+            busy.push(lease);
+        }
         let mut idle = pool
-            .acquire(route, true, true, |_| true, async { Ok(2) })
+            .acquire(route, true, |_| true, async { Ok(2) })
             .await
             .unwrap();
+        assert!(!active.shares_connection(&idle));
+        drop(busy);
         idle.admitted();
         drop(idle);
         tokio::task::yield_now().await;
@@ -297,7 +343,7 @@ mod tests {
         assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);
         assert_eq!(*active.connection(), 1);
         let mut fresh = pool
-            .acquire(route, false, true, |_| true, async { Ok(3) })
+            .acquire(route, true, |_| true, async { Ok(3) })
             .await
             .unwrap();
         fresh.admitted();
@@ -327,9 +373,9 @@ mod tests {
             volume_max_bytes: 10,
         });
         let route = Some("127.0.0.1:0".parse().unwrap());
-        let mut first = pool.acquire(route, false, true, |_| true, async { Ok(1) }).await.unwrap();
+        let mut first = pool.acquire(route, true, |_| true, async { Ok(1) }).await.unwrap();
         first.admitted();
-        let mut second = pool.acquire(route, false, true, |_| true, async { Ok(2) }).await.unwrap();
+        let mut second = pool.acquire(route, true, |_| true, async { Ok(2) }).await.unwrap();
         second.admitted();
         assert!(first.shares_connection(&second));
         first.record_data(4);
@@ -339,7 +385,7 @@ mod tests {
         assert!(first.entry.retired.load(Ordering::Acquire));
         second.record_data(usize::MAX);
         assert_eq!(first.entry.bytes.load(Ordering::Acquire), u64::MAX);
-        let mut fresh = pool.acquire(route, false, true, |_| true, async { Ok(3) }).await.unwrap();
+        let mut fresh = pool.acquire(route, true, |_| true, async { Ok(3) }).await.unwrap();
         fresh.admitted();
         assert!(!first.shares_connection(&fresh));
         assert_eq!(*first.connection(), 1);
@@ -362,9 +408,9 @@ mod tests {
         let source = "127.0.0.1:0".parse().unwrap();
         let a = Some(Scope::fixture(source, 1));
         let b = Some(Scope::fixture(source, 2));
-        let mut old = pool.acquire(a, false, true, |_| true, async { Ok(1) }).await.unwrap();
+        let mut old = pool.acquire(a, true, |_| true, async { Ok(1) }).await.unwrap();
         old.admitted();
-        let mut fresh = pool.acquire(b, false, true, |_| true, async { Ok(2) }).await.unwrap();
+        let mut fresh = pool.acquire(b, true, |_| true, async { Ok(2) }).await.unwrap();
         fresh.admitted();
         assert!(old.entry.retired.load(Ordering::Acquire));
         assert_eq!(*old.connection(), 1);
@@ -373,16 +419,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_budget_is_shared_across_carriers_and_draining_generations() {
+        let budget = profile_budget();
+        let mut h2 = Pool::default();
+        let mut h3 = Pool::default();
+        let mut next = Pool::default();
+        h2.set_profile_budget(budget.clone());
+        h3.set_profile_budget(budget.clone());
+        next.set_profile_budget(budget.clone());
+        let mut leases = Vec::new();
+        for pool in [&h2, &h3] {
+            for _ in 0..MAX_CONNECTIONS {
+                let mut lease = pool.acquire(None, false, |_| true, async { Ok(7) }).await.unwrap();
+                lease.admitted();
+                leases.push(lease);
+            }
+        }
+        assert_eq!(budget.available_permits(), 0);
+        assert!(matches!(next.acquire(None, false, |_| true, async { Ok(8) }).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))));
+        drop(h2);
+        drop(h3);
+        assert_eq!(budget.available_permits(), 0);
+        drop(leases.pop());
+        let fresh = next.acquire(None, false, |_| true, async { Ok(8) }).await.unwrap();
+        assert_eq!(*fresh.connection(), 8);
+    }
+
+    #[tokio::test]
     async fn scope_retirement_and_capacity_keep_live_leases() {
         let pool = Pool::default();
         let route = Some("127.0.0.1:0".parse().unwrap());
         let mut a = pool
-            .acquire(route, true, true, |_| true, async { Ok(1) })
+            .acquire(route, true, |_| true, async { Ok(1) })
             .await
             .unwrap();
         a.admitted();
         let b = pool
-            .acquire(route, true, true, |_| true, async { Ok(2) })
+            .acquire(route, true, |_| true, async { Ok(2) })
             .await
             .unwrap();
         assert_eq!(
@@ -391,31 +465,31 @@ mod tests {
         );
         drop(b);
         let mut c = pool
-            .acquire(route, true, true, |_| true, async { Ok(3) })
+            .acquire(route, true, |_| true, async { Ok(3) })
             .await
             .unwrap();
         c.admitted();
         assert_eq!((*a.connection(), *c.connection()), (1, 3));
         let mut d = pool
-            .acquire(route, false, true, |_| true, async { Ok(4) })
+            .acquire(route, false, |_| true, async { Ok(4) })
             .await
             .unwrap();
         d.admitted();
         assert_eq!(*d.connection(), 4);
         let other = Some("127.0.0.2:0".parse().unwrap());
         let e = pool
-            .acquire(other, true, true, |_| true, async { Ok(5) })
+            .acquire(other, true, |_| true, async { Ok(5) })
             .await
             .unwrap();
         assert_eq!(*e.connection(), 5);
         assert!(matches!(
-            pool.acquire(other, false, true, |_| true, async { Ok(6) })
+            pool.acquire(other, false, |_| true, async { Ok(6) })
                 .await,
             Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))
         ));
         drop(a);
         assert!(pool
-            .acquire(other, false, true, |_| true, async { Ok(6) })
+            .acquire(other, false, |_| true, async { Ok(6) })
             .await
             .is_ok());
     }
