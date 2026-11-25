@@ -100,7 +100,8 @@ impl Drop for Wire {
 }
 
 fn check_wire(wire: &Wire) -> Result<(), InviteError> {
-    if wire.version != 1 || wire.carrier != "smarttheia-xhttp"
+    if wire.version != 1
+        || wire.carrier != "smarttheia-xhttp"
         || !crate::config::valid_id(&wire.id)
         || !crate::config::valid_remote(&wire.endpoint)
         || !crate::split_http::valid_prefix(&wire.path_prefix)
@@ -108,43 +109,70 @@ fn check_wire(wire: &Wire) -> Result<(), InviteError> {
         return Err(InviteError::Invalid);
     }
     let valid = match wire.security_mode {
-        WireSecurity::OwnTls => wire.public_key.is_none()
-            && wire.minimum_revision.is_none() && wire.descriptor.is_none(),
-        WireSecurity::SmartReality => wire.public_key.is_some()
-            && wire.minimum_revision.is_some_and(|revision| revision > 0)
-            && wire.descriptor.as_ref().is_some_and(|value| !value.is_empty()
-                && value.len() <= crate::descriptor::MAX_DOCUMENT),
+        WireSecurity::OwnTls => {
+            wire.public_key.is_none()
+                && wire.minimum_revision.is_none()
+                && wire.descriptor.is_none()
+        }
+        WireSecurity::SmartReality => {
+            wire.public_key.is_some()
+                && wire.minimum_revision.is_some_and(|revision| revision > 0)
+                && wire.descriptor.as_ref().is_some_and(|value| {
+                    !value.is_empty() && value.len() <= crate::descriptor::MAX_DOCUMENT
+                })
+        }
     };
-    if !valid { return Err(InviteError::Invalid); }
+    if !valid {
+        return Err(InviteError::Invalid);
+    }
     Ok(())
 }
 
 pub(crate) fn encode_wire(wire: &Wire) -> Result<Zeroizing<String>, InviteError> {
     check_wire(wire)?;
     let text = Zeroizing::new(toml::to_string(wire).map_err(|_| InviteError::Invalid)?);
-    if text.len() > MAX_DATA { return Err(InviteError::Invalid); }
+    if text.len() > MAX_DATA {
+        return Err(InviteError::Invalid);
+    }
     let mut uri = Zeroizing::new(PREFIX.to_owned());
     URL_SAFE_NO_PAD.encode_string(text.as_bytes(), &mut uri);
-    if uri.len() > MAX_URI { return Err(InviteError::Invalid); }
+    if uri.len() > MAX_URI {
+        return Err(InviteError::Invalid);
+    }
     Ok(uri)
 }
 
 pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
-    if uri.len() > MAX_URI { return Err(InviteError::Invalid); }
-    let encoded = uri.strip_prefix(PREFIX).ok_or(InviteError::Invalid)?;
-    if encoded.is_empty() || encoded.bytes().any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_') {
+    if uri.len() > MAX_URI {
         return Err(InviteError::Invalid);
     }
-    let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded).map_err(|_| InviteError::Invalid)?);
+    let encoded = uri.strip_prefix(PREFIX).ok_or(InviteError::Invalid)?;
+    if encoded.is_empty()
+        || encoded
+            .bytes()
+            .any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_')
+    {
+        return Err(InviteError::Invalid);
+    }
+    let bytes = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| InviteError::Invalid)?,
+    );
     let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice()));
-    if bytes.len() > MAX_DATA || canonical.as_str() != encoded { return Err(InviteError::Invalid); }
+    if bytes.len() > MAX_DATA || canonical.as_str() != encoded {
+        return Err(InviteError::Invalid);
+    }
     let text = std::str::from_utf8(&bytes).map_err(|_| InviteError::Invalid)?;
     let wire: Wire = toml::from_str(text).map_err(|_| InviteError::Invalid)?;
     check_wire(&wire)?;
     // Preserve the authenticated REALITY bootstrap's canonical TOML contract.
     if wire.security_mode == WireSecurity::SmartReality
-        && Zeroizing::new(toml::to_string(&wire).map_err(|_| InviteError::Invalid)?).as_str() != text
-    { return Err(InviteError::Invalid); }
+        && Zeroizing::new(toml::to_string(&wire).map_err(|_| InviteError::Invalid)?).as_str()
+            != text
+    {
+        return Err(InviteError::Invalid);
+    }
     Ok(wire)
 }
 
@@ -507,7 +535,11 @@ mod tests {
             assert_eq!(restored.security_mode, SecurityMode::Plain);
             assert_eq!(restored.transport, transport);
         }
-        for mode in [SecurityMode::PinnedCertV1, SecurityMode::PinnedCertStreamUpV1, SecurityMode::SmartReality] {
+        for mode in [
+            SecurityMode::PinnedCertV1,
+            SecurityMode::PinnedCertStreamUpV1,
+            SecurityMode::SmartReality,
+        ] {
             profile.security_mode = mode;
             for transport in [Transport::Auto, Transport::H2, Transport::H3] {
                 profile.transport = transport;
@@ -608,7 +640,11 @@ mod tests {
                 );
             }
         }
-        for mode in [SecurityMode::PinnedCertV1, SecurityMode::PinnedCertStreamUpV1, SecurityMode::SmartReality] {
+        for mode in [
+            SecurityMode::PinnedCertV1,
+            SecurityMode::PinnedCertStreamUpV1,
+            SecurityMode::SmartReality,
+        ] {
             profile.security_mode = mode;
             assert!(Invitation::public_from_profile(&profile).is_err());
         }

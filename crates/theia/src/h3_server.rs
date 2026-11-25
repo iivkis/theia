@@ -124,7 +124,11 @@ pub(crate) async fn serve_generation(
     Ok(())
 }
 
-pub(crate) async fn run_connection(connection: quinn::Connection, context: Arc<ServerContext>, mut phase: watch::Receiver<GenerationPhase>) {
+pub(crate) async fn run_connection(
+    connection: quinn::Connection,
+    context: Arc<ServerContext>,
+    mut phase: watch::Receiver<GenerationPhase>,
+) {
     let guard = ConnectionGuard(connection);
     let peer = guard.0.remote_address().ip();
     let binding = if context.requires_channel_binding() {
@@ -190,7 +194,9 @@ pub(crate) async fn run_connection(connection: quinn::Connection, context: Arc<S
         };
         if draining || server::generation_draining(&phase) {
             // Resolve only to reject the HTTP stream; no bearer or OPEN.
-            if let Ok(Ok((_, mut stream))) = timeout(CLOSE_TIMEOUT, resolver.resolve_request()).await {
+            if let Ok(Ok((_, mut stream))) =
+                timeout(CLOSE_TIMEOUT, resolver.resolve_request()).await
+            {
                 stream.stop_stream(Code::H3_REQUEST_REJECTED);
                 stream.stop_sending(Code::H3_REQUEST_REJECTED);
             }

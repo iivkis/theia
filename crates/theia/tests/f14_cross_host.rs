@@ -303,7 +303,10 @@ async fn explicit_xhttp_client_scenario(
         panic!("imported client");
     };
     assert_eq!(imported.client.active_profile, "home");
-    assert_eq!(imported.client.profiles[1].security_mode, profile.security_mode);
+    assert_eq!(
+        imported.client.profiles[1].security_mode,
+        profile.security_mode
+    );
     assert_eq!(imported.client.profiles[1].transport, transport);
     imported.client.active_profile = profile.id;
     run_client(&config_path, imported.clone(), fixture.origin, true).await;

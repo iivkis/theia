@@ -4,6 +4,7 @@
 //! or OS/file references in an invitation. No REALITY wire behavior claimed.
 #![forbid(unsafe_code)]
 
+use crate::invite::{self, Wire, WireSecurity};
 use crate::{
     config::{self, Transport, WriteFailure, XhttpMode},
     descriptor::{self, Anchor, ClientPolicy, Descriptor, Scope, Verified},
@@ -17,11 +18,10 @@ use sha2::{Digest, Sha256};
 use std::{fmt, path::Path};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
-use crate::invite::{self, Wire, WireSecurity};
 
+pub use crate::invite::MAX_URI;
 #[cfg(test)]
 use crate::invite::PREFIX;
-pub use crate::invite::MAX_URI;
 const MAX_PROFILE: usize = 64 * 1024;
 pub(crate) const VALIDITY: u64 = 7 * 24 * 60 * 60;
 
@@ -249,7 +249,10 @@ impl Invitation {
             public: identity.public_key(),
             revision: value.descriptor().revision,
             signed: signed.to_owned(),
-            reference_name: value.descriptor().references[usize::from(value.descriptor().active_reference)].server_name.clone(),
+            reference_name: value.descriptor().references
+                [usize::from(value.descriptor().active_reference)]
+            .server_name
+            .clone(),
             path_prefix: value.descriptor().path_prefix.clone(),
             bearer: None,
         })
@@ -330,17 +333,24 @@ impl Invitation {
     pub fn decode(uri: &str, now: u64) -> Result<Self, Error> {
         let wire = invite::decode_wire(uri).map_err(|_| Error::Format)?;
         if wire.security_mode != WireSecurity::SmartReality
-            || wire.transport != Transport::Auto || wire.xhttp_mode != XhttpMode::Auto {
+            || wire.transport != Transport::Auto
+            || wire.xhttp_mode != XhttpMode::Auto
+        {
             return Err(Error::Format);
         }
         let public = key(wire.public_key.as_deref().ok_or(Error::Format)?)?;
-        let scope = Scope { inbound: wire.id.clone(), endpoint: wire.endpoint.clone() };
+        let scope = Scope {
+            inbound: wire.id.clone(),
+            endpoint: wire.endpoint.clone(),
+        };
         let revision = wire.minimum_revision.ok_or(Error::Format)?;
         let signed = wire.descriptor.as_deref().ok_or(Error::Format)?;
         let value = verify(signed, &scope, public, revision, auto_policy(), now)?;
         let d = value.descriptor();
-        if d.revision != revision || d.path_prefix != wire.path_prefix
-            || d.references[usize::from(d.active_reference)].server_name != wire.server_name {
+        if d.revision != revision
+            || d.path_prefix != wire.path_prefix
+            || d.references[usize::from(d.active_reference)].server_name != wire.server_name
+        {
             return Err(Error::Descriptor);
         }
         let bearer = wire

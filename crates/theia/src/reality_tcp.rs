@@ -360,10 +360,18 @@ impl PreparedTcp {
         self.serve_generation(phase).await
     }
 
-    pub(crate) async fn serve_generation(self, mut phase: watch::Receiver<server::GenerationPhase>) -> Result<(), ServerError> {
+    pub(crate) async fn serve_generation(
+        self,
+        mut phase: watch::Receiver<server::GenerationPhase>,
+    ) -> Result<(), ServerError> {
         crate::tcp_bbr::select(&self.listener)
             .map_err(|_| ServerError::TcpControllerUnavailable)?;
-        let Self { listener, live, relay, inspection_slots } = self;
+        let Self {
+            listener,
+            live,
+            relay,
+            inspection_slots,
+        } = self;
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
@@ -402,7 +410,8 @@ impl PreparedTcp {
         drop(listener);
         let _ = timeout(server::GENERATION_DRAIN, async {
             while tasks.join_next().await.is_some() {}
-        }).await;
+        })
+        .await;
         Ok(())
     }
 }

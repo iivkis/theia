@@ -109,8 +109,10 @@ mod tests {
         OWN_TLS_PADDING.add_header(&mut headers).unwrap();
         assert!((16..=64).contains(&headers[HEADER].as_bytes().len()));
         assert!(OWN_TLS_PADDING.frame(0).unwrap().is_none());
-        assert!(matches!(OWN_TLS_PADDING.frame(protocol::CAP_PADDING).unwrap(),
-            Some(Frame::Padding(bytes)) if (16..=128).contains(&bytes.len())));
+        assert!(
+            matches!(OWN_TLS_PADDING.frame(protocol::CAP_PADDING).unwrap(),
+            Some(Frame::Padding(bytes)) if (16..=128).contains(&bytes.len()))
+        );
     }
 
     #[test]

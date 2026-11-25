@@ -889,7 +889,9 @@ pub(crate) fn generation_draining(phase: &watch::Receiver<GenerationPhase>) -> b
 
 pub(crate) async fn await_generation_drain(phase: &mut watch::Receiver<GenerationPhase>) {
     while !generation_draining(phase) {
-        if phase.changed().await.is_err() { break; }
+        if phase.changed().await.is_err() {
+            break;
+        }
     }
 }
 
@@ -2006,10 +2008,15 @@ async fn prepare_selected_listeners(
     only: Option<&std::collections::HashSet<String>>,
 ) -> Result<PreparedGeneration, ServerError> {
     prepare_selected_listeners_inner(
-        document, limits, captured, live, only,
+        document,
+        limits,
+        captured,
+        live,
+        only,
         #[cfg(test)]
         None,
-    ).await
+    )
+    .await
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2064,7 +2071,12 @@ async fn prepare_selected_listeners_inner(
             context.live_quota = Some(limits.ledger.clone());
             #[cfg(test)]
             let carrier = if let Some(start) = guard_start {
-                crate::reality_live::Live::with_guard_start(Arc::new(lease), Arc::new(context), now, start)?
+                crate::reality_live::Live::with_guard_start(
+                    Arc::new(lease),
+                    Arc::new(context),
+                    now,
+                    start,
+                )?
             } else {
                 crate::reality_live::Live::new(Arc::new(lease), Arc::new(context), now)?
             };
@@ -2456,20 +2468,32 @@ pub(crate) async fn registered_reality_drain_fixture(
     draining: tokio::sync::oneshot::Sender<()>,
 ) -> Result<(), ServerError> {
     let limits = GenerationLimits::new(&document);
-    let authorization = Arc::new(LiveAuthorization::new(document.clone())
-        .map_err(|_| ServerError::Config)?);
-    let start = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?
+    let authorization =
+        Arc::new(LiveAuthorization::new(document.clone()).map_err(|_| ServerError::Config)?);
+    let start = crate::reference_health::unix_now()
+        .map_err(|_| ServerError::Config)?
         .saturating_sub(121);
     let prepared = prepare_selected_listeners_inner(
-        &document, &limits, None, authorization, None, Some(start),
-    ).await?;
+        &document,
+        &limits,
+        None,
+        authorization,
+        None,
+        Some(start),
+    )
+    .await?;
     let mut running = RunningGeneration::launch(prepared.listeners, GenerationPhase::Active);
     ready.send(()).map_err(|_| ServerError::Io)?;
     tokio::select! {
         signal = drain => signal.map_err(|_| ServerError::Io)?,
         _ = running.tasks.join_next() => return Err(ServerError::Io),
     }
-    let removed = document.server.inbounds.iter().map(|inbound| inbound.id.clone()).collect();
+    let removed = document
+        .server
+        .inbounds
+        .iter()
+        .map(|inbound| inbound.id.clone())
+        .collect();
     running.remove_inbounds(&removed);
     draining.send(()).map_err(|_| ServerError::Io)?;
     while let Some(result) = running.tasks.join_next().await {
@@ -3735,7 +3759,9 @@ mod hardening_tests {
         document.server.policy.max_connections_per_user = 4;
         document.server.policy.max_connections_total = 8;
         let mut context = ServerContext::new(
-            &document.server.inbounds[0], &document.server.users, &document.server.policy,
+            &document.server.inbounds[0],
+            &document.server.users,
+            &document.server.policy,
         );
         context.apply_own_tls_policy();
         let context = Arc::new(context);
@@ -3750,15 +3776,26 @@ mod hardening_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
         let server = if h3 {
-            let endpoint = crate::quic_transport::server_endpoint(remote, vec![cert], key.into()).unwrap();
+            let endpoint =
+                crate::quic_transport::server_endpoint(remote, vec![cert], key.into()).unwrap();
             drop(listener);
             tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase))
         } else {
-            let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
-                .with_no_client_auth().with_single_cert(vec![cert], key.into()).unwrap();
+            let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key.into())
+            .unwrap();
             tls.alpn_protocols = vec![b"h2".to_vec()];
-            tokio::spawn(serve_generation(listener, TlsAcceptor::from(Arc::new(tls)), context, phase))
+            tokio::spawn(serve_generation(
+                listener,
+                TlsAcceptor::from(Arc::new(tls)),
+                context,
+                phase,
+            ))
         };
         let token = URL_SAFE_NO_PAD.encode([7u8; 32]);
         let address = Address::V4([127, 0, 0, 1]);
@@ -3772,7 +3809,12 @@ mod hardening_tests {
 
         macro_rules! exercise {
             ($client:expr) => {{
-                let client = $client.with_own_tls_policy().unwrap().with_stream_up(split).unwrap().with_connection_pool();
+                let client = $client
+                    .with_own_tls_policy()
+                    .unwrap()
+                    .with_stream_up(split)
+                    .unwrap()
+                    .with_connection_pool();
                 let tunnel = client.open(address.clone(), target_port).await.unwrap();
                 let (mut upstream, _) = target.accept().await.unwrap();
                 let echo = tokio::spawn(async move {
@@ -3789,7 +3831,9 @@ mod hardening_tests {
                 // new admission must fail while the old tunnel still works.
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 assert!(client.open(address.clone(), target_port).await.is_err());
-                assert!(timeout(Duration::from_millis(50), target.accept()).await.is_err());
+                assert!(timeout(Duration::from_millis(50), target.accept())
+                    .await
+                    .is_err());
                 exchange(&mut app, b"existing stream after rejected admission").await;
                 app.shutdown().await.unwrap();
                 let mut tail = Vec::new();
@@ -3802,10 +3846,20 @@ mod hardening_tests {
         }
 
         if h3 {
-            exercise!(crate::h3_client::H3Client::new(remote, "localhost", &token, roots)
-                .unwrap().with_connect_timeout(Duration::from_millis(500)).unwrap());
+            exercise!(
+                crate::h3_client::H3Client::new(remote, "localhost", &token, roots)
+                    .unwrap()
+                    .with_connect_timeout(Duration::from_millis(500))
+                    .unwrap()
+            );
         } else {
-            exercise!(crate::client::H2Client::new(&remote.to_string(), "localhost", &token, roots).unwrap());
+            exercise!(crate::client::H2Client::new(
+                &remote.to_string(),
+                "localhost",
+                &token,
+                roots
+            )
+            .unwrap());
         }
         server.await.unwrap().unwrap();
     }
@@ -3819,7 +3873,9 @@ mod hardening_tests {
                 production_listener_drain(true, false),
                 production_listener_drain(true, true),
             );
-        }).await.expect("bounded production drain matrix");
+        })
+        .await
+        .expect("bounded production drain matrix");
     }
 
     fn live_auth_fixture() -> ServerDocument {

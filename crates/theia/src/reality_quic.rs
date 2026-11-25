@@ -773,7 +773,10 @@ impl PreparedQuic {
         self.serve_generation(phase).await
     }
 
-    pub(crate) async fn serve_generation(self, phase: watch::Receiver<server::GenerationPhase>) -> Result<(), ServerError> {
+    pub(crate) async fn serve_generation(
+        self,
+        phase: watch::Receiver<server::GenerationPhase>,
+    ) -> Result<(), ServerError> {
         let endpoint = self.endpoint.clone();
         let result = tokio::select! {
             result = self.accept_native(phase.clone()) => result,
@@ -783,7 +786,10 @@ impl PreparedQuic {
         result
     }
 
-    async fn accept_native(&self, mut phase: watch::Receiver<server::GenerationPhase>) -> Result<(), ServerError> {
+    async fn accept_native(
+        &self,
+        mut phase: watch::Receiver<server::GenerationPhase>,
+    ) -> Result<(), ServerError> {
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
@@ -825,7 +831,8 @@ impl PreparedQuic {
                     }
                 }
             }
-        }).await;
+        })
+        .await;
         Ok(())
     }
 
@@ -871,7 +878,10 @@ impl PreparedQuic {
         true
     }
 
-    async fn dispatch(&self, phase: watch::Receiver<server::GenerationPhase>) -> Result<(), ServerError> {
+    async fn dispatch(
+        &self,
+        phase: watch::Receiver<server::GenerationPhase>,
+    ) -> Result<(), ServerError> {
         let mut pending: HashMap<(SocketAddr, Cid), Pending> = HashMap::new();
         let mut sessions: HashMap<SessionId, Session> = HashMap::new();
         let mut retired: Vec<Retired> = Vec::new();

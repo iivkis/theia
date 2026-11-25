@@ -244,15 +244,22 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
     )?;
     // Report only the safe structural field name, never the raw TOML
     // value. Both roles use the same enum and reject retired aliases.
-    let (role, records) = if has_server { ("server", "inbounds") } else { ("client", "profiles") };
-    if let Some(entries) = table.get(role)
+    let (role, records) = if has_server {
+        ("server", "inbounds")
+    } else {
+        ("client", "profiles")
+    };
+    if let Some(entries) = table
+        .get(role)
         .and_then(|section| section.get(records))
         .and_then(toml::Value::as_array)
     {
         for (index, record) in entries.iter().enumerate() {
             if let Some(mode) = record.get("security_mode") {
                 ensure(
-                    mode.as_str().and_then(crate::security_profile::SecurityMode::from_product_name).is_some(),
+                    mode.as_str()
+                        .and_then(crate::security_profile::SecurityMode::from_product_name)
+                        .is_some(),
                     format!("{role}.{records}[{index}].security_mode"),
                     "only own-tls and smart-reality are supported",
                 )?;
@@ -955,13 +962,15 @@ mod tests {
             assert!(canonical.contains("security_mode = \"own-tls\""));
             assert_eq!(parse(&canonical).unwrap(), parsed);
             for retired in ["plain", "default", "pinned-cert-v1", "browser-h2-btls-v1"] {
-                let invalid = canonical.replace("security_mode = \"own-tls\"",
-                    &format!("security_mode = \"{retired}\""));
+                let invalid = canonical.replace(
+                    "security_mode = \"own-tls\"",
+                    &format!("security_mode = \"{retired}\""),
+                );
                 assert_ne!(invalid, canonical);
                 assert!(parse(&invalid).is_err());
             }
-            let old_field = canonical.replace("security_mode = \"own-tls\"",
-                "tls_profile = \"default\"");
+            let old_field =
+                canonical.replace("security_mode = \"own-tls\"", "tls_profile = \"default\"");
             assert!(parse(&old_field).is_err());
         }
     }

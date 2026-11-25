@@ -487,7 +487,14 @@ async fn launch_client(
     std::net::SocketAddr,
     std::net::SocketAddr,
 ) {
-    launch_client_with_profile(endpoint, pem, label, transport, theia::security_profile::SecurityMode::Plain).await
+    launch_client_with_profile(
+        endpoint,
+        pem,
+        label,
+        transport,
+        theia::security_profile::SecurityMode::Plain,
+    )
+    .await
 }
 
 /// Black-box curl tests run on both native CI runners. No external service,
@@ -630,10 +637,14 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_binary_curl_connect_and_socks5h() {
-    check_native_binary_connect_and_socks5(theia::security_profile::SecurityMode::Plain, "curl").await;
+    check_native_binary_connect_and_socks5(theia::security_profile::SecurityMode::Plain, "curl")
+        .await;
 }
 
-async fn check_native_binary_connect_and_socks5(security_mode: theia::security_profile::SecurityMode, label: &str) {
+async fn check_native_binary_connect_and_socks5(
+    security_mode: theia::security_profile::SecurityMode,
+    label: &str,
+) {
     timeout(Duration::from_secs(40), async {
         let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();

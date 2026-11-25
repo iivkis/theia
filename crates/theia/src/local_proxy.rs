@@ -78,7 +78,9 @@ async fn load_client_with_budget(
     budget: Arc<Semaphore>,
 ) -> Result<ProxyClient, ClientError> {
     match profile.security_mode {
-        SecurityMode::SmartReality if profile.reality_profile.is_some() && profile.tls_ca.is_none() => {
+        SecurityMode::SmartReality
+            if profile.reality_profile.is_some() && profile.tls_ca.is_none() =>
+        {
             return RealityClient::prepare_with_budget(profile, budget)
                 .await
                 .map(Arc::new)
@@ -1742,337 +1744,452 @@ mod selector_tests {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         )));
         std::fs::create_dir(&dir.0).unwrap();
-        timeout(Duration::from_secs(if drain_only { 55 } else { 80 }), async {
-            let remote = {
-                let mut selected = None;
-                for _ in 0..16 {
-                    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let addr = tcp.local_addr().unwrap();
-                    if let Ok(udp) = std::net::UdpSocket::bind(addr) {
-                        selected = Some(addr);
-                        drop(udp);
-                        break;
+        timeout(
+            Duration::from_secs(if drain_only { 55 } else { 80 }),
+            async {
+                let remote = {
+                    let mut selected = None;
+                    for _ in 0..16 {
+                        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let addr = tcp.local_addr().unwrap();
+                        if let Ok(udp) = std::net::UdpSocket::bind(addr) {
+                            selected = Some(addr);
+                            drop(udp);
+                            break;
+                        }
                     }
-                }
-                selected.unwrap()
-            };
-            let now = reference_health::unix_now().unwrap()
-                .saturating_sub(if drain_only { 0 } else { 3700 });
-            let state = State::new(
-                Plan {
-                    schema_version: 1,
-                    inbound: "reality-native".into(),
-                    endpoint: remote.to_string(),
-                    own_ips: vec![remote.ip()],
-                    references: vec![
-                        Target {
-                            server_name: "ref.example.org".into(),
-                            address: "93.184.216.2:443".parse().unwrap(),
-                        },
-                        Target {
-                            server_name: "reserve.example.org".into(),
-                            address: "93.184.216.3:443".parse().unwrap(),
-                        },
+                    selected.unwrap()
+                };
+                let now = reference_health::unix_now()
+                    .unwrap()
+                    .saturating_sub(if drain_only { 0 } else { 3700 });
+                let state = State::new(
+                    Plan {
+                        schema_version: 1,
+                        inbound: "reality-native".into(),
+                        endpoint: remote.to_string(),
+                        own_ips: vec![remote.ip()],
+                        references: vec![
+                            Target {
+                                server_name: "ref.example.org".into(),
+                                address: "93.184.216.2:443".parse().unwrap(),
+                            },
+                            Target {
+                                server_name: "reserve.example.org".into(),
+                                address: "93.184.216.3:443".parse().unwrap(),
+                            },
+                        ],
+                    },
+                    vec![
+                        Evidence {
+                            h2_status: Some(200),
+                            h3_status: Some(200)
+                        };
+                        2
                     ],
-                },
-                vec![
-                    Evidence {
-                        h2_status: Some(200),
-                        h3_status: Some(200)
-                    };
-                    2
-                ],
-                now,
-            )
-            .unwrap();
-            let health = dir.0.join("health.toml");
-            Store::new(&health).unwrap().enroll(&state).unwrap();
-            let bundle = dir.0.join("bundle");
-            let digest = state.snapshot_sha256().unwrap();
-            let record = crate::reality_provision::create(&state, digest, &bundle, now).unwrap();
-            let token = [42u8; 32];
-            let server_path = dir.0.join("server.toml");
-            let source = include_str!("../../../examples/server.toml").replace(
-                "REPLACE_WITH_64_LOWERCASE_HEX",
-                &format!("{:x}", Sha256::digest(token)),
-            );
-            std::fs::write(&server_path, source).unwrap();
-            let request = Request::Server(ServerRequest {
-                health: health.clone(),
-                bundle: bundle.clone(),
-                health_sha256: digest,
-                identity_sha256: record.identity_sha256,
-                listen: remote,
-                grants: vec!["device-a".into()],
-            });
-            let preview = reality_config::prepare(&server_path, &request, now).unwrap();
-            reality_config::apply(&server_path, &request, preview.approval_sha256(), now).unwrap();
-            let Config::Server(mut server_doc) = config::read_file(&server_path).unwrap() else {
-                panic!()
-            };
-            // The template own-TLS inbound has placeholder PEM paths.
-            // Test the registered REALITY branch, not an invalid template.
-            server_doc
-                .server
-                .inbounds
-                .retain(|i| i.id == "reality-native");
-            server_doc.server.policy.allow_private_ips = true;
-            let config = Config::Server(server_doc.clone());
-            let lease = Manager::new(&config, "reality-native", now)
-                .unwrap()
-                .refresh(now)
-                .unwrap();
-            let material = lease.publication().active();
-            let old_signer = material.verified().signer();
-            let successor =
-                crate::identity_tls::Identity::generate(material.identity().scope().clone())
-                    .unwrap();
-            let successor_path = dir.0.join("successor.key");
-            successor.save_new(&successor_path).unwrap();
-            let invite =
-                bootstrap::Invitation::public(material.identity(), material.signed(), now).unwrap();
-            let uri = invite.encode().unwrap();
-            let client_path = dir.0.join("client.toml");
-            let mut bearer =
-                crate::client_import::PrivateBearer::create(&client_path, &token).unwrap();
-            let reference = bearer.reference().unwrap();
-            bearer.commit();
-            std::fs::write(&client_path, include_str!("../../../examples/client.toml")).unwrap();
-            for (id, transport, mode) in [
-                ("native-h2", Transport::H2, XhttpMode::StreamOne),
-                ("native-h3", Transport::H3, XhttpMode::StreamOne),
-                ("split-h2", Transport::H2, XhttpMode::StreamUp),
-                ("split-h3", Transport::H3, XhttpMode::StreamUp),
-            ] {
-                if !drain_only && mode == XhttpMode::StreamUp { continue; }
-                let enrollment = dir.0.join(format!("{id}.toml"));
-                let trust = dir.0.join(format!("{id}-trust.toml"));
-                bootstrap::import(
-                    &uri,
-                    bootstrap::ImportApproval {
-                        document_sha256: bootstrap::digest(&uri),
-                        identity_sha256: invite.fingerprint(),
-                    },
-                    &enrollment,
-                    &trust,
-                    bootstrap::EnrollmentMaterial {
-                        admission_path: &bundle.join("admission.key"),
-                        expected_admission: None,
-                        external_token: Some(&reference),
-                    },
-                    ClientPolicy {
-                        transport,
-                        xhttp_mode: mode,
-                    },
                     now,
                 )
                 .unwrap();
-                let request = Request::Client(ClientRequest {
-                    enrollment,
-                    identity_sha256: invite.fingerprint(),
-                    id: id.into(),
+                let health = dir.0.join("health.toml");
+                Store::new(&health).unwrap().enroll(&state).unwrap();
+                let bundle = dir.0.join("bundle");
+                let digest = state.snapshot_sha256().unwrap();
+                let record =
+                    crate::reality_provision::create(&state, digest, &bundle, now).unwrap();
+                let token = [42u8; 32];
+                let server_path = dir.0.join("server.toml");
+                let source = include_str!("../../../examples/server.toml").replace(
+                    "REPLACE_WITH_64_LOWERCASE_HEX",
+                    &format!("{:x}", Sha256::digest(token)),
+                );
+                std::fs::write(&server_path, source).unwrap();
+                let request = Request::Server(ServerRequest {
+                    health: health.clone(),
+                    bundle: bundle.clone(),
+                    health_sha256: digest,
+                    identity_sha256: record.identity_sha256,
+                    listen: remote,
+                    grants: vec!["device-a".into()],
                 });
-                let preview = reality_config::prepare(&client_path, &request, now).unwrap();
-                reality_config::apply(&client_path, &request, preview.approval_sha256(), now)
+                let preview = reality_config::prepare(&server_path, &request, now).unwrap();
+                reality_config::apply(&server_path, &request, preview.approval_sha256(), now)
                     .unwrap();
-            }
-            // A single signed snapshot is the source of both native carriers.
-            drop(lease);
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            if drain_only {
+                let Config::Server(mut server_doc) = config::read_file(&server_path).unwrap()
+                else {
+                    panic!()
+                };
+                // The template own-TLS inbound has placeholder PEM paths.
+                // Test the registered REALITY branch, not an invalid template.
+                server_doc
+                    .server
+                    .inbounds
+                    .retain(|i| i.id == "reality-native");
+                server_doc.server.policy.allow_private_ips = true;
+                let config = Config::Server(server_doc.clone());
+                let lease = Manager::new(&config, "reality-native", now)
+                    .unwrap()
+                    .refresh(now)
+                    .unwrap();
+                let material = lease.publication().active();
+                let old_signer = material.verified().signer();
+                let successor =
+                    crate::identity_tls::Identity::generate(material.identity().scope().clone())
+                        .unwrap();
+                let successor_path = dir.0.join("successor.key");
+                successor.save_new(&successor_path).unwrap();
+                let invite =
+                    bootstrap::Invitation::public(material.identity(), material.signed(), now)
+                        .unwrap();
+                let uri = invite.encode().unwrap();
+                let client_path = dir.0.join("client.toml");
+                let mut bearer =
+                    crate::client_import::PrivateBearer::create(&client_path, &token).unwrap();
+                let reference = bearer.reference().unwrap();
+                bearer.commit();
+                std::fs::write(&client_path, include_str!("../../../examples/client.toml"))
+                    .unwrap();
+                for (id, transport, mode) in [
+                    ("native-h2", Transport::H2, XhttpMode::StreamOne),
+                    ("native-h3", Transport::H3, XhttpMode::StreamOne),
+                    ("split-h2", Transport::H2, XhttpMode::StreamUp),
+                    ("split-h3", Transport::H3, XhttpMode::StreamUp),
+                ] {
+                    if !drain_only && mode == XhttpMode::StreamUp {
+                        continue;
+                    }
+                    let enrollment = dir.0.join(format!("{id}.toml"));
+                    let trust = dir.0.join(format!("{id}-trust.toml"));
+                    bootstrap::import(
+                        &uri,
+                        bootstrap::ImportApproval {
+                            document_sha256: bootstrap::digest(&uri),
+                            identity_sha256: invite.fingerprint(),
+                        },
+                        &enrollment,
+                        &trust,
+                        bootstrap::EnrollmentMaterial {
+                            admission_path: &bundle.join("admission.key"),
+                            expected_admission: None,
+                            external_token: Some(&reference),
+                        },
+                        ClientPolicy {
+                            transport,
+                            xhttp_mode: mode,
+                        },
+                        now,
+                    )
+                    .unwrap();
+                    let request = Request::Client(ClientRequest {
+                        enrollment,
+                        identity_sha256: invite.fingerprint(),
+                        id: id.into(),
+                    });
+                    let preview = reality_config::prepare(&client_path, &request, now).unwrap();
+                    reality_config::apply(&client_path, &request, preview.approval_sha256(), now)
+                        .unwrap();
+                }
+                // A single signed snapshot is the source of both native carriers.
+                drop(lease);
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                if drain_only {
+                    let (started, ready) = tokio::sync::oneshot::channel();
+                    let (drain, stop) = tokio::sync::oneshot::channel();
+                    let (draining, acknowledged) = tokio::sync::oneshot::channel();
+                    let mut server = JoinSet::new();
+                    server.spawn(crate::server::registered_reality_drain_fixture(
+                        server_doc, started, stop, draining,
+                    ));
+                    ready.await.unwrap();
+                    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let target_port = target.local_addr().unwrap().port();
+                    let Config::Client(client_doc) = config::read_file(&client_path).unwrap()
+                    else {
+                        panic!("client fixture");
+                    };
+                    let mut clients = Vec::new();
+                    let mut apps = Vec::new();
+                    let mut relays = JoinSet::new();
+                    let mut echoes = JoinSet::new();
+                    let address = Address::V4([127, 0, 0, 1]);
+                    async fn exchange(app: &mut TcpStream, data: &[u8]) {
+                        app.write_all(data).await.unwrap();
+                        let mut got = vec![0; data.len()];
+                        app.read_exact(&mut got).await.unwrap();
+                        assert_eq!(got, data);
+                    }
+                    for id in ["native-h2", "native-h3", "split-h2", "split-h3"] {
+                        let profile = client_doc
+                            .client
+                            .profiles
+                            .iter()
+                            .find(|p| p.id == id)
+                            .unwrap();
+                        let client = load_client(profile).await.unwrap();
+                        // Real marker/identity admission and OPEN_OK through the
+                        // registered production TCP/UDP listeners.
+                        let tunnel = client.open(address.clone(), target_port).await.unwrap();
+                        let (mut upstream, _) = target.accept().await.unwrap();
+                        echoes.spawn(async move {
+                            let (mut read, mut write) = upstream.split();
+                            tokio::io::copy(&mut read, &mut write).await.unwrap();
+                            write.shutdown().await.unwrap();
+                        });
+                        let (mut app, local) = paired().await;
+                        relays.spawn(tunnel.relay(local));
+                        exchange(&mut app, id.as_bytes()).await;
+                        clients.push(client);
+                        apps.push(app);
+                    }
+                    drain.send(()).unwrap();
+                    acknowledged.await.unwrap();
+                    for app in &mut apps {
+                        exchange(app, b"old OPEN_OK tunnel after drain").await;
+                    }
+                    // Exercise all four modes concurrently within the production
+                    // drain deadline. No new upstream dial is permitted.
+                    let mut refusals = JoinSet::new();
+                    for client in clients {
+                        let address = address.clone();
+                        refusals.spawn(async move {
+                            let refusal =
+                                timeout(Duration::from_secs(5), client.open(address, target_port))
+                                    .await;
+                            assert!(matches!(refusal, Ok(Err(_))));
+                        });
+                    }
+                    while let Some(result) = refusals.join_next().await {
+                        result.unwrap();
+                    }
+                    assert!(timeout(Duration::from_millis(100), target.accept())
+                        .await
+                        .is_err());
+                    for mut app in apps {
+                        exchange(&mut app, b"still alive after refused admission").await;
+                        app.shutdown().await.unwrap();
+                        let mut tail = Vec::new();
+                        app.read_to_end(&mut tail).await.unwrap();
+                        assert!(tail.is_empty());
+                    }
+                    while let Some(result) = relays.join_next().await {
+                        result.unwrap().unwrap();
+                    }
+                    while let Some(result) = echoes.join_next().await {
+                        result.unwrap();
+                    }
+                    server.join_next().await.unwrap().unwrap().unwrap();
+                    // The supervisor has released both sockets after drain.
+                    let tcp = TcpListener::bind(remote).await.unwrap();
+                    let udp = tokio::net::UdpSocket::bind(remote).await.unwrap();
+                    drop((tcp, udp));
+                    return;
+                }
                 let (started, ready) = tokio::sync::oneshot::channel();
-                let (drain, stop) = tokio::sync::oneshot::channel();
-                let (draining, acknowledged) = tokio::sync::oneshot::channel();
                 let mut server = JoinSet::new();
-                server.spawn(crate::server::registered_reality_drain_fixture(
-                    server_doc, started, stop, draining,
+                server.spawn(crate::server::run_reality_document_with_ready(
+                    server_doc,
+                    Some(started),
                 ));
                 ready.await.unwrap();
-                let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let target_port = target.local_addr().unwrap().port();
-                let Config::Client(client_doc) = config::read_file(&client_path).unwrap() else {
-                    panic!("client fixture");
+                let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let target = echo.local_addr().unwrap();
+                let mut echo_tasks = JoinSet::new();
+                echo_tasks.spawn(async move {
+                    let mut sessions = JoinSet::new();
+                    loop {
+                        let (mut stream, _) = echo.accept().await.unwrap();
+                        sessions.spawn(async move {
+                            let mut bytes = [0; 4];
+                            while stream.read_exact(&mut bytes).await.is_ok() {
+                                stream.write_all(&bytes).await.unwrap();
+                            }
+                        });
+                    }
+                });
+                let Config::Client(mut client_doc) = config::read_file(&client_path).unwrap()
+                else {
+                    panic!()
                 };
-                let mut clients = Vec::new();
-                let mut apps = Vec::new();
-                let mut relays = JoinSet::new();
-                let mut echoes = JoinSet::new();
-                let address = Address::V4([127, 0, 0, 1]);
-                async fn exchange(app: &mut TcpStream, data: &[u8]) {
-                    app.write_all(data).await.unwrap();
-                    let mut got = vec![0; data.len()];
-                    app.read_exact(&mut got).await.unwrap();
-                    assert_eq!(got, data);
-                }
-                for id in ["native-h2", "native-h3", "split-h2", "split-h3"] {
-                    let profile = client_doc.client.profiles.iter().find(|p| p.id == id).unwrap();
-                    let client = load_client(profile).await.unwrap();
-                    // Real marker/identity admission and OPEN_OK through the
-                    // registered production TCP/UDP listeners.
-                    let tunnel = client.open(address.clone(), target_port).await.unwrap();
-                    let (mut upstream, _) = target.accept().await.unwrap();
-                    echoes.spawn(async move {
-                        let (mut read, mut write) = upstream.split();
-                        tokio::io::copy(&mut read, &mut write).await.unwrap();
-                        write.shutdown().await.unwrap();
-                    });
-                    let (mut app, local) = paired().await;
-                    relays.spawn(tunnel.relay(local));
-                    exchange(&mut app, id.as_bytes()).await;
-                    clients.push(client);
-                    apps.push(app);
-                }
-                drain.send(()).unwrap();
-                acknowledged.await.unwrap();
-                for app in &mut apps {
-                    exchange(app, b"old OPEN_OK tunnel after drain").await;
-                }
-                // Exercise all four modes concurrently within the production
-                // drain deadline. No new upstream dial is permitted.
-                let mut refusals = JoinSet::new();
-                for client in clients {
-                    let address = address.clone();
-                    refusals.spawn(async move {
-                        let refusal = timeout(Duration::from_secs(5),
-                            client.open(address, target_port)).await;
-                        assert!(matches!(refusal, Ok(Err(_))));
-                    });
-                }
-                while let Some(result) = refusals.join_next().await { result.unwrap(); }
-                assert!(timeout(Duration::from_millis(100), target.accept()).await.is_err());
-                for mut app in apps {
-                    exchange(&mut app, b"still alive after refused admission").await;
-                    app.shutdown().await.unwrap();
-                    let mut tail = Vec::new();
-                    app.read_to_end(&mut tail).await.unwrap();
-                    assert!(tail.is_empty());
-                }
-                while let Some(result) = relays.join_next().await { result.unwrap().unwrap(); }
-                while let Some(result) = echoes.join_next().await { result.unwrap(); }
-                server.join_next().await.unwrap().unwrap().unwrap();
-                // The supervisor has released both sockets after drain.
-                let tcp = TcpListener::bind(remote).await.unwrap();
-                let udp = tokio::net::UdpSocket::bind(remote).await.unwrap();
-                drop((tcp, udp));
-                return;
-            }
-            let (started, ready) = tokio::sync::oneshot::channel();
-            let mut server = JoinSet::new();
-            server.spawn(crate::server::run_reality_document_with_ready(
-                server_doc,
-                Some(started),
-            ));
-            ready.await.unwrap();
-            let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let target = echo.local_addr().unwrap();
-            let mut echo_tasks = JoinSet::new();
-            echo_tasks.spawn(async move {
-                let mut sessions = JoinSet::new();
-                loop {
-                    let (mut stream, _) = echo.accept().await.unwrap();
-                    sessions.spawn(async move {
-                        let mut bytes = [0; 4];
-                        while stream.read_exact(&mut bytes).await.is_ok() {
-                            stream.write_all(&bytes).await.unwrap();
-                        }
-                    });
-                }
-            });
-            let Config::Client(mut client_doc) = config::read_file(&client_path).unwrap() else {
-                panic!()
-            };
-            let mut established = Vec::new();
-            let mut proxies = Vec::new();
-            let mut managed_clients = Vec::new();
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            let mut headless = None;
-            for (id, socks_mode) in [("native-h2", false), ("native-h3", true)] {
-                client_doc.client.active_profile = id.into();
-                let profile = client_doc
-                    .client
-                    .profiles
-                    .iter()
-                    .find(|p| p.id == id)
-                    .unwrap();
-                let client = load_client(profile).await.unwrap();
-                let ProxyClient::Reality(managed) = &client else {
-                    panic!("wrong security mode")
-                };
-                let current = managed.generation().await.unwrap();
-                let report = managed.runtime_report().await;
-                assert!(report.contains("Saved trust: совпадает"));
-                assert!(report.contains("last_open=ещё нет подтверждённого OPEN"));
-                assert!(report.contains(if socks_mode { "policy=h3" } else { "policy=h2" }));
-                managed_clients.push(managed.clone());
-                if let Carrier::H3(h3) = &current.carrier {
-                    // Use the production dispatcher and a real OPEN_OK
-                    // tunnel. Rebind the same Quinn endpoint, not a new
-                    // connection or a new admission handshake.
-                    let tunnel = h3
-                        .open(crate::protocol::Address::V4([127, 0, 0, 1]), target.port())
-                        .await
-                        .unwrap();
-                    let (mut local, remote) = tokio::io::duplex(4096);
-                    let rebind = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-                    rebind.set_nonblocking(true).unwrap();
-                    tunnel.rebind_for_test(rebind).unwrap();
-                    let task = tokio::spawn(tunnel.relay(remote));
-                    local.write_all(b"move").await.unwrap();
-                    let mut bytes = [0; 4];
-                    timeout(Duration::from_secs(10), local.read_exact(&mut bytes))
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    assert_eq!(&bytes, b"move");
-                    local.write_all(b"stay").await.unwrap();
-                    timeout(Duration::from_secs(10), local.read_exact(&mut bytes))
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    assert_eq!(&bytes, b"stay");
-                    drop(local);
-                    task.abort();
-                    let _ = task.await;
-                }
-                assert!(matches!(
-                    (&current.carrier, socks_mode),
-                    (Carrier::H2(_), false) | (Carrier::H3(_), true)
-                ));
-                let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let listen = if socks_mode {
-                    socks.local_addr().unwrap()
-                } else {
-                    http.local_addr().unwrap()
-                };
-                let mut proxy = JoinSet::new();
+                let mut established = Vec::new();
+                let mut proxies = Vec::new();
+                let mut managed_clients = Vec::new();
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
-                if !socks_mode {
+                let mut headless = None;
+                for (id, socks_mode) in [("native-h2", false), ("native-h3", true)] {
+                    client_doc.client.active_profile = id.into();
+                    let profile = client_doc
+                        .client
+                        .profiles
+                        .iter()
+                        .find(|p| p.id == id)
+                        .unwrap();
+                    let client = load_client(profile).await.unwrap();
+                    let ProxyClient::Reality(managed) = &client else {
+                        panic!("wrong security mode")
+                    };
+                    let current = managed.generation().await.unwrap();
+                    let report = managed.runtime_report().await;
+                    assert!(report.contains("Saved trust: совпадает"));
+                    assert!(report.contains("last_open=ещё нет подтверждённого OPEN"));
+                    assert!(report.contains(if socks_mode { "policy=h3" } else { "policy=h2" }));
+                    managed_clients.push(managed.clone());
+                    if let Carrier::H3(h3) = &current.carrier {
+                        // Use the production dispatcher and a real OPEN_OK
+                        // tunnel. Rebind the same Quinn endpoint, not a new
+                        // connection or a new admission handshake.
+                        let tunnel = h3
+                            .open(crate::protocol::Address::V4([127, 0, 0, 1]), target.port())
+                            .await
+                            .unwrap();
+                        let (mut local, remote) = tokio::io::duplex(4096);
+                        let rebind = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                        rebind.set_nonblocking(true).unwrap();
+                        tunnel.rebind_for_test(rebind).unwrap();
+                        let task = tokio::spawn(tunnel.relay(remote));
+                        local.write_all(b"move").await.unwrap();
+                        let mut bytes = [0; 4];
+                        timeout(Duration::from_secs(10), local.read_exact(&mut bytes))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(&bytes, b"move");
+                        local.write_all(b"stay").await.unwrap();
+                        timeout(Duration::from_secs(10), local.read_exact(&mut bytes))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(&bytes, b"stay");
+                        drop(local);
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    assert!(matches!(
+                        (&current.carrier, socks_mode),
+                        (Carrier::H2(_), false) | (Carrier::H3(_), true)
+                    ));
+                    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let listen = if socks_mode {
+                        socks.local_addr().unwrap()
+                    } else {
+                        http.local_addr().unwrap()
+                    };
+                    let mut proxy = JoinSet::new();
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    if !socks_mode {
+                        let raw = Config::Client(client_doc.clone()).to_toml().unwrap();
+                        std::fs::write(&client_path, &raw).unwrap();
+                        let digest = Sha256::digest(raw.as_bytes()).into();
+                        let runtime = ClientRuntime::new(
+                            client_path.clone(),
+                            client_doc.clone(),
+                            digest,
+                            client,
+                        );
+                        headless = Some((runtime.clone(), listen));
+                        proxy.spawn(serve_managed_proxy(http, socks, runtime));
+                    } else {
+                        proxy.spawn(serve_proxy(http, socks, client));
+                    }
+                    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                    proxy.spawn(serve_proxy(http, socks, client));
+                    let mut stream = TcpStream::connect(listen).await.unwrap();
+                    if socks_mode {
+                        stream.write_all(&[5, 1, 0]).await.unwrap();
+                        let mut response = [0; 2];
+                        stream.read_exact(&mut response).await.unwrap();
+                        assert_eq!(response, [5, 0]);
+                        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+                        request.extend_from_slice(&target.port().to_be_bytes());
+                        stream.write_all(&request).await.unwrap();
+                        let mut response = [0; 10];
+                        stream.read_exact(&mut response).await.unwrap();
+                        assert_eq!(&response[..2], &[5, 0]);
+                    } else {
+                        stream
+                            .write_all(
+                                format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n")
+                                    .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        let mut response = vec![0; HTTP_OK.len()];
+                        stream.read_exact(&mut response).await.unwrap();
+                        assert_eq!(response, HTTP_OK);
+                    }
+                    stream.write_all(b"ping").await.unwrap();
+                    let mut bytes = [0; 4];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes, b"ping");
+                    let report = managed_clients.last().unwrap().runtime_report().await;
+                    assert!(report.contains(if socks_mode {
+                        "last_open=H3"
+                    } else {
+                        "last_open=H2"
+                    }));
+                    established.push(stream);
+                    proxies.push(proxy);
+                }
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                {
+                    use crate::management::{StatusCommand as C, StatusReply as R};
+                    async fn ipc(
+                        runtime: Arc<ClientRuntime>,
+                        command: C,
+                    ) -> Result<R, crate::management::ManagementError> {
+                        let (caller, handler) = tokio::io::duplex(1024);
+                        let task = tokio::spawn(crate::management::handle_client(handler, runtime));
+                        let result = crate::management::exchange(caller, command).await;
+                        task.await.unwrap().unwrap();
+                        result
+                    }
+                    let (runtime, listen) = headless.unwrap();
                     let raw = Config::Client(client_doc.clone()).to_toml().unwrap();
                     std::fs::write(&client_path, &raw).unwrap();
-                    let digest = Sha256::digest(raw.as_bytes()).into();
-                    let runtime =
-                        ClientRuntime::new(client_path.clone(), client_doc.clone(), digest, client);
-                    headless = Some((runtime.clone(), listen));
-                    proxy.spawn(serve_managed_proxy(http, socks, runtime));
-                } else {
-                    proxy.spawn(serve_proxy(http, socks, client));
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-                proxy.spawn(serve_proxy(http, socks, client));
-                let mut stream = TcpStream::connect(listen).await.unwrap();
-                if socks_mode {
-                    stream.write_all(&[5, 1, 0]).await.unwrap();
-                    let mut response = [0; 2];
-                    stream.read_exact(&mut response).await.unwrap();
-                    assert_eq!(response, [5, 0]);
-                    let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
-                    request.extend_from_slice(&target.port().to_be_bytes());
-                    stream.write_all(&request).await.unwrap();
-                    let mut response = [0; 10];
-                    stream.read_exact(&mut response).await.unwrap();
-                    assert_eq!(&response[..2], &[5, 0]);
-                } else {
+                    let digest: [u8; 32] = Sha256::digest(raw.as_bytes()).into();
+                    assert!(ipc(
+                        runtime.clone(),
+                        C::ClientApply {
+                            expected_revision: 1,
+                            candidate_sha256: [0; 32]
+                        }
+                    )
+                    .await
+                    .is_err());
+                    assert_eq!(
+                        ipc(
+                            runtime.clone(),
+                            C::ClientPreview {
+                                expected_revision: 1,
+                                candidate_sha256: digest
+                            }
+                        )
+                        .await
+                        .unwrap(),
+                        R::ClientReady { revision: 1 }
+                    );
+                    assert_eq!(runtime.status().await.0, 1);
+                    assert_eq!(
+                        ipc(
+                            runtime.clone(),
+                            C::ClientApply {
+                                expected_revision: 1,
+                                candidate_sha256: digest
+                            }
+                        )
+                        .await
+                        .unwrap(),
+                        R::ClientApplied { revision: 2 }
+                    );
+                    assert!(ipc(
+                        runtime.clone(),
+                        C::ClientApply {
+                            expected_revision: 1,
+                            candidate_sha256: digest
+                        }
+                    )
+                    .await
+                    .is_err());
+                    let mut stream = TcpStream::connect(listen).await.unwrap();
                     stream
                         .write_all(
                             format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n")
@@ -2083,198 +2200,115 @@ mod selector_tests {
                     let mut response = vec![0; HTTP_OK.len()];
                     stream.read_exact(&mut response).await.unwrap();
                     assert_eq!(response, HTTP_OK);
-                }
-                stream.write_all(b"ping").await.unwrap();
-                let mut bytes = [0; 4];
-                stream.read_exact(&mut bytes).await.unwrap();
-                assert_eq!(&bytes, b"ping");
-                let report = managed_clients.last().unwrap().runtime_report().await;
-                assert!(report.contains(if socks_mode {
-                    "last_open=H3"
-                } else {
-                    "last_open=H2"
-                }));
-                established.push(stream);
-                proxies.push(proxy);
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            {
-                use crate::management::{StatusCommand as C, StatusReply as R};
-                async fn ipc(
-                    runtime: Arc<ClientRuntime>,
-                    command: C,
-                ) -> Result<R, crate::management::ManagementError> {
-                    let (caller, handler) = tokio::io::duplex(1024);
-                    let task = tokio::spawn(crate::management::handle_client(handler, runtime));
-                    let result = crate::management::exchange(caller, command).await;
-                    task.await.unwrap().unwrap();
-                    result
-                }
-                let (runtime, listen) = headless.unwrap();
-                let raw = Config::Client(client_doc.clone()).to_toml().unwrap();
-                std::fs::write(&client_path, &raw).unwrap();
-                let digest: [u8; 32] = Sha256::digest(raw.as_bytes()).into();
-                assert!(ipc(
-                    runtime.clone(),
-                    C::ClientApply {
-                        expected_revision: 1,
-                        candidate_sha256: [0; 32]
-                    }
-                )
-                .await
-                .is_err());
-                assert_eq!(
-                    ipc(
-                        runtime.clone(),
-                        C::ClientPreview {
-                            expected_revision: 1,
-                            candidate_sha256: digest
-                        }
-                    )
-                    .await
-                    .unwrap(),
-                    R::ClientReady { revision: 1 }
-                );
-                assert_eq!(runtime.status().await.0, 1);
-                assert_eq!(
-                    ipc(
-                        runtime.clone(),
-                        C::ClientApply {
-                            expected_revision: 1,
-                            candidate_sha256: digest
-                        }
-                    )
-                    .await
-                    .unwrap(),
-                    R::ClientApplied { revision: 2 }
-                );
-                assert!(ipc(
-                    runtime.clone(),
-                    C::ClientApply {
-                        expected_revision: 1,
-                        candidate_sha256: digest
-                    }
-                )
-                .await
-                .is_err());
-                let mut stream = TcpStream::connect(listen).await.unwrap();
-                stream
-                    .write_all(
-                        format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-                let mut response = vec![0; HTTP_OK.len()];
-                stream.read_exact(&mut response).await.unwrap();
-                assert_eq!(response, HTTP_OK);
-                stream.write_all(b"swap").await.unwrap();
-                let mut bytes = [0; 4];
-                stream.read_exact(&mut bytes).await.unwrap();
-                assert_eq!(&bytes, b"swap");
-                assert!(matches!(
-                    ipc(runtime.clone(), C::ClientStatus).await.unwrap(),
-                    R::ClientRunning {
-                        revision: 2,
-                        transport: 3,
-                        ..
-                    }
-                ));
-                for stream in &mut established {
-                    stream.write_all(b"keep").await.unwrap();
+                    stream.write_all(b"swap").await.unwrap();
+                    let mut bytes = [0; 4];
                     stream.read_exact(&mut bytes).await.unwrap();
-                    assert_eq!(&bytes, b"keep");
-                }
-            }
-            let publication =
-                crate::identity_publication::Publication::new(&bundle.join("publication.toml"))
-                    .unwrap();
-            let now = reference_health::unix_now().unwrap();
-            let store = Store::new(&health).unwrap();
-            let good = Evidence {
-                h2_status: Some(200),
-                h3_status: Some(200),
-            };
-            store
-                .fixture_record(vec![Evidence::default(), good], now - 301)
-                .unwrap();
-            store
-                .fixture_record(vec![Evidence::default(), good], now - 1)
-                .unwrap();
-            // The maintenance worker, not the test, performs the failover.
-            // Both clients retain the original signed SNI until refresh.
-            for managed in &managed_clients {
-                for _ in 0..20 {
-                    let generation = managed.generation().await.unwrap();
-                    if generation.value.descriptor().active_reference == 1 {
-                        break;
+                    assert_eq!(&bytes, b"swap");
+                    assert!(matches!(
+                        ipc(runtime.clone(), C::ClientStatus).await.unwrap(),
+                        R::ClientRunning {
+                            revision: 2,
+                            transport: 3,
+                            ..
+                        }
+                    ));
+                    for stream in &mut established {
+                        stream.write_all(b"keep").await.unwrap();
+                        stream.read_exact(&mut bytes).await.unwrap();
+                        assert_eq!(&bytes, b"keep");
                     }
-                    let _ = managed.refresh(&generation).await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                assert_eq!(
-                    managed
-                        .generation()
+                let publication =
+                    crate::identity_publication::Publication::new(&bundle.join("publication.toml"))
+                        .unwrap();
+                let now = reference_health::unix_now().unwrap();
+                let store = Store::new(&health).unwrap();
+                let good = Evidence {
+                    h2_status: Some(200),
+                    h3_status: Some(200),
+                };
+                store
+                    .fixture_record(vec![Evidence::default(), good], now - 301)
+                    .unwrap();
+                store
+                    .fixture_record(vec![Evidence::default(), good], now - 1)
+                    .unwrap();
+                // The maintenance worker, not the test, performs the failover.
+                // Both clients retain the original signed SNI until refresh.
+                for managed in &managed_clients {
+                    for _ in 0..20 {
+                        let generation = managed.generation().await.unwrap();
+                        if generation.value.descriptor().active_reference == 1 {
+                            break;
+                        }
+                        let _ = managed.refresh(&generation).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    assert_eq!(
+                        managed
+                            .generation()
+                            .await
+                            .unwrap()
+                            .value
+                            .descriptor()
+                            .active_reference,
+                        1
+                    );
+                }
+                for stream in &mut established {
+                    stream.write_all(b"fail").await.unwrap();
+                    let mut bytes = [0; 4];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes, b"fail");
+                }
+                let now = reference_health::unix_now().unwrap();
+                let status = publication.inspect(now).unwrap();
+                assert_eq!(status.active_reference, 1);
+                publication
+                    .begin_rotation(
+                        &successor_path,
+                        status.snapshot_sha256,
+                        bootstrap::fingerprint(successor.public_key()),
+                        now,
+                    )
+                    .unwrap();
+                for managed in &managed_clients {
+                    // Wait for the owner-scoped live publication poll, then
+                    // explicitly drive the same authenticated promotion path
+                    // that the background client worker uses.
+                    for _ in 0..20 {
+                        let generation = managed.generation().await.unwrap();
+                        if generation.value.signer() == successor.public_key() {
+                            break;
+                        }
+                        assert_eq!(generation.value.signer(), old_signer);
+                        let _ = managed.refresh(&generation).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    let new = managed.generation().await.unwrap();
+                    assert_eq!(new.value.signer(), successor.public_key());
+                    // An actual new tunnel must complete on the new signer.
+                    let tunnel = managed
+                        .open(Address::V4([127, 0, 0, 1]), target.port())
                         .await
-                        .unwrap()
-                        .value
-                        .descriptor()
-                        .active_reference,
-                    1
-                );
-            }
-            for stream in &mut established {
-                stream.write_all(b"fail").await.unwrap();
-                let mut bytes = [0; 4];
-                stream.read_exact(&mut bytes).await.unwrap();
-                assert_eq!(&bytes, b"fail");
-            }
-            let now = reference_health::unix_now().unwrap();
-            let status = publication.inspect(now).unwrap();
-            assert_eq!(status.active_reference, 1);
-            publication
-                .begin_rotation(
-                    &successor_path,
-                    status.snapshot_sha256,
-                    bootstrap::fingerprint(successor.public_key()),
-                    now,
-                )
-                .unwrap();
-            for managed in &managed_clients {
-                // Wait for the owner-scoped live publication poll, then
-                // explicitly drive the same authenticated promotion path
-                // that the background client worker uses.
-                for _ in 0..20 {
-                    let generation = managed.generation().await.unwrap();
-                    if generation.value.signer() == successor.public_key() {
-                        break;
-                    }
-                    assert_eq!(generation.value.signer(), old_signer);
-                    let _ = managed.refresh(&generation).await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                        .unwrap();
+                    drop(tunnel);
                 }
-                let new = managed.generation().await.unwrap();
-                assert_eq!(new.value.signer(), successor.public_key());
-                // An actual new tunnel must complete on the new signer.
-                let tunnel = managed
-                    .open(Address::V4([127, 0, 0, 1]), target.port())
-                    .await
-                    .unwrap();
-                drop(tunnel);
-            }
-            // Both already-established application tunnels still carry
-            // bytes after the two transport pools have changed identity.
-            for mut stream in established {
-                stream.write_all(b"pong").await.unwrap();
-                let mut bytes = [0; 4];
-                stream.read_exact(&mut bytes).await.unwrap();
-                assert_eq!(&bytes, b"pong");
-            }
-            for mut proxy in proxies {
-                proxy.shutdown().await;
-            }
-            echo_tasks.shutdown().await;
-            server.shutdown().await;
-        })
+                // Both already-established application tunnels still carry
+                // bytes after the two transport pools have changed identity.
+                for mut stream in established {
+                    stream.write_all(b"pong").await.unwrap();
+                    let mut bytes = [0; 4];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes, b"pong");
+                }
+                for mut proxy in proxies {
+                    proxy.shutdown().await;
+                }
+                echo_tasks.shutdown().await;
+                server.shutdown().await;
+            },
+        )
         .await
         .unwrap();
     }

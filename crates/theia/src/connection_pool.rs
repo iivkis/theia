@@ -368,7 +368,11 @@ mod tests {
         idle.admitted();
         drop(idle);
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(u64::from(crate::padding::OWN_TLS_ROTATION.lifetime_max_s)) + Duration::from_millis(1)).await;
+        tokio::time::advance(
+            Duration::from_secs(u64::from(crate::padding::OWN_TLS_ROTATION.lifetime_max_s))
+                + Duration::from_millis(1),
+        )
+        .await;
         tokio::task::yield_now().await;
         assert!(pool.entries.lock().await.is_empty());
         assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);
@@ -545,15 +549,24 @@ mod tests {
     async fn pair_namespace_exhaustion_rotates_without_reusing_ids() {
         let pool = Pool::default();
         let route = Some("127.0.0.1:0".parse().unwrap());
-        let mut original = pool.acquire(route, true, |_| true, async { Ok(1) }).await.unwrap();
+        let mut original = pool
+            .acquire(route, true, |_| true, async { Ok(1) })
+            .await
+            .unwrap();
         original.admitted();
         for id in 2..=crate::split_http::MAX_PAIR_IDS {
-            let mut lease = pool.acquire(route, true, |_| true, async { Ok(2) }).await.unwrap();
+            let mut lease = pool
+                .acquire(route, true, |_| true, async { Ok(2) })
+                .await
+                .unwrap();
             assert_eq!(lease.id(), id);
             assert!(lease.shares_connection(&original));
             lease.admitted();
         }
-        let mut replacement = pool.acquire(route, true, |_| true, async { Ok(3) }).await.unwrap();
+        let mut replacement = pool
+            .acquire(route, true, |_| true, async { Ok(3) })
+            .await
+            .unwrap();
         replacement.admitted();
         assert_eq!(replacement.id(), 1);
         assert!(!original.shares_connection(&replacement));
@@ -567,25 +580,36 @@ mod tests {
         let route = Some("127.0.0.1:0".parse().unwrap());
         let mut leases = Vec::new();
         for _ in 0..MAX_CONNECTIONS * MAX_TUNNELS {
-            let mut lease = pool.acquire(route, true, |_| true, async { Ok(1) }).await.unwrap();
+            let mut lease = pool
+                .acquire(route, true, |_| true, async { Ok(1) })
+                .await
+                .unwrap();
             lease.admitted();
             leases.push(lease);
         }
         assert_eq!(pool.connections.available_permits(), 0);
-        assert!(matches!(pool.acquire(route, true, |_| true, async { Ok(2) }).await,
-            Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))));
+        assert!(matches!(
+            pool.acquire(route, true, |_| true, async { Ok(2) }).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))
+        ));
         // One freed stream slot is enough; no physical connection is replaced.
         let old = leases.pop().unwrap();
         let id = old.id();
         drop(old);
-        let mut reused = pool.acquire(route, true, |_| true, async { Ok(3) }).await.unwrap();
+        let mut reused = pool
+            .acquire(route, true, |_| true, async { Ok(3) })
+            .await
+            .unwrap();
         assert_eq!(*reused.connection(), 1);
         assert!(reused.id() > id);
         reused.admitted();
         drop(reused);
         // Release the final group's other leases and deliberately refuse reuse.
         leases.truncate(MAX_TUNNELS * (MAX_CONNECTIONS - 1));
-        let mut fresh = pool.acquire(route, false, |_| true, async { Ok(4) }).await.unwrap();
+        let mut fresh = pool
+            .acquire(route, false, |_| true, async { Ok(4) })
+            .await
+            .unwrap();
         fresh.admitted();
         assert_eq!(*fresh.connection(), 4);
         assert_eq!(pool.connections.available_permits(), 0);
@@ -593,8 +617,12 @@ mod tests {
         assert_eq!(pool.connections.available_permits(), 1);
         // Cancellation while dialing must release both semaphore permits.
         let before = pool.profile.available_permits();
-        assert!(tokio::time::timeout(Duration::from_millis(1),
-            pool.acquire(route, false, |_| true, std::future::pending())).await.is_err());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            pool.acquire(route, false, |_| true, std::future::pending())
+        )
+        .await
+        .is_err());
         assert_eq!(pool.connections.available_permits(), 1);
         assert_eq!(pool.profile.available_permits(), before);
     }
