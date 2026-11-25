@@ -1,0 +1,130 @@
+name: Linux TUI visual review
+on:
+  push:
+    branches: [build/tui-review]
+    paths:
+      - '.github/workflows/tui-review.yml'
+      - 'tools/tui-review/**'
+      - 'TUI-REVIEW.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tui-review-gallery
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: review
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          path: source
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'source -> target'
+          key: tui-review-linux
+      - name: Install native build and rendering tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake clang libclang-dev pkg-config fonts-dejavu-core python3-pil
+      - name: Capture the real TUI renderer
+        shell: bash
+        run: |
+          set -euo pipefail
+          export THEIA_REVIEW_CELLS="$RUNNER_TEMP/theia-review-cells"
+          export THEIA_REVIEW_FIXTURES="$RUNNER_TEMP/theia-review-fixtures"
+          mkdir -m 700 "$THEIA_REVIEW_CELLS" "$THEIA_REVIEW_FIXTURES"
+          mkdir -m 700 "$THEIA_REVIEW_FIXTURES/home" "$THEIA_REVIEW_FIXTURES/config"
+          export HOME="$THEIA_REVIEW_FIXTURES/home"
+          export XDG_CONFIG_HOME="$THEIA_REVIEW_FIXTURES/config"
+          # Keep the installed compiler and Cargo cache after isolating HOME.
+          export RUSTUP_HOME=/home/runner/.rustup
+          export CARGO_HOME=/home/runner/.cargo
+          unset THEIA_CONTROL_DIR THEIA_CONTROL_PIPE
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("source/crates/theia/src/tui.rs")
+          marker = "mod tests {\n    use super::*;"
+          code = p.read_text()
+          assert code.count(marker) == 1, "TUI test module changed; update the gallery adapter"
+          gallery = Path("review/tools/tui-review/gallery.rs").read_text()
+          p.write_text(code.replace(marker, marker + "\n" + gallery, 1))
+          PY
+          cd source
+          source_sha="$(git rev-parse HEAD)"
+          cargo test --locked -p theia visual_review_gallery -- --nocapture --test-threads=1
+          /usr/bin/python3 ../review/tools/tui-review/render.py "$THEIA_REVIEW_CELLS" "$RUNNER_TEMP/tui-gallery" --source-sha "$source_sha"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tui-review-linux
+          path: ${{ runner.temp }}/tui-gallery
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.ref == 'refs/heads/build/tui-review'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: build/tui-review
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: tui-review-linux
+          path: ${{ runner.temp }}/tui-gallery
+      - name: Validate and publish only gallery files
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Do not let an older run overwrite a newer review-input revision.
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 - <<'PY'
+          import hashlib, json, os, re, shutil, struct
+          from pathlib import Path
+          src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
+          manifest = json.loads((src / "manifest.json").read_text())
+          assert re.fullmatch(r"[0-9a-f]{40}", manifest["source_sha"])
+          assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
+          expected = {"manifest.json", "README.md"}
+          for entry in manifest["screens"]:
+              name = entry["file"]
+              assert re.fullmatch(r"[a-z0-9-]+\.png", name) and name not in expected
+              expected.add(name)
+              f = src / name
+              assert f.is_file() and not f.is_symlink()
+              data = f.read_bytes()
+              assert data[:8] == b"\x89PNG\r\n\x1a\n" and struct.unpack(">II", data[16:24]) == (1200,840)
+              assert hashlib.sha256(data).hexdigest() == entry["sha256"]
+          assert len(expected) >= 52
+          assert {p.name for p in src.iterdir()} == expected
+          dst = Path("screenshots")
+          if dst.exists():
+              assert dst.is_dir() and not dst.is_symlink()
+              shutil.rmtree(dst)
+          dst.mkdir()
+          for name in sorted(expected):
+              assert not (src / name).is_symlink()
+              shutil.copyfile(src / name, dst / name)
+          PY
+          git add -A -- screenshots/
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Publish Linux TUI visual review [skip ci]"
+          git push origin HEAD:refs/heads/build/tui-review
