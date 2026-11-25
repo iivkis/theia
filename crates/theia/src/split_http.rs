@@ -46,8 +46,7 @@ impl IdentityRoutes {
         })
     }
 
-    #[cfg(test)]
-pub(crate) fn leg<T>(&self, request: &Request<T>) -> Option<Leg> {
+    pub(crate) fn leg<T>(&self, request: &Request<T>) -> Option<Leg> {
         leg_at(request, &self.upload, &self.download)
     }
 
@@ -365,6 +364,25 @@ mod tests {
                 .body(())
                 .unwrap();
             assert!(leg(&req) == expected);
+        }
+    }
+
+    #[test]
+    fn configured_prefix_is_identical_for_upload_and_download_and_no_alias_is_accepted() {
+        let routes = IdentityRoutes::new("/v1/edge_42").unwrap();
+        let other = IdentityRoutes::new("/v1/other").unwrap();
+        let uri: Uri = "https://localhost/v1/edge_42/session".parse().unwrap();
+        let authorization = HeaderValue::from_static("Bearer fixture");
+        assert_eq!(routes.single, uri.path());
+        for side in [Leg::Upload, Leg::Download] {
+            let request = routes.request(&uri, side, &authorization, 17).unwrap();
+            assert!(routes.leg(&request) == Some(side));
+            assert!(other.leg(&request).is_none());
+            assert!(leg(&request).is_none());
+            assert_eq!(pair_id(&request), Some(17));
+        }
+        for prefix in ["/v1", "/v1/", "/v1/../x", "/v1/a/b", "/v1/a?b", "/v1/a%2fb", "/v2/edge"] {
+            assert!(IdentityRoutes::new(prefix).is_err());
         }
     }
 

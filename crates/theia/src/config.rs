@@ -932,6 +932,19 @@ mod tests {
         }
     }
     #[test]
+    fn own_tls_requires_explicit_valid_prefix() {
+        for source in [server(), client()] {
+            for bad in ["", "/v1/", "/v1/a/b", "/v1/../x", "/v1/a?b", "/v1/a%2fb"] {
+                let invalid = source.replace("/v1/theia-example", bad);
+                assert!(parse(&invalid).unwrap_err().field.contains("path_prefix"));
+            }
+            let missing = source.lines().filter(|line| !line.starts_with("path_prefix = "))
+                .collect::<Vec<_>>().join("\n");
+            assert!(parse(&missing).unwrap_err().field.contains("path_prefix"));
+        }
+    }
+
+    #[test]
     fn server_denies_invalid_ids_digests_and_grants() {
         let original = server();
         for (from, to, expected) in [

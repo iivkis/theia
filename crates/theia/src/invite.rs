@@ -632,6 +632,7 @@ mod tests {
                 let restored = decoded.to_profile("env:TOKEN", None).unwrap();
                 assert_eq!(restored.tls_profile, mode);
                 assert_eq!(restored.transport, transport);
+                assert_eq!(restored.path_prefix, profile.path_prefix);
                 assert!(restored.tls_ca.is_none());
                 assert_eq!(decoded.encode().unwrap(), link);
                 assert!(Invitation::decode(&format!("theia://v2/{payload}")).is_err());
@@ -639,6 +640,11 @@ mod tests {
                 for altered in [
                     raw.replace("version = 1", "version = 2"),
                     raw.replace("smarttheia-xhttp", "legacy-http"),
+                    raw.replace("/v1/theia-example", "/v1/../x"),
+                    raw.lines()
+                        .filter(|line| !line.starts_with("path_prefix = "))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                     raw.lines()
                         .filter(|line| !line.starts_with("carrier = "))
                         .collect::<Vec<_>>()

@@ -2182,6 +2182,45 @@ mod selector_tests {
     }
 
     #[tokio::test]
+    async fn auto_retries_only_two_silent_pre_authentication_attempts() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let token = URL_SAFE_NO_PAD.encode([0x42u8; 32]);
+        let auto = AutoClient {
+            h2: Arc::new(H2Client::new(&remote.to_string(), "localhost", &token, roots.clone()).unwrap()),
+            h3: Arc::new(H3Client::new(remote, "localhost", &token, roots).unwrap()),
+            ttl: Duration::from_secs(900),
+            negative: Mutex::new(NegativeCache::default()),
+            cache_changed: Notify::new(),
+            recheck_gate: tokio::sync::Mutex::new(()),
+        };
+        for error in [ClientError::Tls, ClientError::Unauthorized, ClientError::Protocol,
+            ClientError::Timeout, ClientError::Io, ClientError::Http3, ClientError::Rejected(429)] {
+            let (generation, _) = auto.observe().unwrap();
+            let mut calls = 0;
+            let result = auto.attempt_h3(generation, || {
+                calls += 1;
+                std::future::ready(Err::<(), _>(error))
+            }).await;
+            assert!(matches!(result, Err(actual) if actual == error));
+            assert_eq!(calls, 1);
+            assert!(!auto.observe().unwrap().1);
+        }
+        let (generation, _) = auto.observe().unwrap();
+        let mut calls = 0;
+        let result = auto.attempt_h3(generation, || {
+            calls += 1;
+            std::future::ready(Err::<(), _>(ClientError::QuicUnreachable))
+        }).await;
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(calls, AUTO_QUIC_ATTEMPTS);
+        assert!(auto.observe().unwrap().1);
+    }
+
+    #[tokio::test]
     async fn idle_profile_rechecks_quic_without_opening_an_application_tunnel() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
