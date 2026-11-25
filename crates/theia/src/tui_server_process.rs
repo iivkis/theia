@@ -239,7 +239,9 @@ mod tests {
         done_tx.send(Ok(())).unwrap();
         panel.poll();
         assert!(!panel.running());
-        assert!(panel.body().contains("завершение listener tasks подтверждено"));
+        assert!(panel
+            .body()
+            .contains("завершение listener tasks подтверждено"));
     }
 
     #[test]

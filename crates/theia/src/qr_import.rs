@@ -196,9 +196,13 @@ mod tests {
     fn exact_svg_renders_matrix_and_rejects_duplicates_or_outside_quiet_zone() {
         let crate::config::Config::Client(doc) =
             crate::config::parse(include_str!("../../../examples/client.toml")).unwrap()
-        else { panic!("client") };
+        else {
+            panic!("client")
+        };
         let link = crate::invite::Invitation::public_from_profile(&doc.client.profiles[0])
-            .unwrap().encode().unwrap();
+            .unwrap()
+            .encode()
+            .unwrap();
         let qr = qrcode::QrCode::new(link.as_bytes()).unwrap();
         let size = qr.width() + 8;
         let scaled = size * 4;
@@ -217,7 +221,12 @@ mod tests {
         let (w, pixels) = theia_svg(svg.as_bytes()).unwrap();
         assert_eq!(w, scaled);
         assert_eq!(decode(w, w, &pixels).unwrap().as_str(), link.as_str());
-        for malformed in ["M4 4h1v1h-1zM4 4h1v1h-1z", "M0 4h1v1h-1z", "M4 0h1v1h-1z", "M4 4<script>"] {
+        for malformed in [
+            "M4 4h1v1h-1zM4 4h1v1h-1z",
+            "M0 4h1v1h-1z",
+            "M4 0h1v1h-1z",
+            "M4 4<script>",
+        ] {
             assert!(theia_svg(format!("{header}{malformed}{suffix}").as_bytes()).is_err());
         }
         assert!(theia_svg(svg.replace("fill=\"white\"", "fill=\"red\"").as_bytes()).is_err());

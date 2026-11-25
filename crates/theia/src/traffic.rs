@@ -332,8 +332,18 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         let mut monitor = Monitor::new(Role::Server);
         monitor.current = [
-            Snapshot { active: 2, opened: 10, upload: 1024 * 1024, download: 1024 },
-            Snapshot { active: 3, opened: 20, upload: 1024 * 1024 * 1024, download: 123 },
+            Snapshot {
+                active: 2,
+                opened: 10,
+                upload: 1024 * 1024,
+                download: 1024,
+            },
+            Snapshot {
+                active: 3,
+                opened: 20,
+                upload: 1024 * 1024 * 1024,
+                download: 123,
+            },
         ];
         for sampled in [false, true] {
             if sampled {
@@ -343,12 +353,18 @@ mod tests {
             }
             for (w, h) in [(120, 32), (70, 36), (60, 18)] {
                 let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-                terminal.draw(|frame| {
-                    let area = frame.area();
-                    monitor.render(frame, area);
-                }).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        monitor.render(frame, area);
+                    })
+                    .unwrap();
                 let buffer = terminal.backend().buffer();
-                let screen = buffer.content.iter().map(|cell| cell.symbol()).collect::<String>();
+                let screen = buffer
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
                 assert!(screen.contains("H2"), "{w}x{h}");
                 assert!(screen.contains("H3"), "{w}x{h}");
                 assert!(screen.contains("МиБ"));

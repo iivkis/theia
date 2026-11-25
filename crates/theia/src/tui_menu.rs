@@ -863,7 +863,10 @@ mod tests {
             if let Some(editor) = dialog.poll() {
                 return Some(editor);
             }
-            assert!(std::time::Instant::now() < deadline, "configuration worker stalled");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "configuration worker stalled"
+            );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         None
@@ -872,7 +875,9 @@ mod tests {
     #[test]
     fn server_setup_masks_material_and_creates_disabled_owner_only_after_review() {
         let mut setup = FirstSetup::new(Role::Server);
-        assert!(setup.body("server.toml").contains("Первый пользователь отключён"));
+        assert!(setup
+            .body("server.toml")
+            .contains("Первый пользователь отключён"));
         setup.key(press(KeyCode::Enter));
         assert!(setup.review.is_none());
         assert!(setup.body("server.toml").contains("Ошибка:"));
@@ -888,7 +893,15 @@ mod tests {
         setup.paste("bad\nvalue");
         setup.paste(&"a".repeat(4097));
         assert_eq!(setup.fields[0].as_str(), "inbound");
-        for (i, value) in ["127.0.0.1:443", "example.org", "file:/cert.pem", "file:/key.pem"].iter().enumerate() {
+        for (i, value) in [
+            "127.0.0.1:443",
+            "example.org",
+            "file:/cert.pem",
+            "file:/key.pem",
+        ]
+        .iter()
+        .enumerate()
+        {
             *setup.fields[i + 1] = value.to_string();
         }
         assert!(!setup.body("server.toml").contains("key.pem"));
@@ -906,7 +919,10 @@ mod tests {
         assert!(doc.server.users[0].disabled);
         assert_eq!(doc.server.users[0].token_sha256.len(), 64);
         assert_eq!(doc.server.inbounds[0].allowed_user_ids, vec!["owner"]);
-        assert_eq!(doc.server.inbounds[0].h2_listen, doc.server.inbounds[0].quic_listen);
+        assert_eq!(
+            doc.server.inbounds[0].h2_listen,
+            doc.server.inbounds[0].quic_listen
+        );
         assert!(matches!(setup.key(press(KeyCode::Esc)), SetupAction::Back));
     }
 
@@ -943,7 +959,17 @@ mod tests {
         for attempt in 0..2 {
             dialog.key(press(KeyCode::F(2)));
             let setup = dialog.setup.as_mut().unwrap();
-            for (i, value) in ["main", "example.org:443", "example.org", "file:/ca.pem", "env:THEIA_TOKEN", "/v1/route"].iter().enumerate() {
+            for (i, value) in [
+                "main",
+                "example.org:443",
+                "example.org",
+                "file:/ca.pem",
+                "env:THEIA_TOKEN",
+                "/v1/route",
+            ]
+            .iter()
+            .enumerate()
+            {
                 *setup.fields[i] = value.to_string();
             }
             dialog.key(press(KeyCode::Enter));
