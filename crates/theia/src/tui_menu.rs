@@ -1098,6 +1098,16 @@ impl ConfigDialog {
             self.input.push_str(text);
         }
     }
+    pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        if self.loading.is_some() || self.browser.is_some() { return None; }
+        if let Some(panel) = &self.first_invite {
+            return (panel.review && panel.browser.is_none() && panel.reading.is_none()).then_some(('y', "Сохранить профиль"));
+        }
+        if let Some(panel) = &self.reality { return panel.confirmation_choice(); }
+        if let Some(panel) = &self.enrollment { return panel.confirmation_choice(); }
+        self.setup.as_ref().filter(|s| s.review.is_some()).map(|_| ('y', "Создать настройки"))
+    }
+
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.loading.is_some() {
             return false;

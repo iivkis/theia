@@ -424,6 +424,18 @@ impl StatusPanel {
         self.client_run.is_some() && self.client_confirm.is_none()
     }
 
+    pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        if self.reopen_required || self.pending.is_some() || self.committing { return None; }
+        if self.credential_review.is_some() { return Some(('y', "Сохранить ключ")); }
+        if self.headless_review.is_some() { return Some(('y', "Применить")); }
+        if self.trust_review.is_some() { return Some(('y', "Подтвердить доверие")); }
+        if let Some(start) = self.client_confirm {
+            return Some(('y', if start { "Запустить" } else { "Остановить" }));
+        }
+        if self.expiry_review.is_some() || self.review.is_some() { return Some(('y', "Подтвердить запись")); }
+        None
+    }
+
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
         if self.reopen_required

@@ -1106,6 +1106,24 @@ impl ProvisionPanel {
         }
     }
 
+    pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        if let Some(wizard) = &self.wizard {
+            if let Some(panel) = &wizard.registration { return panel.confirmation_choice(); }
+            if wizard.grant_picker.is_some() { return None; }
+            return match wizard.stage {
+                WizardStage::DnsConfirm(_) => Some(('y', "Разрешить DNS")),
+                WizardStage::ProbeConfirm(_) => Some(('y', "Проверить адреса")),
+                WizardStage::CreateConfirm(_) => Some(('y', "Сохранить")),
+                _ => None,
+            };
+        }
+        match self.stage {
+            Stage::ConfirmPlan(_) => Some(('y', "Начать проверку")),
+            Stage::Confirm(_) => Some(('y', "Сохранить")),
+            _ => None,
+        }
+    }
+
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if let Some(wizard) = self.wizard.as_mut() {
             return wizard.key(key);

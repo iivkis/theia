@@ -368,6 +368,12 @@ impl EnrollmentPanel {
         }
     }
 
+    pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        if self.browser.is_some() { return None; }
+        if let Some(panel) = &self.registration { return panel.confirmation_choice(); }
+        matches!(self.stage, Stage::Confirm(_)).then_some(('y', "Доверять и сохранить"))
+    }
+
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if let Some(browser) = self.browser.as_mut() {
             if key.code == KeyCode::Esc {
