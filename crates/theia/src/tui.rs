@@ -266,6 +266,7 @@ enum ImportFlow {
     Done,
     ActivateConfirm,
     Activating,
+    ActivationFailed,
     Failed,
 }
 
@@ -763,7 +764,7 @@ impl Interaction {
                         self.client_background = None;
                         self.reality_status = self.editor.as_ref().map(StatusPanel::open);
                     } else {
-                        self.importing = Some(ImportFlow::Failed);
+                        self.importing = Some(ImportFlow::ActivationFailed);
                     }
                 }
                 if saved {
@@ -2469,7 +2470,7 @@ impl Interaction {
                     _ => self.importing = Some(ImportFlow::ActivateConfirm),
                 },
                 ImportFlow::Activating => self.importing = Some(ImportFlow::Activating),
-                state @ (ImportFlow::RefreshDone | ImportFlow::Failed) => {
+                state @ (ImportFlow::RefreshDone | ImportFlow::ActivationFailed | ImportFlow::Failed) => {
                     if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                         self.importing = Some(state);
                     }
@@ -3845,12 +3846,13 @@ fn draw_import(
             "Старый файл сохранён. Проверьте доступ отдельно; соединение и системный прокси не менялись. Enter/Esc: закрыть.".into(),
         ),
         ImportFlow::Saving => ("Сохранение профиля", "Создание нового приватного bearer и guarded TOML commit. Секрет не отображается.\nНикакого подключения или системного прокси.".into()),
-        ImportFlow::Done => ("Профиль сохранён", format!("Профиль: {}\n{}\nСоединение не запущено, системный прокси не изменён.\n\nEnter: перейти к подключению\nEsc: закончить без запуска\n\n{}",
+        ImportFlow::Done => ("Профиль сохранён", format!("Профиль: {}\n{}\nИмпорт не запустил новое соединение и не изменил системный прокси.\n\nEnter: перейти к подключению\nEsc: закончить без запуска\n\n{}",
             editor.map_or("Новый профиль", Editor::selected_record_id),
             if editor.is_some_and(Editor::selected_record_is_active) { "Профиль активен в настройках." } else { "Активный профиль не изменён. Перед подключением подтвердите выбор нового профиля." },
             editor.and_then(|e| e.error.as_deref()).unwrap_or(""))),
         ImportFlow::ActivateConfirm => ("Выбрать импортированный профиль", format!("Сделать профиль {} активным?\nДругие профили остаются сохранёнными. Это не запускает соединение.\n\ny: подтвердить · n/Esc: назад", editor.map_or("", Editor::selected_record_id))),
         ImportFlow::Activating => ("Сохранение выбора", "Сохраняется активный профиль. Соединение не запускается.".into()),
+        ImportFlow::ActivationFailed => ("Выбор профиля не подтверждён", format!("Сам профиль уже импортирован. Изменение активного профиля не подтверждено; новое соединение не запущено.\nПроверьте состояние файла и заново откройте настройки, прежде чем повторить выбор.\n\n{}\n\nEnter/Esc: закрыть", editor.and_then(|e| e.error.as_deref()).unwrap_or(""))),
         ImportFlow::Failed => (
             "Импорт НЕ подтверждён",
             format!(
@@ -3861,6 +3863,7 @@ fn draw_import(
     };
     match flow {
         ImportFlow::Preview { .. } => draw_guided(frame, area, title, &body, (3, 5, "Параметры и доверие", "Enter следующий шаг · c сертификат · y сохранить · Esc отменить"), viewport, (None, None)),
+        ImportFlow::Saving => draw_guided(frame, area, title, &body, (4, 5, "Сохранение профиля", "Идёт запись · новое подключение не запускается"), viewport, (None, None)),
         ImportFlow::Done => draw_guided(frame, area, title, &body, (5, 5, "Подключение", "Enter перейти к подключению · Esc закончить"), viewport, (None, None)),
         ImportFlow::ActivateConfirm => draw_guided(frame, area, title, &body, (5, 5, "Выбор профиля", "y подтвердить · n/Esc назад"), viewport, (None, None)),
         _ => panel_at(frame, area, title, &body, true, viewport),
@@ -5304,6 +5307,104 @@ mod tests {
         assert!(ui.reality_enrollment.is_none());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_file(&path).unwrap();
+
+        let first_path = path.with_extension("first.toml");
+        let mut ui = Interaction::new(None);
+        let mut dialog = ConfigDialog::new(Role::Client, Some(&first_path));
+        dialog.begin_client_import();
+        ui.config_dialog = Some(dialog);
+        ui.paste_record_field(uri.as_str());
+        ui.update(&mut model, press(KeyCode::Enter));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ui.config_dialog.as_ref().is_some_and(|d| d.title() == "Импорт REALITY") {
+            ui.poll_navigation(&mut model);
+            assert!(std::time::Instant::now() < deadline, "REALITY import was not detected");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let dialog = ui.config_dialog.as_ref().unwrap();
+        assert_eq!(dialog.guide().unwrap().0, 2);
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(!screen.contains(uri.as_str()));
+        assert!(!first_path.exists());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(!first_path.exists());
+    }
+
+    // The visual gallery uses this same real first-run path, with synthetic
+    // credentials and an independent local certificate. No connection is started.
+    fn first_key_import_fixture(root: &Path, mut capture: impl FnMut(&str, &Model, &Interaction)) {
+        use crate::config::{self, Config};
+        std::fs::create_dir_all(root).unwrap();
+        let path = root.join("client.toml");
+        let ca = root.join("ca.pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
+        std::fs::write(&ca, cert.cert.pem()).unwrap();
+        let server = config::parse(&server_issuance_fixture()).unwrap();
+        let invite = Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let uri = Zeroizing::new(invite.encode().unwrap());
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(None);
+        let mut dialog = ConfigDialog::new(Role::Client, Some(&path));
+        dialog.begin_client_import();
+        ui.config_dialog = Some(dialog);
+        capture("client-first-key-input", &model, &ui);
+        ui.paste_record_field(&uri);
+        let masked = rendered_interaction(120, 40, &model, &ui);
+        assert!(masked.contains("скрыто"));
+        assert!(!masked.contains(uri.as_str()));
+        ui.update(&mut model, press(KeyCode::Enter));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ui.config_dialog.as_ref().and_then(ConfigDialog::guide).is_some_and(|g| g.0 == 3) {
+            ui.poll_navigation(&mut model);
+            assert!(std::time::Instant::now() < deadline, "first key was not decoded");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!path.exists());
+        capture("client-first-key-trust", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Enter)); // CA is mandatory.
+        assert_eq!(ui.config_dialog.as_ref().unwrap().guide().unwrap().0, 3);
+        assert!(!path.exists());
+        ui.paste_record_field(ca.to_str().unwrap());
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.config_dialog.as_ref().unwrap().guide().unwrap().0, 4);
+        assert!(!path.exists());
+        capture("client-first-key-save-review", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Char('n')));
+        assert!(!path.exists());
+        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ui.config_dialog.is_some() {
+            ui.poll_navigation(&mut model);
+            assert!(std::time::Instant::now() < deadline, "first profile was not saved");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(ui.importing, Some(ImportFlow::Done)));
+        assert!(ui.reality_status.is_none());
+        let editor = ui.editor.as_ref().unwrap();
+        assert!(editor.selected_record_is_active());
+        let Config::Client(doc) = config::read_file(&path).unwrap() else { panic!("client expected"); };
+        assert_eq!(doc.client.profiles.len(), 1);
+        assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
+        assert_eq!(doc.client.proxy.system_proxy, config::SystemProxy::Off);
+        assert!(doc.client.profiles[0].auth_token.starts_with("file:"));
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(uri.as_str()));
+        assert!(Editor::create_first_invitation(&path, &invite, &format!("file:{}", ca.display()), None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        capture("client-first-key-saved", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.importing.is_none());
+        assert!(ui.reality_status.is_some());
+        assert!(!ui.reality_status.as_ref().unwrap().local_running());
+        capture("client-first-key-connect", &model, &ui);
+    }
+
+    #[test]
+    fn first_key_import_creates_active_profile_and_opens_connection_panel() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("first-key-import").unwrap());
+        first_key_import_fixture(&root, |_, _, _| {});
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
