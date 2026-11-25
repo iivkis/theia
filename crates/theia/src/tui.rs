@@ -680,13 +680,13 @@ impl Interaction {
     /// Bracketed-paste source text stays in memory and is never rendered.
     fn paste_import_source(&mut self, text: &str) {
         if self.import_browser.is_some() { return; }
-        if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
-            let input = text.trim_end_matches(['\r', '\n']);
-            if source.len().saturating_add(input.len()) <= crate::invite::MAX_URI
-                && !input.contains('\0')
-            {
-                source.push_str(input);
-            }
+        let input = text.trim_end_matches(['\r', '\n']);
+        if input.chars().any(char::is_control) { return; }
+        match self.importing.as_mut() {
+            Some(ImportFlow::Input(source)) if source.len().saturating_add(input.len()) <= crate::invite::MAX_URI => source.push_str(input),
+            Some(ImportFlow::Trust { ca, .. }) if ca.len().saturating_add(input.len()) <= 1024 => ca.push_str(input),
+            Some(ImportFlow::Credential { reference, .. }) if reference.len().saturating_add(input.len()) <= 1024 => reference.push_str(input),
+            _ => {}
         }
     }
 
@@ -889,6 +889,8 @@ impl Interaction {
             if let Some(editor) = dialog.poll() {
                 if dialog.imported() {
                     self.importing = Some(ImportFlow::Done);
+                } else if dialog.import_after_load() {
+                    self.importing = Some(ImportFlow::Input(Zeroizing::new(String::new())));
                 }
                 self.editor = Some(editor);
                 self.config_dialog = None;
@@ -1556,7 +1558,11 @@ impl Interaction {
                         KeyCode::Enter => {
                             self.open_config(role);
                             if let Some(dialog) = self.config_dialog.as_mut() {
-                                dialog.prefer_mode(self.welcome_choice);
+                                if role == Role::Client && self.welcome_choice == 1 {
+                                    dialog.begin_client_import();
+                                } else {
+                                    dialog.prefer_mode(self.welcome_choice);
+                                }
                             }
                             return false;
                         }
@@ -1739,7 +1745,10 @@ impl Interaction {
         if self.editor.is_none() || inactive_editor {
             if model.screen == Screen::Client && matches!(key.code, KeyCode::Char('i' | 'I')) {
                 self.open_config(Role::Client);
-                if let Some(dialog) = self.config_dialog.as_mut() { dialog.prefer_reality(); }
+                if let Some(dialog) = self.config_dialog.as_mut() {
+                    if key.code == KeyCode::Char('i') { dialog.begin_client_import(); }
+                    else { dialog.prefer_reality(); }
+                }
                 return false;
             }
             if model.screen == Screen::Server && key.code == KeyCode::Char('W') {
@@ -2256,6 +2265,12 @@ impl Interaction {
                         KeyCode::Char('r') if editor.can_refresh_credential(&invitation) => {
                             self.importing = Some(ImportFlow::RefreshConfirm(invitation));
                         }
+                        KeyCode::Enter if ca.is_none() => {
+                            self.importing = Some(ImportFlow::Trust { invitation, ca: String::new(), public_ref });
+                        }
+                        KeyCode::Enter if !invitation.has_token() && public_ref.is_none() => {
+                            self.importing = Some(ImportFlow::Credential { invitation, ca, reference: String::new() });
+                        }
                         KeyCode::Char('c') => {
                             self.importing = Some(ImportFlow::Trust {
                                 invitation,
@@ -2270,8 +2285,11 @@ impl Interaction {
                                 reference: public_ref.unwrap_or_default(),
                             });
                         }
-                        KeyCode::Char('y') => {
-                            if !invitation.has_token() && public_ref.is_none() {
+                        KeyCode::Char('y') if key.modifiers.is_empty() => {
+                            if ca.is_none() {
+                                editor.error = Some("Сначала подтвердите доверенный сертификат. Enter или c — выбрать.".into());
+                                self.importing = Some(ImportFlow::Preview { invitation, ca, public_ref });
+                            } else if !invitation.has_token() && public_ref.is_none() {
                                 editor.error = Some("Публичное приглашение требует отдельную env: ссылку на секрет.".into());
                                 self.importing = Some(ImportFlow::Preview {
                                     invitation,
@@ -2314,11 +2332,10 @@ impl Interaction {
                         })
                     }
                     KeyCode::Enter => {
-                        let verified = if ca.is_empty() {
-                            Ok(None)
-                        } else {
-                            client_import::checked_ca_ref(Some(&ca))
-                        };
+                        if !ca.is_empty() && !ca.starts_with("file:") {
+                            ca = format!("file:{ca}");
+                        }
+                        let verified = client_import::checked_ca_ref(Some(&ca));
                         match verified {
                             Ok(value) => {
                                 editor.error = None;
@@ -3770,10 +3787,10 @@ fn draw_import(
         let form=Form {
             fields:vec![Field {id:0,label:"Доверенный сертификат (CA)",value:if ca.is_empty(){String::new()}else{format!("Путь указан · {} символов",ca.len())},hint:"Нажмите F6 и выберите PEM-файл, полученный от администратора по доверенному каналу."}],
             selected:0,
-            lead:"Сертификат подтверждает, что вы подключаетесь к нужному серверу. Получите его отдельно от приглашения. Пустое поле оставит профиль неготовым.".into(),
+            lead:"Сертификат подтверждает, что вы подключаетесь к нужному серверу. Получите его отдельно от приглашения. Без сертификата сохранить профиль нельзя.".into(),
             error:editor.and_then(|e|e.error.clone()).unwrap_or_default(),
         };
-        draw_guided(frame,area,"F-14: отдельный TLS trust","",(2,3,"Проверка сертификата","F6 выбрать файл · Enter проверить · Ctrl+U очистить · Esc назад"),viewport,(Some(form),None));
+        draw_guided(frame,area,"Импорт ключа Theia","",(3,5,"Проверка сертификата","F6 выбрать файл · Enter проверить · Ctrl+U очистить · Esc назад"),viewport,(Some(form),None));
         return;
     }
     let (title, body) = match flow {
@@ -3843,7 +3860,7 @@ fn draw_import(
         ),
     };
     match flow {
-        ImportFlow::Preview { .. } => draw_guided(frame, area, title, &body, (3, 5, "Параметры и доверие", "c сертификат · y сохранить · Esc отменить"), viewport, (None, None)),
+        ImportFlow::Preview { .. } => draw_guided(frame, area, title, &body, (3, 5, "Параметры и доверие", "Enter следующий шаг · c сертификат · y сохранить · Esc отменить"), viewport, (None, None)),
         ImportFlow::Done => draw_guided(frame, area, title, &body, (5, 5, "Подключение", "Enter перейти к подключению · Esc закончить"), viewport, (None, None)),
         ImportFlow::ActivateConfirm => draw_guided(frame, area, title, &body, (5, 5, "Выбор профиля", "y подтвердить · n/Esc назад"), viewport, (None, None)),
         _ => panel_at(frame, area, title, &body, true, viewport),
@@ -4847,12 +4864,11 @@ mod tests {
         ui.mouse(&mut model, click(target.x + 2, y), area);
         assert_eq!(ui.welcome_choice, 1);
         assert!(ui.config_dialog.is_none());
-        ui.update(&mut model, press(KeyCode::Enter));
         let path = root.join("first.toml");
-        let dialog = ui.config_dialog.as_mut().unwrap();
-        dialog.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        dialog.paste(path.to_str().unwrap());
-        assert_eq!(dialog.form().unwrap().selected, 1);
+        let mut dialog = ConfigDialog::new(Role::Client, Some(&path));
+        dialog.prefer_mode(ui.welcome_choice);
+        ui.config_dialog = Some(dialog);
+        assert_eq!(ui.config_dialog.as_ref().unwrap().form().unwrap().selected, 1);
         ui.update(&mut model, press(KeyCode::Enter));
         let dialog = ui.config_dialog.as_ref().unwrap();
         let _ = dialog;
@@ -5340,6 +5356,16 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(matches!(ui.importing, Some(ImportFlow::Preview { .. })));
         ui.update(&mut model, press(KeyCode::Char('y')));
+        assert!(ui.saving.is_none(), "independent CA is required");
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.importing, Some(ImportFlow::Trust { .. })));
+        let ca = path.with_extension("pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["remote.example.org".into()]).unwrap();
+        fs::write(&ca, cert.cert.pem()).unwrap();
+        ui.paste_import_source(ca.to_str().unwrap());
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.importing, Some(ImportFlow::Preview { ca: Some(_), .. })));
+        ui.update(&mut model, press(KeyCode::Char('y')));
         assert!(ui.saving.is_some());
         let start = Instant::now();
         while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
@@ -5356,8 +5382,21 @@ mod tests {
         assert_eq!(after.client.profiles[1].id, "remote");
         assert_eq!(after.client.profiles[1].auth_token, "env:REMOTE_TOKEN");
         assert!(!fs::read_to_string(&path).unwrap().contains(&link));
-        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.importing, Some(ImportFlow::ActivateConfirm)));
+        assert!(ui.saving.is_none());
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        let start = Instant::now();
+        while ui.saving.is_some() && start.elapsed() < Duration::from_secs(5) {
+            ui.poll_save(&mut model).unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(ui.importing.is_none());
+        assert!(ui.editor.as_ref().unwrap().selected_record_is_active());
+        assert!(ui.reality_status.is_some());
+        assert!(!ui.reality_status.as_ref().unwrap().local_running());
+        fs::remove_file(ca).unwrap();
+        fs::remove_file(config::lock_path(&path).unwrap()).unwrap();
         fs::remove_file(path).unwrap();
     }
 

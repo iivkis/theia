@@ -518,7 +518,23 @@ impl EnrollmentPanel {
             _ => return None,
         };
         match result {
-            Ok(stage) => self.stage = stage,
+            Ok(stage) => {
+                self.stage = stage;
+                if matches!(&self.stage, Stage::Done(_)) && self.owned.is_some() {
+                    if let (Some((path, digest)), Ok(input)) = (&self.config, self.input()) {
+                        match crate::tui_reality_register::RegistrationPanel::from_enrollment(
+                            path.clone(), *digest, &input.profile, input.identity,
+                        ) {
+                            Ok(panel) => {
+                                if let Some(owned) = self.owned.take() {
+                                    self.registration = Some(panel.own_material(owned));
+                                }
+                            }
+                            Err(error) => self.error = Some(error.to_string()),
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 self.error = Some(format!(
                     "ОТКАЗ: {error}. При неопределённой записи проверьте файлы перед повтором."
@@ -569,18 +585,18 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn guide(&self) -> (usize, usize, &'static str, &'static str) {
-        let total=if self.managed_paths(){4}else{3};
+        let total=if self.managed_paths(){5}else{3};
         if self.browser.is_some(){return (1,total,"Выбор локального файла","↑↓ выбрать · Enter выбрать путь · Esc назад");}
         if self.registration.is_some() {
-            return (total,total,"Регистрация в TOML","Enter предпросмотр · Y сохранить · Esc назад");
+            return (4,total,"Сохранение профиля","Enter предпросмотр · y сохранить · Esc отменить");
         }
         match &self.stage {
-            Stage::Input if self.managed_paths() && self.focus<4 => (1,4,"Приглашение и файл допуска","↑↓ поле · F6 файл · F8 далее · Enter продолжить · Esc назад"),
-            Stage::Input if self.managed_paths() => (2,4,"Проверка доверия и токена","↑↓ поле · F8 назад · Enter проверить · Ctrl+U очистить · Esc отменить"),
+            Stage::Input if self.managed_paths() && self.focus<4 => (2,5,"REALITY · приглашение и файл допуска","↑↓ поле · F6 файл · F8 далее · Enter продолжить · Esc назад"),
+            Stage::Input if self.managed_paths() => (3,5,"Проверка доверия и ключа","↑↓ поле · F8 назад · Enter проверить · Ctrl+U очистить · Esc отменить"),
             Stage::Input => (1,3,"Приглашение и доверие","↑↓ поле · F8 раздел · Enter проверить · Ctrl+U очистить · Esc назад"),
-            Stage::Loading(_) => (total-1,total,"Проверка приглашения","Идёт локальная проверка"),
-            Stage::Confirm(_) => (total-1,total,"Подтверждение доверия","Y сохранить · N / Esc назад"),
-            Stage::Applying(_) | Stage::Creating(_) => (total,total,"Сохранение","Идёт запись; подключения нет"),
+            Stage::Loading(_) => (if self.managed_paths() {3} else {total-1},total,"Проверка приглашения","Идёт локальная проверка"),
+            Stage::Confirm(_) => (if self.managed_paths() {3} else {total-1},total,"Подтверждение доверия","Y сохранить · N / Esc назад"),
+            Stage::Applying(_) | Stage::Creating(_) => (if self.managed_paths() {4} else {total},total,"Сохранение","Идёт запись; подключения нет"),
             Stage::Done(_) => (total,total,"Результат","G зарегистрировать, если доступно · Esc назад"),
         }
     }

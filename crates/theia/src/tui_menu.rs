@@ -616,7 +616,13 @@ impl FirstInvite {
         String::new()
     }
     fn key(&mut self, key: KeyEvent) -> FirstInviteAction {
-        if self.reading.is_some() { return FirstInviteAction::Stay; }
+        if self.reading.is_some() {
+            if key.code == KeyCode::Esc {
+                self.reading = None;
+                self.error = None;
+            }
+            return FirstInviteAction::Stay;
+        }
         if let Some(browser) = self.browser.as_mut() {
             if key.code == KeyCode::Esc { self.browser = None; }
             else if let Some(path) = browser.key(key.code, "") {
@@ -654,6 +660,9 @@ impl FirstInvite {
             KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab if self.own.as_ref().is_some_and(|i| !i.has_token()) => self.focus = 1 - self.focus,
             KeyCode::Enter => {
                 if let Some(invite) = &self.own {
+                    if !self.ca.is_empty() && !self.ca.starts_with("file:") {
+                        self.ca = format!("file:{}", self.ca);
+                    }
                     if crate::client_import::checked_ca_ref(Some(&self.ca)).is_err() {
                         self.error = Some("Выберите доверенный PEM-сертификат через F6.");
                     } else if !invite.has_token() && !crate::client_import::valid_explicit_reference(&self.reference) {
@@ -683,7 +692,7 @@ impl FirstInvite {
                 else { self.reference.pop(); }
             }
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-                if self.own.is_none() { self.source.clear(); }
+                if self.own.is_none() { self.source = Zeroizing::new(String::new()); }
                 else if self.focus == 0 { self.ca.clear(); }
                 else { self.reference.clear(); }
             }
@@ -708,6 +717,7 @@ pub(crate) struct ConfigDialog {
     enrollment: Option<crate::tui_reality_enroll::EnrollmentPanel>,
     first_invite: Option<FirstInvite>,
     imported: bool,
+    import_after_load: bool,
     creating: bool,
     browser: Option<FileBrowser>,
 }
@@ -736,11 +746,26 @@ impl ConfigDialog {
             enrollment: None,
             first_invite: None,
             imported: false,
+            import_after_load: false,
             creating: false,
             browser: None,
         }
     }
     pub(crate) fn imported(&self) -> bool { self.imported }
+
+    pub(crate) fn import_after_load(&self) -> bool { self.import_after_load }
+
+    pub(crate) fn begin_client_import(&mut self) {
+        if self.role != Role::Client { return; }
+        if std::path::Path::new(&self.input).is_file() {
+            self.choice = 0;
+            self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            self.import_after_load = self.loading.is_some();
+        } else {
+            self.choice = 1;
+            self.key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        }
+    }
 
     pub(crate) fn suggested_mode(role: Role) -> usize {
         let filename=if role==Role::Server {"server.toml"} else {"client.toml"};
@@ -951,7 +976,7 @@ impl ConfigDialog {
             panel.reading = None;
             match result {
                 Ok((_, crate::client_import::ProductSource::OwnTls(invite))) => {
-                    panel.source.clear();
+                    panel.source = Zeroizing::new(String::new());
                     panel.own = Some(invite);
                     panel.focus = 0;
                 }
@@ -987,6 +1012,7 @@ impl ConfigDialog {
             Ok(editor) => Some(editor),
             Err(reason) => {
                 self.imported = false;
+                self.import_after_load = false;
                 self.error = Some(reason);
                 None
             }
