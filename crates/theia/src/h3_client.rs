@@ -404,13 +404,13 @@ impl H3Client {
         let mut stage = HelloOutcome::Pending;
         let Some(mode) = &self.auto_mode else {
             return self
-                .open_inner(&open, operation, self.stream_up, &mut stage)
+                .open_mode(&open, operation, self.stream_up, &mut stage)
                 .await;
         };
         let ticket = mode.select()?;
         let stream_up = ticket.stream_up;
         let result = self
-            .open_inner(&open, operation, stream_up, &mut stage)
+            .open_mode(&open, operation, stream_up, &mut stage)
             .await;
         if !mode.after_attempt(ticket, stream_up, stage)? {
             return result;
@@ -418,10 +418,32 @@ impl H3Client {
         // The first attempt is fully dropped and never sent OPEN_TCP.
         crate::diag!(Debug, "client.h3", "xhttp_pre_open_stream_up_retry");
         let mut stage = HelloOutcome::Pending;
-        let result = self.open_inner(&open, operation, true, &mut stage).await;
+        let result = self.open_mode(&open, operation, true, &mut stage).await;
         mode.after_attempt(ticket, true, stage)?;
         // The original H3 attempt already completed HTTP admission.
         // UDP silence in the second attempt must not authorize H2 fallback.
+        match result {
+            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => Err(ClientError::Timeout),
+            other => other,
+        }
+    }
+
+    /// At most one fresh connection after an explicit graceful GOAWAY
+    /// before any HELLO/OPEN. Never replay a body or change XHTTP mode.
+    async fn open_mode(
+        &self,
+        open: &Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &mut crate::split_http::HelloOutcome,
+    ) -> Result<H3Tunnel, ClientError> {
+        use crate::split_http::HelloOutcome;
+        let result = self.open_inner(open, operation, stream_up, stage).await;
+        if *stage != HelloOutcome::Draining {
+            return result;
+        }
+        *stage = HelloOutcome::Pending;
+        let result = self.open_inner(open, operation, stream_up, stage).await;
         match result {
             Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => Err(ClientError::Timeout),
             other => other,
@@ -497,6 +519,16 @@ impl H3Client {
         if !lease.accepting_new_streams() {
             return Err(ClientError::Http3);
         }
+        // Only a protocol-level graceful refusal during HTTP admission can
+        // retry. The lease's Drop removes the draining connection from reuse
+        // while other admitted leases retain it.
+        let mut admission_error = |error: h3::error::StreamError| {
+            if matches!(error, h3::error::StreamError::RemoteClosing { .. }) {
+                lease.retire();
+                *stage = crate::split_http::HelloOutcome::Draining;
+            }
+            ClientError::Http3
+        };
         let connection = lease.connection();
         let binding = connection.binding.as_ref();
         let mut sender = connection
@@ -519,8 +551,8 @@ impl H3Client {
                     )?)?,
                 )?)
                 .await
-                .map_err(|_| ClientError::Http3)?;
-            download.finish().await.map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
+            download.finish().await.map_err(&mut admission_error)?;
             let mut upload = sender
                 .send_request(crate::channel_binding::attach(
                     binding,
@@ -533,11 +565,11 @@ impl H3Client {
                     )?)?,
                 )?)
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             let upload_response = upload
                 .recv_response()
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             split_http::check_status(upload_response.status())?;
             if upload
                 .recv_data()
@@ -555,7 +587,7 @@ impl H3Client {
             let response = download
                 .recv_response()
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             let (tx, _) = upload.split();
             let (_, rx) = download.split();
             (response, tx, rx)
@@ -568,11 +600,11 @@ impl H3Client {
             let mut stream = sender
                 .send_request(crate::channel_binding::attach(binding, self.padding.request(request)?)?)
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             let response = stream
                 .recv_response()
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             let (tx, rx) = stream.split();
             (response, tx, rx)
         };

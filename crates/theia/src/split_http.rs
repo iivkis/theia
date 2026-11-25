@@ -90,6 +90,7 @@ pub(crate) enum HelloOutcome {
     #[default]
     Pending,
     Silent,
+    Draining,
     Acked,
 }
 

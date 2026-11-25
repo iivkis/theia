@@ -545,13 +545,13 @@ impl H2Client {
         let mut stage = HelloOutcome::Pending;
         let Some(mode) = &self.auto_mode else {
             return self
-                .open_inner(&open, operation, self.stream_up, &mut stage)
+                .open_mode(&open, operation, self.stream_up, &mut stage)
                 .await;
         };
         let ticket = mode.select()?;
         let stream_up = ticket.stream_up;
         let result = self
-            .open_inner(&open, operation, stream_up, &mut stage)
+            .open_mode(&open, operation, stream_up, &mut stage)
             .await;
         if !mode.after_attempt(ticket, stream_up, stage)? {
             return result;
@@ -559,8 +559,27 @@ impl H2Client {
         // The first attempt is fully dropped and never sent OPEN_TCP.
         crate::diag!(Debug, "client.h2", "xhttp_pre_open_stream_up_retry");
         let mut stage = HelloOutcome::Pending;
-        let result = self.open_inner(&open, operation, true, &mut stage).await;
+        let result = self.open_mode(&open, operation, true, &mut stage).await;
         mode.after_attempt(ticket, true, stage)?;
+        result
+    }
+
+    /// At most one fresh connection after an explicit graceful GOAWAY
+    /// before any HELLO/OPEN. Never replay a body or change XHTTP mode.
+    async fn open_mode(
+        &self,
+        open: &Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &mut crate::split_http::HelloOutcome,
+    ) -> Result<Tunnel, ClientError> {
+        use crate::split_http::HelloOutcome;
+        let result = self.open_inner(open, operation, stream_up, stage).await;
+        if *stage != HelloOutcome::Draining {
+            return result;
+        }
+        *stage = HelloOutcome::Pending;
+        let result = self.open_inner(open, operation, stream_up, stage).await;
         result
     }
 
@@ -670,6 +689,16 @@ impl H2Client {
         if !lease.accepting_new_streams() {
             return Err(ClientError::Http2);
         }
+        // Only a protocol-level graceful refusal during HTTP admission can
+        // retry. The lease's Drop removes the draining connection from reuse
+        // while other admitted leases retain it.
+        let mut admission_error = |error: h2::Error| {
+            if error.is_go_away() && error.is_remote() && error.reason() == Some(h2::Reason::NO_ERROR) {
+                lease.retire();
+                *stage = crate::split_http::HelloOutcome::Draining;
+            }
+            ClientError::Http2
+        };
         let connection = lease.connection();
         let binding = connection.binding.as_ref();
         let sender = connection
@@ -677,7 +706,7 @@ impl H2Client {
             .lock()
             .map_err(|_| ClientError::Http2)?
             .clone();
-        let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+        let mut sender = sender.ready().await.map_err(&mut admission_error)?;
         let pair_id = lease.id();
         // Bearer is sent only on a verified connection.
         let (response, mut outgoing) = if stream_up {
@@ -696,8 +725,8 @@ impl H2Client {
                     )?,
                     true,
                 )
-                .map_err(|_| ClientError::Http2)?;
-            let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+                .map_err(&mut admission_error)?;
+            let mut sender = sender.ready().await.map_err(&mut admission_error)?;
             let (upload, tx) = sender
                 .send_request(
                     crate::channel_binding::attach(
@@ -712,8 +741,8 @@ impl H2Client {
                     )?,
                     false,
                 )
-                .map_err(|_| ClientError::Http2)?;
-            let upload = upload.await.map_err(|_| ClientError::Http2)?;
+                .map_err(&mut admission_error)?;
+            let upload = upload.await.map_err(&mut admission_error)?;
             split_http::check_status(upload.status())?;
             let mut empty = upload.into_body();
             if empty.data().await.is_some()
@@ -725,7 +754,7 @@ impl H2Client {
             {
                 return Err(ClientError::Protocol);
             }
-            (download.await.map_err(|_| ClientError::Http2)?, tx)
+            (download.await.map_err(&mut admission_error)?, tx)
         } else {
             let request = Request::post(self.uri.clone())
                 .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -734,8 +763,8 @@ impl H2Client {
                 .map_err(|_| ClientError::Configuration)?;
             let (response, tx) = sender
                 .send_request(crate::channel_binding::attach(binding, self.padding.request(request)?)?, false)
-                .map_err(|_| ClientError::Http2)?;
-            (response.await.map_err(|_| ClientError::Http2)?, tx)
+                .map_err(&mut admission_error)?;
+            (response.await.map_err(&mut admission_error)?, tx)
         };
         crate::diag!(
             Trace,
