@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "c128a81fa8755f43bc271a04c760a2a03ca68cb1",
+  "source_sha": "83dce740a671a55900c03f69a2995470268047c4",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -12,7 +12,7 @@
     {
       "scenario": "client-action-active-profile",
       "file": "client-action-active-profile.png",
-      "sha256": "6cfa74b899b6bbbc9a0c35d4f83bc599bd06a661c5375bb991b24c4aa569ae5d",
+      "sha256": "ecee6cada516099ea81b82b2466d79aac62299b2db2e314677404866fe0b747d",
       "state_fixture": false
     },
     {
@@ -24,7 +24,7 @@
     {
       "scenario": "client-action-delete-profile",
       "file": "client-action-delete-profile.png",
-      "sha256": "5da6cf341f7b5889d2244b2d9a2b3771b5ed3b09552befbb9478647765e11dc0",
+      "sha256": "6be7d391695a1107aad96b11b5a68f7abb6768e30dfc0a08d26be0e9646af375",
       "state_fixture": false
     },
     {
@@ -72,13 +72,13 @@
     {
       "scenario": "client-focus-actions",
       "file": "client-focus-actions.png",
-      "sha256": "7c04cfb3eb94af3d201645d9d01b32d2cbd8a2e523cc956dc84fefcad08fbaf7",
+      "sha256": "2a61023e79f21987d79427b53302006b01907e90229a5be4978790f77a74bc40",
       "state_fixture": false
     },
     {
       "scenario": "client-focus-navigation",
       "file": "client-focus-navigation.png",
-      "sha256": "a0e0b0b7a12014099a35f36a31bdda624287962e87a776759b8de363503fc583",
+      "sha256": "fde76d338dacd90f48d625c3e068d67773914b3062dd5d50623bdef75b20c778",
       "state_fixture": false
     },
     {
@@ -96,13 +96,13 @@
     {
       "scenario": "client-page-overview",
       "file": "client-page-overview.png",
-      "sha256": "7c04cfb3eb94af3d201645d9d01b32d2cbd8a2e523cc956dc84fefcad08fbaf7",
+      "sha256": "fb6e8281e73284844a48a5b1943a09e7958552123825ed3094cd278e9fbd4805",
       "state_fixture": false
     },
     {
       "scenario": "client-page-profiles",
       "file": "client-page-profiles.png",
-      "sha256": "ac38644e9f5a08d1d11b4e474f687ba2a4086af7949a1441cb773e0817e98a44",
+      "sha256": "b13c73aa2b359897e7a5e358a598a97f58149c9214a4357c4c5a5d4cd3ab52ff",
       "state_fixture": false
     },
     {
@@ -114,7 +114,7 @@
     {
       "scenario": "client-page-settings",
       "file": "client-page-settings.png",
-      "sha256": "07c2588fe2773f0a6d748893162b36ee7d4afb306b5deef6806cce64994e5cf5",
+      "sha256": "da092bd582cfecef0564cfedddc925539ccadedfbe0cd36487f8a53daa855c12",
       "state_fixture": false
     },
     {
@@ -132,7 +132,7 @@
     {
       "scenario": "client-validation-error",
       "file": "client-validation-error.png",
-      "sha256": "314b399426869c691a8c5ee1104245258783e27732347fdf4a1bbb42c54ab5b4",
+      "sha256": "0a3b57dbe5d274b18f989e392d006af8616084aaf5b39e5d9383cdd3ab96b570",
       "state_fixture": false
     },
     {
@@ -162,7 +162,7 @@
     {
       "scenario": "server-action-delete-connection",
       "file": "server-action-delete-connection.png",
-      "sha256": "ed3528094aeb8eaa8f020ab5fb0d267c57ca510c5de2ffab08eacac4e492280d",
+      "sha256": "40b559a43d2e906a4d54e5097acb5e2e7292bf3e0fe7f04fb03304f0a7f01a84",
       "state_fixture": false
     },
     {
@@ -208,9 +208,9 @@
       "state_fixture": false
     },
     {
-      "scenario": "server-action-reality-status",
-      "file": "server-action-reality-status.png",
-      "sha256": "4f223dfd77f8b9319fdd6cb0cead15c31a6b3239d51bf374b92197849153b841",
+      "scenario": "server-action-reality-status-unavailable",
+      "file": "server-action-reality-status-unavailable.png",
+      "sha256": "f30a84e8f3b597012e3a165dcb30b6fc5fad3440d5e20594d0fea9a5c6ef041f",
       "state_fixture": false
     },
     {
@@ -270,43 +270,43 @@
     {
       "scenario": "server-focus-actions",
       "file": "server-focus-actions.png",
-      "sha256": "273c2aa8c538a0673a2e5aca7e43a9adf1f6f988af8f334fa64f4cf29f3e903c",
+      "sha256": "1b73140388de20471a0ca610b6e7eb6218b1538085df1fe649a0da69a9243758",
       "state_fixture": false
     },
     {
       "scenario": "server-focus-navigation",
       "file": "server-focus-navigation.png",
-      "sha256": "d1829f8a42ec8b60722efd9a7a7bba8098580d049d5b9bc36475f0b35c2b9c35",
+      "sha256": "96a1b3687cf74a7225317de9b24ac2c278c4f1b21045648f40a02fb1911223ff",
       "state_fixture": false
     },
     {
       "scenario": "server-page-connections",
       "file": "server-page-connections.png",
-      "sha256": "88421a8e209576e619c363267f3d2ab2466cab7b1a9d252b6b8e351bf0bd46f5",
+      "sha256": "902492c870ceee2fd6aeabd2a479621a5579b31b11c675a5c792a35e196754a1",
       "state_fixture": false
     },
     {
       "scenario": "server-page-diagnostics",
       "file": "server-page-diagnostics.png",
-      "sha256": "667ff73183f9240f78602a7153167d20472b52ebc66b7d58c32338081ee2500a",
+      "sha256": "f59026aab25355d601dfb2c53f0bd577a58afc72a0a68bfd730ef1553d727f56",
       "state_fixture": false
     },
     {
       "scenario": "server-page-invitations",
       "file": "server-page-invitations.png",
-      "sha256": "f20588b7e0dba2f77ba1c2471c3f3f09e33a2471e2047c97a25412f59611f979",
+      "sha256": "395d92fb31fdfc879d1c22ed752a569cf02fb3cd54453e6a900bbf2f5ef31696",
       "state_fixture": false
     },
     {
       "scenario": "server-page-overview",
       "file": "server-page-overview.png",
-      "sha256": "273c2aa8c538a0673a2e5aca7e43a9adf1f6f988af8f334fa64f4cf29f3e903c",
+      "sha256": "7e994e7344cb47042e8425742e33a8d0c45d2c2720030362dda9c04b8c2f9022",
       "state_fixture": false
     },
     {
       "scenario": "server-page-settings",
       "file": "server-page-settings.png",
-      "sha256": "6f55766dcf139b21fc338d2b328acd6ab82e847f399da3fcf2da9082a400f81e",
+      "sha256": "c30f514287ad897eb6f3fc42b9f243dd79713e5ea90eba2a38d42c93f224309a",
       "state_fixture": false
     },
     {
@@ -318,7 +318,7 @@
     {
       "scenario": "server-page-users",
       "file": "server-page-users.png",
-      "sha256": "0feeb246be07769347807209998b8daa0c091130e83bfc6677e793136006bb84",
+      "sha256": "0b95a79e2aeb0f250b656d13d25d5a9ec2c9538258adf6be78142346fa2ea1bb",
       "state_fixture": false
     },
     {
@@ -348,7 +348,7 @@
     {
       "scenario": "server-validation-error",
       "file": "server-validation-error.png",
-      "sha256": "1724d99079b61b694624546473868a685c0011f8fa96178d6bb9274e751fc09a",
+      "sha256": "b52d86ed3ad3d64589bc0198179a3f7e5d30b960732e95b0ba18c0bfa144100e",
       "state_fixture": false
     },
     {
@@ -366,7 +366,7 @@
     {
       "scenario": "state-disable-done",
       "file": "state-disable-done.png",
-      "sha256": "2c11623098a1bf4a10f37c01d865dccd317cf5ae2a340a32f2668124e595ab1c",
+      "sha256": "152ab2af9c93afe552c25af73bf30d7c6f5b6dc12686b2c052581c2ca9965487",
       "state_fixture": true
     },
     {
@@ -378,7 +378,7 @@
     {
       "scenario": "state-import-done",
       "file": "state-import-done.png",
-      "sha256": "c368e082e363346743d05f8d91ea5ac2bebc17035f4678b122bdeb273d968d9a",
+      "sha256": "495d81feb7561a711706de9373fb627c779524cf4801590ba01cad285b434445",
       "state_fixture": true
     },
     {
@@ -408,7 +408,7 @@
     {
       "scenario": "state-issuance-new-offer",
       "file": "state-issuance-new-offer.png",
-      "sha256": "7b014885ecb288cb67ad6bfb9e952cac507345c7801e1049e8cd35989ecad97e",
+      "sha256": "02fb5788d40075c6089f66ac9fb91bda03faecca8ccb55c552639318c2e647d8",
       "state_fixture": true
     },
     {
@@ -432,13 +432,13 @@
     {
       "scenario": "state-issuance-recover-offer",
       "file": "state-issuance-recover-offer.png",
-      "sha256": "0240c48104ba941ff02dfe19fe9274ebc5b3a4da6a54454d96633721fc36793a",
+      "sha256": "fe3c59cdb675b49e942a0311a2973eeef8764aca902f3b3b6f12316c3d4d70b9",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-rotate-confirm",
       "file": "state-issuance-rotate-confirm.png",
-      "sha256": "7a371f36e608ce1acbd2d4bf143f6da569e7cf4a6090c04ffca9e6622e11322a",
+      "sha256": "ddd764888330475d06145dfa93bce497c893c9481f83166eaf65155dc49f5da2",
       "state_fixture": true
     },
     {
@@ -456,7 +456,7 @@
     {
       "scenario": "state-issuance-rotate-offer",
       "file": "state-issuance-rotate-offer.png",
-      "sha256": "582d09a37cfb332c4a4bd2173492f53415057ab3510e61ab44bc366d42ed4550",
+      "sha256": "34662f88776fd35b6cece8290007a8fe5dc6c581e06aa01f2031e3d562141e66",
       "state_fixture": true
     }
   ]
