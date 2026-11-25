@@ -3756,6 +3756,65 @@ async fn run_document_with_config(
 mod hardening_tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[tokio::test]
+    async fn tui_server_owns_startup_and_releases_listeners_on_confirmed_stop() {
+        use std::fs;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        let directory = std::env::temp_dir().join(crate::tui_editor::generated_id("tui-server").unwrap());
+        fs::create_dir(&directory).unwrap();
+        let _cleanup = Cleanup(directory.clone());
+        let path = directory.join("server.toml");
+        let cert = directory.join("cert.pem");
+        let key = directory.join("key.pem");
+        let material = rcgen::generate_simple_self_signed(vec!["a.example.org".into()]).unwrap();
+        fs::write(&cert, material.cert.pem()).unwrap();
+        #[cfg(not(windows))]
+        fs::write(&key, material.key_pair.serialize_pem()).unwrap();
+        #[cfg(windows)]
+        crate::bounded_input::write_test_private(&key, material.key_pair.serialize_pem());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tcp_addr = tcp.local_addr().unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        let mut document = live_auth_fixture();
+        document.server.inbounds.truncate(1);
+        let inbound = &mut document.server.inbounds[0];
+        inbound.h2_listen = tcp_addr.to_string();
+        inbound.quic_listen = udp_addr.to_string();
+        inbound.tls_cert = format!("file:{}", cert.display());
+        inbound.tls_key = format!("file:{}", key.display());
+        let contents = Config::Server(document).to_toml().unwrap();
+        fs::write(&path, &contents).unwrap();
+        let expected: [u8; 32] = Sha256::digest(contents.as_bytes()).into();
+        let (bad_ready, _) = tokio::sync::oneshot::channel();
+        let (_bad_stop, bad_rx) = tokio::sync::oneshot::channel();
+        assert!(matches!(run_tui_file(&path, [0; 32], bad_ready, bad_rx).await, Err(ServerError::Config)));
+        drop(tcp);
+        drop(udp);
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let (stop, stop_rx) = tokio::sync::oneshot::channel();
+        let run_path = path.clone();
+        let task = tokio::spawn(async move { run_tui_file(&run_path, expected, ready, stop_rx).await });
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx).await.unwrap().unwrap(), 1);
+        assert!(std::net::TcpListener::bind(tcp_addr).is_err());
+        assert!(std::net::UdpSocket::bind(udp_addr).is_err());
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), task).await.unwrap().unwrap().unwrap();
+        assert!(std::net::TcpListener::bind(tcp_addr).is_ok());
+        assert!(std::net::UdpSocket::bind(udp_addr).is_ok());
+        assert_eq!(fs::read(&path).unwrap(), contents.as_bytes());
+    }
+
+
     #[test]
     fn pem_reader_refuses_oversized_and_relative_inputs() {
         use std::fs;
