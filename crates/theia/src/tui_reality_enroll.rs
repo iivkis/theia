@@ -111,11 +111,54 @@ fn apply(input: &Input, review: Review, now: u64) -> Result<String, Error> {
     Ok("Профиль REALITY и доверие сохранены. Runtime НЕ изменён.\nEsc: закрыть.".into())
 }
 
+fn create_first_client(path: &Path, input: &Input, review: Review, now: u64) -> Result<crate::tui_editor::Editor, Error> {
+    use crate::{config, reality_config, Role};
+    let mut owned = crate::tui_staged_material::StagedMaterial::create_for_new_config(
+        input.profile.parent().ok_or(Error::Storage)?, path,
+    )?;
+    match apply(input, review, now) {
+        Ok(_) => {}
+        Err(Error::Indeterminate) => {
+            owned.preserve();
+            return Err(Error::Indeterminate);
+        }
+        Err(error) => {
+            owned.cleanup()?;
+            return Err(error);
+        }
+    }
+    let request = reality_config::ClientRequest {
+        enrollment: input.profile.clone(),
+        identity_sha256: input.identity,
+        id: crate::tui_editor::generated_id("profile").map_err(|_| Error::Storage)?,
+    };
+    let candidate = match reality_config::first_client_candidate(&request, now) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            owned.cleanup()?;
+            return Err(error);
+        }
+    };
+    match config::guarded_create(path, &candidate) {
+        Ok(()) => owned.preserve(),
+        Err(config::WriteFailure::BeforeReplace(_)) => {
+            owned.cleanup()?;
+            return Err(Error::Storage);
+        }
+        Err(config::WriteFailure::AfterReplace(_)) => {
+            owned.preserve();
+            return Err(Error::Indeterminate);
+        }
+    }
+    crate::tui_editor::Editor::load(Role::Client, path).map_err(|_| Error::Indeterminate)
+}
+
 enum Stage {
     Input,
     Loading(Receiver<Result<Review, Error>>),
     Confirm(Review),
     Applying(Receiver<Result<(String, Option<crate::tui_staged_material::StagedMaterial>), Error>>),
+    Creating(Receiver<Result<crate::tui_editor::Editor, Error>>),
     Done(String),
 }
 
@@ -125,6 +168,7 @@ pub(crate) struct EnrollmentPanel {
     stage: Stage,
     error: Option<String>,
     config: Option<(PathBuf, [u8; 32])>,
+    new_config: Option<PathBuf>,
     registration: Option<crate::tui_reality_register::RegistrationPanel>,
     owned: Option<crate::tui_staged_material::StagedMaterial>,
 }
@@ -137,9 +181,30 @@ impl EnrollmentPanel {
             stage: Stage::Input,
             error: None,
             config: None,
+            new_config: None,
             registration: None,
             owned: None,
         }
+    }
+
+    pub(crate) fn first(path: PathBuf) -> Result<Self, &'static str> {
+        let path = std::path::absolute(path).map_err(|_| "Недопустимый путь TOML")?;
+        if !crate::bounded_input::explicit_file_path(&path)
+            || !matches!(std::fs::symlink_metadata(&path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            || !path.parent().is_some_and(Path::is_dir) {
+            return Err("Укажите новый клиентский TOML в существующем каталоге.");
+        }
+        let root = path.parent().ok_or("Недопустимый путь TOML")?
+            .join(crate::tui_editor::generated_id(".theia-enroll")?);
+        let mut panel = Self::new();
+        panel.fields[2] = Zeroizing::new(root.join("profile.toml").to_str().ok_or("Недопустимый путь")?.to_owned());
+        panel.fields[3] = Zeroizing::new(root.join("trust.toml").to_str().ok_or("Недопустимый путь")?.to_owned());
+        panel.new_config = Some(path);
+        Ok(panel)
+    }
+
+    fn managed_paths(&self) -> bool {
+        self.config.is_some() || self.new_config.is_some()
     }
 
     pub(crate) fn bound(editor: &crate::tui_editor::Editor) -> Result<Self, &'static str> {
@@ -217,7 +282,7 @@ impl EnrollmentPanel {
         if !matches!(self.stage, Stage::Input) {
             return;
         }
-        if self.config.is_some() && matches!(self.focus, 2 | 3) {
+        if self.managed_paths() && matches!(self.focus, 2 | 3) {
             return;
         }
         let value = value.trim_end_matches(['\r', '\n']);
@@ -234,7 +299,7 @@ impl EnrollmentPanel {
             return panel.key(key);
         }
         match &self.stage {
-            Stage::Loading(_) | Stage::Applying(_) => return false,
+            Stage::Loading(_) | Stage::Applying(_) | Stage::Creating(_) => return false,
             Stage::Done(_) => {
                 if key.code == KeyCode::Char('g') && (self.config.is_none() || self.owned.is_some())
                 {
@@ -279,6 +344,17 @@ impl EnrollmentPanel {
                         else {
                             return false;
                         };
+                        if let Some(path) = self.new_config.clone() {
+                            let (tx, rx) = mpsc::channel();
+                            self.stage = Stage::Creating(rx);
+                            let _worker = std::thread::spawn(move || {
+                                let result = reference_health::unix_now()
+                                    .map_err(|_| Error::Clock)
+                                    .and_then(|now| create_first_client(&path, &input, review, now));
+                                let _ = tx.send(result);
+                            });
+                            return false;
+                        }
                         let (tx, rx) = mpsc::channel();
                         self.stage = Stage::Applying(rx);
                         let config = self.config.clone();
@@ -322,15 +398,15 @@ impl EnrollmentPanel {
         }
         match key.code {
             KeyCode::Esc => return true,
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::Down => {
                 self.focus = (self.focus + 1) % LABELS.len();
-                if self.config.is_some() && self.focus == 2 {
+                if self.managed_paths() && self.focus == 2 {
                     self.focus = 4;
                 }
             }
-            KeyCode::BackTab => {
+            KeyCode::BackTab | KeyCode::Up => {
                 self.focus = (self.focus + LABELS.len() - 1) % LABELS.len();
-                if self.config.is_some() && self.focus == 3 {
+                if self.managed_paths() && self.focus == 3 {
                     self.focus = 1;
                 }
             }
@@ -376,6 +452,12 @@ impl EnrollmentPanel {
                 Err(TryRecvError::Empty) => return None,
                 Err(TryRecvError::Disconnected) => Err(Error::Storage),
             },
+            Stage::Creating(rx) => match rx.try_recv() {
+                Ok(Ok(editor)) => return Some(editor),
+                Ok(Err(error)) => Err(error),
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => Err(Error::Indeterminate),
+            },
             Stage::Applying(rx) => match rx.try_recv() {
                 Ok(result) => result.map(|(message, owned)| {
                     self.owned = owned;
@@ -402,15 +484,59 @@ impl EnrollmentPanel {
         None
     }
 
+    pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        if self.registration.is_some() || !matches!(self.stage, Stage::Input) {
+            return None;
+        }
+        let hints = [
+            "Вставьте theia:// приглашение или абсолютный путь к защищённому URI-файлу.",
+            "Отдельно полученный admission-файл от администратора сервера.",
+            "Абсолютный путь нового файла профиля.",
+            "Абсолютный путь нового хранилища доверия.",
+            "Сверьте 64 hex-символа по независимому доверенному каналу.",
+            "Только env:/file: ссылка, если в приглашении нет токена.",
+        ];
+        Some(Form {
+            fields: LABELS.iter().enumerate().filter(|(id, _)| !self.managed_paths() || !matches!(*id, 2 | 3)).map(|(id, label)| Field {
+                id, label, hint: hints[id],
+                value: if self.fields[id].is_empty() { String::new() } else { format!("Скрыто · {} байт", self.fields[id].len()) },
+            }).collect(),
+            selected: self.focus,
+            lead: "Подтвердите источник доверия. Секретные значения скрыты.".into(),
+            error: self.error.clone().unwrap_or_default(),
+        })
+    }
+
+    pub(crate) fn select_field(&mut self, id: usize) {
+        if self.registration.is_none() && matches!(self.stage, Stage::Input)
+            && id < LABELS.len() && (!self.managed_paths() || !matches!(id, 2 | 3)) {
+            self.focus = id;
+        }
+    }
+
+    pub(crate) fn guide(&self) -> (usize, usize, &'static str, &'static str) {
+        if self.registration.is_some() {
+            return (3, 3, "Регистрация в TOML", "Enter предпросмотр · Y сохранить · Esc назад");
+        }
+        match &self.stage {
+            Stage::Input => (1, 3, "Приглашение и доверие", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад"),
+            Stage::Loading(_) => (2, 3, "Проверка приглашения", "Идёт локальная проверка"),
+            Stage::Confirm(_) => (2, 3, "Подтверждение доверия", "Y сохранить · N / Esc назад"),
+            Stage::Applying(_) | Stage::Creating(_) => (3, 3, "Сохранение", "Идёт запись; подключения нет"),
+            Stage::Done(_) => (3, 3, "Результат", "G зарегистрировать, если доступно · Esc назад"),
+        }
+    }
+
     pub(crate) fn body(&self) -> String {
         if let Some(panel) = &self.registration {
             return panel.body();
         }
         match &self.stage {
             Stage::Input => {
-                let mut out = String::from("Локальные абсолютные пути; значения скрыты.\n");
+                let mut out = String::from("ШАГ 1 · Приглашение и доверие\n\nЛокальные абсолютные пути; значения скрыты.\n");
                 for (i, label) in LABELS.iter().enumerate() {
-                    if self.config.is_some() && matches!(i, 2 | 3) {
+                    if self.managed_paths() && matches!(i, 2 | 3) {
                         continue;
                     }
                     out.push_str(&format!(
@@ -431,8 +557,14 @@ impl EnrollmentPanel {
             Stage::Loading(_) => {
                 "Проверка локального приглашения и admission; без сети и записи.".into()
             }
-            Stage::Confirm(review) => review.body.clone(),
-            Stage::Applying(_) => "Сохранение защищённого профиля; runtime не меняется.".into(),
+            Stage::Confirm(review) => {
+                if let Some(path) = &self.new_config {
+                    format!("{}\n\nПервый TOML: {}\nНовый профиль станет активным в TOML. Системный прокси выключен.\ny: создать TOML и enrollment; n/Esc: назад.", review.body, path.display())
+                } else {
+                    review.body.clone()
+                }
+            },
+            Stage::Applying(_) | Stage::Creating(_) => "Сохранение защищённого профиля; runtime не меняется.".into(),
             Stage::Done(body) => {
                 if self.config.is_some() && self.owned.is_some() {
                     format!("{body}\nСледующий шаг: g — зарегистрировать созданный enrollment в сохранённом TOML (отдельный preview/confirm).\n{}",self.error.as_deref().unwrap_or(""))
@@ -532,6 +664,27 @@ mod tests {
         let profile = bootstrap::Profile::read(&input.profile).unwrap();
         assert!(profile.admission().is_ok());
         assert!(profile.load(1000).is_ok());
+
+        // Fresh configuration uses the same independent verification and
+        // does not require an existing or placeholder Own-TLS profile.
+        let cfg = dir.join("client.toml");
+        let root = dir.join("first-material");
+        input.profile = root.join("profile.toml");
+        input.trust = root.join("trust.toml");
+        let review = inspect(&input, 1000).unwrap();
+        assert!(!cfg.exists() && !root.exists());
+        let editor = create_first_client(&cfg, &input, review, 1000).unwrap();
+        assert!(editor.selected_reality());
+        let bytes = std::fs::read(&cfg).unwrap();
+        let crate::config::Config::Client(doc) = crate::config::parse(std::str::from_utf8(&bytes).unwrap()).unwrap() else {
+            panic!("client expected");
+        };
+        assert_eq!(doc.client.profiles.len(), 1);
+        assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
+        assert_eq!(doc.client.proxy.system_proxy, crate::config::SystemProxy::Off);
+        assert!(!String::from_utf8_lossy(&bytes).contains(uri.as_str()));
+        assert!(crate::tui_staged_material::StagedMaterial::create_for_new_config(&dir.join("second-material"), &cfg).is_err());
+        assert_eq!(std::fs::read(&cfg).unwrap(), bytes);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -70,7 +70,8 @@ const SERVER: &[Group] = &[
     Group {
         title: "Входящие подключения",
         entries: &[
-            entry("Создать inbound: Own-TLS или REALITY", key('N')),
+            entry("Создать подключение Own-TLS / REALITY", key('N')),
+            always("Мастер REALITY (новое подключение)", key('W')),
             entry(
                 "Изменить выбранное поле inbound",
                 Action::Shortcut(KeyCode::Enter, KeyModifiers::NONE),
@@ -97,7 +98,7 @@ const SERVER: &[Group] = &[
         title: "REALITY: обслуживание",
         entries: &[
             entry("Состояние, ротация и восстановление", key('V')),
-            always("Подготовить отдельный комплект", key('W')),
+            always("Комплект по готовому плану (расширенные)", key('w')),
             entry("Зарегистрировать существующий комплект", key('M')),
             entry("Независимая замена доверия", key('K')),
             always("Диагностика сети (без автоматических запросов)", key('p')),
@@ -125,6 +126,7 @@ const CLIENT: &[Group] = &[
         title: "Профили и приглашения",
         entries: &[
             entry("Импорт ссылки, URI-файла или изображения QR", key('i')),
+            always("Импорт первого REALITY-профиля", key('I')),
             entry("Создать профиль", key('N')),
             entry("Выбрать активный профиль", key('A')),
             entry(
@@ -262,6 +264,17 @@ impl Menu {
 
     pub(crate) fn click(&mut self, area: Rect, x: u16, y: u16) {
         if area.width < 76 || area.height < 8 {
+            let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+            let rect = parts[0];
+            if x > rect.x && x < rect.right().saturating_sub(1)
+                && y > rect.y && y < rect.bottom().saturating_sub(1) {
+                let height = usize::from(rect.height.saturating_sub(2));
+                let index = Self::visible_start(self.selected(), self.count(), height) + usize::from(y - rect.y - 1);
+                if index < self.count() {
+                    if self.item.is_some() { self.item = Some(index); } else { self.group = index; }
+                    self.notice = None;
+                }
+            }
             return;
         }
         let content = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
@@ -294,17 +307,23 @@ impl Menu {
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(Clear, area);
         if area.width < 76 || area.height < 8 {
-            frame.render_widget(
-                Paragraph::new(self.body(usize::from(area.height)))
-                    .block(
-                        Block::default()
-                            .title(self.title())
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Cyan)),
-                    )
-                    .wrap(Wrap { trim: false }),
-                area,
-            );
+            let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+            let count = self.count();
+            let selected = self.selected();
+            let height = usize::from(parts[0].height.saturating_sub(2));
+            let start = Self::visible_start(selected, count, height);
+            let items = (start..(start + height).min(count)).map(|i| {
+                let (label, enabled) = if self.item.is_some() {
+                    let entry = self.groups()[self.group].entries[i];
+                    (entry.label, self.configured || !entry.requires_config)
+                } else { (self.groups()[i].title, true) };
+                let style = if i == selected { Style::default().fg(Color::Black).bg(Color::Cyan) }
+                    else if !enabled { Style::default().fg(Color::DarkGray) } else { Style::default() };
+                ListItem::new(format!("{} {label}{}", if i == selected { "›" } else { " " }, if enabled { "" } else { " [TOML]" })).style(style)
+            }).collect::<Vec<_>>();
+            let title = if self.item.is_some() { self.groups()[self.group].title } else { self.title() };
+            frame.render_widget(List::new(items).block(Block::default().title(format!("{title} · {}/{}", selected + 1, count)).borders(Borders::ALL)), parts[0]);
+            frame.render_widget(Paragraph::new(self.notice.unwrap_or("↑↓ выбрать · Enter открыть · Esc назад")), parts[1]);
             return;
         }
         let content = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
@@ -400,7 +419,8 @@ impl Menu {
         }
     }
 
-    pub(crate) fn body(&self, rows: usize) -> String {
+    #[cfg(test)]
+    fn body(&self, rows: usize) -> String {
         let groups = self.groups();
         let count = self.count();
         let selected = self.selected();
@@ -442,9 +462,12 @@ impl Menu {
 pub(crate) struct ConfigDialog {
     pub(crate) role: Role,
     input: String,
+    choice: usize,
     error: Option<&'static str>,
     loading: Option<std::sync::mpsc::Receiver<Result<crate::tui_editor::Editor, &'static str>>>,
     setup: Option<FirstSetup>,
+    reality: Option<crate::tui_reality_provision::ProvisionPanel>,
+    enrollment: Option<crate::tui_reality_enroll::EnrollmentPanel>,
     creating: bool,
 }
 impl ConfigDialog {
@@ -464,13 +487,30 @@ impl ConfigDialog {
         Self {
             role,
             input,
+            choice: 0,
             error: None,
             loading: None,
             setup: None,
+            reality: None,
+            enrollment: None,
             creating: false,
         }
     }
+    pub(crate) fn prefer_reality(&mut self) {
+        self.prefer_mode(1);
+    }
+    pub(crate) fn prefer_mode(&mut self, choice: usize) {
+        self.choice = choice.min(2);
+    }
     pub(crate) fn paste(&mut self, text: &str) {
+        if let Some(panel) = self.enrollment.as_mut() {
+            panel.paste(text);
+            return;
+        }
+        if let Some(panel) = self.reality.as_mut() {
+            panel.paste(text);
+            return;
+        }
         if let Some(setup) = &mut self.setup {
             setup.paste(text);
             return;
@@ -484,6 +524,18 @@ impl ConfigDialog {
     }
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.loading.is_some() {
+            return false;
+        }
+        if let Some(panel) = self.enrollment.as_mut() {
+            if panel.key(key) {
+                self.enrollment = None;
+            }
+            return false;
+        }
+        if let Some(panel) = self.reality.as_mut() {
+            if panel.key(key) {
+                self.reality = None;
+            }
             return false;
         }
         if let Some(setup) = &mut self.setup {
@@ -515,7 +567,20 @@ impl ConfigDialog {
                 }
             }
         }
-        match key.code {
+        let code = match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                self.choice = (self.choice + 2) % 3;
+                return false;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.choice = (self.choice + 1) % 3;
+                return false;
+            }
+            KeyCode::Enter if self.choice == 1 => KeyCode::F(4),
+            KeyCode::Enter if self.choice == 2 => KeyCode::F(2),
+            code => code,
+        };
+        match code {
             KeyCode::Esc => return true,
             KeyCode::F(2) => {
                 if self.input.is_empty() {
@@ -523,6 +588,26 @@ impl ConfigDialog {
                 } else {
                     self.setup = Some(FirstSetup::new(self.role));
                     self.error = None;
+                }
+            }
+            KeyCode::F(4) => {
+                if self.input.is_empty() {
+                    self.error = Some("Укажите путь нового TOML.");
+                } else if self.role == Role::Client {
+                    match crate::tui_reality_enroll::EnrollmentPanel::first(std::path::PathBuf::from(&self.input)) {
+                        Ok(panel) => { self.enrollment = Some(panel); self.error = None; }
+                        Err(error) => self.error = Some(error),
+                    }
+                } else {
+                    match crate::tui_reality_provision::ProvisionPanel::first(
+                        std::path::PathBuf::from(&self.input),
+                    ) {
+                        Ok(panel) => {
+                            self.reality = Some(panel);
+                            self.error = None;
+                        }
+                        Err(error) => self.error = Some(error),
+                    }
                 }
             }
             KeyCode::Enter => {
@@ -564,6 +649,12 @@ impl ConfigDialog {
         false
     }
     pub(crate) fn poll(&mut self) -> Option<crate::tui_editor::Editor> {
+        if let Some(panel) = self.enrollment.as_mut() {
+            return panel.poll();
+        }
+        if let Some(panel) = self.reality.as_mut() {
+            return panel.poll();
+        }
         use std::sync::mpsc::TryRecvError;
         let result = match self.loading.as_ref()?.try_recv() {
             Ok(result) => result,
@@ -582,6 +673,80 @@ impl ConfigDialog {
             }
         }
     }
+    pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        if self.loading.is_some() { return None; }
+        if let Some(panel) = &self.reality { return panel.form(); }
+        if let Some(panel) = &self.enrollment { return panel.form(); }
+        if let Some(setup) = &self.setup {
+            if setup.review.is_some() { return None; }
+            let hints = match setup.role {
+                Role::Server => ["Уникальный ID.", "Один адрес для TCP и UDP.", "DNS-имя сертификата.", "Абсолютная file: ссылка на PEM.", "Абсолютная file: ссылка; не вставляйте ключ.", "Пользователь будет отключён до восстановления доступа."],
+                Role::Client => ["Имя профиля.", "Публичный адрес и порт.", "DNS-имя сервера.", "Абсолютная file: ссылка на доверенный CA.", "Ссылка на токен, не сам токен.", "Путь /v1/... из конфигурации сервера."],
+            };
+            return Some(Form {
+                fields: setup.labels().iter().enumerate().map(|(id, label)| Field {
+                    id, label, hint: hints[id],
+                    value: if matches!(id, 3 | 4) && !setup.fields[id].is_empty() {
+                        "Скрыто · ссылка введена".into()
+                    } else { setup.fields[id].to_string() },
+                }).collect(),
+                selected: setup.focus,
+                lead: format!("Новый файл: {}", self.input),
+                error: setup.error.unwrap_or_default().to_owned(),
+            });
+        }
+        let reality = if self.role == Role::Server { "SmartTheia REALITY" } else { "Импорт REALITY" };
+        let fields = vec![
+            Field { id: 0, label: "Открыть TOML", value: "Enter · существующий файл".into(), hint: "Введите путь к существующему файлу." },
+            Field { id: 1, label: reality, value: "F4 · создать через мастер".into(), hint: "Новый TOML, без собственного сертификата." },
+            Field { id: 2, label: "Own-TLS", value: "F2 · создать вручную".into(), hint: "Новый TOML с собственным TLS." },
+        ];
+        Some(Form {
+            fields,
+            selected: self.choice,
+            lead: format!("Путь к TOML: {}\nВведите путь прямо здесь · Ctrl+U очистить", self.input),
+            error: self.error.unwrap_or_default().to_owned(),
+        })
+    }
+
+    pub(crate) fn select_field(&mut self, id: usize) {
+        if self.loading.is_some() { return; }
+        if let Some(panel) = self.reality.as_mut() { panel.select_field(id); }
+        else if let Some(panel) = self.enrollment.as_mut() { panel.select_field(id); }
+        else if let Some(setup) = self.setup.as_mut() {
+            if setup.review.is_none() && id < setup.fields.len() { setup.focus = id; }
+        } else if id < 3 {
+            self.choice = id;
+        }
+    }
+
+    pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
+        if let Some(panel) = &self.reality {
+            return panel.guide();
+        }
+        if let Some(panel) = &self.enrollment {
+            return Some(panel.guide());
+        }
+        self.setup.as_ref().map(|setup| {
+            if setup.review.is_some() {
+                (2, 2, "Подтверждение", "Y создать · N / Esc назад")
+            } else {
+                (1, 2, "Параметры Own-TLS", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад")
+            }
+        })
+    }
+    pub(crate) fn title(&self) -> &'static str {
+        if self.enrollment.is_some() {
+            "Импорт REALITY"
+        } else if self.reality.is_some() {
+            "Мастер REALITY"
+        } else if self.setup.is_some() {
+            "Мастер Own-TLS"
+        } else {
+            "Открыть конфигурацию"
+        }
+    }
     pub(crate) fn body(&self) -> String {
         if self.loading.is_some() {
             return if self.creating {
@@ -591,6 +756,12 @@ impl ConfigDialog {
                 "Проверяется существующий TOML; ничего не записывается.".into()
             };
         }
+        if let Some(panel) = &self.enrollment {
+            return panel.body();
+        }
+        if let Some(panel) = &self.reality {
+            return panel.body();
+        }
         if let Some(setup) = &self.setup {
             return setup.body(&self.input);
         }
@@ -599,7 +770,26 @@ impl ConfigDialog {
         } else {
             "Клиент"
         };
-        format!("{role} • открытие или создание конфигурации\n\nПуть: {}\n\n{}\nCtrl+U очистить • Backspace удалить • Enter открыть • F2 создать Own-TLS • Esc отменить\nЗагрузка не запускает runtime, не делает сетевых запросов и не изменяет файл.", self.input, self.error.unwrap_or(""))
+        let reality = if self.role == Role::Server {
+            "SmartTheia REALITY  ·  мастер подбора, без своего сертификата"
+        } else {
+            "Импорт REALITY  ·  создать TOML из приглашения"
+        };
+        let choices = [
+            ("Enter", "Открыть существующий TOML"),
+            ("F4", reality),
+            ("F2", "Own-TLS  ·  собственный сертификат / ручная настройка"),
+        ];
+        let mut body = format!("{role} • открытие или создание конфигурации\n\nПУТЬ К TOML\n  {}\n\nВЫБЕРИТЕ ДЕЙСТВИЕ\n", self.input);
+        for (i, (shortcut, label)) in choices.iter().enumerate() {
+            body.push_str(&format!("{} {shortcut:5} {label}\n", if i == self.choice { ">" } else { " " }));
+        }
+        body.push_str("\n↑↓ / Tab выбрать · Enter продолжить\nПуть можно вводить сразу. Ctrl+U очистить · Esc назад");
+        if let Some(error) = self.error {
+            body.push_str(&format!("\nОшибка: {error}"));
+        }
+        body
+
     }
 }
 
@@ -836,7 +1026,8 @@ impl FirstSetup {
 fn default_config(filename: &str) -> std::path::PathBuf {
     #[cfg(target_os = "linux")]
     if filename == "server.toml" {
-        return std::path::PathBuf::from("/etc/theia/server.toml");
+        let system = std::path::Path::new("/etc/theia");
+        return if system.is_dir() { system.join(filename) } else { std::path::PathBuf::from(filename) };
     }
     #[cfg(windows)]
     let root = std::env::var_os("APPDATA").map(|p| std::path::PathBuf::from(p).join("Theia"));
@@ -846,7 +1037,7 @@ fn default_config(filename: &str) -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
         .map(|p| p.join("theia"));
-    root.map(|p| p.join(filename))
+    root.filter(|p| p.is_dir()).map(|p| p.join(filename))
         .unwrap_or_else(|| std::path::PathBuf::from(filename))
 }
 
@@ -1052,8 +1243,8 @@ mod tests {
         menu.click(area, 2, 2);
         assert_eq!(menu.group, 1);
         assert_eq!(menu.item, Some(0));
-        menu.click(area, 32, 5);
-        assert_eq!(menu.item, Some(4));
+        menu.click(area, 32, 6);
+        assert_eq!(menu.item, Some(5));
         assert_eq!(menu.key(KeyCode::Enter), Some(key('Q')));
     }
 

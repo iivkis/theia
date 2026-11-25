@@ -1190,6 +1190,17 @@ impl Editor {
         self.error = None;
     }
 
+    pub(crate) fn workspace_select_field(&mut self, index: usize) {
+        if !self.editing && self.issued.is_none() && index < self.field_count() {
+            self.selected_field = index;
+            self.error = None;
+        }
+    }
+
+    pub(crate) fn workspace_field_index(&self) -> usize {
+        self.selected_field
+    }
+
     pub fn select_field(&mut self, forward: bool) {
         if self.editing || self.issued.is_some() {
             return;
@@ -1248,7 +1259,7 @@ impl Editor {
 
     /// Render only the explicitly whitelisted non-secret fields.
     /// Never include token refs, TLS key refs, grants, or config file paths.
-    pub fn fields_overview(&self) -> String {
+    pub(crate) fn workspace_fields(&self) -> Vec<(&'static str, String, bool)> {
         let labels: &[&str] = match self.role {
             Role::Server => &["TLS DNS", "H2 TCP", "H3 UDP"],
             Role::Client => &["Endpoint", "TLS SNI", "Transport", "XHTTP"],
@@ -1284,19 +1295,18 @@ impl Editor {
                 })
                 .unwrap_or_default(),
         };
+        labels.iter().copied().zip(values).enumerate().map(|(index, (label, value))| {
+            let selected = self.selected_field == index;
+            let value = if self.editing && selected { self.input.clone() } else { value };
+            (label, value, selected)
+        }).collect()
+    }
+
+    pub fn fields_overview(&self) -> String {
         let mut output = String::new();
-        for (index, (label, value)) in labels.iter().zip(values).enumerate() {
-            let marker = if self.selected_field == index {
-                '>'
-            } else {
-                ' '
-            };
-            let value = if self.editing && self.selected_field == index {
-                self.input.as_str()
-            } else {
-                value.as_str()
-            };
-            output.push_str(&format!("{marker} {}: {value}\n", label));
+        for (label, value, selected) in self.workspace_fields() {
+            let marker = if selected { '>' } else { ' ' };
+            output.push_str(&format!("{marker} {label}: {value}\n"));
         }
         output
     }
@@ -1356,6 +1366,31 @@ impl Editor {
         }
         self.input = self.field_value();
         self.editing = true;
+        self.error = None;
+    }
+
+    pub(crate) fn choice_options(&self) -> &'static [&'static str] {
+        if self.role != Role::Client || self.selected_reality() {
+            return &[];
+        }
+        match self.selected_field {
+            2 => &["auto", "h2", "h3"],
+            3 => &["auto", "stream-one", "stream-up"],
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn cycle_choice(&mut self, forward: bool) {
+        let options = self.choice_options();
+        if !self.editing || options.is_empty() { return; }
+        let index = options.iter().position(|value| *value == self.input.as_str());
+        let next = match index {
+            Some(i) if forward => (i + 1) % options.len(),
+            Some(i) => (i + options.len() - 1) % options.len(),
+            None if forward => 0,
+            None => options.len() - 1,
+        };
+        self.input = options[next].to_owned();
         self.error = None;
     }
 
