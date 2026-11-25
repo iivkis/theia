@@ -408,7 +408,7 @@ fn wildcard(ip: IpAddr) -> SocketAddr {
 /// seen from a second address does not redirect or validate the old path.
 /// Responses return only to the physical peer owning this socket.
 async fn reference_path(
-    generation: Arc<Lease>,
+    source: (Arc<Live>, Arc<Lease>),
     signer: [u8; 32],
     id: SessionId,
     peer: SocketAddr,
@@ -416,6 +416,7 @@ async fn reference_path(
     incoming: mpsc::Receiver<Vec<u8>>,
     replies: mpsc::Sender<Reply>,
 ) {
+    let (live, generation) = source;
     let publication = generation.publication();
     let Ok(now) = crate::reference_health::unix_now() else {
         return;
@@ -429,9 +430,7 @@ async fn reference_path(
     let value = material.verified();
     let Ok(Ok(lease)) = timeout(
         DNS_DEADLINE,
-        generation
-            .health()
-            .relay_lease(value, publication.plan_sha256()),
+        live.reference_lease(&generation, value),
     )
     .await
     else {
@@ -896,9 +895,10 @@ impl PreparedQuic {
         };
         let deadline = session.deadline;
         let replies = replies.clone();
+        let live = self.live.clone();
         workers.spawn(async move {
             let _slot = slot;
-            reference_path(generation, signer, id, peer, deadline, rx, replies).await;
+            reference_path((live, generation), signer, id, peer, deadline, rx, replies).await;
         });
         true
     }

@@ -4183,6 +4183,113 @@ mod hardening_tests {
         assert!(check_certificate_name(cert.cert.der(), "other.example").is_err());
     }
 
+
+    /// Required native CI fixture: Python/OpenSSL+h2 and aioquic are
+    /// independent implementations on both ends of the passive relay.
+    /// No marker or bearer is supplied by the independent client.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "required independent reference CI installs pinned h2/aioquic"]
+    async fn independent_external_reference_through_registered_reality_dispatchers() {
+        use crate::reference_health::{Evidence, Plan, State, Store, Target};
+        use crate::reality_config::{self, Request, ServerRequest};
+        use std::{fs, path::PathBuf, process::{Child, Command}, sync::atomic::{AtomicU64, Ordering}};
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        struct Process(Child);
+        impl Drop for Process {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let directory = Scratch(std::env::temp_dir().join(format!(
+            "theia-independent-reference-{}-{}", std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        fs::create_dir(&directory.0).unwrap();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let address = (0..16).find_map(|_| {
+                let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+                let address = tcp.local_addr().ok()?;
+                let _udp = std::net::UdpSocket::bind(address).ok()?;
+                Some(address)
+            }).expect("fixture TCP/UDP address");
+            let now = crate::reference_health::unix_now().unwrap();
+            let approved: SocketAddr = "93.184.216.2:443".parse().unwrap();
+            let state = State::new(Plan {
+                schema_version: 1,
+                inbound: "independent-reference".into(),
+                endpoint: address.to_string(),
+                own_ips: vec![address.ip()],
+                references: vec![Target {
+                    server_name: "reference.example.org".into(), address: approved,
+                }],
+            }, vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+            let health = directory.0.join("health.toml");
+            Store::new(&health).unwrap().enroll(&state).unwrap();
+            let bundle = directory.0.join("bundle");
+            let digest = state.snapshot_sha256().unwrap();
+            let record = crate::reality_provision::create(&state, digest, &bundle, now).unwrap();
+            let config_path = directory.0.join("server.toml");
+            fs::write(&config_path, include_str!("../../../examples/server.toml")
+                .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))).unwrap();
+            let request = Request::Server(ServerRequest {
+                health, bundle, health_sha256: digest,
+                identity_sha256: record.identity_sha256, listen: address,
+                grants: vec!["device-a".into()],
+            });
+            let preview = reality_config::prepare(&config_path, &request, now).unwrap();
+            reality_config::apply(&config_path, &request, preview.approval_sha256(), now).unwrap();
+            let Config::Server(mut document) = config::read_file(&config_path).unwrap() else { panic!() };
+            document.server.inbounds.retain(|i| i.id == "independent-reference");
+            let limits = GenerationLimits::new(&document);
+            let auth = Arc::new(LiveAuthorization::new(document.clone()).unwrap());
+            let prepared = prepare_selected_listeners_inner(&document, &limits, None, auth, None, None)
+                .await.unwrap();
+            let cert = rcgen::generate_simple_self_signed(vec!["reference.example.org".into()]).unwrap();
+            fs::write(directory.0.join("cert.pem"), cert.cert.pem()).unwrap();
+            fs::write(directory.0.join("key.pem"), cert.key_pair.serialize_pem()).unwrap();
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/f18_independent_reference.py");
+            let mut child = Process(Command::new("python")
+                .arg(script).arg(&directory.0).arg(address.to_string()).spawn().unwrap());
+            let ready = directory.0.join("reference-port");
+            let fixture = loop {
+                if let Ok(raw) = fs::read_to_string(&ready) {
+                    let port = raw.trim().parse::<u16>().unwrap();
+                    break SocketAddr::from(([127, 0, 0, 1], port));
+                }
+                assert!(child.0.try_wait().unwrap().is_none(), "independent reference exited before readiness");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            let (_, carrier) = prepared.reality.get("independent-reference").unwrap();
+            carrier.set_fixture_reference(approved, fixture);
+            let mut running = RunningGeneration::launch(prepared.listeners, GenerationPhase::Active);
+            fs::write(directory.0.join("relay-ready"), b"ready").unwrap();
+            loop {
+                if let Some(exit) = child.0.try_wait().unwrap() {
+                    assert!(exit.success(), "independent direct/relay comparison failed");
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+                    result = running.tasks.join_next() => panic!("reference dispatcher exited: {result:?}"),
+                }
+            }
+            let removed = document.server.inbounds.iter().map(|i| i.id.clone()).collect();
+            running.remove_inbounds(&removed);
+            while let Some(result) = running.tasks.join_next().await {
+                let (id, result) = result.unwrap();
+                result.unwrap();
+                assert!(running.finish_draining(&id));
+            }
+            assert!(!running.has_draining());
+        }).await.expect("bounded independent reference fixture");
+    }
+
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[tokio::test]
     async fn supervisor_prepares_both_transports_rotates_rolls_back_and_cuts_over_shared_limits() {
