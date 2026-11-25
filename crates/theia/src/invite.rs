@@ -12,9 +12,9 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) const PREFIX: &str = "theia://v1/";
-const MAX_DATA: usize = 24 * 1024;
-// One envelope must accommodate the full signed REALITY descriptor.
-pub const MAX_URI: usize = 32 * 1024;
+/// The full ASCII access key, including its scheme/version prefix.
+pub const MAX_URI: usize = 2048;
+const MAX_DATA: usize = (MAX_URI - PREFIX.len()) * 3 / 4;
 
 /// This type may contain a live 32-byte bearer secret. No derived Debug.
 pub struct Invitation {
@@ -128,14 +128,184 @@ fn check_wire(wire: &Wire) -> Result<(), InviteError> {
     Ok(())
 }
 
+// The compact v1 format has one canonical representation. It uses fixed
+// width big-endian integers, length-prefixed UTF-8 strings and raw keys.
+// REALITY scope, route and reference data are encoded once in the signed
+// descriptor. Reconstructing its original envelope preserves signature,
+// revision and equivocation checks; no alternate signature format exists.
+fn put_text(out: &mut Vec<u8>, value: &str) -> Result<(), InviteError> {
+    let len = u16::try_from(value.len()).map_err(|_| InviteError::Invalid)?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+struct Reader<'a>(&'a [u8]);
+impl Reader<'_> {
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], InviteError> {
+        let (value, rest) = self.0.split_at_checked(N).ok_or(InviteError::Invalid)?;
+        self.0 = rest;
+        value.try_into().map_err(|_| InviteError::Invalid)
+    }
+
+    fn byte(&mut self) -> Result<u8, InviteError> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, InviteError> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn u32(&mut self) -> Result<u32, InviteError> {
+        Ok(u32::from_be_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, InviteError> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    fn text(&mut self) -> Result<String, InviteError> {
+        let len = usize::from(self.u16()?);
+        let (value, rest) = self.0.split_at_checked(len).ok_or(InviteError::Invalid)?;
+        self.0 = rest;
+        String::from_utf8(value.to_vec()).map_err(|_| InviteError::Invalid)
+    }
+
+    fn flag(&mut self) -> Result<bool, InviteError> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(InviteError::Invalid),
+        }
+    }
+}
+
+fn raw_key<const N: usize>(value: &str) -> Result<Zeroizing<[u8; N]>, InviteError> {
+    let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(value).map_err(|_| InviteError::Invalid)?);
+    let result: [u8; N] = bytes.as_slice().try_into().map_err(|_| InviteError::Invalid)?;
+    if Zeroizing::new(URL_SAFE_NO_PAD.encode(result)).as_str() != value {
+        return Err(InviteError::Invalid);
+    }
+    Ok(Zeroizing::new(result))
+}
+
+fn put_descriptor(
+    out: &mut Vec<u8>,
+    d: &crate::descriptor::Descriptor,
+    signature: [u8; 64],
+) -> Result<(), InviteError> {
+    put_text(out, &d.scope.inbound)?;
+    put_text(out, &d.scope.endpoint)?;
+    put_text(out, &d.path_prefix)?;
+    out.extend_from_slice(&d.revision.to_be_bytes());
+    out.extend_from_slice(&d.not_before.to_be_bytes());
+    out.extend_from_slice(&d.not_after.to_be_bytes());
+    out.push(d.active_reference);
+    out.push(u8::from(d.h3) | (u8::from(d.stream_one) << 1) | (u8::from(d.stream_up) << 2)
+        | (u8::from(d.next_identity.is_some()) << 3));
+    if let Some(next) = &d.next_identity {
+        out.extend_from_slice(&raw_key::<32>(next)?[..]);
+    }
+    out.extend_from_slice(&d.padding.header_min.to_be_bytes());
+    out.extend_from_slice(&d.padding.header_max.to_be_bytes());
+    out.extend_from_slice(&d.padding.frame_min.to_be_bytes());
+    out.extend_from_slice(&d.padding.frame_max.to_be_bytes());
+    out.extend_from_slice(&d.rotation.lifetime_min_s.to_be_bytes());
+    out.extend_from_slice(&d.rotation.lifetime_max_s.to_be_bytes());
+    out.extend_from_slice(&d.rotation.volume_min_bytes.to_be_bytes());
+    out.extend_from_slice(&d.rotation.volume_max_bytes.to_be_bytes());
+    out.push(u8::try_from(d.references.len()).map_err(|_| InviteError::Invalid)?);
+    for reference in &d.references {
+        put_text(out, &reference.server_name)?;
+        out.extend_from_slice(&reference.port.to_be_bytes());
+        out.push(u8::from(reference.h3));
+    }
+    out.extend_from_slice(&signature);
+    Ok(())
+}
+
+fn get_descriptor(r: &mut Reader<'_>) -> Result<(crate::descriptor::Descriptor, String), InviteError> {
+    use crate::descriptor::{Descriptor, Padding, Reference, Rotation, Scope, SecurityMode};
+    let scope = Scope { inbound: r.text()?, endpoint: r.text()? };
+    let path_prefix = r.text()?;
+    let revision = r.u64()?;
+    let not_before = r.u64()?;
+    let not_after = r.u64()?;
+    let active_reference = r.byte()?;
+    let flags = r.byte()?;
+    if flags & !0x0f != 0 {
+        return Err(InviteError::Invalid);
+    }
+    let next_identity = if flags & 8 != 0 {
+        Some(URL_SAFE_NO_PAD.encode(r.array::<32>()?))
+    } else {
+        None
+    };
+    let padding = Padding {
+        header_min: r.u16()?, header_max: r.u16()?,
+        frame_min: r.u32()?, frame_max: r.u32()?,
+    };
+    let rotation = Rotation {
+        lifetime_min_s: r.u32()?, lifetime_max_s: r.u32()?,
+        volume_min_bytes: r.u64()?, volume_max_bytes: r.u64()?,
+    };
+    let count = r.byte()?;
+    if !(1..=3).contains(&count) {
+        return Err(InviteError::Invalid);
+    }
+    let mut references = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        references.push(Reference { server_name: r.text()?, port: r.u16()?, h3: r.flag()? });
+    }
+    let d = Descriptor {
+        schema_version: 1, wire_version: 1, security_mode: SecurityMode::SmartReality,
+        revision, not_before, not_after, active_reference,
+        h3: flags & 1 != 0, stream_one: flags & 2 != 0, stream_up: flags & 4 != 0,
+        path_prefix, next_identity, scope, padding, rotation, references,
+    };
+    let document = crate::descriptor::invitation_document(&d, r.array()?)
+        .map_err(|_| InviteError::Invalid)?;
+    Ok((d, document))
+}
+
 pub(crate) fn encode_wire(wire: &Wire) -> Result<Zeroizing<String>, InviteError> {
     check_wire(wire)?;
-    let text = Zeroizing::new(toml::to_string(wire).map_err(|_| InviteError::Invalid)?);
-    if text.len() > MAX_DATA {
+    let mut bytes = Zeroizing::new(Vec::new());
+    bytes.push(1);
+    bytes.push(match wire.security_mode { WireSecurity::OwnTls => 0, WireSecurity::SmartReality => 1 });
+    bytes.push(match wire.transport { Transport::Auto => 0, Transport::H2 => 1, Transport::H3 => 2 });
+    bytes.push(match wire.xhttp_mode { XhttpMode::Auto => 0, XhttpMode::StreamOne => 1, XhttpMode::StreamUp => 2 });
+    bytes.push(u8::from(wire.token.is_some()));
+    if let Some(token) = &wire.token {
+        bytes.extend_from_slice(&raw_key::<32>(token)?[..]);
+    }
+    match wire.security_mode {
+        WireSecurity::OwnTls => {
+            put_text(&mut bytes, &wire.id)?;
+            put_text(&mut bytes, &wire.endpoint)?;
+            put_text(&mut bytes, &wire.server_name)?;
+            put_text(&mut bytes, &wire.path_prefix)?;
+        }
+        WireSecurity::SmartReality => {
+            let public = raw_key::<32>(wire.public_key.as_deref().ok_or(InviteError::Invalid)?)?;
+            let (d, signature) = crate::descriptor::invitation_parts(
+                wire.descriptor.as_deref().ok_or(InviteError::Invalid)?
+            ).map_err(|_| InviteError::Invalid)?;
+            if d.scope.inbound != wire.id || d.scope.endpoint != wire.endpoint
+                || d.path_prefix != wire.path_prefix || Some(d.revision) != wire.minimum_revision
+                || d.references[usize::from(d.active_reference)].server_name != wire.server_name
+            {
+                return Err(InviteError::Invalid);
+            }
+            bytes.extend_from_slice(&public[..]);
+            put_descriptor(&mut bytes, &d, signature)?;
+        }
+    }
+    if bytes.len() > MAX_DATA {
         return Err(InviteError::Invalid);
     }
     let mut uri = Zeroizing::new(PREFIX.to_owned());
-    URL_SAFE_NO_PAD.encode_string(text.as_bytes(), &mut uri);
+    URL_SAFE_NO_PAD.encode_string(bytes.as_slice(), &mut uri);
     if uri.len() > MAX_URI {
         return Err(InviteError::Invalid);
     }
@@ -147,32 +317,57 @@ pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
         return Err(InviteError::Invalid);
     }
     let encoded = uri.strip_prefix(PREFIX).ok_or(InviteError::Invalid)?;
-    if encoded.is_empty()
-        || encoded
-            .bytes()
-            .any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_')
-    {
+    if encoded.is_empty() || encoded.bytes().any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_') {
         return Err(InviteError::Invalid);
     }
-    let bytes = Zeroizing::new(
-        URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|_| InviteError::Invalid)?,
-    );
-    let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice()));
-    if bytes.len() > MAX_DATA || canonical.as_str() != encoded {
+    let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded).map_err(|_| InviteError::Invalid)?);
+    if bytes.len() > MAX_DATA || Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice())).as_str() != encoded {
         return Err(InviteError::Invalid);
     }
-    let text = std::str::from_utf8(&bytes).map_err(|_| InviteError::Invalid)?;
-    let wire: Wire = toml::from_str(text).map_err(|_| InviteError::Invalid)?;
+    let mut r = Reader(bytes.as_slice());
+    if r.byte()? != 1 {
+        return Err(InviteError::Invalid);
+    }
+    let security_mode = match r.byte()? {
+        0 => WireSecurity::OwnTls, 1 => WireSecurity::SmartReality, _ => return Err(InviteError::Invalid),
+    };
+    let transport = match r.byte()? {
+        0 => Transport::Auto, 1 => Transport::H2, 2 => Transport::H3, _ => return Err(InviteError::Invalid),
+    };
+    let xhttp_mode = match r.byte()? {
+        0 => XhttpMode::Auto, 1 => XhttpMode::StreamOne, 2 => XhttpMode::StreamUp, _ => return Err(InviteError::Invalid),
+    };
+    let mut wire = Wire {
+        version: 1, carrier: "smarttheia-xhttp".into(), security_mode, transport, xhttp_mode,
+        id: String::new(), endpoint: String::new(), server_name: String::new(), path_prefix: String::new(),
+        token: None, public_key: None, minimum_revision: None, descriptor: None,
+    };
+    if r.flag()? {
+        let token = Zeroizing::new(r.array::<32>()?);
+        wire.token = Some(URL_SAFE_NO_PAD.encode(&token[..]));
+    }
+    match security_mode {
+        WireSecurity::OwnTls => {
+            wire.id = r.text()?;
+            wire.endpoint = r.text()?;
+            wire.server_name = r.text()?;
+            wire.path_prefix = r.text()?;
+        }
+        WireSecurity::SmartReality => {
+            wire.public_key = Some(URL_SAFE_NO_PAD.encode(r.array::<32>()?));
+            let (d, document) = get_descriptor(&mut r)?;
+            wire.id = d.scope.inbound;
+            wire.endpoint = d.scope.endpoint;
+            wire.path_prefix = d.path_prefix;
+            wire.server_name = d.references[usize::from(d.active_reference)].server_name.clone();
+            wire.minimum_revision = Some(d.revision);
+            wire.descriptor = Some(document);
+        }
+    }
+    if !r.0.is_empty() {
+        return Err(InviteError::Invalid);
+    }
     check_wire(&wire)?;
-    // Preserve the authenticated REALITY bootstrap's canonical TOML contract.
-    if wire.security_mode == WireSecurity::SmartReality
-        && Zeroizing::new(toml::to_string(&wire).map_err(|_| InviteError::Invalid)?).as_str()
-            != text
-    {
-        return Err(InviteError::Invalid);
-    }
     Ok(wire)
 }
 
@@ -614,8 +809,8 @@ mod tests {
                 .unwrap()
                 .encode()
                 .unwrap();
-            let payload = link.strip_prefix(PREFIX).unwrap();
-            let raw = String::from_utf8(URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+            // Old textual v1 links are deliberately incompatible in DEV.
+            let raw = toml::to_string(&decode_wire(&link).unwrap()).unwrap();
             let decoded = Invitation::decode(&link).unwrap();
             assert_eq!(
                 decoded.to_profile("env:TOKEN", None).unwrap().path_prefix,
@@ -663,10 +858,7 @@ mod tests {
             .unwrap()
             .encode()
             .unwrap();
-        let bytes = URL_SAFE_NO_PAD
-            .decode(uri.strip_prefix(PREFIX).unwrap())
-            .unwrap();
-        let text = std::str::from_utf8(&bytes).unwrap();
+        let text = toml::to_string(&decode_wire(&uri).unwrap()).unwrap();
         let retired = format!(
             "{}server_public_key = \"{key}\"\n",
             text.replace(
@@ -707,10 +899,19 @@ mod tests {
         ] {
             assert!(Invitation::decode(bad).is_err());
         }
-        let bytes = URL_SAFE_NO_PAD
-            .decode(uri.strip_prefix(PREFIX).unwrap())
-            .unwrap();
-        let text = std::str::from_utf8(&bytes).unwrap();
+        let bytes = URL_SAFE_NO_PAD.decode(uri.strip_prefix(PREFIX).unwrap()).unwrap();
+        for (offset, invalid) in [(0, 2), (1, 9), (2, 9), (3, 9), (4, 2)] {
+            let mut changed = bytes.clone();
+            changed[offset] = invalid;
+            assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(changed))).is_err());
+        }
+        for end in 0..bytes.len() {
+            assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(&bytes[..end]))).is_err());
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(trailing))).is_err());
+        let text = toml::to_string(&decode_wire(&uri).unwrap()).unwrap();
         for altered in [
             text.replace("version = 1", "version = 2"),
             text.replace(

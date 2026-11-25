@@ -984,6 +984,9 @@ mod tests {
         let invite = Invitation::public(&identity, &raw, NOW).unwrap();
         let uri = invite.encode().unwrap();
         let received = Invitation::decode(&uri, NOW).unwrap();
+        assert!(uri.len() <= crate::invite::MAX_URI);
+        assert_eq!(received.encode().unwrap().as_str(), uri.as_str());
+        assert_eq!(received.signed, raw);
         assert_eq!(received.fingerprint(), fingerprint(identity.public_key()));
         assert!(received.confirmed([0; 32], auto_policy(), NOW).is_err());
         received
@@ -1004,8 +1007,7 @@ mod tests {
         assert!(crate::invite::Invitation::decode(&uri).is_err());
         let mut wire = received.wire();
         wire.path_prefix = "/v1/substituted".into();
-        let wrong = invite::encode_wire(&wire).unwrap();
-        assert!(Invitation::decode(&wrong, NOW).is_err());
+        assert!(invite::encode_wire(&wire).is_err());
         wire = received.wire();
         wire.security_mode = WireSecurity::OwnTls;
         assert!(invite::encode_wire(&wire).is_err());

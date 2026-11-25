@@ -162,6 +162,8 @@ fn server_invitation(
         let invitation =
             crate::reality_config::registered_invitation(document, id, credential, now)
                 .map_err(|_| "Registered REALITY publication not eligible")?;
+        // Check the actual full key before a grant or credential is saved.
+        invitation.encode().map_err(|_| "Ключ REALITY превышает лимит или невалиден")?;
         return Ok(IssuedInvitation::Reality {
             invitation,
             user: credential.map_or_else(String::new, |(user, _)| user.to_owned()),
@@ -172,6 +174,7 @@ fn server_invitation(
         None => Invitation::public_from_server(config, id),
     }
     .map_err(|_| "Selected inbound cannot issue invitations")?;
+    invitation.encode().map_err(|_| "Ключ TLS превышает лимит или невалиден")?;
     Ok(IssuedInvitation::OwnTls(invitation))
 }
 
