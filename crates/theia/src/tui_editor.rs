@@ -733,6 +733,17 @@ impl Editor {
         }
     }
 
+    /// IDs, disabled state and membership in the current inbound are safe to
+    /// display. Never expose password/token digests or credential references.
+    pub(crate) fn workspace_users(&self) -> Vec<(String, bool, bool)> {
+        let Config::Server(doc) = &self.draft else { return Vec::new(); };
+        let grants = doc.server.inbounds.get(self.selected_record)
+            .map(|entry| entry.allowed_user_ids.as_slice()).unwrap_or(&[]);
+        doc.server.users.iter().map(|user| (
+            user.id.clone(), user.disabled, grants.iter().any(|id| id == &user.id),
+        )).collect()
+    }
+
     pub(crate) fn workspace_selected(&self) -> usize { self.selected_record }
 
     pub(crate) fn workspace_select(&mut self, index: usize) {
