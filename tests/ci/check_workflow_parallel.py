@@ -43,7 +43,6 @@ mandatory = {
     "m0-1-windows-spike",
     "m3-4-btls-spike",
     "m3-4e-btls-production-feature",
-    "native-liveness",
     "coverage-native",
     "coverage-gate",
 }
@@ -160,20 +159,32 @@ for term in ("coverage-Linux", "coverage-Windows", "ci-coverage.py gate",
     require(term in coverage_gate, "missing combined coverage contract: " + term)
 require("continue-on-error" not in coverage_native + coverage_gate,
         "coverage collection and threshold may not be advisory")
-liveness = job("native-liveness")
-require(needs("native-liveness") == {"specification"}
-        and "os: [ubuntu-latest, windows-latest]" in liveness
-        and "cargo test --workspace --locked --test tunnel_liveness -- production_h2_h3_real_traffic_beyond_300_seconds --ignored --exact" in liveness
-        and "Real long-lived relay test failed or did not execute" in liveness
-        and "continue-on-error" not in liveness,
-        "real long-lived H2/H3 matrix must run once per native OS in parallel and fail closed")
+# Real H2/H3 cases share one bounded, non-ignored native test. Both the
+# ordinary and instrumented suites execute it; there is no separate soak job.
+require("  native-liveness:" not in workflow, "obsolete long-running job must not return")
+for name in ("rust-tests", "windows-smoke"):
+    require("cargo test --workspace --all-targets --locked" in job(name),
+            f"{name}: real network matrix must execute in the full native suite")
+require("cargo llvm-cov test --workspace --all-targets --all-features --locked --no-report" in coverage_native,
+        "both instrumented native suites must execute the real network matrix")
 liveness_source = (ROOT / "crates/theia/tests/tunnel_liveness.rs").read_text(encoding="utf-8")
 require("async fn production_h2_h3_asymmetric_traffic_half_close_and_idle()" in liveness_source
-        and "async fn production_h2_h3_real_traffic_beyond_300_seconds()" in liveness_source
-        and "Case::LongUpload, Case::LongDownload" in liveness_source
-        and "(32, Duration::from_secs(10))" in liveness_source
-        and "if long { 300 } else { 30 }" in liveness_source,
-        "retain real 300-second traffic, short half-close/idle cases and explicit wall-clock assertions")
+        and "#[ignore" not in liveness_source
+        and "for transport in [Transport::H2, Transport::H3]" in liveness_source
+        and "cases.spawn(async move" in liveness_source
+        and "Case::LongUpload," in liveness_source and "Case::LongDownload," in liveness_source
+        and "(23, Duration::from_secs(2))" in liveness_source
+        and "if long { 40 } else { 30 }" in liveness_source
+        and "Duration::from_secs(55)" in liveness_source,
+        "retain real concurrent H2/H3 byte progress, half-close and idle with a <60s deadline")
+activity_source = (ROOT / "crates/theia/src/relay_liveness.rs").read_text(encoding="utf-8")
+require("async fn sustained_progress_beyond_300_seconds_in_either_direction()" in activity_source
+        and "#[tokio::test(start_paused = true)]" in activity_source
+        and "for _ in 0..32" in activity_source
+        and "Duration::from_secs(320)" in activity_source
+        and "activity.run(progress, inactive" in activity_source
+        and "activity.run(inactive, progress" in activity_source,
+        "retain accelerated long-progress regression in both directions")
 require("workflow_dispatch:" not in workflow and "  push:" not in workflow,
         "direct pushes, PR updates and manual dispatch must not start CI")
 require("github.event.pull_request.merge_commit_sha" in job("specification")
@@ -316,7 +327,7 @@ for name in mandatory | {"ci-gate"}:
                 f"{name}: cache producer must be trusted and dependency-only")
 require("rust-cache" not in spec and "actions/cache" not in spec,
         "never restore executable caches in the write-privileged source publisher")
-for name in ("rust-tests", "windows-smoke", "browser-e2e", "native-liveness"):
+for name in ("rust-tests", "windows-smoke", "browser-e2e"):
     payload = job(name)
     require("shared-key: native-default-deps-v4" in payload
             and 'CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in payload
@@ -324,7 +335,7 @@ for name in ("rust-tests", "windows-smoke", "browser-e2e", "native-liveness"):
             and "cache-workspace-crates: false" in payload
             and "cache-bin: false" in payload,
             f"{name}: incompatible shared native cache or workspace output caching")
-for name in ("browser-e2e", "native-liveness"):
+for name in ("browser-e2e",):
     require("save-if: false" in job(name), f"{name}: restore-only cache consumer")
 require("shared-key: native-default-deps-v4" not in coverage_native,
         "instrumented outputs must never share the default native target cache")

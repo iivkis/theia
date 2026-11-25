@@ -135,6 +135,37 @@ mod tests {
         assert_eq!(result, Err("close timeout"));
     }
 
+    // Exercise the real shared deadline implementation with paused Tokio time.
+    // No network-soak claim: the real H2/H3 socket matrix is separately bounded.
+    #[tokio::test(start_paused = true)]
+    async fn sustained_progress_beyond_300_seconds_in_either_direction() {
+        for upload_active in [true, false] {
+            let activity = Activity::new();
+            let started = Instant::now();
+            let progress = async {
+                for _ in 0..32 {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    activity.data(4096);
+                }
+                Err("peer finished")
+            };
+            let inactive = std::future::pending::<Result<(), &'static str>>();
+            let result = if upload_active {
+                activity.run(progress, inactive, "idle").await
+            } else {
+                activity.run(inactive, progress, "idle").await
+            };
+            assert_eq!(result, Err("peer finished"));
+            assert!(started.elapsed() >= Duration::from_secs(320));
+            assert!(timeout(Duration::from_secs(29), activity.idle())
+                .await
+                .is_err());
+            assert!(timeout(Duration::from_secs(2), activity.idle())
+                .await
+                .is_ok());
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stalled_direction_does_not_override_other_direction_progress() {
         let activity = Activity::new();
