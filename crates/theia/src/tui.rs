@@ -871,15 +871,28 @@ impl Interaction {
             return;
         }
         let input = text.trim_end_matches(['\r', '\n']);
+        if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
+            let error = if input.chars().any(char::is_control) {
+                Some("Ввод содержит недопустимые символы. Вставьте ключ целиком.")
+            } else if source.len().saturating_add(input.len()) > crate::invite::MAX_URI {
+                Some("Ключ слишком длинный. Вставьте его целиком или запросите новый.")
+            } else {
+                None
+            };
+            if error.is_some() {
+                *source = Zeroizing::new(String::new());
+            } else {
+                source.push_str(input);
+            }
+            if let Some(editor) = self.editor.as_mut() {
+                editor.error = error.map(str::to_owned);
+            }
+            return;
+        }
         if input.chars().any(char::is_control) {
             return;
         }
         match self.importing.as_mut() {
-            Some(ImportFlow::Input(source))
-                if source.len().saturating_add(input.len()) <= crate::invite::MAX_URI =>
-            {
-                source.push_str(input)
-            }
             Some(ImportFlow::Trust { ca, .. }) if ca.len().saturating_add(input.len()) <= 1024 => {
                 ca.push_str(input)
             }
@@ -7655,12 +7668,18 @@ mod tests {
         let mut model = Model::new(Some(Role::Client));
         let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         ui.update(&mut model, press(KeyCode::Char('i')));
+        ui.paste_import_source("theia://v1/test");
+        ui.paste_import_source(&"A".repeat(crate::invite::MAX_URI));
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.is_empty()));
+        assert!(ui.editor.as_ref().unwrap().error.as_deref().unwrap().contains("слишком длинный"));
         ui.paste_import_source(&uri);
+        assert!(ui.editor.as_ref().unwrap().error.is_none());
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(ui.importing.is_none());
         let panel = ui.reality_enrollment.as_ref().unwrap();
         let body = panel.body();
-        assert!(body.contains("Проверка"));
+        assert_eq!(panel.guide().2, "Проверка приглашения");
+        assert!(body.contains("без сети и записи"));
         assert!(!body.contains(uri.as_str()));
         assert!(!body.contains("Файл допуска"));
         ui.update(&mut model, press(KeyCode::Esc));
@@ -7679,7 +7698,8 @@ mod tests {
         while !ui
             .config_dialog
             .as_ref()
-            .is_some_and(|d| d.title() == "Импорт REALITY")
+            .is_some_and(|d| d.title() == "Импорт REALITY"
+                && d.guide().is_some_and(|g| g.2 == "Подтверждение доверия"))
         {
             ui.poll_navigation(&mut model);
             assert!(
@@ -7689,7 +7709,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let dialog = ui.config_dialog.as_ref().unwrap();
-        assert!(matches!(dialog.guide().unwrap().0, 2 | 3));
+        assert_eq!(dialog.guide().unwrap().0, 3);
+        assert!(dialog.body().contains("Связь с сервером ещё не проверена"));
+        assert!(!dialog.body().contains("identity_sha256"));
         let screen = rendered_interaction(120, 40, &model, &ui);
         assert!(!screen.contains(uri.as_str()));
         assert!(!first_path.exists());
