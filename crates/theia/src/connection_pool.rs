@@ -140,13 +140,18 @@ impl<C> Lease<C> {
     /// leases. This is a rotation trigger, never a tunnel termination limit.
     pub(crate) fn record_data(&self, size: usize) {
         let increment = size as u64;
-        let prior = self
-            .entry
-            .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                Some(old.saturating_add(increment))
-            })
-            .unwrap_or_else(|old| old);
+        let mut prior = self.entry.bytes.load(Ordering::Acquire);
+        loop {
+            match self.entry.bytes.compare_exchange_weak(
+                prior,
+                prior.saturating_add(increment),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => prior = current,
+            }
+        }
         if prior.saturating_add(increment) >= self.entry.byte_limit {
             self.entry.retire();
         }
