@@ -289,6 +289,17 @@ impl CandidateBatchPanel {
         }
     }
 
+    pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        if !matches!(self.state,BatchState::Select) || self.server_name.is_none() || self.entries.is_empty() {return None;}
+        Some(Form {
+            fields:self.entries.iter().enumerate().map(|(id,(ip,_))|Field{id,label:if self.selected.contains(ip){"[x] Отмечен"}else{"[ ] Не отмечен"},value:SocketAddr::new(*ip,443).to_string(),hint:"Space — отметить. Enter — предпросмотр. Нужны отдельные права на каждый IP."}).collect(),
+            selected:self.cursor,lead:format!("Выбрано: {}/{}. Только явный выбор, без сканирования подсети.",self.selected_count(),MAX_DUAL_BATCH),error:String::new(),
+        })
+    }
+    pub(crate) fn select_field(&mut self,id:usize) {
+        if matches!(self.state,BatchState::Select) && id<self.entries.len() { self.cursor=id; }
+    }
     pub(crate) fn body(&self) -> String {
         let mut out =
             String::from("F-18: выбранные вручную IP из offline-плана, H2 + H3 (без DNS)\n\n");

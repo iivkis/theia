@@ -3,11 +3,60 @@
 use crate::{server::ServerError, tui_editor::Editor, Role};
 use crossterm::event::KeyCode;
 use std::{
+    path::PathBuf,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread::JoinHandle,
 };
 
+/// The endpoint exists only for the server owned by this TUI. On Linux a
+/// newly created private directory is removed only if its identity is still
+/// the one we created, and only when empty. Windows uses the existing SID DACL.
+struct OwnedEndpoint {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    identity: (u64, u64),
+}
+
+impl OwnedEndpoint {
+    #[cfg(target_os = "linux")]
+    fn create() -> Result<Self, &'static str> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let id = crate::tui_editor::generated_id("theia-ipc")?;
+        let path = std::path::absolute(std::env::temp_dir().join(id))
+            .map_err(|_| "Не удалось определить локальный каталог управления.")?;
+        std::fs::DirBuilder::new().mode(0o700).create(&path)
+            .map_err(|_| "Не удалось создать закрытый каталог управления.")?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| "Не удалось проверить каталог управления.")?;
+        let endpoint = Self { path, identity: (metadata.dev(), metadata.ino()) };
+        if !metadata.file_type().is_dir() || metadata.mode() & 0o777 != 0o700 {
+            return Err("Каталог управления должен иметь права 0700.");
+        }
+        Ok(endpoint)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn create() -> Result<Self, &'static str> {
+        Ok(Self { path: PathBuf::from(crate::tui_editor::generated_id("theia-ipc")?) })
+    }
+}
+
+impl Drop for OwnedEndpoint {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if std::fs::symlink_metadata(&self.path).is_ok_and(|m| {
+                m.file_type().is_dir() && (m.dev(), m.ino()) == self.identity
+            }) {
+                let _ = std::fs::remove_dir(&self.path);
+            }
+        }
+    }
+}
+
 struct Worker {
+    endpoint: Option<OwnedEndpoint>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     ready: tokio::sync::oneshot::Receiver<usize>,
     done: Receiver<Result<(), ServerError>>,
@@ -36,6 +85,7 @@ pub(crate) struct ProcessPanel {
     worker: Option<Worker>,
     confirm: Option<bool>,
     notice: String,
+    action_focus: usize,
 }
 impl ProcessPanel {
     pub(crate) fn new() -> Self {
@@ -43,11 +93,16 @@ impl ProcessPanel {
             worker: None,
             confirm: None,
             notice: "Сервер этой панели не запущен.".into(),
+            action_focus: 0,
         }
     }
 
     pub(crate) fn running(&self) -> bool {
         self.worker.is_some()
+    }
+
+    pub(crate) fn management_endpoint(&self) -> Option<PathBuf> {
+        self.worker.as_ref().and_then(|w| w.endpoint.as_ref()).map(|e| e.path.clone())
     }
 
     fn start(&mut self, editor: &Editor) {
@@ -65,6 +120,11 @@ impl ProcessPanel {
                 self.notice = "Сначала откройте и сохраните серверную конфигурацию.".into();
                 return;
             }
+            let endpoint = match OwnedEndpoint::create() {
+                Ok(endpoint) => endpoint,
+                Err(message) => { self.notice = message.into(); return; }
+            };
+            let management_path = endpoint.path.clone();
             let path = editor.saved_path().to_owned();
             let digest = editor.saved_sha256();
             let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -79,7 +139,7 @@ impl ProcessPanel {
                         .map_err(|_| ServerError::Io)
                         .and_then(|runtime| {
                             runtime.block_on(crate::server::run_tui_file(
-                                &path, digest, ready_tx, stopped,
+                                &path, digest, ready_tx, stopped, Some(management_path),
                             ))
                         });
                     let _ = tx.send(result);
@@ -87,6 +147,7 @@ impl ProcessPanel {
             match thread {
                 Ok(thread) => {
                     self.worker = Some(Worker {
+                        endpoint: Some(endpoint),
                         stop: Some(stop),
                         ready,
                         done,
@@ -124,8 +185,26 @@ impl ProcessPanel {
         }
     }
 
+    pub(crate) fn confirmation(&self) -> Option<bool> { self.confirm }
+
+    pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if self.confirm.is_some() { return Vec::new(); }
+        match &self.worker {
+            None => vec![ActionItem { key: 's', label: "Запустить сервер" }],
+            Some(worker) if worker.stop.is_some() => vec![ActionItem { key: 'x', label: "Остановить сервер" }],
+            Some(_) => Vec::new(),
+        }
+    }
+    pub(crate) fn action_focus(&self) -> usize { self.action_focus }
+    pub(crate) fn select_action(&mut self, index: usize) {
+        if index < self.actions().len() { self.action_focus = index; }
+    }
+
     /// Return true to close the panel. Closing the panel is not stopping.
     pub(crate) fn key(&mut self, key: KeyCode, editor: Option<&Editor>) -> bool {
+        let items = self.actions();
+        let Some(key) = crate::tui_widgets::action_key(&items, &mut self.action_focus, key) else { return false; };
         if let Some(start) = self.confirm {
             match key {
                 KeyCode::Char('y') => {
@@ -175,10 +254,19 @@ impl ProcessPanel {
         }
     }
 
+    pub(crate) fn summary(&self) -> String {
+        let report = match &self.worker {
+            Some(w) if w.stop.is_none() => "Остановка: новые подключения не принимаются, ожидается завершение задач.".into(),
+            Some(w) if w.inbounds.is_some() => format!("Сервер запущен. Inbound: {}.\nСостояние относится только к этому экземпляру.", w.inbounds.unwrap_or(0)),
+            _ => self.notice.clone(),
+        };
+        format!("{}\n\n{report}\n\nEsc — назад, не останавливает сервер.\nВнешний сервис управляется отдельно через IPC.", self.status())
+    }
+
     pub(crate) fn body(&self) -> String {
         if let Some(start) = self.confirm {
             return if start {
-                "Запустить сервер по сохранённому TOML? Открываются указанные сетевые порты. Права ОС не повышаются.\ny: запустить • n/Esc: отменить".into()
+                "Запустить сервер по сохранённым настройкам?\nОткрываются указанные сетевые порты и закрытый локальный канал управления. Права ОС не повышаются.\ny: запустить • n/Esc: отменить".into()
             } else {
                 "Остановить запущенный этой панелью сервер? Новые подключения будут отклонены; действующие получат ограниченное время на завершение.\ny: остановить • n/Esc: отменить".into()
             };
@@ -212,6 +300,7 @@ mod tests {
         let (done_tx, done) = mpsc::channel();
         let mut panel = ProcessPanel::new();
         panel.worker = Some(Worker {
+            endpoint: None,
             stop: Some(stop),
             ready,
             done,
@@ -235,7 +324,7 @@ mod tests {
         panel.key(KeyCode::Char('y'), None);
         stopped.try_recv().unwrap();
         assert_eq!(panel.status(), "Останавливается");
-        assert!(panel.body().contains("admission"));
+        assert!(panel.body().contains("новые подключения не принимаются"));
         done_tx.send(Ok(())).unwrap();
         panel.poll();
         assert!(!panel.running());
@@ -258,6 +347,7 @@ mod tests {
         panel.key(KeyCode::Char('y'), None);
         assert!(panel.body().contains("Сначала откройте серверный TOML"));
         panel.worker = Some(Worker {
+            endpoint: None,
             stop: Some(stop),
             ready,
             done,
@@ -269,6 +359,26 @@ mod tests {
         assert!(!panel.running());
         stopped.try_recv().unwrap();
         assert!(panel.body().contains("Сервер не работает"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_endpoint_is_private_unique_and_only_removed_when_empty() {
+        use std::os::unix::fs::MetadataExt;
+        let first = OwnedEndpoint::create().unwrap();
+        let second = OwnedEndpoint::create().unwrap();
+        assert_ne!(first.path, second.path);
+        let path = first.path.clone();
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().mode() & 0o777, 0o700);
+        drop(first);
+        assert!(!path.exists());
+        let path = second.path.clone();
+        let retained = path.join("retain");
+        std::fs::write(&retained, b"data").unwrap();
+        drop(second);
+        assert!(retained.exists());
+        std::fs::remove_file(retained).unwrap();
+        std::fs::remove_dir(path).unwrap();
     }
 
     #[test]

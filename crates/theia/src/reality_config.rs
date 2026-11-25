@@ -102,6 +102,132 @@ fn approval(original: &[u8], next: &str, evidence: [u8; 32]) -> [u8; 32] {
     hash.finalize().into()
 }
 
+/// Same verified binding builder for registration and first-run creation.
+fn approved_server_inbound(
+    r: &ServerRequest,
+    now: u64,
+) -> Result<(Inbound, reference_health::State, crate::reality_provision::Record), Error> {
+    if r.listen.port() == 0 || r.grants.is_empty() || r.grants.len() > 256 {
+        return Err(Error::Grant);
+    }
+    let state = reference_health::Store::new(&r.health)
+        .map_err(|_| Error::Health)?
+        .inspect()
+        .map_err(|_| Error::Health)?;
+    let record = crate::reality_provision::inspect_initial(
+        &state, r.health_sha256, r.identity_sha256, &r.bundle, now,
+    )?;
+    let (host, port) = record.scope.endpoint.rsplit_once(':').ok_or(Error::Scope)?;
+    if port.parse::<u16>().ok() != Some(r.listen.port()) {
+        return Err(Error::Scope);
+    }
+    let inbound = Inbound {
+        id: record.scope.inbound.clone(),
+        path_prefix: None,
+        security_mode: SecurityMode::SmartReality,
+        reality: Some(RealityBinding {
+            health_store: path_string(&r.health)?,
+            bundle: path_string(&r.bundle)?,
+            initial_health_sha256: r.health_sha256,
+            identity_sha256: r.identity_sha256,
+            manifest_sha256: record.manifest_sha256()?,
+        }),
+        allowed_user_ids: r.grants.clone(),
+        h2_listen: r.listen.to_string(),
+        quic_listen: r.listen.to_string(),
+        server_name: host.to_owned(),
+        tls_cert: String::new(),
+        tls_key: String::new(),
+    };
+    Ok((inbound, state, record))
+}
+
+/// First configuration: no placeholder Own-TLS or usable default credential.
+pub(crate) fn first_server_candidate(r: &ServerRequest, now: u64) -> Result<Config, Error> {
+    use zeroize::Zeroizing;
+    if r.grants.len() != 1 || !config::valid_id(&r.grants[0]) {
+        return Err(Error::Grant);
+    }
+    let (inbound, _, _) = approved_server_inbound(r, now)?;
+    let mut random = Zeroizing::new([0u8; 32]);
+    rustls::crypto::ring::default_provider()
+        .secure_random.fill(&mut random[..]).map_err(|_| Error::Storage)?;
+    let candidate = Config::Server(config::ServerDocument {
+        schema_version: 1,
+        management: config::Management { ipc: "auto".into(), log_level: "info".into() },
+        ui: config::Ui { language: "ru".into() },
+        server: config::ServerSettings {
+            enabled: true,
+            inbounds: vec![inbound],
+            users: vec![config::User {
+                id: r.grants[0].clone(),
+                token_sha256: format!("{:x}", Sha256::digest(&random[..])),
+                disabled: true,
+            }],
+            policy: config::ServerPolicy {
+                allow_private_ips: false,
+                max_connections_per_user: 64,
+                max_connections_total: 1024,
+                connect_timeout_ms: 10000,
+            },
+        },
+    });
+    candidate.validate().map_err(|_| Error::Format)?;
+    Ok(candidate)
+}
+
+fn approved_client_profile(r: &ClientRequest, now: u64) -> Result<(Profile, crate::descriptor::Verified), Error> {
+    if !config::valid_id(&r.id) {
+        return Err(Error::Scope);
+    }
+    let (profile, enrollment_sha256) = bootstrap::Profile::read_snapshot(&r.enrollment)?;
+    if !bool::from(profile.enrollment_identity()?.ct_eq(&r.identity_sha256)) {
+        return Err(Error::Approval);
+    }
+    let value = profile.load(now)?;
+    let policy = profile.policy();
+    let host = profile.endpoint().rsplit_once(':').ok_or(Error::Scope)?.0;
+    let entry = Profile {
+        id: r.id.clone(),
+        path_prefix: None,
+        server: profile.endpoint().to_owned(),
+        server_name: host.to_owned(),
+        auth_token: profile.credential_reference().to_owned(),
+        security_mode: SecurityMode::SmartReality,
+        reality_profile: Some(RealityClientBinding {
+            enrollment: path_string(&r.enrollment)?,
+            enrollment_sha256,
+            identity_sha256: r.identity_sha256,
+        }),
+        xhttp_mode: Some(policy.xhttp_mode),
+        tls_ca: None,
+        transport: policy.transport,
+        quic_connect_timeout_ms: 1600,
+        quic_negative_cache_ttl_s: 900,
+    };
+    Ok((entry, value))
+}
+
+pub(crate) fn first_client_candidate(r: &ClientRequest, now: u64) -> Result<Config, Error> {
+    let (profile, _) = approved_client_profile(r, now)?;
+    let candidate = Config::Client(config::ClientDocument {
+        schema_version: 1,
+        management: config::Management { ipc: "auto".into(), log_level: "info".into() },
+        ui: config::Ui { language: "ru".into() },
+        client: config::ClientSettings {
+            active_profile: r.id.clone(),
+            profiles: vec![profile],
+            proxy: config::LocalProxy {
+                http_listen: "127.0.0.1:7890".into(),
+                socks5_listen: "127.0.0.1:7891".into(),
+                system_proxy: config::SystemProxy::Off,
+            },
+        },
+    });
+    candidate.validate().map_err(|_| Error::Format)?;
+    Ok(candidate)
+}
+
 /// Read and validate exactly one config snapshot plus the corresponding
 /// independent enrollment or complete initial server receipt. The returned
 /// config is immutable; no listener, proxy, grant runtime or file is changed.
@@ -125,47 +251,11 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
             }) {
                 return Err(Error::Grant);
             }
-            let state = reference_health::Store::new(&r.health)
-                .map_err(|_| Error::Health)?
-                .inspect()
-                .map_err(|_| Error::Health)?;
-            let record = crate::reality_provision::inspect_initial(
-                &state,
-                r.health_sha256,
-                r.identity_sha256,
-                &r.bundle,
-                now,
-            )?;
-            let (host, port) = record.scope.endpoint.rsplit_once(':').ok_or(Error::Scope)?;
-            if port.parse::<u16>().ok() != Some(r.listen.port()) {
+            let (inbound, state, record) = approved_server_inbound(r, now)?;
+            if document.server.inbounds.iter().any(|i| i.id == inbound.id) {
                 return Err(Error::Scope);
             }
-            if document
-                .server
-                .inbounds
-                .iter()
-                .any(|i| i.id == record.scope.inbound)
-            {
-                return Err(Error::Scope);
-            }
-            document.server.inbounds.push(Inbound {
-                id: record.scope.inbound.clone(),
-                path_prefix: None,
-                security_mode: SecurityMode::SmartReality,
-                reality: Some(RealityBinding {
-                    health_store: path_string(&r.health)?,
-                    bundle: path_string(&r.bundle)?,
-                    initial_health_sha256: r.health_sha256,
-                    identity_sha256: r.identity_sha256,
-                    manifest_sha256: record.manifest_sha256()?,
-                }),
-                allowed_user_ids: r.grants.clone(),
-                h2_listen: r.listen.to_string(),
-                quic_listen: r.listen.to_string(),
-                server_name: host.to_owned(),
-                tls_cert: String::new(),
-                tls_key: String::new(),
-            });
+            document.server.inbounds.push(inbound);
             let report = format!("Register REALITY inbound (saved configuration only)\ninbound={}\nendpoint={}\nlisten={}\ngrants={}\nidentity_sha256={}\n{}\nExisting runtime remains unchanged. Startup uses the registered generation; live changes require a separate supported activation operation.",
                 record.scope.inbound, record.scope.endpoint, r.listen, r.grants.join(","),
                 hex(record.identity_sha256), state.report(now).map_err(|_| Error::Health)?);
@@ -221,34 +311,12 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
             if !config::valid_id(&r.id) || document.client.profiles.iter().any(|p| p.id == r.id) {
                 return Err(Error::Scope);
             }
-            let (profile, enrollment_sha256) = bootstrap::Profile::read_snapshot(&r.enrollment)?;
-            if !bool::from(profile.enrollment_identity()?.ct_eq(&r.identity_sha256)) {
-                return Err(Error::Approval);
-            }
-            let value = profile.load(now)?;
-            let policy = profile.policy();
-            let host = profile.endpoint().rsplit_once(':').ok_or(Error::Scope)?.0;
-            document.client.profiles.push(Profile {
-                id: r.id.clone(),
-                path_prefix: None,
-                server: profile.endpoint().to_owned(),
-                server_name: host.to_owned(),
-                auth_token: profile.credential_reference().to_owned(),
-                security_mode: SecurityMode::SmartReality,
-                reality_profile: Some(RealityClientBinding {
-                    enrollment: path_string(&r.enrollment)?,
-                    enrollment_sha256,
-                    identity_sha256: r.identity_sha256,
-                }),
-                xhttp_mode: Some(policy.xhttp_mode),
-                tls_ca: None,
-                transport: policy.transport,
-                quic_connect_timeout_ms: 1600,
-                quic_negative_cache_ttl_s: 900,
-            });
+            let (profile, value) = approved_client_profile(r, now)?;
+            let endpoint = profile.server.clone();
+            document.client.profiles.push(profile);
             let modes = value.effective_modes();
             let report = format!("Register REALITY profile (saved configuration only)\nprofile={}\nendpoint={}\nidentity_sha256={}\nrevision={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nActive profile and proxy remain unchanged. Selected profile can be started after preflight; the current process is unchanged.",
-                r.id, profile.endpoint(), hex(bootstrap::fingerprint(value.signer())), value.descriptor().revision,
+                r.id, endpoint, hex(bootstrap::fingerprint(value.signer())), value.descriptor().revision,
                 modes.h2, modes.h3, modes.stream_one, modes.stream_up);
             (report, value.payload_sha256())
         }

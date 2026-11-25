@@ -224,7 +224,7 @@ const WIZARD_LABELS: [&str; 7] = [
 #[derive(Clone)]
 struct WizardInput {
     config: PathBuf,
-    source: [u8; 32],
+    source: Option<[u8; 32]>,
     id: String,
     listen: SocketAddr,
     endpoint: String,
@@ -238,9 +238,21 @@ struct WizardInput {
 impl WizardInput {
     fn check_source(&self) -> Result<(), Error> {
         use sha2::{Digest, Sha256};
+        if self.source.is_none() {
+            if self.grants.len() != 1 || !config::valid_id(&self.grants[0]) {
+                return Err(Error::Grant);
+            }
+            new_health_path(&self.config)?;
+            if !self.config.parent().is_some_and(Path::is_dir)
+                || self.health.parent().is_none_or(|p| p.exists()) {
+                return Err(Error::Storage);
+            }
+            validate_paths(&self.health, &self.bundle)?;
+            return new_health_path(&self.health);
+        }
         let raw = config::editor_bytes(&self.config).map_err(|_| Error::Storage)?;
         let actual: [u8; 32] = Sha256::digest(&raw).into();
-        if actual != self.source {
+        if Some(actual) != self.source {
             return Err(Error::Approval);
         }
         let Config::Server(doc) =
@@ -279,7 +291,7 @@ impl WizardInput {
         new_health_path(&self.health)?;
         Ok(())
     }
-    fn parse(config: PathBuf, source: [u8; 32], fields: &[String; 7]) -> Result<Self, Error> {
+    fn parse(config: PathBuf, source: Option<[u8; 32]>, fields: &[String; 7]) -> Result<Self, Error> {
         if !config::valid_id(&fields[0]) {
             return Err(Error::Scope);
         }
@@ -408,18 +420,89 @@ impl WizardInput {
         self.plan(references)
     }
 }
+/// Publish a first-run configuration only after an explicit reviewed save.
+fn create_first_server(input: WizardInput, state: reference_health::State) -> Result<Editor, Error> {
+    input.check_source()?;
+    let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
+    let preview = reality_provision::preview(&state, now)?;
+    let mut owned = crate::tui_staged_material::StagedMaterial::create_for_new_config(
+        input.health.parent().ok_or(Error::Storage)?, &input.config,
+    )?;
+    let enrolled = reference_health::Store::new(&input.health).and_then(|s| s.enroll(&state));
+    if let Err(error) = enrolled {
+        if matches!(error, reference_health::Error::Indeterminate) {
+            owned.preserve();
+            return Err(Error::Indeterminate);
+        }
+        owned.cleanup()?;
+        return Err(Error::Storage);
+    }
+    let record = match reality_provision::create(&state, preview.health_sha256, &input.bundle, now) {
+        Ok(record) => record,
+        Err(Error::Indeterminate) => {
+            owned.preserve();
+            return Err(Error::Indeterminate);
+        }
+        Err(error) => {
+            owned.cleanup()?;
+            return Err(error);
+        }
+    };
+    let request = ServerRequest {
+        health: input.health,
+        bundle: input.bundle,
+        health_sha256: preview.health_sha256,
+        identity_sha256: record.identity_sha256,
+        listen: input.listen,
+        grants: input.grants,
+    };
+    let candidate = match reality_config::first_server_candidate(&request, now) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            owned.cleanup()?;
+            return Err(error);
+        }
+    };
+    match config::guarded_create(&input.config, &candidate) {
+        Ok(()) => owned.preserve(),
+        Err(config::WriteFailure::BeforeReplace(_)) => {
+            owned.cleanup()?;
+            return Err(Error::Storage);
+        }
+        Err(config::WriteFailure::AfterReplace(_)) => {
+            owned.preserve();
+            return Err(Error::Indeterminate);
+        }
+    }
+    Editor::load(Role::Server, &input.config).map_err(|_| Error::Indeterminate)
+}
+
+#[derive(Clone)]
+struct RankedReview {
+    text: String,
+    rows: Vec<crate::tui_widgets::ReferenceRow>,
+}
+
 fn rank_checked(
     input: &WizardInput,
     plan: reference_health::Plan,
     evidence: Vec<reference_health::Evidence>,
     now: u64,
-) -> Result<(reference_health::State, String), Error> {
+) -> Result<(reference_health::State, RankedReview), Error> {
     if plan.references.len() != evidence.len() {
         return Err(Error::Health);
     }
     let mut entries: Vec<_> = plan.references.into_iter().zip(evidence).collect();
     let mut report =
         String::from("Оценки: 100 = стабильные H2+H3, 80 = стабильный H2, 0 = отказ.\n");
+    let mut rows: Vec<_> = entries.iter().map(|(target, item)| crate::tui_widgets::ReferenceRow {
+        name: target.server_name.clone(),
+        address: target.address.to_string(),
+        score: item.score(),
+        h2: item.eligible(),
+        h3: item.h3(),
+        selected: None,
+    }).collect();
     for (target, item) in &entries {
         report.push_str(&format!(
             "{} {}: {}\n",
@@ -437,9 +520,18 @@ fn rank_checked(
     let (targets, observed): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
     let plan = input.plan(targets)?;
     let state = reference_health::State::new(plan, observed, now).map_err(|_| Error::Health)?;
-    report.push_str(&state.plan().preview().map_err(|_| Error::Health)?);
-    report.push_str("\nОсновной — первый; остальные — резервы. Создать health и private bundle? Runtime не меняется.\ny: создать; n/Esc: отменить.");
-    Ok((state, report))
+    report.push_str("\nПРЕДЛОЖЕННЫЙ НАБОР\n");
+    for (index, target) in state.plan().references.iter().enumerate() {
+        if let Some(row) = rows.iter_mut().find(|row| row.name == target.server_name && row.address == target.address.to_string()) {
+            row.selected = Some(index);
+        }
+        let role = if index == 0 { "Основной".to_owned() } else { format!("Резерв {index}") };
+        report.push_str(&format!("{role}: {}  ({})\n", target.server_name, target.address));
+    }
+    report.push_str(&format!("\nСервер: {}\nПорт: {}\nПользователи: {}\n", input.endpoint, input.listen.port(), input.grants.join(", ")));
+    report.push_str("\nСоздать защищённые материалы? Сервер не будет запущен.\ny: создать; n/Esc: назад.");
+    rows.sort_by_key(|row| row.selected.unwrap_or(usize::MAX));
+    Ok((state, RankedReview { text: report, rows }))
 }
 
 enum WizardStage {
@@ -451,20 +543,28 @@ enum WizardStage {
     ),
     ProbeConfirm(Box<(WizardInput, reference_health::Plan)>),
     Checking(
-        Receiver<Result<(WizardInput, reference_health::State, String), Error>>,
+        Receiver<Result<(WizardInput, reference_health::State, RankedReview), Error>>,
         tokio::sync::oneshot::Sender<()>,
     ),
-    CreateConfirm(Box<(WizardInput, reference_health::State, String)>),
+    CreateConfirm(Box<(WizardInput, reference_health::State, RankedReview)>),
     Saving(Receiver<Result<RegistrationPanel, Error>>, PathBuf),
+    SavingInitial(Receiver<Result<Editor, Error>>, PathBuf),
     Done(String),
 }
+struct GrantPicker {
+    selected: Vec<bool>,
+    focus: usize,
+}
+
 struct Wizard {
     config: PathBuf,
-    source: [u8; 32],
+    source: Option<[u8; 32]>,
     fields: [String; 7],
     focus: usize,
     advanced: bool,
     users: String,
+    available_users: Vec<String>,
+    grant_picker: Option<GrantPicker>,
     stage: WizardStage,
     error: String,
     registration: Option<RegistrationPanel>,
@@ -480,7 +580,7 @@ impl Wizard {
         let id = crate::tui_editor::generated_id("inbound")?;
         Ok(Self {
             config,
-            source: editor.saved_sha256(),
+            source: Some(editor.saved_sha256()),
             fields: [
                 id,
                 "443".into(),
@@ -495,11 +595,61 @@ impl Wizard {
             users: editor
                 .record_user_catalog(crate::tui_editor::RecordAction::NewInbound)
                 .unwrap_or_default(),
+            available_users: editor.workspace_users().into_iter().filter_map(|(id, disabled, _)| (!disabled).then_some(id)).collect(),
+            grant_picker: None,
             stage: WizardStage::Input,
             error: String::new(),
             registration: None,
         })
     }
+    fn first(path: PathBuf) -> Result<Self, &'static str> {
+        let config = std::path::absolute(path).map_err(|_| "Недопустимый путь TOML.")?;
+        if !crate::bounded_input::explicit_file_path(&config)
+            || new_health_path(&config).is_err()
+            || !config.parent().is_some_and(Path::is_dir) {
+            return Err("Укажите новый TOML в существующем каталоге.");
+        }
+        Ok(Self {
+            config,
+            source: None,
+            fields: [
+                crate::tui_editor::generated_id("inbound")?,
+                "443".into(),
+                String::new(),
+                String::new(),
+                crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[..3].join(","),
+                String::new(),
+                "auto".into(),
+            ],
+            focus: 1,
+            advanced: false,
+            users: "Введите ID первого пользователя. Он будет отключён до явного выпуска токена.".into(),
+            available_users: Vec::new(),
+            grant_picker: None,
+            stage: WizardStage::Input,
+            error: String::new(),
+            registration: None,
+        })
+    }
+    /// Explain common form mistakes before the shared validator; never replace it.
+    fn basic_error(&self) -> Option<(usize, &'static str)> {
+        let port = self.fields[1].parse::<u16>().ok()
+            .or_else(|| self.fields[1].parse::<SocketAddr>().ok().map(|a| a.port()));
+        if port.is_none_or(|p| p == 0) { return Some((1, "Укажите порт от 1 до 65535. Обычно подходит 443.")); }
+        let endpoint = format!("{}:{}", self.fields[2], port.unwrap_or(443));
+        if !config::valid_remote(&endpoint) { return Some((2, "Введите публичный IP или домен вашего сервера без https:// и без порта. Для IPv6 используйте квадратные скобки.")); }
+        if self.fields[3].split(',').any(|v| v.trim().parse::<IpAddr>().is_err()) {
+            return Some((3, "Введите IP вашего сервера. Если их несколько, разделите запятыми. Не вводите домены или адреса сторонних сайтов."));
+        }
+        if self.fields[5].trim().is_empty() {
+            return Some((5, if self.source.is_none() {"Придумайте имя первого пользователя, например phone. Доступ появится только после выдачи приглашения."}else{"Выберите хотя бы одного активного пользователя с помощью F6. Если их нет, создайте пользователя отдельно."}));
+        }
+        if self.source.is_none() && !config::valid_id(&self.fields[5]) {
+            return Some((5,"Имя первого пользователя должно быть одним допустимым ID, например phone или laptop."));
+        }
+        None
+    }
+
     fn visible_fields(&self) -> &[usize] {
         if self.advanced {
             &[0, 1, 2, 3, 4, 5, 6]
@@ -520,7 +670,7 @@ impl Wizard {
             panel.paste(text);
             return;
         }
-        if matches!(self.stage, WizardStage::Input) {
+        if self.grant_picker.is_none() && matches!(self.stage, WizardStage::Input) {
             let field = &mut self.fields[self.focus];
             let value = text.trim_end_matches(['\r', '\n']);
             if !value.chars().any(char::is_control)
@@ -534,6 +684,25 @@ impl Wizard {
         if let Some(panel) = self.registration.as_mut() {
             return panel.key(key);
         }
+        if let Some(mut picker) = self.grant_picker.take() {
+            let count = picker.selected.len();
+            match key.code {
+                KeyCode::Esc => return false,
+                KeyCode::Enter => {
+                    self.fields[5] = self.available_users.iter().zip(&picker.selected)
+                        .filter_map(|(id, chosen)| chosen.then_some(id.as_str())).collect::<Vec<_>>().join(",");
+                    return false;
+                }
+                KeyCode::Up | KeyCode::BackTab => picker.focus = (picker.focus + count - 1) % count,
+                KeyCode::Down | KeyCode::Tab => picker.focus = (picker.focus + 1) % count,
+                KeyCode::Home => picker.focus = 0,
+                KeyCode::End => picker.focus = count - 1,
+                KeyCode::Char(' ') => picker.selected[picker.focus] = !picker.selected[picker.focus],
+                _ => {}
+            }
+            self.grant_picker = Some(picker);
+            return false;
+        }
         let old = std::mem::replace(&mut self.stage, WizardStage::Input);
         self.stage = match old {
             WizardStage::Input => {
@@ -545,15 +714,37 @@ impl Wizard {
                             self.focus = 1;
                         }
                     }
-                    KeyCode::Tab => self.move_focus(true),
-                    KeyCode::BackTab => self.move_focus(false),
+                    KeyCode::F(3) if self.focus==3 && self.fields[3].is_empty() => {
+                        if let Ok(ip)=self.fields[2].trim_matches(['[',']']).parse::<IpAddr>() {
+                            self.fields[3]=ip.to_string();
+                            self.error.clear();
+                        } else {
+                            self.error="Адрес для клиентов не является IP. Укажите все IP своего сервера вручную.".into();
+                        }
+                    }
+                    KeyCode::F(6) if self.focus == 5 && !self.available_users.is_empty() => {
+                        self.grant_picker = Some(GrantPicker {
+                            selected: self.available_users.iter().map(|id| self.fields[5].split(',').any(|s| s.trim() == id)).collect(),
+                            focus: 0,
+                        });
+                    }
+                    KeyCode::Tab | KeyCode::Down => self.move_focus(true),
+                    KeyCode::BackTab | KeyCode::Up => self.move_focus(false),
                     KeyCode::Backspace => {
                         self.fields[self.focus].pop();
+                        self.error.clear();
                     }
                     KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-                        self.fields[self.focus].clear()
+                        self.fields[self.focus].clear();
+                        self.error.clear();
                     }
                     KeyCode::Enter => {
+                        if let Some((field, message)) = self.basic_error() {
+                            self.focus = field;
+                            self.error = message.into();
+                            self.stage = WizardStage::Input;
+                            return false;
+                        }
                         match WizardInput::parse(self.config.clone(), self.source, &self.fields) {
                             Ok(input) => {
                                 self.error.clear();
@@ -631,16 +822,25 @@ impl Wizard {
                     .parent()
                     .map(Path::to_owned)
                     .unwrap_or_default();
+                if input.source.is_none() {
+                    let (tx, rx) = mpsc::channel();
+                    let _worker = std::thread::spawn(move || {
+                        let _ = tx.send(create_first_server(input, state));
+                    });
+                    self.stage = WizardStage::SavingInitial(rx, root);
+                    return false;
+                }
                 let (tx, rx) = mpsc::channel();
                 let _worker = std::thread::spawn(move || {
                     let result = (|| {
+                        let source = input.source.ok_or(Error::Approval)?;
                         input.check_source()?;
                         let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
                         let preview = reality_provision::preview(&state, now)?;
                         let mut owned = crate::tui_staged_material::StagedMaterial::create(
                             input.health.parent().ok_or(Error::Storage)?,
                             &input.config,
-                            input.source,
+                            source,
                         )?;
                         // No external reference can exist before registration.
                         // Keep an uncertain write for explicit inspection.
@@ -685,7 +885,7 @@ impl Wizard {
                             &reality_config::Request::Server(request.clone()),
                             now,
                         )?;
-                        RegistrationPanel::from_provision(input.config, input.source, request)
+                        RegistrationPanel::from_provision(input.config, source, request)
                             .map(|panel| panel.own_material(owned))
                     })();
                     let _ = tx.send(result);
@@ -725,6 +925,12 @@ impl Wizard {
                 Ok(value) => value.map(|v| WizardStage::CreateConfirm(Box::new(v))),
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
             },
+            WizardStage::SavingInitial(rx, root) => match rx.try_recv() {
+                Ok(Ok(editor)) => return Some(editor),
+                Ok(Err(error)) => Ok(WizardStage::Done(format!("Не удалось сохранить первый TOML: {error}. При неопределённой записи проверьте {root:?}. Сервер не запущен."))),
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => Ok(WizardStage::Done(format!("Запись не подтверждена. Проверьте TOML и {root:?}; не повторяйте вслепую."))),
+            },
             WizardStage::Saving(rx, root) => match rx.try_recv() {
                 Ok(Ok(panel)) => { self.registration = Some(panel); return None; }
                 Ok(Err(error)) => Ok(WizardStage::Done(format!("ОТКАЗ: {error}. При неопределённой записи проверьте каталог {root:?}; для целых материалов доступна регистрация M. Runtime не изменён. Esc: закрыть."))),
@@ -748,14 +954,26 @@ impl Wizard {
         }
         match &self.stage {
             WizardStage::Input => {
-                let mut out = String::from("Новый REALITY inbound. Без TLS cert/key.\n");
+                let mut out = String::from("СЕТЬ · без собственного TLS-сертификата\n\n");
                 for &i in self.visible_fields() {
-                    let label = if i == 1 && !self.advanced { "Порт (или bind)" } else { WIZARD_LABELS[i] };
-                    out.push_str(&format!("{} {label}: {}\n", if i == self.focus { ">" } else { " " }, self.fields[i]));
+                    if i == 5 { out.push_str("\nДОСТУП\n"); }
+                    let label = match i {
+                        1 if !self.advanced => "Порт TCP/UDP",
+                        2 => "Адрес сервера для клиентов (домен/IP без порта)",
+                        3 => "Собственные IP сервера (через запятую)",
+                        5 if self.source.is_none() => "ID первого пользователя",
+                        5 => "Пользователи с доступом (ID через запятую)",
+                        _ => WIZARD_LABELS[i],
+                    };
+                    let value = if self.fields[i].is_empty() { "[введите значение]" } else { self.fields[i].as_str() };
+                    out.push_str(&format!("{} {label}: {value}\n", if i == self.focus { ">" } else { " " }));
                 }
                 out.push_str(if self.advanced { "auto: подобрать по оценкам; manual: сохранить порядок.\nF2: скрыть расширенные.\n" } else { "ID создаётся автоматически; референсы подбираются из каталога.\nУкажите все собственные IP, включая публичный/NAT: это обязательная защита от self-reference.\nF2: расширенные (ID, домены/IP, manual).\n" });
                 out.push_str(&self.users);
-                out.push_str("\nEnter: проверить и подобрать; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
+                if !self.available_users.is_empty() {
+                    out.push_str("\nF6 на поле доступа: выбрать пользователей из списка.");
+                }
+                out.push_str("\nEnter: проверить и подобрать; ↑↓ / Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
                 out.push_str(&self.error); out
             }
             WizardStage::DnsConfirm(input) => format!("DNS: только перечисленные домены без заданного IP.\n{}\nНет TLS/QUIC соединений. y: DNS; n/Esc: отменить.", input.candidates.iter().map(|(name, ip)| format!("{name}: {}", ip.map_or("DNS".into(), |ip| ip.to_string()))).collect::<Vec<_>>().join("\n")),
@@ -765,8 +983,14 @@ impl Wizard {
                 format!("Проверить только эти IP:443 и SNI (public PKI, H2/H3 HEAD):\n{}\nИсключены DNS/недопустимые/повторные IP: {}\nDNS будет повторно сверён, включая endpoint; запрещено подключение к собственным IP.\ny: проверить; n/Esc: отменить.", value.1.preview().unwrap_or_else(|_| "Неверный план".into()), skipped.join(", "))
             },
             WizardStage::Checking(_, _) => "Проверка согласованных IP; Esc: отменить без записи.".into(),
-            WizardStage::CreateConfirm(value) => value.2.clone(),
-            WizardStage::Saving(_, _) => "Создание локальных материалов; не закрывайте экран. Runtime не меняется.".into(),
+            WizardStage::CreateConfirm(value) => {
+                if value.0.source.is_none() {
+                    format!("{}\nПервый TOML: {}\nПервый пользователь: {} (отключён).\ny: создать материалы и сохранить новый TOML; n/Esc: назад.", value.2.text, value.0.config.display(), value.0.grants.join(", "))
+                } else {
+                    value.2.text.clone()
+                }
+            },
+            WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => "Создание локальных материалов; не закрывайте экран. Runtime не меняется.".into(),
             WizardStage::Done(message) => message.clone(),
         }
     }
@@ -781,6 +1005,12 @@ impl ProvisionPanel {
             error: None,
             wizard: None,
         }
+    }
+
+    pub(crate) fn first(path: PathBuf) -> Result<Self, &'static str> {
+        let mut panel = Self::new();
+        panel.wizard = Some(Wizard::first(path)?);
+        Ok(panel)
     }
 
     pub(crate) fn bound(editor: &Editor) -> Result<Self, &'static str> {
@@ -959,6 +1189,108 @@ impl ProvisionPanel {
         None
     }
 
+    pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        let wizard = self.wizard.as_ref()?;
+        if let Some(panel)=&wizard.registration{return panel.form();}
+        if !matches!(wizard.stage, WizardStage::Input) {
+            return None;
+        }
+        if let Some(picker) = &wizard.grant_picker {
+            let count = picker.selected.iter().filter(|chosen| **chosen).count();
+            return Some(Form {
+                fields: wizard.available_users.iter().enumerate().map(|(id, name)| Field {
+                    id, label: if picker.selected[id] { "[x] Доступ выбран" } else { "[ ] Нет доступа" },
+                    value: name.clone(), hint: "Пробел изменить выбор · Enter перенести в черновик · Esc отменить",
+                }).collect(),
+                selected: picker.focus,
+                lead: format!("Выбрано: {count} из {} · только активные пользователи", picker.selected.len()),
+                error: String::new(),
+            });
+        }
+        let first = wizard.source.is_none();
+        let labels = [
+            ("ID подключения", "Уникальное имя подключения, создаётся автоматически."),
+            ("Порт TCP/UDP", "Оставьте 443, если не знаете, зачем менять. Порт должен быть доступен на сервере."),
+            ("Адрес сервера для клиентов", "Введите IP или домен VPS из панели хостинга, без https:// и порта. Не адрес стороннего сайта."),
+            ("IP-адреса вашего сервера", "IP указаны в панели хостинга. F3 — перенести IP из поля выше. Если IP несколько, перечислите их через запятую."),
+            ("Домены референсов", "До трёх доменов или домен=IP, через запятую."),
+            (if first { "Имя первого пользователя" } else { "Пользователи с доступом (F6)" },
+             if first { "Придумайте имя, например phone. После создания выдайте личный ключ через «Восстановить доступ» на обзоре." } else { "Нажмите F6 и отметьте нужных пользователей. Никому не выдаётся доступ автоматически." }),
+            ("Режим подбора", "auto — по результатам проверок; manual — в заданном порядке."),
+        ];
+        Some(Form {
+            fields: wizard.visible_fields().iter().map(|&id| Field {
+                id, label: labels[id].0, hint: labels[id].1, value: wizard.fields[id].clone(),
+            }).collect(),
+            selected: wizard.focus,
+            lead: if wizard.advanced { "Расширенные параметры · F2 скрыть".into() } else { "Данные сервера возьмите из панели хостинга. Порт обычно 443. Выберите пользователя. F2 — расширенные настройки.".into() },
+            error: wizard.error.clone(),
+        })
+    }
+
+    pub(crate) fn select_field(&mut self, id: usize) {
+        if let Some(wizard) = self.wizard.as_mut() {
+            if let Some(panel)=wizard.registration.as_mut(){panel.select_field(id);return;}
+            if let Some(picker) = wizard.grant_picker.as_mut() {
+                if id < picker.selected.len() { picker.focus = id; }
+                return;
+            }
+            if wizard.registration.is_none() && matches!(wizard.stage, WizardStage::Input)
+                && wizard.visible_fields().contains(&id) {
+                wizard.focus = id;
+            }
+        }
+    }
+
+    pub(crate) fn reference_review(&self) -> Option<crate::tui_widgets::ReferenceReview> {
+        let wizard = self.wizard.as_ref()?;
+        if wizard.registration.is_some() { return None; }
+        let WizardStage::CreateConfirm(value) = &wizard.stage else { return None; };
+        let (input, _, review) = value.as_ref();
+        let first = input.source.is_none();
+        let details = vec![
+            ("Адрес сервера", input.endpoint.clone()),
+            ("TCP/UDP bind", input.listen.to_string()),
+            ("Пользователи", if first { format!("{} (отключён до выпуска токена)", input.grants.join(", ")) } else { input.grants.join(", ") }),
+            ("TOML", input.config.display().to_string()),
+        ];
+        let mut note = if first {
+            "Создание защищённых материалов и нового TOML. Сервер не запускается.".to_owned()
+        } else {
+            "Создание защищённых материалов. TOML сохраняется после отдельного подтверждения; сервер не запускается.".to_owned()
+        };
+        if input.endpoint.parse::<SocketAddr>().is_ok_and(|address| match address.ip() {
+            IpAddr::V4(ip) => ip.is_documentation(),
+            IpAddr::V6(ip) => ip.segments()[..2] == [0x2001, 0xdb8],
+        }) {
+            note.push_str("\nВнимание: адрес из диапазона для документации, не публичный адрес вашего VPS. Вернитесь назад и замените его перед реальным использованием.");
+        }
+        Some(crate::tui_widgets::ReferenceReview {
+            rows: review.rows.clone(),
+            details,
+            note,
+        })
+    }
+
+    pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
+        let wizard = self.wizard.as_ref()?;
+        if wizard.registration.is_some() {
+            return Some((5, 5, "Сохранение TOML", "Enter предпросмотр · Y подтвердить · Esc назад"));
+        }
+        if wizard.grant_picker.is_some() { return Some((1, 5, "Выбор пользователей", "↑↓ пользователь · Пробел отметить · Enter готово · Esc отменить")); }
+        Some(match &wizard.stage {
+            WizardStage::Input => (1, 5, "Настройка сервера", "↑↓ поле · Enter проверить и подобрать · F2 расширенные · Esc назад"),
+            WizardStage::DnsConfirm(_) => (2, 5, "Разрешение DNS", "Y разрешить DNS · N / Esc назад"),
+            WizardStage::Resolving(_, _) => (2, 5, "Получение адресов", "Esc отменить"),
+            WizardStage::ProbeConfirm(_) => (3, 5, "Проверка референсов", "Y проверить перечисленные адреса · N / Esc назад"),
+            WizardStage::Checking(_, _) => (3, 5, "Проверка TLS / QUIC", "Esc отменить"),
+            WizardStage::CreateConfirm(value) => (4, 5, "Результат подбора", if value.0.source.is_none() { "Y создать TOML · N / Esc назад" } else { "Y создать материалы · N / Esc назад" }),
+            WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => (5, 5, "Сохранение", "Идёт запись; сервер не запускается"),
+            WizardStage::Done(_) => (5, 5, "Результат записи", "Esc закрыть"),
+        })
+    }
+
     pub(crate) fn body(&self) -> String {
         if let Some(wizard) = &self.wizard {
             return wizard.body();
@@ -985,6 +1317,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn novice_errors_focus_the_missing_field_without_creating_files() {
+        let dir=std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-errors").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let mut wizard=Wizard::first(dir.join("server.toml")).unwrap();
+        let enter=KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE);
+        wizard.key(enter);
+        assert_eq!(wizard.focus,2);
+        wizard.fields[2]="edge.example.org".into();
+        wizard.key(enter);
+        assert_eq!(wizard.focus,3);
+        wizard.fields[3]="192.0.2.10".into();
+        wizard.key(enter);
+        assert_eq!(wizard.focus,5);
+        assert!(matches!(wizard.stage,WizardStage::Input));
+        assert!(!wizard.config.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn grant_picker_is_explicit_and_cancel_restores_previous_draft() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("grant-picker").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let mut wizard = Wizard::first(dir.join("server.toml")).unwrap();
+        wizard.available_users = vec!["alice".into(), "bob".into()];
+        wizard.focus = 5;
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        wizard.key(press(KeyCode::F(6)));
+        wizard.key(press(KeyCode::Char(' ')));
+        wizard.key(press(KeyCode::Down));
+        wizard.key(press(KeyCode::Char(' ')));
+        assert!(wizard.fields[5].is_empty());
+        wizard.key(press(KeyCode::Esc));
+        assert!(wizard.fields[5].is_empty());
+        wizard.key(press(KeyCode::F(6)));
+        wizard.key(press(KeyCode::Char(' ')));
+        wizard.key(press(KeyCode::Down));
+        wizard.key(press(KeyCode::Char(' ')));
+        wizard.key(press(KeyCode::Enter));
+        assert_eq!(wizard.fields[5], "alice,bob");
+        assert!(!wizard.config.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn first_server_wizard_publishes_only_after_review_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("first-reality-server").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut wizard = Wizard::first(path.clone()).unwrap();
+        wizard.fields[2] = "edge.example.org".into();
+        wizard.fields[3] = "93.184.216.1".into();
+        wizard.fields[4] = "reference.example.org=93.184.216.2".into();
+        wizard.fields[5] = "owner".into();
+        let input = WizardInput::parse(path.clone(), None, &wizard.fields).unwrap();
+        let plan = input.plan(vec![Target {
+            server_name: "reference.example.org".into(),
+            address: "93.184.216.2:443".parse().unwrap(),
+        }]).unwrap();
+        let now = reference_health::unix_now().unwrap();
+        let (state, report) = rank_checked(&input, plan, vec![Evidence {
+            h2_status: Some(200), h3_status: None,
+        }], now).unwrap();
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        wizard.stage = WizardStage::CreateConfirm(Box::new((input.clone(), state.clone(), report.clone())));
+        assert!(!path.exists() && !input.bundle.exists());
+        assert!(!wizard.key(press(KeyCode::Esc)));
+        assert!(matches!(wizard.stage, WizardStage::Input));
+        assert!(!path.exists() && !input.health.exists());
+        wizard.stage = WizardStage::CreateConfirm(Box::new((input.clone(), state.clone(), report)));
+        assert!(!wizard.key(press(KeyCode::Char('y'))));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let editor = loop {
+            if let Some(editor) = wizard.poll() {
+                break editor;
+            }
+            assert!(std::time::Instant::now() < deadline, "{}", wizard.body());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(editor.selected_reality());
+        let before = std::fs::read(&path).unwrap();
+        let Config::Server(doc) = config::parse(std::str::from_utf8(&before).unwrap()).unwrap() else {
+            panic!("server expected");
+        };
+        assert_eq!(doc.server.inbounds.len(), 1);
+        assert_eq!(doc.server.users.len(), 1);
+        assert!(doc.server.users[0].disabled);
+        assert_eq!(doc.server.inbounds[0].allowed_user_ids, vec!["owner"]);
+        assert!(doc.server.inbounds[0].tls_cert.is_empty());
+        assert!(doc.server.inbounds[0].tls_key.is_empty());
+        assert!(input.bundle.exists() && input.health.exists());
+        assert!(create_first_server(input, state).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn bound_wizard_keeps_dns_probe_creation_and_registration_separate() {
         let dir = std::env::temp_dir().join(format!("theia-typed-wizard-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
@@ -1009,7 +1437,7 @@ mod tests {
         wizard.fields[4] = "first.example.org=93.184.216.2,second.example.org=93.184.216.3".into();
         wizard.fields[5] = "device-a".into();
         let input =
-            WizardInput::parse(path.clone(), editor.saved_sha256(), &wizard.fields).unwrap();
+            WizardInput::parse(path.clone(), Some(editor.saved_sha256()), &wizard.fields).unwrap();
         let plan = input
             .plan(vec![
                 reference_health::Target {
@@ -1047,7 +1475,10 @@ mod tests {
             h3_status: None,
         };
         assert!(rank_checked(&manual, plan.clone(), failed.clone(), now).is_err());
-        let (filtered, _) = rank_checked(&input, plan.clone(), failed, now).unwrap();
+        let (filtered, filtered_review) = rank_checked(&input, plan.clone(), failed, now).unwrap();
+        assert_eq!(filtered_review.rows.len(), 2);
+        assert_eq!(filtered_review.rows[1].selected, None);
+        assert_eq!(filtered_review.rows[1].score, 0);
         assert_eq!(filtered.plan().references.len(), 1);
         assert!(rank_checked(&input, plan.clone(), Vec::new(), now).is_err());
         let resolved = tokio::runtime::Builder::new_current_thread()
@@ -1058,7 +1489,10 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.digest().unwrap(), plan.digest().unwrap());
         assert_eq!(state.plan().references[0].server_name, "second.example.org");
-        assert!(report.contains("100") && report.contains("80"));
+        assert!(report.text.contains("100") && report.text.contains("80"));
+        assert_eq!(report.rows[0].selected, Some(0));
+        assert_eq!(report.rows[0].score, 100);
+        assert_eq!(report.rows[1].selected, Some(1));
         assert!(!input.bundle.exists() && !input.health.exists());
         wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(wizard.stage, WizardStage::DnsConfirm(_)));

@@ -38,6 +38,7 @@ pub(crate) struct StatusPanel {
     digest: [u8; 32],
     id: String,
     server: bool,
+    server_endpoint: Option<PathBuf>,
     reality: bool,
     pending: Option<Receiver<Result<Update, Error>>>,
     review: Option<RotationReview>,
@@ -54,14 +55,20 @@ pub(crate) struct StatusPanel {
     credential_review: Option<(PathBuf, [u8; 32], u64)>,
     refreshed_editor: Option<Editor>,
     reopen_required: bool,
+    action_focus: usize,
 }
 impl StatusPanel {
     pub(crate) fn open(editor: &Editor) -> Self {
+        Self::open_with_endpoint(editor, None)
+    }
+
+    pub(crate) fn open_with_endpoint(editor: &Editor, server_endpoint: Option<PathBuf>) -> Self {
         let mut panel = Self {
             path: editor.saved_path().to_owned(),
             digest: editor.saved_sha256(),
             id: editor.selected_record_id().to_owned(),
             server: editor.role() == Role::Server,
+            server_endpoint,
             reality: editor.selected_reality(),
             pending: None,
             review: None,
@@ -78,6 +85,7 @@ impl StatusPanel {
             credential_review: None,
             refreshed_editor: None,
             reopen_required: false,
+            action_focus: 0,
         };
         panel.start(None);
         panel
@@ -90,6 +98,7 @@ impl StatusPanel {
         let digest = self.digest;
         let id = self.id.clone();
         let server = self.server;
+        let server_endpoint = self.server_endpoint.clone();
         let reality = self.reality;
         let selected_active = self.client_active;
         let (tx, rx) = mpsc::channel();
@@ -130,8 +139,10 @@ impl StatusPanel {
                         .build()
                         .ok()
                         .and_then(|rt| {
-                            rt.block_on(crate::management::query_environment(command))
-                                .ok()
+                            match server_endpoint.as_deref() {
+                                Some(endpoint) => rt.block_on(crate::tui_runtime::query_endpoint(endpoint, command)),
+                                None => rt.block_on(crate::management::query_environment(command)),
+                            }.ok()
                         });
                     let live=match response{
                         Some(StatusReply::RealityRunning{generation,revision,health_revision,active_reference,overlap})=>
@@ -397,7 +408,68 @@ impl StatusPanel {
         self.client_run.is_some() && self.client_confirm.is_none()
     }
 
-    pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
+    pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if self.reopen_required || self.pending.is_some() || self.committing
+            || self.review.is_some() || self.expiry_review.is_some()
+            || self.client_confirm.is_some() || self.credential_input.is_some()
+            || self.credential_review.is_some() || self.headless_review.is_some()
+            || self.trust_input.is_some() || self.trust_review.is_some() {
+            return Vec::new();
+        }
+        if let Some(run) = &self.client_run {
+            return if run.stop.is_some() {
+                vec![ActionItem { key: 'x', label: "Остановить подключение" }]
+            } else { Vec::new() };
+        }
+        let mut items = Vec::new();
+        if !self.server && self.client_active {
+            items.push(ActionItem { key: 's', label: "Запустить подключение" });
+            items.push(ActionItem { key: 'h', label: "Настройки внешнего клиента" });
+        }
+        items.push(ActionItem { key: 'r', label: "Обновить состояние" });
+        if self.server {
+            items.extend([
+                ActionItem { key: 't', label: "Начать замену ключей доверия" },
+                ActionItem { key: 'p', label: "Отозвать старый ключ" },
+                ActionItem { key: 'e', label: "Восстановить подписанное описание" },
+            ]);
+        } else if self.reality {
+            items.extend([
+                ActionItem { key: 'o', label: "Восстановить доверие" },
+                ActionItem { key: 'k', label: "Плановый переход identity" },
+                ActionItem { key: 'c', label: "Обновить credential" },
+            ]);
+        }
+        items
+    }
+    pub(crate) fn action_focus(&self) -> usize { self.action_focus }
+    pub(crate) fn select_action(&mut self, index: usize) {
+        if index < self.actions().len() { self.action_focus = index; }
+    }
+    pub(crate) fn title(&self) -> &'static str {
+        if self.server { "Состояние REALITY на сервере" }
+        else if self.reality { "Подключение REALITY" }
+        else { "Подключение клиента · собственный TLS" }
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        if let Some(run) = &self.client_run {
+            let status = run.report.lock().map(|s| s.clone()).unwrap_or_else(|_| "Статус недоступен".into());
+            return format!("{status}\n\nEsc: свернуть, подключение продолжит работу.");
+        }
+        let mut summary = self.report.clone();
+        if !self.server && !self.client_active {
+            summary.push_str("\n\nДля запуска сначала выберите активный профиль.");
+        }
+        summary.push_str("\n\nEsc: назад.");
+        summary
+    }
+
+    pub(crate) fn key(&mut self, mut key: KeyEvent) -> bool {
+        let items = self.actions();
+        let Some(code) = crate::tui_widgets::action_key(&items, &mut self.action_focus, key.code) else { return false; };
+        key.code = code;
         if self.reopen_required {
             return key.code == KeyCode::Esc;
         }
@@ -670,7 +742,7 @@ impl StatusPanel {
             return "Подтверждённая запись публикации выполняется. Не закрывайте экран.".into();
         }
         if self.pending.is_some() {
-            return "Проверка сохранённых материалов/локального IPC. Ничего не применяется.\nEsc: закрыть.".into();
+            return "Проверяем сохранённые настройки и состояние локального процесса. Изменения не применяются.\nEsc: закрыть.".into();
         }
         if let Some(review) = &self.expiry_review {
             return format!("{}\n\ny: подтвердить | n/Esc: отменить", review.report());
@@ -714,6 +786,7 @@ mod tests {
             digest: [1; 32],
             id: "test".into(),
             server: false,
+            server_endpoint: None,
             reality: true,
             pending: None,
             review: None,
@@ -730,6 +803,7 @@ mod tests {
             credential_review: None,
             refreshed_editor: None,
             reopen_required: false,
+            action_focus: 0,
         }
     }
     #[test]

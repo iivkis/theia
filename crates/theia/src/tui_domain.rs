@@ -543,6 +543,28 @@ impl DomainPanel {
         }
     }
 
+    pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        match self.state {
+            DomainState::Catalog if !self.domains.is_empty() => Some(Form {
+                fields:self.domains.iter().enumerate().map(|(id,name)| Field {id,label:"Домен",value:(*name).to_owned(),hint:"Enter — запросить отдельное согласие на DNS. m — ручное имя."}).collect(),
+                selected:self.domain_index,lead:"DNS ещё НЕ выполнялся. Каталог не даёт права на активную проверку.".into(),error:String::new(),
+            }),
+            DomainState::Resolved if !self.addresses.is_empty() => Some(Form {
+                fields:self.addresses.iter().enumerate().map(|(id,ip)| Field {id,label:if self.selected.contains(ip) {"[x] Отмечен"} else {"[ ] Не отмечен"},value:SocketAddr::new(*ip,443).to_string(),hint:"Space — отметить адрес. Enter — предпросмотр точных целей. Права проверяются отдельно."}).collect(),
+                selected:self.address_index,lead:format!("Выбрано: {}/{}. DNS не разрешает активную проверку.",self.selected_count(),MAX_PINNED_IPS),error:if self.fresh(){String::new()}else{"Ответ DNS устарел. Вернитесь в каталог и повторите запрос.".into()},
+            }),
+            _=>None,
+        }
+    }
+    pub(crate) fn select_field(&mut self,id:usize) {
+        match self.state {
+            DomainState::Catalog if id<self.domains.len()=>{self.domain_index=id;self.reset_pins();}
+            DomainState::Resolved if id<self.addresses.len()=>self.address_index=id,
+            _=>{}
+        }
+    }
+
     pub(crate) fn body(&self) -> String {
         let mut out = String::from(
             "F-18: домены из 14 seed-каталога; DNS и TLS только с двумя согласиями\n\n",

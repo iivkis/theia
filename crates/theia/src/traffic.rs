@@ -1,11 +1,11 @@
 //! Privacy-preserving, process-local application DATA accounting.
 //! Counts complete relay writes/accepted frames, not IP/wire bytes or peer ACKs.
 //! No per-destination state, payload, credentials, unbounded history or I/O.
-use crate::Role;
+use crate::{tui_widgets::{self, ACCENT, MUTED, SURFACE, TEXT}, Role};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, Paragraph, Sparkline, Wrap},
+    widgets::{Block, Borders, Paragraph, Sparkline, Wrap},
     Frame,
 };
 use std::collections::VecDeque;
@@ -146,22 +146,19 @@ impl Monitor {
     /// Render only measured process-local aggregates. Each transport uses
     /// the same chart scale; the history is bounded to 60 sampled intervals.
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        frame.render_widget(Clear, area);
-        let border = Style::default().fg(Color::DarkGray);
+        tui_widgets::canvas(frame, area);
         if area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
             frame.render_widget(
                 Paragraph::new(self.body())
                     .wrap(Wrap { trim: false })
                     .block(
-                        Block::default()
-                            .title(" Монитор трафика ")
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Cyan)),
+                        tui_widgets::section(" Монитор трафика ", true),
                     ),
                 area,
             );
             return;
         }
+        let area = Rect::new(area.x, area.y, area.width, area.height.min(if area.width >= 86 { 25 } else { 36 }));
         let layout = Layout::vertical([
             Constraint::Length(4),
             Constraint::Min(1),
@@ -178,13 +175,10 @@ impl Monitor {
             .iter()
             .map(|s| s.opened)
             .fold(0u64, u64::saturating_add);
-        let scope = format!("Активные relay: {active}   •   Всего открыто: {opened}\nТолько DATA текущего процесса, не сетевые байты и не подтверждение доставки.");
+        let scope = format!("Активные туннели: {active}   •   Всего открыто: {opened}\nДанные этого процесса без служебного трафика; доставка не подтверждается.");
         frame.render_widget(
             Paragraph::new(scope).wrap(Wrap { trim: true }).block(
-                Block::default()
-                    .title(" Обзор ")
-                    .borders(Borders::ALL)
-                    .border_style(border),
+                tui_widgets::section(" Обзор ", false),
             ),
             layout[0],
         );
@@ -204,19 +198,16 @@ impl Monitor {
             .max(1);
         for (i, panel) in panels.iter().copied().enumerate() {
             let color = if i == 0 {
-                Color::Cyan
+                ACCENT
             } else {
-                Color::LightBlue
+                Color::Rgb(170, 180, 250)
             };
             let title = if i == 0 {
                 " H2 · TCP "
             } else {
                 " H3 · QUIC "
             };
-            let block = Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(color));
+            let block = tui_widgets::section(title, i == 0);
             let inner = block.inner(panel);
             frame.render_widget(block, panel);
             let regions =
@@ -224,13 +215,13 @@ impl Monitor {
             let s = self.current[i];
             let (up, down) = self.rate[i];
             let (up_rate, down_rate) = if self.history.is_empty() {
-                ("…".into(), "…".into())
+                ("ожидание".into(), "ожидание".into())
             } else {
                 (format!("{} /с", bytes(up)), format!("{} /с", bytes(down)))
             };
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Активно: {}  •  Всего: {}\n↑ {up_rate}  ·  {}\n↓ {down_rate}  ·  {}",
+                    "Активно: {}  •  Всего: {}\n↑ Отправлено: {}  ·  {up_rate}\n↓ Получено: {}  ·  {down_rate}",
                     s.active,
                     s.opened,
                     bytes(s.upload),
@@ -240,37 +231,51 @@ impl Monitor {
                 regions[0],
             );
             let history: Vec<_> = self.history.iter().map(|sample| sample[i]).collect();
+            if history.is_empty() || history.iter().all(|&v| v == 0) {
+                let message = if history.is_empty() {
+                    "Сбор первого измерения скорости…\nЗдесь появится история передачи данных."
+                } else {
+                    "В измеренных интервалах нет трафика.\nГрафик появится при передаче данных."
+                };
+                frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: true })
+                    .block(tui_widgets::section(" Скорость передачи ", false))
+                    .style(Style::default().fg(tui_widgets::MUTED)), regions[1]);
+                continue;
+            }
             let chart = Sparkline::default()
                 .data(&history)
                 .max(max)
                 .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
                 .block(
                     Block::default()
-                        .title(" ↑+↓ DATA/с · 60 отсчётов ")
-                        .borders(Borders::TOP),
+                        .title(" ↑+↓ скорость · до 60 измерений ")
+                        .borders(Borders::TOP).border_style(Style::default().fg(MUTED)),
                 );
             frame.render_widget(chart, regions[1]);
         }
         let note = format!(
-            "Общая шкала: {} /с  •  1 с  •  внешние сервисы не измеряются  •  Esc назад",
-            bytes(max)
+            "Общая шкала: {}  •  обновление 1 с  •  внешние сервисы не измеряются  •  Esc назад",
+            if self.history.is_empty() || self.history.iter().all(|sample| sample.iter().all(|&v| v == 0)) { "нет данных для графика".into() } else { format!("{} /с", bytes(max)) }
         );
         frame.render_widget(
             Paragraph::new(note)
                 .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).border_style(border)),
+                .style(Style::default().bg(SURFACE).fg(TEXT)),
             layout[2],
         );
     }
 
     pub(crate) fn body(&self) -> String {
-        let mut result = String::from("Только трафик текущего процесса Theia; внешние сервисы не измеряются.\nDATA после OPEN_OK, без TLS/HTTP/QUIC overhead. Не подтверждение доставки peer.\n");
+        let mut result = String::from("Только трафик текущего процесса Theia; внешние сервисы не измеряются.\nДанные после открытия туннеля, без служебного трафика. Доставка не подтверждается.\n");
         for (i, s) in self.current.iter().enumerate() {
             let transport = if i == 0 { "H2" } else { "H3" };
             let (up, down) = self.rate[i];
             result.push_str(&format!(
-                "\n{transport} • открыто сейчас: {} • всего relay: {}\n↑ {} ({} /с)   ↓ {} ({} /с)\n",
-                s.active, s.opened, bytes(s.upload), bytes(up), bytes(s.download), bytes(down)
+                "\n{transport} • открыто сейчас: {} • всего туннелей: {}\n↑ {} ({})   ↓ {} ({})\n",
+                s.active, s.opened, bytes(s.upload),
+                if self.history.is_empty() { "ожидание".into() } else { format!("{} /с", bytes(up)) },
+                bytes(s.download),
+                if self.history.is_empty() { "ожидание".into() } else { format!("{} /с", bytes(down)) }
             ));
         }
         if self.history.is_empty() {
@@ -370,13 +375,13 @@ mod tests {
                 assert!(screen.contains("МиБ"));
                 assert!(screen.contains("ГиБ"));
                 if w >= 70 {
-                    assert!(screen.contains("Активные relay: 5"));
+                    assert!(screen.contains("Активные туннели: 5"));
                     assert!(screen.contains("Всего открыто: 30"));
                     assert!(screen.contains("Общая шкала"));
                     if sampled {
                         assert!(screen.contains("12.0 КиБ"));
                     } else {
-                        assert!(screen.contains("…"));
+                        assert!(screen.contains("Сбор первого измерения"));
                     }
                 }
             }
@@ -384,6 +389,22 @@ mod tests {
         assert_eq!(bytes(123), "123 Б");
         assert_eq!(bytes(1024 * 1024), "1.00 МиБ");
         assert_eq!(bytes(1024 * 1024 * 1024), "1.00 ГиБ");
+    }
+
+    #[test]
+    fn idle_monitor_distinguishes_unsampled_and_measured_zero() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut monitor = Monitor::new(Role::Client);
+        for sampled in [false, true] {
+            if sampled { monitor.history.push_back([0, 0]); }
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| {
+                let area = frame.area();
+                monitor.render(frame, area);
+            }).unwrap();
+            let screen: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+            assert!(screen.contains(if sampled { "В измеренных интервалах нет трафика" } else { "Сбор первого измерения" }));
+        }
     }
 
     #[test]

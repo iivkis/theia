@@ -444,7 +444,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
     def issue(tty, name):
         before = set(base.glob(".theia-export-*/invitation.theia"))
         tty.send("u")
-        tty.wait("ID пользователя")
+        tty.wait("Имя пользователя")
         tty.send(name + "\r")
         tty.wait("Подтверждение нового пользователя")
         tty.send("y")
@@ -461,7 +461,6 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             assert path.read_text(encoding="utf-8") not in tty.raw
         revision(binary, 1)
         tty.send("\x1b")
-        tty.wait("Параметры · Enter")
         return path
 
     server_cmd = [binary, "tui", "--role", "server", "--config", str(server)]
@@ -514,7 +513,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Параметры · Enter")
         original = client.read_bytes()
         tty.send("i")
-        tty.wait("F-14: импорт подключения")
+        tty.wait("Импорт подключения")
         tty.send(str(own_link) + "\r")
         tty.wait("F-14: безопасный предпросмотр подключения")
         tty.send("c")
@@ -540,7 +539,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Headless Apply: revision=1")
         assert client_revision(1)
         tty.send("n")
-        tty.wait("h: headless Apply")
+        tty.wait("Настройки внешнего клиента")
         assert client_revision(1)
         tty.send("h")
         tty.wait("Headless Apply: revision=1")
@@ -555,9 +554,9 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
 
         def enroll():
             tty.send("i")
-            tty.wait("F-14: импорт подключения")
+            tty.wait("Импорт подключения")
             tty.send(str(reality_link) + "\r")
-            tty.wait("Отдельный admission-файл")
+            tty.wait("Файл допуска (admission)")
             tty.send(admission + "\t")
             tty.send(fingerprint + "\r")
             tty.wait("ПРЕДПРОСМОТР: fingerprint совпал")
@@ -571,7 +570,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         assert client.read_bytes() == saved
         assert len(set(base.glob(".theia-enroll-*")) - before) == 1
         tty.send("g")
-        tty.wait("Регистрация уже подготовленных материалов")
+        tty.wait("Материалы подготовлены")
         tty.send("\x1b")
         tty.wait("Параметры · Enter")
         assert set(base.glob(".theia-enroll-*")) == before
@@ -580,7 +579,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         # Re-run and actually register: still no implicit activation.
         enroll()
         tty.send("g")
-        tty.wait("Регистрация уже подготовленных материалов")
+        tty.wait("Материалы подготовлены")
         tty.send("\x15reality-profile\r")
         tty.wait("Register REALITY profile")
         assert client.read_bytes() == saved
@@ -592,10 +591,10 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Параметры · Enter")
+        tty.wait("Защищённое подключение")
         assert read_config(client)["client"]["active_profile"] == "reality-profile"
         tty.send("V")
-        tty.wait("s: запустить локальный runtime")
+        tty.wait("Запустить подключение")
         tty.send("s")
         tty.wait("Запустить сохранённый активный профиль")
         tty.send("y")
