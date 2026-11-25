@@ -54,7 +54,22 @@ fn load_file(
         .map_err(|_| ClientError::Configuration)
 }
 
+fn read_token(profile: &Profile) -> Result<zeroize::Zeroizing<String>, ClientError> {
+    let token = if let Some(name) = profile.auth_token.strip_prefix("env:") {
+        zeroize::Zeroizing::new(std::env::var(name).map_err(|_| ClientError::Configuration)?)
+    } else {
+        let bytes = load_file(&profile.auth_token, 43, true)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?;
+        zeroize::Zeroizing::new(text.to_owned())
+    };
+    if token.len() != 43 { return Err(ClientError::Configuration); }
+    Ok(token)
+}
+
 async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
+    if profile.tls_profile == "smart-reality" || profile.reality_profile.is_some() {
+        return RealityClient::prepare(profile).await.map(Arc::new).map(ProxyClient::Reality);
+    }
     let cert = load_file(
         profile
             .tls_ca
@@ -69,14 +84,8 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             .add(cert.map_err(|_| ClientError::Configuration)?)
             .map_err(|_| ClientError::Configuration)?;
     }
-    let token = if let Some(name) = profile.auth_token.strip_prefix("env:") {
-        zeroize::Zeroizing::new(std::env::var(name).map_err(|_| ClientError::Configuration)?)
-    } else {
-        let bytes = load_file(&profile.auth_token, 43, true)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?;
-        zeroize::Zeroizing::new(text.to_owned())
-    };
-    if token.len() != 43 || roots.is_empty() {
+    let token = read_token(profile)?;
+    if roots.is_empty() {
         return Err(ClientError::Configuration);
     }
     // F-13: runtime selection must match strict typed TOML validation even
@@ -189,6 +198,208 @@ enum ProxyClient {
     H2(Arc<H2Client>),
     H3(Arc<H3Client>),
     Auto(Arc<AutoClient>),
+    Reality(Arc<RealityClient>),
+}
+
+
+/// A pinned endpoint and trust-store generation for the production proxy.
+/// New logical tunnels re-read the persistent trust floor. A changed
+/// descriptor creates new carrier pools and an independent fallback cache;
+/// established tunnels retain their own transport leases.
+enum RealityCarrier {
+    H2(Arc<H2Client>),
+    H3(Arc<H3Client>),
+    Auto(Arc<AutoClient>),
+}
+struct RealityGeneration {
+    value: crate::descriptor::Verified,
+    carrier: RealityCarrier,
+    credential_digest: [u8;32],
+    last_transport:std::sync::atomic::AtomicU8,
+    last_refresh:std::sync::atomic::AtomicU8,
+}
+pub(crate) struct RealityClient {
+    profile: Profile,
+    remote: SocketAddr,
+    current: tokio::sync::Mutex<Arc<RealityGeneration>>,
+    changed: Notify,
+}
+impl RealityClient {
+    fn now() -> Result<u64, ClientError> {
+        crate::reference_health::unix_now().map_err(|_| ClientError::Tls)
+    }
+    async fn prepare(profile: &Profile) -> Result<Self, ClientError> {
+        // No DNS/credential use before the enrollment and independent trust
+        // anchor have been checked.
+        let enrollment = crate::reality_config::pinned_client(profile).map_err(|_| ClientError::Configuration)?;
+        let value = enrollment.load(Self::now()?).map_err(|_| ClientError::Tls)?;
+        let remote = resolve_server(profile).await?;
+        let first = Self::build(profile, remote, &enrollment, value, None)?;
+        Ok(Self { profile: profile.clone(), remote, current: tokio::sync::Mutex::new(Arc::new(first)),
+            changed: Notify::new() })
+    }
+    fn build(profile: &Profile, remote: SocketAddr, enrollment: &crate::reality_bootstrap::Profile,
+        value: crate::descriptor::Verified, expected_credential: Option<[u8;32]>) -> Result<RealityGeneration, ClientError> {
+        if value.descriptor().scope.endpoint != profile.server { return Err(ClientError::Configuration); }
+        let secret = Arc::new(enrollment.admission().map_err(|_| ClientError::Tls)?);
+        let token = read_token(profile)?;
+        use sha2::{Digest, Sha256};
+        let credential_digest: [u8;32] = Sha256::digest(token.as_bytes()).into();
+        if expected_credential.is_some_and(|expected| expected != credential_digest) {
+            return Err(ClientError::Configuration);
+        }
+        let modes = value.effective_modes();
+        let ttl = Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s));
+        let timeout = Duration::from_millis(u64::from(profile.quic_connect_timeout_ms));
+        let h2 = if modes.h2 {
+            Some(Arc::new(H2Client::admitted_runtime(remote, &token, &value, secret.clone())?
+                .with_connection_pool()))
+        } else { None };
+        let h3 = if modes.h3 {
+            Some(Arc::new(H3Client::admitted_runtime(remote, &token, &value, secret)?
+                .with_connect_timeout(timeout)?.with_connection_pool()))
+        } else { None };
+        let carrier = match (h2,h3) {
+            (Some(h2),Some(h3)) => RealityCarrier::Auto(Arc::new(AutoClient {
+                h2, h3, ttl, negative: Mutex::new(NegativeCache::default()), cache_changed: Notify::new(),
+            })),
+            (Some(h2),None) => RealityCarrier::H2(h2),
+            (None,Some(h3)) => RealityCarrier::H3(h3),
+            _ => return Err(ClientError::Configuration),
+        };
+        Ok(RealityGeneration { value, carrier, credential_digest,last_transport:std::sync::atomic::AtomicU8::new(0),last_refresh:std::sync::atomic::AtomicU8::new(0) })
+    }
+    async fn generation(&self) -> Result<Arc<RealityGeneration>, ClientError> {
+        let mut slot = self.current.lock().await;
+        let enrollment = crate::reality_config::pinned_client(&self.profile).map_err(|_| ClientError::Configuration)?;
+        let value = enrollment.load(Self::now()?).map_err(|_| ClientError::Tls)?;
+        use sha2::{Digest,Sha256};
+        let credential_digest: [u8;32] = Sha256::digest(read_token(&self.profile)?.as_bytes()).into();
+        if credential_digest != slot.credential_digest {
+            return Err(ClientError::Configuration);
+        }
+        let old = &slot.value;
+        if old.descriptor().scope != value.descriptor().scope
+            || value.descriptor().revision < old.descriptor().revision { return Err(ClientError::Tls); }
+        if old.signer() == value.signer() {
+            if old.compare(&value).map_err(|_| ClientError::Tls)? == crate::descriptor::Change::Unchanged {
+                return Ok(slot.clone());
+            }
+        } else if value.descriptor().revision <= old.descriptor().revision {
+            return Err(ClientError::Tls);
+        }
+        let next = Arc::new(Self::build(&self.profile, self.remote, &enrollment, value,
+            Some(slot.credential_digest))?);
+        *slot = next.clone();
+        self.changed.notify_one();
+        Ok(next)
+    }
+    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+        let generation = self.generation().await?;
+        let result=match &generation.carrier {
+            RealityCarrier::H2(h2) => h2.open(address, port).await.map(Box::new).map(ProxyTunnel::H2),
+            RealityCarrier::H3(h3) => h3.open(address, port).await.map(Box::new).map(ProxyTunnel::H3),
+            RealityCarrier::Auto(auto) => auto.open(address, port).await,
+        };
+        if let Ok(tunnel)=&result{
+            generation.last_transport.store(match tunnel{ProxyTunnel::H2(_)=>2,ProxyTunnel::H3(_)=>3},std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    pub(crate) async fn runtime_report(&self)->String{
+        use std::sync::atomic::Ordering;
+        let generation=self.current.lock().await.clone();
+        let value=&generation.value;
+        let valid=Self::now().is_ok_and(|now|value.check_time(now).is_ok());
+        let policy=match &generation.carrier{RealityCarrier::H2(_)=>"h2",RealityCarrier::H3(_)=>"h3",RealityCarrier::Auto(_)=>"auto"};
+        let fallback=match &generation.carrier{
+            RealityCarrier::Auto(auto)=>auto.negative.lock().ok().map(|cache|{
+                cache.route.is_some()&&cache.route==route_source(auto.h3.remote())&&cache.expires.is_some_and(|until|until>Instant::now())
+            }),
+            _=>None,
+        };
+        let transport=match generation.last_transport.load(Ordering::Relaxed){2=>"H2",3=>"H3",_=>"ещё нет подтверждённого OPEN"};
+        let refresh=match generation.last_refresh.load(Ordering::Relaxed){1=>"успешно",2=>"отклонено/недоступно",_=>"ещё не выполнялось"};
+        // Read the pinned durable state without refreshing or changing it.
+        let profile=self.profile.clone();
+        let trust=tokio::task::spawn_blocking(move||crate::reality_config::pinned_client(&profile).ok()
+            .and_then(|p|p.load(Self::now().ok()?).ok())).await.ok().flatten();
+        let trust_state=match trust{Some(v) if v.payload_sha256()==value.payload_sha256()=>"совпадает",Some(_)=>"изменилось, новые запросы перепроверят",None=>"не подтверждено, новые запросы могут быть отклонены"};
+        format!("Loopback listeners работают (не доказательство удалённого соединения)\nrevision={} reference_index={} valid_now={valid}\npolicy={policy} last_open={transport}\nH3 negative cache: {}\nDescriptor refresh: {refresh}\nSaved trust: {trust_state}",
+            value.descriptor().revision,value.descriptor().active_reference,
+            fallback.map_or("не применяется",|v|if v{"активен"}else{"не активен"}))
+    }
+    async fn refresh(&self, generation: &RealityGeneration) -> Result<(), ClientError> {
+        let enrollment = crate::reality_config::pinned_client(&self.profile).map_err(|_| ClientError::Configuration)?;
+        let store = enrollment.store().map_err(|_| ClientError::Tls)?;
+        let signed = match &generation.carrier {
+            RealityCarrier::H2(h2) => h2.fetch_identity_descriptor().await?,
+            RealityCarrier::H3(h3) => h3.fetch_identity_descriptor().await?,
+            // Same route-generation and two-silent-attempt policy as the
+            // ordinary auto tunnel. Authentication/HTTP errors are terminal.
+            RealityCarrier::Auto(auto) => auto.fetch_identity_document(false).await?,
+        };
+        store.update_matching(&signed, &generation.value, Self::now()?).map_err(|_| ClientError::Tls)?;
+        let current=store.load(Self::now()?).map_err(|_|ClientError::Tls)?;
+        if current.descriptor().next_identity.is_some(){
+            // Read the successor only on the still-authenticated old
+            // identity. Its key must match the signed announcement and
+            // its operational parameters must match exactly.
+            let successor=match &generation.carrier {
+                RealityCarrier::H2(h2)=>h2.fetch_identity_document(true).await?,
+                RealityCarrier::H3(h3)=>h3.fetch_identity_document(true).await?,
+                RealityCarrier::Auto(auto)=>auto.fetch_identity_document(true).await?,
+            };
+            let now=Self::now()?;
+            let preview=enrollment.preview_promotion(&successor,now).map_err(|_|ClientError::Tls)?;
+            if preview.expected_revision!=current.descriptor().revision
+                || preview.current_identity_sha256!=crate::reality_bootstrap::fingerprint(current.signer()){
+                return Err(ClientError::Tls);
+            }
+            // Prepare a carrier for the proposed signer before committing
+            // the CAS. Verify actual successor TLS identity on a new
+            // connection; possession is not inferred from a signed file.
+            let (_,_,candidate)=store.preview_promotion_bound(&successor,now).map_err(|_|ClientError::Tls)?;
+            let next=Self::build(&self.profile,self.remote,&enrollment,candidate,Some(generation.credential_digest))?;
+            let seen=match &next.carrier{
+                RealityCarrier::H2(h2)=>h2.fetch_identity_descriptor().await?,
+                RealityCarrier::H3(h3)=>h3.fetch_identity_descriptor().await?,
+                RealityCarrier::Auto(auto)=>auto.fetch_identity_document(false).await?,
+            };
+            if seen!=successor{return Err(ClientError::Tls);}
+            enrollment.promote(&successor,crate::reality_bootstrap::PromotionApproval{
+                expected_revision:preview.expected_revision,snapshot_sha256:preview.snapshot_sha256,
+                document_sha256:preview.document_sha256,next_identity_sha256:preview.next_identity_sha256,
+            },Self::now()?).map_err(|_|ClientError::Tls)?;
+        }
+        Ok(())
+    }
+    async fn maintain(&self) -> Result<(), ClientError> {
+        loop {
+            let generation = match self.generation().await {
+                Ok(value) => value,
+                Err(_) => { tokio::time::sleep(Duration::from_secs(30)).await; continue; }
+            };
+            let background = async {
+                match &generation.carrier {
+                    RealityCarrier::Auto(auto) => auto.maintain().await,
+                    _ => std::future::pending::<Result<(),ClientError>>().await,
+                }
+            };
+            tokio::select! {
+                _ = self.changed.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    // No stale update can overwrite a new store revision;
+                    // update_matching performs a full CAS. Failure never
+                    // authorizes use of an expired/rolled-back generation.
+                    let ok=self.refresh(&generation).await.is_ok();
+                    generation.last_refresh.store(if ok{1}else{2},std::sync::atomic::Ordering::Relaxed);
+                }
+                result = background => return result,
+            }
+        }
+    }
 }
 
 /// The OS chooses the UDP source address for the pinned server. Connecting
@@ -388,6 +599,25 @@ impl AutoClient {
         }
     }
 
+    async fn fetch_identity_document(&self,successor:bool) -> Result<String, ClientError> {
+        let (generation,cached) = self.observe()?;
+        if !cached {
+            for attempt in 0..AUTO_QUIC_ATTEMPTS {
+                match self.h3.fetch_identity_document(successor).await {
+                    Ok(value) => { self.complete(generation,false)?; return Ok(value); }
+                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
+                        if self.observe()?.0 != generation { return Err(ClientError::QuicUnreachable); }
+                    }
+                    Err(ClientError::QuicUnreachable) => {
+                        if !self.complete(generation,true)? { return Err(ClientError::QuicUnreachable); }
+                    }
+                    Err(error) => { self.complete(generation,false)?; return Err(error); }
+                }
+            }
+        }
+        self.h2.fetch_identity_document(successor).await
+    }
+
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let (generation, cached) = self.observe()?;
         crate::diag!(
@@ -498,6 +728,7 @@ impl ProxyClient {
                 .map(Box::new)
                 .map(ProxyTunnel::H3),
             Self::Auto(client) => client.open(address, port).await,
+            Self::Reality(client) => client.open(address, port).await,
         }
     }
 }
@@ -523,6 +754,99 @@ pub async fn run_file_with_system_proxy(config_path: &Path) -> Result<(), Client
     run_file_inner(config_path, true).await
 }
 
+// The process-level generation owns the exact saved config. Old accepted
+// sockets retain their carrier clone; only new accepts use the new snapshot.
+#[cfg(any(target_os="linux",target_os="windows"))]
+struct ClientView{
+    document:config::ClientDocument,
+    digest:[u8;32],
+    revision:u64,
+    client:ProxyClient,
+}
+#[cfg(any(target_os="linux",target_os="windows"))]
+pub(crate) struct ClientRuntime{
+    path:std::path::PathBuf,
+    slot:tokio::sync::watch::Sender<Arc<ClientView>>,
+    // Bound one staging operation per process, with no commit on cancellation.
+    stage:tokio::sync::Mutex<()>,
+}
+#[cfg(any(target_os="linux",target_os="windows"))]
+impl ClientRuntime{
+    fn new(path:std::path::PathBuf,document:config::ClientDocument,digest:[u8;32],client:ProxyClient)->Arc<Self>{
+        let (slot,_)=tokio::sync::watch::channel(Arc::new(ClientView{document,digest,revision:1,client}));
+        Arc::new(Self{path,slot,stage:tokio::sync::Mutex::new(())})
+    }
+    pub(crate) async fn status(&self)->(u64,[u8;32],u64,u8,bool){
+        let view=self.slot.borrow().clone();
+        let (desc,transport,fallback)=match &view.client{
+            ProxyClient::Reality(r)=>{
+                let g=r.current.lock().await.clone();
+                let fallback=match &g.carrier{
+                    RealityCarrier::Auto(a)=>a.negative.lock().ok().is_some_and(|c|c.route.is_some()
+                        && c.route==route_source(a.h3.remote()) && c.expires.is_some_and(|t|t>Instant::now())),
+                    _=>false,
+                };
+                (g.value.descriptor().revision,g.last_transport.load(std::sync::atomic::Ordering::Relaxed),fallback)
+            }
+            _=>(0,0,false),
+        };
+        (view.revision,view.digest,desc,transport,fallback)
+    }
+    async fn candidate(&self,previous:&ClientView,digest:[u8;32])->Result<(config::ClientDocument,ProxyClient),ClientError>{
+        let raw=saved_client_bytes(&self.path,digest)?;
+        let Config::Client(candidate)=config::parse(std::str::from_utf8(&raw).map_err(|_|ClientError::Configuration)?)
+            .map_err(|_|ClientError::Configuration)? else{return Err(ClientError::Configuration);};
+        // Structural loopback and OS proxy changes require explicit stop/start.
+        if candidate.client.proxy!=previous.document.client.proxy ||
+            candidate.management!=previous.document.management{return Err(ClientError::Configuration);}
+        let old=previous.document.client.profiles.iter().find(|p|p.id==previous.document.client.active_profile)
+            .ok_or(ClientError::Configuration)?;
+        let next=candidate.client.profiles.iter().find(|p|p.id==candidate.client.active_profile)
+            .ok_or(ClientError::Configuration)?;
+        // No in-place replacement of any existing independently enrolled root.
+        for prior in &previous.document.client.profiles{
+            if let Some(new)=candidate.client.profiles.iter().find(|p|p.id==prior.id){
+                if prior.reality_profile!=new.reality_profile||prior.tls_profile!=new.tls_profile{
+                    return Err(ClientError::Configuration);
+                }
+            }
+        }
+        if old.tls_profile!=next.tls_profile{return Err(ClientError::Configuration);}
+        let client=load_client(next).await?;
+        saved_client_bytes(&self.path,digest)?;
+        Ok((candidate,client))
+    }
+    pub(crate) async fn change(&self,expected:u64,digest:[u8;32],apply:bool)->Result<u64,ClientError>{
+        let _stage=self.stage.try_lock().map_err(|_|ClientError::Configuration)?;
+        let previous=self.slot.borrow().clone();
+        if previous.revision!=expected || previous.digest==digest{return Err(ClientError::Configuration);}
+        let (document,client)=self.candidate(&previous,digest).await?;
+        if !apply{return Ok(expected);}
+        let revision=expected.checked_add(1).ok_or(ClientError::Configuration)?;
+        // No await between final exact-byte recheck and publication.
+        saved_client_bytes(&self.path,digest)?;
+        self.slot.send_replace(Arc::new(ClientView{document,digest,revision,client}));
+        Ok(revision)
+    }
+    async fn maintain(&self)->Result<(),ClientError>{
+        let mut changes=self.slot.subscribe();
+        loop{
+            let view=changes.borrow_and_update().clone();
+            let maintenance=async{
+                match &view.client{
+                    ProxyClient::Auto(a)=>a.maintain().await,
+                    ProxyClient::Reality(r)=>r.maintain().await,
+                    _=>std::future::pending::<Result<(),ClientError>>().await,
+                }
+            };
+            tokio::select!{
+                result=maintenance=>return result,
+                result=changes.changed()=>if result.is_err(){return Err(ClientError::Io);},
+            }
+        }
+    }
+}
+
 async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result<(), ClientError> {
     crate::diag!(
         Info,
@@ -530,12 +854,36 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
         "config_read_begin",
         "system_proxy_requested" = Value::Flag(enable_system_proxy)
     );
-    let Config::Client(document) =
-        config::read_file(config_path).map_err(|_| ClientError::Configuration)?
-    else {
-        return Err(ClientError::Configuration);
+    let raw=zeroize::Zeroizing::new(config::editor_bytes(config_path).map_err(|_|ClientError::Configuration)?);
+    let Config::Client(document)=config::parse(std::str::from_utf8(&raw).map_err(|_|ClientError::Configuration)?)
+        .map_err(|_|ClientError::Configuration)? else{return Err(ClientError::Configuration);};
+    let (http,socks,client)=prepare_proxy(&document).await?;
+    #[cfg(windows)]
+    let http_bound=http.local_addr().map_err(|_|ClientError::Io)?;
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let managed={
+        use sha2::{Digest,Sha256};
+        let digest:[u8;32]=Sha256::digest(raw.as_slice()).into();
+        saved_client_bytes(config_path,digest)?;
+        ClientRuntime::new(std::path::absolute(config_path).map_err(|_|ClientError::Configuration)?,document.clone(),digest,client.clone())
     };
-    let (http, socks, client) = prepare_proxy(&document).await?;
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let control=crate::management::client_server(managed.clone()).map_err(|_|ClientError::Configuration)?;
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let serving=async move{
+        let management=async move{
+            match control{
+                Some(server)=>server.serve().await.map_err(|_|ClientError::Io),
+                None=>std::future::pending::<Result<(),ClientError>>().await,
+            }
+        };
+        tokio::select!{
+            result=serve_managed_proxy(http,socks,managed)=>result,
+            result=management=>result,
+        }
+    };
+    #[cfg(not(any(target_os="linux",target_os="windows")))]
+    let serving=serve_proxy(http,socks,client);
     #[cfg(windows)]
     if enable_system_proxy {
         // A config declaration is insufficient by itself: this branch
@@ -543,14 +891,13 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
         if document.client.proxy.system_proxy != config::SystemProxy::Manual {
             return Err(ClientError::SystemProxy);
         }
-        let bound = http.local_addr().map_err(|_| ClientError::Io)?;
-        let mut lease = crate::windows_system_proxy::OwnedProxy::apply(bound)
+        let mut lease = crate::windows_system_proxy::OwnedProxy::apply(http_bound)
             .map_err(|_| ClientError::SystemProxy)?;
         // Ctrl+C is the normal scoped exit. A killed process cannot execute
         // destructors; persistent registry journal permits explicit recovery
         // on the next invocation, without overwriting a foreign proxy change.
         let result = tokio::select! {
-            result = serve_proxy(http, socks, client) => result,
+            result = serving => result,
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|_| ClientError::SystemProxy)
             }
@@ -562,7 +909,7 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     if enable_system_proxy {
         return Err(ClientError::SystemProxy);
     }
-    serve_proxy(http, socks, client).await
+    serving.await
 }
 
 /// Shared startup preflight: never changes the OS proxy or claims an
@@ -603,16 +950,16 @@ async fn prepare_proxy(
 /// A Windows TUI starts the local client independently of OS proxy consent.
 /// The exact saved TOML is parsed once; subsequent activation must still
 /// match that editor revision. No credential or source text leaves this API.
-#[cfg(windows)]
 pub(crate) struct PreparedLocalProxy {
     http: TcpListener,
     socks: TcpListener,
     client: ProxyClient,
+    #[cfg(windows)]
     pub(crate) manual: bool,
 }
 
-#[cfg(windows)]
 impl PreparedLocalProxy {
+    #[cfg(windows)]
     pub(crate) async fn start(path: &Path, expected: [u8; 32]) -> Result<Self, ClientError> {
         let bytes = saved_client_bytes(path, expected)?;
         let source = std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?;
@@ -630,16 +977,53 @@ impl PreparedLocalProxy {
         })
     }
 
+    pub(crate) async fn start_reality(path:&Path,expected:[u8;32],id:&str)->Result<Self,ClientError>{
+        let bytes=saved_client_bytes(path,expected)?;
+        let Config::Client(document)=config::parse(std::str::from_utf8(&bytes).map_err(|_|ClientError::Configuration)?)
+            .map_err(|_|ClientError::Configuration)? else{return Err(ClientError::Configuration);};
+        if document.client.active_profile!=id || !document.client.profiles.iter().any(|p|p.id==id&&p.tls_profile=="smart-reality"){
+            return Err(ClientError::Configuration);
+        }
+        let (http,socks,client)=prepare_proxy(&document).await?;
+        if !matches!(&client,ProxyClient::Reality(_)){return Err(ClientError::Configuration);}
+        // Detect edits during DNS/bind preflight before accepting traffic.
+        saved_client_bytes(path,expected)?;
+        Ok(Self{http,socks,client,#[cfg(windows)] manual:document.client.proxy.system_proxy==config::SystemProxy::Manual})
+    }
+
+    pub(crate) async fn serve_reality_observed(self,mut stop:tokio::sync::oneshot::Receiver<()>,
+        report:Arc<Mutex<String>>)->Result<(),ClientError>{
+        let ProxyClient::Reality(reality)=&self.client else{return Err(ClientError::Configuration);};
+        let reality=reality.clone();
+        let monitor=async move{
+            loop{
+                let status=reality.runtime_report().await;
+                if let Ok(mut slot)=report.lock(){*slot=status;}
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        };
+        tokio::select!{
+            result=serve_proxy(self.http,self.socks,self.client)=>result,
+            _=monitor=>Ok(()),
+            _=&mut stop=>Ok(()),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn reality_monitor(&self)->Option<Arc<RealityClient>>{
+        match &self.client{ProxyClient::Reality(r)=>Some(r.clone()),_=>None}
+    }
+    #[cfg(windows)]
     pub(crate) fn http_address(&self) -> Result<SocketAddr, ClientError> {
         self.http.local_addr().map_err(|_| ClientError::Io)
     }
 
+    #[cfg(windows)]
     pub(crate) async fn serve(self) -> Result<(), ClientError> {
         serve_proxy(self.http, self.socks, self.client).await
     }
 }
 
-#[cfg(windows)]
 pub(crate) fn saved_client_bytes(
     path: &Path,
     expected: [u8; 32],
@@ -663,11 +1047,27 @@ pub async fn serve(
     serve_proxy(http, socks, ProxyClient::H2(client)).await
 }
 
-async fn serve_proxy(
-    http: TcpListener,
-    socks: TcpListener,
-    client: ProxyClient,
-) -> Result<(), ClientError> {
+async fn serve_proxy(http:TcpListener,socks:TcpListener,client:ProxyClient)->Result<(),ClientError>{
+    let maintenance=async{
+        match &client{
+            ProxyClient::Auto(a)=>a.maintain().await,
+            ProxyClient::Reality(r)=>r.maintain().await,
+            _=>std::future::pending::<Result<(),ClientError>>().await,
+        }
+    };
+    serve_proxy_loop(http,socks,||client.clone(),maintenance).await
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
+async fn serve_managed_proxy(http:TcpListener,socks:TcpListener,runtime:Arc<ClientRuntime>)->Result<(),ClientError>{
+    serve_proxy_loop(http,socks,||runtime.slot.borrow().client.clone(),runtime.maintain()).await
+}
+
+async fn serve_proxy_loop(
+    http:TcpListener,socks:TcpListener,
+    current:impl Fn()->ProxyClient,
+    maintenance:impl std::future::Future<Output=Result<(),ClientError>>,
+)->Result<(),ClientError>{
     // Preserve the boundary even for callers bypassing TOML validation.
     for listener in [&http, &socks] {
         let addr = listener.local_addr().map_err(|_| ClientError::Io)?;
@@ -688,12 +1088,6 @@ async fn serve_proxy(
     let mut tasks = JoinSet::new();
     // Tied to this accept loop: shutdown or cancellation drops maintenance,
     // including any in-flight QUIC probe, before releasing the profile.
-    let maintenance = async {
-        match &client {
-            ProxyClient::Auto(auto) => auto.maintain().await,
-            _ => std::future::pending::<Result<(), ClientError>>().await,
-        }
-    };
     tokio::pin!(maintenance);
     loop {
         let (socket, is_http) = tokio::select! {
@@ -719,7 +1113,7 @@ async fn serve_proxy(
             );
             continue;
         };
-        let client = client.clone();
+        let client=current();
         tasks.spawn(async move {
             let _slot = slot;
             let result = handle(socket, is_http, &client, session_id).await;
@@ -1007,6 +1401,289 @@ async fn handle(
 #[cfg(test)]
 mod selector_tests {
     use super::*;
+
+    // The public-address reference evidence is synthetic and deliberately
+    // not used by the admitted test branch. All application I/O is loopback;
+    // this does not assert external reference parity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registered_reality_live_rotation_keeps_native_connect_and_socks5_open() {
+        use crate::{
+            descriptor::ClientPolicy,
+            reality_bootstrap as bootstrap,
+            reality_config::{self, Request, ServerRequest, ClientRequest},
+            reality_generation::Manager,
+            reference_health::{self, Evidence, Plan, State, Store, Target},
+        };
+        use sha2::{Digest,Sha256};
+        use std::{path::PathBuf, sync::atomic::{AtomicU64,Ordering}};
+        struct Scratch(PathBuf);
+        impl Drop for Scratch { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let dir = Scratch(std::env::temp_dir().join(format!("theia-reality-native-{}-{}",
+            std::process::id(),SEQUENCE.fetch_add(1,Ordering::Relaxed))));
+        std::fs::create_dir(&dir.0).unwrap();
+        timeout(Duration::from_secs(80), async {
+            let remote = {
+                let mut selected = None;
+                for _ in 0..16 {
+                    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = tcp.local_addr().unwrap();
+                    if let Ok(udp) = std::net::UdpSocket::bind(addr) {
+                        selected = Some(addr); drop(udp); break;
+                    }
+                }
+                selected.unwrap()
+            };
+            let now = reference_health::unix_now().unwrap().saturating_sub(3700);
+            let state = State::new(Plan { schema_version: 1, inbound: "reality-native".into(),
+                endpoint: remote.to_string(), own_ips: vec![remote.ip()],
+                references: vec![Target { server_name: "ref.example.org".into(),
+                    address: "93.184.216.2:443".parse().unwrap() },
+                    Target {server_name:"reserve.example.org".into(),address:"93.184.216.3:443".parse().unwrap()}] },
+                vec![Evidence { h2_status: Some(200), h3_status: Some(200) };2], now).unwrap();
+            let health = dir.0.join("health.toml");
+            Store::new(&health).unwrap().enroll(&state).unwrap();
+            let bundle = dir.0.join("bundle");
+            let digest = state.snapshot_sha256().unwrap();
+            let record = crate::reality_provision::create(&state,digest,&bundle,now).unwrap();
+            let token = [42u8;32];
+            let server_path = dir.0.join("server.toml");
+            let source = include_str!("../../../examples/server.toml")
+                .replace("REPLACE_WITH_64_LOWERCASE_HEX",&format!("{:x}",Sha256::digest(token)));
+            std::fs::write(&server_path,source).unwrap();
+            let request = Request::Server(ServerRequest { health:health.clone(), bundle:bundle.clone(),
+                health_sha256:digest,identity_sha256:record.identity_sha256,listen:remote,
+                grants:vec!["device-a".into()] });
+            let preview = reality_config::prepare(&server_path,&request,now).unwrap();
+            reality_config::apply(&server_path,&request,preview.approval_sha256(),now).unwrap();
+            let Config::Server(mut server_doc) = config::read_file(&server_path).unwrap() else { panic!() };
+            // The template own-TLS inbound has placeholder PEM paths.
+            // Test the registered REALITY branch, not an invalid template.
+            server_doc.server.inbounds.retain(|i| i.id=="reality-native");
+            server_doc.server.policy.allow_private_ips = true;
+            let config = Config::Server(server_doc.clone());
+            let lease = Manager::new(&config,"reality-native",now).unwrap().refresh(now).unwrap();
+            let material = lease.publication().active();
+            let old_signer=material.verified().signer();
+            let successor=crate::identity_tls::Identity::generate(material.identity().scope().clone()).unwrap();
+            let successor_path=dir.0.join("successor.key");
+            successor.save_new(&successor_path).unwrap();
+            let invite = bootstrap::Invitation::public(material.identity(),material.signed(),now).unwrap();
+            let uri = invite.encode().unwrap();
+            let client_path = dir.0.join("client.toml");
+            let mut bearer = crate::client_import::PrivateBearer::create(&client_path,&token).unwrap();
+            let reference = bearer.reference().unwrap();
+            bearer.commit();
+            std::fs::write(&client_path,include_str!("../../../examples/client.toml")).unwrap();
+            for (id,transport) in [("native-h2",Transport::H2),("native-h3",Transport::H3)] {
+                let enrollment = dir.0.join(format!("{id}.toml"));
+                let trust = dir.0.join(format!("{id}-trust.toml"));
+                bootstrap::import(&uri,bootstrap::ImportApproval {
+                    document_sha256:bootstrap::digest(&uri),identity_sha256:invite.fingerprint(),
+                }, &enrollment,&trust,bootstrap::EnrollmentMaterial {
+                    admission_path:&bundle.join("admission.key"),expected_admission:None,
+                    external_token:Some(&reference),
+                },ClientPolicy { transport,xhttp_mode:XhttpMode::StreamOne },now).unwrap();
+                let request = Request::Client(ClientRequest {
+                    enrollment,identity_sha256:invite.fingerprint(),id:id.into(),
+                });
+                let preview = reality_config::prepare(&client_path,&request,now).unwrap();
+                reality_config::apply(&client_path,&request,preview.approval_sha256(),now).unwrap();
+            }
+            // A single signed snapshot is the source of both native carriers.
+            drop(lease);
+            let (started,ready) = tokio::sync::oneshot::channel();
+            let mut server = JoinSet::new();
+            server.spawn(crate::server::run_reality_document_with_ready(server_doc,Some(started)));
+            ready.await.unwrap();
+            let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = echo.local_addr().unwrap();
+            let mut echo_tasks = JoinSet::new();
+            echo_tasks.spawn(async move {
+                let mut sessions=JoinSet::new();
+                loop {
+                    let (mut stream,_) = echo.accept().await.unwrap();
+                    sessions.spawn(async move {
+                        let mut bytes=[0;4];
+                        while stream.read_exact(&mut bytes).await.is_ok(){
+                            stream.write_all(&bytes).await.unwrap();
+                        }
+                    });
+                }
+            });
+            let Config::Client(mut client_doc) = config::read_file(&client_path).unwrap() else { panic!() };
+            let mut established=Vec::new();
+            let mut proxies=Vec::new();
+            let mut managed_clients=Vec::new();
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            let mut headless=None;
+            for (id,socks_mode) in [("native-h2",false),("native-h3",true)] {
+                client_doc.client.active_profile=id.into();
+                let profile = client_doc.client.profiles.iter().find(|p|p.id==id).unwrap();
+                let client = load_client(profile).await.unwrap();
+                let ProxyClient::Reality(managed) = &client else { panic!("wrong security mode") };
+                let current = managed.generation().await.unwrap();
+                managed_clients.push(managed.clone());
+                if let RealityCarrier::H3(h3)=&current.carrier{
+                    // Use the production dispatcher and a real OPEN_OK
+                    // tunnel. Rebind the same Quinn endpoint, not a new
+                    // connection or a new admission handshake.
+                    let tunnel=h3.open(crate::protocol::Address::V4([127,0,0,1]),target.port()).await.unwrap();
+                    let (mut local,remote)=tokio::io::duplex(4096);
+                    let rebind=std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                    rebind.set_nonblocking(true).unwrap();
+                    tunnel.rebind_for_test(rebind).unwrap();
+                    let task=tokio::spawn(tunnel.relay(remote));
+                    local.write_all(b"move").await.unwrap();
+                    let mut bytes=[0;4];
+                    timeout(Duration::from_secs(10),local.read_exact(&mut bytes)).await.unwrap().unwrap();
+                    assert_eq!(&bytes,b"move");
+                    local.write_all(b"stay").await.unwrap();
+                    timeout(Duration::from_secs(10),local.read_exact(&mut bytes)).await.unwrap().unwrap();
+                    assert_eq!(&bytes,b"stay");
+                    drop(local);
+                    task.abort();
+                    let _=task.await;
+                }
+                assert!(match (&current.carrier,socks_mode) {
+                    (RealityCarrier::H2(_),false)|(RealityCarrier::H3(_),true)=>true,
+                    _=>false,
+                });
+                let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let listen = if socks_mode { socks.local_addr().unwrap() } else { http.local_addr().unwrap() };
+                let mut proxy = JoinSet::new();
+                #[cfg(any(target_os="linux",target_os="windows"))]
+                if !socks_mode {
+                    let raw=Config::Client(client_doc.clone()).to_toml().unwrap();
+                    std::fs::write(&client_path,&raw).unwrap();
+                    let digest=Sha256::digest(raw.as_bytes()).into();
+                    let runtime=ClientRuntime::new(client_path.clone(),client_doc.clone(),digest,client);
+                    headless=Some((runtime.clone(),listen));
+                    proxy.spawn(serve_managed_proxy(http,socks,runtime));
+                }else{
+                    proxy.spawn(serve_proxy(http,socks,client));
+                }
+                #[cfg(not(any(target_os="linux",target_os="windows")))]
+                proxy.spawn(serve_proxy(http,socks,client));
+                let mut stream = TcpStream::connect(listen).await.unwrap();
+                if socks_mode {
+                    stream.write_all(&[5,1,0]).await.unwrap();
+                    let mut response = [0;2];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(response,[5,0]);
+                    let mut request = vec![5,1,0,1,127,0,0,1];
+                    request.extend_from_slice(&target.port().to_be_bytes());
+                    stream.write_all(&request).await.unwrap();
+                    let mut response = [0;10];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(&response[..2],&[5,0]);
+                } else {
+                    stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).await.unwrap();
+                    let mut response = vec![0;HTTP_OK.len()];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(response,HTTP_OK);
+                }
+                stream.write_all(b"ping").await.unwrap();
+                let mut bytes=[0;4];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes,b"ping");
+                established.push(stream);
+                proxies.push(proxy);
+            }
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            {
+                use crate::management::{StatusCommand as C,StatusReply as R};
+                async fn ipc(runtime:Arc<ClientRuntime>,command:C)->Result<R,crate::management::ManagementError>{
+                    let (caller,handler)=tokio::io::duplex(1024);
+                    let task=tokio::spawn(crate::management::handle_client(handler,runtime));
+                    let result=crate::management::exchange(caller,command).await;
+                    task.await.unwrap().unwrap();
+                    result
+                }
+                let (runtime,listen)=headless.unwrap();
+                let raw=Config::Client(client_doc.clone()).to_toml().unwrap();
+                std::fs::write(&client_path,&raw).unwrap();
+                let digest:[u8;32]=Sha256::digest(raw.as_bytes()).into();
+                assert!(ipc(runtime.clone(),C::ClientApply{expected_revision:1,candidate_sha256:[0;32]}).await.is_err());
+                assert_eq!(ipc(runtime.clone(),C::ClientPreview{expected_revision:1,candidate_sha256:digest}).await.unwrap(),R::ClientReady{revision:1});
+                assert_eq!(runtime.status().await.0,1);
+                assert_eq!(ipc(runtime.clone(),C::ClientApply{expected_revision:1,candidate_sha256:digest}).await.unwrap(),R::ClientApplied{revision:2});
+                assert!(ipc(runtime.clone(),C::ClientApply{expected_revision:1,candidate_sha256:digest}).await.is_err());
+                let mut stream=TcpStream::connect(listen).await.unwrap();
+                stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).await.unwrap();
+                let mut response=vec![0;HTTP_OK.len()];
+                stream.read_exact(&mut response).await.unwrap();
+                assert_eq!(response,HTTP_OK);
+                stream.write_all(b"swap").await.unwrap();
+                let mut bytes=[0;4];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes,b"swap");
+                assert!(matches!(ipc(runtime.clone(),C::ClientStatus).await.unwrap(),R::ClientRunning{revision:2,transport:3,..}));
+                for stream in &mut established{
+                    stream.write_all(b"keep").await.unwrap();
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes,b"keep");
+                }
+            }
+            let publication=crate::identity_publication::Publication::new(&bundle.join("publication.toml")).unwrap();
+            let now=reference_health::unix_now().unwrap();
+            let store=Store::new(&health).unwrap();
+            let good=Evidence{h2_status:Some(200),h3_status:Some(200)};
+            store.fixture_record(vec![Evidence::default(),good.clone()],now-301).unwrap();
+            store.fixture_record(vec![Evidence::default(),good],now-1).unwrap();
+            // The maintenance worker, not the test, performs the failover.
+            // Both clients retain the original signed SNI until refresh.
+            for managed in &managed_clients{
+                for _ in 0..20{
+                    let generation=managed.generation().await.unwrap();
+                    if generation.value.descriptor().active_reference==1{break;}
+                    let _=managed.refresh(&generation).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                assert_eq!(managed.generation().await.unwrap().value.descriptor().active_reference,1);
+            }
+            for stream in &mut established{
+                stream.write_all(b"fail").await.unwrap();
+                let mut bytes=[0;4];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes,b"fail");
+            }
+            let now=reference_health::unix_now().unwrap();
+            let status=publication.inspect(now).unwrap();
+            assert_eq!(status.active_reference,1);
+            publication.begin_rotation(&successor_path,status.snapshot_sha256,
+                bootstrap::fingerprint(successor.public_key()),now).unwrap();
+            for managed in &managed_clients {
+                // Wait for the owner-scoped live publication poll, then
+                // explicitly drive the same authenticated promotion path
+                // that the background client worker uses.
+                for _ in 0..20 {
+                    let generation=managed.generation().await.unwrap();
+                    if generation.value.signer()==successor.public_key(){break;}
+                    assert_eq!(generation.value.signer(),old_signer);
+                    let _=managed.refresh(&generation).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                let new=managed.generation().await.unwrap();
+                assert_eq!(new.value.signer(),successor.public_key());
+                // An actual new tunnel must complete on the new signer.
+                let tunnel=managed.open(Address::V4([127,0,0,1]),target.port()).await.unwrap();
+                drop(tunnel);
+            }
+            // Both already-established application tunnels still carry
+            // bytes after the two transport pools have changed identity.
+            for mut stream in established {
+                stream.write_all(b"pong").await.unwrap();
+                let mut bytes=[0;4];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes,b"pong");
+            }
+            for mut proxy in proxies{proxy.shutdown().await;}
+            echo_tasks.shutdown().await;
+            server.shutdown().await;
+        }).await.unwrap();
+    }
 
     #[test]
     fn runtime_file_reference_refuses_non_native_or_oversized_input() {
@@ -1358,6 +2035,7 @@ mod selector_tests {
             tls_cert: "unused".into(),
             tls_key: "unused".into(),
             security_mode: Default::default(),
+            reality: None,
         };
         let user = User {
             id: "client".into(),

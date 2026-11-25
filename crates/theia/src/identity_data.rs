@@ -68,6 +68,16 @@ fn now() -> Result<u64, ClientError> {
     crate::reference_health::unix_now().map_err(|_| ClientError::Configuration)
 }
 
+/// Local fixture controller. It can renew only the original identity's
+/// compatible signed descriptor; it cannot activate another listener.
+pub struct FixtureControl(Arc<ServerContext>);
+
+impl FixtureControl {
+    pub fn renew(&self, document: &str, expected: [u8;32]) -> Result<u64, ServerError> {
+        self.0.renew_identity_fixture(document, expected)
+    }
+}
+
 pub struct PreparedFixture {
     tcp: TcpListener,
     h2: TlsAcceptor,
@@ -86,6 +96,24 @@ impl PreparedFixture {
         inbound: &Inbound,
         users: &[User],
         policy: &ServerPolicy,
+    ) -> Result<Self, ServerError> {
+        Self::build(tcp, identity, signed, inbound, users, policy, None)
+    }
+
+    /// Exercise admission and identity verification with real native
+    /// carriers, without contacting an external reference.
+    pub fn new_admitted(
+        tcp: TcpListener, identity: &Identity, signed: &str,
+        inbound: &Inbound, users: &[User], policy: &ServerPolicy,
+        admission: (Arc<crate::reality_admission::Secret>, Arc<crate::reality_admission::ReplayGuard>),
+    ) -> Result<Self, ServerError> {
+        Self::build(tcp, identity, signed, inbound, users, policy, Some(admission))
+    }
+
+    fn build(
+        tcp: TcpListener, identity: &Identity, signed: &str,
+        inbound: &Inbound, users: &[User], policy: &ServerPolicy,
+        admission: Option<(Arc<crate::reality_admission::Secret>, Arc<crate::reality_admission::ReplayGuard>)>,
     ) -> Result<Self, ServerError> {
         let local = tcp.local_addr().map_err(|_| ServerError::Io)?;
         if !local.ip().is_loopback()
@@ -114,16 +142,18 @@ impl PreparedFixture {
             &value,
             Arc::from(signed),
         )?);
-        let tls = identity
-            .server_tls("localhost", Branch::H2)
-            .map_err(|_| ServerError::Tls)?;
+        let tls = match &admission {
+            Some((secret, guard)) => crate::identity_tls::checked_server_tls(identity, &value, Branch::H2, secret.clone(), guard.clone()),
+            None => identity.server_tls("localhost", Branch::H2),
+        }.map_err(|_| ServerError::Tls)?;
         let h2 = TlsAcceptor::from(Arc::new(tls));
         let h3 = if value.descriptor().h3 {
             Some(
                 quinn::Endpoint::server(
-                    identity
-                        .quic_server("localhost")
-                        .map_err(|_| ServerError::Tls)?,
+                    match &admission {
+                        Some((secret, guard)) => crate::identity_tls::checked_quic_server(identity, &value, secret.clone(), guard.clone()),
+                        None => identity.quic_server("localhost"),
+                    }.map_err(|_| ServerError::Tls)?,
                     local,
                 )
                 .map_err(|_| ServerError::Io)?,
@@ -137,6 +167,10 @@ impl PreparedFixture {
             h3,
             context,
         })
+    }
+
+    pub fn control(&self) -> FixtureControl {
+        FixtureControl(self.context.clone())
     }
 
     pub async fn serve(self) -> Result<(), ServerError> {
@@ -200,6 +234,18 @@ impl FixtureClient {
         Ok(Self { carrier, value })
     }
 
+    pub fn new_admitted(
+        remote: SocketAddr, token: &str, value: Verified, branch: Branch,
+        secret: Arc<crate::reality_admission::Secret>,
+    ) -> Result<Self, ClientError> {
+        value.check_time(now()?).map_err(|_| ClientError::Tls)?;
+        let carrier = match branch {
+            Branch::H2 => Carrier::H2(H2Client::admitted_fixture(remote, token, &value, secret)?),
+            Branch::H3 => Carrier::H3(H3Client::admitted_fixture(remote, token, &value, secret)?),
+        };
+        Ok(Self { carrier, value })
+    }
+
     pub async fn open(&self, target: Address, port: u16) -> Result<FixtureTunnel, ClientError> {
         self.value
             .check_time(now()?)
@@ -228,18 +274,95 @@ impl FixtureClient {
             Carrier::H3(client) => client.fetch_identity_descriptor().await?,
         };
         let timestamp = now()?;
-        let previous = store.load(timestamp).map_err(|_| ClientError::Tls)?;
-        if previous.descriptor().scope != self.value.descriptor().scope
-            || previous.signer() != self.value.signer()
-            || previous.descriptor().revision != self.value.descriptor().revision
-        {
-            return Err(ClientError::Tls);
-        }
-        self.value
-            .compare(&previous)
-            .map_err(|_| ClientError::Tls)?;
         store
-            .update_at(&raw, previous.descriptor().revision, timestamp)
+            .update_matching(&raw, &self.value, timestamp)
             .map_err(|_| ClientError::Tls)
+    }
+}
+
+
+/// Persistent trust-backed application-plane client for controlled loopback
+/// fixtures. Re-read the verified store before every new logical operation.
+/// A new signed revision (or explicitly promoted signer) replaces the
+/// carrier/pool as one generation; outstanding tunnels own their leases.
+pub struct ManagedFixtureClient {
+    remote: SocketAddr,
+    branch: Branch,
+    token: zeroize::Zeroizing<String>,
+    store: descriptor::Store,
+    current: tokio::sync::Mutex<Option<Arc<FixtureClient>>>,
+}
+
+impl ManagedFixtureClient {
+    pub fn new(
+        remote: SocketAddr,
+        branch: Branch,
+        token: &str,
+        store: descriptor::Store,
+    ) -> Result<Self, ClientError> {
+        if !remote.ip().is_loopback() {
+            return Err(ClientError::Configuration);
+        }
+        let value = store.load(now()?).map_err(|_| ClientError::Tls)?;
+        let first = Self::build(remote, token, value, branch)?;
+        Ok(Self {
+            remote,
+            branch,
+            token: zeroize::Zeroizing::new(token.to_owned()),
+            store,
+            current: tokio::sync::Mutex::new(Some(Arc::new(first))),
+        })
+    }
+
+    fn build(remote: SocketAddr, token: &str, value: Verified, branch: Branch) -> Result<FixtureClient, ClientError> {
+        let mut client = FixtureClient::new(remote, token, value, branch)?;
+        client.carrier = match client.carrier {
+            Carrier::H2(h2) => Carrier::H2(h2.with_connection_pool()),
+            Carrier::H3(h3) => Carrier::H3(h3.with_connection_pool()),
+        };
+        Ok(client)
+    }
+
+    async fn generation(&self) -> Result<Arc<FixtureClient>, ClientError> {
+        let mut slot = self.current.lock().await;
+        let value = self.store.load(now()?).map_err(|_| ClientError::Tls)?;
+        if let Some(previous) = slot.as_ref() {
+            let old = &previous.value;
+            if old.descriptor().scope != value.descriptor().scope
+                || value.descriptor().revision < old.descriptor().revision
+            {
+                return Err(ClientError::Tls);
+            }
+            if old.signer() == value.signer() {
+                if old.compare(&value).map_err(|_| ClientError::Tls)? == descriptor::Change::Unchanged {
+                    return Ok(previous.clone());
+                }
+            } else if value.descriptor().revision <= old.descriptor().revision {
+                return Err(ClientError::Tls);
+            }
+        }
+        // No fallback to the previous carrier on policy, key, expiry or
+        // construction errors. A separately promoted signer must already be
+        // authenticated by the full persisted Store history.
+        let next = Arc::new(Self::build(self.remote, &self.token, value, self.branch)?);
+        *slot = Some(next.clone());
+        Ok(next)
+    }
+
+    pub async fn revision(&self) -> Result<u64, ClientError> {
+        Ok(self.generation().await?.value.descriptor().revision)
+    }
+
+    pub async fn open(&self, target: Address, port: u16) -> Result<FixtureTunnel, ClientError> {
+        self.generation().await?.open(target, port).await
+    }
+
+    pub async fn refresh(&self) -> Result<descriptor::Change, ClientError> {
+        let current = self.generation().await?;
+        let change = current.refresh(&self.store).await?;
+        // Rebuild before any subsequent new connection. If another local
+        // operation superseded the update, the latest verified Store wins.
+        self.generation().await?;
+        Ok(change)
     }
 }

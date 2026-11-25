@@ -18,6 +18,26 @@ enum Phase {
     LegacyStatus,
     Confirming { inbounds: usize, revision: u64 },
     Applying,
+    RollbackChecking,
+    RollbackConfirming {revision:u64,remaining_seconds:u64},
+    RollbackApplying,
+    RollbackApplied {revision:u64},
+    RollbackUnavailable,
+    QuotaChecking {revision:u64},
+    QuotaConfirming {revision:u64},
+    QuotaApplying,
+    QuotaApplied {revision:u64},
+    QuotaRejected,
+    CutoverChecking { revision: u64 },
+    CutoverConfirming { revision: u64, same_port: bool, material_sha256: [u8; 32] },
+    CutoverApplying,
+    CutoverApplied { revision: u64 },
+    CutoverRejected,
+    RestartRollbackChecking,
+    RestartRollbackConfirming { revision: u64, remaining_seconds: u64 },
+    RestartRollbackApplying,
+    RestartRollbackApplied { revision: u64 },
+    RestartRollbackUnavailable,
     Applied { revision: u64 },
     Rejected,
     Indeterminate,
@@ -178,6 +198,58 @@ impl RuntimePanel {
                     _ => Phase::RestartUnavailable,
                 };
             }
+            Phase::CutoverChecking { revision } => {
+                self.phase = match result {
+                    Ok(StatusReply::RestartPreview { same_port, material_sha256 }) =>
+                        Phase::CutoverConfirming { revision, same_port, material_sha256 },
+                    _ => Phase::CutoverRejected,
+                };
+            }
+            Phase::CutoverApplying => {
+                self.phase = match result {
+                    Ok(StatusReply::RestartApplied { revision }) => Phase::CutoverApplied { revision },
+                    Err(ManagementError::CandidateRejected | ManagementError::Unsupported) => Phase::CutoverRejected,
+                    _ => Phase::Indeterminate,
+                };
+            }
+            Phase::RestartRollbackChecking => {
+                self.phase = match result {
+                    Ok(StatusReply::RestartRollbackReady { revision, remaining_seconds }) =>
+                        Phase::RestartRollbackConfirming { revision, remaining_seconds },
+                    _ => Phase::RestartRollbackUnavailable,
+                };
+            }
+            Phase::RestartRollbackApplying => {
+                self.phase = match result {
+                    Ok(StatusReply::RestartRollbackApplied { revision }) => Phase::RestartRollbackApplied { revision },
+                    Err(ManagementError::CandidateRejected | ManagementError::Unsupported) => Phase::RestartRollbackUnavailable,
+                    _ => Phase::Indeterminate,
+                };
+            }
+            Phase::QuotaChecking{revision}=>{
+                self.phase=match result{Ok(StatusReply::QuotaReady)=>Phase::QuotaConfirming{revision},_=>Phase::QuotaRejected};
+            }
+            Phase::QuotaApplying=>{
+                self.phase=match result{
+                    Ok(StatusReply::QuotaApplied{revision})=>Phase::QuotaApplied{revision},
+                    Err(ManagementError::CandidateRejected|ManagementError::Unsupported)=>Phase::QuotaRejected,
+                    _=>Phase::Indeterminate,
+                };
+            }
+            Phase::RollbackChecking=>{
+                self.phase=match result{
+                    Ok(StatusReply::AuthRollbackReady{revision,remaining_seconds})=>Phase::RollbackConfirming{revision,remaining_seconds},
+                    _=>Phase::RollbackUnavailable,
+                };
+            }
+            Phase::RollbackApplying=>{
+                self.phase=match result{
+                    Ok(StatusReply::AuthRollbackApplied{revision})=>Phase::RollbackApplied{revision},
+                    Err(ManagementError::CandidateRejected)=>Phase::Rejected,
+                    Err(ManagementError::Unsupported)=>Phase::RollbackUnavailable,
+                    _=>Phase::Indeterminate,
+                };
+            }
             Phase::Applying => {
                 self.phase = match result {
                     Ok(StatusReply::Applied { revision }) => Phase::Applied { revision },
@@ -231,7 +303,61 @@ impl RuntimePanel {
                 false
             }
             (Phase::Checking, KeyCode::Esc) => true,
-            (Phase::Checking | Phase::Applying, _) => false,
+            (Phase::Checking | Phase::Applying | Phase::RollbackApplying | Phase::QuotaApplying | Phase::CutoverApplying | Phase::RestartRollbackApplying, _) => false,
+            (Phase::CutoverChecking{..} | Phase::RestartRollbackChecking, KeyCode::Esc) => true,
+            (Phase::CutoverChecking{..} | Phase::RestartRollbackChecking, _) => false,
+            (Phase::Viewing{revision,..} | Phase::Applied{revision} | Phase::CutoverApplied{revision}, KeyCode::Char('s')) if self.saved_sha256.is_some() => {
+                let Some(candidate_sha256)=self.saved_sha256 else{return false;};
+                self.phase=Phase::CutoverChecking{revision};
+                self.start(StatusCommand::CheckRestartBound{expected_revision:revision,candidate_sha256});
+                false
+            }
+            (Phase::CutoverConfirming{revision,material_sha256,..},KeyCode::Char('y'))=>{
+                let Some(candidate_sha256)=self.saved_sha256 else{self.phase=Phase::CutoverRejected;return false;};
+                self.phase=Phase::CutoverApplying;
+                self.start(StatusCommand::ApplyRestartBound{expected_revision:revision,candidate_sha256,tls_sha256:material_sha256});
+                false
+            }
+            (Phase::CutoverConfirming{..},KeyCode::Char('n')|KeyCode::Esc)=>true,
+            (Phase::CutoverConfirming{..},_)=>false,
+            (Phase::Viewing{..}|Phase::Applied{..}|Phase::CutoverApplied{..},KeyCode::Char('z')) if self.saved_sha256.is_some()=>{
+                self.phase=Phase::RestartRollbackChecking;
+                self.start(StatusCommand::CheckRestartRollback);
+                false
+            }
+            (Phase::RestartRollbackConfirming{revision,..},KeyCode::Char('y'))=>{
+                self.phase=Phase::RestartRollbackApplying;
+                self.start(StatusCommand::ApplyRestartRollback{expected_revision:revision});
+                false
+            }
+            (Phase::RestartRollbackConfirming{..},KeyCode::Char('n')|KeyCode::Esc)=>true,
+            (Phase::RestartRollbackConfirming{..},_)=>false,
+            (Phase::QuotaChecking{..},KeyCode::Esc)=>true,
+            (Phase::QuotaChecking{..},_)=>false,
+            (Phase::Viewing{revision,..}|Phase::Applied{revision},KeyCode::Char('c')) if self.saved_sha256.is_some()=>{
+                self.phase=Phase::QuotaChecking{revision};self.start(StatusCommand::CheckQuota);false
+            }
+            (Phase::QuotaConfirming{revision},KeyCode::Char('y'))=>{
+                let Some(candidate_sha256)=self.saved_sha256 else{self.phase=Phase::QuotaRejected;return false;};
+                self.phase=Phase::QuotaApplying;
+                self.start(StatusCommand::ApplyQuotaBound{expected_revision:revision,candidate_sha256});false
+            }
+            (Phase::QuotaConfirming{..},KeyCode::Char('n')|KeyCode::Esc)=>true,
+            (Phase::QuotaConfirming{..},_)=>false,
+            (Phase::RollbackChecking,KeyCode::Esc)=>true,
+            (Phase::RollbackChecking,_)=>false,
+            (Phase::Viewing{..}|Phase::Applied{..},KeyCode::Char('b')) if self.saved_sha256.is_some()=>{
+                self.phase=Phase::RollbackChecking;
+                self.start(StatusCommand::CheckAuthRollback);
+                false
+            }
+            (Phase::RollbackConfirming{revision,..},KeyCode::Char('y'))=>{
+                self.phase=Phase::RollbackApplying;
+                self.start(StatusCommand::ApplyAuthRollback{expected_revision:revision});
+                false
+            }
+            (Phase::RollbackConfirming{..},KeyCode::Char('n')|KeyCode::Esc)=>true,
+            (Phase::RollbackConfirming{..},_)=>false,
             (Phase::Viewing { inbounds, revision }, KeyCode::Char('a'))
                 if self.saved_sha256.is_some() =>
             {
@@ -293,11 +419,36 @@ impl RuntimePanel {
             Phase::RestartFreshPortsBindable => "Все НОВЫЕ TCP и UDP порты удалось одновременно пробно открыть.\nОни уже освобождены: НЕТ гарантии будущего bind, НЕТ restart, НЕТ rollback.\nСервер работает БЕЗ ИЗМЕНЕНИЙ.\nr: перепроверить | Esc: закрыть".into(),
             Phase::RestartRejected => "Отказ: кандидат TOML, TLS identity или TCP/UDP bind не прошёл проверку.\nСтарые listeners, авторизация и туннели не изменены этой операцией.\nr: перепроверить | Esc: закрыть".into(),
             Phase::RestartUnavailable => "Нет доступного защищённого IPC/снимка конфигурации для проверки restart.\nНичего не изменено.\nr: повторить | Esc: закрыть".into(),
+            Phase::CutoverChecking{..}=>"Проверка точного сохранённого TOML и отпечатка материалов; runtime не меняется.".into(),
+            Phase::CutoverConfirming{revision,same_port,material_sha256}=>{
+                let digest=material_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                let mode=if same_port {"Смена TLS на текущих портах; открытые туннели сохраняются."}else{"Новые порты готовятся до Apply; неизменённые inbound при частичном cutover сохраняются. Удаляемые/заменяемые соединения получают до 20 с на завершение, затем могут быть закрыты."};
+                format!("Структурный Apply, revision={revision}.\n{mode}\nОтпечаток материалов SHA-256: {digest}\nСервер повторно проверит TOML, материалы и CAS.\ny: применить | n/Esc: отменить")
+            }
+            Phase::CutoverApplying=>"Структурный Apply отправлен; при потере ACK сначала запросите фактический статус.".into(),
+            Phase::CutoverApplied{revision}=>format!("Структурный Apply подтверждён, revision={revision}.\nz: проверить структурный откат после drain | r: статус | Esc: закрыть"),
+            Phase::CutoverRejected=>"Структурный кандидат отклонён: проверьте порты, материалы, сохранённый TOML и revision.\nr: статус | Esc: закрыть".into(),
+            Phase::RestartRollbackChecking=>"Проверка доступности структурного отката. Только чтение.".into(),
+            Phase::RestartRollbackConfirming{revision,remaining_seconds}=>format!("Одноразовый структурный откат, revision={revision}, осталось {remaining_seconds} с.\nСервер заново проверит прежние порты и текущие доверенные материалы. Старые ключи и trust floor не откатываются. TOML не меняется.\ny: подтвердить | n/Esc: отменить"),
+            Phase::RestartRollbackApplying=>"Структурный откат отправлен; при потере ACK не повторяйте запрос автоматически.".into(),
+            Phase::RestartRollbackApplied{revision}=>format!("Структурный откат подтверждён, revision={revision}. TOML не изменён.\nr: статус | Esc: закрыть"),
+            Phase::RestartRollbackUnavailable=>"Структурный откат недоступен: drain, истечение срока, изменение revision или материалов.\nr: статус | Esc: закрыть".into(),
+            Phase::QuotaChecking{..}=>"Проверка quota-only кандидата. Runtime не изменяется.".into(),
+            Phase::QuotaConfirming{revision}=>format!("Подтвердить изменение только двух лимитов квот, revision={revision}.\nПри уменьшении лимита действующие соединения остаются; новые ждут освобождения занятых слотов.\ny: применить | n/Esc: отменить"),
+            Phase::QuotaApplying=>"Отправлен CAS квот. При потере ACK сначала перечитайте revision.".into(),
+            Phase::QuotaApplied{revision}=>format!("Квоты применены, revision={revision}. Действующие туннели сохранены.\nr: статус | Esc: закрыть"),
+            Phase::QuotaRejected=>"Кандидат квот отклонён. Ничего не применено.\nr: статус | Esc: закрыть".into(),
+            Phase::RollbackChecking=>"Проверка доступности одноразового отката авторизации REALITY. Только чтение.".into(),
+            Phase::RollbackConfirming{revision,remaining_seconds}=>format!(
+                "Откат авторизации, revision={revision}, осталось {remaining_seconds} с.\nПредыдущие пользователи, grants, disabled и digest снова начнут действовать для новых запросов; занятые квоты сохраняются. Доверие, identity, дескрипторы и активные туннели не откатываются. TOML останется без изменений.\ny: подтвердить | n/Esc: отменить"),
+            Phase::RollbackApplying=>"Откат отправлен; при потере ответа сначала перечитайте runtime revision.".into(),
+            Phase::RollbackApplied{revision}=>format!("Авторизация восстановлена, новая revision={revision}. Слот отката израсходован. TOML не изменён.\nr: статус | Esc: закрыть"),
+            Phase::RollbackUnavailable=>"Одноразовый откат недоступен или истёк. Ничего не изменено.\nr: статус | Esc: закрыть".into(),
             Phase::Checking => "Запрос IPC status...\nТолько чтение; ничего не применяется.\nEsc: закрыть".into(),
             Phase::Viewing { inbounds, revision } => format!(
                 "Сервер работает. Inbounds: {inbounds}. Авторизация: revision={revision}.\n\n{}\nr: обновить статус | Esc: закрыть",
                 if self.saved_sha256.is_some() {
-                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются только token digest/disabled/grants прежних пользователей."
+                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются пользователи, token digest, disabled и grants; занятость удалённых ID сохраняется до завершения их туннелей.\nb: проверить одноразовый откат авторизации REALITY (300 с).\nc: проверить quota-only Apply.\ns: проверить структурный Apply.\nz: проверить структурный откат."
                 } else {
                     "Применение недоступно без явного --role server --config FILE."
                 }
@@ -532,6 +683,32 @@ mod tests {
         panel.complete(Err(ManagementError::TimedOut));
         assert_eq!(panel.phase, Phase::Indeterminate);
         assert!(panel.body().contains("МОГЛО"));
+    }
+
+    #[test]
+    fn structural_preview_is_bound_and_never_auto_commits() {
+        let mut panel=fake(Some([7;32]),false);
+        panel.phase=Phase::Viewing{inbounds:1,revision:8};
+        panel.key(key(KeyCode::Char('y')));
+        assert_eq!(panel.phase,Phase::Viewing{inbounds:1,revision:8});
+        panel.phase=Phase::CutoverChecking{revision:8};
+        panel.complete(Ok(StatusReply::RestartPreview{same_port:false,material_sha256:[9;32]}));
+        assert_eq!(panel.phase,Phase::CutoverConfirming{revision:8,same_port:false,material_sha256:[9;32]});
+        assert!(panel.body().contains("09".repeat(32).as_str()));
+        assert!(panel.body().contains("20 с"));
+        assert!(panel.key(key(KeyCode::Char('n'))));
+        assert!(panel.receiver.is_none());
+        panel.phase=Phase::CutoverApplying;
+        assert!(!panel.key(key(KeyCode::Esc)));
+        panel.complete(Err(ManagementError::TimedOut));
+        assert_eq!(panel.phase,Phase::Indeterminate);
+        panel.phase=Phase::RestartRollbackChecking;
+        panel.complete(Ok(StatusReply::RestartRollbackReady{revision:9,remaining_seconds:123}));
+        assert_eq!(panel.phase,Phase::RestartRollbackConfirming{revision:9,remaining_seconds:123});
+        assert!(panel.key(key(KeyCode::Esc)));
+        panel.phase=Phase::RestartRollbackApplying;
+        panel.complete(Ok(StatusReply::RestartRollbackApplied{revision:10}));
+        assert_eq!(panel.phase,Phase::RestartRollbackApplied{revision:10});
     }
 
     #[test]

@@ -18,6 +18,7 @@ fn baseline() -> ServerDocument {
                 server_name: "edge.example.org".into(),
                 tls_cert: "file:/etc/theia/fullchain.pem".into(),
                 security_mode: Default::default(),
+                reality: None,
                 tls_key: "file:/etc/theia/private.pem".into(),
             }],
             users: vec![

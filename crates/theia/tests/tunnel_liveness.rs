@@ -82,6 +82,7 @@ impl Fixture {
             server_name: "localhost".into(),
             tls_cert: "unused".into(),
             security_mode: Default::default(),
+            reality: None,
             tls_key: "unused".into(),
         };
         let user = User {

@@ -37,9 +37,17 @@ pub(crate) mod quota;
 pub mod reality_admission;
 pub mod reality_bootstrap;
 pub mod reality_cli;
+pub mod reality_config;
+pub mod reality_generation;
+mod reality_live;
+mod reality_checkpoint;
+pub mod reality_provision;
 pub mod reality_tcp;
+pub mod reality_quic;
+mod reality_quic_wire;
 pub mod reference_cli;
 pub mod reference_health;
+pub mod reference_maintenance;
 mod relay_liveness;
 pub mod reload_preflight;
 pub mod restart_guard;
@@ -57,6 +65,10 @@ pub(crate) mod tui_domain;
 pub mod tui_editor;
 pub(crate) mod tui_probe;
 mod tui_reality_review;
+mod tui_reality_provision;
+mod tui_reality_enroll;
+mod tui_reality_register;
+mod tui_reality_status;
 pub(crate) mod tui_runtime;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;
@@ -114,6 +126,11 @@ pub enum Command {
     ServerApplyReload {
         expected_revision: u64,
     },
+    ServerApplyReloadBound{expected_revision:u64,candidate_sha256:[u8;32]},
+    ServerAuthRollbackCheck,
+    ServerAuthRollbackApply{expected_revision:u64},
+    ServerRestartRollbackCheck,
+    ServerRestartRollbackApply{expected_revision:u64},
     ClientRun {
         config: String,
     },
@@ -121,6 +138,8 @@ pub enum Command {
     ClientRunSystemProxy {
         config: String,
     },
+    ClientStatus,
+    ClientApply{expected_revision:u64,candidate_sha256:[u8;32],apply:bool},
     ClientProxyStatus,
     ClientProxyRecover,
     ConfigValidate {
@@ -287,6 +306,18 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 candidate_sha256,
             })
         }
+        ["server","reload","--apply","--expected-revision",revision,"--sha256",digest,"--confirm"]=>Ok(Command::ServerApplyReloadBound{
+            expected_revision:expected_revision(revision)?,
+            candidate_sha256:parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
+        }),
+        ["server","restart","rollback","--check"]=>Ok(Command::ServerRestartRollbackCheck),
+        ["server","restart","rollback","--apply","--expected-revision",revision,"--confirm"]=>Ok(Command::ServerRestartRollbackApply{
+            expected_revision:expected_revision(revision)?,
+        }),
+        ["server","auth","rollback","--check"]=>Ok(Command::ServerAuthRollbackCheck),
+        ["server","auth","rollback","--apply","--expected-revision",revision,"--confirm"]=>Ok(Command::ServerAuthRollbackApply{
+            expected_revision:expected_revision(revision)?,
+        }),
         ["server", "reload", "--expected-revision", raw] => {
             if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(CliError::InvalidArguments);
@@ -305,6 +336,13 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 config: config_path(path)?,
             })
         }
+        ["client","status"]=>Ok(Command::ClientStatus),
+        ["client","reload","--check","--expected-revision",revision,"--sha256",digest]=>Ok(Command::ClientApply{
+            expected_revision:expected_revision(revision)?,candidate_sha256:parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,apply:false,
+        }),
+        ["client","reload","--apply","--expected-revision",revision,"--sha256",digest,"--confirm"]=>Ok(Command::ClientApply{
+            expected_revision:expected_revision(revision)?,candidate_sha256:parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,apply:true,
+        }),
         ["client", "proxy", "--status"] => Ok(Command::ClientProxyStatus),
         ["client", "proxy", "--recover", "--confirm"] => Ok(Command::ClientProxyRecover),
         ["config", "validate", "--config", path] => Ok(Command::ConfigValidate {
@@ -348,10 +386,10 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
             Ok("Usage: theia tui [--role server|client] [--config <path>]\nWith role+config, edit 3 non-secret fields per existing record; server panel u creates a user with an inbound grant and one-time URI only after save; no runtime reload or OS proxy changes.")
         }
         Some("server") => {
-            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server tls rollback --check | theia server tls rollback --apply --expected-revision N --confirm | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --expected-revision N\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
+            Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server tls rollback --check | theia server tls rollback --apply --expected-revision N --confirm | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --apply --expected-revision N --sha256 HEX --confirm | theia server auth rollback --check | theia server auth rollback --apply --expected-revision N --confirm\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
         }
         Some("client") => {
-            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
+            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
         Some("trust") => Ok(descriptor_cli::HELP),
         Some("reference") => Ok(reference_cli::HELP),

@@ -16,6 +16,7 @@ pub enum SecurityMode {
     Plain,
     PinnedCertV1,
     PinnedCertStreamUpV1,
+    SmartReality,
 }
 
 impl SecurityMode {
@@ -32,6 +33,8 @@ impl SecurityMode {
             Self::Plain => "/v1/session",
             Self::PinnedCertV1 => PINNED_PATH,
             Self::PinnedCertStreamUpV1 => crate::split_http::UPLOAD_PATH,
+            // No generic HTTP route is valid for this security mode.
+            Self::SmartReality => "",
         }
     }
 }

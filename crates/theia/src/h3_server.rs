@@ -123,7 +123,7 @@ pub(crate) async fn serve_generation(
     Ok(())
 }
 
-async fn run_connection(connection: quinn::Connection, context: Arc<ServerContext>) {
+pub(crate) async fn run_connection(connection: quinn::Connection, context: Arc<ServerContext>) {
     let guard = ConnectionGuard(connection);
     let peer = guard.0.remote_address().ip();
     let binding = if context.requires_channel_binding() {

@@ -40,6 +40,7 @@ struct Local {
     address: SocketAddr,
     manual: bool,
     task: JoinHandle<Result<(), ClientError>>,
+    reality:Option<std::sync::Arc<crate::local_proxy::RealityClient>>,
 }
 
 struct Worker {
@@ -162,11 +163,12 @@ impl Worker {
                     .map_err(|error| error.to_string())?;
                 let address = prepared.http_address().map_err(|error| error.to_string())?;
                 let manual = prepared.manual;
+                let reality=prepared.reality_monitor();
                 let task = tokio::spawn(prepared.serve());
                 self.local = Some(Local {
                     address,
                     manual,
-                    task,
+                    task,reality,
                 });
                 Ok("Оба локальных listener привязаны; удалённый транспорт не проверен.".into())
             }
@@ -279,7 +281,12 @@ async fn run(
             }
             command = commands.recv() => {
                 let Some(command) = command else { break };
-                if events.send(worker.command(command).await).is_err() {
+                let mut event=worker.command(command).await;
+                if let Some(reality)=worker.local.as_ref().and_then(|l|l.reality.as_ref()){
+                    event.view.status.push_str("\n\n");
+                    event.view.status.push_str(&reality.runtime_report().await);
+                }
+                if events.send(event).is_err() {
                     break;
                 }
             }
@@ -427,7 +434,7 @@ impl Panel {
             Phase::Idle => "s: local start  a: WinINet  r: restore  c: recovery  x: stop  v: status  Esc: назад",
         };
         format!(
-            "WinINet: {status}\nLocal: {} | manual: {}\nTransport/OPEN_OK: не проверялись\n{}\n{controls}",
+            "WinINet: {status}\nLocal: {} | manual: {}\nTransport/OPEN_OK: см. REALITY runtime выше; для own-TLS не проверяются этим экраном\n{}\n{controls}",
             if self.unavailable || self.phase == Phase::Busy {
                 "неизвестно"
             } else if self.view.running {

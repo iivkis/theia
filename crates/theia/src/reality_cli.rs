@@ -5,22 +5,36 @@ use crate::{
     descriptor::{ClientPolicy, Scope},
     identity_tls::Identity,
     reality_bootstrap::{self as bootstrap, Error, Invitation, Profile},
-    reference_health, CliError,
+    reference_health, reality_config, CliError,
 };
 use std::path::Path;
 
 pub const HELP: &str = "REALITY provisioning candidate; runtime UNCHANGED. All paths absolute.\n\
+theia reality registered-status --config PATH --id ID\n\
+theia reality register-server-preview --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID\n\
+theia reality register-server-save --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID --sha256 HEX --confirm\n\
+theia reality register-client-preview --config PATH --profile PATH --identity-sha256 HEX --id ID\n\
+theia reality reenroll-preview --config PATH --profile NEW_PATH --identity-sha256 HEX --id ID\n\
+theia reality reenroll-save --config PATH --profile NEW_PATH --identity-sha256 HEX --id ID --sha256 HEX --confirm-reenrollment\n\
+theia reality register-client-save --config PATH --profile PATH --identity-sha256 HEX --id ID --sha256 HEX --confirm\n\
+theia reality provision-preview --health PATH\n\
+theia reality provision-inspect --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX\n\
+theia reality provision-apply --health PATH --output NEW_DIRECTORY --health-sha256 HEX --confirm\n\
+theia reality admission-new --inbound ID --endpoint HOST:PORT --key PATH --confirm\n\
+theia reality admission-check --inbound ID --endpoint HOST:PORT --key PATH\n\
 theia reality identity-new --inbound ID --endpoint HOST:PORT --key PATH --confirm\n\
 theia reality descriptor-new --health PATH --key PATH --output PATH --confirm\n\
 theia reality descriptor-refresh --health PATH --key PATH --previous PATH --output PATH --sha256 HEX --confirm\n\
 theia reality invite-public --health PATH --key PATH --descriptor PATH --output PATH --confirm\n\
 theia reality invite-issued --health PATH --key PATH --descriptor PATH --server PATH --user ID --token-file PATH --output PATH --confirm\n\
 theia reality preview-import --invitation PATH\n\
-theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
-theia reality import --invitation PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --token-ref REF --confirm\n\
+theia reality import --invitation PATH --admission PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
+theia reality import --invitation PATH --admission PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --token-ref REF --confirm\n\
 theia reality inspect --profile PATH\n\
+theia reality promotion-preview --profile PATH --descriptor PATH\n\
+theia reality promotion-apply --profile PATH --descriptor PATH --expected-revision N --snapshot-sha256 HEX --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality recovery-preview --profile PATH --descriptor PATH\n\
-theia reality recovery-apply --profile PATH --descriptor PATH --expected-revision N --sha256 HEX --identity-sha256 HEX --confirm\n\
+theia reality recovery-apply --profile PATH --descriptor PATH --expected-revision N --snapshot-sha256 HEX --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality publish-new --health PATH --key PATH --publication PATH --confirm\n\
 theia reality publish-status --publication PATH\n\
 theia reality publish-refresh --health PATH --publication PATH --sha256 HEX --confirm\n\
@@ -34,6 +48,21 @@ Identity SHA-256 must be obtained independently. Import never changes active pro
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    RegisteredStatus { config: String, id: String },
+    RegisterConfig {
+        config: String,
+        request: reality_config::Request,
+        approval: Option<[u8; 32]>,
+    },
+    ProvisionPreview { health: String },
+    ProvisionInspect { health: String, bundle: String, digest: [u8; 32], identity: [u8; 32] },
+    ProvisionApply { health: String, output: String, digest: [u8; 32] },
+    Admission {
+        inbound: String,
+        endpoint: String,
+        key: String,
+        create: bool,
+    },
     Identity {
         inbound: String,
         endpoint: String,
@@ -71,6 +100,7 @@ pub enum Command {
     },
     Import {
         invitation: String,
+        admission: String,
         profile: String,
         trust: String,
         digest: [u8; 32],
@@ -80,6 +110,15 @@ pub enum Command {
     Inspect {
         profile: String,
     },
+    PromotionPreview {
+        profile: String,
+        descriptor: String,
+    },
+    PromotionApply {
+        profile: String,
+        descriptor: String,
+        approval: bootstrap::PromotionApproval,
+    },
     RecoveryPreview {
         profile: String,
         descriptor: String,
@@ -88,6 +127,7 @@ pub enum Command {
         profile: String,
         descriptor: String,
         revision: u64,
+        snapshot: [u8;32],
         digest: [u8; 32],
         identity: [u8; 32],
     },
@@ -149,8 +189,76 @@ fn hex(bytes: [u8; 32]) -> String {
     result
 }
 
+fn registration_approval(kind: &str, tail: &[&str]) -> Result<Option<[u8; 32]>, CliError> {
+    match (kind, tail) {
+        ("register-server-preview" | "register-client-preview", []) => Ok(None),
+        ("register-server-save" | "register-client-save", ["--sha256", digest, "--confirm"]) => Ok(Some(hash(digest)?)),
+        _ => Err(CliError::InvalidArguments),
+    }
+}
+
 pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
     Ok(match args {
+        ["registered-status", "--config", c, "--id", id] if config::valid_id(id) => Command::RegisteredStatus {
+            config: path(c)?, id: (*id).to_owned(),
+        },
+        [kind @ ("register-server-preview" | "register-server-save"), "--config", c, "--health", h, "--bundle", b,
+            "--health-sha256", d, "--identity-sha256", i, "--listen", listen, "--grants", grants, tail @ ..] => {
+            let listen: std::net::SocketAddr = listen.parse().map_err(|_| CliError::InvalidArguments)?;
+            let grants: Vec<String> = grants.split(',').map(str::to_owned).collect();
+            if listen.port() == 0 || grants.len() > 256 || grants.iter().any(|id| !config::valid_id(id)) {
+                return Err(CliError::InvalidArguments);
+            }
+            Command::RegisterConfig {
+                config: path(c)?,
+                request: reality_config::Request::Server(reality_config::ServerRequest {
+                    health: path(h)?.into(), bundle: path(b)?.into(),
+                    health_sha256: hash(d)?, identity_sha256: hash(i)?,
+                    listen, grants,
+                }),
+                approval: registration_approval(kind, tail)?,
+            }
+        }
+        [kind @ ("register-client-preview" | "register-client-save"), "--config", c, "--profile", p,
+            "--identity-sha256", i, "--id", id, tail @ ..] if config::valid_id(id) => {
+            Command::RegisterConfig {
+                config: path(c)?,
+                request: reality_config::Request::Client(reality_config::ClientRequest {
+                    enrollment: path(p)?.into(), identity_sha256: hash(i)?, id: (*id).to_owned(),
+                }),
+                approval: registration_approval(kind, tail)?,
+            }
+        }
+        [kind @ ("reenroll-preview" | "reenroll-save"), "--config", c, "--profile", p,
+            "--identity-sha256", i, "--id", id, tail @ ..] if config::valid_id(id) => {
+            let approval = match (*kind, tail) {
+                ("reenroll-preview", []) => None,
+                ("reenroll-save", ["--sha256", digest, "--confirm-reenrollment"]) => Some(hash(digest)?),
+                _ => return Err(CliError::InvalidArguments),
+            };
+            Command::RegisterConfig {
+                config: path(c)?,
+                request: reality_config::Request::Reenroll(reality_config::ClientRequest {
+                    enrollment: path(p)?.into(), identity_sha256: hash(i)?, id: (*id).to_owned(),
+                }),
+                approval,
+            }
+        }
+        ["provision-preview", "--health", h] => Command::ProvisionPreview { health: path(h)? },
+        ["provision-inspect", "--health", h, "--bundle", b, "--health-sha256", d, "--identity-sha256", i] => Command::ProvisionInspect {
+            health: path(h)?, bundle: path(b)?, digest: hash(d)?, identity: hash(i)?,
+        },
+        ["provision-apply", "--health", h, "--output", o, "--health-sha256", d, "--confirm"] => Command::ProvisionApply { health: path(h)?, output: path(o)?, digest: hash(d)? },
+        ["admission-new", "--inbound", i, "--endpoint", e, "--key", k, "--confirm"]
+            if config::valid_id(i) && config::valid_remote(e) =>
+        {
+            Command::Admission { inbound: (*i).into(), endpoint: (*e).into(), key: path(k)?, create: true }
+        }
+        ["admission-check", "--inbound", i, "--endpoint", e, "--key", k]
+            if config::valid_id(i) && config::valid_remote(e) =>
+        {
+            Command::Admission { inbound: (*i).into(), endpoint: (*e).into(), key: path(k)?, create: false }
+        }
         ["identity-new", "--inbound", i, "--endpoint", e, "--key", k, "--confirm"]
             if config::valid_id(i) && config::valid_remote(e) =>
         {
@@ -200,9 +308,10 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
         ["preview-import", "--invitation", i] => Command::Preview {
             invitation: path(i)?,
         },
-        ["import", "--invitation", i, "--profile", p, "--trust", t, "--sha256", d, "--identity-sha256", k, "--confirm"] => {
+        ["import", "--invitation", i, "--admission", a, "--profile", p, "--trust", t, "--sha256", d, "--identity-sha256", k, "--confirm"] => {
             Command::Import {
                 invitation: path(i)?,
+                admission: path(a)?,
                 profile: path(p)?,
                 trust: path(t)?,
                 digest: hash(d)?,
@@ -210,11 +319,12 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
                 token_ref: None,
             }
         }
-        ["import", "--invitation", i, "--profile", p, "--trust", t, "--sha256", d, "--identity-sha256", k, "--token-ref", r, "--confirm"]
+        ["import", "--invitation", i, "--admission", a, "--profile", p, "--trust", t, "--sha256", d, "--identity-sha256", k, "--token-ref", r, "--confirm"]
             if config::valid_secret_ref(r) =>
         {
             Command::Import {
                 invitation: path(i)?,
+                admission: path(a)?,
                 profile: path(p)?,
                 trust: path(t)?,
                 digest: hash(d)?,
@@ -223,15 +333,30 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
             }
         }
         ["inspect", "--profile", p] => Command::Inspect { profile: path(p)? },
+        ["promotion-preview", "--profile", p, "--descriptor", d] => Command::PromotionPreview {
+            profile: path(p)?,
+            descriptor: path(d)?,
+        },
+        ["promotion-apply", "--profile", p, "--descriptor", d, "--expected-revision", r, "--snapshot-sha256", s, "--sha256", h, "--identity-sha256", i, "--confirm"] => Command::PromotionApply {
+            profile: path(p)?,
+            descriptor: path(d)?,
+            approval: bootstrap::PromotionApproval {
+                expected_revision: crate::expected_revision(r)?,
+                snapshot_sha256: hash(s)?,
+                document_sha256: hash(h)?,
+                next_identity_sha256: hash(i)?,
+            },
+        },
         ["recovery-preview", "--profile", p, "--descriptor", d] => Command::RecoveryPreview {
             profile: path(p)?,
             descriptor: path(d)?,
         },
-        ["recovery-apply", "--profile", p, "--descriptor", d, "--expected-revision", r, "--sha256", h, "--identity-sha256", i, "--confirm"] => {
+        ["recovery-apply", "--profile", p, "--descriptor", d, "--expected-revision", r, "--snapshot-sha256", s, "--sha256", h, "--identity-sha256", i, "--confirm"] => {
             Command::RecoveryApply {
                 profile: path(p)?,
                 descriptor: path(d)?,
                 revision: crate::expected_revision(r)?,
+                snapshot: hash(s)?,
                 digest: hash(h)?,
                 identity: hash(i)?,
             }
@@ -342,6 +467,60 @@ fn publication_status(
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
+        Command::RegisteredStatus { config, id } => reality_config::registered_status(Path::new(&config), &id, now),
+        Command::RegisterConfig { config, request, approval } => {
+            if let Some(expected) = approval {
+                reality_config::apply(Path::new(&config), &request, expected, now)?;
+                Ok("REALITY record saved; runtime UNCHANGED; external backend not available".into())
+            } else {
+                let preview = reality_config::prepare(Path::new(&config), &request, now)?;
+                Ok(format!("{}\napproval_sha256={}", preview.report(), hex(preview.approval_sha256())))
+            }
+        }
+        Command::ProvisionInspect { health, bundle, digest, identity } => {
+            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?.inspect().map_err(|_| Error::Health)?;
+            let record = crate::reality_provision::inspect_initial(&state, digest, identity, Path::new(&bundle), now)?;
+            Ok(format!("Initial bundle verified; runtime UNCHANGED\nidentity_sha256={}\npublication_sha256={}", hex(record.identity_sha256), hex(record.publication_sha256)))
+        }
+        Command::ProvisionPreview { health } => {
+            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?.inspect().map_err(|_| Error::Health)?;
+            let preview = crate::reality_provision::preview(&state, now)?;
+            Ok(format!("Initial provisioning preview; runtime UNCHANGED\nhealth_sha256={}\nplan_sha256={}\n{}", hex(preview.health_sha256), hex(preview.plan_sha256), state.plan().preview().map_err(|_| Error::Health)?))
+        }
+        Command::ProvisionApply { health, output, digest } => {
+            let state = reference_health::Store::new(Path::new(&health)).map_err(|_| Error::Health)?.inspect().map_err(|_| Error::Health)?;
+            let record = crate::reality_provision::create(&state, digest, Path::new(&output), now)?;
+            Ok(format!("Private candidate bundle created; runtime UNCHANGED\nidentity_sha256={}\npublication_sha256={}", hex(record.identity_sha256), hex(record.publication_sha256)))
+        }
+        Command::Admission { inbound, endpoint, key, create } => {
+            let scope = Scope { inbound, endpoint };
+            if create {
+                let secret = crate::reality_admission::Secret::generate().map_err(|_| Error::Identity)?;
+                secret.save_new(&scope, Path::new(&key)).map_err(|error| match error {
+                    crate::reality_admission::Error::Indeterminate => Error::Indeterminate,
+                    _ => Error::Storage,
+                })?;
+                Ok("Private admission material saved; runtime UNCHANGED. Transfer only through a protected channel.".into())
+            } else {
+                crate::reality_admission::Secret::load(&scope, Path::new(&key)).map_err(|_| Error::Identity)?;
+                Ok("Private admission material matches inbound scope; runtime UNCHANGED".into())
+            }
+        }
+        Command::PromotionPreview { profile, descriptor } => {
+            let profile = Profile::read(Path::new(&profile))?;
+            let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
+            let preview = profile.preview_promotion(&raw, now)?;
+            Ok(format!("Identity promotion preview; runtime UNCHANGED\nexpected_revision={}\nnext_revision={}\ncurrent_identity_sha256={}\nnext_identity_sha256={}\nsnapshot_sha256={}\ndocument_sha256={}\noverlap_ends_at={}\nIndependently confirm successor identity; this is not compromise recovery.",
+                preview.expected_revision, preview.next_revision, hex(preview.current_identity_sha256),
+                hex(preview.next_identity_sha256), hex(preview.snapshot_sha256),
+                hex(preview.document_sha256), preview.overlap_ends_at))
+        }
+        Command::PromotionApply { profile, descriptor, approval } => {
+            let profile = Profile::read(Path::new(&profile))?;
+            let raw = bootstrap::read_text(Path::new(&descriptor), crate::descriptor::MAX_DOCUMENT, false)?;
+            profile.promote(&raw, approval, now)?;
+            Ok("Identity trust promoted; credentials, profile and runtime UNCHANGED".into())
+        }
         Command::RecoveryPreview {
             profile,
             descriptor,
@@ -353,13 +532,14 @@ pub fn run(command: Command) -> Result<String, Error> {
                 false,
             )?;
             let preview = profile.preview_recovery(&raw, now)?;
-            Ok(format!("Offline recovery preview; runtime UNCHANGED\nexpected_revision={}\nnext_revision={}\ncurrent_expired={}\nreference_changed={}\ndocument_sha256={}\nidentity_sha256={}\nConfirm the fingerprint independently. This cannot recover a compromised or retired identity.",
-                preview.expected_revision, preview.next_revision, preview.current_expired, preview.reference_changed, hex(preview.document_sha256), hex(preview.identity_sha256)))
+            Ok(format!("Offline recovery preview; runtime UNCHANGED\nexpected_revision={}\nnext_revision={}\ncurrent_expired={}\nreference_changed={}\nsnapshot_sha256={}\ndocument_sha256={}\nidentity_sha256={}\nConfirm the fingerprint independently. This cannot recover a compromised or retired identity.",
+                preview.expected_revision, preview.next_revision, preview.current_expired, preview.reference_changed, hex(preview.snapshot_sha256), hex(preview.document_sha256), hex(preview.identity_sha256)))
         }
         Command::RecoveryApply {
             profile,
             descriptor,
             revision,
+            snapshot,
             digest,
             identity,
         } => {
@@ -372,6 +552,7 @@ pub fn run(command: Command) -> Result<String, Error> {
             profile.recover(
                 &raw,
                 bootstrap::RecoveryApproval {
+                    snapshot_sha256: snapshot,
                     expected_revision: revision,
                     document_sha256: digest,
                     identity_sha256: identity,
@@ -565,7 +746,7 @@ pub fn run(command: Command) -> Result<String, Error> {
             publish(&output, &invite.encode()?)
         }
         Command::Preview { invitation } => {
-            let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, false)?;
+            let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, true)?;
             let invite = Invitation::decode(&uri, now)?;
             Ok(format!(
                 "{}\ndocument_sha256={}",
@@ -575,13 +756,14 @@ pub fn run(command: Command) -> Result<String, Error> {
         }
         Command::Import {
             invitation,
+            admission,
             profile,
             trust,
             digest,
             identity,
             token_ref,
         } => {
-            let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, false)?;
+            let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, true)?;
             bootstrap::import(
                 &uri,
                 bootstrap::ImportApproval {
@@ -590,7 +772,11 @@ pub fn run(command: Command) -> Result<String, Error> {
                 },
                 Path::new(&profile),
                 Path::new(&trust),
-                token_ref.as_deref(),
+                bootstrap::EnrollmentMaterial {
+                    admission_path: Path::new(&admission),
+                    expected_admission: None,
+                    external_token: token_ref.as_deref(),
+                },
                 ClientPolicy {
                     transport: Transport::Auto,
                     xhttp_mode: XhttpMode::Auto,
@@ -686,6 +872,8 @@ mod tests {
         let i = dir.file("invitation");
         let p = dir.file("profile.toml");
         let t = dir.file("trust.toml");
+        let admission = dir.file("admission.key");
+        invoke(&["admission-new", "--inbound", "edge", "--endpoint", "edge.example.org:443", "--key", &admission, "--confirm"]).unwrap();
         let a = [
             "identity-new",
             "--inbound",
@@ -737,6 +925,8 @@ mod tests {
             "import",
             "--invitation",
             &i,
+            "--admission",
+            &admission,
             "--profile",
             &p,
             "--trust",
@@ -756,6 +946,8 @@ mod tests {
             "import",
             "--invitation",
             &i,
+            "--admission",
+            &admission,
             "--profile",
             &p,
             "--trust",
@@ -938,6 +1130,33 @@ mod tests {
     }
 
     #[test]
+    fn config_registration_requires_exact_preview_and_explicit_grants() {
+        let dir = Scratch::new();
+        let cfg = dir.file("server.toml");
+        let h = health(&dir);
+        let bundle = dir.file("bundle");
+        let p = invoke(&["provision-preview", "--health", &h]).unwrap();
+        let health_digest = field(&p, "health_sha256");
+        let created = invoke(&["provision-apply", "--health", &h, "--output", &bundle, "--health-sha256", health_digest, "--confirm"]).unwrap();
+        let identity = field(&created, "identity_sha256");
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))
+            .replace(":443", ":8443");
+        std::fs::write(&cfg, &source).unwrap();
+        let preview = ["register-server-preview", "--config", &cfg, "--health", &h, "--bundle", &bundle,
+            "--health-sha256", health_digest, "--identity-sha256", identity, "--listen", "127.0.0.1:443", "--grants", "device-a"];
+        let out = invoke(&preview).unwrap();
+        let mut save = preview.to_vec();
+        save[0] = "register-server-save";
+        assert!(parse(&save).is_err());
+        save.extend(["--sha256", field(&out, "approval_sha256"), "--confirm"]);
+        assert!(invoke(&save).unwrap().contains("runtime UNCHANGED"));
+        let config::Config::Server(doc) = config::read_file(Path::new(&cfg)).unwrap() else { panic!() };
+        assert_eq!(doc.server.inbounds.len(), 2);
+        assert!(invoke(&save).is_err());
+    }
+
+    #[test]
     fn cli_refuses_relative_paths_unconfirmed_commands_and_malformed_digests() {
         let dir = Scratch::new();
         let p = dir.file("profile");
@@ -1017,6 +1236,8 @@ mod tests {
         assert!(parse(&[
             "import",
             "--invitation",
+            &d,
+            "--admission",
             &d,
             "--profile",
             &p,

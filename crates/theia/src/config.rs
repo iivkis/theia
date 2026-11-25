@@ -85,12 +85,38 @@ pub struct Inbound {
         skip_serializing_if = "crate::security_profile::SecurityMode::is_plain"
     )]
     pub security_mode: crate::security_profile::SecurityMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality: Option<RealityBinding>,
     pub allowed_user_ids: Vec<String>,
     pub quic_listen: String,
     pub h2_listen: String,
     pub server_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tls_cert: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tls_key: String,
+}
+
+/// Private local paths and initial owner-confirmed enrollment root.
+/// No bearer, key bytes or reference private material is stored here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealityBinding {
+    pub health_store: String,
+    pub bundle: String,
+    pub initial_health_sha256: [u8; 32],
+    pub identity_sha256: [u8; 32],
+    pub manifest_sha256: [u8; 32],
+}
+impl RealityBinding {
+    fn valid(&self) -> bool {
+        self.initial_health_sha256 != [0; 32]
+            && self.identity_sha256 != [0; 32]
+            && self.manifest_sha256 != [0; 32]
+            && self.health_store != self.bundle
+            && [&self.health_store, &self.bundle].into_iter().all(|p|
+                crate::bounded_input::explicit_file_path(Path::new(p)) && !p.chars().any(char::is_control))
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,6 +149,8 @@ pub struct Profile {
     pub auth_token: String,
     pub tls_profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality_profile: Option<RealityClientBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xhttp_mode: Option<XhttpMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<String>,
@@ -130,6 +158,23 @@ pub struct Profile {
     pub quic_connect_timeout_ms: u32,
     pub quic_negative_cache_ttl_s: u32,
 }
+/// The imported root is immutable even as the separate signed trust
+/// history advances. Pin the exact enrollment bytes and independent root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealityClientBinding {
+    pub enrollment: String,
+    pub enrollment_sha256: [u8; 32],
+    pub identity_sha256: [u8; 32],
+}
+impl RealityClientBinding {
+    fn valid(&self) -> bool {
+        self.enrollment_sha256 != [0; 32] && self.identity_sha256 != [0; 32]
+            && crate::bounded_input::explicit_file_path(Path::new(&self.enrollment))
+            && !self.enrollment.chars().any(char::is_control)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
@@ -149,7 +194,7 @@ impl Profile {
     /// Own TLS defaults to adaptive XHTTP. Experimental security adapters
     /// currently have a fixed mode and never silently downgrade.
     pub fn effective_xhttp_mode(&self) -> XhttpMode {
-        if self.tls_profile == "default" {
+        if self.tls_profile == "default" || self.tls_profile == "smart-reality" {
             self.xhttp_mode.unwrap_or(XhttpMode::Auto)
         } else if crate::security_profile::CertificatePin::is_stream_up_profile(&self.tls_profile) {
             XhttpMode::StreamUp
@@ -402,23 +447,27 @@ impl ServerDocument {
                     "duplicate user grant",
                 )?;
             }
-            ensure(
-                valid_dns(&inbound.server_name),
-                format!("{field}.server_name"),
-                "invalid DNS name",
-            )?;
-            ensure(
-                valid_file_ref(&inbound.tls_cert),
-                format!("{field}.tls_cert"),
-                "expected absolute file: reference",
-            )?;
-            ensure(
-                valid_file_ref(&inbound.tls_key),
-                format!("{field}.tls_key"),
-                "expected absolute file: reference",
-            )?;
             let udp = listen(&inbound.quic_listen, &format!("{field}.quic_listen"))?;
             let tcp = listen(&inbound.h2_listen, &format!("{field}.h2_listen"))?;
+            if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
+                ensure(inbound.reality.as_ref().is_some_and(RealityBinding::valid),
+                    format!("{field}.reality"), "approved REALITY bundle and trust root required")?;
+                ensure(inbound.tls_cert.is_empty() && inbound.tls_key.is_empty(),
+                    format!("{field}.tls_cert"), "own-TLS material prohibited in REALITY")?;
+                ensure(tcp == udp, format!("{field}.quic_listen"),
+                    "REALITY requires one TCP/UDP listen address and port")?;
+                ensure(valid_remote(&format!("{}:{}", inbound.server_name, tcp.port())),
+                    format!("{field}.server_name"), "REALITY endpoint host is invalid")?;
+            } else {
+                ensure(inbound.reality.is_none(), format!("{field}.reality"),
+                    "REALITY material prohibited in own TLS")?;
+                ensure(valid_dns(&inbound.server_name), format!("{field}.server_name"),
+                    "invalid DNS name")?;
+                ensure(valid_file_ref(&inbound.tls_cert), format!("{field}.tls_cert"),
+                    "expected absolute file: reference")?;
+                ensure(valid_file_ref(&inbound.tls_key), format!("{field}.tls_key"),
+                    "expected absolute file: reference")?;
+            }
             ensure(
                 !udp_listeners.iter().any(|x| overlaps(*x, udp)),
                 format!("{field}.quic_listen"),
@@ -491,11 +540,6 @@ impl ClientDocument {
                 "invalid host:port or [IPv6]:port",
             )?;
             ensure(
-                valid_dns(&profile.server_name),
-                format!("{field}.server_name"),
-                "invalid TLS server name",
-            )?;
-            ensure(
                 valid_secret_ref(&profile.auth_token),
                 format!("{field}.auth_token"),
                 "expected env:NAME or absolute file: reference",
@@ -508,21 +552,31 @@ impl ClientDocument {
                 format!("{field}.tls_ca"),
                 "expected absolute file: reference to PEM CA bundle",
             )?;
-            ensure(
-                profile.tls_profile == "default"
-                    || crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile)
-                        .is_some()
-                    || (cfg!(feature = "experimental-btls-h2")
-                        && profile.tls_profile == "browser-h2-btls-v1"
-                        && profile.transport == Transport::H2),
-                format!("{field}.tls_profile"),
-                "unsupported TLS/HTTP fingerprint profile for this transport/backend (fail closed)",
-            )?;
-            ensure(
-                profile.xhttp_mode.is_none() || profile.tls_profile == "default",
-                format!("{field}.xhttp_mode"),
-                "explicit XHTTP selection requires own TLS; experimental profiles have a fixed mode",
-            )?;
+            if profile.tls_profile == "smart-reality" {
+                ensure(profile.reality_profile.as_ref().is_some_and(RealityClientBinding::valid),
+                    format!("{field}.reality_profile"), "pinned private REALITY enrollment required")?;
+                ensure(profile.server.rsplit_once(':').is_some_and(|(host, _)| host == profile.server_name),
+                    format!("{field}.server_name"), "REALITY server_name is the endpoint host, not reference SNI")?;
+                ensure(profile.tls_ca.is_none(), format!("{field}.tls_ca"),
+                    "own-TLS CA prohibited in REALITY")?;
+            } else {
+                ensure(profile.reality_profile.is_none(), format!("{field}.reality_profile"),
+                    "REALITY enrollment prohibited in own TLS")?;
+                ensure(valid_dns(&profile.server_name), format!("{field}.server_name"),
+                    "invalid TLS server name")?;
+                ensure(
+                    profile.tls_profile == "default"
+                        || crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile).is_some()
+                        || (cfg!(feature = "experimental-btls-h2")
+                            && profile.tls_profile == "browser-h2-btls-v1"
+                            && profile.transport == Transport::H2),
+                    format!("{field}.tls_profile"),
+                    "unsupported TLS/HTTP fingerprint profile for this transport/backend (fail closed)",
+                )?;
+                ensure(profile.xhttp_mode.is_none() || profile.tls_profile == "default",
+                    format!("{field}.xhttp_mode"),
+                    "explicit XHTTP selection requires own TLS; experimental profiles have a fixed mode")?;
+            }
             ensure(
                 (500..=15_000).contains(&profile.quic_connect_timeout_ms),
                 format!("{field}.quic_connect_timeout_ms"),
@@ -667,6 +721,13 @@ fn guarded_write_with_sync(
 /// Signed trust snapshots share the same cooperating CAS lock and atomic
 /// publication as config. None is an explicit create-only operation, never
 /// an overwrite. The caller must validate the whole document before use.
+/// Linearize a no-op trust update against cooperating writers without
+/// replacing the file. The caller must have already checked its contents.
+pub(crate) fn guarded_trust_assert(path: &Path, expected: &[u8]) -> Result<(), ConfigError> {
+    let _lock = editor_lock(path)?;
+    require_unchanged(path, expected)
+}
+
 pub(crate) fn guarded_trust_write(
     path: &Path,
     data: &str,

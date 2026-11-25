@@ -135,7 +135,8 @@ impl AuthFailure {
 pub struct ServerContext {
     pub inbound_id: String,
     security_mode: crate::security_profile::SecurityMode,
-    identity_routes: Option<IdentityRoutePolicy>,
+    identity_routes: Option<RwLock<IdentityRoutePolicy>>,
+    identity_gate:Option<Arc<RwLock<bool>>>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
     global_streams: Arc<Semaphore>,
@@ -154,6 +155,10 @@ struct IdentityRoutePolicy {
     not_before: u64,
     not_after: u64,
     signed: Arc<str>,
+    successor: Option<Arc<str>>,
+    signer: [u8; 32],
+    descriptor: crate::descriptor::Descriptor,
+    digest: [u8; 32],
 }
 
 impl IdentityRoutePolicy {
@@ -209,6 +214,7 @@ impl ServerContext {
             inbound_id: inbound.id.clone(),
             security_mode: inbound.security_mode,
             identity_routes: None,
+            identity_gate:None,
             authorization,
             policy: policy.clone(),
             global_streams,
@@ -228,8 +234,24 @@ impl ServerContext {
         value: &crate::descriptor::Verified,
         signed: Arc<str>,
     ) -> Result<Self, ServerError> {
+        if !inbound.security_mode.is_plain() { return Err(ServerError::Config); }
+        Self::identity_context(inbound, users, policy, value, signed)
+    }
+
+    pub(crate) fn identity_context(
+        inbound: &Inbound,
+        users: &[User],
+        policy: &ServerPolicy,
+        value: &crate::descriptor::Verified,
+        signed: Arc<str>,
+    ) -> Result<Self, ServerError> {
+        Self::new(inbound, users, policy).with_identity(inbound, value, signed)
+    }
+
+    fn with_identity(mut self, inbound: &Inbound, value: &crate::descriptor::Verified,
+        signed: Arc<str>) -> Result<Self, ServerError> {
         let d = value.descriptor();
-        if !inbound.security_mode.is_plain()
+        if !(inbound.security_mode.is_plain() || inbound.security_mode == crate::security_profile::SecurityMode::SmartReality)
             || inbound.id != d.scope.inbound
             || inbound.allowed_user_ids.is_empty()
             || value
@@ -240,29 +262,95 @@ impl ServerContext {
         }
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
-        let mut context = Self::new(inbound, users, policy);
-        context.identity_routes = Some(IdentityRoutePolicy {
+        self.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
             paths,
             stream_one: d.stream_one,
             stream_up: d.stream_up,
             not_before: d.not_before,
             not_after: d.not_after,
             signed,
-        });
-        Ok(context)
+            successor: None,
+            signer: value.signer(),
+            descriptor: d.clone(),
+            digest: value.payload_sha256(),
+        }));
+        Ok(self)
+    }
+
+    pub(crate) fn fork_identity(&self, value: &crate::descriptor::Verified,
+        signed: Arc<str>, successor: Option<Arc<str>>,gate:Arc<RwLock<bool>>) -> Result<Self,ServerError> {
+        let d=value.descriptor();
+        if d.scope.inbound!=self.inbound_id || value.check_time(crate::reference_health::unix_now()
+            .map_err(|_|ServerError::Config)?).is_err() { return Err(ServerError::Config); }
+        let paths=crate::split_http::IdentityRoutes::new(&d.path_prefix).map_err(|_|ServerError::Config)?;
+        Ok(Self {
+            inbound_id:self.inbound_id.clone(), security_mode:self.security_mode,
+            identity_routes:Some(RwLock::new(IdentityRoutePolicy {
+                paths,stream_one:d.stream_one,stream_up:d.stream_up,not_before:d.not_before,
+                not_after:d.not_after,signed,successor,signer:value.signer(),descriptor:d.clone(),digest:value.payload_sha256(),
+            })),
+            identity_gate:Some(gate),
+            authorization:self.authorization.clone(),policy:self.policy.clone(),
+            global_streams:self.global_streams.clone(),user_streams:self.user_streams.clone(),
+            connection_slots:self.connection_slots.clone(),live_quota:self.live_quota.clone(),peer_budget:self.peer_budget.clone(),
+        })
+    }
+
+    /// Controlled loopback fixture only. Update a compatible signed
+    /// descriptor on the existing shared authorization/connection budget.
+    /// No transport, routes, reference, grants or key change is permitted.
+    pub(crate) fn renew_identity_fixture(
+        &self, signed: &str, expected: [u8; 32],
+    ) -> Result<u64, ServerError> {
+        let mut routes = self.identity_routes.as_ref().ok_or(ServerError::Config)?
+            .write().map_err(|_| ServerError::Config)?;
+        if routes.digest != expected || !routes.current() {
+            return Err(ServerError::Config);
+        }
+        let previous = &routes.descriptor;
+        let anchor = crate::descriptor::Anchor::new(previous.scope.clone(), routes.signer,
+            previous.revision, crate::descriptor::ClientPolicy {
+                transport: crate::config::Transport::Auto,
+                xhttp_mode: crate::config::XhttpMode::Auto,
+            }).map_err(|_| ServerError::Config)?;
+        let value = crate::descriptor::verify(signed, &anchor).map_err(|_| ServerError::Config)?;
+        let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
+        value.check_time(now).map_err(|_| ServerError::Config)?;
+        let next = value.descriptor();
+        if next.revision <= previous.revision || next.not_before < previous.not_before
+            || next.not_after <= previous.not_after {
+            return Err(ServerError::Config);
+        }
+        let mut compatible = previous.clone();
+        compatible.revision = next.revision;
+        compatible.not_before = next.not_before;
+        compatible.not_after = next.not_after;
+        if &compatible != next {
+            return Err(ServerError::Config);
+        }
+        routes.not_before = next.not_before;
+        routes.not_after = next.not_after;
+        routes.descriptor = next.clone();
+        routes.digest = value.payload_sha256();
+        routes.signed = Arc::from(signed);
+        Ok(next.revision)
     }
 
     pub(crate) fn split_leg<T>(&self, request: &Request<T>) -> Option<crate::split_http::Leg> {
         match &self.identity_routes {
-            Some(routes) if routes.current() && routes.stream_up => routes.paths.leg(request),
-            Some(_) => None,
+            Some(routes) => {
+                let routes = routes.read().ok()?;
+                if routes.current() && routes.stream_up { routes.paths.leg(request) } else { None }
+            }
             None => crate::split_http::leg(request),
         }
     }
 
     pub(crate) fn is_descriptor_request<T>(&self, request: &Request<T>) -> bool {
         self.identity_routes.as_ref().is_some_and(|routes| {
-            request.method() == Method::GET && request.uri().path() == routes.paths.descriptor
+            routes.read().is_ok_and(|routes|
+                request.method() == Method::GET && (request.uri().path() == routes.paths.descriptor
+                    || request.uri().path() == routes.paths.successor))
         })
     }
 
@@ -273,9 +361,11 @@ impl ServerContext {
         request: &Request<T>,
         peer: IpAddr,
     ) -> Result<(SessionPermit, Arc<str>), StatusCode> {
-        let routes = self.identity_routes.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        let routes = self.identity_routes.as_ref().ok_or(StatusCode::NOT_FOUND)?
+            .read().map_err(|_| StatusCode::NOT_FOUND)?;
         if !routes.current()
-            || !self.is_descriptor_request(request)
+            || request.method() != Method::GET
+            || (request.uri().path() != routes.paths.descriptor && request.uri().path() != routes.paths.successor)
             || request.uri().query().is_some()
             || request
                 .headers()
@@ -303,7 +393,10 @@ impl ServerContext {
                     .and_then(|value| value.to_str().ok()),
             )
             .map_err(AuthFailure::status)?;
-        Ok((permit, routes.signed.clone()))
+        let signed = if request.uri().path() == routes.paths.successor {
+            routes.successor.clone().ok_or(StatusCode::NOT_FOUND)?
+        } else { routes.signed.clone() };
+        Ok((permit, signed))
     }
 
     pub(crate) fn connection_slot(&self) -> Option<ConnectionSlot> {
@@ -339,7 +432,8 @@ impl ServerContext {
         }
         let single_allowed = match &self.identity_routes {
             Some(routes) => {
-                routes.current() && routes.stream_one && request.uri().path() == routes.paths.single
+                routes.read().is_ok_and(|routes|
+                    routes.current() && routes.stream_one && request.uri().path() == routes.paths.single)
             }
             None => {
                 !self.security_mode.is_stream_up()
@@ -383,7 +477,7 @@ impl ServerContext {
     }
 
     pub(crate) fn requires_channel_binding(&self) -> bool {
-        !self.security_mode.is_plain()
+        !self.security_mode.is_plain() && self.identity_routes.is_none()
     }
 
     pub(crate) fn stream_up(&self) -> bool {
@@ -408,7 +502,7 @@ impl ServerContext {
         if !self.peer_budget.admit(peer, Instant::now()) {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        if !(self.stream_up() || self.security_mode.is_plain())
+        if !(self.stream_up() || self.security_mode.is_plain() || self.identity_routes.is_some())
             || self.split_leg(upload) != Some(Leg::Upload)
             || self.split_leg(download) != Some(Leg::Download)
             || split_http::pair_id(upload).is_none()
@@ -442,6 +536,13 @@ impl ServerContext {
     /// Check all configured hashes using constant-time comparison and never
     /// reflect token bytes, hashes or even the candidate string in errors.
     pub fn authorize(&self, authorization: Option<&str>) -> Result<SessionPermit, AuthFailure> {
+        // Held through permit acquisition: a structural root replacement
+        // linearizes against new logical streams on the old TLS context.
+        let _identity=if let Some(gate)=&self.identity_gate{
+            let held=gate.read().map_err(|_|AuthFailure::Forbidden)?;
+            if !*held{return Err(AuthFailure::Forbidden);}
+            Some(held)
+        }else{None};
         let header = authorization.ok_or(AuthFailure::Unauthorized)?;
         let bearer = header
             .strip_prefix("Bearer ")
@@ -486,7 +587,7 @@ impl ServerContext {
         // Admission and quota resize serialize through a single short
         // occupancy lock across old/new H2 and QUIC listener generations.
         if let Some(ledger) = &self.live_quota {
-            let permit = ledger.acquire_session(&user.id).ok_or(AuthFailure::Busy)?;
+            let permit=ledger.acquire_session_checked(&user.id,||self.authorization.load().is_ok_and(|current|Arc::ptr_eq(&current,&snapshot))).ok_or(AuthFailure::Busy)?;
             return Ok(SessionPermit {
                 _global: None,
                 _user: None,
@@ -748,86 +849,7 @@ pub(crate) async fn serve_generation_with_tls(
                     current.clone()
                 };
                 let context = context.clone();
-                connections.spawn(async move {
-                    let _slot = slot;
-                    let tls = match timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(socket)).await {
-                        Ok(Ok(tls)) => tls,
-                        Ok(Err(_)) => {
-                            crate::diag!(Warn, "server.h2", "tls_handshake_failed",
-                                "connection" = Value::Count(connection_id));
-                            return;
-                        }
-                        Err(_) => {
-                            crate::diag!(Warn, "server.h2", "tls_handshake_timeout",
-                                "connection" = Value::Count(connection_id));
-                            return;
-                        }
-                    };
-                    if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-                        crate::diag!(Warn, "server.h2", "alpn_rejected",
-                            "connection" = Value::Count(connection_id));
-                        return;
-                    }
-                    crate::diag!(Trace, "server.h2", "tls_verified",
-                        "connection" = Value::Count(connection_id));
-                    let binding = if context.requires_channel_binding() {
-                        let Ok(key) = tls.get_ref().1.export_keying_material(
-                            [0u8; 32], crate::channel_binding::LABEL,
-                            Some(crate::channel_binding::H2),
-                        ) else {
-                            return;
-                        };
-                        Some(Arc::new(crate::channel_binding::Admission::new(
-                            zeroize::Zeroizing::new(key),
-                        )))
-                    } else {
-                        None
-                    };
-                    let mut builder = h2::server::Builder::new();
-                    builder.max_concurrent_streams(MAX_H2_STREAMS);
-                    builder.max_header_list_size(MAX_HEADER_BYTES);
-                    let Ok(Ok(mut connection)) = timeout(HANDSHAKE_TIMEOUT, builder.handshake(tls)).await else {
-                        crate::diag!(Warn, "server.h2", "h2_handshake_failed_or_timeout",
-                            "connection" = Value::Count(connection_id));
-                        return;
-                    };
-                    crate::diag!(Debug, "server.h2", "connection_ready",
-                        "connection" = Value::Count(connection_id));
-                    let mut handlers = JoinSet::new();
-                    let pair = Arc::new(crate::split_http::Pair::new());
-                    loop {
-                        let accepted = if handlers.is_empty() {
-                            match timeout(AUTH_WINDOW, connection.accept()).await {
-                                Ok(accepted) => accepted,
-                                Err(_) => break,
-                            }
-                        } else {
-                            tokio::select! {
-                                _ = handlers.join_next() => continue,
-                                accepted = connection.accept() => accepted,
-                            }
-                        };
-                        let Some(Ok((request, respond))) = accepted else {
-                            break;
-                        };
-                        let context = context.clone();
-                        let pair = pair.clone();
-                        let binding = binding.clone();
-                        handlers.spawn(async move {
-                            let result = if context.is_descriptor_request(&request) {
-                                handle_descriptor(request, respond, &context, peer.ip()).await
-                            } else if context.accepts_split(&request) {
-                                handle_split_request(request, respond, &context, peer.ip(), &pair, binding.as_deref()).await
-                            } else {
-                                handle_request(request, respond, context, peer.ip(), binding.as_deref()).await
-                            };
-                            if let Err(error) = result {
-                                crate::diag!(Warn, "server.h2", "request_failed",
-                                    "reason" = Value::Label(error_kind(error)));
-                            }
-                        });
-                    }
-                });
+                connections.spawn(serve_h2_socket(socket, tls_acceptor, context, peer, slot, connection_id));
             }
         }
     }
@@ -841,6 +863,93 @@ pub(crate) async fn serve_generation_with_tls(
     })
     .await;
     Ok(())
+}
+
+/// Shared H2 application transport. The upstream admission adapter must
+/// supply the exact original byte stream and selected identity TLS config.
+pub(crate) async fn serve_h2_socket<S>(
+    socket: S, tls_acceptor: TlsAcceptor, context: Arc<ServerContext>,
+    peer: std::net::SocketAddr, slot: ConnectionSlot, connection_id: u64,
+) where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
+    let _slot = slot;
+    let tls = match timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(socket)).await {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(_)) => {
+            crate::diag!(Warn, "server.h2", "tls_handshake_failed",
+                "connection" = Value::Count(connection_id));
+            return;
+        }
+        Err(_) => {
+            crate::diag!(Warn, "server.h2", "tls_handshake_timeout",
+                "connection" = Value::Count(connection_id));
+            return;
+        }
+    };
+    if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+        crate::diag!(Warn, "server.h2", "alpn_rejected",
+            "connection" = Value::Count(connection_id));
+        return;
+    }
+    crate::diag!(Trace, "server.h2", "tls_verified",
+        "connection" = Value::Count(connection_id));
+    let binding = if context.requires_channel_binding() {
+        let Ok(key) = tls.get_ref().1.export_keying_material(
+            [0u8; 32], crate::channel_binding::LABEL,
+            Some(crate::channel_binding::H2),
+        ) else {
+            return;
+        };
+        Some(Arc::new(crate::channel_binding::Admission::new(
+            zeroize::Zeroizing::new(key),
+        )))
+    } else {
+        None
+    };
+    let mut builder = h2::server::Builder::new();
+    builder.max_concurrent_streams(MAX_H2_STREAMS);
+    builder.max_header_list_size(MAX_HEADER_BYTES);
+    let Ok(Ok(mut connection)) = timeout(HANDSHAKE_TIMEOUT, builder.handshake(tls)).await else {
+        crate::diag!(Warn, "server.h2", "h2_handshake_failed_or_timeout",
+            "connection" = Value::Count(connection_id));
+        return;
+    };
+    crate::diag!(Debug, "server.h2", "connection_ready",
+        "connection" = Value::Count(connection_id));
+    let mut handlers = JoinSet::new();
+    let pair = Arc::new(crate::split_http::Pair::new());
+    loop {
+        let accepted = if handlers.is_empty() {
+            match timeout(AUTH_WINDOW, connection.accept()).await {
+                Ok(accepted) => accepted,
+                Err(_) => break,
+            }
+        } else {
+            tokio::select! {
+                _ = handlers.join_next() => continue,
+                accepted = connection.accept() => accepted,
+            }
+        };
+        let Some(Ok((request, respond))) = accepted else {
+            break;
+        };
+        let context = context.clone();
+        let pair = pair.clone();
+        let binding = binding.clone();
+        handlers.spawn(async move {
+            let result = if context.is_descriptor_request(&request) {
+                handle_descriptor(request, respond, &context, peer.ip()).await
+            } else if context.accepts_split(&request) {
+                handle_split_request(request, respond, &context, peer.ip(), &pair, binding.as_deref()).await
+            } else {
+                handle_request(request, respond, context, peer.ip(), binding.as_deref()).await
+            };
+            if let Err(error) = result {
+                crate::diag!(Warn, "server.h2", "request_failed",
+                    "reason" = Value::Label(error_kind(error)));
+            }
+        });
+    }
+
 }
 
 async fn reject(
@@ -1444,6 +1553,9 @@ pub(crate) fn configured_certificate_pin(
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
+    if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality || inbound.reality.is_some() {
+        return Err(ServerError::Config);
+    }
     let cert_bytes = pem_data(&inbound.tls_cert, false)?;
     let key_bytes = pem_data(&inbound.tls_key, true)?;
     tls_material_from_bytes(inbound, &cert_bytes, &key_bytes)
@@ -1456,6 +1568,9 @@ fn tls_material_from_bytes(
 ) -> Result<TlsMaterial, ServerError> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let identity = crate::reload_preflight::IdentityHash::from_pem(cert_bytes, key_bytes);
+    if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality || inbound.reality.is_some() {
+        return Err(ServerError::Config);
+    }
     let mut cert_reader = BufReader::new(cert_bytes);
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
@@ -1478,11 +1593,17 @@ fn tls_material_from_bytes(
 /// stderr or logs; raw buffers are zeroized when the request/snapshot drops.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) struct CapturedTls {
-    pairs: Vec<CapturedPem>,
-    fingerprint: [u8; 32],
+    pairs:Vec<CapturedMaterial>,
+    fingerprint:[u8;32],
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+enum CapturedMaterial {
+    Pem(CapturedPem),
+    Reality(crate::reality_generation::Candidate,crate::reload_preflight::IdentityHash),
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 struct CapturedPem {
     cert: zeroize::Zeroizing<Vec<u8>>,
     key: zeroize::Zeroizing<Vec<u8>>,
@@ -1500,6 +1621,16 @@ impl CapturedTls {
         hash.update((document.server.inbounds.len() as u64).to_be_bytes());
         let mut pairs = Vec::with_capacity(document.server.inbounds.len());
         for inbound in &document.server.inbounds {
+            if let Some(binding)=&inbound.reality{
+                let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+                let candidate=crate::reality_generation::Candidate::capture(inbound,now).map_err(|_|ServerError::Config)?;
+                let fingerprint=candidate.fingerprint();
+                for chunk in [inbound.id.as_bytes(),b"Theia/REALITY/v1".as_slice(),fingerprint.as_slice()]{
+                    hash.update((chunk.len() as u64).to_be_bytes());hash.update(chunk);
+                }
+                pairs.push(CapturedMaterial::Reality(candidate,crate::reload_preflight::IdentityHash::reality(binding)));
+                continue;
+            }
             let cert = pem_data(&inbound.tls_cert, false)?;
             let key = pem_data(&inbound.tls_key, true)?;
             // A successful fingerprint is proof of a usable TLS1.3 identity,
@@ -1514,17 +1645,15 @@ impl CapturedTls {
                 hash.update(chunk);
             }
             let identity = crate::reload_preflight::IdentityHash::from_pem(&cert, &key);
-            pairs.push(CapturedPem {
-                cert,
-                key,
-                identity,
-            });
+            pairs.push(CapturedMaterial::Pem(CapturedPem{cert,key,identity}));
         }
         Ok(Self {
             pairs,
             fingerprint: hash.finalize().into(),
         })
     }
+
+    pub(crate) fn fingerprint(&self)->[u8;32]{self.fingerprint}
 
     pub(crate) fn matches(&self, expected: &[u8; 32]) -> bool {
         self.fingerprint.ct_eq(expected).unwrap_u8() == 1
@@ -1533,13 +1662,17 @@ impl CapturedTls {
     pub(crate) fn identities(&self) -> Vec<crate::reload_preflight::IdentityHash> {
         self.pairs
             .iter()
-            .map(|pair| pair.identity.clone())
+            .map(|pair|match pair{CapturedMaterial::Pem(p)=>p.identity.clone(),CapturedMaterial::Reality(_,id)=>id.clone()})
             .collect()
     }
 
     fn material(&self, inbound: &Inbound, index: usize) -> Result<TlsMaterial, ServerError> {
-        let pair = self.pairs.get(index).ok_or(ServerError::Config)?;
-        tls_material_from_bytes(inbound, &pair.cert, &pair.key)
+        let Some(CapturedMaterial::Pem(pair))=self.pairs.get(index) else{return Err(ServerError::Config);};
+        tls_material_from_bytes(inbound,&pair.cert,&pair.key)
+    }
+    fn reality(&self,index:usize)->Result<&crate::reality_generation::Candidate,ServerError>{
+        let Some(CapturedMaterial::Reality(candidate,_))=self.pairs.get(index)else{return Err(ServerError::Config);};
+        Ok(candidate)
     }
 }
 
@@ -1640,19 +1773,18 @@ impl GenerationLimits {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-type ReadyListener = (
-    TcpListener,
-    TlsAcceptor,
-    quinn::Endpoint,
-    Arc<ServerContext>,
-    quinn::ServerConfig,
-);
+enum ReadyListener {
+    Plain(TcpListener,TlsAcceptor,quinn::Endpoint,Arc<ServerContext>,quinn::ServerConfig),
+    Reality(crate::reality_tcp::PreparedTcp,Option<crate::reality_quic::PreparedQuic>,
+        Option<tokio::net::UdpSocket>,crate::reality_generation::Manager,Arc<crate::reality_live::Live>),
+}
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct PreparedGeneration {
     listeners: Vec<ReadyListener>,
     identities: Vec<crate::reload_preflight::IdentityHash>,
     live: Arc<LiveAuthorization>,
+    reality:crate::runtime_generation::RealityMap,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1666,14 +1798,52 @@ async fn prepare_generation(
         LiveAuthorization::new_at_revision(document.clone(), revision)
             .map_err(|_| ServerError::Config)?,
     );
+    prepare_selected_listeners(document,limits,captured,live,None).await
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
+async fn prepare_selected_listeners(document:&ServerDocument,limits:&GenerationLimits,captured:Option<&CapturedTls>,
+    live:Arc<LiveAuthorization>,only:Option<&std::collections::HashSet<String>>)->Result<PreparedGeneration,ServerError>{
     let mut listeners = Vec::with_capacity(document.server.inbounds.len());
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
+    let mut reality=HashMap::new();
+    let config=Config::Server(document.clone());
     for (index, inbound) in document.server.inbounds.iter().enumerate() {
+        if only.is_some_and(|ids|!ids.contains(&inbound.id)){continue;}
         let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
         let udp_addr: SocketAddr = inbound
             .quic_listen
             .parse()
             .map_err(|_| ServerError::Config)?;
+        if let Some(binding)=&inbound.reality{
+            let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+            let (manager,lease)=if let Some(snapshot)=captured{
+                snapshot.reality(index)?.activate(inbound,now).map_err(|_|ServerError::Config)?
+            }else{
+                let manager=crate::reality_generation::Manager::new_live(&config,&inbound.id,now).await.map_err(|_|ServerError::Config)?;
+                let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+                let lease=manager.refresh(now).map_err(|_|ServerError::Config)?;
+                (manager,lease)
+            };
+            let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+            let h3=lease.publication().active().verified().descriptor().h3;
+            let mut context=ServerContext::with_limits(inbound,&document.server.policy,live.shared(),
+                limits.global.clone(),limits.per_user.clone(),limits.connections.clone(),limits.peer_budget.clone());
+            context.live_quota=Some(limits.ledger.clone());
+            let carrier=crate::reality_live::Live::new(Arc::new(lease),Arc::new(context),now)?;
+            let listener=crate::tcp_bbr::bind(tcp_addr).map_err(|e|match e{
+                crate::tcp_bbr::Error::Network=>ServerError::Io,
+                crate::tcp_bbr::Error::Unavailable=>ServerError::TcpControllerUnavailable,
+            })?;
+            let tcp=crate::reality_tcp::PreparedTcp::from_live(listener,carrier.clone())?;
+            let udp=tokio::net::UdpSocket::bind(udp_addr).await.map_err(|_|ServerError::Io)?;
+            let (quic,silent)=if h3{(Some(crate::reality_quic::PreparedQuic::from_live(udp,carrier.clone())?),None)}
+                else{(None,Some(udp))};
+            identities.push(crate::reload_preflight::IdentityHash::reality(binding));
+            reality.insert(inbound.id.clone(),(binding.manifest_sha256,carrier.clone()));
+            listeners.push(ReadyListener::Reality(tcp,quic,silent,manager,carrier));
+            continue;
+        }
         let material = match captured {
             Some(snapshot) => snapshot.material(inbound, index)?,
             None => tls_material(inbound)?,
@@ -1701,12 +1871,13 @@ async fn prepare_generation(
             limits.peer_budget.clone(),
         );
         context.live_quota = Some(limits.ledger.clone());
-        listeners.push((listener, acceptor, endpoint, Arc::new(context), h3_config));
+        listeners.push(ReadyListener::Plain(listener,acceptor,endpoint,Arc::new(context),h3_config));
     }
     Ok(PreparedGeneration {
         listeners,
         identities,
         live,
+        reality,
     })
 }
 
@@ -1714,6 +1885,7 @@ async fn prepare_generation(
 /// when the supervisor rotates the certificate for new H2/H3 handshakes.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct HotIdentity {
+    id:String,
     h2: Arc<RwLock<TlsAcceptor>>,
     h3: quinn::Endpoint,
 }
@@ -1735,10 +1907,12 @@ fn prepare_same_port_tls(
 ) -> Result<PreparedSamePortTls, ServerError> {
     let mut h2 = Vec::with_capacity(document.server.inbounds.len());
     let mut h3 = Vec::with_capacity(document.server.inbounds.len());
-    let mut identities = Vec::with_capacity(document.server.inbounds.len());
+    // Keep identities in document order, but compile PEM acceptors in
+    // ordinary-listener order, exactly as RunningGeneration::launch does.
+    let identities=captured.identities();
     for (index, inbound) in document.server.inbounds.iter().enumerate() {
+        if inbound.reality.is_some(){continue;}
         let material = captured.material(inbound, index)?;
-        identities.push(material.identity);
         let h2_acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         let h3_config = crate::quic_transport::server_config(material.certs, material.key)
             .map_err(|_| ServerError::Tls)?;
@@ -1752,6 +1926,15 @@ fn prepare_same_port_tls(
 /// after ONE same-port rotation. TLS ServerConfig owns private signing keys;
 /// this slot never holds raw PEM bytes and never touches disk on rollback.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+struct StructuralRollbackSlot {
+    document:Arc<ServerDocument>,
+    identities:Vec<crate::reload_preflight::IdentityHash>,
+    revision:u64,
+    ready_at:Instant,
+    expires:Instant,
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 struct RollbackSlot {
     expires: Instant,
     h2: Vec<TlsAcceptor>,
@@ -1764,61 +1947,170 @@ struct RollbackSlot {
 const TLS_ROLLBACK_WINDOW: Duration = Duration::from_secs(300);
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+struct HotReality{
+    id:String,
+    carrier:Arc<crate::reality_live::Live>,
+    manager:Arc<tokio::sync::Mutex<Arc<crate::reality_generation::Manager>>>,
+    used_roots:std::collections::HashSet<[u8;32]>,
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 struct RunningGeneration {
-    tasks: JoinSet<Result<(), ServerError>>,
-    phase: watch::Sender<GenerationPhase>,
+    tasks: JoinSet<(String,Result<(),ServerError>)>,
+    phases:HashMap<String,watch::Sender<GenerationPhase>>,
+    draining:std::collections::HashSet<String>,
     identities: Vec<HotIdentity>,
     // Exact QUIC configs installed on the endpoints. Saved previous configs
     // support a one-shot TLS undo without reading external PEM files again.
     active_h3: Vec<quinn::ServerConfig>,
+    reality:Vec<HotReality>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl RunningGeneration {
-    fn launch(listeners: Vec<ReadyListener>, phase: GenerationPhase) -> Self {
-        let (sender, receiver) = watch::channel(phase);
-        let mut tasks = JoinSet::new();
-        let mut identities = Vec::with_capacity(listeners.len());
-        let mut active_h3 = Vec::with_capacity(listeners.len());
-        for (tcp, acceptor, udp, context, h3_config) in listeners {
-            active_h3.push(h3_config);
-            let h2 = Arc::new(RwLock::new(acceptor));
-            identities.push(HotIdentity {
-                h2: h2.clone(),
-                h3: udp.clone(),
+    fn launch(listeners:Vec<ReadyListener>,phase:GenerationPhase)->Self{
+        let mut running=Self{tasks:JoinSet::new(),phases:HashMap::new(),draining:Default::default(),
+            identities:Vec::new(),active_h3:Vec::new(),reality:Vec::new()};
+        running.append(listeners,phase);
+        running
+    }
+    fn append(&mut self,listeners:Vec<ReadyListener>,phase:GenerationPhase){
+        for listener in listeners{
+            let id=match &listener{
+                ReadyListener::Plain(_,_,_,context,_)=>context.inbound_id.clone(),
+                ReadyListener::Reality(_,_,_,_,carrier)=>carrier.inbound_id().to_owned(),
+            };
+            let (sender,receiver)=watch::channel(phase);
+            self.phases.insert(id.clone(),sender);
+            let mut tasks=JoinSet::new();
+            match listener{
+                ReadyListener::Plain(tcp,acceptor,udp,context,h3_config)=>{
+                    let h2=Arc::new(RwLock::new(acceptor));
+                    self.identities.push(HotIdentity{id:id.clone(),h2:h2.clone(),h3:udp.clone()});
+                    self.active_h3.push(h3_config);
+                    tasks.spawn(serve_generation_with_tls(tcp,h2,context.clone(),receiver.clone()));
+                    tasks.spawn(crate::h3_server::serve_generation(udp,context,receiver.clone()));
+                }
+                ReadyListener::Reality(tcp,quic,silent,manager,carrier)=>{
+                    let root=manager.root_fingerprint();
+                    let manager=Arc::new(tokio::sync::Mutex::new(Arc::new(manager)));
+                    self.reality.push(HotReality{id:id.clone(),carrier:carrier.clone(),manager:manager.clone(),used_roots:std::collections::HashSet::from([root])});
+                    let mut phase=receiver.clone();
+                    tasks.spawn(async move{
+                        if !await_generation_activation(&mut phase).await{return Ok(());}
+                        tcp.serve().await
+                    });
+                    if let Some(quic)=quic{
+                        let mut phase=receiver.clone();
+                        tasks.spawn(async move{
+                            if !await_generation_activation(&mut phase).await{return Ok(());}
+                            quic.serve().await
+                        });
+                    }
+                    if let Some(socket)=silent{
+                        let mut phase=receiver.clone();
+                        tasks.spawn(async move{
+                            let _socket=socket;
+                            if !await_generation_activation(&mut phase).await{return Ok(());}
+                            while phase.changed().await.is_ok(){
+                                if *phase.borrow()==GenerationPhase::Drain{break;}
+                            }
+                            Ok(())
+                        });
+                    }
+                    let mut phase=receiver.clone();
+                    tasks.spawn(async move{
+                        if !await_generation_activation(&mut phase).await{return Ok(());}
+                        loop{
+                            tokio::select!{
+                                changed=phase.changed()=>{
+                                    if changed.is_err()||*phase.borrow()==GenerationPhase::Drain{return Ok(());}
+                                }
+                                _=tokio::time::sleep(Duration::from_secs(5))=>{
+                                    let manager=manager.lock().await;
+                                    let result=tokio::select!{
+                                        result=manager.maintain(&carrier)=>result,
+                                        _=phase.changed()=>return Ok(()),
+                                    };
+                                    match result{
+                                        Ok(lease)=>{
+                                            if let Ok(now)=crate::reference_health::unix_now(){
+                                                if carrier.publish(Arc::new(lease),now).is_ok(){continue;}
+                                            }
+                                            carrier.suspend();
+                                        }
+                                        Err(_)=>carrier.suspend(),
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            // Own every transport task for this inbound in a scoped group.
+            // Dropping the parent cancels the entire group, including on
+            // panic. An active group exiting unexpectedly is fatal.
+            self.tasks.spawn(async move{
+                let mut phase=receiver;
+                let result=loop{
+                    if *phase.borrow()==GenerationPhase::Drain{break Ok(());}
+                    tokio::select!{
+                        change=phase.changed()=>{
+                            if change.is_err(){break Ok(());}
+                        }
+                        joined=tasks.join_next()=>{
+                            if *phase.borrow()==GenerationPhase::Drain{break Ok(());}
+                            break match joined{Some(Ok(Err(e)))=>Err(e),_=>Err(ServerError::Io)};
+                        }
+                    }
+                };
+                if result.is_ok(){
+                    let _=timeout(GENERATION_DRAIN+Duration::from_secs(2),async{
+                        while tasks.join_next().await.is_some(){}
+                    }).await;
+                }
+                tasks.shutdown().await;
+                (id,result)
             });
-            tasks.spawn(serve_generation_with_tls(
-                tcp,
-                h2,
-                context.clone(),
-                receiver.clone(),
-            ));
-            tasks.spawn(crate::h3_server::serve_generation(
-                udp,
-                context,
-                receiver.clone(),
-            ));
-        }
-        Self {
-            tasks,
-            phase: sender,
-            identities,
-            active_h3,
         }
     }
-
-    fn is_healthy_before_activation(&mut self) -> bool {
-        // Every task is waiting at an activation barrier, with the socket
-        // already bound. Any premature completion is a failed generation.
+    fn is_healthy_before_activation(&mut self)->bool{
         self.tasks.try_join_next().is_none()
     }
-
-    fn start(&self) {
-        self.phase.send_replace(GenerationPhase::Active);
+    fn start(&self){
+        for phase in self.phases.values(){phase.send_replace(GenerationPhase::Active);}
     }
-
-    fn drain(&self) {
-        self.phase.send_replace(GenerationPhase::Drain);
+    fn drain(&self){
+        for hot in &self.reality{hot.carrier.retire();}
+        for phase in self.phases.values(){phase.send_replace(GenerationPhase::Drain);}
+    }
+    fn remove_inbounds(&mut self,removed:&std::collections::HashSet<String>){
+        for id in removed{
+            if let Some(phase)=self.phases.get(id){
+                self.draining.insert(id.clone());
+                phase.send_replace(GenerationPhase::Drain);
+            }
+        }
+        self.reality.retain(|hot|{
+            if removed.contains(&hot.id){hot.carrier.retire();false}else{true}
+        });
+        let old=std::mem::take(&mut self.identities);
+        let configs=std::mem::take(&mut self.active_h3);
+        for (hot,cfg) in old.into_iter().zip(configs){
+            if !removed.contains(&hot.id){self.identities.push(hot);self.active_h3.push(cfg);}
+        }
+    }
+    fn order_plain(&mut self,document:&ServerDocument){
+        let mut entries:Vec<_>=std::mem::take(&mut self.identities).into_iter()
+            .zip(std::mem::take(&mut self.active_h3)).collect();
+        entries.sort_by_key(|(hot,_)|document.server.inbounds.iter().position(|i|i.id==hot.id).unwrap_or(usize::MAX));
+        (self.identities,self.active_h3)=entries.into_iter().unzip();
+    }
+    fn has_draining(&self)->bool{!self.draining.is_empty()}
+    fn finish_draining(&mut self,id:&str)->bool{
+        if !self.draining.remove(id){return false;}
+        self.phases.remove(id);
+        true
     }
 }
 
@@ -1846,6 +2138,7 @@ async fn stage_fresh_generation(
         RunningGeneration,
         crate::runtime_generation::View,
         Vec<crate::reload_preflight::IdentityHash>,
+        crate::runtime_generation::RealityMap,
         u64,
     ),
     (),
@@ -1880,13 +2173,74 @@ async fn stage_fresh_generation(
     if !running.is_healthy_before_activation() {
         return Err(());
     }
-    Ok((running, next, prepared.identities, next_revision))
+    Ok((running,next,prepared.identities,prepared.reality,next_revision))
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
+async fn stage_partial_generation(request:&crate::runtime_generation::RestartRequest,loaded:&[crate::reload_preflight::IdentityHash],
+    limits:&GenerationLimits,path:&Path,plan:&crate::restart_guard::PartialLayout)
+    ->Result<(PreparedGeneration,crate::runtime_generation::View,crate::live_auth::StagedAuthorization),()>{
+    let snapshot=request.material.as_ref().ok_or(())?;
+    let candidate=&request.candidate;
+    if crate::restart_guard::probe_captured(&request.previous.document,loaded,candidate,snapshot)
+        !=Ok(crate::restart_guard::RestartVerdict::FreshPortsBindable){return Err(());}
+    let (live,auth)=request.previous.live.prepare_tls_rebase(candidate,request.expected_revision).map_err(|_|())?;
+    let live=Arc::new(live);
+    let prepared=prepare_selected_listeners(candidate,limits,Some(snapshot),live.clone(),Some(&plan.added)).await.map_err(|_|())?;
+    let view=crate::runtime_generation::View{document:Arc::new(candidate.clone()),inbounds:candidate.server.inbounds.len(),
+        preflight:Arc::new(crate::reload_preflight::ReloadPreflight::new(path.to_owned(),candidate.clone(),snapshot.identities())),live};
+    Ok((prepared,view,auth))
 }
 
 /// Only identity material may change. All PEM/cert/key/QUIC/H2 builders
 /// finish before acquiring the short CAS lock or swapping any live handles.
 /// The old listener socket and both active tunnel populations remain intact.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn commit_same_port_reality(
+    runtime:&crate::runtime_generation::State,running:&mut RunningGeneration,
+    request:&crate::runtime_generation::RestartRequest,
+    loaded:&[crate::reload_preflight::IdentityHash],path:&Path,
+)->Result<(Vec<crate::reload_preflight::IdentityHash>,u64),()>{
+    use crate::restart_guard::{self,RestartVerdict};
+    let previous=request.previous.document.as_ref();
+    let candidate=&request.candidate;
+    let index=restart_guard::same_port_reality_only(previous,candidate).ok_or(())?;
+    let snapshot=request.material.as_ref().ok_or(())?;
+    if restart_guard::probe_captured(previous,loaded,candidate,snapshot)!=Ok(RestartVerdict::SamePortTlsReady){
+        return Err(());
+    }
+    let inbound=&candidate.server.inbounds[index];
+    let binding=inbound.reality.as_ref().ok_or(())?;
+    let old=previous.server.inbounds[index].reality.as_ref().ok_or(())?;
+    let hot=running.reality.iter_mut().find(|v|v.id==inbound.id).ok_or(())?;
+    if hot.used_roots.contains(&binding.identity_sha256){return Err(());}
+    // One supervisor owns the maintenance mutex. If DNS/health work is
+    // in progress, refuse rather than race a stale manager publication.
+    let mut manager=hot.manager.try_lock().map_err(|_|())?;
+    let now=crate::reference_health::unix_now().map_err(|_|())?;
+    let (next_manager,lease)=snapshot.reality(index).map_err(|_|())?.activate(inbound,now).map_err(|_|())?;
+    manager.check_replacement(&lease,binding.identity_sha256).map_err(|_|())?;
+    let prepared=hot.carrier.prepare_replacement(Arc::new(lease),now).map_err(|_|())?;
+    let (live,auth)=request.previous.live.prepare_tls_rebase(candidate,request.expected_revision).map_err(|_|())?;
+    let identities=snapshot.identities();
+    let next=crate::runtime_generation::View{
+        document:Arc::new(candidate.clone()),inbounds:candidate.server.inbounds.len(),
+        preflight:Arc::new(crate::reload_preflight::ReloadPreflight::new(path.to_owned(),candidate.clone(),identities.clone())),
+        live:Arc::new(live),
+    };
+    if request.complete.is_closed(){return Err(());}
+    let revision=hot.carrier.commit_replacement(prepared,|publish|{
+        runtime.commit_reality_replacement(&request.previous,request.expected_revision,next,auth,
+            &inbound.id,old.manifest_sha256,binding.manifest_sha256,||{
+                publish();
+                *manager=Arc::new(next_manager);
+            }).map_err(|_|())
+    })?;
+    hot.used_roots.insert(binding.identity_sha256);
+    Ok((identities,revision))
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 fn commit_same_port_tls(
     runtime: &crate::runtime_generation::State,
     running: &mut RunningGeneration,
@@ -1906,11 +2260,14 @@ fn commit_same_port_tls(
     let snapshot = request.material.as_ref().ok_or(())?;
     if crate::restart_guard::probe_captured(original, loaded_identities, candidate, snapshot)
         != Ok(crate::restart_guard::RestartVerdict::SamePortTlsReady)
-        || running.identities.len() != candidate.server.inbounds.len()
+        || !crate::restart_guard::same_port_tls_only(original,candidate)
+        || running.identities.len()!=candidate.server.inbounds.iter().filter(|i|i.reality.is_none()).count()
+        || running.active_h3.len()!=running.identities.len()
     {
         return Err(());
     }
     let prepared = prepare_same_port_tls(candidate, snapshot).map_err(|_| ())?;
+    if prepared.h2.len()!=running.identities.len()||prepared.h3.len()!=running.identities.len(){return Err(());}
     let (rebased_live, staged_auth) = request
         .previous
         .live
@@ -1986,13 +2343,17 @@ fn commit_tls_rollback(
     if Instant::now() >= slot.expires
         || slot.h2.len() != running.identities.len()
         || slot.h3.len() != running.identities.len()
-        || slot.refs.len() != running.identities.len()
-        || slot.identities.len() != running.identities.len()
+        || running.active_h3.len()!=running.identities.len()
     {
         return Err(());
     }
     let previous = runtime.snapshot().map_err(|_| ())?;
-    if previous.live.revision() != Ok(expected_revision) {
+    if slot.refs.len()!=previous.document.server.inbounds.len()
+        || slot.identities.len()!=previous.document.server.inbounds.len()
+        || running.identities.len()!=previous.document.server.inbounds.iter().filter(|i|i.reality.is_none()).count()
+        || previous.document.server.inbounds.iter().zip(&slot.identities).any(|(i,identity)|
+            i.reality.as_ref().is_some_and(|b|crate::reload_preflight::IdentityHash::reality(b)!=*identity))
+        || previous.live.revision() != Ok(expected_revision) {
         return Err(());
     }
     let mut target = previous.document.as_ref().clone();
@@ -2105,7 +2466,7 @@ async fn run_supervised_file(
             )),
             live: initial.live,
         },
-    ));
+    ).with_reality(initial.reality).with_reality_ledger(limits.ledger.clone()));
 
     // Only the original, protected management listener survives cutover.
     // Never expose a new administrative TCP port or loosen Named Pipe DACL.
@@ -2132,15 +2493,20 @@ async fn run_supervised_file(
     let mut identities = current_identities;
     let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
     let mut rollback: Option<RollbackSlot> = None;
+    let mut structural_rollback:Option<StructuralRollbackSlot>=None;
+    // Independent replacement is irreversible within this supervisor,
+    // even after removal/re-addition or a subsequent fresh-port cutover.
+    let mut replaced_roots=std::collections::HashSet::<[u8;32]>::new();
+    const MAX_REPLACED_ROOTS:usize=4096;
     loop {
         tokio::select! {
             request = queue.recv() => {
-                let Some(request) = request else {
+                let Some(mut request) = request else {
                     return Err(ServerError::Io);
                 };
                 // No unbounded retired-generation backlog and no double
                 // admission during simultaneous restart attempts.
-                if retiring.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                if running.has_draining()||retiring.as_ref().is_some_and(|worker| !worker.is_finished()) {
                     let _ = request.complete.send(Err(()));
                     continue;
                 }
@@ -2156,6 +2522,39 @@ async fn run_supervised_file(
                 // is no longer listening for its result.
                 if request.complete.is_closed() {
                     continue;
+                }
+                let structural=request.kind==crate::runtime_generation::ChangeKind::StructuralRollback;
+                if structural{
+                    let Some(slot)=structural_rollback.as_ref()else{let _=request.complete.send(Err(()));continue;};
+                    let now=Instant::now();
+                    if slot.revision!=request.expected_revision||now<slot.ready_at||now>=slot.expires{
+                        let _=request.complete.send(Err(()));continue;
+                    }
+                    let previous=slot.document.clone();
+                    let previous_ids=slot.identities.clone();
+                    let result=tokio::task::spawn_blocking(move||{
+                        let material=CapturedTls::capture(&previous).map_err(|_|())?;
+                        if material.identities()!=previous_ids{return Err(());}
+                        Ok((previous,material))
+                    }).await;
+                    let Ok(Ok((previous,material)))=result else{let _=request.complete.send(Err(()));continue;};
+                    if request.complete.is_closed(){continue;}
+                    request.candidate=previous.as_ref().clone();
+                    request.material=Some(material);
+                }
+                if request.candidate.server.inbounds.iter().any(|i|i.reality.as_ref().is_some_and(|b|replaced_roots.contains(&b.identity_sha256))){
+                    let _=request.complete.send(Err(()));continue;
+                }
+                let replacing:Vec<_>=request.previous.document.server.inbounds.iter().filter_map(|old|{
+                    let root=old.reality.as_ref()?;
+                    request.candidate.server.inbounds.iter().any(|new|
+                        new.id==old.id && new.server_name==old.server_name &&
+                        new.h2_listen.parse::<SocketAddr>().ok().map(|v|v.port())==old.h2_listen.parse::<SocketAddr>().ok().map(|v|v.port()) &&
+                        new.reality.as_ref().map(|v|v.identity_sha256)!=Some(root.identity_sha256))
+                        .then_some(root.identity_sha256)
+                }).collect();
+                if replaced_roots.len().saturating_add(replacing.len())>MAX_REPLACED_ROOTS{
+                    let _=request.complete.send(Err(()));continue;
                 }
                 if request.kind == crate::runtime_generation::ChangeKind::Rollback {
                     let applied = rollback.as_ref().ok_or(()).and_then(|slot| {
@@ -2187,6 +2586,23 @@ async fn run_supervised_file(
                     let _ = request.complete.send(result);
                     continue;
                 }
+                if crate::restart_guard::same_port_reality_only(request.previous.document.as_ref(),&request.candidate).is_some(){
+                    let result=commit_same_port_reality(&runtime,&mut running,&request,&identities,config_path);
+                    match result{
+                        Ok((next,revision))=>{
+                            identities=next;
+                            replaced_roots.extend(replacing.iter().copied());
+                            // Independent enrollment is not reversible TLS
+                            // rotation; never resurrect the replaced root.
+                            rollback=None;structural_rollback=None;
+                            runtime.set_rollback_until(None);
+                            runtime.set_restart_rollback(None);
+                            let _=request.complete.send(Ok(revision));
+                        }
+                        Err(())=>{let _=request.complete.send(Err(()));}
+                    }
+                    continue;
+                }
                 if crate::restart_guard::same_port_tls_only(
                     request.previous.document.as_ref(),
                     &request.candidate,
@@ -2202,7 +2618,9 @@ async fn run_supervised_file(
                         Ok((new_identities, revision, previous_tls)) => {
                             identities = new_identities;
                             runtime.set_rollback_until(Some(previous_tls.expires));
-                            rollback = Some(previous_tls);
+                            rollback=Some(previous_tls);
+                            structural_rollback=None;
+                            runtime.set_restart_rollback(None);
                             let _ = request.complete.send(Ok(revision));
                         }
                         Err(()) => {
@@ -2211,6 +2629,33 @@ async fn run_supervised_file(
                     }
                     continue;
                 }
+                if let Some(snapshot)=request.material.as_ref(){
+                    let next_ids=snapshot.identities();
+                    if let Some(plan)=crate::restart_guard::partial_layout(request.previous.document.as_ref(),&identities,&request.candidate,&next_ids){
+                        let staged=stage_partial_generation(&request,&identities,&limits,config_path,&plan).await;
+                        let Ok((prepared,next_view,auth))=staged else{let _=request.complete.send(Err(()));continue;};
+                        if request.complete.is_closed(){continue;}
+                        let revision=runtime.commit_partial_layout(&request.previous,request.expected_revision,next_view,auth,&plan.removed,prepared.reality);
+                        let Ok(revision)=revision else{let _=request.complete.send(Err(()));continue;};
+                        running.remove_inbounds(&plan.removed);
+                        running.append(prepared.listeners,GenerationPhase::Active);
+                        running.order_plain(&request.candidate);
+                        rollback=None;
+                        runtime.set_rollback_until(None);
+                        if structural{
+                            structural_rollback=None;runtime.set_restart_rollback(None);
+                        }else{
+                            let now=Instant::now();
+                            let ready_at=if plan.removed.is_empty(){now}else{now+GENERATION_DRAIN+Duration::from_secs(2)};
+                            let expires=now+Duration::from_secs(300);
+                            structural_rollback=Some(StructuralRollbackSlot{document:request.previous.document.clone(),identities:identities.clone(),revision,ready_at,expires});
+                            runtime.set_restart_rollback(Some((revision,ready_at,expires)));
+                        }
+                        identities=next_ids;
+                        let _=request.complete.send(Ok(revision));
+                        continue;
+                    }
+                }
                 let staged = stage_fresh_generation(
                     &request,
                     &identities,
@@ -2218,7 +2663,7 @@ async fn run_supervised_file(
                     config_path,
                 )
                 .await;
-                let Ok((next_running, next_view, next_identities, revision)) = staged else {
+                let Ok((next_running,next_view,next_identities,next_reality,revision))=staged else {
                     let _ = request.complete.send(Err(()));
                     continue;
                 };
@@ -2227,18 +2672,39 @@ async fn run_supervised_file(
                 if request.complete.is_closed() {
                     continue;
                 }
-                if runtime.commit_restart(
+                if runtime.commit_restart_with_reality(
                     &request.previous,
                     request.expected_revision,
-                    next_view,
+                    next_view,next_reality,
                 ).is_err() {
                     let _ = request.complete.send(Err(()));
                     continue;
                 }
                 next_running.start();
-                let previous = std::mem::replace(&mut running, next_running);
-                identities = next_identities;
-                rollback = None;
+                let previous=std::mem::replace(&mut running,next_running);
+                // No key or health rollback: previous own-TLS PEM digest
+                // must still match, REALITY reopens its CURRENT rooted
+                // publication and floor when the operator confirms.
+                // An independent root replacement on the same logical endpoint
+                // is not a reversible listener operation. Never offer its old root
+                // as a structural rollback target.
+                let replaced_root=!replacing.is_empty();
+                replaced_roots.extend(replacing);
+                if structural || replaced_root{
+                    structural_rollback=None;
+                    runtime.set_restart_rollback(None);
+                }else{
+                    let now=Instant::now();
+                    let ready_at=now+GENERATION_DRAIN+Duration::from_secs(2);
+                    let expires=now+Duration::from_secs(300);
+                    structural_rollback=Some(StructuralRollbackSlot{
+                        document:request.previous.document.clone(),identities:identities.clone(),
+                        revision,ready_at,expires,
+                    });
+                    runtime.set_restart_rollback(Some((revision,ready_at,expires)));
+                }
+                identities=next_identities;
+                rollback=None;
                 runtime.set_rollback_until(None);
                 retiring = Some(tokio::spawn(reap_previous(previous)));
                 // This ACK is AFTER commit. Lost ACK is indeterminate:
@@ -2255,13 +2721,22 @@ async fn run_supervised_file(
                 rollback = None;
                 runtime.set_rollback_until(None);
             }
+            _=async{
+                if let Some(slot)=&structural_rollback{
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(slot.expires)).await;
+                }else{std::future::pending::<()>().await;}
+            }=>{
+                structural_rollback=None;
+                runtime.set_restart_rollback(None);
+            }
             result = running.tasks.join_next() => {
                 // An unexpected H2/H3 accept-loop exit is fatal, not a
                 // misleading healthy status from the management endpoint.
-                return match result {
-                    Some(Ok(Err(error))) => Err(error),
-                    _ => Err(ServerError::Io),
-                };
+                match result{
+                    Some(Ok((id,Ok(())))) if running.finish_draining(&id)=>continue,
+                    Some(Ok((_,Err(error))))=>return Err(error),
+                    _=>return Err(ServerError::Io),
+                }
             }
             result = async {
                 match &mut management_task {
@@ -2276,6 +2751,153 @@ async fn run_supervised_file(
     }
 }
 
+
+fn has_reality(document: &ServerDocument) -> bool {
+    document.server.inbounds.iter().any(|i|
+        i.security_mode == crate::security_profile::SecurityMode::SmartReality || i.reality.is_some())
+}
+
+/// Prepare every inbound before accepting any traffic. REALITY material is
+/// captured once for both transports, and every inbound shares accounting.
+/// The current REALITY generation is immutable; ordinary own-TLS hot
+/// replacement cannot mutate it. Management is status-only in this mode.
+async fn run_reality_document(document: ServerDocument) -> Result<(), ServerError> {
+    run_reality_document_inner(document,None,None).await
+}
+
+pub(crate) async fn run_reality_document_with_ready(
+    document: ServerDocument,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), ServerError> {
+    run_reality_document_inner(document,started,None).await
+}
+
+async fn run_reality_document_inner(document:ServerDocument,
+    started:Option<tokio::sync::oneshot::Sender<()>>,config_path:Option<&Path>)->Result<(),ServerError>{
+    let config = Config::Server(document.clone());
+    config.validate().map_err(|_| ServerError::Config)?;
+    if !document.server.enabled { return Err(ServerError::Config); }
+    let live = Arc::new(LiveAuthorization::new(document.clone()).map_err(|_| ServerError::Config)?);
+    let policy = &document.server.policy;
+    let ledger=crate::quota::Ledger::new(policy,&document.server.users);
+    let global = Arc::new(Semaphore::new(policy.max_connections_total as usize));
+    let connections = Arc::new(Semaphore::new(policy.max_connections_total as usize));
+    let peers = Arc::new(PeerBudget::default());
+    let users = Arc::new(document.server.users.iter().map(|user|
+        (user.id.clone(), Arc::new(Semaphore::new(policy.max_connections_per_user as usize))))
+        .collect::<HashMap<_,_>>());
+    enum Ready {
+        Plain(TcpListener, TlsAcceptor, quinn::Endpoint, Arc<ServerContext>),
+        Reality(crate::reality_tcp::PreparedTcp, Option<crate::reality_quic::PreparedQuic>,
+            Option<tokio::net::UdpSocket>,crate::reality_generation::Manager,Arc<crate::reality_live::Live>),
+    }
+    let mut ready = Vec::with_capacity(document.server.inbounds.len());
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let mut loaded_identities=Vec::new();
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let mut reality_status=HashMap::new();
+    for inbound in &document.server.inbounds {
+        let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
+        let udp_addr: SocketAddr = inbound.quic_listen.parse().map_err(|_| ServerError::Config)?;
+        let listener = crate::tcp_bbr::bind(tcp_addr).map_err(|error| match error {
+            crate::tcp_bbr::Error::Network => ServerError::Io,
+            crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
+        })?;
+        let mut context = ServerContext::with_limits(inbound, policy, live.shared(), global.clone(),
+            users.clone(), connections.clone(), peers.clone());
+        context.live_quota=Some(ledger.clone());
+        if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            loaded_identities.push(crate::reload_preflight::IdentityHash::reality(inbound.reality.as_ref().ok_or(ServerError::Config)?));
+            let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
+            let manager = crate::reality_generation::Manager::new_live(&config,&inbound.id,now).await
+                .map_err(|_|ServerError::Config)?;
+            let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+            let generation=Arc::new(manager.refresh(now).map_err(|_|ServerError::Config)?);
+            let h3=generation.publication().active().verified().descriptor().h3;
+            #[cfg(test)]
+            let live_generation=if started.is_some(){
+                crate::reality_live::Live::with_guard_start(generation,Arc::new(context),now,now.saturating_sub(121))?
+            }else{crate::reality_live::Live::new(generation,Arc::new(context),now)?};
+            #[cfg(not(test))]
+            let live_generation=crate::reality_live::Live::new(generation,Arc::new(context),now)?;
+            let tcp=crate::reality_tcp::PreparedTcp::from_live(listener,live_generation.clone())?;
+            let udp = tokio::net::UdpSocket::bind(udp_addr).await.map_err(|_| ServerError::Io)?;
+            let (quic, silent) = if h3 {
+                (Some(crate::reality_quic::PreparedQuic::from_live(udp,live_generation.clone())?),None)
+            } else {
+                // Keep the approved UDP port reserved; no H3 advertisement,
+                // no TLS response and no speculative reference forwarding.
+                (None, Some(udp))
+            };
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            reality_status.insert(inbound.id.clone(),(inbound.reality.as_ref().ok_or(ServerError::Config)?.manifest_sha256,live_generation.clone()));
+            ready.push(Ready::Reality(tcp,quic,silent,manager,live_generation));
+        } else {
+            let material = tls_material(inbound)?;
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            loaded_identities.push(material.identity.clone());
+            let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
+            let endpoint = crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
+                .map_err(|_| ServerError::Tls)?;
+            ready.push(Ready::Plain(listener, acceptor, endpoint, Arc::new(context)));
+        }
+    }
+    // Same protected native CAS interface, but only auth-only mutations
+    // until a structural REALITY cutover can be fully staged.
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let runtime=config_path.map(|path|Arc::new(crate::runtime_generation::State::new(
+        crate::runtime_generation::View{document:Arc::new(document.clone()),inbounds:ready.len(),
+            preflight:Arc::new(crate::reload_preflight::ReloadPreflight::new(path.to_owned(),document.clone(),loaded_identities)),
+            live:live.clone()}).with_reality(reality_status).with_reality_ledger(ledger.clone())));
+    #[cfg(target_os = "linux")]
+    let management = crate::management::StatusServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?
+        .map(|server|if let Some(runtime)=runtime{server.with_runtime(runtime)}else{server});
+    #[cfg(target_os = "windows")]
+    let management = crate::windows_control::WindowsServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?
+        .map(|server|if let Some(runtime)=runtime{server.with_runtime(runtime)}else{server});
+    let mut tasks = JoinSet::new();
+    let mut silent_sockets = Vec::new();
+    for item in ready {
+        match item {
+            Ready::Plain(listener, acceptor, endpoint, context) => {
+                tasks.spawn(serve(listener, acceptor, context.clone()));
+                tasks.spawn(crate::h3_server::serve(endpoint, context));
+            }
+            Ready::Reality(tcp,quic,silent,manager,live_generation) => {
+                tasks.spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        match manager.maintain(&live_generation).await {
+                            Ok(lease)=>{
+                                let Ok(now)=crate::reference_health::unix_now() else{live_generation.suspend();continue;};
+                                if live_generation.publish(Arc::new(lease),now).is_err(){live_generation.suspend();}
+                            }
+                            Err(_)=>live_generation.suspend(),
+                        }
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(),ServerError>(())
+                });
+                tasks.spawn(tcp.serve());
+                if let Some(quic) = quic { tasks.spawn(quic.serve()); }
+                if let Some(socket) = silent { silent_sockets.push(socket); }
+            }
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if let Some(management) = management {
+        tasks.spawn(async move { management.serve().await.map_err(|_| ServerError::Io) });
+    }
+    if let Some(started) = started { let _ = started.send(()); }
+    let result = match tasks.join_next().await {
+        Some(Ok(result)) => result,
+        _ => Err(ServerError::Io),
+    };
+    drop(silent_sockets);
+    result
+}
+
 pub async fn run_document(document: ServerDocument) -> Result<(), ServerError> {
     run_document_with_config(document, None).await
 }
@@ -2286,6 +2908,9 @@ async fn run_document_with_config(
 ) -> Result<(), ServerError> {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = config_path;
+    if has_reality(&document) {
+        return run_reality_document_inner(document,None,config_path).await;
+    }
     if !document.server.enabled {
         return Err(ServerError::Config);
     }
@@ -2515,6 +3140,7 @@ mod hardening_tests {
                         server_name: "a.example.org".into(),
                         tls_cert: "file:/tmp/theia-a.crt".into(),
                         security_mode: Default::default(),
+                        reality: None,
                         tls_key: "file:/tmp/theia-a.key".into(),
                     },
                     Inbound {
@@ -2525,6 +3151,7 @@ mod hardening_tests {
                         server_name: "b.example.org".into(),
                         tls_cert: "file:/tmp/theia-b.crt".into(),
                         security_mode: Default::default(),
+                        reality: None,
                         tls_key: "file:/tmp/theia-b.key".into(),
                     },
                 ],
@@ -2934,7 +3561,7 @@ mod hardening_tests {
             .await
             .is_err());
         drop(fresh_reservations);
-        let (successor, next, next_ids, revision) =
+        let (mut successor,next,next_ids,next_reality,revision)=
             stage_fresh_generation(&fresh, &restored, &limits, &path)
                 .await
                 .unwrap();
@@ -2944,7 +3571,7 @@ mod hardening_tests {
         assert!(StdTcp::bind(&initial.server.inbounds[0].h2_listen).is_err());
         assert!(StdTcp::bind(&candidate.server.inbounds[0].h2_listen).is_err());
         runtime
-            .commit_restart(&fresh.previous, fresh.expected_revision, next)
+            .commit_restart_with_reality(&fresh.previous,fresh.expected_revision,next,next_reality)
             .unwrap();
         successor.start();
         assert_eq!(runtime.snapshot().unwrap().live.revision(), Ok(5));
@@ -2954,8 +3581,115 @@ mod hardening_tests {
         tokio::time::timeout(Duration::from_secs(5), reap_previous(running))
             .await
             .unwrap();
+        // Partial cutover: bind only a new inbound, keep existing TCP/UDP
+        // ownership and the exact shared authorization cell.
+        let retained=runtime.snapshot().unwrap();
+        let mut added=retained.document.as_ref().clone();
+        let mut inbound=added.server.inbounds[0].clone();
+        inbound.id="edge-c".into();
+        let reserve_tcp=StdTcp::bind("127.0.0.1:0").unwrap();
+        let reserve_udp=StdUdp::bind("127.0.0.1:0").unwrap();
+        inbound.h2_listen=reserve_tcp.local_addr().unwrap().to_string();
+        inbound.quic_listen=reserve_udp.local_addr().unwrap().to_string();
+        added.server.inbounds.push(inbound.clone());
+        let captured=CapturedTls::capture(&added).unwrap();
+        let add_ids=captured.identities();
+        let plan=crate::restart_guard::partial_layout(&retained.document,&next_ids,&added,&add_ids).unwrap();
+        assert!(plan.added.contains("edge-c")&&plan.removed.is_empty());
+        let add=request(added.clone(),ChangeKind::Restart,Some(captured));
+        assert!(stage_partial_generation(&add,&next_ids,&limits,&path,&plan).await.is_err());
+        assert_eq!(runtime.snapshot().unwrap().live.revision(),Ok(5));
+        drop((reserve_tcp,reserve_udp));
+        let (prepared,view,auth)=stage_partial_generation(&add,&next_ids,&limits,&path,&plan).await.unwrap();
+        assert_eq!(prepared.listeners.len(),1);
+        assert_eq!(runtime.commit_partial_layout(&add.previous,5,view,auth,&plan.removed,prepared.reality),Ok(6));
+        successor.append(prepared.listeners,GenerationPhase::Active);
+        successor.order_plain(&added);
+        let current=runtime.snapshot().unwrap();
+        assert!(Arc::ptr_eq(&current.live.shared(),&retained.live.shared()));
+        assert!(StdTcp::bind(&added.server.inbounds[0].h2_listen).is_err());
+        assert!(StdUdp::bind(&added.server.inbounds[0].quic_listen).is_err());
+        assert!(StdTcp::bind(&inbound.h2_listen).is_err());
+        let mut removed=added.clone();
+        removed.server.inbounds.retain(|i|i.id!="edge-c");
+        let captured=CapturedTls::capture(&removed).unwrap();
+        let remove_ids=captured.identities();
+        let plan=crate::restart_guard::partial_layout(&added,&add_ids,&removed,&remove_ids).unwrap();
+        assert!(plan.added.is_empty()&&plan.removed.contains("edge-c"));
+        let remove=request(removed,ChangeKind::Restart,Some(captured));
+        let (prepared,view,auth)=stage_partial_generation(&remove,&add_ids,&limits,&path,&plan).await.unwrap();
+        assert!(prepared.listeners.is_empty());
+        assert_eq!(runtime.commit_partial_layout(&remove.previous,6,view,auth,&plan.removed,prepared.reality),Ok(7));
+        successor.remove_inbounds(&plan.removed);
+        assert!(successor.has_draining());
+        let (id,result)=tokio::time::timeout(Duration::from_secs(5),successor.tasks.join_next()).await.unwrap().unwrap().unwrap();
+        assert!(result.is_ok()&&successor.finish_draining(&id));
+        assert!(!successor.has_draining());
+        assert!(StdTcp::bind(&inbound.h2_listen).is_ok());
+        assert!(StdUdp::bind(&inbound.quic_listen).is_ok());
+        assert!(StdTcp::bind(&added.server.inbounds[0].h2_listen).is_err());
         tokio::time::timeout(Duration::from_secs(5), reap_previous(successor))
             .await
             .unwrap();
+
+        // Real registered bundle plus ordinary TLS. PEM rotation and its
+        // rollback must not replace the REALITY route table or UDP endpoint.
+        let mut mixed=initial.clone();
+        let reservations=addresses(&mut mixed);
+        drop(reservations);
+        let (tcp,udp)=loop{
+            let tcp=StdTcp::bind("127.0.0.1:0").unwrap();
+            if let Ok(udp)=StdUdp::bind(tcp.local_addr().unwrap()){break(tcp,udp);}
+        };
+        let addr=tcp.local_addr().unwrap();
+        let edge=&mut mixed.server.inbounds[1];
+        edge.h2_listen=addr.to_string();edge.quic_listen=addr.to_string();
+        edge.security_mode=crate::security_profile::SecurityMode::SmartReality;
+        edge.tls_cert.clear();edge.tls_key.clear();
+        let now=crate::reference_health::unix_now().unwrap();
+        let health=crate::reference_health::State::new(crate::reference_health::Plan{
+            schema_version:1,inbound:edge.id.clone(),endpoint:format!("{}:{}",edge.server_name,addr.port()),
+            own_ips:vec![addr.ip()],references:vec![crate::reference_health::Target{
+                server_name:"ref.example.org".into(),address:"93.184.216.2:443".parse().unwrap()}],
+        },vec![crate::reference_health::Evidence{h2_status:Some(200),h3_status:Some(200)}],now).unwrap();
+        let health_path=directory.join("mixed-health");
+        crate::reference_health::Store::new(&health_path).unwrap().enroll(&health).unwrap();
+        let bundle=directory.join("mixed-bundle");
+        let digest=health.snapshot_sha256().unwrap();
+        let record=crate::reality_provision::create(&health,digest,&bundle,now).unwrap();
+        edge.reality=Some(crate::config::RealityBinding{health_store:health_path.to_string_lossy().into_owned(),
+            bundle:bundle.to_string_lossy().into_owned(),initial_health_sha256:digest,
+            identity_sha256:record.identity_sha256,manifest_sha256:record.manifest_sha256().unwrap()});
+        drop((tcp,udp));
+        let captured=CapturedTls::capture(&mixed).unwrap();
+        let mixed_ids=captured.identities();
+        let mixed_limits=GenerationLimits::new(&mixed);
+        let prepared=prepare_generation(&mixed,1,&mixed_limits,Some(&captured)).await.unwrap();
+        let state=State::new(View{document:Arc::new(mixed.clone()),inbounds:2,
+            preflight:Arc::new(ReloadPreflight::new(path.clone(),mixed.clone(),mixed_ids.clone())),
+            live:prepared.live}).with_reality(prepared.reality).with_reality_ledger(mixed_limits.ledger.clone());
+        let mut running=RunningGeneration::launch(prepared.listeners,GenerationPhase::Active);
+        let live=running.reality[0].carrier.clone();
+        let generation=live.current().unwrap();
+        let mut rotated=mixed.clone();
+        rotated.server.inbounds[0].tls_cert=new_cert;
+        rotated.server.inbounds[0].tls_key=new_key;
+        let (complete,_rx)=tokio::sync::oneshot::channel();
+        let request=RestartRequest{kind:ChangeKind::Restart,previous:state.snapshot().unwrap(),expected_revision:1,
+            material:Some(CapturedTls::capture(&rotated).unwrap()),candidate:rotated,complete};
+        let (updated,revision,slot)=commit_same_port_tls(&state,&mut running,&request,&mixed_ids,&path).unwrap();
+        assert_eq!(revision,2);
+        assert!(updated[0]!=mixed_ids[0]&&updated[1]==mixed_ids[1]);
+        assert!(Arc::ptr_eq(&live,&running.reality[0].carrier));
+        assert!(Arc::ptr_eq(&generation,&live.current().unwrap()));
+        let (restored,revision)=commit_tls_rollback(&state,&mut running,&slot,2,&path).unwrap();
+        assert_eq!(revision,3);
+        assert!(restored==mixed_ids);
+        assert!(Arc::ptr_eq(&generation,&live.current().unwrap()));
+        assert!(StdTcp::bind(addr).is_err());
+        assert!(StdUdp::bind(addr).is_err());
+        // REALITY groups need not finish naturally before the drain timeout;
+        // dropping the test-owned group cancels every listener task.
+        running.tasks.shutdown().await;
     }
 }

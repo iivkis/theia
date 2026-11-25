@@ -462,6 +462,8 @@ pub struct Profile {
     xhttp_mode: XhttpMode,
     trust_store: String,
     auth_token: String,
+    admission_ref: String,
+    admission_commitment: [u8; 32],
 }
 
 impl Profile {
@@ -469,6 +471,8 @@ impl Profile {
         if self.schema_version != 1
             || !config::valid_secret_ref(&self.auth_token)
             || !crate::bounded_input::explicit_file_path(Path::new(&self.trust_store))
+            || !self.admission_ref.strip_prefix("file:").is_some_and(|path|
+                crate::bounded_input::explicit_file_path(Path::new(path)))
         {
             return Err(Error::Format);
         }
@@ -488,15 +492,19 @@ impl Profile {
     }
 
     pub fn read(path: &Path) -> Result<Self, Error> {
-        let raw = crate::bounded_input::read(path, MAX_PROFILE as u64, true, true)
-            .map_err(|_| Error::Storage)?;
-        let profile: Self = toml::from_str(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
-            .map_err(|_| Error::Format)?;
+        Self::read_snapshot(path).map(|(profile, _)| profile)
+    }
+
+    pub(crate) fn read_snapshot(path: &Path) -> Result<(Self, [u8; 32]), Error> {
+        let raw = read_text(path, MAX_PROFILE, true)?;
+        let profile: Self = toml::from_str(&raw).map_err(|_| Error::Format)?;
         profile.anchor()?;
-        Ok(profile)
+        profile.admission()?;
+        Ok((profile, digest(&raw)))
     }
 
     pub fn load(&self, now: u64) -> Result<Verified, Error> {
+        self.admission()?;
         descriptor::Store::new(Path::new(&self.trust_store), self.anchor()?)
             .map_err(|_| Error::Storage)?
             .load(now)
@@ -512,18 +520,16 @@ impl Profile {
     /// The persisted current signer (not the original enrollment key after
     /// promotion) is authoritative. No network, credential or profile writes.
     pub fn preview_recovery(&self, signed: &str, now: u64) -> Result<RecoveryPreview, Error> {
-        let store = self.store()?;
-        let current = store.inspect(now).map_err(|_| Error::Descriptor)?;
-        let (revision, next) = store
-            .preview_update(signed, now)
-            .map_err(|_| Error::Descriptor)?;
-        if revision != current.descriptor().revision
-            || current.signer() != next.signer()
-            || next.descriptor().revision <= revision
+        self.admission()?;
+        let (snapshot_sha256, current, next) = self.store()?
+            .preview_update_bound(signed, now).map_err(|_| Error::Descriptor)?;
+        let revision = current.descriptor().revision;
+        if current.signer() != next.signer() || next.descriptor().revision <= revision
         {
             return Err(Error::Descriptor);
         }
         Ok(RecoveryPreview {
+            snapshot_sha256,
             expected_revision: revision,
             next_revision: next.descriptor().revision,
             identity_sha256: fingerprint(next.signer()),
@@ -540,13 +546,14 @@ impl Profile {
     pub fn recover(&self, signed: &str, approval: RecoveryApproval, now: u64) -> Result<(), Error> {
         let preview = self.preview_recovery(signed, now)?;
         if preview.expected_revision != approval.expected_revision
+            || !bool::from(preview.snapshot_sha256.ct_eq(&approval.snapshot_sha256))
             || !bool::from(preview.document_sha256.ct_eq(&approval.document_sha256))
             || !bool::from(preview.identity_sha256.ct_eq(&approval.identity_sha256))
         {
             return Err(Error::Approval);
         }
         self.store()?
-            .update_at(signed, approval.expected_revision, now)
+            .update_bound(signed, approval.expected_revision, approval.snapshot_sha256, now)
             .map_err(|error| match error {
                 descriptor::Error::Indeterminate => Error::Indeterminate,
                 _ => Error::Descriptor,
@@ -554,14 +561,105 @@ impl Profile {
         Ok(())
     }
 
+    /// Preview the already-announced successor, signed by that successor.
+    /// A missed/expired overlap is not recoverable using an old key alone.
+    pub fn preview_promotion(&self, signed: &str, now: u64) -> Result<PromotionPreview, Error> {
+        let (snapshot_sha256, old, next) = self.store()?
+            .preview_promotion_bound(signed, now)
+            .map_err(|_| Error::Descriptor)?;
+        let a = old.descriptor();
+        let b = next.descriptor();
+        // A trust change is not an implicit change of operational parameters.
+        if a.references != b.references || a.active_reference != b.active_reference
+            || a.h3 != b.h3 || a.stream_one != b.stream_one || a.stream_up != b.stream_up
+            || a.path_prefix != b.path_prefix || a.padding != b.padding || a.rotation != b.rotation
+            || b.revision != a.revision.checked_add(1).ok_or(Error::Descriptor)?
+            || b.next_identity.is_some() {
+            return Err(Error::Descriptor);
+        }
+        Ok(PromotionPreview {
+            expected_revision: a.revision,
+            next_revision: b.revision,
+            current_identity_sha256: fingerprint(old.signer()),
+            next_identity_sha256: fingerprint(next.signer()),
+            document_sha256: digest(signed),
+            snapshot_sha256,
+            overlap_ends_at: a.not_after,
+        })
+    }
+
+    pub fn promote(&self, signed: &str, approval: PromotionApproval, now: u64) -> Result<(), Error> {
+        let preview = self.preview_promotion(signed, now)?;
+        if preview.expected_revision != approval.expected_revision
+            || !bool::from(preview.snapshot_sha256.ct_eq(&approval.snapshot_sha256))
+            || !bool::from(preview.document_sha256.ct_eq(&approval.document_sha256))
+            || !bool::from(preview.next_identity_sha256.ct_eq(&approval.next_identity_sha256))
+        {
+            return Err(Error::Approval);
+        }
+        let (snapshot, _, next) = self.store()?.preview_promotion_bound(signed, now)
+            .map_err(|_| Error::Descriptor)?;
+        if !bool::from(snapshot.ct_eq(&approval.snapshot_sha256)) {
+            return Err(Error::Approval);
+        }
+        self.store()?.promote_bound(signed, approval.expected_revision, next.signer(),
+            approval.snapshot_sha256, now).map_err(|error| match error {
+                descriptor::Error::Indeterminate => Error::Indeterminate,
+                _ => Error::Descriptor,
+            })?;
+        Ok(())
+    }
+
+    /// Reopen the private copied admission material and bind it to this
+    /// enrollment. No fallback to a public-only marker or bearer.
+    pub fn admission(&self) -> Result<crate::reality_admission::Secret, Error> {
+        let path = self.admission_ref.strip_prefix("file:").ok_or(Error::Credential)?;
+        let scope = Scope { inbound: self.inbound.clone(), endpoint: self.endpoint.clone() };
+        let secret = crate::reality_admission::Secret::load(&scope, Path::new(path))
+            .map_err(|_| Error::Credential)?;
+        if !bool::from(secret.commitment().ct_eq(&self.admission_commitment)) {
+            return Err(Error::Credential);
+        }
+        Ok(secret)
+    }
+
+    pub fn endpoint(&self) -> &str { &self.endpoint }
+    pub fn policy(&self) -> ClientPolicy {
+        ClientPolicy { transport: self.transport, xhttp_mode: self.xhttp_mode }
+    }
+    pub fn enrollment_identity(&self) -> Result<[u8; 32], Error> {
+        Ok(fingerprint(key(&self.public_key)?))
+    }
+
     pub fn credential_reference(&self) -> &str {
         &self.auth_token
     }
 }
 
+/// Redacted explicit client-side identity promotion. No credential material.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PromotionPreview {
+    pub expected_revision: u64,
+    pub next_revision: u64,
+    pub current_identity_sha256: [u8; 32],
+    pub next_identity_sha256: [u8; 32],
+    pub document_sha256: [u8; 32],
+    pub snapshot_sha256: [u8; 32],
+    pub overlap_ends_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PromotionApproval {
+    pub expected_revision: u64,
+    pub snapshot_sha256: [u8; 32],
+    pub document_sha256: [u8; 32],
+    pub next_identity_sha256: [u8; 32],
+}
+
 /// Redacted offline recovery preview. All values are public trust metadata.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecoveryPreview {
+    pub snapshot_sha256: [u8;32],
     pub expected_revision: u64,
     pub next_revision: u64,
     pub identity_sha256: [u8; 32],
@@ -572,6 +670,7 @@ pub struct RecoveryPreview {
 
 #[derive(Clone, Copy)]
 pub struct RecoveryApproval {
+    pub snapshot_sha256: [u8;32],
     pub expected_revision: u64,
     pub document_sha256: [u8; 32],
     pub identity_sha256: [u8; 32],
@@ -585,12 +684,31 @@ pub struct ImportApproval {
     pub identity_sha256: [u8; 32],
 }
 
+/// Admission material is transferred independently of the invitation.
+/// A UI may bind the exact private preview without ever displaying it.
+#[derive(Clone, Copy)]
+pub struct EnrollmentMaterial<'a> {
+    pub admission_path: &'a Path,
+    pub expected_admission: Option<[u8; 32]>,
+    pub external_token: Option<&'a str>,
+}
+
+impl Invitation {
+    pub fn has_token(&self) -> bool { self.bearer.is_some() }
+
+    pub(crate) fn admission_preview(&self, path: &Path) -> Result<[u8; 32], Error> {
+        crate::reality_admission::Secret::load(&self.scope, path)
+            .map(|secret| secret.commitment())
+            .map_err(|_| Error::Credential)
+    }
+}
+
 pub fn import(
     uri: &str,
     approval: ImportApproval,
     profile_path: &Path,
     trust_path: &Path,
-    external_token: Option<&str>,
+    material: EnrollmentMaterial<'_>,
     policy: ClientPolicy,
     now: u64,
 ) -> Result<(), Error> {
@@ -612,9 +730,16 @@ pub fn import(
     }
     let invitation = Invitation::decode(uri, now)?;
     let anchor = invitation.confirmed(approval.identity_sha256, policy, now)?;
+    let admission = crate::reality_admission::Secret::load(&invitation.scope, material.admission_path)
+        .map_err(|_| Error::Credential)?;
+    let admission_commitment = admission.commitment();
+    if material.expected_admission.is_some_and(|expected|
+        !bool::from(expected.ct_eq(&admission_commitment))) {
+        return Err(Error::Approval);
+    }
     let trust_store = trust_path.to_str().ok_or(Error::Storage)?.to_owned();
     let mut staged = None;
-    let auth_token = match (&invitation.bearer, external_token) {
+    let auth_token = match (&invitation.bearer, material.external_token) {
         (Some(bearer), None) => {
             let guard = crate::client_import::PrivateBearer::create(profile_path, bearer)
                 .map_err(|_| Error::Storage)?;
@@ -625,6 +750,9 @@ pub fn import(
         (None, Some(reference)) if config::valid_secret_ref(reference) => reference.to_owned(),
         _ => return Err(Error::Credential),
     };
+    let mut staged_admission = admission.stage_for_profile(&invitation.scope, profile_path)
+        .map_err(|_| Error::Storage)?;
+    let admission_ref = staged_admission.reference().map_err(|_| Error::Storage)?;
     let profile = Profile {
         schema_version: 1,
         inbound: invitation.scope.inbound.clone(),
@@ -635,6 +763,8 @@ pub fn import(
         xhttp_mode: policy.xhttp_mode,
         trust_store,
         auth_token,
+        admission_ref,
+        admission_commitment,
     };
     profile.anchor()?;
     let raw = Zeroizing::new(toml::to_string(&profile).map_err(|_| Error::Format)?);
@@ -652,12 +782,14 @@ pub fn import(
     // Never remove a path which might be observed/replaced by another process.
     match config::guarded_trust_write(profile_path, &raw, None) {
         Ok(()) => {
+            staged_admission.commit();
             if let Some(guard) = &mut staged {
                 guard.commit();
             }
             Ok(())
         }
         Err(WriteFailure::AfterReplace(_)) => {
+            staged_admission.commit();
             if let Some(guard) = &mut staged {
                 guard.commit();
             }
@@ -742,6 +874,16 @@ mod tests {
         }
     }
 
+    fn admission_file(scratch: &Scratch, identity: &Identity) -> std::path::PathBuf {
+        let path = scratch.0.join("transferred-admission");
+        crate::reality_admission::Secret::generate().unwrap().save_new(identity.scope(), &path).unwrap();
+        path
+    }
+
+    fn material<'a>(admission: &'a Path, token: Option<&'a str>) -> EnrollmentMaterial<'a> {
+        EnrollmentMaterial { admission_path: admission, expected_admission: None, external_token: token }
+    }
+
     #[test]
     fn bootstrap_is_canonical_and_independent_confirmation_is_required() {
         let (state, identity) = fixture();
@@ -809,6 +951,68 @@ mod tests {
     }
 
     #[test]
+    fn guarded_client_promotion_binds_snapshot_and_preserves_credentials() {
+        let (state, identity) = fixture();
+        let next = Identity::generate(identity.scope().clone()).unwrap();
+        let dir = Scratch::new();
+        let profile_path = dir.0.join("profile.toml");
+        let trust_path = dir.0.join("trust.toml");
+        let initial = initial_descriptor(&state, &identity, NOW).unwrap();
+        let invitation = Invitation::public(&identity, &initial, NOW).unwrap().encode().unwrap();
+        import(&invitation, ImportApproval {
+            document_sha256: digest(&invitation), identity_sha256: fingerprint(identity.public_key()),
+        }, &profile_path, &trust_path, material(&admission_file(&dir, &identity), Some("env:THEIA_TOKEN")), auto_policy(), NOW).unwrap();
+        let profile = Profile::read(&profile_path).unwrap();
+        let profile_bytes = std::fs::read(&profile_path).unwrap();
+        let mut announcement = profile.load(NOW).unwrap().descriptor().clone();
+        announcement.revision = 2;
+        announcement.not_before = NOW + 1;
+        announcement.next_identity = Some(URL_SAFE_NO_PAD.encode(next.public_key()));
+        let signed = identity.sign_descriptor(&announcement).unwrap();
+        profile.store().unwrap().update_at(&signed, 1, NOW + 1).unwrap();
+        let mut successor = announcement.clone();
+        successor.revision = 3;
+        successor.next_identity = None;
+        successor.not_after += VALIDITY;
+        let document = next.sign_descriptor(&successor).unwrap();
+        let preview = profile.preview_promotion(&document, NOW + 2).unwrap();
+        assert_eq!(preview.expected_revision, 2);
+        assert_eq!(preview.next_revision, 3);
+        let approval = PromotionApproval {
+            expected_revision: 2,
+            snapshot_sha256: preview.snapshot_sha256,
+            document_sha256: preview.document_sha256,
+            next_identity_sha256: preview.next_identity_sha256,
+        };
+        let old = std::fs::read(&trust_path).unwrap();
+        for wrong in [
+            PromotionApproval { snapshot_sha256: [0; 32], ..approval },
+            PromotionApproval { document_sha256: [0; 32], ..approval },
+            PromotionApproval { next_identity_sha256: [0; 32], ..approval },
+            PromotionApproval { expected_revision: 1, ..approval },
+        ] {
+            assert!(profile.promote(&document, wrong, NOW + 2).is_err());
+            assert_eq!(std::fs::read(&trust_path).unwrap(), old);
+        }
+        let mut altered = successor.clone();
+        altered.path_prefix = "/v1/substituted".into();
+        assert!(profile.preview_promotion(&next.sign_descriptor(&altered).unwrap(), NOW + 2).is_err());
+        assert!(profile.preview_promotion(&document, announcement.not_after).is_err());
+        // Even the same revision can have a more recent durable acceptance time.
+        profile.store().unwrap().update_at(&signed, 2, NOW + 3).unwrap();
+        assert!(profile.promote(&document, approval, NOW + 3).is_err());
+        let refreshed = profile.preview_promotion(&document, NOW + 3).unwrap();
+        profile.promote(&document, PromotionApproval {
+            snapshot_sha256: refreshed.snapshot_sha256, ..approval
+        }, NOW + 3).unwrap();
+        let reopened = Profile::read(&profile_path).unwrap();
+        assert_eq!(reopened.load(NOW + 4).unwrap().signer(), next.public_key());
+        assert_eq!(reopened.credential_reference(), "env:THEIA_TOKEN");
+        assert_eq!(std::fs::read(&profile_path).unwrap(), profile_bytes);
+        assert!(reopened.promote(&document, approval, NOW + 4).is_err());
+    }
+
+    #[test]
     fn offline_recovery_retains_revision_floor_credentials_and_scope() {
         let (state, identity) = fixture();
         let dir = Scratch::new();
@@ -827,7 +1031,7 @@ mod tests {
             },
             &profile_path,
             &trust_path,
-            Some("env:THEIA_TOKEN"),
+            material(&admission_file(&dir, &identity), Some("env:THEIA_TOKEN")),
             auto_policy(),
             NOW,
         )
@@ -851,6 +1055,7 @@ mod tests {
         assert!(preview.current_expired);
         assert_eq!(preview.next_revision, 6);
         let approval = RecoveryApproval {
+            snapshot_sha256: preview.snapshot_sha256,
             expected_revision: 1,
             document_sha256: digest(&updated),
             identity_sha256: fingerprint(identity.public_key()),
@@ -875,6 +1080,12 @@ mod tests {
                 later
             )
             .is_err());
+        assert!(profile.recover(&updated, RecoveryApproval { snapshot_sha256: [0;32], ..approval }, later).is_err());
+        // Even a valid equal-revision snapshot with a changed acceptance
+        // timestamp must require a fresh operator preview.
+        profile.store().unwrap().update(&raw, NOW + 1).unwrap();
+        assert!(profile.recover(&updated, approval, later).is_err());
+        let approval = RecoveryApproval { snapshot_sha256: profile.preview_recovery(&updated, later).unwrap().snapshot_sha256, ..approval };
         let stranger = Identity::generate(identity.scope().clone()).unwrap();
         assert!(profile
             .preview_recovery(&stranger.sign_descriptor(&next).unwrap(), later)
@@ -908,6 +1119,7 @@ mod tests {
         let trust = scratch.0.join("trust.toml");
         let expected = digest(&uri);
         let pin = fingerprint(identity.public_key());
+        let admission = admission_file(&scratch, &identity);
         assert_eq!(
             import(
                 &uri,
@@ -917,7 +1129,7 @@ mod tests {
                 },
                 &profile,
                 &trust,
-                Some("env:TEST_TOKEN"),
+                material(&admission, Some("env:TEST_TOKEN")),
                 auto_policy(),
                 NOW
             ),
@@ -933,7 +1145,7 @@ mod tests {
                 },
                 &profile,
                 &trust,
-                None,
+                material(&admission, None),
                 auto_policy(),
                 NOW
             ),
@@ -948,7 +1160,7 @@ mod tests {
             },
             &profile,
             &trust,
-            Some("env:TEST_TOKEN"),
+            material(&admission, Some("env:TEST_TOKEN")),
             auto_policy(),
             NOW,
         )
@@ -957,6 +1169,11 @@ mod tests {
         let loaded = Profile::read(&profile).unwrap();
         assert_eq!(loaded.credential_reference(), "env:TEST_TOKEN");
         assert_eq!(loaded.load(NOW).unwrap().signer(), identity.public_key());
+        let copied = loaded.admission_ref.strip_prefix("file:").unwrap();
+        assert_ne!(Path::new(copied), admission);
+        assert!(loaded.admission().is_ok());
+        std::fs::remove_file(&admission).unwrap();
+        assert!(loaded.admission().is_ok());
         assert_eq!(
             import(
                 &uri,
@@ -966,7 +1183,7 @@ mod tests {
                 },
                 &profile,
                 &trust,
-                Some("env:OTHER"),
+                material(&admission, Some("env:OTHER")),
                 auto_policy(),
                 NOW
             ),
@@ -988,6 +1205,10 @@ mod tests {
                 .revision,
             2
         );
+        std::fs::remove_file(copied).unwrap();
+        crate::reality_admission::Secret::generate().unwrap().save_new(identity.scope(), Path::new(copied)).unwrap();
+        assert!(matches!(Profile::read(&profile), Err(Error::Credential)));
+        assert!(loaded.load(NOW + 1).is_err());
     }
 
     #[test]
@@ -1022,7 +1243,7 @@ mod tests {
             },
             &profile,
             &trust,
-            None,
+            material(&admission_file(&scratch, &identity), None),
             auto_policy(),
             NOW,
         )

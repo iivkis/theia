@@ -99,7 +99,7 @@ impl PrivateBearer {
         Self::create_payload(config_path, "bearer", "token", encoded.as_bytes())
     }
 
-    fn create_payload(
+    pub(crate) fn create_payload(
         config_path: &Path,
         kind: &str,
         filename: &str,
@@ -188,7 +188,7 @@ impl Drop for PrivateBearer {
 }
 
 #[cfg(unix)]
-fn new_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn new_private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
@@ -232,7 +232,10 @@ mod private_windows {
     fn security_descriptor() -> io::Result<Descriptor> {
         let sid = crate::windows_control::current_user_sid()
             .map_err(|_| io::Error::other("private user SID unavailable"))?;
-        let sddl = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+        let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+        descriptor_from_sddl(&sddl)
+    }
+    fn descriptor_from_sddl(sddl: &str) -> io::Result<Descriptor> {
         let wide = sddl
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -276,7 +279,15 @@ mod private_windows {
         Ok(())
     }
     pub(super) fn file(path: &Path) -> io::Result<File> {
-        let descriptor = security_descriptor()?;
+        file_with_descriptor(path, security_descriptor()?)
+    }
+    #[cfg(test)]
+    pub(super) fn broad_file(path: &Path) -> io::Result<File> {
+        let sid = crate::windows_control::current_user_sid()
+            .map_err(|_| io::Error::other("private user SID unavailable"))?;
+        file_with_descriptor(path, descriptor_from_sddl(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FR;;;WD)"))?)
+    }
+    fn file_with_descriptor(path: &Path, descriptor: Descriptor) -> io::Result<File> {
         let attrs = attrs(&descriptor);
         // SAFETY: CREATE_NEW refuses existing targets, including symlink/reparse
         // objects. Security attributes are explicit and protected, not inherited.
@@ -299,8 +310,13 @@ mod private_windows {
     }
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_broad_file(path: &Path) -> io::Result<File> {
+    private_windows::broad_file(path)
+}
+
 #[cfg(windows)]
-fn new_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn new_private_directory(path: &Path) -> io::Result<()> {
     private_windows::directory(path)
 }
 #[cfg(windows)]
@@ -309,7 +325,7 @@ pub(crate) fn new_private_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn new_private_directory(_: &Path) -> io::Result<()> {
+pub(crate) fn new_private_directory(_: &Path) -> io::Result<()> {
     Err(io::Error::other("unsupported platform"))
 }
 #[cfg(not(any(unix, windows)))]

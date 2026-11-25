@@ -673,7 +673,7 @@ impl Editor {
         }
     }
 
-    fn require_clean_records(&self) -> Result<(), &'static str> {
+    pub(crate) fn require_clean_records(&self) -> Result<(), &'static str> {
         if self.editing || self.dirty() || self.issued.is_some() {
             return Err("Сначала завершите или отмените редактирование и выдачу.");
         }
@@ -789,6 +789,7 @@ impl Editor {
                 doc.server.inbounds.push(config::Inbound {
                     id: fields[0].clone(),
                     security_mode: Default::default(),
+                    reality: None,
                     allowed_user_ids: grants.clone(),
                     quic_listen: fields[1].clone(),
                     h2_listen: fields[1].clone(),
@@ -812,6 +813,7 @@ impl Editor {
                     server_name: fields[2].clone(),
                     auth_token: fields[4].clone(),
                     tls_profile: "default".into(),
+                    reality_profile: None,
                     xhttp_mode: Some(XhttpMode::Auto),
                     tls_ca: Some(fields[3].clone()),
                     transport: Transport::Auto,
@@ -1054,6 +1056,10 @@ impl Editor {
     }
 
     pub fn selection_summary(&self) -> String {
+        if self.selected_reality() {
+            return format!("REALITY {}/{}: {} [сохранённый профиль, runtime: V]",
+                self.selected_record + 1, self.record_count(), self.selected_record_id());
+        }
         match self.role {
             Role::Server => format!(
                 "Inbound {}/{}: {}",
@@ -1226,12 +1232,24 @@ impl Editor {
         Sha256::digest(&self.source).into()
     }
 
-    #[cfg(windows)]
     pub(crate) fn saved_path(&self) -> &Path {
         &self.path
     }
 
+    pub(crate) fn selected_reality(&self) -> bool {
+        match &self.draft {
+            Config::Server(doc) => doc.server.inbounds.get(self.selected_record).is_some_and(|i|
+                i.security_mode == crate::security_profile::SecurityMode::SmartReality),
+            Config::Client(doc) => doc.client.profiles.get(self.selected_record).is_some_and(|p|
+                p.tls_profile == "smart-reality"),
+        }
+    }
+
     pub fn begin(&mut self) {
+        if self.selected_reality() {
+            self.error = Some("REALITY: endpoint, bind и policy закреплены при регистрации; требуется отдельное подтверждение доверия, не обычная правка TLS.".into());
+            return;
+        }
         if self.write_uncertain {
             self.error = Some("config: uncertain previous write; reload editor".into());
             return;

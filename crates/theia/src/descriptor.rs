@@ -291,6 +291,9 @@ impl Verified {
     pub fn signer(&self) -> [u8; 32] {
         self.signer
     }
+    pub fn payload_sha256(&self) -> [u8; 32] {
+        self.digest
+    }
     pub fn effective_modes(&self) -> EffectiveModes {
         self.effective_modes
     }
@@ -561,18 +564,56 @@ impl Store {
     /// Authenticated local snapshot for offline review. Expiration does
     /// not erase the revision floor; callers must display validity separately.
     pub fn inspect(&self, now: u64) -> Result<Verified, Error> {
-        let (_, _, history, verified) = self.snapshot()?;
+        self.inspect_bound(now).map(|(_, value)| value)
+    }
+
+    pub(crate) fn inspect_bound(&self, now: u64) -> Result<([u8;32], Verified), Error> {
+        let (raw, _, history, verified) = self.snapshot()?;
         history.check_clock(now)?;
-        Ok(verified)
+        Ok((Sha256::digest(raw.as_bytes()).into(), verified))
+    }
+
+    /// Independent re-enrollment must not resurrect a key this trust
+    /// history already retired, or disguise ordinary renewal as a reset.
+    pub(crate) fn inspect_replacement(&self, proposed: [u8;32], now: u64) -> Result<([u8;32], Verified), Error> {
+        let (raw, _, history, verified) = self.snapshot()?;
+        history.check_clock(now)?;
+        if proposed == self.anchor.public_key || proposed == verified.signer()
+            || history.retired.contains(&proposed) {
+            return Err(Error::Rotation);
+        }
+        Ok((Sha256::digest(raw.as_bytes()).into(), verified))
     }
 
     pub fn preview_update(&self, document: &str, now: u64) -> Result<(u64, Verified), Error> {
-        let (_, _, history, previous) = self.snapshot()?;
+        let (_, previous, next) = self.preview_update_bound(document, now)?;
+        Ok((previous.descriptor.revision, next))
+    }
+
+    /// The entire trust history, including accepted timestamps and the
+    /// old signed payload, is bound to the offline confirmation.
+    pub fn preview_update_bound(&self, document: &str, now: u64) -> Result<([u8;32], Verified, Verified), Error> {
+        let (raw, _, history, previous) = self.snapshot()?;
         history.check_clock(now)?;
         let next = history.verify_current(document)?;
         next.check_time(now)?;
         previous.compare(&next)?;
-        Ok((previous.descriptor.revision, next))
+        Ok((Sha256::digest(raw.as_bytes()).into(), previous, next))
+    }
+
+    /// Bind an explicit trust transition to the complete current persistent
+    /// snapshot, not merely its revision (including the accepted history).
+    pub fn preview_promotion_bound(
+        &self,
+        document: &str,
+        now: u64,
+    ) -> Result<([u8; 32], Verified, Verified), Error> {
+        let (raw, _, mut history, previous) = self.snapshot()?;
+        let next_key = canonical_base64::<32>(
+            previous.descriptor.next_identity.as_deref().ok_or(Error::Rotation)?,
+        )?;
+        let next = history.advance(&previous, document, next_key, now)?;
+        Ok((Sha256::digest(raw.as_bytes()).into(), previous, next))
     }
 
     pub fn preview_promotion(
@@ -610,7 +651,7 @@ impl Store {
     /// Ordinary updates cannot change identity. Read/verify old and new,
     /// then CAS the entire signed snapshot, including the immutable history.
     pub fn update(&self, document: &str, now: u64) -> Result<Change, Error> {
-        self.update_inner(document, None, now)
+        self.update_inner(document, None, None, None, now)
     }
 
     /// Guarded offline operator update; the revision check is inside the
@@ -621,18 +662,49 @@ impl Store {
         expected_revision: u64,
         now: u64,
     ) -> Result<Change, Error> {
-        self.update_inner(document, Some(expected_revision), now)
+        self.update_inner(document, Some(expected_revision), None, None, now)
+    }
+
+    /// Bind an authenticated download to the exact descriptor used for its
+    /// connection, including signer, scope, revision and signed digest.
+    pub fn update_matching(
+        &self,
+        document: &str,
+        expected: &Verified,
+        now: u64,
+    ) -> Result<Change, Error> {
+        self.update_inner(document, Some(expected.descriptor.revision), Some(expected), None, now)
+    }
+
+    /// Offline recovery can replace an expired document, but never a
+    /// different trust snapshot from the one the operator confirmed.
+    pub fn update_bound(
+        &self, document: &str, expected_revision: u64, expected_snapshot: [u8;32], now: u64,
+    ) -> Result<Change, Error> {
+        self.update_inner(document, Some(expected_revision), None, Some(expected_snapshot), now)
     }
 
     fn update_inner(
         &self,
         document: &str,
         expected_revision: Option<u64>,
+        expected: Option<&Verified>,
+        expected_snapshot: Option<[u8;32]>,
         now: u64,
     ) -> Result<Change, Error> {
         let (old, mut snapshot, history, previous) = self.snapshot()?;
+        let digest: [u8;32] = Sha256::digest(old.as_bytes()).into();
+        if expected_snapshot.is_some_and(|expected| expected != digest) {
+            return Err(Error::Rollback);
+        }
         if expected_revision.is_some_and(|rev| rev != previous.descriptor.revision) {
             return Err(Error::Rollback);
+        }
+        if let Some(expected) = expected {
+            if expected.compare(&previous)? != Change::Unchanged {
+                return Err(Error::Rollback);
+            }
+            expected.check_time(now)?;
         }
         history.check_clock(now)?;
         let next = history.verify_current(document)?;
@@ -646,9 +718,11 @@ impl Store {
         Ok(change)
     }
 
-    /// Explicit, revision-guarded normal rotation, NOT compromise recovery.
+    /// Revision-guarded normal rotation, NOT compromise recovery.
     /// Caller must independently confirm the intended key and current
-    /// revision; never call from an automatic descriptor download.
+    /// revision, or establish continuity through the authenticated live
+    /// successor protocol (announcement + successor handshake + bound CAS).
+    /// A raw automatic descriptor download alone is insufficient.
     /// Both signatures and both validity intervals must be verified before
     /// publication. The current signer is retired only at the CAS commit.
     pub fn promote(
@@ -658,8 +732,33 @@ impl Store {
         expected_key: [u8; 32],
         now: u64,
     ) -> Result<Change, Error> {
+        self.promote_inner(successor, expected_revision, expected_key, None, now)
+    }
+
+    pub fn promote_bound(
+        &self,
+        successor: &str,
+        expected_revision: u64,
+        expected_key: [u8; 32],
+        expected_snapshot: [u8; 32],
+        now: u64,
+    ) -> Result<Change, Error> {
+        self.promote_inner(successor, expected_revision, expected_key, Some(expected_snapshot), now)
+    }
+
+    fn promote_inner(
+        &self,
+        successor: &str,
+        expected_revision: u64,
+        expected_key: [u8; 32],
+        expected_snapshot: Option<[u8; 32]>,
+        now: u64,
+    ) -> Result<Change, Error> {
         let (old, mut snapshot, mut history, previous) = self.snapshot()?;
-        if previous.descriptor.revision != expected_revision {
+        let actual: [u8; 32] = Sha256::digest(old.as_bytes()).into();
+        if previous.descriptor.revision != expected_revision
+            || expected_snapshot.is_some_and(|expected| expected != actual)
+        {
             return Err(Error::Rotation);
         }
         history.advance(&previous, successor, expected_key, now)?;

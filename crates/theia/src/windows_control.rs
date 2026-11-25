@@ -184,6 +184,7 @@ pub struct WindowsServer {
     live: Option<Arc<LiveAuthorization>>,
     runtime: Option<Arc<crate::runtime_generation::State>>,
     restarts: Option<mpsc::Sender<crate::runtime_generation::RestartRequest>>,
+    client:Option<Arc<crate::local_proxy::ClientRuntime>>,
 }
 
 impl WindowsServer {
@@ -201,6 +202,7 @@ impl WindowsServer {
             live: None,
             runtime: None,
             restarts: None,
+            client:None,
         })
     }
 
@@ -221,6 +223,14 @@ impl WindowsServer {
 
     pub(crate) fn with_live_authorization(mut self, live: Arc<LiveAuthorization>) -> Self {
         self.live = Some(live);
+        self
+    }
+
+    pub(crate) fn with_client(mut self,client:Arc<crate::local_proxy::ClientRuntime>)->Self{
+        self.client=Some(client);self
+    }
+    pub(crate) fn with_runtime(mut self,state:Arc<crate::runtime_generation::State>)->Self{
+        self.runtime=Some(state);
         self
     }
 
@@ -255,24 +265,29 @@ impl WindowsServer {
             let live = self.live.clone();
             let runtime = self.runtime.clone();
             let restarts = self.restarts.clone();
+            let client=self.client.clone();
             tasks.spawn(async move {
                 let _permit = permit;
-                let _ = timeout(
-                    management::IO_TIMEOUT,
-                    management::handle_internal(
-                        stream, inbounds, preflight, live, runtime, restarts,
-                    ),
-                )
-                .await;
+                if let Some(client)=client{
+                    let _=timeout(management::CLIENT_TIMEOUT,management::handle_client(stream,client)).await;
+                }else{
+                    let _=timeout(management::IO_TIMEOUT,management::handle_internal(stream,inbounds,preflight,live,runtime,restarts)).await;
+                }
             });
             while tasks.try_join_next().is_some() {}
         }
     }
 }
 
-pub async fn query_pipe(id: &str, command: StatusCommand) -> Result<StatusReply, ManagementError> {
-    let name = pipe_name(id)?;
-    timeout(management::IO_TIMEOUT, async {
+pub async fn query_pipe(id:&str,command:StatusCommand)->Result<StatusReply,ManagementError>{
+    query_pipe_timeout(id,command,management::IO_TIMEOUT).await
+}
+pub(crate) async fn query_client_pipe(id:&str,command:StatusCommand)->Result<StatusReply,ManagementError>{
+    query_pipe_timeout(id,command,management::CLIENT_TIMEOUT).await
+}
+async fn query_pipe_timeout(id:&str,command:StatusCommand,limit:Duration)->Result<StatusReply,ManagementError>{
+    let name=pipe_name(id)?;
+    timeout(limit,async {
         loop {
             match ClientOptions::new().open(&name) {
                 Ok(stream) => return management::exchange(stream, command).await,

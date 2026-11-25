@@ -44,7 +44,7 @@ def inventory(root: Path) -> dict[str, str]:
             pass
         elif len(parts) == 3 and parts[0] == "crates" and parts[2] == "build.rs":
             pass
-        elif parts[0] in {"spikes", "tests"} or (
+        elif parts[:2] == ("vendor", "rustls") or parts[0] in {"spikes", "tests"} or (
             len(parts) >= 4 and parts[0] == "crates" and parts[2] in {"tests", "benches", "examples"}
         ):
             continue
@@ -64,7 +64,7 @@ def exact_head(root: Path, sha: str) -> None:
     actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     if not SHA.fullmatch(sha) or actual != sha:
         raise EvidenceError("Coverage does not belong to the checked-out merge SHA")
-    subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "crates"], cwd=root, check=True)
+    subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "crates", "vendor/rustls"], cwd=root, check=True)
 
 
 def source_name(raw: str, root: Path) -> str | None:

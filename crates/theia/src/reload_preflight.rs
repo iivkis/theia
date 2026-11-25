@@ -65,6 +65,7 @@ pub fn assess_reload(
             || before.tls_cert != after.tls_cert
             || before.tls_key != after.tls_key
             || before.security_mode != after.security_mode
+            || before.reality != after.reality
         {
             return Err(ReloadCheckError::RequiresRestart);
         }
@@ -81,6 +82,19 @@ pub fn assess_reload(
     Ok(())
 }
 
+/// Managed roster changes are allowed only on the shared dynamic ledger.
+/// Validate the real candidate first; normalize ONLY roster and grants to
+/// reuse the strict structural comparison. No listener/identity/quota edits.
+pub(crate) fn assess_managed_reload(running:&ServerDocument,candidate:&ServerDocument)->Result<(),ReloadCheckError>{
+    Config::Server(candidate.clone()).validate().map_err(|_|ReloadCheckError::InvalidConfig)?;
+    let mut normalized=candidate.clone();
+    normalized.server.users=running.server.users.clone();
+    for (before,after) in running.server.inbounds.iter().zip(&mut normalized.server.inbounds){
+        after.allowed_user_ids=before.allowed_user_ids.clone();
+    }
+    assess_reload(running,&normalized)
+}
+
 /// Digest of *loaded* PEM bytes, not the paths in TOML. Never log these
 /// digests: the private key itself is not captured in this snapshot.
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
@@ -92,6 +106,10 @@ pub(crate) struct IdentityHash {
 
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 impl IdentityHash {
+    pub(crate) fn reality(binding:&crate::config::RealityBinding)->Self {
+        Self{cert:binding.manifest_sha256,key:binding.identity_sha256}
+    }
+
     pub(crate) fn from_pem(cert: &[u8], key: &[u8]) -> Self {
         Self {
             cert: Sha256::digest(cert).into(),
@@ -172,6 +190,37 @@ impl ReloadPreflight {
         self.validate_candidate(candidate)
     }
 
+    pub(crate) fn load_managed_candidate_bound(&self,expected_sha256:[u8;32])->Result<ServerDocument,ReloadCheckError>{
+        let contents=crate::bounded_input::read(&self.config_path,1024*1024,false,false)
+            .map_err(|_|ReloadCheckError::InvalidConfig)?;
+        let observed:[u8;32]=Sha256::digest(contents.as_slice()).into();
+        if observed!=expected_sha256{return Err(ReloadCheckError::InvalidConfig);}
+        let Config::Server(candidate)=config::parse(std::str::from_utf8(&contents).map_err(|_|ReloadCheckError::InvalidConfig)?)
+            .map_err(|_|ReloadCheckError::InvalidConfig)? else{return Err(ReloadCheckError::InvalidConfig);};
+        self.validate_managed_candidate(candidate)
+    }
+
+    pub(crate) fn check_managed_file(&self)->Result<(),ReloadCheckError>{
+        let Config::Server(candidate)=config::read_file(&self.config_path).map_err(|_|ReloadCheckError::InvalidConfig)?
+            else{return Err(ReloadCheckError::InvalidConfig);};
+        self.validate_managed_candidate(candidate).map(|_|())
+    }
+
+    pub(crate) fn preview_restart_bound(&self,digest:[u8;32])->Result<(bool,[u8;32]),crate::restart_guard::RestartError>{
+        use crate::restart_guard::{RestartError,RestartVerdict};
+        let _probe=self.restart_probe_lock.try_lock().map_err(|_|RestartError::ProbeBusy)?;
+        let candidate=self.load_restart_candidate_bound(digest)?;
+        if !crate::restart_guard::same_shared_limits(&self.active,&candidate){return Err(RestartError::InvalidConfig);}
+        let material=crate::server::CapturedTls::capture(&candidate).map_err(|_|RestartError::InvalidTlsIdentity)?;
+        let verdict=crate::restart_guard::probe_captured(&self.active,&self.identities,&candidate,&material)?;
+        let same_port=match verdict{
+            RestartVerdict::SamePortTlsReady=>true,
+            RestartVerdict::FreshPortsBindable=>false,
+            _=>return Err(RestartError::InvalidConfig),
+        };
+        Ok((same_port,material.fingerprint()))
+    }
+
     /// Content-bound restart candidate, read ONCE by a cancel-safe worker.
     /// Unlike auth-only Apply this deliberately allows changed listeners/TLS,
     /// but still never commits or opens a production socket on the worker.
@@ -200,15 +249,35 @@ impl ReloadPreflight {
         Ok(candidate)
     }
 
-    fn validate_candidate(
+    pub(crate) fn validate_candidate(
         &self,
         candidate: ServerDocument,
     ) -> Result<ServerDocument, ReloadCheckError> {
         assess_reload(&self.active, &candidate)?;
+        self.verify_candidate_material(candidate)
+    }
+
+    pub(crate) fn validate_managed_candidate(&self,candidate:ServerDocument)->Result<ServerDocument,ReloadCheckError>{
+        assess_managed_reload(&self.active,&candidate)?;
+        self.verify_candidate_material(candidate)
+    }
+
+    fn verify_candidate_material(&self,candidate:ServerDocument)->Result<ServerDocument,ReloadCheckError>{
         if self.identities.len() != candidate.server.inbounds.len() {
             return Err(ReloadCheckError::IdentityDrift);
         }
         for (inbound, identity) in candidate.server.inbounds.iter().zip(&self.identities) {
+            if let Some(binding)=&inbound.reality {
+                if *identity!=IdentityHash::reality(binding){return Err(ReloadCheckError::IdentityDrift);}
+                let addr:std::net::SocketAddr=inbound.h2_listen.parse().map_err(|_|ReloadCheckError::IdentityDrift)?;
+                let scope=crate::descriptor::Scope{inbound:inbound.id.clone(),endpoint:format!("{}:{}",inbound.server_name,addr.port())};
+                let state=crate::reference_health::Store::new(std::path::Path::new(&binding.health_store))
+                    .and_then(|store|store.inspect()).map_err(|_|ReloadCheckError::IdentityDrift)?;
+                let now=crate::reference_health::unix_now().map_err(|_|ReloadCheckError::IdentityDrift)?;
+                crate::reality_provision::inspect_registered(std::path::Path::new(&binding.bundle),binding,&state,&scope,now)
+                    .map_err(|_|ReloadCheckError::IdentityDrift)?;
+                continue;
+            }
             let cert = crate::server::pem_data(&inbound.tls_cert, false)
                 .map_err(|_| ReloadCheckError::IdentityDrift)?;
             let key = crate::server::pem_data(&inbound.tls_key, true)
@@ -223,23 +292,9 @@ impl ReloadPreflight {
     /// The quota transaction MUST NOT smuggle a TLS file update via an
     /// unchanged file: reference; actual loaded PEM bytes remain authoritative.
     pub(crate) fn loaded_tls_unchanged(&self, candidate: &ServerDocument) -> bool {
-        if candidate.server.inbounds.len() != self.identities.len() {
-            return false;
-        }
-        candidate
-            .server
-            .inbounds
-            .iter()
-            .zip(&self.identities)
-            .all(|(inbound, identity)| {
-                let Ok(cert) = crate::server::pem_data(&inbound.tls_cert, false) else {
-                    return false;
-                };
-                let Ok(key) = crate::server::pem_data(&inbound.tls_key, true) else {
-                    return false;
-                };
-                identity.matches(&cert, &key)
-            })
+        let mut normalized=candidate.clone();
+        normalized.server.policy=self.active.server.policy.clone();
+        self.validate_candidate(normalized).is_ok()
     }
 
     /// Bound and typed TOML is the ONE candidate the native supervisor sees.
@@ -299,7 +354,7 @@ impl ReloadPreflight {
             Ok(Config::Server(document)) => document,
             _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
         };
-        crate::restart_guard::probe(&self.active, &self.identities, &candidate)
+        crate::restart_guard::probe(&self.active,&self.identities,&candidate)
     }
 
     /// Still a read-only check, never an implicit Apply.
@@ -348,6 +403,7 @@ mod tests {
                     server_name: "edge.example.org".into(),
                     tls_cert: "file:/tmp/theia-cert.pem".into(),
                     security_mode: Default::default(),
+                    reality: None,
                     tls_key: "file:/tmp/theia-key.pem".into(),
                 }],
                 users: vec![User {

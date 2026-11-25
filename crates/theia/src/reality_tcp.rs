@@ -4,7 +4,11 @@
 #![forbid(unsafe_code)]
 
 use crate::{
+    config::Config,
+    identity_tls::Branch,
     reality_admission::{self, Context, ReplayGuard, Secret},
+    reality_generation::Manager,
+    server::{self, ServerContext, ServerError},
     reference_health::RelayLease,
 };
 use std::{
@@ -19,8 +23,9 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     sync::Semaphore,
+    task::JoinSet,
     time::{timeout, timeout_at, Instant},
 };
 
@@ -280,6 +285,77 @@ impl RelayGate {
             return Err(Error::Reference);
         }
         relay_io(client, upstream, RELAY_BYTES, RELAY_LIFETIME).await
+    }
+}
+
+/// Prepared single-generation TCP backend. The construction requires the
+/// exact registered bundle and durable generation floor. Startup can share
+/// one immutable lease and application context with the QUIC backend.
+/// Both accepted and reference paths are bounded; all sockets are owned
+/// by this task's JoinSet and cancelled on shutdown.
+pub struct PreparedTcp {
+    listener: TcpListener,
+    live: Arc<crate::reality_live::Live>,
+    relay: Arc<RelayGate>,
+    inspection_slots: Arc<Semaphore>,
+}
+
+impl PreparedTcp {
+    pub fn prepare(listener: TcpListener, document: &Config, inbound_id: &str) -> Result<Self, ServerError> {
+        let Config::Server(doc) = document else { return Err(ServerError::Config); };
+        let inbound = doc.server.inbounds.iter().find(|i| i.id == inbound_id).ok_or(ServerError::Config)?;
+        let expected: std::net::SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
+        if listener.local_addr().map_err(|_| ServerError::Io)? != expected { return Err(ServerError::Config); }
+        let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
+        let manager = Manager::new(document, inbound_id, now).map_err(|_| ServerError::Config)?;
+        let lease = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
+        let context=Arc::new(ServerContext::new(inbound,&doc.server.users,&doc.server.policy));
+        Self::from_shared(listener, lease, context, now)
+    }
+
+    pub(crate) fn from_shared(listener: TcpListener, lease: Arc<crate::reality_generation::Lease>,
+        context: Arc<ServerContext>, now: u64) -> Result<Self, ServerError> {
+        Self::from_live(listener,crate::reality_live::Live::new(lease,context,now)?)
+    }
+
+    pub(crate) fn from_live(listener:TcpListener,live:Arc<crate::reality_live::Live>)->Result<Self,ServerError>{
+        Ok(Self { listener,live,relay:Arc::new(RelayGate::default()),
+            inspection_slots:Arc::new(Semaphore::new(64)) })
+    }
+
+    pub async fn serve(self) -> Result<(), ServerError> {
+        crate::tcp_bbr::select(&self.listener).map_err(|_| ServerError::TcpControllerUnavailable)?;
+        let shared = Arc::new(self);
+        let mut tasks = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
+                result = shared.listener.accept() => {
+                    let (socket, peer) = result.map_err(|_| ServerError::Io)?;
+                    let Ok(slot) = shared.inspection_slots.clone().try_acquire_owned() else { continue; };
+                    if crate::tcp_bbr::select(&socket).is_err() { continue; }
+                    let backend = shared.clone();
+                    tasks.spawn(async move {
+                        let Ok(inspected) = inspect(socket).await else { return; };
+                        let Ok(now) = crate::reference_health::unix_now() else { return; };
+                        let Some(generation)=backend.live.current() else { return; };
+                        let selected=inspected.hello.as_ref().and_then(|hello|
+                            generation.select(&backend.live.guard,Branch::H2,hello,now));
+                        if let Some(route)=selected {
+                            let Some(connection)=route.context.connection_slot() else { return; };
+                            drop(slot);
+                            server::serve_h2_socket(inspected.io,route.tcp.clone(),route.context.clone(),
+                                peer,connection,crate::diagnostics::next_id()).await;
+                        } else {
+                            let Some(value)=generation.relay_value(now) else { return; };
+                            let Ok(lease)=generation.lease.health().relay_lease(value,generation.lease.publication().plan_sha256()).await else { return; };
+                            let _=backend.relay.relay(inspected.io,&lease).await;
+                            drop(slot);
+                        }
+                    });
+                }
+            }
+        }
     }
 }
 

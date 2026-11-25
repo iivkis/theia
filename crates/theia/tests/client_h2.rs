@@ -68,6 +68,7 @@ fn listener_with_pem_bound_mode(
         server_name: "localhost".into(),
         tls_cert: "unused-test-fixture".into(),
         security_mode: mode,
+        reality: None,
         tls_key: "unused-test-fixture".into(),
     };
     let user = User {
@@ -711,6 +712,7 @@ async fn client_binary_chromium_socks5_over_h3() {
         server_name: "localhost".into(),
         tls_cert: "unused-test-fixture".into(),
         security_mode: Default::default(),
+        reality: None,
         tls_key: "unused-test-fixture".into(),
     };
     let user = User {
@@ -1211,6 +1213,7 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
             server_name: "localhost".into(),
             tls_cert: "unused".into(),
             security_mode: Default::default(),
+            reality: None,
             tls_key: "unused".into(),
         };
         let user = User {
@@ -1320,6 +1323,7 @@ async fn pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_sil
         let inbound = Inbound {
             id: "test".into(),
             security_mode: SecurityMode::PinnedCertV1,
+            reality: None,
             allowed_user_ids: vec!["client".into()],
             h2_listen: endpoint.clone(),
             quic_listen: endpoint.clone(),

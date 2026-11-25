@@ -78,6 +78,7 @@ impl Fixture {
         let inbound = Inbound {
             id: "test".into(),
             security_mode: mode,
+            reality: None,
             allowed_user_ids: vec!["client".into()],
             h2_listen: h2.to_string(),
             quic_listen: h3.to_string(),

@@ -1,0 +1,40 @@
+# F-18 external runtime: development integration
+
+The normal server run path now recognizes registered REALITY records and
+prepares a single immutable generation per inbound before starting accept
+tasks. H2 and H3 share the same authorization and quotas, including mixed
+own-TLS inbounds. H3 is only constructed when the signed descriptor allows
+it; otherwise reserve the UDP port and remain silent. The normal client
+proxy prepares the independently pinned enrollment, resolves only its
+configured endpoint, constructs native H2/H3 admission carriers, and uses
+the existing SOCKS5/CONNECT relay and conservative auto transport. New
+logical operations check the durable signed trust state and credential
+digest; a changed signed revision gets a new carrier pool and fallback
+cache. Authenticated descriptor refresh is bounded and tied to the running
+proxy; auto uses the same H3-first, two silent attempts, route-scoped
+fallback rules as new tunnels. Existing tunnels retain their carrier leases.
+
+This is development code, not a release acceptance claim. REALITY
+server startup now supports live immutable generations, dual-signer overlap,
+rooted compatible renewal and automatic approved-reference failover; see
+f18-live-runtime.md for the precise recovery contract. It fails closed for
+new handshakes when no valid generation exists. Protected IPC now supports bound authorization and quota changes, runtime
+REALITY status, fresh-port structural cutover and bounded rollback for
+mixed configurations. See f18-management.md for restrictions. Independent
+audit remains open. No deployment should
+be declared accepted before main CI and independent review.
+
+External QUIC path lifecycle retains independent budgets and original
+physical peers. Retired CIDs are held for a bounded cooldown, idle/closed
+paths cannot recreate their budget, Retry token is bound to its original
+path, and unverified routing information cannot lift 3x amplification.
+The passive reference limitation from f18-quic-relay.md remains: encrypted
+CID issuance and PATH_RESPONSE cannot be observed; an unknown CID on a
+new tuple is dropped and the external cap is not lifted. Native Quinn
+handles authenticated validation and CID retirement for admitted traffic.
+
+Tests for Retry continuity, retirement, closed paths, registered startup,
+H2 HTTP CONNECT, and H3 SOCKS5 are authored. The latter uses synthetic
+reference evidence and loopback application I/O, not actual public relay
+interoperability.
+All build/test/coverage acceptance is deferred to the post-merge main CI.

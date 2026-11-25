@@ -95,7 +95,8 @@ impl Drop for Wire {
 impl Invitation {
     /// Safe token-free export of an exact supported profile.
     pub fn public_from_profile(profile: &Profile) -> Result<Self, InviteError> {
-        if profile.xhttp_mode.is_some() && profile.tls_profile != "default" {
+        if profile.reality_profile.is_some() || profile.tls_profile == "smart-reality"
+            || (profile.xhttp_mode.is_some() && profile.tls_profile != "default") {
             return Err(InviteError::Invalid);
         }
         let invite = Self {
@@ -127,6 +128,9 @@ impl Invitation {
             .iter()
             .find(|item| item.id == inbound_id)
             .ok_or(InviteError::Unavailable)?;
+        if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality || inbound.reality.is_some() {
+            return Err(InviteError::Unavailable);
+        }
         let h2 = inbound
             .h2_listen
             .parse::<SocketAddr>()
@@ -363,6 +367,7 @@ impl Invitation {
             server_name: self.server_name.clone(),
             auth_token: secret_ref.into(),
             tls_profile: self.tls_profile.clone(),
+            reality_profile: None,
             xhttp_mode: (self.tls_profile == "default").then_some(self.xhttp_mode),
             tls_ca,
             transport: self.transport,
@@ -395,6 +400,7 @@ impl Invitation {
             server_name: self.server_name.clone(),
             auth_token,
             tls_profile: self.tls_profile.clone(),
+            reality_profile: None,
             xhttp_mode: (self.tls_profile == "default").then_some(self.xhttp_mode),
             tls_ca,
             transport: self.transport,
