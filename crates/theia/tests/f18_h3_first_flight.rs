@@ -389,3 +389,68 @@ async fn live_quic_initial_h3_data_and_exporter_pinned_identity_are_distinct_evi
     .await
     .expect("bounded QUIC Initial and real H3 proof fixture finished");
 }
+
+/// Independent real-browser HTTP/3 reference. The only certificate exception
+/// is the ephemeral fixture SPKI. No browser proxy, TCP listener or H2 fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native browser-e2e CI supplies pinned Chromium"]
+async fn actual_chromium_h3_initial_reference() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use sha2::{Digest, Sha256};
+    timeout(Duration::from_secs(55), async {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let spki = STANDARD.encode(Sha256::digest(cert.key_pair.public_key_der()));
+        let endpoint = server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![cert.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        ).unwrap();
+        let (front, first, proxy) = udp_witness(endpoint.local_addr().unwrap()).await;
+        let server = tokio::spawn(async move {
+            let mut connection = None;
+            for _ in 0..8 {
+                let incoming = endpoint.accept().await.expect("browser QUIC incoming");
+                if let Ok(value) = accept(incoming).await {
+                    connection = Some(value);
+                    break;
+                }
+            }
+            let connection = connection.expect("Chromium negotiated h3");
+            let mut http3 = h3::server::Connection::new(h3_quinn::Connection::new(connection.clone()))
+                .await.unwrap();
+            let resolver = http3.accept().await.unwrap().unwrap();
+            let (request, mut stream) = resolver.resolve_request().await.unwrap();
+            assert_eq!(request.method(), http::Method::GET);
+            assert_eq!(request.uri().path(), "/ci-chromium-h3-reference");
+            assert!(stream.recv_data().await.unwrap().is_none());
+            stream.send_response(http::Response::builder().status(200)
+                .header("content-type", "text/html; charset=utf-8").body(()).unwrap())
+                .await.unwrap();
+            stream.send_data(Bytes::from_static(b"<html><main id='h3-reference'>chromium-h3</main></html>"))
+                .await.unwrap();
+            stream.finish().await.unwrap();
+            // Keep the connection and H3 control stream driven until the
+            // browser finishes the isolated navigation and closes.
+            while let Ok(Some(resolver)) = http3.accept().await {
+                if let Ok((_, mut stream)) = resolver.resolve_request().await {
+                    let _ = stream.send_response(http::Response::builder().status(404).body(()).unwrap()).await;
+                    let _ = stream.finish().await;
+                }
+            }
+        });
+        let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/e2e/chromium_h3_reference.py");
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("python").arg(script).arg(front.to_string()).arg(spki).output()
+        }).await.unwrap().expect("pinned Chromium launcher");
+        assert!(output.status.success(), "independent Chromium H3 navigation failed");
+        let initial = first.await.unwrap().expect("browser sent valid QUIC v1 Initial");
+        assert!(initial.datagram_len >= 1200);
+        assert!(initial.packet_len <= initial.datagram_len);
+        eprintln!("Actual Chromium H3 Initial: version={} dcid_len={} scid_len={} token_len={} packet_len={} datagram_len={}; reference only, not fingerprint parity",
+            initial.version, initial.destination_cid_len, initial.source_cid_len,
+            initial.token_len, initial.packet_len, initial.datagram_len);
+        server.abort();
+        proxy.abort();
+    }).await.expect("bounded Chromium H3 reference deadline");
+}
