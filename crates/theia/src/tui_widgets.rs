@@ -40,7 +40,8 @@ pub(crate) fn key_line(keys: &str) -> Line<'_> {
     for (i, part) in keys.split(" · ").enumerate() {
         if i > 0 { spans.push(Span::raw("  ")); }
         let (key, label) = part.split_once(' ').unwrap_or((part, ""));
-        spans.push(Span::styled(format!(" {key} "), Style::default().fg(BG).bg(MUTED).add_modifier(Modifier::BOLD)));
+        let primary = matches!(key, "Enter" | "Y" | "y");
+        spans.push(Span::styled(format!(" {key} "), Style::default().fg(BG).bg(if primary { ACCENT } else { MUTED }).add_modifier(Modifier::BOLD)));
         if !label.is_empty() { spans.push(Span::styled(format!(" {label}"), Style::default().fg(TEXT))); }
     }
     Line::from(spans)
@@ -198,7 +199,7 @@ pub(crate) struct ReferenceReview {
 impl ReferenceReview {
     pub(crate) fn lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = vec![Line::styled("Результаты проверки", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))];
-        let wide = width >= 82;
+        let wide = width >= 96;
         if wide {
             lines.push(Line::styled(format!("{:<30} {:<25} {:<13} {}", "Референс", "Адрес", "H2 / H3", "Результат"), Style::default().fg(MUTED)));
         }
