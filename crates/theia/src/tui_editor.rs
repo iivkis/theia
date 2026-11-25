@@ -1369,6 +1369,31 @@ impl Editor {
         self.error = None;
     }
 
+    pub(crate) fn choice_options(&self) -> &'static [&'static str] {
+        if self.role != Role::Client || self.selected_reality() {
+            return &[];
+        }
+        match self.selected_field {
+            2 => &["auto", "h2", "h3"],
+            3 => &["auto", "stream-one", "stream-up"],
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn cycle_choice(&mut self, forward: bool) {
+        let options = self.choice_options();
+        if !self.editing || options.is_empty() { return; }
+        let index = options.iter().position(|value| *value == self.input.as_str());
+        let next = match index {
+            Some(i) if forward => (i + 1) % options.len(),
+            Some(i) => (i + options.len() - 1) % options.len(),
+            None if forward => 0,
+            None => options.len() - 1,
+        };
+        self.input = options[next].to_owned();
+        self.error = None;
+    }
+
     pub fn insert(&mut self, ch: char) {
         if self.editing && ch.is_ascii_graphic() && self.input.len() < MAX_INPUT {
             self.input.push(ch);
