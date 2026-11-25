@@ -1798,11 +1798,18 @@ async fn prepare_generation(
         LiveAuthorization::new_at_revision(document.clone(), revision)
             .map_err(|_| ServerError::Config)?,
     );
+    prepare_selected_listeners(document,limits,captured,live,None).await
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
+async fn prepare_selected_listeners(document:&ServerDocument,limits:&GenerationLimits,captured:Option<&CapturedTls>,
+    live:Arc<LiveAuthorization>,only:Option<&std::collections::HashSet<String>>)->Result<PreparedGeneration,ServerError>{
     let mut listeners = Vec::with_capacity(document.server.inbounds.len());
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
     let mut reality=HashMap::new();
     let config=Config::Server(document.clone());
     for (index, inbound) in document.server.inbounds.iter().enumerate() {
+        if only.is_some_and(|ids|!ids.contains(&inbound.id)){continue;}
         let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
         let udp_addr: SocketAddr = inbound
             .quic_listen
@@ -1878,6 +1885,7 @@ async fn prepare_generation(
 /// when the supervisor rotates the certificate for new H2/H3 handshakes.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct HotIdentity {
+    id:String,
     h2: Arc<RwLock<TlsAcceptor>>,
     h3: quinn::Endpoint,
 }
@@ -1948,8 +1956,9 @@ struct HotReality{
 
 #[cfg(any(target_os="linux",target_os="windows"))]
 struct RunningGeneration {
-    tasks: JoinSet<Result<(), ServerError>>,
-    phase: watch::Sender<GenerationPhase>,
+    tasks: JoinSet<(String,Result<(),ServerError>)>,
+    phases:HashMap<String,watch::Sender<GenerationPhase>>,
+    draining:std::collections::HashSet<String>,
     identities: Vec<HotIdentity>,
     // Exact QUIC configs installed on the endpoints. Saved previous configs
     // support a one-shot TLS undo without reading external PEM files again.
@@ -1959,20 +1968,33 @@ struct RunningGeneration {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl RunningGeneration {
-    fn launch(listeners: Vec<ReadyListener>, phase: GenerationPhase) -> Self {
-        let (sender, receiver) = watch::channel(phase);
-        let mut tasks = JoinSet::new();
-        let mut identities = Vec::with_capacity(listeners.len());
-        let mut active_h3 = Vec::with_capacity(listeners.len());
-        let mut reality=Vec::new();
-        for listener in listeners {
-            let (tcp,acceptor,udp,context,h3_config)=match listener{
-                ReadyListener::Plain(tcp,acceptor,udp,context,h3_config)=>(tcp,acceptor,udp,context,h3_config),
+    fn launch(listeners:Vec<ReadyListener>,phase:GenerationPhase)->Self{
+        let mut running=Self{tasks:JoinSet::new(),phases:HashMap::new(),draining:Default::default(),
+            identities:Vec::new(),active_h3:Vec::new(),reality:Vec::new()};
+        running.append(listeners,phase);
+        running
+    }
+    fn append(&mut self,listeners:Vec<ReadyListener>,phase:GenerationPhase){
+        for listener in listeners{
+            let id=match &listener{
+                ReadyListener::Plain(_,_,_,context,_)=>context.inbound_id.clone(),
+                ReadyListener::Reality(_,_,_,_,carrier)=>carrier.inbound_id().to_owned(),
+            };
+            let (sender,receiver)=watch::channel(phase);
+            self.phases.insert(id.clone(),sender);
+            let mut tasks=JoinSet::new();
+            match listener{
+                ReadyListener::Plain(tcp,acceptor,udp,context,h3_config)=>{
+                    let h2=Arc::new(RwLock::new(acceptor));
+                    self.identities.push(HotIdentity{id:id.clone(),h2:h2.clone(),h3:udp.clone()});
+                    self.active_h3.push(h3_config);
+                    tasks.spawn(serve_generation_with_tls(tcp,h2,context.clone(),receiver.clone()));
+                    tasks.spawn(crate::h3_server::serve_generation(udp,context,receiver.clone()));
+                }
                 ReadyListener::Reality(tcp,quic,silent,manager,carrier)=>{
-                    let id=carrier.inbound_id().to_owned();
                     let root=manager.root_fingerprint();
                     let manager=Arc::new(tokio::sync::Mutex::new(Arc::new(manager)));
-                    reality.push(HotReality{id,carrier:carrier.clone(),manager:manager.clone(),used_roots:std::collections::HashSet::from([root])});
+                    self.reality.push(HotReality{id:id.clone(),carrier:carrier.clone(),manager:manager.clone(),used_roots:std::collections::HashSet::from([root])});
                     let mut phase=receiver.clone();
                     tasks.spawn(async move{
                         if !await_generation_activation(&mut phase).await{return Ok(());}
@@ -2023,49 +2045,72 @@ impl RunningGeneration {
                             }
                         }
                     });
-                    continue;
                 }
-            };
-            active_h3.push(h3_config);
-            let h2 = Arc::new(RwLock::new(acceptor));
-            identities.push(HotIdentity {
-                h2: h2.clone(),
-                h3: udp.clone(),
+            }
+            // Own every transport task for this inbound in a scoped group.
+            // Dropping the parent cancels the entire group, including on
+            // panic. An active group exiting unexpectedly is fatal.
+            self.tasks.spawn(async move{
+                let mut phase=receiver;
+                let result=loop{
+                    if *phase.borrow()==GenerationPhase::Drain{break Ok(());}
+                    tokio::select!{
+                        change=phase.changed()=>{
+                            if change.is_err(){break Ok(());}
+                        }
+                        joined=tasks.join_next()=>{
+                            if *phase.borrow()==GenerationPhase::Drain{break Ok(());}
+                            break match joined{Some(Ok(Err(e)))=>Err(e),_=>Err(ServerError::Io)};
+                        }
+                    }
+                };
+                if result.is_ok(){
+                    let _=timeout(GENERATION_DRAIN+Duration::from_secs(2),async{
+                        while tasks.join_next().await.is_some(){}
+                    }).await;
+                }
+                tasks.shutdown().await;
+                (id,result)
             });
-            tasks.spawn(serve_generation_with_tls(
-                tcp,
-                h2,
-                context.clone(),
-                receiver.clone(),
-            ));
-            tasks.spawn(crate::h3_server::serve_generation(
-                udp,
-                context,
-                receiver.clone(),
-            ));
-        }
-        Self {
-            tasks,
-            phase: sender,
-            identities,
-            active_h3,
-            reality,
         }
     }
-
-    fn is_healthy_before_activation(&mut self) -> bool {
-        // Every task is waiting at an activation barrier, with the socket
-        // already bound. Any premature completion is a failed generation.
+    fn is_healthy_before_activation(&mut self)->bool{
         self.tasks.try_join_next().is_none()
     }
-
-    fn start(&self) {
-        self.phase.send_replace(GenerationPhase::Active);
+    fn start(&self){
+        for phase in self.phases.values(){phase.send_replace(GenerationPhase::Active);}
     }
-
-    fn drain(&self) {
+    fn drain(&self){
         for hot in &self.reality{hot.carrier.retire();}
-        self.phase.send_replace(GenerationPhase::Drain);
+        for phase in self.phases.values(){phase.send_replace(GenerationPhase::Drain);}
+    }
+    fn remove_inbounds(&mut self,removed:&std::collections::HashSet<String>){
+        for id in removed{
+            if let Some(phase)=self.phases.get(id){
+                self.draining.insert(id.clone());
+                phase.send_replace(GenerationPhase::Drain);
+            }
+        }
+        self.reality.retain(|hot|{
+            if removed.contains(&hot.id){hot.carrier.retire();false}else{true}
+        });
+        let old=std::mem::take(&mut self.identities);
+        let configs=std::mem::take(&mut self.active_h3);
+        for (hot,cfg) in old.into_iter().zip(configs){
+            if !removed.contains(&hot.id){self.identities.push(hot);self.active_h3.push(cfg);}
+        }
+    }
+    fn order_plain(&mut self,document:&ServerDocument){
+        let mut entries:Vec<_>=std::mem::take(&mut self.identities).into_iter()
+            .zip(std::mem::take(&mut self.active_h3)).collect();
+        entries.sort_by_key(|(hot,_)|document.server.inbounds.iter().position(|i|i.id==hot.id).unwrap_or(usize::MAX));
+        (self.identities,self.active_h3)=entries.into_iter().unzip();
+    }
+    fn has_draining(&self)->bool{!self.draining.is_empty()}
+    fn finish_draining(&mut self,id:&str)->bool{
+        if !self.draining.remove(id){return false;}
+        self.phases.remove(id);
+        true
     }
 }
 
@@ -2129,6 +2174,22 @@ async fn stage_fresh_generation(
         return Err(());
     }
     Ok((running,next,prepared.identities,prepared.reality,next_revision))
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
+async fn stage_partial_generation(request:&crate::runtime_generation::RestartRequest,loaded:&[crate::reload_preflight::IdentityHash],
+    limits:&GenerationLimits,path:&Path,plan:&crate::restart_guard::PartialLayout)
+    ->Result<(PreparedGeneration,crate::runtime_generation::View,crate::live_auth::StagedAuthorization),()>{
+    let snapshot=request.material.as_ref().ok_or(())?;
+    let candidate=&request.candidate;
+    if crate::restart_guard::probe_captured(&request.previous.document,loaded,candidate,snapshot)
+        !=Ok(crate::restart_guard::RestartVerdict::FreshPortsBindable){return Err(());}
+    let (live,auth)=request.previous.live.prepare_tls_rebase(candidate,request.expected_revision).map_err(|_|())?;
+    let live=Arc::new(live);
+    let prepared=prepare_selected_listeners(candidate,limits,Some(snapshot),live.clone(),Some(&plan.added)).await.map_err(|_|())?;
+    let view=crate::runtime_generation::View{document:Arc::new(candidate.clone()),inbounds:candidate.server.inbounds.len(),
+        preflight:Arc::new(crate::reload_preflight::ReloadPreflight::new(path.to_owned(),candidate.clone(),snapshot.identities())),live};
+    Ok((prepared,view,auth))
 }
 
 /// Only identity material may change. All PEM/cert/key/QUIC/H2 builders
@@ -2441,7 +2502,7 @@ async fn run_supervised_file(
                 };
                 // No unbounded retired-generation backlog and no double
                 // admission during simultaneous restart attempts.
-                if retiring.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                if running.has_draining()||retiring.as_ref().is_some_and(|worker| !worker.is_finished()) {
                     let _ = request.complete.send(Err(()));
                     continue;
                 }
@@ -2549,6 +2610,33 @@ async fn run_supervised_file(
                     }
                     continue;
                 }
+                if let Some(snapshot)=request.material.as_ref(){
+                    let next_ids=snapshot.identities();
+                    if let Some(plan)=crate::restart_guard::partial_layout(request.previous.document.as_ref(),&identities,&request.candidate,&next_ids){
+                        let staged=stage_partial_generation(&request,&identities,&limits,config_path,&plan).await;
+                        let Ok((prepared,next_view,auth))=staged else{let _=request.complete.send(Err(()));continue;};
+                        if request.complete.is_closed(){continue;}
+                        let revision=runtime.commit_partial_layout(&request.previous,request.expected_revision,next_view,auth,&plan.removed,prepared.reality);
+                        let Ok(revision)=revision else{let _=request.complete.send(Err(()));continue;};
+                        running.remove_inbounds(&plan.removed);
+                        running.append(prepared.listeners,GenerationPhase::Active);
+                        running.order_plain(&request.candidate);
+                        rollback=None;
+                        runtime.set_rollback_until(None);
+                        if structural{
+                            structural_rollback=None;runtime.set_restart_rollback(None);
+                        }else{
+                            let now=Instant::now();
+                            let ready_at=if plan.removed.is_empty(){now}else{now+GENERATION_DRAIN+Duration::from_secs(2)};
+                            let expires=now+Duration::from_secs(300);
+                            structural_rollback=Some(StructuralRollbackSlot{document:request.previous.document.clone(),identities:identities.clone(),revision,ready_at,expires});
+                            runtime.set_restart_rollback(Some((revision,ready_at,expires)));
+                        }
+                        identities=next_ids;
+                        let _=request.complete.send(Ok(revision));
+                        continue;
+                    }
+                }
                 let staged = stage_fresh_generation(
                     &request,
                     &identities,
@@ -2630,10 +2718,11 @@ async fn run_supervised_file(
             result = running.tasks.join_next() => {
                 // An unexpected H2/H3 accept-loop exit is fatal, not a
                 // misleading healthy status from the management endpoint.
-                return match result {
-                    Some(Ok(Err(error))) => Err(error),
-                    _ => Err(ServerError::Io),
-                };
+                match result{
+                    Some(Ok((id,Ok(())))) if running.finish_draining(&id)=>continue,
+                    Some(Ok((_,Err(error))))=>return Err(error),
+                    _=>return Err(ServerError::Io),
+                }
             }
             result = async {
                 match &mut management_task {

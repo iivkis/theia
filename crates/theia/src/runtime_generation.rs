@@ -314,6 +314,26 @@ impl State {
         Ok(revision)
     }
 
+    /// Partial listener edit: retained contexts keep the same AuthCell
+    /// and ledger; removed grants disappear at the same revision. New
+    /// listeners were fully bound before this method, but are not serving.
+    pub(crate) fn commit_partial_layout(&self,previous:&Arc<View>,expected:u64,next:View,auth:StagedAuthorization,
+        removed:&std::collections::HashSet<String>,added:RealityMap)->Result<u64,LiveAuthError>{
+        let mut current=self.current.write().map_err(|_|LiveAuthError::Unavailable)?;
+        if !Arc::ptr_eq(&current,previous)||previous.live.revision()?!=expected{return Err(LiveAuthError::StaleRevision);}
+        let mut reality=self.reality.write().map_err(|_|LiveAuthError::Unavailable)?;
+        if added.keys().any(|id|reality.contains_key(id)){return Err(LiveAuthError::RequiresRestart);}
+        let mut rollback=self.auth_rollback.write().map_err(|_|LiveAuthError::Unavailable)?;
+        let revision=previous.live.publish(auth)?;
+        reality.retain(|id,(_,carrier)|{
+            if removed.contains(id){carrier.retire();false}else{true}
+        });
+        reality.extend(added);
+        *rollback=None;
+        *current=Arc::new(next);
+        Ok(revision)
+    }
+
     /// Linearization point for a prepared fresh-port listener generation.
     /// In-flight and future requests on the former generation are denied
     /// NEW admission before the protected IPC view points to the successor.

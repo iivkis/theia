@@ -140,9 +140,11 @@ pub(crate) fn probe_captured(
                 .map_err(|_| RestartError::InvalidConfig)?,
         );
     }
+    let partial=partial_layout(active,loaded_identities,candidate,&candidate_identities);
     let mut next_tcp = Vec::new();
     let mut next_udp = Vec::new();
     for inbound in &candidate.server.inbounds {
+        if partial.as_ref().is_some_and(|plan|!plan.added.contains(&inbound.id)){continue;}
         let tcp: SocketAddr = inbound
             .h2_listen
             .parse()
@@ -182,6 +184,32 @@ pub(crate) fn probe_captured(
     drop(udp_probes);
     drop(tcp_probes);
     Ok(RestartVerdict::FreshPortsBindable)
+}
+
+/// A partial structural edit preserves every retained listener's exact
+/// material, mode and bind. Added IDs need fresh disjoint ports; removing
+/// IDs never makes their occupied ports available during preparation.
+pub(crate) struct PartialLayout{
+    pub(crate) added:HashSet<String>,
+    pub(crate) removed:HashSet<String>,
+}
+pub(crate) fn partial_layout(active:&ServerDocument,loaded:&[IdentityHash],candidate:&ServerDocument,captured:&[IdentityHash])->Option<PartialLayout>{
+    if !same_shared_limits(active,candidate)||active.server.inbounds.len()!=loaded.len()||candidate.server.inbounds.len()!=captured.len(){return None;}
+    let mut added=HashSet::new();
+    let mut retained=0usize;
+    for (next,material) in candidate.server.inbounds.iter().zip(captured){
+        if let Some((old,old_material))=active.server.inbounds.iter().zip(loaded).find(|(old,_)|old.id==next.id){
+            let mut normalized=next.clone();
+            normalized.allowed_user_ids=old.allowed_user_ids.clone();
+            if &normalized!=old||material!=old_material{return None;}
+            retained+=1;
+        }else{
+            added.insert(next.id.clone());
+        }
+    }
+    let removed:HashSet<_>=active.server.inbounds.iter().filter(|old|!candidate.server.inbounds.iter().any(|next|next.id==old.id)).map(|i|i.id.clone()).collect();
+    if retained==0||(added.is_empty()&&removed.is_empty()){return None;}
+    Some(PartialLayout{added,removed})
 }
 
 /// A TLS-only in-place rotation never rebinds a TCP/UDP port, changes
