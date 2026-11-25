@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 95d4b5a7ad69cf8ff5ac1114dbff7611546c4059
+Source: 3b210f224a7e096297cf45a59a919d437891c5a4
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -74,9 +74,17 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-focus-actions](client-focus-actions.png)
 
+## client-focus-fields
+
+![client-focus-fields](client-focus-fields.png)
+
 ## client-focus-navigation
 
 ![client-focus-navigation](client-focus-navigation.png)
+
+## client-focus-records
+
+![client-focus-records](client-focus-records.png)
 
 ## client-local-proxy-before-start
 
@@ -153,6 +161,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## help
 
 ![help](help.png)
+
+## home-role-selection-client
+
+![home-role-selection-client](home-role-selection-client.png)
 
 ## home-role-selection
 
@@ -238,9 +250,17 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-focus-actions](server-focus-actions.png)
 
+## server-focus-fields
+
+![server-focus-fields](server-focus-fields.png)
+
 ## server-focus-navigation
 
 ![server-focus-navigation](server-focus-navigation.png)
+
+## server-focus-records
+
+![server-focus-records](server-focus-records.png)
 
 ## server-page-connections
 
