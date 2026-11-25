@@ -68,7 +68,7 @@ pub(crate) struct RegistrationPanel {
     stage: Stage,
     error: Option<String>,
     owned: Option<crate::tui_staged_material::StagedMaterial>,
-    staged_save: bool,
+    staged_save: Option<PathBuf>,
 }
 
 fn labels(role: Role) -> &'static [&'static str] {
@@ -175,7 +175,7 @@ impl RegistrationPanel {
             focus: 0,
             stage: Stage::Input,
             error: None,
-            owned: None, staged_save: false,
+            owned: None, staged_save: None,
         })
     }
 
@@ -194,7 +194,7 @@ impl RegistrationPanel {
         ];
         Ok(Self {
             role: Role::Server, reenroll_id: None, config, original, fields,
-            focus: 5, stage: Stage::Input, error: None, owned: None, staged_save: false,
+            focus: 5, stage: Stage::Input, error: None, owned: None, staged_save: None,
         })
     }
 
@@ -224,7 +224,7 @@ impl RegistrationPanel {
             focus: 2,
             stage: Stage::Input,
             error: None,
-            owned: None, staged_save: false,
+            owned: None, staged_save: None,
         })
     }
 
@@ -255,7 +255,7 @@ impl RegistrationPanel {
     fn cancel_owned(&mut self) -> bool {
         let Some(mut owned) = self.owned.take() else { return true; };
         if owned.cleanup().is_err() {
-            self.stage = Stage::Done("Очистка не подтверждена: материалы сохранены полностью или частично. Проверьте каталог и TOML; не повторяйте вслепую. Esc: закрыть.".into());
+            self.stage = Stage::Done(format!("Очистка не подтверждена. Проверьте каталог {:?} и TOML; не повторяйте вслепую. Для целых материалов используйте M после независимой проверки. Esc: закрыть.", owned.root()));
             return false;
         }
         true
@@ -339,7 +339,7 @@ impl RegistrationPanel {
         let (tx, rx) = mpsc::channel();
         self.stage = Stage::Saving(rx);
         let mut owned = self.owned.take();
-        self.staged_save = owned.is_some();
+        self.staged_save = owned.as_ref().map(|guard| guard.root().to_owned());
         let _worker = std::thread::spawn(move || {
             // Once publication starts, a panic or lost result must retain
             // material. Only a definite pre-replacement refusal permits cleanup.
@@ -430,13 +430,13 @@ impl RegistrationPanel {
                     }
                     Ok(Err(SaveError::Refused(Error::Indeterminate)))
                     | Err(TryRecvError::Disconnected) => {
-                        self.stage = Stage::Done("Неопределённая запись. Проверьте файл и заново откройте редактор, не повторяйте автоматически.\nEsc: закрыть.".into());
+                        self.stage = Stage::Done(format!("Неопределённая запись. Проверьте файл и заново откройте редактор, не повторяйте автоматически.\nПодготовленный каталог: {:?}\nEsc: закрыть.", self.staged_save));
                     }
                     Ok(Err(SaveError::SavedReloadFailed)) => {
                         self.stage = Stage::Done("TOML сохранён, перечитать редактор не удалось. Откройте заново; runtime не изменён.\nEsc: закрыть.".into());
                     }
                     Ok(Err(SaveError::Refused(error))) => {
-                        if self.staged_save {
+                        if self.staged_save.is_some() {
                             self.stage = Stage::Done(format!("ОТКАЗ: {error}. Подготовленные материалы удалены; откройте новый мастер. Esc: закрыть."));
                         } else {
                             self.error = Some(format!("ОТКАЗ: {error}"));
@@ -596,7 +596,7 @@ mod tests {
             focus: 0,
             stage: Stage::Input,
             error: None,
-            owned: None, staged_save: false,
+            owned: None, staged_save: None,
         };
         let request = p.request().unwrap();
         assert!(matches!(&request, Request::ReplaceServer(r) if r.id == "selected"));

@@ -22,6 +22,7 @@ impl StagedMaterial {
     fn unchanged(path: &Path, source: [u8; 32]) -> bool {
         config::editor_bytes(path).is_ok_and(|raw| <[u8; 32]>::from(Sha256::digest(raw)) == source)
     }
+    pub(crate) fn root(&self) -> &Path { &self.root }
     pub(crate) fn preserve(&mut self) { self.armed = false; }
     pub(crate) fn refuse(&mut self) { self.armed = true; }
     pub(crate) fn cleanup(&mut self) -> Result<(), Error> {
@@ -29,6 +30,7 @@ impl StagedMaterial {
         // Disarm before deletion: an ambiguous or failed cleanup must never
         // be retried against a path that may have been reused.
         self.armed = false;
+        let _lock = config::editor_lock(&self.config).map_err(|_| Error::Indeterminate)?;
         if !Self::unchanged(&self.config, self.source) { return Err(Error::Indeterminate); }
         let meta = std::fs::symlink_metadata(&self.root).map_err(|_| Error::Storage)?;
         if !meta.is_dir() || meta.file_type().is_symlink() { return Err(Error::Storage); }
@@ -69,6 +71,13 @@ mod tests {
         let mut guard = StagedMaterial::create(&root, &config, source).unwrap();
         std::fs::write(&config, b"changed").unwrap();
         assert_eq!(guard.cleanup(), Err(Error::Indeterminate));
+        assert!(root.exists());
+        std::fs::write(&config, include_str!("../../../examples/server.toml")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let mut guard = StagedMaterial::create(&root, &config, source).unwrap();
+        let lock = config::editor_lock(&config).unwrap();
+        assert_eq!(guard.cleanup(), Err(Error::Indeterminate));
+        drop(lock);
         assert!(root.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }

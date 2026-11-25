@@ -226,7 +226,7 @@ impl EnrollmentPanel {
                 if key.code == KeyCode::Esc {
                     if let Some(mut owned) = self.owned.take() {
                         if owned.cleanup().is_err() {
-                            self.stage = Stage::Done("Очистка не подтверждена; проверьте материалы. Esc: закрыть.".into());
+                            self.stage = Stage::Done(format!("Очистка не подтверждена; проверьте каталог {:?}. Для полного enrollment используйте M после независимой проверки. Esc: закрыть.", owned.root()));
                             return false;
                         }
                     }
@@ -343,7 +343,7 @@ impl EnrollmentPanel {
                 self.error = Some(format!(
                     "ОТКАЗ: {error}. При неопределённой записи проверьте файлы перед повтором."
                 ));
-                self.stage = if error == Error::Indeterminate { Stage::Done("ОТКАЗ: неопределённая запись. Закройте и проверьте файлы; повтор заблокирован.".into()) } else { Stage::Input };
+                self.stage = if error == Error::Indeterminate { Stage::Done(format!("ОТКАЗ: неопределённая запись. Проверьте подготовленный профиль {:?}; повтор заблокирован.", Path::new(self.fields[2].as_str()))) } else { Stage::Input };
             }
         }
         None

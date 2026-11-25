@@ -345,7 +345,7 @@ enum WizardStage {
     ProbeConfirm(Box<(WizardInput, reference_health::Plan)>),
     Checking(Receiver<Result<(WizardInput, reference_health::State, String), Error>>, tokio::sync::oneshot::Sender<()>),
     CreateConfirm(Box<(WizardInput, reference_health::State, String)>),
-    Saving(Receiver<Result<RegistrationPanel, Error>>),
+    Saving(Receiver<Result<RegistrationPanel, Error>>, PathBuf),
     Done(String),
 }
 struct Wizard {
@@ -354,6 +354,7 @@ struct Wizard {
     fields: [String; 7],
     focus: usize,
     advanced: bool,
+    users: String,
     stage: WizardStage,
     error: String,
     registration: Option<RegistrationPanel>,
@@ -368,7 +369,7 @@ impl Wizard {
             id, "443".into(), String::new(), String::new(),
             crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[..3].join(","),
             String::new(), "auto".into(),
-        ], focus: 1, advanced: false, stage: WizardStage::Input, error: String::new(), registration: None })
+        ], focus: 1, advanced: false, users: editor.record_user_catalog(crate::tui_editor::RecordAction::NewInbound).unwrap_or_default(), stage: WizardStage::Input, error: String::new(), registration: None })
     }
     fn visible_fields(&self) -> &[usize] {
         if self.advanced { &[0, 1, 2, 3, 4, 5, 6] } else { &[1, 2, 3, 5] }
@@ -453,6 +454,7 @@ impl Wizard {
             }
             WizardStage::CreateConfirm(value) if key.code == KeyCode::Char('y') && key.modifiers.is_empty() => {
                 let (input, state, _) = *value;
+                let root = input.health.parent().map(Path::to_owned).unwrap_or_default();
                 let (tx, rx) = mpsc::channel();
                 let _worker = std::thread::spawn(move || {
                     let result = (|| {
@@ -485,7 +487,7 @@ impl Wizard {
                     })();
                     let _ = tx.send(result);
                 });
-                WizardStage::Saving(rx)
+                WizardStage::Saving(rx, root)
             }
             WizardStage::DnsConfirm(_) | WizardStage::ProbeConfirm(_) | WizardStage::CreateConfirm(_) if matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) => WizardStage::Input,
             WizardStage::Checking(_, cancel) if key.code == KeyCode::Esc => { let _ = cancel.send(()); WizardStage::Input }
@@ -506,11 +508,11 @@ impl Wizard {
                 Ok(value) => value.map(|v| WizardStage::CreateConfirm(Box::new(v))),
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
             },
-            WizardStage::Saving(rx) => match rx.try_recv() {
+            WizardStage::Saving(rx, root) => match rx.try_recv() {
                 Ok(Ok(panel)) => { self.registration = Some(panel); return None; }
-                Ok(Err(error)) => Ok(WizardStage::Done(format!("ОТКАЗ: {error}. Возможно сохранены локальные материалы; проверьте их вручную. Runtime не изменён. Esc: закрыть."))),
+                Ok(Err(error)) => Ok(WizardStage::Done(format!("ОТКАЗ: {error}. При неопределённой записи проверьте каталог {root:?}; для целых материалов доступна регистрация M. Runtime не изменён. Esc: закрыть."))),
                 Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => Ok(WizardStage::Done("Неопределённая запись материалов. Не повторяйте вслепую. Esc: закрыть.".into())),
+                Err(TryRecvError::Disconnected) => Ok(WizardStage::Done(format!("Неопределённая запись материалов в {root:?}. Не повторяйте вслепую. Esc: закрыть."))),
             },
             _ => return None,
         };
@@ -527,18 +529,19 @@ impl Wizard {
                     out.push_str(&format!("{} {label}: {}\n", if i == self.focus { ">" } else { " " }, self.fields[i]));
                 }
                 out.push_str(if self.advanced { "auto: подобрать по оценкам; manual: сохранить порядок.\nF2: скрыть расширенные.\n" } else { "ID создаётся автоматически; референсы подбираются из каталога.\nУкажите все собственные IP, включая публичный/NAT: это обязательная защита от self-reference.\nF2: расширенные (ID, домены/IP, manual).\n" });
-                out.push_str("Enter: проверить и подобрать; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
+                out.push_str(&self.users);
+                out.push_str("\nEnter: проверить и подобрать; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
                 out.push_str(&self.error); out
             }
             WizardStage::DnsConfirm(input) => format!("DNS: только перечисленные домены без заданного IP.\n{}\nНет TLS/QUIC соединений. y: DNS; n/Esc: отменить.", input.candidates.iter().map(|(name, ip)| format!("{name}: {}", ip.map_or("DNS".into(), |ip| ip.to_string()))).collect::<Vec<_>>().join("\n")),
             WizardStage::Resolving(_, _) => "Ограниченный DNS. Esc: отменить ожидание, без TLS/записи.".into(),
             WizardStage::ProbeConfirm(value) => {
                 let skipped = value.0.candidates.iter().filter(|(name, _)| !value.1.references.iter().any(|t| &t.server_name == name)).map(|(name, _)| name.as_str()).collect::<Vec<_>>();
-                format!("Проверить только эти IP:443 и SNI (public PKI, H2/H3 HEAD):\n{}\nИсключены DNS/недопустимые/повторные IP: {}\ny: проверить; n/Esc: отменить.", value.1.preview().unwrap_or_else(|_| "Неверный план".into()), skipped.join(", "))
+                format!("Проверить только эти IP:443 и SNI (public PKI, H2/H3 HEAD):\n{}\nИсключены DNS/недопустимые/повторные IP: {}\nDNS будет повторно сверён, включая endpoint; запрещено подключение к собственным IP.\ny: проверить; n/Esc: отменить.", value.1.preview().unwrap_or_else(|_| "Неверный план".into()), skipped.join(", "))
             },
             WizardStage::Checking(_, _) => "Проверка согласованных IP; Esc: отменить без записи.".into(),
             WizardStage::CreateConfirm(value) => value.2.clone(),
-            WizardStage::Saving(_) => "Создание локальных материалов; не закрывайте экран. Runtime не меняется.".into(),
+            WizardStage::Saving(_, _) => "Создание локальных материалов; не закрывайте экран. Runtime не меняется.".into(),
             WizardStage::Done(message) => message.clone(),
         }
     }
@@ -796,6 +799,20 @@ mod tests {
         assert!(matches!(wizard.stage, WizardStage::Input));
         assert!(!input.bundle.exists() && !input.health.exists());
         let original = std::fs::read(&path).unwrap();
+        // Cancel the registration after local creation, then repeat the same
+        // operation: only our new root is removed and TOML stays byte-exact.
+        wizard.stage = WizardStage::CreateConfirm(Box::new((input.clone(), state.clone(), report.clone())));
+        wizard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while wizard.registration.is_none() {
+            let _ = wizard.poll();
+            assert!(std::time::Instant::now() < deadline, "{}", wizard.body());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(wizard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!input.health.parent().unwrap().exists());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        wizard.registration = None;
         wizard.stage = WizardStage::CreateConfirm(Box::new((input.clone(), state, report)));
         assert!(!wizard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);

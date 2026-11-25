@@ -1942,7 +1942,7 @@ fn draw_issuance(
         IssueFlow::Public(link) => (
             "Публичное приглашение без токена",
             format!(
-                "Только данные профиля. Не содержит bearer, CA или grant. Получателю нужны отдельные доверенные credentials и CA.\n\n{link}\n\nEnter/Esc: закрыть."
+                "Только данные профиля. Не содержит bearer, CA или grant. Получателю нужны независимое доверие (CA или REALITY fingerprint/admission) и отдельный credential.\nQ: защищённый QR | c: буфер обмена | Enter/Esc: закрыть.\n\n{link}"
             ),
         ),
         IssueFlow::Showing(link) => (
