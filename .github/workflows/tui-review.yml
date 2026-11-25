@@ -83,7 +83,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: build/tui-review
-          fetch-depth: 1
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: tui-review-linux
@@ -93,7 +93,8 @@ jobs:
         run: |
           set -euo pipefail
           # Do not let an older run overwrite a newer review-input revision.
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" HEAD
+          git diff --quiet "$GITHUB_SHA" HEAD -- . ':(exclude)screenshots/**'
           python3 - <<'PY'
           import hashlib, json, os, re, shutil, struct
           from pathlib import Path
