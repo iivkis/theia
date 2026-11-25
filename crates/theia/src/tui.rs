@@ -1119,7 +1119,7 @@ impl Interaction {
             base && Self::panel_role(model).is_some_and(|role| self.editor_for(role).is_none());
         if self.editor.is_none() || inactive_editor {
             if model.screen == Screen::Client && key.code == KeyCode::Char('I') {
-                self.reality_enrollment = Some(EnrollmentPanel::new());
+                self.open_config(Role::Client);
                 return false;
             }
             if model.screen == Screen::Server && key.code == KeyCode::Char('W') {
@@ -2145,7 +2145,7 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
                 .add_modifier(Modifier::BOLD)
         } else if line.starts_with("Ошибка:") || line.starts_with("ОТКАЗ:") {
             Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
-        } else if line.starts_with("ШАГ ") || line.starts_with("ВЫБЕРИТЕ ") || line.starts_with("НАЧАЛО РАБОТЫ") || line.starts_with("SMARTTHEIA REALITY") || line == "OWN-TLS" || line == "ПРОФИЛИ" {
+        } else if line.starts_with("ШАГ ") || line.starts_with("ВЫБЕРИТЕ ") || line.starts_with("НАЧАЛО РАБОТЫ") || line.starts_with("SMARTTHEIA REALITY") || line.starts_with("СЕТЬ ") || line == "ДОСТУП" || line == "OWN-TLS" || line == "ПРОФИЛИ" {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("КОНФИДЕНЦИАЛЬНО")
         {
@@ -2226,6 +2226,52 @@ fn panel_at(
 
 fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bool) {
     panel_at(frame, area, title, body, focused, None);
+}
+
+/// A persistent step header and action strip separate guidance from the
+/// scrollable form/review. No display-only shortcut may commit a transaction.
+fn draw_guided(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    body: &str,
+    guide: (usize, usize, &'static str, &'static str),
+    viewport: Option<&Viewport>,
+) {
+    let (step, total, heading, keys) = guide;
+    let title = format!("{title} · ШАГ {step}/{total} · {heading}");
+    frame.render_widget(Clear, area);
+    if area.height < 12 || area.width < 48 {
+        panel_at(frame, area, &title, body, true, viewport);
+        return;
+    }
+    let area = centered_column(area, 108);
+    let parts = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(4),
+        Constraint::Length(3),
+    ]).split(area);
+    let mut segments = vec![Span::styled(
+        format!(" {step}/{total}  "),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )];
+    for number in 1..=total {
+        segments.push(Span::styled(
+            if number <= step { "━━" } else { "──" },
+            Style::default().fg(if number <= step { Color::Cyan } else { Color::DarkGray }),
+        ));
+        segments.push(Span::raw(" "));
+    }
+    segments.push(Span::styled(heading, Style::default().add_modifier(Modifier::BOLD)));
+    frame.render_widget(
+        Paragraph::new(Line::from(segments)).block(Block::default().title(title.as_str()).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))),
+        parts[0],
+    );
+    panel_at(frame, parts[1], "Параметры / проверка", body, true, viewport);
+    frame.render_widget(
+        Paragraph::new(keys).wrap(Wrap { trim: true }).block(Block::default().title("Следующее действие").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))),
+        parts[2],
+    );
 }
 
 fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>) {
@@ -2333,13 +2379,11 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     } else if let Some(dialog) = interaction.and_then(|ui| ui.config_dialog.as_ref()) {
         frame.render_widget(Clear, parts[1]);
-        modal_panel!(
-            frame,
-            parts[1],
-            dialog.title(),
-            &dialog.body(),
-            true
-        );
+        if let Some(guide) = dialog.guide() {
+            draw_guided(frame, parts[1], dialog.title(), &dialog.body(), guide, viewport);
+        } else {
+            modal_panel!(frame, parts[1], dialog.title(), &dialog.body(), true);
+        }
     } else if let Some(menu) = interaction.and_then(|ui| ui.menu.as_ref()) {
         frame.render_widget(Clear, parts[1]);
         menu.render(frame, parts[1]);
@@ -2379,9 +2423,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         );
     } else if let Some(enrollment) = interaction.and_then(|ui| ui.reality_enrollment.as_ref()) {
-        modal_panel!(frame, parts[1], "Импорт REALITY", &enrollment.body(), true,);
+        draw_guided(frame, parts[1], "Импорт REALITY", &enrollment.body(), enrollment.guide(), viewport);
     } else if let Some(provision) = interaction.and_then(|ui| ui.reality_provision.as_ref()) {
-        modal_panel!(frame, parts[1], "Мастер REALITY", &provision.body(), true,);
+        if let Some(guide) = provision.guide() {
+            draw_guided(frame, parts[1], "Мастер REALITY", &provision.body(), guide, viewport);
+        } else {
+            modal_panel!(frame, parts[1], "Мастер REALITY", &provision.body(), true);
+        }
     } else if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
         modal_panel!(frame, parts[1], runtime.title(), &runtime.body(), true);
     } else if interaction.is_some_and(|ui| ui.saving.is_some()) {
@@ -2929,7 +2977,7 @@ fn draw_welcome(frame: &mut Frame<'_>, area: Rect, role: Role) {
     let title = if role == Role::Server { "Для сервера" } else { "Для клиента" };
     let body = match role {
         Role::Server => "НАЧАЛО РАБОТЫ\n\n> Enter / F3   Создать или открыть TOML\n\nSMARTTHEIA REALITY\n  Новый сервер без собственного TLS-сертификата.\n  Введите путь к TOML, затем F4 — мастер REALITY.\n\nOWN-TLS\n  Собственный сертификат и ключ.\n  Введите путь к TOML, затем F2 — мастер Own-TLS.\n\nF2: все действия   F5: сервер\nСервер не запущен этой панелью. IPC — отдельно.",
-        Role::Client => "НАЧАЛО РАБОТЫ\n\n> Enter / F3   Создать или открыть TOML\n\nПРОФИЛИ\n  F2 в выборе файла — новый Own-TLS.\n  Откройте TOML для импорта приглашения.\n\nF2: все действия   F4: трафик\nТранспорт не проверялся. Системный прокси не изменён.",
+        Role::Client => "НАЧАЛО РАБОТЫ\n\n> Enter / F3   Создать или открыть TOML\n\nПРОФИЛИ\n  F4 в выборе файла — импорт первого REALITY-приглашения.\n  F2 — новый Own-TLS; Enter — открыть существующий TOML.\n\nF2: все действия   F4: трафик\nТранспорт не проверялся. Системный прокси не изменён.",
     };
     // A welcome screen has one reading column, not empty sidebars.
     frame.render_widget(Clear, area);
@@ -3001,7 +3049,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         panel(frame, area, title, &message, true);
         return;
     }
-    let parts = Layout::vertical([Constraint::Length(4), Constraint::Min(7), Constraint::Length(5), Constraint::Length(3)]).split(area);
+    let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(7), Constraint::Length(5), Constraint::Length(3)]).split(area);
     let status = format!("{}\n{} · {}\n{}", editor.selection_summary(), mode, dirty, users.trim_end());
     panel(frame, parts[0], "Обзор", &status, false);
     let fields = format!("{}\n{}\n{}", editor.fields_overview(), editor.field_name(), help);
@@ -4285,10 +4333,10 @@ mod tests {
         assert!(ui.reality_enrollment.is_none());
         model.update(press(KeyCode::Char('2')));
         ui.update(&mut model, press(KeyCode::Char('I')));
-        assert!(ui.reality_enrollment.is_some());
+        assert!(ui.config_dialog.is_some());
         assert!(rendered_interaction(120, 40, &model, &ui).contains("Импорт REALITY"));
         ui.update(&mut model, press(KeyCode::Esc));
-        assert!(ui.reality_enrollment.is_none());
+        assert!(ui.config_dialog.is_none());
     }
 
     #[test]
