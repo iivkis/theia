@@ -246,6 +246,13 @@ async fn h2_peer(
                                 handlers.spawn(h2_echo(leg, None));
                             }
                         }
+                        Some(Err(error)) if accepted == expected && pending.is_empty() && handlers.is_empty()
+                            && error.get_io().is_some_and(|io| matches!(io.kind(),
+                                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof)) => {
+                            // Only after all expected handlers completed successfully.
+                            // The client independently checks all DATA and both FIN/EOF.
+                            break;
+                        }
                         Some(Err(error)) => panic!("H2 fixture connection: {error}"),
                         None => break,
                     }
