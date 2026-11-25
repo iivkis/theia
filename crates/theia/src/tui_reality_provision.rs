@@ -249,6 +249,7 @@ impl WizardInput {
                 }
             }
         }
+        if self.health.parent().is_none_or(|p| p.exists()) { return Err(Error::Storage); }
         validate_paths(&self.health, &self.bundle)?;
         new_health_path(&self.health)?;
         Ok(())
@@ -275,8 +276,9 @@ impl WizardInput {
         if grants.len() > 256 || grants.iter().any(|v| !config::valid_id(v)) || grants.iter().collect::<std::collections::HashSet<_>>().len() != grants.len() { return Err(Error::Grant); }
         let automatic = match fields[6].as_str() { "auto" => true, "manual" => false, _ => return Err(Error::Format) };
         let parent = config.parent().ok_or(Error::Storage)?;
-        let health = parent.join(format!("{}.health.toml", fields[0]));
-        let bundle = parent.join(format!("{}.reality", fields[0]));
+        let root = parent.join(format!(".theia-{}-material", fields[0]));
+        let health = root.join("health.toml");
+        let bundle = root.join("bundle");
         let input = Self { config, source, id: fields[0].clone(), listen, endpoint, own_ips, candidates, grants, automatic, health, bundle };
         input.check_source()?;
         Ok(input)
@@ -424,8 +426,21 @@ impl Wizard {
                         input.check_source()?;
                         let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
                         let preview = reality_provision::preview(&state, now)?;
-                        reference_health::Store::new(&input.health).and_then(|s| s.enroll(&state)).map_err(|_| Error::Storage)?;
-                        let record = reality_provision::create(&state, preview.health_sha256, &input.bundle, now)?;
+                        let mut owned = crate::tui_staged_material::StagedMaterial::create(
+                            input.health.parent().ok_or(Error::Storage)?, &input.config, input.source)?;
+                        // No external reference can exist before registration.
+                        // Keep an uncertain write for explicit inspection.
+                        let enrolled = reference_health::Store::new(&input.health).and_then(|s| s.enroll(&state));
+                        if let Err(error) = enrolled {
+                            if matches!(error, reference_health::Error::Indeterminate) { owned.preserve(); return Err(Error::Indeterminate); }
+                            owned.cleanup()?;
+                            return Err(Error::Storage);
+                        }
+                        let record = match reality_provision::create(&state, preview.health_sha256, &input.bundle, now) {
+                            Ok(record) => record,
+                            Err(Error::Indeterminate) => { owned.preserve(); return Err(Error::Indeterminate); }
+                            Err(error) => { owned.cleanup()?; return Err(error); }
+                        };
                         let request = ServerRequest {
                             health: input.health, bundle: input.bundle, health_sha256: preview.health_sha256,
                             identity_sha256: record.identity_sha256, listen: input.listen, grants: input.grants,
@@ -433,7 +448,7 @@ impl Wizard {
                         // Validate the exact saved TOML and prepared material
                         // again before presenting a separate registration.
                         reality_config::prepare(&input.config, &reality_config::Request::Server(request.clone()), now)?;
-                        RegistrationPanel::from_provision(input.config, input.source, request)
+                        RegistrationPanel::from_provision(input.config, input.source, request).map(|panel| panel.own_material(owned))
                     })();
                     let _ = tx.send(result);
                 });

@@ -73,6 +73,7 @@ mod tui_reality_provision;
 mod tui_reality_register;
 mod tui_reality_review;
 mod tui_reality_status;
+mod tui_staged_material;
 pub(crate) mod tui_runtime;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;
