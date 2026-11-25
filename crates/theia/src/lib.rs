@@ -67,6 +67,7 @@ mod split_http;
 mod tcp_bbr;
 pub mod transport_policy;
 pub mod tui;
+mod tui_menu;
 pub(crate) mod tui_candidate_batch;
 pub(crate) mod tui_candidates;
 pub(crate) mod tui_discovery;
