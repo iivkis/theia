@@ -95,6 +95,7 @@ fn visual_review_gallery() {
         assert!(!ui.owned_running(Role::Client));
         let screen = rendered_interaction(120, 40, &model, &ui);
         assert!(screen.contains("Активный профиль: №1 · edge.example.org:443"));
+        assert!(!screen.contains("Выбран:"));
         assert!(!screen.contains(&doc.client.profiles[0].id));
         review_capture("client-reality-key-connect", &model, &ui);
         ui.update(&mut model, press(KeyCode::Char('V')));
@@ -117,10 +118,12 @@ fn visual_review_gallery() {
         ui.update(&mut model, press(KeyCode::Char('s')));
         let screen = rendered_interaction(120, 40, &model, &ui);
         assert!(screen.contains("Запуск локального прокси"));
-        assert!(screen.contains("ШАГ 1/1"));
+        assert!(!screen.contains("ШАГ 1/1"));
         assert!(screen.contains("Следующее действие"));
         assert!(!ui.owned_running(Role::Client));
         assert!(screen.contains("› Отменить"));
+        let rect = ui.viewport.confirm_rect.get().unwrap();
+        assert!(rect.y < 18);
         review_capture("client-reality-local-proxy-start-confirm", &model, &ui);
         ui.update(&mut model, press(KeyCode::Right));
         assert!(!ui.owned_running(Role::Client));
@@ -150,9 +153,10 @@ fn visual_review_gallery() {
     modes.update(&mut client_model, press(KeyCode::Char('s')));
     assert!(!modes.owned_running(Role::Client));
     let screen = rendered_interaction(120, 40, &client_model, &modes);
-    assert!(screen.contains("ШАГ 1/1"));
+    assert!(!screen.contains("ШАГ 1/1"));
     assert!(screen.contains("Следующее действие"));
     assert!(screen.contains("› Отменить"));
+    assert!(modes.viewport.confirm_rect.get().unwrap().y < 18);
     review_capture("client-local-proxy-start-confirm", &client_model, &modes);
     modes.update(&mut client_model, press(KeyCode::Enter));
     assert!(!modes.owned_running(Role::Client));
@@ -305,16 +309,80 @@ fn visual_review_gallery() {
         if role == Role::Server {
             let mut ui = Interaction::new(None);
             ui.update(&mut model, press(KeyCode::Char('p')));
-            ui.update(&mut model, press(KeyCode::Char('i')));
-            assert!(ui.discovery.is_some());
+            let screen = rendered_interaction(120, 40, &model, &ui);
+            assert!(screen.contains("Узнать внешний IP"));
+            review_capture("server-discovery-actions", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(ui.discovery.as_ref().unwrap().is_consent_pending());
             review_capture("server-discovery-consent", &model, &ui);
-            ui.update(&mut model, press(KeyCode::Char('n')));
-            ui.update(&mut model, press(KeyCode::Char('r')));
+            ui.update(&mut model, press(KeyCode::Enter));
+            ui.update(&mut model, press(KeyCode::Down));
+            ui.update(&mut model, press(KeyCode::Enter));
             assert!(ui.candidates.is_some());
             review_capture("server-reference-candidate-groups", &model, &ui);
-            ui.update(&mut model, press(KeyCode::Char('a')));
+            ui.update(&mut model, press(KeyCode::End));
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(ui.domain.is_some());
+            review_capture("server-domain-catalog", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(ui.domain.as_ref().unwrap().is_dns_confirming());
+            review_capture("server-domain-dns-confirm", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(!ui.domain.as_ref().unwrap().is_running());
+            ui.update(&mut model, press(KeyCode::Esc));
+            ui.update(&mut model, press(KeyCode::Enter));
             review_capture("server-reference-cidr-input", &model, &ui);
         }
+    }
+    // Registered REALITY server: actual local material and the production
+    // status reader, no listener, DNS query or reference probe.
+    {
+        use crate::reference_health::{Evidence, Plan, State, Store, Target};
+        use crate::reality_config::{self, Request, ServerRequest};
+        let now = crate::reference_health::unix_now().unwrap();
+        let path = root.join("review-reality-server.toml");
+        let health = root.join("review-reality-health");
+        let bundle = root.join("review-reality-bundle");
+        let state = State::new(Plan {
+            schema_version: 1, inbound: "reality-edge".into(), endpoint: "edge.example.org:9443".into(),
+            own_ips: vec!["93.184.216.1".parse().unwrap()],
+            references: vec![Target { server_name: "ref.example.org".into(), address: "93.184.216.2:443".parse().unwrap() }],
+        }, vec![Evidence { h2_status: Some(200), h3_status: None }], now).unwrap();
+        Store::new(&health).unwrap().enroll(&state).unwrap();
+        let digest = state.snapshot_sha256().unwrap();
+        let record = crate::reality_provision::create(&state, digest, &bundle, now).unwrap();
+        std::fs::write(&path, server_issuance_fixture()).unwrap();
+        let request = Request::Server(ServerRequest { health, bundle, health_sha256: digest, identity_sha256: record.identity_sha256, listen: "127.0.0.1:9443".parse().unwrap(), grants: vec!["device-a".into()] });
+        let preview = reality_config::prepare(&path, &request, now).unwrap();
+        reality_config::apply(&path, &request, preview.approval_sha256(), now).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        editor.workspace_select(1);
+        assert!(editor.selected_reality());
+        let mut ui = Interaction::new(Some(editor));
+        let mut model = Model::new(Some(Role::Server));
+        ui.update(&mut model, press(KeyCode::Char('V')));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let status = ui.reality_status.as_mut().unwrap();
+            status.poll();
+            if status.actions().iter().any(|a| a.key == 'd') { break; }
+            assert!(std::time::Instant::now() < deadline, "server REALITY status did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Основной референс: ref.example.org"));
+        assert!(screen.contains("Технические подробности"));
+        assert!(!screen.contains("identity_sha256"));
+        review_capture("server-reality-status-summary", &model, &ui);
+        ui.update(&mut model, press(KeyCode::End));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("identity_sha256"));
+        review_capture("server-reality-status-technical", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.reality_status.is_some());
+        assert!(!ui.owned_running(Role::Server));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
     // State fixtures use synthetic inputs, never actual issued credentials.
     let model = Model::new(Some(Role::Server));
@@ -334,7 +402,12 @@ fn visual_review_gallery() {
         ui.issuance = Some(IssueFlow::SaveFailed);
         review_capture(&format!("state-issuance-{label}-failed"), &model, &ui);
         ui.issuance = Some(IssueFlow::Offer);
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Показать ссылку один раз"));
+        assert!(!screen.contains("theia://v1/"));
         review_capture(&format!("state-issuance-{label}-offer"), &model, &ui);
+        ui.issuance = Some(IssueFlow::ConfirmReveal);
+        review_capture(&format!("state-issuance-{label}-reveal-confirm"), &model, &ui);
     }
     assert_eq!(std::fs::read_to_string(&disabled_server).unwrap(), disabled_fixture);
     let mut ui = Interaction::new(Some(Editor::load(Role::Server, &server).unwrap()));
