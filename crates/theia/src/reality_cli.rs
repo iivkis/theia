@@ -1012,6 +1012,21 @@ mod tests {
     }
 
     #[test]
+    fn credential_refresh_save_requires_exact_confirmation() {
+        let dir = Scratch::new();
+        let c = dir.file("client.toml");
+        let i = dir.file("invitation");
+        let digest = "01".repeat(32);
+        let prefix = ["credential-refresh-save", "--config", c.as_str(), "--id", "client", "--invitation", i.as_str()];
+        assert!(parse(&prefix).is_err());
+        let args = [prefix.as_slice(), &["--sha256", &digest, "--confirm"]].concat();
+        assert!(matches!(parse(&args), Ok(Command::CredentialRefresh { approval: Some(_), .. })));
+        let mut preview = prefix;
+        preview[0] = "credential-refresh-preview";
+        assert!(matches!(parse(&preview), Ok(Command::CredentialRefresh { approval: None, .. })));
+    }
+
+    #[test]
     fn offline_cli_provisions_enrollment_and_never_overwrites_or_implicitly_applies() {
         let dir = Scratch::new();
         let h = health(&dir);
