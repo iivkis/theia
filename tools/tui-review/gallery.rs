@@ -28,6 +28,16 @@ fn visual_review_gallery() {
     std::fs::write(&client, include_str!("../../../examples/client.toml")).unwrap();
     // Real first-run import through the production state machine, using a synthetic invitation.
     first_key_import_fixture(&root.join("first-own-tls"), review_capture);
+    let mut modes = Interaction::new(Some(Editor::load(Role::Client, &client).unwrap()));
+    let mut client_model = Model::new(Some(Role::Client));
+    modes.update(&mut client_model, press(KeyCode::Char('P')));
+    assert_eq!(modes.workspace_page, 3);
+    assert!(!modes.owned_running(Role::Client));
+    review_capture("client-connection-modes", &client_model, &modes);
+    modes.update(&mut client_model, press(KeyCode::Char('V')));
+    assert!(modes.reality_status.is_some());
+    assert!(!modes.owned_running(Role::Client));
+    review_capture("client-local-proxy-before-start", &client_model, &modes);
     let model = Model::new(None);
     let ui = Interaction::new(None);
     review_capture("home-role-selection", &model, &ui);
