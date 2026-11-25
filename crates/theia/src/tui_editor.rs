@@ -1679,6 +1679,11 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
         let certificate = Temp::write(&generated.cert.pem());
         let key = Temp::write(&generated.key_pair.serialize_pem());
+        #[cfg(windows)]
+        {
+            fs::remove_file(&key.0).unwrap();
+            crate::bounded_input::write_test_private(&key.0, generated.key_pair.serialize_pem());
+        }
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1749,6 +1754,11 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
         let certificate = Temp::write(&generated.cert.pem());
         let key = Temp::write(&generated.key_pair.serialize_pem());
+        #[cfg(windows)]
+        {
+            fs::remove_file(&key.0).unwrap();
+            crate::bounded_input::write_test_private(&key.0, generated.key_pair.serialize_pem());
+        }
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::PermissionsExt;

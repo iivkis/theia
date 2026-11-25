@@ -601,7 +601,7 @@ mod tests {
                     },
                 ],
             },
-            vec![good.clone(), good.clone()],
+            vec![good, good],
             initial,
         )
         .unwrap();
@@ -631,7 +631,7 @@ mod tests {
         reality_config::apply(&cfg, &request, preview.approval_sha256(), initial).unwrap();
         let doc = config::read_file(&cfg).unwrap();
         store
-            .fixture_record(vec![Evidence::default(), good.clone()], now - 301)
+            .fixture_record(vec![Evidence::default(), good], now - 301)
             .unwrap();
         store
             .fixture_record(vec![Evidence::default(), good], now - 1)

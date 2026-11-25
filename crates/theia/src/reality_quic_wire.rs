@@ -476,7 +476,7 @@ mod tests {
     use super::*;
     fn hex(s: &str) -> Vec<u8> {
         s.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
             .collect()
     }
@@ -534,7 +534,9 @@ mod tests {
         assert!(flight.frames(&[6, 0, 2, 1, 0]).is_some());
         assert!(flight.frames(&[6, 2, 2, 0, 34]).is_some());
         assert!(flight.frames(&[6, 2, 1, 1]).is_none());
-        assert!(flight.frames(&[6, 0x7f, 0xff, 2, 0, 0]).is_none());
+        // 32767 is encoded as a four-byte QUIC varint; one byte fits, two do not.
+        assert!(flight.frames(&[6, 0x80, 0, 0x7f, 0xff, 1, 0]).is_some());
+        assert!(flight.frames(&[6, 0x80, 0, 0x7f, 0xff, 2, 0, 0]).is_none());
         for n in 0..raw.len() {
             assert!(long(&raw[..n]).is_none());
         }

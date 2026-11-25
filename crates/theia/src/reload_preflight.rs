@@ -568,7 +568,10 @@ mod tests {
         let cert_bytes = b"certificate bytes captured when listener started";
         let key_bytes = b"private key bytes captured when listener started";
         fs::write(&cert, cert_bytes).unwrap();
+        #[cfg(not(windows))]
         fs::write(&key, key_bytes).unwrap();
+        #[cfg(windows)]
+        crate::bounded_input::write_test_private(&key, key_bytes);
         #[cfg(unix)]
         fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
         let mut active = document();
@@ -640,7 +643,10 @@ mod tests {
         let cert_pem = generated.cert.pem();
         let key_pem = generated.key_pair.serialize_pem();
         fs::write(&cert, &cert_pem).unwrap();
+        #[cfg(not(windows))]
         fs::write(&key, &key_pem).unwrap();
+        #[cfg(windows)]
+        crate::bounded_input::write_test_private(&key, &key_pem);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

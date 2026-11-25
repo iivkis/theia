@@ -122,6 +122,13 @@ pub(crate) fn read(
     Ok(contents)
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn write_test_private(path: &Path, data: impl AsRef<[u8]>) {
+    use std::io::Write;
+    let mut file = crate::client_import::new_private_file(path).unwrap();
+    file.write_all(data.as_ref()).unwrap();
+}
+
 // Inspect the opened handle, not the path: path-based ACL checks could
 // otherwise validate a different object from the bytes about to be read.
 // The accepted policy is deliberately narrow: protected DACL, only current

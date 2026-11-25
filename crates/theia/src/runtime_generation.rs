@@ -358,9 +358,7 @@ impl State {
         expected: u64,
         next: View,
         authorization: StagedAuthorization,
-        id: &str,
-        old_manifest: [u8; 32],
-        new_manifest: [u8; 32],
+        replacement: (&str, [u8; 32], [u8; 32]),
         swap: impl FnOnce(),
     ) -> Result<u64, LiveAuthError> {
         let mut guard = self
@@ -374,6 +372,7 @@ impl State {
             .reality
             .write()
             .map_err(|_| LiveAuthError::Unavailable)?;
+        let (id, old_manifest, new_manifest) = replacement;
         let entry = reality.get_mut(id).ok_or(LiveAuthError::Unavailable)?;
         if entry.0 != old_manifest || old_manifest == new_manifest {
             return Err(LiveAuthError::StaleRevision);
@@ -477,6 +476,7 @@ impl State {
     /// Linearization point for a prepared fresh-port listener generation.
     /// In-flight and future requests on the former generation are denied
     /// NEW admission before the protected IPC view points to the successor.
+    #[cfg(test)]
     pub(crate) fn commit_restart(
         &self,
         previous: &Arc<View>,

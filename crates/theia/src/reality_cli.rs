@@ -941,7 +941,7 @@ mod tests {
         }
     }
     fn invoke(args: &[&str]) -> Result<String, Error> {
-        run(parse(args).unwrap())
+        run(parse(args).map_err(|_| Error::Format)?)
     }
     fn field<'a>(output: &'a str, key: &str) -> &'a str {
         output
