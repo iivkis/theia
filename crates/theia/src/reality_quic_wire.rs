@@ -151,6 +151,18 @@ pub(crate) fn coherent_datagram(bytes: &[u8]) -> bool {
         }
         let tail = &bytes[offset..];
         if tail[0] & 0x80 == 0 {
+            // Some independent QUIC implementations (aioquic 1.2) pad
+            // a datagram containing an Initial outside the encrypted
+            // packet. Only an all-zero terminal suffix is tolerated here;
+            // it cannot introduce another destination CID. The endpoint
+            // still validates packets; the relay preserves and accounts
+            // for every byte, including the suffix.
+            if first.kind == Kind::Initial
+                && bytes.len() >= MIN_INITIAL
+                && tail.iter().all(|&byte| byte == 0)
+            {
+                return true;
+            }
             return tail.len() >= 1 + first.dcid.len() + 17
                 && tail.get(1..1 + first.dcid.len()) == Some(first.dcid);
         }
@@ -545,6 +557,10 @@ mod tests {
     }
 
     fn initial_packet(pn: u16, frames: &[u8], version: u32) -> Vec<u8> {
+        initial_packet_sized(pn, frames, version, MIN_INITIAL)
+    }
+
+    fn initial_packet_sized(pn: u16, frames: &[u8], version: u32, size: usize) -> Vec<u8> {
         let dcid = [1, 2, 3, 4, 5, 6, 7, 8];
         let keys = InitialKeys::client(&dcid, version).unwrap();
         let mut packet = vec![if version == V1 { 0xc1 } else { 0xd1 }];
@@ -553,7 +569,7 @@ mod tests {
         packet.extend_from_slice(&dcid);
         packet.extend_from_slice(&[8, 9, 10, 11, 12, 13, 14, 15, 16, 0]);
         // Two-byte length, two-byte packet number, 16-byte tag.
-        let payload_len = MIN_INITIAL - packet.len() - 2 - 2 - 16;
+        let payload_len = size - packet.len() - 2 - 2 - 16;
         let length = (payload_len + 2 + 16) as u16 | 0x4000;
         packet.extend_from_slice(&length.to_be_bytes());
         let offset = packet.len();
@@ -576,8 +592,29 @@ mod tests {
         packet[0] ^= mask[0] & 15;
         packet[offset] ^= mask[1];
         packet[offset + 1] ^= mask[2];
-        assert_eq!(packet.len(), MIN_INITIAL);
+        assert_eq!(packet.len(), size);
         packet
+    }
+
+    #[test]
+    fn initial_datagram_zero_suffix_is_not_a_second_connection() {
+        let mut hello = vec![1, 0, 0, 34];
+        hello.extend_from_slice(&[7; 34]);
+        let mut frames = vec![6, 0, 38];
+        frames.extend_from_slice(&hello);
+        for version in [V1, V2] {
+            let mut packet = initial_packet_sized(0, &frames, version, 256);
+            assert_eq!(long(&packet).unwrap().end, 256);
+            packet.resize(MIN_INITIAL, 0);
+            assert!(coherent_datagram(&packet));
+            let mut flight = Flight::new(&long(&packet).unwrap()).unwrap();
+            assert!(matches!(flight.inspect(&packet), Inspection::Hello(value) if value == hello));
+            let mut malformed = packet.clone();
+            malformed[MIN_INITIAL - 1] = 1;
+            assert!(!coherent_datagram(&malformed));
+            packet.truncate(MIN_INITIAL - 1);
+            assert!(!coherent_datagram(&packet));
+        }
     }
 
     #[test]
