@@ -1248,7 +1248,7 @@ impl ProvisionPanel {
             WizardStage::Resolving(_, _) => (2, 5, "Получение адресов", "Esc отменить"),
             WizardStage::ProbeConfirm(_) => (3, 5, "Проверка референсов", "Y проверить перечисленные адреса · N / Esc назад"),
             WizardStage::Checking(_, _) => (3, 5, "Проверка TLS / QUIC", "Esc отменить"),
-            WizardStage::CreateConfirm(_) => (4, 5, "Результат подбора", "Y создать · N / Esc назад"),
+            WizardStage::CreateConfirm(value) => (4, 5, "Результат подбора", if value.0.source.is_none() { "Y создать TOML · N / Esc назад" } else { "Y создать материалы · N / Esc назад" }),
             WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => (5, 5, "Сохранение", "Идёт запись; сервер не запускается"),
             WizardStage::Done(_) => (5, 5, "Результат записи", "Esc закрыть"),
         })
