@@ -478,6 +478,19 @@ impl EnrollmentPanel {
         None
     }
 
+    pub(crate) fn guide(&self) -> (usize, usize, &'static str, &'static str) {
+        if self.registration.is_some() {
+            return (3, 3, "Регистрация в TOML", "Enter предпросмотр · Y сохранить · Esc назад");
+        }
+        match &self.stage {
+            Stage::Input => (1, 3, "Приглашение и доверие", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад"),
+            Stage::Loading(_) => (2, 3, "Проверка приглашения", "Идёт локальная проверка"),
+            Stage::Confirm(_) => (2, 3, "Подтверждение доверия", "Y сохранить · N / Esc назад"),
+            Stage::Applying(_) | Stage::Creating(_) => (3, 3, "Сохранение", "Идёт запись; подключения нет"),
+            Stage::Done(_) => (3, 3, "Результат", "G зарегистрировать, если доступно · Esc назад"),
+        }
+    }
+
     pub(crate) fn body(&self) -> String {
         if let Some(panel) = &self.registration {
             return panel.body();
