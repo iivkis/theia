@@ -373,17 +373,17 @@ fn pages(role: Role) -> &'static [&'static str] {
 
 fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
     let entries: &[(char, &str)] = match (role, page) {
-        (Role::Server, 0) => &[('W',"Создать REALITY"),('N',"Новое подключение"),('v',"Проверить работающий сервер"),('u',"Добавить пользователя"),('b',"Восстановить доступ")],
+        (Role::Server, 0) => &[('s',"Запуск / остановка сервера"),('W',"Создать REALITY"),('N',"Новое подключение"),('v',"Проверить работающий сервер"),('u',"Добавить пользователя"),('b',"Восстановить доступ")],
         (Role::Server, 1) => &[('N',"Создать подключение"),('W',"Мастер REALITY"),('V',"Состояние REALITY"),('G',"Настроить доступ"),('Q',"Лимиты"),('E',"Сертификат TLS"),('D',"Удалить подключение")],
         (Role::Server, 2) => &[('u',"Добавить пользователя"),('x',"Отключить"),('b',"Восстановить доступ"),('t',"Обновить токен"),('G',"Назначить доступ"),('U',"Удалить пользователя")],
         (Role::Server, 3) => &[('u',"Создать пользователя и приглашение"),('b',"Выдать приглашение отключённому"),('t',"Обновить приглашение"),('l',"Публичная ссылка")],
-        (Role::Server, 5) => &[('v',"Статус и применение изменений"),('R',"Проверить готовность перезапуска"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
+        (Role::Server, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('v',"Статус и применение изменений"),('R',"Проверить готовность перезапуска"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
         (Role::Server, 6) => &[('p',"Сетевая диагностика"),('V',"Состояние REALITY")],
         (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль")],
         (Role::Client, 1) => &[('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт"),('E',"Доверие Own-TLS"),('D',"Удалить профиль")],
         (Role::Client, 2) => &[('i',"Импорт ссылки или QR"),('I',"Импорт REALITY")],
         (Role::Client, 3) => &[('p',"Управление системным прокси")],
-        (Role::Client, 5) => &[('V',"Состояние и применение"),('K',"Подтвердить доверие"),('M',"Регистрация материалов")],
+        (Role::Client, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('V',"Состояние и применение"),('K',"Подтвердить доверие"),('M',"Регистрация материалов")],
         (Role::Client, 6) => &[('V',"Диагностика подключения")],
         _ => &[],
     };
@@ -896,10 +896,21 @@ impl Interaction {
             return;
         }
         let Some(columns) = workspace_columns(body) else {
+            let items=page_actions(role,self.workspace_page);
+            let controls=page_layout(body,role,self.workspace_page).map(|p|p[1]).unwrap_or(if self.workspace_focus==WorkspaceFocus::Actions {body} else {Rect::default()});
+            if let Some(i)=(Actions {items:&items,selected:self.workspace_action}).hit(controls,event.column,event.row) {
+                self.workspace_action=i; self.workspace_focus=WorkspaceFocus::Actions; return;
+            }
             if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
-                if let Some(id) = editor_field_hit(body, editor, event.column, event.row) {
-                    editor.workspace_select_field(id);
+                let content=page_layout(body,role,self.workspace_page).map(|p|p[0]).unwrap_or(body);
+                if self.workspace_page<=1 {
+                    if let Some(id)=editor_field_hit(content,editor,event.column,event.row) {editor.workspace_select_field(id);self.workspace_focus=WorkspaceFocus::Fields;}
+                } else if role==Role::Server && self.workspace_page==2 && inside(content) && event.row>=content.y+2 && event.row<content.bottom().saturating_sub(1) {
+                    let users=editor.workspace_users();
+                    let i=user_table_start(self.workspace_user,users.len(),content)+usize::from(event.row-content.y-2);
+                    if i<users.len(){self.workspace_user=i;self.workspace_focus=WorkspaceFocus::Users;}
                 }
+ 
             }
             return;
         };
@@ -1367,7 +1378,13 @@ impl Interaction {
                                     self.editor_for(role).and_then(|e| e.workspace_users().get(self.workspace_user).map(|u| u.0.clone()))
                                 } else { None };
                                 self.workspace_focus = WorkspaceFocus::Fields;
-                                let result = self.update(model, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+                                let command = match ch {
+                                    's' if role == Role::Server => KeyEvent::new(KeyCode::F(5),KeyModifiers::NONE),
+                                    'o' => KeyEvent::new(KeyCode::F(3),KeyModifiers::NONE),
+                                    'S' => KeyEvent::new(KeyCode::Char('s'),KeyModifiers::CONTROL),
+                                    _ => KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                                };
+                                let result = self.update(model, command);
                                 if let Some(id) = selected {
                                     if ch == 'x' { if let Some(DisableFlow::Input(value)) = self.revocation.as_mut() { *value = id.clone(); } }
                                     if matches!(ch, 'b' | 't') { if let Some(IssueFlow::Input(value)) = self.issuance.as_mut() { *value = id; } }
@@ -1375,6 +1392,16 @@ impl Interaction {
                                 return result;
                             }
                             return false;
+                        }
+                    }
+                    if self.workspace_page <= 1 && self.workspace_focus == WorkspaceFocus::Fields {
+                        let index = self.editor_for(role).map_or(0,Editor::workspace_field_index);
+                        let count = self.editor_for(role).map_or(0,Editor::field_count);
+                        if key.code == KeyCode::Tab && index+1 >= count {
+                            self.workspace_focus=WorkspaceFocus::Actions; return false;
+                        }
+                        if key.code == KeyCode::BackTab && index==0 {
+                            self.workspace_focus=WorkspaceFocus::Navigation; return false;
                         }
                     }
                     if self.workspace_page > 1 && key.code == KeyCode::Enter {
@@ -2923,10 +2950,10 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 "↑↓ выбрать · Enter продолжить · F2 все действия · Esc назад"
             }
             Screen::Server => {
-                "F6 Фокус · Alt+←/→ Раздел · F7 Значение · F3 Файл · F2 Меню · F5 Сервер · Ctrl+S Сохранить"
+                "Tab / F6 Фокус · Alt+←/→ Раздел · F7 Значение · F3 Файл · F2 Меню · F5 Сервер · Ctrl+S Сохранить"
             }
             Screen::Client => {
-                "F6 Фокус · Alt+←/→ Раздел · F7 Значение · F3 Файл · F2 Меню · Ctrl+S Сохранить"
+                "Tab / F6 Фокус · Alt+←/→ Раздел · F7 Значение · F3 Файл · F2 Меню · Ctrl+S Сохранить"
             }
         }
     };
@@ -4056,6 +4083,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let details = workspace_columns(body).unwrap()[2];
+        let details=page_layout(details,Role::Client,0).map(|p|p[0]).unwrap_or(details);
         let table = editor_layout(details).unwrap()[1];
         let y = (table.y..table.bottom()).find(|&y| editor_field_hit(details, ui.editor.as_ref().unwrap(), table.x + 2, y) == Some(1)).unwrap();
         ui.mouse(&mut model, click(table.x + 2, y), area);

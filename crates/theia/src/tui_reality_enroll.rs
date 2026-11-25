@@ -14,12 +14,12 @@ use zeroize::Zeroizing;
 
 const LIMIT: usize = 1024;
 const LABELS: [&str; 6] = [
-    "URI или защищённый файл приглашения",
-    "Отдельный admission-файл",
+    "Приглашение (ссылка или файл)",
+    "Файл допуска (admission)",
     "Новый файл профиля",
-    "Новый trust store",
-    "Fingerprint из независимого канала",
-    "Ссылка bearer (если нет в приглашении)",
+    "Хранилище доверия",
+    "Отпечаток сервера (Fingerprint)",
+    "Ссылка на токен (если его нет в приглашении)",
 ];
 
 struct Input {
@@ -398,6 +398,9 @@ impl EnrollmentPanel {
         }
         match key.code {
             KeyCode::Esc => return true,
+            KeyCode::F(8) => {
+                self.focus = if self.focus < 4 {4} else {0};
+            }
             KeyCode::Tab | KeyCode::Down => {
                 self.focus = (self.focus + 1) % LABELS.len();
                 if self.managed_paths() && self.focus == 2 {
@@ -503,7 +506,7 @@ impl EnrollmentPanel {
                 value: if self.fields[id].is_empty() { String::new() } else { format!("Скрыто · {} байт", self.fields[id].len()) },
             }).collect(),
             selected: self.focus,
-            lead: "Подтвердите источник доверия. Секретные значения скрыты.".into(),
+            lead: "1. Приглашение и файл допуска от администратора. 2. Отпечаток из отдельного канала. 3. Токен, только если нужен. Значения скрыты.".into(),
             error: self.error.clone().unwrap_or_default(),
         })
     }
@@ -520,7 +523,7 @@ impl EnrollmentPanel {
             return (3, 3, "Регистрация в TOML", "Enter предпросмотр · Y сохранить · Esc назад");
         }
         match &self.stage {
-            Stage::Input => (1, 3, "Приглашение и доверие", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад"),
+            Stage::Input => (1, 3, if self.focus<4 {"Приглашение и файл допуска"} else {"Проверка доверия и токена"}, "↑↓ поле · F8 раздел доверия/приглашения · Ctrl+U очистить · Enter проверить · Esc назад"),
             Stage::Loading(_) => (2, 3, "Проверка приглашения", "Идёт локальная проверка"),
             Stage::Confirm(_) => (2, 3, "Подтверждение доверия", "Y сохранить · N / Esc назад"),
             Stage::Applying(_) | Stage::Creating(_) => (3, 3, "Сохранение", "Идёт запись; подключения нет"),
