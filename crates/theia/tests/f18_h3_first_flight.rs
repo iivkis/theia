@@ -419,7 +419,7 @@ async fn actual_native_h3_client_initial_reference() {
         let (done, finished) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let connection = accept(endpoint.accept().await.unwrap()).await.unwrap();
-            let mut http3 =
+            let mut http3: h3::server::Connection<_, Bytes> =
                 h3::server::Connection::new(h3_quinn::Connection::new(connection.clone()))
                     .await
                     .unwrap();
