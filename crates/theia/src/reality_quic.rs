@@ -67,6 +67,7 @@ struct Session {
     retry: Option<Retry>,
     retry_echoed: bool,
     server_initial: bool,
+    initial_server_cid:Option<Cid>,
     first_peer: SocketAddr,
     paths: HashMap<SocketAddr, Path>,
     deadline: Instant,
@@ -79,7 +80,7 @@ struct Session {
 }
 impl Session {
     fn new(peer: SocketAddr, original: Cid, client: Cid, version:u32,now: Instant) -> Self {
-        Self { original, client, original_version:version,negotiated_version:None,server: HashSet::new(), retry: None, retry_echoed: false, server_initial: false, first_peer: peer,
+        Self { original, client, original_version:version,negotiated_version:None,server: HashSet::new(), retry: None, retry_echoed: false, server_initial: false, initial_server_cid:None,first_peer: peer,
             paths: HashMap::new(), deadline: now + LIFETIME, last: now, remaining: BYTES, paths_opened: 0, closed_paths: HashSet::new(), generation: None, reference_signer:None }
     }
     fn expired(&self, now: Instant) -> bool {
@@ -98,13 +99,13 @@ impl Session {
                 && (h.dcid == self.original || self.server.contains(h.dcid))
                 && (h.kind != Kind::Initial || h.scid == self.client)
         } else {
-            self.server.iter().any(|cid| wire::short_matches(datagram, cid))
+            self.initial_server_cid.as_ref().is_some_and(|cid|wire::short_matches(datagram,cid))
         }
     }
     fn allows_client(&self, peer: SocketAddr, datagram: &[u8]) -> bool {
         if let Some(h) = wire::long(datagram) {
             if !wire::coherent_datagram(datagram){return false;}
-            if peer != self.first_peer && !self.paths.contains_key(&peer) { return false; }
+            if peer!=self.first_peer{return false;}
             let version=self.negotiated_version.unwrap_or(self.original_version);
             if h.version!=version{return false;}
             if h.kind == Kind::Initial {
@@ -117,7 +118,7 @@ impl Session {
                         || (self.retry_echoed && self.server_initial && self.server.contains(h.dcid)));
                 }
             }
-            self.known(datagram)
+            self.known(datagram)||self.initial_server_cid.as_deref().is_some_and(|cid|cid.is_empty()&&h.dcid.is_empty())
         } else {
             self.server_initial && datagram.len()>=18 && datagram.first().is_some_and(|b| b & 0x80 == 0) &&
                 (self.paths.contains_key(&peer) || self.known(datagram))
@@ -152,6 +153,12 @@ impl Session {
                 }else{
                     if peer!=self.first_peer||h.kind!=Kind::Initial{return false;}
                     self.negotiated_version=Some(h.version);
+                }
+                if let Some(cid)=&self.initial_server_cid{
+                    if h.scid!=cid.as_slice(){return false;}
+                }else{
+                    if h.kind!=Kind::Initial||peer!=self.first_peer{return false;}
+                    self.initial_server_cid=Some(h.scid.to_vec());
                 }
                 if h.kind == Kind::Initial { self.server_initial = true; }
             }
@@ -309,6 +316,9 @@ fn route(sessions: &HashMap<SessionId, Session>, peer: SocketAddr, bytes: &[u8],
         // A tuple is not proof of association with one of several CIDs.
         if global.next().is_some(){return None;}
         return (session.paths.contains_key(&peer)||bytes[0]&0x80==0).then_some(id);
+    }
+    if wire::long(bytes).is_some_and(|h|h.dcid.is_empty()&&h.kind==Kind::Handshake){
+        return unique(sessions.iter().filter(|(_,s)|s.first_peer==peer&&s.initial_server_cid.as_deref()==Some(&[])).map(|(&id,_)|id));
     }
     // On an existing, unambiguous physical tuple the reference can decrypt
     // packets carrying an encrypted, newly issued CID. Do not learn it from
@@ -587,7 +597,11 @@ impl PreparedQuic {
                     if !local_known && !existing_local && retired.iter().any(|s| s.blocks(peer, data, now)) {
                         continue;
                     }
-                    let relay = route(&sessions, peer, data, local_peer || local_known);
+                    // An opaque CID from an old connection could otherwise
+                    // be delivered to a new session on a reused tuple.
+                    // Known CIDs still work; tuple-only fallback is quarantined.
+                    let retired_tuple=short&&retired.iter().any(|s|s.until>now&&s.peers.contains(&peer));
+                    let relay=route(&sessions,peer,data,local_peer||local_known||retired_tuple);
                     if (local_known || existing_local) && (relay.is_some() || sessions.values().any(|s|s.known(data))) { continue; }
                     if local_known || existing_local {
                         // An issued local CID alone is not authorization to
@@ -676,7 +690,7 @@ mod tests {
     fn session(p: SocketAddr, server: &[u8]) -> Session {
         let mut s = Session::new(p, vec![1;8], vec![2;8], wire::V1,Instant::now());
         s.server.insert(server.to_vec());
-        s.server_initial=true;
+        s.server_initial=true;s.initial_server_cid=Some(server.to_vec());
         s.negotiated_version=Some(wire::V1);
         let (queue, _rx) = mpsc::channel(1);
         s.paths.insert(p, Path { queue, budget: Budget::default(), last: Instant::now() });
@@ -721,6 +735,25 @@ mod tests {
         assert_eq!(route(&table, new, &known, false), None);
         assert_eq!(route(&table, old, &known, false), None);
     }
+    #[test]
+    fn zero_cid_and_retry_cid_cannot_authorize_migration(){
+        let p=peer(1);
+        let mut s=session(p,&[3;8]);
+        s.initial_server_cid=Some(Vec::new());
+        s.server.insert(vec![9;8]); // historical Retry CID, not a 1-RTT CID
+        let mut short=vec![0x40];short.extend_from_slice(&[9;8]);short.extend_from_slice(&[0;24]);
+        let mut table=HashMap::from([(1,s)]);
+        assert_eq!(route(&table,peer(2),&short,false),None);
+        assert_eq!(route(&table,p,&short,false),Some(1));
+        let mut handshake=vec![0xe0,0,0,0,1,0,8];
+        handshake.extend_from_slice(&[2;8]);handshake.push(20);handshake.extend_from_slice(&[0;20]);
+        assert_eq!(route(&table,p,&handshake,false),Some(1));
+        assert!(table[&1].allows_client(p,&handshake));
+        assert_eq!(route(&table,peer(2),&handshake,false),None);
+        table.insert(2,session(p,&[4;8]));
+        assert_eq!(route(&table,p,&short,false),None);
+    }
+
     #[test]
     fn opaque_cid_new_address_is_not_connection_or_validation_evidence(){
         let mut table=HashMap::new();
@@ -774,6 +807,85 @@ mod tests {
             assert!(!a.matches(&bad));
         }
         assert!(!a.matches(&first[..19]));
+    }
+
+    // Real separate TLS/QUIC endpoint forces Retry. The relay has no
+    // TLS keys and does not terminate the connection; only the fixture's
+    // socket setup bypasses production public-DNS eligibility.
+    #[tokio::test]
+    async fn external_quic_retry_then_authenticated_stream_through_relay(){
+        let cert=rcgen::generate_simple_self_signed(vec!["reference.example".into()]).unwrap();
+        let mut roots=rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let key=rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into();
+        let reference=crate::quic_transport::server_endpoint(peer(0),vec![cert.cert.der().clone()],key).unwrap();
+        let target=reference.local_addr().unwrap();
+        let listener=UdpSocket::bind(peer(0)).await.unwrap();
+        let relay_addr=listener.local_addr().unwrap();
+        let client=crate::quic_transport::client_endpoint(peer(0),roots).unwrap();
+        let physical=client.local_addr().unwrap();
+        let upstream=UdpSocket::bind(peer(0)).await.unwrap();
+        upstream.connect(target).await.unwrap();
+        let (tx,rx)=mpsc::channel(QUEUE);
+        let (rtx,mut rrx)=mpsc::channel(QUEUE);
+        let deadline=Instant::now()+Duration::from_secs(15);
+        let pump=tokio::spawn(pump_path(upstream,1,physical,deadline,rx,rtx,||true));
+        let relay=tokio::spawn(async move{
+            let mut buf=vec![0;wire::MAX_DATAGRAM+1];
+            let mut state:Option<Session>=None;
+            loop{
+                tokio::select!{
+                    _=tokio::time::sleep_until(deadline)=>break,
+                    result=listener.recv_from(&mut buf)=>{
+                        let (n,peer)=result.unwrap();
+                        if peer!=physical||n==0||n>wire::MAX_DATAGRAM{continue;}
+                        let data=&buf[..n];
+                        if state.is_none(){
+                            let Some(h)=wire::long(data)else{continue;};
+                            if h.kind!=Kind::Initial||n<wire::MIN_INITIAL{continue;}
+                            let mut s=Session::new(peer,h.dcid.to_vec(),h.scid.to_vec(),h.version,Instant::now());
+                            s.paths.insert(peer,Path{queue:tx.clone(),budget:Budget::default(),last:Instant::now()});
+                            state=Some(s);
+                        }
+                        let s=state.as_mut().unwrap();
+                        if s.allows_client(peer,data){s.enqueue(peer,data.to_vec(),Instant::now());}
+                    }
+                    reply=rrx.recv()=>{
+                        let Some(reply)=reply else{break;};
+                        let Some(s)=state.as_mut()else{continue;};
+                        if s.can_reply(reply.peer,reply.data.len())&&s.observe_reference(reply.peer,&reply.data){
+                            let n=listener.send_to(&reply.data,reply.peer).await.unwrap();
+                            assert_eq!(n,reply.data.len());
+                            s.sent(reply.peer,n,Instant::now());
+                            let budget=&s.paths[&physical].budget;
+                            assert!(budget.sent<=budget.received*3);
+                        }
+                    }
+                }
+            }
+        });
+        let server=tokio::spawn(async move{
+            let initial=reference.accept().await.unwrap();
+            assert!(!initial.remote_address_validated());
+            initial.retry().unwrap();
+            let next=reference.accept().await.unwrap();
+            assert!(next.remote_address_validated());
+            let conn=crate::quic_transport::accept(next).await.unwrap();
+            let (mut send,mut recv)=conn.accept_bi().await.unwrap();
+            assert_eq!(recv.read_to_end(1024).await.unwrap(),b"external");
+            send.write_all(b"reference").await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+        });
+        let result=timeout(Duration::from_secs(12),async{
+            let conn=crate::quic_transport::connect(&client,relay_addr,"reference.example").await.unwrap();
+            let (mut send,mut recv)=conn.open_bi().await.unwrap();
+            send.write_all(b"external").await.unwrap();send.finish().unwrap();
+            assert_eq!(recv.read_to_end(1024).await.unwrap(),b"reference");
+            conn.close(0u32.into(),b"done");
+        }).await;
+        relay.abort();pump.abort();server.abort();
+        result.unwrap();
     }
 
     #[tokio::test]
@@ -859,7 +971,7 @@ mod tests {
     fn retry_token_never_transfers_to_another_path_or_grants_credit() {
         let p = peer(10);
         let mut s = session(p,&[3;8]);
-        s.server_initial=false;s.negotiated_version=None;
+        s.server_initial=false;s.negotiated_version=None;s.initial_server_cid=None;
         s.retry = Some(Retry { cid: vec![3;8], token: vec![9] });
         let (tx,_rx) = mpsc::channel(2);
         s.paths.get_mut(&p).unwrap().queue = tx;
