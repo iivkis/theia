@@ -946,8 +946,10 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
         doc.server.policy.allow_private_ips = true;
         let config = dir.0.join("server.toml");
         theia::config::atomic_write(&config, &theia::config::Config::Server(doc)).unwrap();
-        assert!(theia::server::tls_fingerprint_file(&config).is_ok(),
-            "server fixture must pass the real protected PEM reader and TLS builders");
+        assert!(
+            theia::server::tls_fingerprint_file(&config).is_ok(),
+            "server fixture must pass the real protected PEM reader and TLS builders"
+        );
         let mut issuer = theia::tui_editor::Editor::load(theia::Role::Server, &config).unwrap();
         issuer.issue_user("export-device").unwrap();
         assert!(issuer.save());

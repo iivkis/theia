@@ -199,7 +199,10 @@ pub(crate) fn new_private_directory(path: &Path) -> io::Result<()> {
 /// Uses mode 0600 on Unix and an explicit protected user/System DACL on Windows.
 pub fn create_private_file(path: &Path) -> io::Result<File> {
     if !crate::bounded_input::explicit_file_path(path) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid private file path"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid private file path",
+        ));
     }
     new_private_file(path)
 }
