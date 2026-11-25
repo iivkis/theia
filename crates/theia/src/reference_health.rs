@@ -881,6 +881,14 @@ impl Store {
         self.snapshot().map(|(_, state)| state)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture_record(&self,evidence:Vec<Evidence>,now:u64)->Result<State,Error>{
+        let (raw,previous)=self.snapshot()?;
+        let next=previous.record(evidence,now)?;
+        config::guarded_trust_write(&self.path,&next.encode()?,Some(&raw)).map_err(storage_error)?;
+        Ok(next)
+    }
+
     pub fn enroll(&self, state: &State) -> Result<(), Error> {
         if state.revision != 1 || !state.health.iter().all(|entry| entry.evidence.eligible()) {
             return Err(Error::Format);

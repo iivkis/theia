@@ -474,7 +474,7 @@ impl PreparedQuic {
                     let Some(ticket)=ticket else{incoming.ignore();continue;};
                     let Ok(now)=crate::reference_health::unix_now() else{incoming.ignore();continue;};
                     let still_current=self.live.current().is_some_and(|g|
-                        g.lease.publication().snapshot_sha256()==ticket.route.publication_id());
+                        (g.lease.publication().snapshot_sha256(),g.lease.status().health_revision)==ticket.route.generation_id());
                     if ticket.until<=Instant::now() || !still_current || !ticket.route.current(now) {
                         incoming.ignore();continue;
                     }

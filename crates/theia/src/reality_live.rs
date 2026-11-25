@@ -27,7 +27,9 @@ impl Route {
         let p = self.lease.publication();
         if self.successor { p.next().expect("prepared successor") } else { p.active() }
     }
-    pub(crate) fn publication_id(&self)->[u8;32]{self.lease.publication().snapshot_sha256()}
+    pub(crate) fn generation_id(&self)->([u8;32],u64){
+        (self.lease.publication().snapshot_sha256(),self.lease.status().health_revision)
+    }
     pub(crate) fn current(&self, now: u64) -> bool {
         let v = self.material().verified();
         v.check_time(now).is_ok() && self.lease.health().validate_active(v.descriptor(),now).is_ok()
@@ -63,8 +65,9 @@ impl Generation {
             };
             let context = Arc::new(base.fork_identity(value,Arc::from(material.signed()),next)?);
             // Active reference first. Other signed, operator-approved SNI
-            // values are authenticated bootstrap aliases only: an invalid
-            // marker still uses the single active pinned relay destination.
+            // values allow authenticated clients with a previously signed
+            // descriptor to reconnect. An invalid marker still uses only
+            // the active pinned relay destination.
             // This lets a client with a still-valid pre-failover descriptor
             // authenticate and retrieve the new signed active index.
             let active = usize::from(d.active_reference);

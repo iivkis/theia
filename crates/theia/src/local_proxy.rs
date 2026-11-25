@@ -1213,7 +1213,7 @@ mod selector_tests {
     // not used by the admitted test branch. All application I/O is loopback;
     // this does not assert external reference parity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn registered_reality_startup_serves_native_connect_and_socks5() {
+    async fn registered_reality_live_rotation_keeps_native_connect_and_socks5_open() {
         use crate::{
             descriptor::ClientPolicy,
             reality_bootstrap as bootstrap,
@@ -1229,7 +1229,7 @@ mod selector_tests {
         let dir = Scratch(std::env::temp_dir().join(format!("theia-reality-native-{}-{}",
             std::process::id(),SEQUENCE.fetch_add(1,Ordering::Relaxed))));
         std::fs::create_dir(&dir.0).unwrap();
-        timeout(Duration::from_secs(45), async {
+        timeout(Duration::from_secs(80), async {
             let remote = {
                 let mut selected = None;
                 for _ in 0..16 {
@@ -1270,6 +1270,10 @@ mod selector_tests {
             let config = Config::Server(server_doc.clone());
             let lease = Manager::new(&config,"reality-native",now).unwrap().refresh(now).unwrap();
             let material = lease.publication().active();
+            let old_signer=material.verified().signer();
+            let successor=crate::identity_tls::Identity::generate(material.identity().scope().clone()).unwrap();
+            let successor_path=dir.0.join("successor.key");
+            successor.save_new(&successor_path).unwrap();
             let invite = bootstrap::Invitation::public(material.identity(),material.signed(),now).unwrap();
             let uri = invite.encode().unwrap();
             let client_path = dir.0.join("client.toml");
@@ -1302,21 +1306,29 @@ mod selector_tests {
             let target = echo.local_addr().unwrap();
             let mut echo_tasks = JoinSet::new();
             echo_tasks.spawn(async move {
-                for _ in 0..2 {
+                let mut sessions=JoinSet::new();
+                for _ in 0..4 {
                     let (mut stream,_) = echo.accept().await.unwrap();
-                    let mut bytes = [0;4];
-                    stream.read_exact(&mut bytes).await.unwrap();
-                    stream.write_all(&bytes).await.unwrap();
-                    stream.shutdown().await.unwrap();
+                    sessions.spawn(async move {
+                        let mut bytes=[0;4];
+                        while stream.read_exact(&mut bytes).await.is_ok(){
+                            stream.write_all(&bytes).await.unwrap();
+                        }
+                    });
                 }
+                while let Some(result)=sessions.join_next().await{result.unwrap();}
             });
             let Config::Client(mut client_doc) = config::read_file(&client_path).unwrap() else { panic!() };
+            let mut established=Vec::new();
+            let mut proxies=Vec::new();
+            let mut managed_clients=Vec::new();
             for (id,socks_mode) in [("native-h2",false),("native-h3",true)] {
                 client_doc.client.active_profile=id.into();
                 let profile = client_doc.client.profiles.iter().find(|p|p.id==id).unwrap();
                 let client = load_client(profile).await.unwrap();
                 let ProxyClient::Reality(managed) = &client else { panic!("wrong security mode") };
                 let current = managed.generation().await.unwrap();
+                managed_clients.push(managed.clone());
                 assert!(match (&current.carrier,socks_mode) {
                     (RealityCarrier::H2(_),false)|(RealityCarrier::H3(_),true)=>true,
                     _=>false,
@@ -1348,10 +1360,41 @@ mod selector_tests {
                 let mut bytes=[0;4];
                 stream.read_exact(&mut bytes).await.unwrap();
                 assert_eq!(&bytes,b"ping");
-                drop(stream);
-                proxy.shutdown().await;
+                established.push(stream);
+                proxies.push(proxy);
             }
-            assert!(echo_tasks.join_next().await.unwrap().is_ok());
+            let publication=crate::identity_publication::Publication::new(&bundle.join("publication.toml")).unwrap();
+            let now=reference_health::unix_now().unwrap();
+            let status=publication.inspect(now).unwrap();
+            publication.begin_rotation(&successor_path,status.snapshot_sha256,
+                bootstrap::fingerprint(successor.public_key()),now).unwrap();
+            for managed in &managed_clients {
+                // Wait for the owner-scoped live publication poll, then
+                // explicitly drive the same authenticated promotion path
+                // that the background client worker uses.
+                for _ in 0..20 {
+                    let generation=managed.generation().await.unwrap();
+                    if generation.value.signer()==successor.public_key(){break;}
+                    assert_eq!(generation.value.signer(),old_signer);
+                    let _=managed.refresh(&generation).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                let new=managed.generation().await.unwrap();
+                assert_eq!(new.value.signer(),successor.public_key());
+                // An actual new tunnel must complete on the new signer.
+                let tunnel=managed.open(Address::Ip(target.ip()),target.port()).await.unwrap();
+                drop(tunnel);
+            }
+            // Both already-established application tunnels still carry
+            // bytes after the two transport pools have changed identity.
+            for mut stream in established {
+                stream.write_all(b"pong").await.unwrap();
+                let mut bytes=[0;4];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes,b"pong");
+            }
+            for mut proxy in proxies{proxy.shutdown().await;}
+            echo_tasks.shutdown().await;
             server.shutdown().await;
         }).await.unwrap();
     }

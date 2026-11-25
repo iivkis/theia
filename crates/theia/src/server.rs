@@ -2436,9 +2436,10 @@ pub(crate) async fn run_reality_document_with_ready(
             users.clone(), connections.clone(), peers.clone());
         if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
             let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
-            let manager = crate::reality_generation::Manager::new(&config, &inbound.id, now)
-                .map_err(|_| ServerError::Config)?;
-            let generation = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
+            let manager = crate::reality_generation::Manager::new_live(&config,&inbound.id,now).await
+                .map_err(|_|ServerError::Config)?;
+            let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
+            let generation=Arc::new(manager.refresh(now).map_err(|_|ServerError::Config)?);
             let h3=generation.publication().active().verified().descriptor().h3;
             #[cfg(test)]
             let live_generation=if started.is_some(){

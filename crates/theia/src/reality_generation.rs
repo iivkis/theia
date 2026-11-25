@@ -131,6 +131,53 @@ impl Manager {
         Ok(Self { inbound: inbound.clone(), scope, slot: Mutex::new(Slot { last: first, last_checked_at: now }) })
     }
 
+    /// Startup may encounter persisted degradation from a previous process.
+    /// Before binding listeners, perform only a due bounded recheck and
+    /// the same approved failover CAS. Missing or invalid private material,
+    /// floor rollback, expired trust and unavailable reserves fail closed.
+    pub(crate) async fn new_live(config:&Config,inbound_id:&str,now:u64)->Result<Self,Error>{
+        if let Ok(manager)=Self::new(config,inbound_id,now){return Ok(manager);}
+        config.validate().map_err(|_|Error::Format)?;
+        let Config::Server(doc)=config else{return Err(Error::Format);};
+        if !doc.server.enabled{return Err(Error::Format);}
+        let inbound=doc.server.inbounds.iter().find(|i|i.id==inbound_id)
+            .ok_or(Error::Scope)?;
+        if inbound.security_mode!=SecurityMode::SmartReality{return Err(Error::Format);}
+        let binding=inbound.reality.as_ref().ok_or(Error::Format)?;
+        let listen:SocketAddr=inbound.h2_listen.parse().map_err(|_|Error::Scope)?;
+        let scope=Scope{inbound:inbound.id.clone(),endpoint:format!("{}:{}",inbound.server_name,listen.port())};
+        let directory=Path::new(&binding.bundle);
+        let store=Store::new(Path::new(&binding.health_store)).map_err(|_|Error::Health)?;
+        let publication=crate::identity_publication::Publication::new(&directory.join("publication.toml"))?;
+        let snapshot=|time:u64|->Result<(State,crate::descriptor::Verified,Stamp),Error>{
+            let health=store.inspect().map_err(|_|Error::Health)?;
+            let (value,stamp)=crate::reality_provision::inspect_registered_snapshot(directory,binding,&health,&scope,time)?;
+            reality_checkpoint::accept(directory,stamp,time)?;
+            Ok((health,value,stamp))
+        };
+        let (mut health,mut value,mut stamp)=snapshot(now)?;
+        let approved=health.plan().digest().map_err(|_|Error::Health)?;
+        let mut time=now;
+        if now>=health.next_active_check_at(value.descriptor(),now).map_err(|_|Error::Health)?{
+            store.recheck(health.revision(),approved).await.map_err(|_|Error::Health)?;
+            time=crate::reference_health::unix_now().map_err(|_|Error::Clock)?;
+            (health,value,stamp)=snapshot(time)?;
+        }
+        let status=publication.inspect(time)?;
+        if status.snapshot_sha256!=stamp.publication || status.plan_sha256!=approved{return Err(Error::Approval);}
+        if status.valid_now && status.next_fingerprint.is_none()
+            && health.active_status(value.descriptor(),time).map_err(|_|Error::Health)?.0==crate::reference_health::PrimaryStatus::Degraded{
+            let preview=publication.preview_failover(&health,time)?;
+            if preview.publication_sha256!=stamp.publication || preview.health_sha256!=stamp.health
+                || snapshot(time)?.2!=stamp{return Err(Error::Approval);}
+            publication.apply_failover(&health,crate::identity_publication::FailoverApproval{
+                publication_sha256:stamp.publication,health_sha256:stamp.health,
+                selected_reference:preview.selected_reference,
+            },time)?;
+        }
+        Self::new(config,inbound_id,time)
+    }
+
     /// Independently root both files even while the active reference is
     /// degraded. Advance the durable floor before further probes or writes:
     /// a failed capture must not make stale healthy evidence acceptable.
