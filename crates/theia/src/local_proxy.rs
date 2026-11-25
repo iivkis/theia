@@ -215,6 +215,8 @@ struct RealityGeneration {
     value: crate::descriptor::Verified,
     carrier: RealityCarrier,
     credential_digest: [u8;32],
+    last_transport:std::sync::atomic::AtomicU8,
+    last_refresh:std::sync::atomic::AtomicU8,
 }
 struct RealityClient {
     profile: Profile,
@@ -265,7 +267,7 @@ impl RealityClient {
             (None,Some(h3)) => RealityCarrier::H3(h3),
             _ => return Err(ClientError::Configuration),
         };
-        Ok(RealityGeneration { value, carrier, credential_digest })
+        Ok(RealityGeneration { value, carrier, credential_digest,last_transport:std::sync::atomic::AtomicU8::new(0),last_refresh:std::sync::atomic::AtomicU8::new(0) })
     }
     async fn generation(&self) -> Result<Arc<RealityGeneration>, ClientError> {
         let mut slot = self.current.lock().await;
@@ -294,11 +296,38 @@ impl RealityClient {
     }
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let generation = self.generation().await?;
-        match &generation.carrier {
+        let result=match &generation.carrier {
             RealityCarrier::H2(h2) => h2.open(address, port).await.map(Box::new).map(ProxyTunnel::H2),
             RealityCarrier::H3(h3) => h3.open(address, port).await.map(Box::new).map(ProxyTunnel::H3),
             RealityCarrier::Auto(auto) => auto.open(address, port).await,
+        };
+        if let Ok(tunnel)=&result{
+            generation.last_transport.store(match tunnel{ProxyTunnel::H2(_)=>2,ProxyTunnel::H3(_)=>3},std::sync::atomic::Ordering::Relaxed);
         }
+        result
+    }
+
+    async fn runtime_report(&self)->String{
+        use std::sync::atomic::Ordering;
+        let generation=self.current.lock().await.clone();
+        let value=&generation.value;
+        let valid=Self::now().is_ok_and(|now|value.check_time(now).is_ok());
+        let policy=match &generation.carrier{RealityCarrier::H2(_)=>"h2",RealityCarrier::H3(_)=>"h3",RealityCarrier::Auto(_)=>"auto"};
+        let fallback=match &generation.carrier{
+            RealityCarrier::Auto(auto)=>auto.negative.lock().ok().map(|cache|{
+                cache.route.is_some()&&cache.route==route_source(auto.h3.remote())&&cache.expires.is_some_and(|until|until>Instant::now())
+            }),
+            _=>None,
+        };
+        let transport=match generation.last_transport.load(Ordering::Relaxed){2=>"H2",3=>"H3",_=>"ещё нет подтверждённого OPEN"};
+        let refresh=match generation.last_refresh.load(Ordering::Relaxed){1=>"успешно",2=>"отклонено/недоступно",_=>"ещё не выполнялось"};
+        // Read the pinned durable state without refreshing or changing it.
+        let trust=crate::reality_config::pinned_client(&self.profile).ok()
+            .and_then(|p|p.load(Self::now().ok()?).ok());
+        let trust_state=match trust{Some(v) if v.payload_sha256()==value.payload_sha256()=>"совпадает",Some(_)=>"изменилось, новые запросы перепроверят",None=>"не подтверждено, новые запросы могут быть отклонены"};
+        format!("Loopback listeners работают (не доказательство удалённого соединения)\nrevision={} reference_index={} valid_now={valid}\npolicy={policy} last_open={transport}\nH3 negative cache: {}\nDescriptor refresh: {refresh}\nSaved trust: {trust_state}",
+            value.descriptor().revision,value.descriptor().active_reference,
+            fallback.map_or("не применяется",|v|if v{"активен"}else{"не активен"}))
     }
     async fn refresh(&self, generation: &RealityGeneration) -> Result<(), ClientError> {
         let enrollment = crate::reality_config::pinned_client(&self.profile).map_err(|_| ClientError::Configuration)?;
@@ -363,7 +392,8 @@ impl RealityClient {
                     // No stale update can overwrite a new store revision;
                     // update_matching performs a full CAS. Failure never
                     // authorizes use of an expired/rolled-back generation.
-                    let _ = self.refresh(&generation).await;
+                    let ok=self.refresh(&generation).await.is_ok();
+                    generation.last_refresh.store(if ok{1}else{2},std::sync::atomic::Ordering::Relaxed);
                 }
                 result = background => return result,
             }
@@ -803,16 +833,16 @@ async fn prepare_proxy(
 /// A Windows TUI starts the local client independently of OS proxy consent.
 /// The exact saved TOML is parsed once; subsequent activation must still
 /// match that editor revision. No credential or source text leaves this API.
-#[cfg(windows)]
 pub(crate) struct PreparedLocalProxy {
     http: TcpListener,
     socks: TcpListener,
     client: ProxyClient,
+    #[cfg(windows)]
     pub(crate) manual: bool,
 }
 
-#[cfg(windows)]
 impl PreparedLocalProxy {
+    #[cfg(windows)]
     pub(crate) async fn start(path: &Path, expected: [u8; 32]) -> Result<Self, ClientError> {
         let bytes = saved_client_bytes(path, expected)?;
         let source = std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?;
@@ -830,16 +860,49 @@ impl PreparedLocalProxy {
         })
     }
 
+    pub(crate) async fn start_reality(path:&Path,expected:[u8;32],id:&str)->Result<Self,ClientError>{
+        let bytes=saved_client_bytes(path,expected)?;
+        let Config::Client(document)=config::parse(std::str::from_utf8(&bytes).map_err(|_|ClientError::Configuration)?)
+            .map_err(|_|ClientError::Configuration)? else{return Err(ClientError::Configuration);};
+        if document.client.active_profile!=id || !document.client.profiles.iter().any(|p|p.id==id&&p.tls_profile=="smart-reality"){
+            return Err(ClientError::Configuration);
+        }
+        let (http,socks,client)=prepare_proxy(&document).await?;
+        if !matches!(&client,ProxyClient::Reality(_)){return Err(ClientError::Configuration);}
+        // Detect edits during DNS/bind preflight before accepting traffic.
+        saved_client_bytes(path,expected)?;
+        Ok(Self{http,socks,client,#[cfg(windows)] manual:document.client.proxy.system_proxy==config::SystemProxy::Manual})
+    }
+
+    pub(crate) async fn serve_reality_observed(self,mut stop:tokio::sync::oneshot::Receiver<()>,
+        report:Arc<Mutex<String>>)->Result<(),ClientError>{
+        let ProxyClient::Reality(reality)=&self.client else{return Err(ClientError::Configuration);};
+        let reality=reality.clone();
+        let monitor=async move{
+            loop{
+                let status=reality.runtime_report().await;
+                if let Ok(mut slot)=report.lock(){*slot=status;}
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        };
+        tokio::select!{
+            result=serve_proxy(self.http,self.socks,self.client)=>result,
+            _=monitor=>Ok(()),
+            _=&mut stop=>Ok(()),
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn http_address(&self) -> Result<SocketAddr, ClientError> {
         self.http.local_addr().map_err(|_| ClientError::Io)
     }
 
+    #[cfg(windows)]
     pub(crate) async fn serve(self) -> Result<(), ClientError> {
         serve_proxy(self.http, self.socks, self.client).await
     }
 }
 
-#[cfg(windows)]
 pub(crate) fn saved_client_bytes(
     path: &Path,
     expected: [u8; 32],

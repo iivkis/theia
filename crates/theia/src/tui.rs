@@ -1441,8 +1441,10 @@ impl Interaction {
                 if editor.dirty() {
                     editor.error = Some("Сохраните или отмените черновик перед импортом REALITY.".into());
                 } else {
-                    editor.error = None;
-                    self.reality_enrollment = Some(EnrollmentPanel::new());
+                    match EnrollmentPanel::bound(editor){
+                        Ok(panel)=>{editor.error=None;self.reality_enrollment=Some(panel);}
+                        Err(message)=>editor.error=Some(message.into()),
+                    }
                 }
                 return false;
             }
@@ -2044,7 +2046,7 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
             provision.poll();
         }
         if let Some(enrollment) = interaction.reality_enrollment.as_mut() {
-            enrollment.poll();
+            if let Some(editor)=enrollment.poll(){interaction.editor=Some(editor);}
         }
         if let Some(status) = interaction.reality_status.as_mut() {
             status.poll();

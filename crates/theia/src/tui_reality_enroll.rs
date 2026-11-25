@@ -78,12 +78,21 @@ pub(crate) struct EnrollmentPanel {
     focus: usize,
     stage: Stage,
     error: Option<String>,
+    config:Option<(PathBuf,[u8;32])>,
+    registration:Option<crate::tui_reality_register::RegistrationPanel>,
 }
 
 impl EnrollmentPanel {
     pub(crate) fn new() -> Self {
         Self { fields: std::array::from_fn(|_| Zeroizing::new(String::new())),
-            focus: 0, stage: Stage::Input, error: None }
+            focus: 0, stage: Stage::Input, error: None,config:None,registration:None }
+    }
+
+    pub(crate) fn bound(editor:&crate::tui_editor::Editor)->Result<Self,&'static str>{
+        editor.require_clean_records()?;
+        let mut panel=Self::new();
+        panel.config=Some((std::path::absolute(editor.saved_path()).map_err(|_|"Недопустимый путь TOML")?,editor.saved_sha256()));
+        Ok(panel)
     }
 
     fn input(&self) -> Result<Input, Error> {
@@ -94,6 +103,7 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn paste(&mut self, value: &str) {
+        if let Some(panel)=self.registration.as_mut(){panel.paste(value);return;}
         if !matches!(self.stage, Stage::Input) { return; }
         let value = value.trim_end_matches(['\r', '\n']);
         let field = &mut self.fields[self.focus];
@@ -103,9 +113,20 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
+        if let Some(panel)=self.registration.as_mut(){return panel.key(key);}
         match &self.stage {
             Stage::Loading(_) | Stage::Applying(_) => return false,
-            Stage::Done(_) => return key.code == KeyCode::Esc,
+            Stage::Done(_) => {
+                if key.code==KeyCode::Char('g'){
+                    if let (Some((path,digest)),Ok(input))=(&self.config,self.input()){
+                        match crate::tui_reality_register::RegistrationPanel::from_enrollment(path.clone(),*digest,&input.profile,input.identity){
+                            Ok(panel)=>self.registration=Some(panel),
+                            Err(error)=>self.error=Some(error.to_string()),
+                        }
+                    }
+                }
+                return key.code==KeyCode::Esc;
+            }
             Stage::Confirm(_) => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('n') => self.stage = Stage::Input,
@@ -155,19 +176,20 @@ impl EnrollmentPanel {
         false
     }
 
-    pub(crate) fn poll(&mut self) {
+    pub(crate) fn poll(&mut self)->Option<crate::tui_editor::Editor> {
+        if let Some(panel)=self.registration.as_mut(){return panel.poll();}
         let result = match &self.stage {
             Stage::Loading(rx) => match rx.try_recv() {
                 Ok(result) => result.map(Stage::Confirm),
-                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Empty) => return None,
                 Err(TryRecvError::Disconnected) => Err(Error::Storage),
             },
             Stage::Applying(rx) => match rx.try_recv() {
                 Ok(result) => result.map(Stage::Done),
-                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Empty) => return None,
                 Err(TryRecvError::Disconnected) => Err(Error::Indeterminate),
             },
-            _ => return,
+            _ => return None,
         };
         match result {
             Ok(stage) => self.stage = stage,
@@ -176,9 +198,11 @@ impl EnrollmentPanel {
                 self.stage = Stage::Input;
             }
         }
+        None
     }
 
     pub(crate) fn body(&self) -> String {
+        if let Some(panel)=&self.registration{return panel.body();}
         match &self.stage {
             Stage::Input => {
                 let mut out = String::from("Локальные абсолютные пути; значения скрыты.\n");
@@ -194,7 +218,7 @@ impl EnrollmentPanel {
             Stage::Loading(_) => "Проверка локального приглашения и admission; без сети и записи.".into(),
             Stage::Confirm(review) => review.body.clone(),
             Stage::Applying(_) => "Сохранение защищённого профиля; runtime не меняется.".into(),
-            Stage::Done(body) => body.clone(),
+            Stage::Done(body) => if self.config.is_some(){format!("{body}\nСледующий шаг: g — зарегистрировать созданный enrollment в сохранённом TOML (отдельный preview/confirm).\n{}",self.error.as_deref().unwrap_or(""))}else{body.clone()},
         }
     }
 }

@@ -1057,7 +1057,7 @@ impl Editor {
 
     pub fn selection_summary(&self) -> String {
         if self.selected_reality() {
-            return format!("REALITY {}/{}: {} [сохранённый, backend недоступен]",
+            return format!("REALITY {}/{}: {} [сохранённый профиль, runtime: V]",
                 self.selected_record + 1, self.record_count(), self.selected_record_id());
         }
         match self.role {

@@ -4,18 +4,30 @@ use crossterm::event::{KeyCode,KeyEvent};
 use std::{path::PathBuf,sync::mpsc::{self,Receiver,TryRecvError}};
 
 enum Update { Report(String), Review(RotationReview) }
+struct ClientRun{
+    stop:Option<tokio::sync::oneshot::Sender<()>>,
+    done:Receiver<Result<(),crate::client::ClientError>>,
+    report:std::sync::Arc<std::sync::Mutex<String>>,
+}
+impl Drop for ClientRun{
+    fn drop(&mut self){if let Some(stop)=self.stop.take(){let _=stop.send(());}}
+}
 pub(crate) struct StatusPanel {
     path:PathBuf,digest:[u8;32],id:String,server:bool,
     pending:Option<Receiver<Result<Update,Error>>>,
     review:Option<RotationReview>,
     committing:bool,
     report:String,
+    client_active:bool,
+    client_confirm:Option<bool>,
+    client_run:Option<ClientRun>,
 }
 impl StatusPanel{
     pub(crate) fn open(editor:&Editor)->Self{
         let mut panel=Self{path:editor.saved_path().to_owned(),digest:editor.saved_sha256(),
             id:editor.selected_record_id().to_owned(),server:editor.role()==Role::Server,
-            pending:None,review:None,committing:false,report:String::new()};
+            pending:None,review:None,committing:false,report:String::new(),
+            client_active:editor.selected_record_is_active(),client_confirm:None,client_run:None};
         panel.start(None);
         panel
     }
@@ -57,7 +69,46 @@ impl StatusPanel{
             let _=tx.send(result);
         });
     }
+    fn start_client(&mut self){
+        if !self.client_active||self.client_run.is_some(){return;}
+        let path=self.path.clone();let digest=self.digest;let id=self.id.clone();
+        let (stop,rx)=tokio::sync::oneshot::channel();
+        let (tx,done)=mpsc::channel();
+        let report=std::sync::Arc::new(std::sync::Mutex::new("Проверка trust, credentials и двух loopback bind...".into()));
+        let monitor=report.clone();
+        self.client_run=Some(ClientRun{stop:Some(stop),done,report});
+        let _worker=std::thread::spawn(move||{
+            use crate::{client::ClientError,local_proxy::PreparedLocalProxy};
+            let result=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_|ClientError::Io)
+                .and_then(|runtime|runtime.block_on(async move{
+                    let mut rx=rx;
+                    let prepared=tokio::select!{
+                        result=PreparedLocalProxy::start_reality(&path,digest,&id)=>result?,
+                        _=&mut rx=>return Ok(()),
+                    };
+                    prepared.serve_reality_observed(rx,monitor).await
+                }));
+            let _=tx.send(result);
+        });
+    }
     pub(crate) fn key(&mut self,key:KeyEvent)->bool{
+        if !self.server{
+            if let Some(start)=self.client_confirm{
+                match key.code{
+                    KeyCode::Char('y')=>{self.client_confirm=None;if start{self.start_client();}else if let Some(run)=self.client_run.as_mut(){if let Some(stop)=run.stop.take(){let _=stop.send(());}}},
+                    KeyCode::Char('n')|KeyCode::Esc=>self.client_confirm=None,
+                    _=>{},
+                }
+                return false;
+            }
+            if self.client_run.is_some(){
+                if key.code==KeyCode::Char('x'){self.client_confirm=Some(false);}
+                return false;
+            }
+            if self.pending.is_none()&&self.client_active&&key.code==KeyCode::Char('s'){
+                self.client_confirm=Some(true);return false;
+            }
+        }
         if self.committing{return false;}
         if self.pending.is_some(){return key.code==KeyCode::Esc;}
         if self.review.is_some(){
@@ -77,6 +128,10 @@ impl StatusPanel{
         }
     }
     pub(crate) fn poll(&mut self){
+        if let Some(run)=&self.client_run{
+            let result=match run.done.try_recv(){Ok(result)=>Some(result),Err(TryRecvError::Disconnected)=>Some(Err(crate::client::ClientError::Io)),Err(TryRecvError::Empty)=>None};
+            if let Some(result)=result{self.client_run=None;self.client_confirm=None;self.report=match result{Ok(())=>"Локальный runtime остановлен; OS proxy не изменён.".into(),Err(_)=>"Локальный runtime завершился с ошибкой; слушатели закрыты. Проверьте сохранённый профиль.".into()};}
+        }
         let Some(rx)=self.pending.as_ref() else{return;};
         let result=match rx.try_recv(){
             Ok(value)=>value,Err(TryRecvError::Empty)=>return,Err(TryRecvError::Disconnected)=>Err(Error::Storage),
@@ -89,10 +144,16 @@ impl StatusPanel{
         }
     }
     pub(crate) fn body(&self)->String{
+        if let Some(start)=self.client_confirm{return if start{"Запустить сохранённый активный REALITY-профиль с двумя loopback listeners? OS proxy не изменяется.\ny: подтвердить | n/Esc: отменить".into()}else{"Остановить локальный runtime? Открытые туннели будут закрыты.\ny: подтвердить | n/Esc: отменить".into()};}
+        if let Some(run)=&self.client_run{
+            if run.stop.is_none(){return "Остановка локального runtime...".into();}
+            let status=run.report.lock().map(|s|s.clone()).unwrap_or_else(|_|"Статус недоступен".into());
+            return format!("{status}\n\nx: остановить (подтверждение). Esc не закрывает работающий runtime.");
+        }
         if self.committing{return "Подтверждённая запись публикации выполняется. Не закрывайте экран.".into();}
         if self.pending.is_some(){return "Проверка сохранённых материалов/локального IPC. Ничего не применяется.\nEsc: закрыть.".into();}
         if let Some(review)=&self.review{return format!("{}\n\ny: подтвердить запись | n/Esc: отменить",review.report());}
         format!("{}\n\nr: перечитать | {}Esc: закрыть",self.report,
-            if self.server{"t: начать ротацию | p: отозвать старый ключ после overlap | "}else{""})
+            if self.server{"t: начать ротацию | p: отозвать старый ключ после overlap | "}else if self.client_active{"s: запустить локальный runtime | "}else{"сначала выберите профиль активным и сохраните TOML | "})
     }
 }

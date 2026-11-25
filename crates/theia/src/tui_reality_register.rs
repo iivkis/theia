@@ -104,6 +104,13 @@ impl RegistrationPanel {
             stage: Stage::Input, error: None })
     }
 
+    pub(crate) fn from_enrollment(config:PathBuf,original:[u8;32],enrollment:&std::path::Path,identity:[u8;32])->Result<Self,Error>{
+        if !crate::bounded_input::explicit_file_path(&config){return Err(Error::Storage);}
+        let fields=vec![enrollment.to_str().ok_or(Error::Storage)?.to_owned(),
+            identity.iter().map(|b|format!("{b:02x}")).collect::<String>(),String::new()];
+        Ok(Self{role:Role::Client,reenroll_id:None,config,original,fields,focus:2,stage:Stage::Input,error:None})
+    }
+
     pub(crate) fn reenroll(editor: &Editor) -> Result<Self, &'static str> {
         if editor.role() != Role::Client || !editor.selected_reality() {
             return Err("Выберите зарегистрированный REALITY-профиль.");
@@ -208,7 +215,7 @@ impl RegistrationPanel {
             },
             Stage::Saving(rx) => match rx.try_recv() {
                 Ok(Ok(editor)) => {
-                    self.stage = Stage::Done("Запись сохранена, редактор перечитан. Runtime НЕ изменён. Внешний REALITY backend пока недоступен.\nEsc: закрыть.".into());
+                    self.stage = Stage::Done("Запись сохранена, редактор перечитан. Runtime НЕ изменён.\nEsc: закрыть.".into());
                     return Some(editor);
                 }
                 Ok(Err(SaveError::Refused(Error::Indeterminate))) | Err(TryRecvError::Disconnected) => {
