@@ -934,7 +934,7 @@ mod tests {
         p.path = nonexistent.clone();
         p.key(key(KeyCode::Char('r')));
         assert!(p.pending.is_some());
-        assert!(p.body().contains("Ничего не применяется"));
+        assert!(p.body().contains("Изменения не применяются"));
         p.start(None);
         assert!(!p.key(key(KeyCode::Char('s'))));
         assert!(p.client_confirm.is_none());

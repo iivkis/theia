@@ -532,7 +532,7 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
             .iter()
             .map(|(key, label)| ActionItem {
                 key: *key,
-                label: *label,
+                label,
             })
             .collect();
     };
@@ -4780,8 +4780,6 @@ fn draw_issuance(
         } else {
             format!("{body}\nEsc: закрыть без выдачи. Файл останется сохранённым.")
         }
-    } else if matches!(flow, IssueFlow::Public(_)) {
-        body
     } else {
         body
     };
@@ -6474,7 +6472,7 @@ mod tests {
             std::env::temp_dir().join(crate::tui_editor::generated_id("onboarding").unwrap());
         std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
         let editor = Editor::load(Role::Client, &path).unwrap();
-        assert_eq!(recommended_step(&editor, false).0, 'V');
+        assert_eq!(recommended_step(&editor, false).0, 'P');
         let actions = invitation_actions(&IssueFlow::Offer);
         assert_eq!(actions[0].key, 'f');
         assert!(actions.iter().all(|a| a.key != 'y'));
@@ -6848,7 +6846,7 @@ mod tests {
             assert!(snapshot.contains("Следующее действие"));
             if role == Role::Server {
                 assert!(snapshot.contains("443"));
-                assert!(snapshot.contains("ID первого пользователя"));
+                assert!(snapshot.contains("Имя первого пользователя"));
             } else {
                 assert!(snapshot.contains("Ключ Theia"));
                 assert!(
@@ -6885,8 +6883,12 @@ mod tests {
         let client = Model::new(Some(Role::Client));
         assert_eq!(server.screen, Screen::Server);
         assert_eq!(client.screen, Screen::Client);
-        assert!(render(80, 24, client).contains("не проверялся"));
-        assert!(render(80, 24, server).contains("IPC"));
+        let client_screen = render(80, 24, client);
+        let server_screen = render(80, 24, server);
+        assert!(client_screen.contains("Импортировать ключ Theia"));
+        assert!(server_screen.contains("Настроить новый сервер"));
+        assert!(!client_screen.contains("Подключено"));
+        assert!(!server_screen.contains("Запущен"));
     }
 
     #[test]
