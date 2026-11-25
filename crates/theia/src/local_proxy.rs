@@ -655,7 +655,7 @@ impl AutoClient {
                     return Ok(Some(value));
                 }
                 Err(ClientError::QuicUnreachable) if index + 1 < AUTO_QUIC_ATTEMPTS => {}
-                Err(ClientError::QuicUnreachable) => {
+                Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => {
                     if self.complete(generation, true)? {
                         return Ok(None);
                     }
@@ -1613,6 +1613,7 @@ async fn handle(
                     }
                     ClientError::Timeout
                     | ClientError::QuicUnreachable
+                    | ClientError::QuicEndpointNetworkRefused
                     | ClientError::Open(ErrorCode::DialTimeout) => HTTP_TIMEOUT,
                     _ => HTTP_FAILED,
                 };
@@ -2217,6 +2218,16 @@ mod selector_tests {
         }).await;
         assert!(matches!(result, Ok(None)));
         assert_eq!(calls, AUTO_QUIC_ATTEMPTS);
+        assert!(auto.observe().unwrap().1);
+        auto.complete(generation, false).unwrap();
+        let (generation, _) = auto.observe().unwrap();
+        let mut calls = 0;
+        let result = auto.attempt_h3(generation, || {
+            calls += 1;
+            std::future::ready(Err::<(), _>(ClientError::QuicEndpointNetworkRefused))
+        }).await;
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(calls, 1);
         assert!(auto.observe().unwrap().1);
     }
 

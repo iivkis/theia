@@ -125,6 +125,9 @@ impl<C> Lease<C> {
     pub(crate) fn retire(&self) {
         self.entry.retire();
     }
+    pub(crate) fn accepting_new_streams(&self) -> bool {
+        !self.entry.retired.load(Ordering::Acquire) && Instant::now() < self.entry.deadline
+    }
     pub(crate) fn admitted(&mut self) {
         self.admitted = true;
     }
@@ -399,6 +402,33 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::task::yield_now().await;
         assert!(pool.entries.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn goaway_or_failed_admission_retires_only_new_streams_and_keeps_live_leases() {
+        let pool = Pool::default();
+        let route = Some("127.0.0.1:0".parse().unwrap());
+        let accepting = std::sync::Arc::new(AtomicBool::new(true));
+        let mut first = pool.acquire(route, true, |c: &Arc<AtomicBool>| c.load(Ordering::Acquire),
+            async { Ok(accepting.clone()) }).await.unwrap();
+        first.admitted();
+        let pending = pool.acquire(route, true, |_| true, async { Ok(accepting.clone()) }).await.unwrap();
+        assert!(first.shares_connection(&pending));
+        // Model a carrier reporting GOAWAY while an admitted stream lives.
+        // Failed or cancelled admission retires the connection, not leases.
+        accepting.store(false, Ordering::Release);
+        drop(pending);
+        assert!(!first.accepting_new_streams());
+        let mut next = pool.acquire(route, true, |c| c.load(Ordering::Acquire),
+            async { Ok(Arc::new(AtomicBool::new(true))) }).await.unwrap();
+        next.admitted();
+        assert!(!first.shares_connection(&next));
+        assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 2);
+        drop(first);
+        // Cleanup may still hold a transient Arc; acquire already removed
+        // the retired entry, so yield before inspecting permit release.
+        tokio::task::yield_now().await;
+        assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);
     }
 
     #[tokio::test]

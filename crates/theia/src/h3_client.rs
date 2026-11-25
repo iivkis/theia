@@ -491,6 +491,9 @@ impl H3Client {
             lease.retire();
             return Err(ClientError::Io);
         }
+        if !lease.accepting_new_streams() {
+            return Err(ClientError::Http3);
+        }
         let connection = lease.connection();
         let binding = connection.binding.as_ref();
         let mut sender = connection
@@ -672,6 +675,7 @@ fn quic_error(error: QuicError) -> ClientError {
         QuicError::Bind => ClientError::Io,
         QuicError::Timeout => ClientError::Timeout,
         QuicError::Unreachable => ClientError::QuicUnreachable,
+        QuicError::EndpointNetworkRefused => ClientError::QuicEndpointNetworkRefused,
         QuicError::Handshake | QuicError::Alpn => ClientError::Tls,
         QuicError::CongestionController => ClientError::Http3,
     }

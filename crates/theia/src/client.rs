@@ -26,6 +26,7 @@ pub enum ClientError {
     Http2,
     Http3,
     QuicUnreachable,
+    QuicEndpointNetworkRefused,
     Unauthorized,
     SystemProxy,
     Rejected(u16),
@@ -45,6 +46,7 @@ impl fmt::Display for ClientError {
             Self::Http2 => f.write_str("HTTP/2 transport failed"),
             Self::Http3 => f.write_str("HTTP/3 transport failed"),
             Self::QuicUnreachable => f.write_str("quic_unreachable"),
+            Self::QuicEndpointNetworkRefused => f.write_str("quic_endpoint_network_refused"),
             Self::Unauthorized => f.write_str("server rejected authentication"),
             Self::SystemProxy => f.write_str("Windows user proxy CAS/recovery failed; inspect client proxy --status and recover explicitly"),
             Self::Rejected(status) => write!(f, "server rejected request (HTTP {status})"),
@@ -67,6 +69,7 @@ pub(crate) fn error_kind(error: &ClientError) -> &'static str {
         ClientError::Http2 => "h2",
         ClientError::Http3 => "h3",
         ClientError::QuicUnreachable => "quic_unreachable",
+        ClientError::QuicEndpointNetworkRefused => "quic_endpoint_network_refused",
         ClientError::Unauthorized => "unauthorized",
         ClientError::SystemProxy => "system_proxy",
         ClientError::Rejected(_) => "http_rejected",
@@ -660,6 +663,9 @@ impl H2Client {
         if route.is_some() && self.endpoint.parse().ok().and_then(crate::network_scope::observe) != route {
             lease.retire();
             return Err(ClientError::Io);
+        }
+        if !lease.accepting_new_streams() {
+            return Err(ClientError::Http2);
         }
         let connection = lease.connection();
         let binding = connection.binding.as_ref();
