@@ -6395,7 +6395,7 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.reality_registration.is_none());
 
-        ui.reality_provision = Some(ProvisionPanel::new());
+        ui.reality_provision = Some(ProvisionPanel::bound(ui.editor.as_ref().unwrap()).unwrap());
         click_form_field(&mut ui, &mut model, area, 1);
         ui.paste_record_field("test-reference");
         ui.update(&mut model, press(KeyCode::Esc));

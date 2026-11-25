@@ -520,6 +520,55 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn probe_failure_labels_cover_each_transport_without_echoing_untrusted_text() {
+        for (reason, label) in [
+            ("TLS1.3 not measured", "TLS1.3 не измерен"),
+            ("TLS1.3 rejected", "TLS1.3 отклонён"),
+            ("certificate chain unverified", "цепочка сертификата не проверена"),
+            ("untrusted certificate chain", "цепочка сертификата не доверена"),
+            ("SNI/SAN not measured", "SNI/SAN не измерены"),
+            ("SNI/SAN mismatch", "SNI/SAN не совпадают"),
+            ("certificate validity unverified", "срок действия сертификата не проверен"),
+            ("certificate expired or not yet valid", "сертификат просрочен или ещё не действует"),
+            ("reachability unverified", "доступность не измерена"),
+            ("endpoint unreachable", "адрес недоступен"),
+            ("ALPN not measured", "H2 ALPN не измерен"),
+            ("ALPN not supported", "H2 ALPN не поддерживается"),
+            ("Theia fingerprint not measured", "fingerprint Theia не измерен"),
+            ("Theia fingerprint mismatch", "fingerprint Theia не совпадает"),
+            ("untrusted payload", "неподтверждённый критерий"),
+        ] {
+            assert_eq!(translated_h2_blocker(reason), label);
+        }
+        for (error, label) in [
+            (ProbeError::NotApproved, "нет согласия"),
+            (ProbeError::InvalidServerName, "SNI некорректен"),
+            (ProbeError::InvalidDeadline, "нет deadline"),
+            (ProbeError::NoTrustAnchors, "нет доверенных CA"),
+            (ProbeError::TimedOut, "таймаут TLS"),
+            (ProbeError::ConnectFailed, "TCP недоступен"),
+            (ProbeError::TlsRejected, "TLS/сертификат отклонён"),
+            (ProbeError::WrongAlpn, "нет ALPN h2"),
+        ] {
+            assert_eq!(h2_failure(error), label);
+        }
+        for (error, label) in [
+            (H3ProbeError::NotApproved, "нет согласия"),
+            (H3ProbeError::InvalidServerName, "SNI некорректен"),
+            (H3ProbeError::InvalidDeadline, "нет deadline"),
+            (H3ProbeError::NoTrustAnchors, "нет доверенных CA"),
+            (H3ProbeError::TimedOut, "таймаут QUIC"),
+            (H3ProbeError::UdpUnavailable, "UDP недоступен"),
+            (H3ProbeError::BindFailed, "ошибка UDP сокета"),
+            (H3ProbeError::HandshakeRejected, "QUIC/TLS сертификат или ALPN h3 отклонены"),
+            (H3ProbeError::WrongPeer, "IP QUIC peer не совпал с выбранным"),
+        ] {
+            assert_eq!(h3_failure(error), label);
+        }
+    }
+
     #[test]
     fn no_server_name_means_no_probe_even_for_public_owned_local_address() {
         let mut panel = ProbePanel::new(assigned(), None);
