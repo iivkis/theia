@@ -22,6 +22,14 @@ EXPECTED_JOBS = frozenset({
     "F-14 Linux VM server to native Windows client", "ci-gate",
 })
 
+MERGED_JOBS = EXPECTED_JOBS | frozenset({
+    "Real 300s relay liveness (ubuntu-latest)",
+    "Real 300s relay liveness (windows-latest)",
+    "Coverage instrumented (ubuntu-latest)",
+    "Coverage instrumented (windows-latest)",
+    "Production line coverage >= 80%",
+})
+
 class EvidenceError(ValueError):
     """Incomplete or incomparable timing evidence."""
 
@@ -47,8 +55,12 @@ def summarize(run: dict, response: dict) -> dict:
     require(isinstance(run, dict) and isinstance(response, dict), "expected JSON objects")
     require(run.get("status") == "completed" and run.get("conclusion") == "success",
             "run is not successful and complete")
-    require(run.get("name") == "CI (tests first)", "unexpected workflow")
-    require(run.get("event") in {"push", "pull_request"}, "not ordinary CI")
+    workflow = run.get("name")
+    require(workflow in {"CI (tests first)", "CI (merged dev)"}, "unexpected workflow")
+    merged = workflow == "CI (merged dev)"
+    expected_jobs = MERGED_JOBS if merged else EXPECTED_JOBS
+    require(run.get("event") in ({"pull_request"} if merged else {"push", "pull_request"}),
+            "not ordinary CI")
     sha = run.get("head_sha")
     require(isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) is not None,
             "missing exact head SHA")
@@ -65,20 +77,21 @@ def summarize(run: dict, response: dict) -> dict:
 
     jobs = response.get("jobs")
     require(isinstance(jobs, list) and response.get("total_count") == len(jobs)
-            and len(jobs) in {len(EXPECTED_JOBS), len(EXPECTED_JOBS) + 1},
+            and len(jobs) in ({len(expected_jobs)} if merged else
+                              {len(expected_jobs), len(expected_jobs) + 1}),
             "incomplete or unexpected job matrix")
     # Old successful snapshots predate the optional repair job. Current clean
     # runs may contain exactly one skipped repair; it is not runner time.
     repair_jobs = [job for job in jobs
                    if isinstance(job, dict) and job.get("name") == "format-repair"]
-    require(len(repair_jobs) <= 1, "duplicate format repair")
+    require(len(repair_jobs) <= (0 if merged else 1), "unexpected format repair")
     for repair in repair_jobs:
         require(repair.get("run_id") == run_id and repair.get("head_sha") == sha
                 and repair.get("run_attempt") == attempt, "repair job identity mismatch")
         require(repair.get("status") == "completed" and repair.get("conclusion") == "skipped",
                 "successful ordinary CI cannot execute format repair")
     jobs = [job for job in jobs if job not in repair_jobs]
-    require(len(jobs) == len(EXPECTED_JOBS), "incomplete required job matrix")
+    require(len(jobs) == len(expected_jobs), "incomplete required job matrix")
     timings = {}
     steps = {}
     first = None
@@ -86,7 +99,7 @@ def summarize(run: dict, response: dict) -> dict:
     for job in jobs:
         require(isinstance(job, dict), "invalid job entry")
         name = job.get("name")
-        require(isinstance(name, str) and name in EXPECTED_JOBS and name not in timings,
+        require(isinstance(name, str) and name in expected_jobs and name not in timings,
                 "unknown or duplicate job")
         require(job.get("run_id") == run_id and job.get("head_sha") == sha
                 and job.get("run_attempt") == attempt, "job identity mismatch")
@@ -117,9 +130,9 @@ def summarize(run: dict, response: dict) -> dict:
             measured[number] = (label, int((right - left).total_seconds()))
         steps[name] = measured
 
-    require(set(timings) == EXPECTED_JOBS, "incomplete required job names")
+    require(set(timings) == expected_jobs, "incomplete required job names")
     return {
-        "id": run_id, "sha": sha, "event": run["event"],
+        "id": run_id, "sha": sha, "event": run["event"], "workflow": workflow,
         "creation_to_last_job_s": int((last - created).total_seconds()),
         "first_to_last_job_s": int((last - first).total_seconds()),
         "runner_job_seconds": sum(timings.values()),
@@ -130,6 +143,9 @@ def summarize(run: dict, response: dict) -> dict:
 def compare(before: dict, after: dict) -> str:
     require(before["event"] == after["event"], "do not compare PR with push")
     require(before["id"] != after["id"], "same run is not a comparison")
+    require(before["workflow"] == after["workflow"]
+            and set(before["jobs"]) == set(after["jobs"]),
+            "different required job matrices are not comparable")
     lines = [
         f"Before: run {before['id']} ({before['sha']})",
         f"After: run {after['id']} ({after['sha']})",
@@ -144,13 +160,13 @@ def compare(before: dict, after: dict) -> str:
     ]:
         a, b = before[key], after[key]
         lines.append(f"| {label} | {a} | {b} | {b - a:+d} |")
-    for name in sorted(EXPECTED_JOBS):
+    for name in sorted(before["jobs"]):
         a, b = before["jobs"][name], after["jobs"][name]
         lines.append(f"| {name} | {a} | {b} | {b - a:+d} |")
     lines += ["", "Step timings (matching unique names only):",
               "", "| Job / step | Before (s) | After (s) | Delta (s) |",
               "|---|---:|---:|---:|"]
-    for name in sorted(EXPECTED_JOBS):
+    for name in sorted(before["jobs"]):
         def unique_steps(snapshot: dict) -> dict:
             entries = list(snapshot["steps"][name].values())
             return {label: seconds for label, seconds in entries

@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Closed PR runs otherwise receive read-only cache access. Only the trusted
+# post-merge native dependency-cache producers below may write caches.
+# No cache is restored by the privileged source-publication job.
+cache-mode: read
+
 concurrency:
   # Independent merged commits must not cancel one another.
   group: ci-main-merge-${{ github.event.pull_request.merge_commit_sha || github.run_id }}
@@ -144,7 +149,8 @@ jobs:
   m0-1-api-spike:
     name: m0-1-api-spike (Linux)
     needs: specification
-    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    cache-mode: write
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository && needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -159,6 +165,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
+          cache-workspace-crates: false
           workspaces: "spikes/m0_1 -> target"
           key: "m0-1"
       - name: Test actual HTTP/2 and HTTP/3 TLS transports
@@ -207,7 +215,8 @@ jobs:
   m0-1-windows-spike:
     name: m0-1-api-spike (Windows)
     needs: specification
-    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    cache-mode: write
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository && needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -222,6 +231,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
+          cache-workspace-crates: false
           workspaces: "spikes/m0_1 -> target"
           key: "m0-1-windows"
       - name: Native Windows TLS/H2 and QUIC/H3 tests
@@ -261,12 +272,15 @@ jobs:
   rust-tests:
     name: rust-tests (Linux)
     needs: specification
-    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    cache-mode: write
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository && needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -276,6 +290,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -302,7 +320,8 @@ jobs:
   windows-smoke:
     name: windows-smoke
     needs: specification
-    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    cache-mode: write
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository && needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     runs-on: windows-latest
     timeout-minutes: 35
     env:
@@ -322,6 +341,10 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -417,6 +440,8 @@ jobs:
     env:
       THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
       CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -424,6 +449,11 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -465,12 +495,21 @@ jobs:
             $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'f14_cross_host' -and $_.executable
           })
           if ($tests.Count -ne 1) { throw 'Expected exactly one compiled native F-14 test harness' }
-          $binEvents = @(cargo build --workspace --locked --bin theia --message-format=json |
-            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native Windows client' }
-          $bins = @($binEvents | Where-Object {
-            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and $_.executable
+          # Integration-test compilation normally builds the executable too.
+          # Reuse only a real non-harness bin from this exact Cargo invocation.
+          $bins = @($testEvents | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and
+              $_.target.kind -contains 'bin' -and $_.profile.test -eq $false -and $_.executable
           })
+          if ($bins.Count -eq 0) {
+            $binEvents = @(cargo build --workspace --locked --bin theia --message-format=json |
+              ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native Windows client' }
+            $bins = @($binEvents | Where-Object {
+              $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and
+                $_.target.kind -contains 'bin' -and $_.profile.test -eq $false -and $_.executable
+            })
+          }
           if ($bins.Count -ne 1) { throw 'Expected exactly one compiled Windows client executable' }
           if (!(Test-Path $tests[0].executable -PathType Leaf)) { throw 'Missing compiled F-14 test harness' }
           if (!(Test-Path $bins[0].executable -PathType Leaf)) { throw 'Missing compiled Windows client' }
@@ -497,7 +536,8 @@ jobs:
   m3-4-btls-spike:
     name: m3-4-btls-spike (${{ matrix.os }})
     needs: specification
-    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    cache-mode: write
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository && needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -516,6 +556,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
+          cache-workspace-crates: false
           workspaces: "spikes/m3_4 -> target"
           key: "m3-4-btls"
       - name: Real BoringSSL TCP first flight and strict TLS certificate matrix
@@ -532,7 +574,8 @@ jobs:
   m3-4e-btls-production-feature:
     name: m3-4e-btls-production-feature (${{ matrix.os }})
     needs: specification
-    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    cache-mode: write
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository && needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -552,6 +595,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
+          cache-workspace-crates: false
           key: "m3-4e-feature"
       - name: Verify production H2Client using optional BoringSSL TLS and real SmartTheia
         shell: pwsh
@@ -600,7 +645,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-long-liveness
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
       - name: Mandatory real H2 and H3 traffic beyond 300 seconds
         shell: pwsh
         run: |
@@ -610,7 +658,8 @@ jobs:
   coverage-native:
     name: Coverage instrumented (${{ matrix.os }})
     needs: specification
-    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    cache-mode: write
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository && needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -634,6 +683,7 @@ jobs:
           tool: cargo-llvm-cov@0.9.1
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           key: native-coverage-dependencies-v2
           workspaces: ". -> target/llvm-cov-target"
           cache-targets: true
@@ -649,7 +699,7 @@ jobs:
       - name: Purge any restored profile counters before instrumenting this SHA
         run: cargo llvm-cov clean --profraw-only
       - name: Instrument full native workspace tests
-        run: cargo llvm-cov test --workspace --all-targets --all-features --locked --lcov --include-build-script --output-path coverage.lcov
+        run: cargo llvm-cov test --workspace --all-targets --all-features --locked --no-report
       - name: Instrument real disposable Windows proxy and ConPTY lifecycle
         if: runner.os == 'Windows'
         shell: pwsh
@@ -660,8 +710,8 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override \.\.\. ok') { throw 'Instrumented real WinINet CAS and recovery failed or did not execute' }
           cargo llvm-cov test --workspace --all-features --locked --no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
           if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test compiled_client_proxy_conpty_lifecycle \.\.\. ok') { throw 'Instrumented real ConPTY lifecycle failed or did not execute' }
-          cargo llvm-cov report --lcov --include-build-script --output-path coverage.lcov
-          if ($LASTEXITCODE -ne 0) { throw 'Combined native LCOV export failed' }
+      - name: Export LCOV once after all native instrumented tests
+        run: cargo llvm-cov report --lcov --include-build-script --output-path coverage.lcov
       - name: Export independent LLVM file segments from the same profiles
         run: cargo llvm-cov report --json --include-build-script --output-path coverage-segments.json
       - name: Normalize exact-SHA native line evidence

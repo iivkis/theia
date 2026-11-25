@@ -602,19 +602,13 @@ fn offline_cli_requires_exact_preview_digest_and_guarded_revision() {
     let store = scratch.0.join("store.toml");
     let document = scratch.0.join("descriptor.toml");
     let anchor_text = format!("schema_version = 1\ninbound = \"edge\"\nendpoint = \"edge.example.org:443\"\npublic_key = \"{}\"\nminimum_revision = 1\ntransport = \"auto\"\nxhttp_mode = \"auto\"\n", URL_SAFE_NO_PAD.encode(public(&root)));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     use std::io::Write;
-    options
-        .open(&anchor_path)
-        .unwrap()
-        .write_all(anchor_text.as_bytes())
-        .unwrap();
+    {
+        let mut anchor = theia::client_import::create_private_file(&anchor_path)
+            .expect("create protected independent trust anchor");
+        anchor.write_all(anchor_text.as_bytes()).unwrap();
+        anchor.sync_all().unwrap();
+    }
     let raw = descriptor::sign(&first, &root).unwrap();
     fs::write(&document, &raw).unwrap();
     let a = anchor_path.to_str().unwrap();
