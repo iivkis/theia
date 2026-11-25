@@ -21,13 +21,15 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::{lookup_host, TcpListener, TcpStream},
     sync::{watch, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1625,9 +1627,10 @@ async fn relay_tcp(
     };
     let download = async {
         let mut buffer = [0u8; 4096];
+        let mut batch = crate::relay_batch::BatchReader::new();
         loop {
             let size = tokio::select! {
-                result = read.read(&mut buffer) => {
+                result = batch.read(&mut read, &mut buffer) => {
                     result.map_err(|_| ServerError::Io)?
                 }
                 _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
