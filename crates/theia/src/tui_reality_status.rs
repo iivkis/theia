@@ -591,7 +591,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while p.pending.is_some() {
             p.poll();
-            assert!(std::time::Instant::now() < deadline, "local status worker deadline");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "local status worker deadline"
+            );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -599,7 +602,8 @@ mod tests {
     #[test]
     fn offline_status_workers_fail_closed_and_never_publish_on_missing_config() {
         let mut p = panel(true);
-        let nonexistent = std::env::temp_dir().join(format!("theia-missing-status-{}", std::process::id()));
+        let nonexistent =
+            std::env::temp_dir().join(format!("theia-missing-status-{}", std::process::id()));
         assert!(!nonexistent.exists());
         p.path = nonexistent.clone();
         p.key(key(KeyCode::Char('r')));
@@ -642,7 +646,8 @@ mod tests {
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let (tx, done) = mpsc::channel();
         p.client_run = Some(ClientRun {
-            stop: Some(stop), done,
+            stop: Some(stop),
+            done,
             report: std::sync::Arc::new(std::sync::Mutex::new("active-local".into())),
         });
         assert!(p.body().contains("active-local"));
@@ -650,7 +655,10 @@ mod tests {
         p.key(key(KeyCode::Char('x')));
         assert!(p.body().contains("Открытые туннели"));
         p.key(key(KeyCode::Char('n')));
-        assert!(matches!(stopped.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(matches!(
+            stopped.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         p.key(key(KeyCode::Char('x')));
         p.key(key(KeyCode::Char('y')));
         assert_eq!(stopped.try_recv(), Ok(()));
@@ -661,7 +669,11 @@ mod tests {
         assert!(p.body().contains("runtime остановлен"));
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let (tx, done) = mpsc::channel();
-        p.client_run = Some(ClientRun { stop: Some(stop), done, report: Default::default() });
+        p.client_run = Some(ClientRun {
+            stop: Some(stop),
+            done,
+            report: Default::default(),
+        });
         drop(tx);
         p.poll();
         assert_eq!(stopped.try_recv(), Ok(()));
@@ -700,6 +712,4 @@ mod tests {
         assert!(p.body().contains("ошибкой"));
         assert!(!p.path.exists());
     }
-
-
 }

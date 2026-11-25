@@ -456,9 +456,11 @@ mod tests {
 
     #[test]
     fn registration_worker_rejects_missing_material_and_unknown_save_outcome() {
-        let path = std::env::temp_dir().join(format!("theia-registration-missing-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("theia-registration-missing-{}", std::process::id()));
         assert!(!path.exists());
-        let mut p = RegistrationPanel::from_enrollment(path.clone(), [3;32], &path, [4;32]).unwrap();
+        let mut p =
+            RegistrationPanel::from_enrollment(path.clone(), [3; 32], &path, [4; 32]).unwrap();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         p.key(key(KeyCode::Enter));
         assert!(p.error.is_some());
@@ -480,14 +482,22 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(p.body().contains("ОТКАЗ"));
-        for error in [SaveError::Refused(Error::Indeterminate), SaveError::SavedReloadFailed, SaveError::Refused(Error::Approval)] {
+        for error in [
+            SaveError::Refused(Error::Indeterminate),
+            SaveError::SavedReloadFailed,
+            SaveError::Refused(Error::Approval),
+        ] {
             let (tx, rx) = mpsc::channel();
             p.stage = Stage::Saving(rx);
             assert!(p.body().contains("Атомарное сохранение"));
             assert!(!p.key(key(KeyCode::Esc)));
             tx.send(Err(error)).unwrap();
             assert!(p.poll().is_none());
-            assert!(p.body().contains("запись") || p.body().contains("ОТКАЗ") || p.body().contains("TOML сохранён"));
+            assert!(
+                p.body().contains("запись")
+                    || p.body().contains("ОТКАЗ")
+                    || p.body().contains("TOML сохранён")
+            );
         }
         assert!(!path.exists());
     }
@@ -496,20 +506,32 @@ mod tests {
     fn replacement_request_keeps_selected_inbound_and_requires_uppercase_confirmation() {
         let path = std::env::temp_dir().join("theia-replacement.toml");
         let mut p = RegistrationPanel {
-            role: Role::Server, reenroll_id: Some("selected".into()), config: path,
-            original: [1;32], fields: vec!["health".into(), "bundle".into(), "ab".repeat(32), "cd".repeat(32)],
-            focus: 0, stage: Stage::Input, error: None,
+            role: Role::Server,
+            reenroll_id: Some("selected".into()),
+            config: path,
+            original: [1; 32],
+            fields: vec![
+                "health".into(),
+                "bundle".into(),
+                "ab".repeat(32),
+                "cd".repeat(32),
+            ],
+            focus: 0,
+            stage: Stage::Input,
+            error: None,
         };
         let request = p.request().unwrap();
         assert!(matches!(&request, Request::ReplaceServer(r) if r.id == "selected"));
         assert!(p.body().contains("Независимая замена"));
-        p.stage = Stage::Confirm(Box::new(Review { request, approval: [0;32], body: "review".into() }));
+        p.stage = Stage::Confirm(Box::new(Review {
+            request,
+            approval: [0; 32],
+            body: "review".into(),
+        }));
         assert_eq!(p.body(), "review");
         p.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(matches!(p.stage, Stage::Confirm(_)));
         p.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(matches!(p.stage, Stage::Input));
     }
-
-
 }

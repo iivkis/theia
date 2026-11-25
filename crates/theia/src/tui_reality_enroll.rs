@@ -446,9 +446,13 @@ mod tests {
         p.key(key(KeyCode::BackTab));
         p.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert!(p.fields[0].is_empty());
-        let dir = std::env::temp_dir().join(format!("theia-enrollment-missing-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("theia-enrollment-missing-{}", std::process::id()));
         assert!(!dir.exists());
-        for (i, field) in ["invitation", "admission", "profile", "trust"].into_iter().enumerate() {
+        for (i, field) in ["invitation", "admission", "profile", "trust"]
+            .into_iter()
+            .enumerate()
+        {
             p.fields[i] = Zeroizing::new(dir.join(field).to_str().unwrap().to_owned());
         }
         p.fields[4] = Zeroizing::new("ab".repeat(32));
@@ -471,6 +475,4 @@ mod tests {
         assert!(p.body().contains("ОТКАЗ"));
         assert!(!dir.exists());
     }
-
-
 }

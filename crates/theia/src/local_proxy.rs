@@ -1942,7 +1942,11 @@ mod selector_tests {
                 stream.read_exact(&mut bytes).await.unwrap();
                 assert_eq!(&bytes, b"ping");
                 let report = managed_clients.last().unwrap().runtime_report().await;
-                assert!(report.contains(if socks_mode { "last_open=H3" } else { "last_open=H2" }));
+                assert!(report.contains(if socks_mode {
+                    "last_open=H3"
+                } else {
+                    "last_open=H2"
+                }));
                 established.push(stream);
                 proxies.push(proxy);
             }

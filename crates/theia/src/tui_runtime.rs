@@ -870,12 +870,28 @@ mod tests {
     #[test]
     fn quota_and_auth_rollback_receipts_require_the_correct_operation() {
         for (checking, reply, confirmed, applying, ack, applied) in [
-            (Phase::QuotaChecking { revision: 7 }, StatusReply::QuotaReady,
-                Phase::QuotaConfirming { revision: 7 }, Phase::QuotaApplying,
-                StatusReply::QuotaApplied { revision: 8 }, Phase::QuotaApplied { revision: 8 }),
-            (Phase::RollbackChecking, StatusReply::AuthRollbackReady { revision: 7, remaining_seconds: 123 },
-                Phase::RollbackConfirming { revision: 7, remaining_seconds: 123 }, Phase::RollbackApplying,
-                StatusReply::AuthRollbackApplied { revision: 8 }, Phase::RollbackApplied { revision: 8 }),
+            (
+                Phase::QuotaChecking { revision: 7 },
+                StatusReply::QuotaReady,
+                Phase::QuotaConfirming { revision: 7 },
+                Phase::QuotaApplying,
+                StatusReply::QuotaApplied { revision: 8 },
+                Phase::QuotaApplied { revision: 8 },
+            ),
+            (
+                Phase::RollbackChecking,
+                StatusReply::AuthRollbackReady {
+                    revision: 7,
+                    remaining_seconds: 123,
+                },
+                Phase::RollbackConfirming {
+                    revision: 7,
+                    remaining_seconds: 123,
+                },
+                Phase::RollbackApplying,
+                StatusReply::AuthRollbackApplied { revision: 8 },
+                Phase::RollbackApplied { revision: 8 },
+            ),
         ] {
             let mut panel = fake(Some([3; 32]), false);
             panel.phase = checking;
@@ -907,7 +923,10 @@ mod tests {
             assert!(panel.body().contains("МОГЛО"));
             panel.phase = checking;
             panel.complete(Err(ManagementError::CandidateRejected));
-            assert!(matches!(panel.phase, Phase::QuotaRejected | Phase::RollbackUnavailable));
+            assert!(matches!(
+                panel.phase,
+                Phase::QuotaRejected | Phase::RollbackUnavailable
+            ));
         }
     }
 
@@ -915,7 +934,10 @@ mod tests {
     fn rejected_and_ambiguous_operation_results_are_not_success_receipts() {
         for (phase, rejected) in [
             (Phase::CutoverApplying, Phase::CutoverRejected),
-            (Phase::RestartRollbackApplying, Phase::RestartRollbackUnavailable),
+            (
+                Phase::RestartRollbackApplying,
+                Phase::RestartRollbackUnavailable,
+            ),
             (Phase::QuotaApplying, Phase::QuotaRejected),
             (Phase::RollbackApplying, Phase::Rejected),
             (Phase::Applying, Phase::Rejected),
@@ -931,7 +953,10 @@ mod tests {
         }
         let mut panel = fake(Some([3; 32]), false);
         panel.phase = Phase::CutoverChecking { revision: 7 };
-        panel.complete(Ok(StatusReply::RestartPreview { same_port: true, material_sha256: [5; 32] }));
+        panel.complete(Ok(StatusReply::RestartPreview {
+            same_port: true,
+            material_sha256: [5; 32],
+        }));
         assert!(panel.body().contains("Смена TLS на текущих портах"));
         panel.phase = Phase::CutoverApplying;
         panel.complete(Ok(StatusReply::RestartApplied { revision: 8 }));
@@ -944,5 +969,4 @@ mod tests {
         panel.complete(Err(ManagementError::CandidateRejected));
         assert_eq!(panel.phase, Phase::CutoverRejected);
     }
-
 }

@@ -538,16 +538,30 @@ mod tests {
 
     #[test]
     fn existing_health_panel_requires_confirmation_and_persists_bundle() {
-        let dir = std::env::temp_dir().join(format!("theia-provision-panel-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("theia-provision-panel-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let health = dir.join("health");
         let output = dir.join("bundle");
         let now = reference_health::unix_now().unwrap();
-        let state = State::new(Plan {
-            schema_version: 1, inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
-            own_ips: vec!["93.184.216.1".parse().unwrap()],
-            references: vec![Target { server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap() }],
-        }, vec![Evidence { h2_status: Some(200), h3_status: None }], now).unwrap();
+        let state = State::new(
+            Plan {
+                schema_version: 1,
+                inbound: "edge".into(),
+                endpoint: "edge.example.org:443".into(),
+                own_ips: vec!["93.184.216.1".parse().unwrap()],
+                references: vec![Target {
+                    server_name: "reference.example.org".into(),
+                    address: "93.184.216.2:443".parse().unwrap(),
+                }],
+            },
+            vec![Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
+            now,
+        )
+        .unwrap();
         Store::new(&health).unwrap().enroll(&state).unwrap();
         let mut p = ProvisionPanel::new();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
@@ -596,7 +610,11 @@ mod tests {
         p.stage = Stage::LoadingPlan(rx);
         assert!(p.body().contains("согласуемого плана"));
         p.poll();
-        tx.send(Ok(PlanReview { digest: [1;32], body: "consent".into() })).unwrap();
+        tx.send(Ok(PlanReview {
+            digest: [1; 32],
+            body: "consent".into(),
+        }))
+        .unwrap();
         p.poll();
         assert_eq!(p.body(), "consent");
         p.key(key(KeyCode::Char('n')));
@@ -616,6 +634,4 @@ mod tests {
         assert!(p.body().contains("ОТКАЗ"));
         assert!(matches!(p.stage, Stage::Input));
     }
-
-
 }
