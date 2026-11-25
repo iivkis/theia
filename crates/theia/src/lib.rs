@@ -52,7 +52,6 @@ pub mod reality_tcp;
 pub mod reference_cli;
 pub mod reference_health;
 pub mod reference_maintenance;
-mod relay_batch;
 mod relay_liveness;
 pub mod reload_preflight;
 pub mod restart_guard;

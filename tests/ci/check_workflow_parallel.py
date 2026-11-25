@@ -367,4 +367,6 @@ require("actual_native_h3_client_initial_reference" in browser
         and "check_f13_observations.py f13-observations" in browser
         and "test_f13_observations.py" in spec,
         "real native and browser first-flight observation matrix must remain mandatory")
+require("test_benchmark_ports.py" in spec and "test_benchmark_ports.py" in browser,
+        "native benchmark transport-specific port reservation regressions remain mandatory")
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")

@@ -10,7 +10,13 @@ use bytes::{Buf, Bytes};
 use h3::{error::Code, quic, server::RequestStream};
 use http::{Request, Response, StatusCode};
 use std::{collections::VecDeque, net::IpAddr, sync::Arc, time::Duration};
-use tokio::{io::AsyncWriteExt, net::TcpStream, sync::watch, task::JoinSet, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::watch,
+    task::JoinSet,
+    time::timeout,
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -701,12 +707,8 @@ async fn relay(
     };
     let download = async {
         let mut buffer = [0; 4096];
-        let mut batch = crate::relay_batch::BatchReader::new();
         loop {
-            let n = batch
-                .read(&mut read, &mut buffer)
-                .await
-                .map_err(|_| ServerError::Io)?;
+            let n = read.read(&mut buffer).await.map_err(|_| ServerError::Io)?;
             let frame = if n == 0 {
                 Frame::Fin
             } else {

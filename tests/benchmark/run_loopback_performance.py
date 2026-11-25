@@ -10,6 +10,7 @@ A same-binary run is a smoke test and cannot establish performance acceptance.
 import argparse
 import base64
 import concurrent.futures
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -24,8 +25,6 @@ import subprocess
 import tempfile
 import threading
 import time
-
-import psutil
 
 LOOP = "127.0.0.1"
 WORKLOADS = {"interactive": (1, 16, 256), "bulk": (1, 8, 65536),
@@ -48,20 +47,38 @@ def recv_exact(sock, size):
     return bytes(result)
 
 
-def free_ports(shared=False):
-    for _ in range(32):
-        with socket.socket() as tcp:
-            tcp.bind((LOOP, 0))
-            port = tcp.getsockname()[1]
-            if not shared:
-                return port
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-                try:
-                    udp.bind((LOOP, port))
-                    return port
-                except OSError:
-                    continue
-    raise RuntimeError("could not reserve loopback TCP/UDP port")
+def reserve_port(stack, kind=socket.SOCK_STREAM):
+    """Use the OS allocator for the actual transport, holding the reservation."""
+    sock = stack.enter_context(socket.socket(socket.AF_INET, kind))
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    sock.bind((LOOP, 0))
+    return sock
+
+
+class TrialPorts:
+    """Own-TLS permits distinct TCP/UDP listeners. Never guess a UDP port from TCP.
+
+    Reservations are held concurrently until the process needs the ports.
+    The close-to-bind handoff is not atomic; a competing bind fails the trial.
+    """
+    def __init__(self, stack):
+        self.h2_socket = reserve_port(stack)
+        self.h3_socket = reserve_port(stack, socket.SOCK_DGRAM)
+        self.http_socket = reserve_port(stack)
+        self.socks_socket = reserve_port(stack)
+        self.h2, self.h3, self.http, self.socks = (
+            sock.getsockname()[1] for sock in
+            (self.h2_socket, self.h3_socket, self.http_socket, self.socks_socket))
+        require(len({self.h2, self.http, self.socks}) == 3, "TCP reservations overlap")
+
+    def release_server(self):
+        self.h2_socket.close()
+        self.h3_socket.close()
+
+    def release_client(self):
+        self.http_socket.close()
+        self.socks_socket.close()
 
 
 class Counter:
@@ -240,7 +257,7 @@ class UDPWitness:
         require(not self.thread.is_alive(), "UDP witness did not stop")
 
 
-def config_files(directory, cert, key, target, front, http, socks, transport, token):
+def config_files(directory, cert, key, h2, h3, front, http, socks, transport, token):
     q = lambda value: json.dumps(str(value), ensure_ascii=False)
     common = '\n[management]\nipc = "auto"\nlog_level = "error"\n[ui]\nlanguage = "en"\n'
     server = f'''schema_version = 1
@@ -251,8 +268,8 @@ id = "bench"
 path_prefix = "/v1/bench"
 security_mode = "own-tls"
 allowed_user_ids = ["fixture"]
-h2_listen = "{LOOP}:{target}"
-quic_listen = "{LOOP}:{target}"
+h2_listen = "{LOOP}:{h2}"
+quic_listen = "{LOOP}:{h3}"
 server_name = "localhost"
 tls_cert = {q("file:" + str(cert))}
 tls_key = {q("file:" + str(key))}
@@ -349,21 +366,23 @@ def sample_rss(processes):
 
 
 def trial(binary, cert, key, transport, workload, condition):
+    import psutil
+
     streams, count, size = WORKLOADS[workload]
-    target = free_ports(shared=True)
+    reservations = ExitStack()
     counter = Counter(condition)
-    witness = (TCPFixture(TCPWitness, target, counter) if transport == "h2"
-               else UDPWitness(target, counter))
+    witness = None
     origin = None
     children = []
     sampler = None
     sampling_stop = threading.Event()
     scratch = None
     try:
+        ports = TrialPorts(reservations)
+        witness = (TCPFixture(TCPWitness, ports.h2, counter) if transport == "h2"
+                   else UDPWitness(ports.h3, counter))
         origin = TCPFixture(Echo)
-        http, socks = free_ports(), free_ports()
-        while socks == http:
-            socks = free_ports()
+        http, socks = ports.http, ports.socks
         token = secrets.token_bytes(32)
         env = dict(os.environ)
         for name in tuple(env):
@@ -373,8 +392,10 @@ def trial(binary, cert, key, transport, workload, condition):
         scratch = tempfile.TemporaryDirectory(prefix="theia-perf-")
         if scratch:
             directory = Path(scratch.name)
-            config_files(directory, cert, key, target, witness.port, http, socks, transport, token)
-            for role, port in (("server", target), ("client", http)):
+            config_files(directory, cert, key, ports.h2, ports.h3, witness.port, http, socks, transport, token)
+            for role, port, release in (("server", ports.h2, ports.release_server),
+                                        ("client", http, ports.release_client)):
+                release()
                 child = subprocess.Popen([str(binary), role, "run", "--config",
                                           str(directory / (role + ".toml"))],
                                          env=env, stdin=subprocess.DEVNULL,
@@ -429,7 +450,9 @@ def trial(binary, cert, key, transport, workload, condition):
             sampler.join(TIMEOUT)
         for child in reversed(children):
             stop(child)
-        witness.close()
+        reservations.close()
+        if witness:
+            witness.close()
         if origin:
             origin.close()
         if scratch:
@@ -457,8 +480,13 @@ def run(args):
                     # Alternate order to reduce systematic warm-cache bias.
                     order = ("baseline", "candidate") if repetition % 2 == 0 else ("candidate", "baseline")
                     for variant in order:
-                        result = trial(binary[variant], args.cert.resolve(strict=True),
-                                       args.key.resolve(strict=True), transport, workload, condition)
+                        try:
+                            result = trial(binary[variant], args.cert.resolve(strict=True),
+                                           args.key.resolve(strict=True), transport, workload, condition)
+                        except Exception as error:
+                            raise RuntimeError(
+                                f"trial failed: {transport}/{condition}/{workload}/{repetition}/{variant}"
+                            ) from error
                         rows.append(dict(transport=transport, condition=condition, workload=workload,
                                          trial=repetition, variant=variant, **result))
     return dict(schema=1, scope="controlled-loopback", mode="smoke" if smoke else "comparison",
