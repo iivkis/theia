@@ -396,18 +396,19 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
     let key = base.join("key.pem");
     let server_file = base.join("server.toml");
     let client_file = base.join("client.toml");
-    let generated = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     fs::write(&cert, generated.cert.pem()).unwrap();
     private_pem::write_new_key(&key, generated.key_pair.serialize_pem());
-    let reserve = || {
+    let localhost = tokio::net::lookup_host(("localhost", 0)).await.unwrap().next().unwrap().ip();
+    let reserve = |ip| {
         (0..16).find_map(|_| {
-            let tcp = TcpListener::bind("127.0.0.1:0").ok()?;
+            let tcp = TcpListener::bind(std::net::SocketAddr::new(ip, 0)).ok()?;
             let udp = UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
             Some((tcp, udp))
         }).unwrap()
     };
-    let own = reserve();
-    let smart = reserve();
+    let own = reserve(localhost);
+    let smart = reserve(std::net::Ipv4Addr::LOCALHOST.into());
     let own_addr = own.0.local_addr().unwrap();
     let smart_addr = smart.0.local_addr().unwrap();
     let Config::Server(mut document) = theia::config::parse(&include_str!("../../../examples/server.toml")
@@ -415,7 +416,7 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
     let inbound = &mut document.server.inbounds[0];
     inbound.h2_listen = own_addr.to_string();
     inbound.quic_listen = own_addr.to_string();
-    inbound.server_name = "127.0.0.1".into();
+    inbound.server_name = "localhost".into();
     inbound.tls_cert = format!("file:{}", cert.display());
     inbound.tls_key = format!("file:{}", key.display());
     document.server.policy.allow_private_ips = true;
@@ -443,7 +444,7 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
     let mut credential = PrivateBearer::create(&client_file, &[42;32]).unwrap();
     let profile = &mut client.client.profiles[0];
     profile.server = own_addr.to_string();
-    profile.server_name = "127.0.0.1".into();
+    profile.server_name = "localhost".into();
     profile.tls_ca = Some(format!("file:{}", cert.display()));
     profile.auth_token = credential.reference().unwrap();
     let http = TcpListener::bind("127.0.0.1:0").unwrap();
