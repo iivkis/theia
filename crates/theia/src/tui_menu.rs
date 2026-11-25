@@ -70,7 +70,8 @@ const SERVER: &[Group] = &[
     Group {
         title: "Входящие подключения",
         entries: &[
-            entry("Создать inbound: Own-TLS или REALITY", key('N')),
+            entry("Создать подключение Own-TLS / REALITY", key('N')),
+            always("Мастер REALITY (новое подключение)", key('W')),
             entry(
                 "Изменить выбранное поле inbound",
                 Action::Shortcut(KeyCode::Enter, KeyModifiers::NONE),
@@ -97,7 +98,7 @@ const SERVER: &[Group] = &[
         title: "REALITY: обслуживание",
         entries: &[
             entry("Состояние, ротация и восстановление", key('V')),
-            always("Подготовить отдельный комплект", key('W')),
+            entry("Мастер нового REALITY", key('W')),
             entry("Зарегистрировать существующий комплект", key('M')),
             entry("Независимая замена доверия", key('K')),
             always("Диагностика сети (без автоматических запросов)", key('p')),
@@ -445,6 +446,7 @@ pub(crate) struct ConfigDialog {
     error: Option<&'static str>,
     loading: Option<std::sync::mpsc::Receiver<Result<crate::tui_editor::Editor, &'static str>>>,
     setup: Option<FirstSetup>,
+    reality: Option<crate::tui_reality_provision::ProvisionPanel>,
     creating: bool,
 }
 impl ConfigDialog {
@@ -467,10 +469,15 @@ impl ConfigDialog {
             error: None,
             loading: None,
             setup: None,
+            reality: None,
             creating: false,
         }
     }
     pub(crate) fn paste(&mut self, text: &str) {
+        if let Some(panel) = self.reality.as_mut() {
+            panel.paste(text);
+            return;
+        }
         if let Some(setup) = &mut self.setup {
             setup.paste(text);
             return;
@@ -484,6 +491,12 @@ impl ConfigDialog {
     }
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.loading.is_some() {
+            return false;
+        }
+        if let Some(panel) = self.reality.as_mut() {
+            if panel.key(key) {
+                self.reality = None;
+            }
             return false;
         }
         if let Some(setup) = &mut self.setup {
@@ -525,6 +538,21 @@ impl ConfigDialog {
                     self.error = None;
                 }
             }
+            KeyCode::F(4) if self.role == Role::Server => {
+                if self.input.is_empty() {
+                    self.error = Some("Укажите путь нового TOML.");
+                } else {
+                    match crate::tui_reality_provision::ProvisionPanel::first(
+                        std::path::PathBuf::from(&self.input),
+                    ) {
+                        Ok(panel) => {
+                            self.reality = Some(panel);
+                            self.error = None;
+                        }
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+            }
             KeyCode::Enter => {
                 if self.input.is_empty() {
                     self.error = Some("Укажите путь к существующему файлу.");
@@ -564,6 +592,9 @@ impl ConfigDialog {
         false
     }
     pub(crate) fn poll(&mut self) -> Option<crate::tui_editor::Editor> {
+        if let Some(panel) = self.reality.as_mut() {
+            return panel.poll();
+        }
         use std::sync::mpsc::TryRecvError;
         let result = match self.loading.as_ref()?.try_recv() {
             Ok(result) => result,
@@ -582,6 +613,15 @@ impl ConfigDialog {
             }
         }
     }
+    pub(crate) fn title(&self) -> &'static str {
+        if self.reality.is_some() {
+            "Мастер REALITY"
+        } else if self.setup.is_some() {
+            "Мастер Own-TLS"
+        } else {
+            "Открыть конфигурацию"
+        }
+    }
     pub(crate) fn body(&self) -> String {
         if self.loading.is_some() {
             return if self.creating {
@@ -591,6 +631,9 @@ impl ConfigDialog {
                 "Проверяется существующий TOML; ничего не записывается.".into()
             };
         }
+        if let Some(panel) = &self.reality {
+            return panel.body();
+        }
         if let Some(setup) = &self.setup {
             return setup.body(&self.input);
         }
@@ -599,7 +642,13 @@ impl ConfigDialog {
         } else {
             "Клиент"
         };
-        format!("{role} • открытие или создание конфигурации\n\nПуть: {}\n\n{}\nCtrl+U очистить • Backspace удалить • Enter открыть • F2 создать Own-TLS • Esc отменить\nЗагрузка не запускает runtime, не делает сетевых запросов и не изменяет файл.", self.input, self.error.unwrap_or(""))
+        let reality = if self.role == Role::Server {
+            "\n  F4    SmartTheia REALITY  ·  мастер подбора, без своего сертификата"
+        } else {
+            ""
+        };
+        format!("{role} • открытие или создание конфигурации\n\nПуть к TOML\n> {}\n\nВЫБЕРИТЕ ДЕЙСТВИЕ\n  Enter Открыть существующий TOML\n  F2    Own-TLS  ·  собственный сертификат{reality}\n\n{}\nCtrl+U очистить путь · Esc назад", self.input, self.error.unwrap_or(""))
+
     }
 }
 
