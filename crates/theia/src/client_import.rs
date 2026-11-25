@@ -49,26 +49,37 @@ pub(crate) fn read_product_source(raw: &str) -> Result<ProductSource, ImportErro
         Zeroizing::new(raw.to_owned())
     } else {
         let bytes = read_local_file(Path::new(raw), MAX_URI)?;
-        Zeroizing::new(std::str::from_utf8(&bytes).map_err(|_| ImportError::InvalidSource)?
-            .trim_end_matches(['\r', '\n']).to_owned())
+        Zeroizing::new(
+            std::str::from_utf8(&bytes)
+                .map_err(|_| ImportError::InvalidSource)?
+                .trim_end_matches(['\r', '\n'])
+                .to_owned(),
+        )
     };
     let wire = crate::invite::decode_wire(&uri).map_err(|_| ImportError::InvalidSource)?;
     match wire.security_mode {
         crate::invite::WireSecurity::OwnTls => Invitation::decode(&uri)
-            .map(ProductSource::OwnTls).map_err(|_| ImportError::InvalidSource),
+            .map(ProductSource::OwnTls)
+            .map_err(|_| ImportError::InvalidSource),
         crate::invite::WireSecurity::SmartReality => {
             let checked = if inline {
                 uri
             } else {
-                let protected = crate::reality_bootstrap::read_text(Path::new(raw), crate::invite::MAX_URI, true)
-                    .map_err(|_| ImportError::InvalidSource)?;
+                let protected = crate::reality_bootstrap::read_text(
+                    Path::new(raw),
+                    crate::invite::MAX_URI,
+                    true,
+                )
+                .map_err(|_| ImportError::InvalidSource)?;
                 if protected.as_str() != uri.as_str() {
                     return Err(ImportError::InvalidSource);
                 }
                 protected
             };
-            let now = crate::reference_health::unix_now().map_err(|_| ImportError::InvalidSource)?;
-            crate::reality_bootstrap::Invitation::decode(&checked, now).map_err(|_| ImportError::InvalidSource)?;
+            let now =
+                crate::reference_health::unix_now().map_err(|_| ImportError::InvalidSource)?;
+            crate::reality_bootstrap::Invitation::decode(&checked, now)
+                .map_err(|_| ImportError::InvalidSource)?;
             Ok(ProductSource::Reality)
         }
     }

@@ -683,7 +683,12 @@ pub(crate) fn registered_invitation(
     credential: Option<(&str, &[u8; 32])>,
     now: u64,
 ) -> Result<bootstrap::Invitation, Error> {
-    let inbound = document.server.inbounds.iter().find(|i| i.id == id).ok_or(Error::Scope)?;
+    let inbound = document
+        .server
+        .inbounds
+        .iter()
+        .find(|i| i.id == id)
+        .ok_or(Error::Scope)?;
     if !document.server.enabled || inbound.security_mode != SecurityMode::SmartReality {
         return Err(Error::Grant);
     }
@@ -694,9 +699,14 @@ pub(crate) fn registered_invitation(
         endpoint: format!("{}:{}", inbound.server_name, listen.port()),
     };
     let state = reference_health::Store::new(Path::new(&binding.health_store))
-        .and_then(|s| s.inspect()).map_err(|_| Error::Health)?;
+        .and_then(|s| s.inspect())
+        .map_err(|_| Error::Health)?;
     let (publication, _admission) = crate::reality_provision::capture_registered(
-        Path::new(&binding.bundle), binding, &state, &scope, now,
+        Path::new(&binding.bundle),
+        binding,
+        &state,
+        &scope,
+        now,
     )?;
     // Prefer the active signer while it remains valid. The successor can
     // be used after expiration, but its fingerprint must be verified
@@ -709,7 +719,12 @@ pub(crate) fn registered_invitation(
     };
     match credential {
         Some((user, bearer)) => bootstrap::Invitation::issued(
-            material.identity(), material.signed(), document, user, bearer, now,
+            material.identity(),
+            material.signed(),
+            document,
+            user,
+            bearer,
+            now,
         ),
         None => bootstrap::Invitation::public(material.identity(), material.signed(), now),
     }

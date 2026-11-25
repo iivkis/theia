@@ -213,7 +213,10 @@ enum IssueFlow {
     ExportFailed,
     Showing(Zeroizing<String>),
     Public(String),
-    ShareConfirm { action: crate::tui_share::Action, public: Option<String> },
+    ShareConfirm {
+        action: crate::tui_share::Action,
+        public: Option<String>,
+    },
     Sharing,
     ShareDone(String),
 }
@@ -444,7 +447,9 @@ impl Interaction {
     fn paste_import_source(&mut self, text: &str) {
         if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
             let input = text.trim_end_matches(['\r', '\n']);
-            if source.len().saturating_add(input.len()) <= crate::invite::MAX_URI && !input.contains('\0') {
+            if source.len().saturating_add(input.len()) <= crate::invite::MAX_URI
+                && !input.contains('\0')
+            {
                 source.push_str(input);
             }
         }
@@ -533,7 +538,12 @@ impl Interaction {
     }
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
-        if key.kind != KeyEventKind::Press || self.saving.is_some() || self.exporting.is_some() || self.sharing.is_some() || self.clipboard.is_some() {
+        if key.kind != KeyEventKind::Press
+            || self.saving.is_some()
+            || self.exporting.is_some()
+            || self.sharing.is_some()
+            || self.clipboard.is_some()
+        {
             return false;
         }
         #[cfg(windows)]
@@ -744,21 +754,33 @@ impl Interaction {
             match flow {
                 RecordFlow::ChooseMode(role) => match key.code {
                     KeyCode::Char('1') => {
-                        let action = if role == Role::Server { RecordAction::NewInbound } else { RecordAction::NewProfile };
+                        let action = if role == Role::Server {
+                            RecordAction::NewInbound
+                        } else {
+                            RecordAction::NewProfile
+                        };
                         match editor.record_fields(action) {
-                            Ok(fields) => self.records = Some(RecordFlow::Input { action, fields, focus: 0 }),
+                            Ok(fields) => {
+                                self.records = Some(RecordFlow::Input {
+                                    action,
+                                    fields,
+                                    focus: 0,
+                                })
+                            }
                             Err(message) => editor.error = Some(message.into()),
                         }
                     }
-                    KeyCode::Char('2') if role == Role::Server => match ProvisionPanel::bound(editor) {
-                        Ok(panel) => self.reality_provision = Some(panel),
-                        Err(message) => editor.error = Some(message.into()),
-                    },
+                    KeyCode::Char('2') if role == Role::Server => {
+                        match ProvisionPanel::bound(editor) {
+                            Ok(panel) => self.reality_provision = Some(panel),
+                            Err(message) => editor.error = Some(message.into()),
+                        }
+                    }
                     KeyCode::Char('2') => match EnrollmentPanel::bound(editor) {
                         Ok(panel) => self.reality_enrollment = Some(panel),
                         Err(message) => editor.error = Some(message.into()),
                     },
-                    KeyCode::Esc => {},
+                    KeyCode::Esc => {}
                     _ => self.records = Some(RecordFlow::ChooseMode(role)),
                 },
                 RecordFlow::Confirm(review) => match key.code {
@@ -862,8 +884,15 @@ impl Interaction {
                 },
                 IssueFlow::Offer => match key.code {
                     KeyCode::Char('Q' | 'c') => {
-                        let action = if key.code == KeyCode::Char('Q') { crate::tui_share::Action::Qr } else { crate::tui_share::Action::Clipboard };
-                        self.issuance = Some(IssueFlow::ShareConfirm { action, public: None });
+                        let action = if key.code == KeyCode::Char('Q') {
+                            crate::tui_share::Action::Qr
+                        } else {
+                            crate::tui_share::Action::Clipboard
+                        };
+                        self.issuance = Some(IssueFlow::ShareConfirm {
+                            action,
+                            public: None,
+                        });
                     }
                     KeyCode::Char('f') => {
                         self.issuance = Some(IssueFlow::ConfirmExport);
@@ -905,16 +934,21 @@ impl Interaction {
                         self.issuance = Some(IssueFlow::ExportFailed);
                     }
                 }
-                IssueFlow::Public(link) => {
-                    match key.code {
-                        KeyCode::Char('Q' | 'c') => {
-                            let action = if key.code == KeyCode::Char('Q') { crate::tui_share::Action::Qr } else { crate::tui_share::Action::Clipboard };
-                            self.issuance = Some(IssueFlow::ShareConfirm { action, public: Some(link) });
-                        }
-                        KeyCode::Esc | KeyCode::Enter => {}
-                        _ => self.issuance = Some(IssueFlow::Public(link)),
+                IssueFlow::Public(link) => match key.code {
+                    KeyCode::Char('Q' | 'c') => {
+                        let action = if key.code == KeyCode::Char('Q') {
+                            crate::tui_share::Action::Qr
+                        } else {
+                            crate::tui_share::Action::Clipboard
+                        };
+                        self.issuance = Some(IssueFlow::ShareConfirm {
+                            action,
+                            public: Some(link),
+                        });
                     }
-                }
+                    KeyCode::Esc | KeyCode::Enter => {}
+                    _ => self.issuance = Some(IssueFlow::Public(link)),
+                },
                 IssueFlow::ShareConfirm { action, public } => match key.code {
                     KeyCode::Char('n') | KeyCode::Esc => {
                         self.issuance = Some(public.map_or(IssueFlow::Offer, IssueFlow::Public));
@@ -922,13 +956,16 @@ impl Interaction {
                     KeyCode::Char('y') if key.modifiers.is_empty() => {
                         let link = match public {
                             Some(link) => Some(Zeroizing::new(link)),
-                            None => editor.take_issued().and_then(|invitation| invitation.encode().ok()).map(Zeroizing::new),
+                            None => editor
+                                .take_issued()
+                                .and_then(|invitation| invitation.encode().ok())
+                                .map(Zeroizing::new),
                         };
                         if let Some(link) = link {
                             match action {
                                 crate::tui_share::Action::Qr => {
                                     let path = editor.saved_path().to_owned();
-                                    let (tx,rx) = mpsc::channel();
+                                    let (tx, rx) = mpsc::channel();
                                     self.sharing = Some(rx);
                                     self.issuance = Some(IssueFlow::Sharing);
                                     let _worker = std::thread::spawn(move || {
@@ -948,7 +985,9 @@ impl Interaction {
                 },
                 IssueFlow::Sharing => self.issuance = Some(IssueFlow::Sharing),
                 IssueFlow::ShareDone(message) => {
-                    if key.code != KeyCode::Esc { self.issuance = Some(IssueFlow::ShareDone(message)); }
+                    if key.code != KeyCode::Esc {
+                        self.issuance = Some(IssueFlow::ShareDone(message));
+                    }
                 }
                 IssueFlow::Showing(link) => {
                     if key.code == KeyCode::Esc {
@@ -1330,7 +1369,9 @@ impl Interaction {
                 }
                 return false;
             }
-            if key.code == KeyCode::Char('N') && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+            if key.code == KeyCode::Char('N')
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            {
                 match editor.require_clean_records() {
                     Ok(()) => self.records = Some(RecordFlow::ChooseMode(editor.role())),
                     Err(message) => editor.error = Some(message.into()),
@@ -1955,7 +1996,9 @@ fn draw_issuance(
     };
     let body = if matches!(flow, IssueFlow::Offer | IssueFlow::Public(_)) {
         format!("{body}\nQ: защищённый QR | c: буфер обмена (отдельное подтверждение)")
-    } else { body };
+    } else {
+        body
+    };
     panel(frame, area, title, &body, true);
 }
 
@@ -2142,7 +2185,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
             batch.poll();
         }
         if let Some(provision) = interaction.reality_provision.as_mut() {
-            if let Some(editor) = provision.poll() { interaction.editor = Some(editor); }
+            if let Some(editor) = provision.poll() {
+                interaction.editor = Some(editor);
+            }
         }
         if let Some(enrollment) = interaction.reality_enrollment.as_mut() {
             if let Some(editor) = enrollment.poll() {
@@ -2166,7 +2211,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         if let Some(link) = interaction.clipboard.take() {
             let message = if crate::tui_share::send_clipboard(io::stdout().lock(), &link).is_ok() {
                 "Запрос копирования отправлен терминалу; фактическое содержимое буфера не подтверждено. Проверьте вставкой в доверенное приложение."
-            } else { "Запрос копирования не подтверждён. Для конфиденциальной ссылки потребуется новая выдача." };
+            } else {
+                "Запрос копирования не подтверждён. Для конфиденциальной ссылки потребуется новая выдача."
+            };
             interaction.issuance = Some(IssueFlow::ShareDone(message.into()));
         }
         terminal.draw(|frame| draw(frame, &model, Some(&interaction)))?;
@@ -2627,20 +2674,38 @@ mod tests {
     fn common_import_dispatches_reality_uri_to_masked_independent_enrollment() {
         use crate::reference_health::{Evidence, Plan, State, Target};
         let now = crate::reference_health::unix_now().unwrap();
-        let state = State::new(Plan {
-            schema_version: 1, inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
-            own_ips: vec!["93.184.216.1".parse().unwrap()],
-            references: vec![Target {
-                server_name: "reference.example.org".into(),
-                address: "93.184.216.2:443".parse().unwrap(),
+        let state = State::new(
+            Plan {
+                schema_version: 1,
+                inbound: "edge".into(),
+                endpoint: "edge.example.org:443".into(),
+                own_ips: vec!["93.184.216.1".parse().unwrap()],
+                references: vec![Target {
+                    server_name: "reference.example.org".into(),
+                    address: "93.184.216.2:443".parse().unwrap(),
+                }],
+            },
+            vec![Evidence {
+                h2_status: Some(200),
+                h3_status: Some(200),
             }],
-        }, vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+            now,
+        )
+        .unwrap();
         let identity = crate::identity_tls::Identity::generate(crate::descriptor::Scope {
-            inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
-        }).unwrap();
+            inbound: "edge".into(),
+            endpoint: "edge.example.org:443".into(),
+        })
+        .unwrap();
         let signed = crate::reality_bootstrap::initial_descriptor(&state, &identity, now).unwrap();
-        let uri = crate::reality_bootstrap::Invitation::public(&identity, &signed, now).unwrap().encode().unwrap();
-        let path = std::env::temp_dir().join(format!("theia-tui-common-import-{}.toml", std::process::id()));
+        let uri = crate::reality_bootstrap::Invitation::public(&identity, &signed, now)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "theia-tui-common-import-{}.toml",
+            std::process::id()
+        ));
         std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
         let before = std::fs::read(&path).unwrap();
         let mut model = Model::new(Some(Role::Client));
@@ -2957,7 +3022,9 @@ mod tests {
 
     #[test]
     fn clipboard_and_qr_offer_require_separate_confirmation_and_never_render_secret() {
-        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("theia-share-ui").unwrap()).with_extension("toml");
+        let path = std::env::temp_dir()
+            .join(crate::tui_editor::generated_id("theia-share-ui").unwrap())
+            .with_extension("toml");
         std::fs::write(&path, server_issuance_fixture()).unwrap();
         let mut editor = Editor::load(Role::Server, &path).unwrap();
         editor.issue_user("share-device").unwrap();
@@ -2965,11 +3032,11 @@ mod tests {
         let mut ui = Interaction::new(Some(editor));
         let mut model = Model::new(Some(Role::Server));
         ui.issuance = Some(IssueFlow::Offer);
-        for key in ['Q','c'] {
+        for key in ['Q', 'c'] {
             ui.update(&mut model, press(KeyCode::Char(key)));
             assert!(matches!(ui.issuance, Some(IssueFlow::ShareConfirm { .. })));
             assert!(ui.clipboard.is_none() && ui.sharing.is_none());
-            assert!(!rendered_interaction(120,40,&model,&ui).contains("theia://v1/"));
+            assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
             ui.update(&mut model, press(KeyCode::Esc));
             assert!(ui.editor.as_ref().unwrap().issued_ready());
         }
@@ -2978,7 +3045,7 @@ mod tests {
         let link = ui.clipboard.take().unwrap();
         assert!(Invitation::decode(&link).unwrap().has_token());
         assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
-        assert!(!rendered_interaction(120,40,&model,&ui).contains("theia://v1/"));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
         std::fs::remove_file(&path).unwrap();
         let _ = std::fs::remove_file(crate::config::lock_path(&path).unwrap());
     }

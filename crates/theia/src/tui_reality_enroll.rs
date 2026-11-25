@@ -145,15 +145,32 @@ impl EnrollmentPanel {
     pub(crate) fn bound(editor: &crate::tui_editor::Editor) -> Result<Self, &'static str> {
         editor.require_clean_records()?;
         let mut panel = Self::new();
-        let path = std::path::absolute(editor.saved_path()).map_err(|_| "Недопустимый путь TOML")?;
-        let root = path.parent().ok_or("Недопустимый путь TOML")?.join(crate::tui_editor::generated_id(".theia-enroll")?);
-        panel.fields[2] = Zeroizing::new(root.join("profile.toml").to_str().ok_or("Недопустимый путь")?.to_owned());
-        panel.fields[3] = Zeroizing::new(root.join("trust.toml").to_str().ok_or("Недопустимый путь")?.to_owned());
+        let path =
+            std::path::absolute(editor.saved_path()).map_err(|_| "Недопустимый путь TOML")?;
+        let root = path
+            .parent()
+            .ok_or("Недопустимый путь TOML")?
+            .join(crate::tui_editor::generated_id(".theia-enroll")?);
+        panel.fields[2] = Zeroizing::new(
+            root.join("profile.toml")
+                .to_str()
+                .ok_or("Недопустимый путь")?
+                .to_owned(),
+        );
+        panel.fields[3] = Zeroizing::new(
+            root.join("trust.toml")
+                .to_str()
+                .ok_or("Недопустимый путь")?
+                .to_owned(),
+        );
         panel.config = Some((path, editor.saved_sha256()));
         Ok(panel)
     }
 
-    pub(crate) fn from_source(editor: &crate::tui_editor::Editor, source: Zeroizing<String>) -> Result<Self, &'static str> {
+    pub(crate) fn from_source(
+        editor: &crate::tui_editor::Editor,
+        source: Zeroizing<String>,
+    ) -> Result<Self, &'static str> {
         if source.len() > bootstrap::MAX_URI {
             return Err("Приглашение превышает лимит v1.");
         }
@@ -164,7 +181,11 @@ impl EnrollmentPanel {
     }
 
     fn limit(&self) -> usize {
-        if self.focus == 0 { bootstrap::MAX_URI } else { LIMIT }
+        if self.focus == 0 {
+            bootstrap::MAX_URI
+        } else {
+            LIMIT
+        }
     }
 
     fn input(&self) -> Result<Input, Error> {
@@ -172,8 +193,14 @@ impl EnrollmentPanel {
         let identity = crate::parse_restart_digest(&self.fields[4]).ok_or(Error::Approval)?;
         let token = (!self.fields[5].is_empty()).then(|| self.fields[5].clone());
         Ok(Input {
-            source: if self.fields[0].starts_with("theia://") { PathBuf::new() } else { path(0) },
-            inline: self.fields[0].starts_with("theia://").then(|| self.fields[0].clone()),
+            source: if self.fields[0].starts_with("theia://") {
+                PathBuf::new()
+            } else {
+                path(0)
+            },
+            inline: self.fields[0]
+                .starts_with("theia://")
+                .then(|| self.fields[0].clone()),
             admission: path(1),
             profile: path(2),
             trust: path(3),
@@ -190,7 +217,9 @@ impl EnrollmentPanel {
         if !matches!(self.stage, Stage::Input) {
             return;
         }
-        if self.config.is_some() && matches!(self.focus, 2 | 3) { return; }
+        if self.config.is_some() && matches!(self.focus, 2 | 3) {
+            return;
+        }
         let value = value.trim_end_matches(['\r', '\n']);
         let limit = self.limit();
         let field = &mut self.fields[self.focus];
@@ -207,7 +236,8 @@ impl EnrollmentPanel {
         match &self.stage {
             Stage::Loading(_) | Stage::Applying(_) => return false,
             Stage::Done(_) => {
-                if key.code == KeyCode::Char('g') && (self.config.is_none() || self.owned.is_some()) {
+                if key.code == KeyCode::Char('g') && (self.config.is_none() || self.owned.is_some())
+                {
                     if let (Some((path, digest)), Ok(input)) = (&self.config, self.input()) {
                         match crate::tui_reality_register::RegistrationPanel::from_enrollment(
                             path.clone(),
@@ -215,10 +245,12 @@ impl EnrollmentPanel {
                             &input.profile,
                             input.identity,
                         ) {
-                            Ok(panel) => self.registration = Some(match self.owned.take() {
-                                Some(owned) => panel.own_material(owned),
-                                None => panel,
-                            }),
+                            Ok(panel) => {
+                                self.registration = Some(match self.owned.take() {
+                                    Some(owned) => panel.own_material(owned),
+                                    None => panel,
+                                })
+                            }
                             Err(error) => self.error = Some(error.to_string()),
                         }
                     }
@@ -253,18 +285,28 @@ impl EnrollmentPanel {
                         let _worker = std::thread::spawn(move || {
                             let result = (|| {
                                 let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
-                                let mut owned = config.as_ref().map(|(path, digest)| {
-                                    crate::tui_staged_material::StagedMaterial::create(
-                                        input.profile.parent().ok_or(Error::Storage)?, path, *digest)
-                                }).transpose()?;
+                                let mut owned = config
+                                    .as_ref()
+                                    .map(|(path, digest)| {
+                                        crate::tui_staged_material::StagedMaterial::create(
+                                            input.profile.parent().ok_or(Error::Storage)?,
+                                            path,
+                                            *digest,
+                                        )
+                                    })
+                                    .transpose()?;
                                 match apply(&input, review, now) {
                                     Ok(message) => Ok((message, owned)),
                                     Err(Error::Indeterminate) => {
-                                        if let Some(guard) = &mut owned { guard.preserve(); }
+                                        if let Some(guard) = &mut owned {
+                                            guard.preserve();
+                                        }
                                         Err(Error::Indeterminate)
                                     }
                                     Err(error) => {
-                                        if let Some(guard) = &mut owned { guard.cleanup()?; }
+                                        if let Some(guard) = &mut owned {
+                                            guard.cleanup()?;
+                                        }
                                         Err(error)
                                     }
                                 }
@@ -282,11 +324,15 @@ impl EnrollmentPanel {
             KeyCode::Esc => return true,
             KeyCode::Tab => {
                 self.focus = (self.focus + 1) % LABELS.len();
-                if self.config.is_some() && self.focus == 2 { self.focus = 4; }
+                if self.config.is_some() && self.focus == 2 {
+                    self.focus = 4;
+                }
             }
             KeyCode::BackTab => {
                 self.focus = (self.focus + LABELS.len() - 1) % LABELS.len();
-                if self.config.is_some() && self.focus == 3 { self.focus = 1; }
+                if self.config.is_some() && self.focus == 3 {
+                    self.focus = 1;
+                }
             }
             KeyCode::Backspace => {
                 self.fields[self.focus].pop();
@@ -331,7 +377,10 @@ impl EnrollmentPanel {
                 Err(TryRecvError::Disconnected) => Err(Error::Storage),
             },
             Stage::Applying(rx) => match rx.try_recv() {
-                Ok(result) => result.map(|(message, owned)| { self.owned = owned; Stage::Done(message) }),
+                Ok(result) => result.map(|(message, owned)| {
+                    self.owned = owned;
+                    Stage::Done(message)
+                }),
                 Err(TryRecvError::Empty) => return None,
                 Err(TryRecvError::Disconnected) => Err(Error::Indeterminate),
             },
@@ -343,7 +392,11 @@ impl EnrollmentPanel {
                 self.error = Some(format!(
                     "ОТКАЗ: {error}. При неопределённой записи проверьте файлы перед повтором."
                 ));
-                self.stage = if error == Error::Indeterminate { Stage::Done(format!("ОТКАЗ: неопределённая запись. Проверьте подготовленный профиль {:?}; повтор заблокирован.", Path::new(self.fields[2].as_str()))) } else { Stage::Input };
+                self.stage = if error == Error::Indeterminate {
+                    Stage::Done(format!("ОТКАЗ: неопределённая запись. Проверьте подготовленный профиль {:?}; повтор заблокирован.", Path::new(self.fields[2].as_str())))
+                } else {
+                    Stage::Input
+                };
             }
         }
         None
@@ -357,7 +410,9 @@ impl EnrollmentPanel {
             Stage::Input => {
                 let mut out = String::from("Локальные абсолютные пути; значения скрыты.\n");
                 for (i, label) in LABELS.iter().enumerate() {
-                    if self.config.is_some() && matches!(i, 2 | 3) { continue; }
+                    if self.config.is_some() && matches!(i, 2 | 3) {
+                        continue;
+                    }
                     out.push_str(&format!(
                         "{} {label}: {} ({} bytes)\n",
                         if i == self.focus { ">" } else { " " },
@@ -455,7 +510,10 @@ mod tests {
         assert!(!review.body.contains(uri.as_str()));
         input.inline = Some(uri.clone());
         let inline = inspect(&input, 1000).unwrap();
-        assert_eq!(inline.approval.document_sha256, review.approval.document_sha256);
+        assert_eq!(
+            inline.approval.document_sha256,
+            review.approval.document_sha256
+        );
         assert_eq!(inline.admission, review.admission);
         input.inline = None;
         assert!(!review.body.contains("env:TEST_BEARER"));
@@ -481,13 +539,15 @@ mod tests {
     fn wizard_handoff_keeps_original_config_binding_and_requires_profile_id() {
         let mut panel = EnrollmentPanel::new();
         use sha2::{Digest, Sha256};
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("enroll-handoff").unwrap());
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("enroll-handoff").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let cfg = dir.join("client.toml");
         std::fs::write(&cfg, include_str!("../../../examples/client.toml")).unwrap();
         let digest = Sha256::digest(std::fs::read(&cfg).unwrap()).into();
         let root = dir.join("enrollment");
-        panel.owned = Some(crate::tui_staged_material::StagedMaterial::create(&root, &cfg, digest).unwrap());
+        panel.owned =
+            Some(crate::tui_staged_material::StagedMaterial::create(&root, &cfg, digest).unwrap());
         panel.config = Some((cfg.clone(), digest));
         panel.fields[2] = Zeroizing::new(root.join("profile.toml").to_string_lossy().into_owned());
         panel.fields[4] = Zeroizing::new("ab".repeat(32));

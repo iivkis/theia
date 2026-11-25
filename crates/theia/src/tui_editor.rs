@@ -123,7 +123,10 @@ impl IssuedInvitation {
     pub fn encode(&self) -> Result<String, &'static str> {
         match self {
             Self::OwnTls(value) => value.encode().map_err(|_| "Invalid invitation"),
-            Self::Reality { invitation, .. } => invitation.encode().map(|uri| uri.to_string()).map_err(|_| "Invalid REALITY invitation"),
+            Self::Reality { invitation, .. } => invitation
+                .encode()
+                .map(|uri| uri.to_string())
+                .map_err(|_| "Invalid REALITY invitation"),
         }
     }
     pub fn token_bytes(&self) -> Option<[u8; 32]> {
@@ -135,22 +138,34 @@ impl IssuedInvitation {
 }
 
 fn server_invitation(
-    config: &Config, id: &str, credential: Option<(&str, &[u8; 32])>,
+    config: &Config,
+    id: &str,
+    credential: Option<(&str, &[u8; 32])>,
 ) -> Result<IssuedInvitation, &'static str> {
-    let Config::Server(document) = config else { return Err("Server configuration required"); };
-    let inbound = document.server.inbounds.iter().find(|entry| entry.id == id).ok_or("Inbound missing")?;
+    let Config::Server(document) = config else {
+        return Err("Server configuration required");
+    };
+    let inbound = document
+        .server
+        .inbounds
+        .iter()
+        .find(|entry| entry.id == id)
+        .ok_or("Inbound missing")?;
     if inbound.security_mode == SecurityMode::SmartReality {
         let now = crate::reference_health::unix_now().map_err(|_| "Invalid clock")?;
-        let invitation = crate::reality_config::registered_invitation(document, id, credential, now)
-            .map_err(|_| "Registered REALITY publication not eligible")?;
+        let invitation =
+            crate::reality_config::registered_invitation(document, id, credential, now)
+                .map_err(|_| "Registered REALITY publication not eligible")?;
         return Ok(IssuedInvitation::Reality {
-            invitation, user: credential.map_or_else(String::new, |(user, _)| user.to_owned()),
+            invitation,
+            user: credential.map_or_else(String::new, |(user, _)| user.to_owned()),
         });
     }
     let invitation = match credential {
         Some((user, bearer)) => Invitation::issued_from_server(config, id, user, bearer),
         None => Invitation::public_from_server(config, id),
-    }.map_err(|_| "Selected inbound cannot issue invitations")?;
+    }
+    .map_err(|_| "Selected inbound cannot issue invitations")?;
     Ok(IssuedInvitation::OwnTls(invitation))
 }
 
@@ -625,7 +640,12 @@ impl Editor {
             // Publication/health may have advanced during TOML save. Never
             // reveal an outdated or no-longer-authorized confidential offer.
             let token = Zeroizing::new(invitation.token_bytes()?);
-            let current = server_invitation(&self.original, self.selected_record_id(), Some((user, &token))).ok();
+            let current = server_invitation(
+                &self.original,
+                self.selected_record_id(),
+                Some((user, &token)),
+            )
+            .ok();
             let unchanged = current.as_ref().is_some_and(|value| {
                 let left = invite.encode().ok().map(Zeroizing::new);
                 let right = value.encode().ok().map(Zeroizing::new);
@@ -650,7 +670,8 @@ impl Editor {
         }
         let invite = match &self.original {
             Config::Server(_) => {
-                return server_invitation(&self.original, self.selected_record_id(), None)?.encode();
+                return server_invitation(&self.original, self.selected_record_id(), None)?
+                    .encode();
             }
             Config::Client(doc) => {
                 let profile = doc
@@ -674,7 +695,9 @@ impl Editor {
         }
         let invite = self.take_issued().ok_or("No saved invitation available")?;
         let result = match &invite {
-            IssuedInvitation::OwnTls(value) => client_import::export_invitation_file(&self.path, value),
+            IssuedInvitation::OwnTls(value) => {
+                client_import::export_invitation_file(&self.path, value)
+            }
             IssuedInvitation::Reality { .. } => {
                 let encoded = Zeroizing::new(invite.encode()?);
                 client_import::export_encoded_invitation(&self.path, &encoded)
@@ -910,7 +933,9 @@ impl Editor {
                 )
             }
             (Config::Server(doc), RecordAction::SetQuota) => {
-                let per: u32 = fields[0].parse().map_err(|_| "Неверный лимит пользователя")?;
+                let per: u32 = fields[0]
+                    .parse()
+                    .map_err(|_| "Неверный лимит пользователя")?;
                 let total: u32 = fields[1].parse().map_err(|_| "Неверный общий лимит")?;
                 if per == 0 || total == 0 || per > total {
                     return Err("Требуется 0 < per-user <= total");
@@ -1796,16 +1821,25 @@ mod tests {
         let temp = Temp::write(&server_source());
         let original = fs::read(&temp.0).unwrap();
         let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
-        assert_eq!(editor.record_fields(RecordAction::SetQuota).unwrap().len(), 2);
+        assert_eq!(
+            editor.record_fields(RecordAction::SetQuota).unwrap().len(),
+            2
+        );
         for values in [["0", "4"], ["5", "4"], ["x", "4"], ["4", "0"]] {
-            assert!(editor.review_record(RecordAction::SetQuota, &values.map(str::to_owned)).is_err());
+            assert!(editor
+                .review_record(RecordAction::SetQuota, &values.map(str::to_owned))
+                .is_err());
         }
-        let review = editor.review_record(RecordAction::SetQuota, &["3".into(), "7".into()]).unwrap();
+        let review = editor
+            .review_record(RecordAction::SetQuota, &["3".into(), "7".into()])
+            .unwrap();
         assert_eq!(fs::read(&temp.0).unwrap(), original);
         editor.stage_record(review).unwrap();
         assert_eq!(fs::read(&temp.0).unwrap(), original);
         assert!(editor.save());
-        let Config::Server(doc) = config::read_file(&temp.0).unwrap() else { panic!("server"); };
+        let Config::Server(doc) = config::read_file(&temp.0).unwrap() else {
+            panic!("server");
+        };
         assert_eq!(doc.server.policy.max_connections_per_user, 3);
         assert_eq!(doc.server.policy.max_connections_total, 7);
     }
@@ -1818,29 +1852,44 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
-            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
         }
         let _cleanup = Cleanup(directory.clone());
         let now = crate::reference_health::unix_now().unwrap();
-        let state = State::new(Plan {
-            schema_version: 1,
-            inbound: "reality".into(),
-            endpoint: "127.0.0.1:9443".into(),
-            own_ips: vec!["127.0.0.1".parse().unwrap()],
-            references: vec![Target {
-                server_name: "reference.example.org".into(),
-                address: "93.184.216.2:443".parse().unwrap(),
+        let state = State::new(
+            Plan {
+                schema_version: 1,
+                inbound: "reality".into(),
+                endpoint: "127.0.0.1:9443".into(),
+                own_ips: vec!["127.0.0.1".parse().unwrap()],
+                references: vec![Target {
+                    server_name: "reference.example.org".into(),
+                    address: "93.184.216.2:443".parse().unwrap(),
+                }],
+            },
+            vec![Evidence {
+                h2_status: Some(200),
+                h3_status: Some(200),
             }],
-        }, vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+            now,
+        )
+        .unwrap();
         let health = directory.join("health.toml");
         Store::new(&health).unwrap().enroll(&state).unwrap();
         let bundle = directory.join("bundle");
         let digest = state.snapshot_sha256().unwrap();
         let record = crate::reality_provision::create(&state, digest, &bundle, now).unwrap();
-        let request = crate::reality_config::Request::Server(crate::reality_config::ServerRequest {
-            health, bundle, health_sha256: digest, identity_sha256: record.identity_sha256,
-            listen: "127.0.0.1:9443".parse().unwrap(), grants: vec!["device-a".into()],
-        });
+        let request =
+            crate::reality_config::Request::Server(crate::reality_config::ServerRequest {
+                health,
+                bundle,
+                health_sha256: digest,
+                identity_sha256: record.identity_sha256,
+                listen: "127.0.0.1:9443".parse().unwrap(),
+                grants: vec!["device-a".into()],
+            });
         let review = crate::reality_config::prepare(&temp.0, &request, now).unwrap();
         crate::reality_config::apply(&temp.0, &request, review.approval_sha256(), now).unwrap();
         let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
@@ -1856,12 +1905,15 @@ mod tests {
         let invite = editor.take_issued().unwrap();
         let first = Zeroizing::new(invite.token_bytes().unwrap());
         let raw = Zeroizing::new(invite.encode().unwrap());
-        assert!(crate::reality_bootstrap::Invitation::decode(&raw, now).unwrap().has_token());
+        assert!(crate::reality_bootstrap::Invitation::decode(&raw, now)
+            .unwrap()
+            .has_token());
         assert!(editor.take_issued().is_none());
         editor.rotate_user("new-reality").unwrap();
         assert!(editor.save());
         let path = editor.export_issued_file().unwrap();
-        let encoded = crate::reality_bootstrap::read_text(&path, crate::invite::MAX_URI, true).unwrap();
+        let encoded =
+            crate::reality_bootstrap::read_text(&path, crate::invite::MAX_URI, true).unwrap();
         let rotated = crate::reality_bootstrap::Invitation::decode(&encoded, now).unwrap();
         assert_ne!(rotated.token_bytes(), Some(*first));
         fs::remove_file(&path).unwrap();

@@ -59,9 +59,14 @@ enum Phase {
     },
     CutoverRejected,
     TlsRollbackChecking,
-    TlsRollbackConfirming { revision: u64, remaining_seconds: u64 },
+    TlsRollbackConfirming {
+        revision: u64,
+        remaining_seconds: u64,
+    },
     TlsRollbackApplying,
-    TlsRollbackApplied { revision: u64 },
+    TlsRollbackApplied {
+        revision: u64,
+    },
     TlsRollbackUnavailable,
     RestartRollbackChecking,
     RestartRollbackConfirming {
@@ -261,15 +266,24 @@ impl RuntimePanel {
             }
             Phase::TlsRollbackChecking => {
                 self.phase = match result {
-                    Ok(StatusReply::TlsRollbackReady { revision, remaining_seconds }) =>
-                        Phase::TlsRollbackConfirming { revision, remaining_seconds },
+                    Ok(StatusReply::TlsRollbackReady {
+                        revision,
+                        remaining_seconds,
+                    }) => Phase::TlsRollbackConfirming {
+                        revision,
+                        remaining_seconds,
+                    },
                     _ => Phase::TlsRollbackUnavailable,
                 };
             }
             Phase::TlsRollbackApplying => {
                 self.phase = match result {
-                    Ok(StatusReply::TlsRollbackApplied { revision }) => Phase::TlsRollbackApplied { revision },
-                    Err(ManagementError::CandidateRejected | ManagementError::Unsupported) => Phase::TlsRollbackUnavailable,
+                    Ok(StatusReply::TlsRollbackApplied { revision }) => {
+                        Phase::TlsRollbackApplied { revision }
+                    }
+                    Err(ManagementError::CandidateRejected | ManagementError::Unsupported) => {
+                        Phase::TlsRollbackUnavailable
+                    }
                     _ => Phase::Indeterminate,
                 };
             }
@@ -396,8 +410,18 @@ impl RuntimePanel {
                 | Phase::TlsRollbackApplying,
                 _,
             ) => false,
-            (Phase::CutoverChecking { .. } | Phase::RestartRollbackChecking | Phase::TlsRollbackChecking, KeyCode::Esc) => true,
-            (Phase::CutoverChecking { .. } | Phase::RestartRollbackChecking | Phase::TlsRollbackChecking, _) => false,
+            (
+                Phase::CutoverChecking { .. }
+                | Phase::RestartRollbackChecking
+                | Phase::TlsRollbackChecking,
+                KeyCode::Esc,
+            ) => true,
+            (
+                Phase::CutoverChecking { .. }
+                | Phase::RestartRollbackChecking
+                | Phase::TlsRollbackChecking,
+                _,
+            ) => false,
             (
                 Phase::Viewing { revision, .. }
                 | Phase::Applied { revision }
@@ -444,15 +468,19 @@ impl RuntimePanel {
                 self.start(StatusCommand::CheckRestartRollback);
                 false
             }
-            (Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. }, KeyCode::Char('t'))
-                if self.saved_sha256.is_some() => {
+            (
+                Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. },
+                KeyCode::Char('t'),
+            ) if self.saved_sha256.is_some() => {
                 self.phase = Phase::TlsRollbackChecking;
                 self.start(StatusCommand::CheckTlsRollback);
                 false
             }
             (Phase::TlsRollbackConfirming { revision, .. }, KeyCode::Char('y')) => {
                 self.phase = Phase::TlsRollbackApplying;
-                self.start(StatusCommand::ApplyTlsRollback { expected_revision: revision });
+                self.start(StatusCommand::ApplyTlsRollback {
+                    expected_revision: revision,
+                });
                 false
             }
             (Phase::TlsRollbackConfirming { .. }, KeyCode::Char('n') | KeyCode::Esc) => true,
@@ -644,8 +672,17 @@ mod tests {
     fn tls_rollback_requires_separate_confirmation_and_ack() {
         let mut p = fake(Some([1; 32]), false);
         p.phase = Phase::TlsRollbackChecking;
-        p.complete(Ok(StatusReply::TlsRollbackReady { revision: 7, remaining_seconds: 20 }));
-        assert_eq!(p.phase, Phase::TlsRollbackConfirming { revision: 7, remaining_seconds: 20 });
+        p.complete(Ok(StatusReply::TlsRollbackReady {
+            revision: 7,
+            remaining_seconds: 20,
+        }));
+        assert_eq!(
+            p.phase,
+            Phase::TlsRollbackConfirming {
+                revision: 7,
+                remaining_seconds: 20
+            }
+        );
         assert!(p.body().contains("revision=7"));
         assert!(p.key(key(KeyCode::Char('n'))));
         p.phase = Phase::TlsRollbackApplying;

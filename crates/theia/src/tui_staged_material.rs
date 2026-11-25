@@ -15,35 +15,58 @@ impl StagedMaterial {
         if !crate::bounded_input::explicit_file_path(root) || root.parent() != config.parent() {
             return Err(Error::Storage);
         }
-        if !Self::unchanged(config, source) { return Err(Error::Approval); }
+        if !Self::unchanged(config, source) {
+            return Err(Error::Approval);
+        }
         crate::client_import::new_private_directory(root).map_err(|_| Error::Storage)?;
-        Ok(Self { root: root.to_owned(), config: config.to_owned(), source, armed: true })
+        Ok(Self {
+            root: root.to_owned(),
+            config: config.to_owned(),
+            source,
+            armed: true,
+        })
     }
     fn unchanged(path: &Path, source: [u8; 32]) -> bool {
         config::editor_bytes(path).is_ok_and(|raw| <[u8; 32]>::from(Sha256::digest(raw)) == source)
     }
-    pub(crate) fn root(&self) -> &Path { &self.root }
-    pub(crate) fn preserve(&mut self) { self.armed = false; }
-    pub(crate) fn refuse(&mut self) { self.armed = true; }
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+    pub(crate) fn preserve(&mut self) {
+        self.armed = false;
+    }
+    pub(crate) fn refuse(&mut self) {
+        self.armed = true;
+    }
     pub(crate) fn cleanup(&mut self) -> Result<(), Error> {
-        if !self.armed { return Ok(()); }
+        if !self.armed {
+            return Ok(());
+        }
         // Disarm before deletion: an ambiguous or failed cleanup must never
         // be retried against a path that may have been reused.
         self.armed = false;
         let _lock = config::editor_lock(&self.config).map_err(|_| Error::Indeterminate)?;
-        if !Self::unchanged(&self.config, self.source) { return Err(Error::Indeterminate); }
+        if !Self::unchanged(&self.config, self.source) {
+            return Err(Error::Indeterminate);
+        }
         let meta = std::fs::symlink_metadata(&self.root).map_err(|_| Error::Storage)?;
-        if !meta.is_dir() || meta.file_type().is_symlink() { return Err(Error::Storage); }
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(Error::Storage);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
-            if meta.file_attributes() & 0x400 != 0 { return Err(Error::Storage); }
+            if meta.file_attributes() & 0x400 != 0 {
+                return Err(Error::Storage);
+            }
         }
         std::fs::remove_dir_all(&self.root).map_err(|_| Error::Storage)
     }
 }
 impl Drop for StagedMaterial {
-    fn drop(&mut self) { let _ = self.cleanup(); }
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
 }
 #[cfg(test)]
 mod tests {

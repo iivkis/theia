@@ -108,9 +108,17 @@ impl StatusPanel {
                     let raw = crate::local_proxy::saved_client_bytes(&path, digest)
                         .map_err(|_| Error::Approval)?;
                     let crate::config::Config::Client(doc) = crate::config::parse(
-                        std::str::from_utf8(&raw).map_err(|_| Error::Storage)?
-                    ).map_err(|_| Error::Storage)? else { return Err(Error::Storage); };
-                    let p = doc.client.profiles.iter().find(|p| p.id == id)
+                        std::str::from_utf8(&raw).map_err(|_| Error::Storage)?,
+                    )
+                    .map_err(|_| Error::Storage)?
+                    else {
+                        return Err(Error::Storage);
+                    };
+                    let p = doc
+                        .client
+                        .profiles
+                        .iter()
+                        .find(|p| p.id == id)
                         .ok_or(Error::Storage)?;
                     format!("Сохранённый профиль: {} (Own-TLS)\nEndpoint={}\nTransport={:?}; XHTTP={:?}\nАктивный в TOML: {}\nCA/credential: проверяются при запуске", p.id, p.server, p.transport, p.effective_xhttp_mode(), doc.client.active_profile == id)
                 };
@@ -488,11 +496,16 @@ impl StatusPanel {
                 }
                 return false;
             }
-            if self.reality && self.pending.is_none() && !self.committing && key.code == KeyCode::Char('c') {
+            if self.reality
+                && self.pending.is_none()
+                && !self.committing
+                && key.code == KeyCode::Char('c')
+            {
                 self.credential_input = Some(String::new());
                 return false;
             }
-            if self.reality && self.pending.is_none()
+            if self.reality
+                && self.pending.is_none()
                 && !self.committing
                 && matches!(key.code, KeyCode::Char('o' | 'k'))
             {
@@ -667,8 +680,11 @@ impl StatusPanel {
             if self.server {
                 "t: начать ротацию | p: отозвать старый ключ после overlap | e: восстановить истёкший descriptor | "
             } else if !self.reality {
-                if self.client_active { "s: запустить локальный runtime | h: headless Apply | " }
-                else { "для запуска выберите активный профиль | " }
+                if self.client_active {
+                    "s: запустить локальный runtime | h: headless Apply | "
+                } else {
+                    "для запуска выберите активный профиль | "
+                }
             } else if self.client_active {
                 "s: запустить локальный runtime | h: headless Apply | o: recovery | k: promotion | c: сменить credential | "
             } else {

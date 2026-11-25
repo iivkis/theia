@@ -73,9 +73,9 @@ mod tui_reality_provision;
 mod tui_reality_register;
 mod tui_reality_review;
 mod tui_reality_status;
-mod tui_staged_material;
-mod tui_share;
 pub(crate) mod tui_runtime;
+mod tui_share;
+mod tui_staged_material;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;
 #[cfg(target_os = "windows")]

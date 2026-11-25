@@ -203,13 +203,22 @@ fn apply_checked(
         hex(record.identity_sha256), hex(record.publication_sha256)))
 }
 
-
-use crate::{config::{self, Config}, reality_config::{self, ServerRequest}, tui_editor::Editor, tui_reality_register::RegistrationPanel, Role};
+use crate::{
+    config::{self, Config},
+    reality_config::{self, ServerRequest},
+    tui_editor::Editor,
+    tui_reality_register::RegistrationPanel,
+    Role,
+};
 use std::net::{IpAddr, SocketAddr};
 const WIZARD_LABELS: [&str; 7] = [
-    "ID inbound", "TCP/UDP bind", "Публичный endpoint host (без порта)",
-    "Собственные IP через запятую", "Домены (до 3) или domain=IP",
-    "Grants (ID через запятую)", "Выбор: auto / manual",
+    "ID inbound",
+    "TCP/UDP bind",
+    "Публичный endpoint host (без порта)",
+    "Собственные IP через запятую",
+    "Домены (до 3) или domain=IP",
+    "Grants (ID через запятую)",
+    "Выбор: auto / manual",
 ];
 
 #[derive(Clone)]
@@ -231,63 +240,134 @@ impl WizardInput {
         use sha2::{Digest, Sha256};
         let raw = config::editor_bytes(&self.config).map_err(|_| Error::Storage)?;
         let actual: [u8; 32] = Sha256::digest(&raw).into();
-        if actual != self.source { return Err(Error::Approval); }
-        let Config::Server(doc) = config::parse(std::str::from_utf8(&raw).map_err(|_| Error::Format)?).map_err(|_| Error::Format)? else { return Err(Error::Format); };
+        if actual != self.source {
+            return Err(Error::Approval);
+        }
+        let Config::Server(doc) =
+            config::parse(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
+                .map_err(|_| Error::Format)?
+        else {
+            return Err(Error::Format);
+        };
         if doc.server.inbounds.iter().any(|i| i.id == self.id)
             || self.grants.is_empty()
-            || self.grants.iter().any(|id| !doc.server.users.iter().any(|u| u.id == *id && !u.disabled))
-        { return Err(Error::Grant); }
+            || self
+                .grants
+                .iter()
+                .any(|id| !doc.server.users.iter().any(|u| u.id == *id && !u.disabled))
+        {
+            return Err(Error::Grant);
+        }
         // Reject collisions with saved listeners before any consented work
         // or material creation. Wildcards may overlap both address families.
         for inbound in &doc.server.inbounds {
             for address in [&inbound.h2_listen, &inbound.quic_listen] {
                 let existing: SocketAddr = address.parse().map_err(|_| Error::Scope)?;
                 if existing.port() == self.listen.port()
-                    && (existing.ip() == self.listen.ip() || existing.ip().is_unspecified() || self.listen.ip().is_unspecified())
+                    && (existing.ip() == self.listen.ip()
+                        || existing.ip().is_unspecified()
+                        || self.listen.ip().is_unspecified())
                 {
                     return Err(Error::Scope);
                 }
             }
         }
-        if self.health.parent().is_none_or(|p| p.exists()) { return Err(Error::Storage); }
+        if self.health.parent().is_none_or(|p| p.exists()) {
+            return Err(Error::Storage);
+        }
         validate_paths(&self.health, &self.bundle)?;
         new_health_path(&self.health)?;
         Ok(())
     }
     fn parse(config: PathBuf, source: [u8; 32], fields: &[String; 7]) -> Result<Self, Error> {
-        if !config::valid_id(&fields[0]) { return Err(Error::Scope); }
+        if !config::valid_id(&fields[0]) {
+            return Err(Error::Scope);
+        }
         let listen: SocketAddr = match fields[1].parse::<u16>() {
             Ok(port) => SocketAddr::from(([0, 0, 0, 0], port)),
             Err(_) => fields[1].parse().map_err(|_| Error::Scope)?,
         };
-        if listen.port() == 0 { return Err(Error::Scope); }
+        if listen.port() == 0 {
+            return Err(Error::Scope);
+        }
         let endpoint = format!("{}:{}", fields[2], listen.port());
-        if !config::valid_remote(&endpoint) { return Err(Error::Scope); }
-        let own_ips = fields[3].split(',').map(|s| s.trim().parse::<IpAddr>().map_err(|_| Error::Scope)).collect::<Result<Vec<_>, _>>()?;
-        if own_ips.is_empty() || own_ips.len() > 64 { return Err(Error::Scope); }
+        if !config::valid_remote(&endpoint) {
+            return Err(Error::Scope);
+        }
+        let own_ips = fields[3]
+            .split(',')
+            .map(|s| s.trim().parse::<IpAddr>().map_err(|_| Error::Scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        if own_ips.is_empty() || own_ips.len() > 64 {
+            return Err(Error::Scope);
+        }
         let mut candidates = Vec::new();
         for item in fields[4].split(',').map(str::trim) {
             let (name, address) = if let Some((name, ip)) = item.split_once('=') {
                 (name, Some(ip.parse::<IpAddr>().map_err(|_| Error::Scope)?))
-            } else { (item, None) };
-            crate::camouflage_domain_dns::validate_manual_dns_request(name, crate::camouflage_domain_dns::DnsConsent::Approved).map_err(|_| Error::Scope)?;
-            if candidates.iter().any(|(prior, _)| prior == name) { return Err(Error::Scope); }
+            } else {
+                (item, None)
+            };
+            crate::camouflage_domain_dns::validate_manual_dns_request(
+                name,
+                crate::camouflage_domain_dns::DnsConsent::Approved,
+            )
+            .map_err(|_| Error::Scope)?;
+            if candidates.iter().any(|(prior, _)| prior == name) {
+                return Err(Error::Scope);
+            }
             candidates.push((name.to_owned(), address));
         }
-        if candidates.is_empty() || candidates.len() > 3 { return Err(Error::Scope); }
+        if candidates.is_empty() || candidates.len() > 3 {
+            return Err(Error::Scope);
+        }
         let grants: Vec<String> = fields[5].split(',').map(|v| v.trim().to_owned()).collect();
-        if grants.len() > 256 || grants.iter().any(|v| !config::valid_id(v)) || grants.iter().collect::<std::collections::HashSet<_>>().len() != grants.len() { return Err(Error::Grant); }
-        let automatic = match fields[6].as_str() { "auto" => true, "manual" => false, _ => return Err(Error::Format) };
+        if grants.len() > 256
+            || grants.iter().any(|v| !config::valid_id(v))
+            || grants
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != grants.len()
+        {
+            return Err(Error::Grant);
+        }
+        let automatic = match fields[6].as_str() {
+            "auto" => true,
+            "manual" => false,
+            _ => return Err(Error::Format),
+        };
         let parent = config.parent().ok_or(Error::Storage)?;
         let root = parent.join(format!(".theia-{}-material", fields[0]));
         let health = root.join("health.toml");
         let bundle = root.join("bundle");
-        let input = Self { config, source, id: fields[0].clone(), listen, endpoint, own_ips, candidates, grants, automatic, health, bundle };
+        let input = Self {
+            config,
+            source,
+            id: fields[0].clone(),
+            listen,
+            endpoint,
+            own_ips,
+            candidates,
+            grants,
+            automatic,
+            health,
+            bundle,
+        };
         input.check_source()?;
         Ok(input)
     }
-    fn plan(&self, references: Vec<reference_health::Target>) -> Result<reference_health::Plan, Error> {
-        let plan = reference_health::Plan { schema_version: 1, inbound: self.id.clone(), endpoint: self.endpoint.clone(), own_ips: self.own_ips.clone(), references };
+    fn plan(
+        &self,
+        references: Vec<reference_health::Target>,
+    ) -> Result<reference_health::Plan, Error> {
+        let plan = reference_health::Plan {
+            schema_version: 1,
+            inbound: self.id.clone(),
+            endpoint: self.endpoint.clone(),
+            own_ips: self.own_ips.clone(),
+            references,
+        };
         plan.digest().map_err(|_| Error::Health)?;
         Ok(plan)
     }
@@ -296,34 +376,58 @@ impl WizardInput {
         for (name, pinned) in &self.candidates {
             let mut addresses = match pinned {
                 Some(ip) => vec![*ip],
-                None => match crate::camouflage_domain_dns::resolve_manual_domain(name, crate::camouflage_domain_dns::DnsConsent::Approved).await {
+                None => match crate::camouflage_domain_dns::resolve_manual_domain(
+                    name,
+                    crate::camouflage_domain_dns::DnsConsent::Approved,
+                )
+                .await
+                {
                     Ok(ips) => ips,
                     Err(_) if self.automatic => continue,
                     Err(_) => return Err(Error::Health),
                 },
             };
             addresses.sort();
-            let target = addresses.into_iter().map(|ip| reference_health::Target {
-                server_name: name.clone(), address: SocketAddr::new(ip, 443),
-            }).find(|target| {
-                let mut candidate = references.clone();
-                candidate.push(target.clone());
-                self.plan(candidate).is_ok()
-            });
+            let target = addresses
+                .into_iter()
+                .map(|ip| reference_health::Target {
+                    server_name: name.clone(),
+                    address: SocketAddr::new(ip, 443),
+                })
+                .find(|target| {
+                    let mut candidate = references.clone();
+                    candidate.push(target.clone());
+                    self.plan(candidate).is_ok()
+                });
             match target {
                 Some(target) => references.push(target),
-                None if self.automatic => {},
+                None if self.automatic => {}
                 None => return Err(Error::Health),
             }
         }
         self.plan(references)
     }
 }
-fn rank_checked(input: &WizardInput, plan: reference_health::Plan, evidence: Vec<reference_health::Evidence>, now: u64) -> Result<(reference_health::State, String), Error> {
-    if plan.references.len() != evidence.len() { return Err(Error::Health); }
+fn rank_checked(
+    input: &WizardInput,
+    plan: reference_health::Plan,
+    evidence: Vec<reference_health::Evidence>,
+    now: u64,
+) -> Result<(reference_health::State, String), Error> {
+    if plan.references.len() != evidence.len() {
+        return Err(Error::Health);
+    }
     let mut entries: Vec<_> = plan.references.into_iter().zip(evidence).collect();
-    let mut report = String::from("Оценки: 100 = стабильные H2+H3, 80 = стабильный H2, 0 = отказ.\n");
-    for (target, item) in &entries { report.push_str(&format!("{} {}: {}\n", target.server_name, target.address, item.score())); }
+    let mut report =
+        String::from("Оценки: 100 = стабильные H2+H3, 80 = стабильный H2, 0 = отказ.\n");
+    for (target, item) in &entries {
+        report.push_str(&format!(
+            "{} {}: {}\n",
+            target.server_name,
+            target.address,
+            item.score()
+        ));
+    }
     if input.automatic {
         entries.retain(|(_, item)| item.eligible());
         entries.sort_by_key(|(_, item)| std::cmp::Reverse(item.score()));
@@ -341,9 +445,15 @@ fn rank_checked(input: &WizardInput, plan: reference_health::Plan, evidence: Vec
 enum WizardStage {
     Input,
     DnsConfirm(Box<WizardInput>),
-    Resolving(Receiver<Result<(WizardInput, reference_health::Plan), Error>>, tokio::sync::oneshot::Sender<()>),
+    Resolving(
+        Receiver<Result<(WizardInput, reference_health::Plan), Error>>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
     ProbeConfirm(Box<(WizardInput, reference_health::Plan)>),
-    Checking(Receiver<Result<(WizardInput, reference_health::State, String), Error>>, tokio::sync::oneshot::Sender<()>),
+    Checking(
+        Receiver<Result<(WizardInput, reference_health::State, String), Error>>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
     CreateConfirm(Box<(WizardInput, reference_health::State, String)>),
     Saving(Receiver<Result<RegistrationPanel, Error>>, PathBuf),
     Done(String),
@@ -362,33 +472,68 @@ struct Wizard {
 impl Wizard {
     fn new(editor: &Editor) -> Result<Self, &'static str> {
         editor.require_clean_records()?;
-        if editor.role() != Role::Server { return Err("Требуется серверная конфигурация."); }
-        let config = std::path::absolute(editor.saved_path()).map_err(|_| "Недопустимый путь TOML.")?;
+        if editor.role() != Role::Server {
+            return Err("Требуется серверная конфигурация.");
+        }
+        let config =
+            std::path::absolute(editor.saved_path()).map_err(|_| "Недопустимый путь TOML.")?;
         let id = crate::tui_editor::generated_id("inbound")?;
-        Ok(Self { config, source: editor.saved_sha256(), fields: [
-            id, "443".into(), String::new(), String::new(),
-            crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[..3].join(","),
-            String::new(), "auto".into(),
-        ], focus: 1, advanced: false, users: editor.record_user_catalog(crate::tui_editor::RecordAction::NewInbound).unwrap_or_default(), stage: WizardStage::Input, error: String::new(), registration: None })
+        Ok(Self {
+            config,
+            source: editor.saved_sha256(),
+            fields: [
+                id,
+                "443".into(),
+                String::new(),
+                String::new(),
+                crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[..3].join(","),
+                String::new(),
+                "auto".into(),
+            ],
+            focus: 1,
+            advanced: false,
+            users: editor
+                .record_user_catalog(crate::tui_editor::RecordAction::NewInbound)
+                .unwrap_or_default(),
+            stage: WizardStage::Input,
+            error: String::new(),
+            registration: None,
+        })
     }
     fn visible_fields(&self) -> &[usize] {
-        if self.advanced { &[0, 1, 2, 3, 4, 5, 6] } else { &[1, 2, 3, 5] }
+        if self.advanced {
+            &[0, 1, 2, 3, 4, 5, 6]
+        } else {
+            &[1, 2, 3, 5]
+        }
     }
     fn move_focus(&mut self, forward: bool) {
         let fields = self.visible_fields();
-        let index = fields.iter().position(|field| *field == self.focus).unwrap_or(0);
-        self.focus = fields[(index + if forward {1} else {fields.len() - 1}) % fields.len()];
+        let index = fields
+            .iter()
+            .position(|field| *field == self.focus)
+            .unwrap_or(0);
+        self.focus = fields[(index + if forward { 1 } else { fields.len() - 1 }) % fields.len()];
     }
     fn paste(&mut self, text: &str) {
-        if let Some(panel) = self.registration.as_mut() { panel.paste(text); return; }
+        if let Some(panel) = self.registration.as_mut() {
+            panel.paste(text);
+            return;
+        }
         if matches!(self.stage, WizardStage::Input) {
             let field = &mut self.fields[self.focus];
-            let value = text.trim_end_matches(['\r','\n']);
-            if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= LIMIT { field.push_str(value); }
+            let value = text.trim_end_matches(['\r', '\n']);
+            if !value.chars().any(char::is_control)
+                && field.len().saturating_add(value.len()) <= LIMIT
+            {
+                field.push_str(value);
+            }
         }
     }
     fn key(&mut self, key: KeyEvent) -> bool {
-        if let Some(panel) = self.registration.as_mut() { return panel.key(key); }
+        if let Some(panel) = self.registration.as_mut() {
+            return panel.key(key);
+        }
         let old = std::mem::replace(&mut self.stage, WizardStage::Input);
         self.stage = match old {
             WizardStage::Input => {
@@ -396,42 +541,67 @@ impl Wizard {
                     KeyCode::Esc => return true,
                     KeyCode::F(2) => {
                         self.advanced = !self.advanced;
-                        if !self.visible_fields().contains(&self.focus) { self.focus = 1; }
+                        if !self.visible_fields().contains(&self.focus) {
+                            self.focus = 1;
+                        }
                     }
                     KeyCode::Tab => self.move_focus(true),
                     KeyCode::BackTab => self.move_focus(false),
-                    KeyCode::Backspace => { self.fields[self.focus].pop(); }
-                    KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => self.fields[self.focus].clear(),
+                    KeyCode::Backspace => {
+                        self.fields[self.focus].pop();
+                    }
+                    KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                        self.fields[self.focus].clear()
+                    }
                     KeyCode::Enter => {
                         match WizardInput::parse(self.config.clone(), self.source, &self.fields) {
-                            Ok(input) => { self.error.clear(); self.stage = WizardStage::DnsConfirm(Box::new(input)); return false; }
+                            Ok(input) => {
+                                self.error.clear();
+                                self.stage = WizardStage::DnsConfirm(Box::new(input));
+                                return false;
+                            }
                             Err(error) => self.error = format!("ОТКАЗ: {error}"),
                         }
                     }
-                    KeyCode::Char(ch) if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) && !ch.is_control() && self.fields[self.focus].len() + ch.len_utf8() <= LIMIT => self.fields[self.focus].push(ch),
+                    KeyCode::Char(ch)
+                        if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                            && !ch.is_control()
+                            && self.fields[self.focus].len() + ch.len_utf8() <= LIMIT =>
+                    {
+                        self.fields[self.focus].push(ch)
+                    }
                     _ => {}
                 }
                 WizardStage::Input
             }
-            WizardStage::DnsConfirm(input) if key.code == KeyCode::Char('y') && key.modifiers.is_empty() => {
+            WizardStage::DnsConfirm(input)
+                if key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
+            {
                 let input = *input;
                 let (tx, rx) = mpsc::channel();
                 let (cancel, cancelled) = tokio::sync::oneshot::channel();
                 let _worker = std::thread::spawn(move || {
                     let result = input.check_source().and_then(|()| {
-                        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| Error::Storage)?;
-                        let plan = rt.block_on(async { tokio::select! {
-                            biased;
-                            _ = cancelled => Err(Error::Health),
-                            result = input.resolve() => result,
-                        } })?;
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|_| Error::Storage)?;
+                        let plan = rt.block_on(async {
+                            tokio::select! {
+                                biased;
+                                _ = cancelled => Err(Error::Health),
+                                result = input.resolve() => result,
+                            }
+                        })?;
                         Ok((input, plan))
                     });
                     let _ = tx.send(result);
                 });
                 WizardStage::Resolving(rx, cancel)
             }
-            WizardStage::ProbeConfirm(value) if key.code == KeyCode::Char('y') && key.modifiers.is_empty() => {
+            WizardStage::ProbeConfirm(value)
+                if key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
+            {
                 let (input, plan) = *value;
                 let (tx, rx) = mpsc::channel();
                 let (cancel, cancelled) = tokio::sync::oneshot::channel();
@@ -452,9 +622,15 @@ impl Wizard {
                 });
                 WizardStage::Checking(rx, cancel)
             }
-            WizardStage::CreateConfirm(value) if key.code == KeyCode::Char('y') && key.modifiers.is_empty() => {
+            WizardStage::CreateConfirm(value)
+                if key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
+            {
                 let (input, state, _) = *value;
-                let root = input.health.parent().map(Path::to_owned).unwrap_or_default();
+                let root = input
+                    .health
+                    .parent()
+                    .map(Path::to_owned)
+                    .unwrap_or_default();
                 let (tx, rx) = mpsc::channel();
                 let _worker = std::thread::spawn(move || {
                     let result = (|| {
@@ -462,43 +638,84 @@ impl Wizard {
                         let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
                         let preview = reality_provision::preview(&state, now)?;
                         let mut owned = crate::tui_staged_material::StagedMaterial::create(
-                            input.health.parent().ok_or(Error::Storage)?, &input.config, input.source)?;
+                            input.health.parent().ok_or(Error::Storage)?,
+                            &input.config,
+                            input.source,
+                        )?;
                         // No external reference can exist before registration.
                         // Keep an uncertain write for explicit inspection.
-                        let enrolled = reference_health::Store::new(&input.health).and_then(|s| s.enroll(&state));
+                        let enrolled = reference_health::Store::new(&input.health)
+                            .and_then(|s| s.enroll(&state));
                         if let Err(error) = enrolled {
-                            if matches!(error, reference_health::Error::Indeterminate) { owned.preserve(); return Err(Error::Indeterminate); }
+                            if matches!(error, reference_health::Error::Indeterminate) {
+                                owned.preserve();
+                                return Err(Error::Indeterminate);
+                            }
                             owned.cleanup()?;
                             return Err(Error::Storage);
                         }
-                        let record = match reality_provision::create(&state, preview.health_sha256, &input.bundle, now) {
+                        let record = match reality_provision::create(
+                            &state,
+                            preview.health_sha256,
+                            &input.bundle,
+                            now,
+                        ) {
                             Ok(record) => record,
-                            Err(Error::Indeterminate) => { owned.preserve(); return Err(Error::Indeterminate); }
-                            Err(error) => { owned.cleanup()?; return Err(error); }
+                            Err(Error::Indeterminate) => {
+                                owned.preserve();
+                                return Err(Error::Indeterminate);
+                            }
+                            Err(error) => {
+                                owned.cleanup()?;
+                                return Err(error);
+                            }
                         };
                         let request = ServerRequest {
-                            health: input.health, bundle: input.bundle, health_sha256: preview.health_sha256,
-                            identity_sha256: record.identity_sha256, listen: input.listen, grants: input.grants,
+                            health: input.health,
+                            bundle: input.bundle,
+                            health_sha256: preview.health_sha256,
+                            identity_sha256: record.identity_sha256,
+                            listen: input.listen,
+                            grants: input.grants,
                         };
                         // Validate the exact saved TOML and prepared material
                         // again before presenting a separate registration.
-                        reality_config::prepare(&input.config, &reality_config::Request::Server(request.clone()), now)?;
-                        RegistrationPanel::from_provision(input.config, input.source, request).map(|panel| panel.own_material(owned))
+                        reality_config::prepare(
+                            &input.config,
+                            &reality_config::Request::Server(request.clone()),
+                            now,
+                        )?;
+                        RegistrationPanel::from_provision(input.config, input.source, request)
+                            .map(|panel| panel.own_material(owned))
                     })();
                     let _ = tx.send(result);
                 });
                 WizardStage::Saving(rx, root)
             }
-            WizardStage::DnsConfirm(_) | WizardStage::ProbeConfirm(_) | WizardStage::CreateConfirm(_) if matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) => WizardStage::Input,
-            WizardStage::Checking(_, cancel) if key.code == KeyCode::Esc => { let _ = cancel.send(()); WizardStage::Input }
-            WizardStage::Resolving(_, cancel) if key.code == KeyCode::Esc => { let _ = cancel.send(()); WizardStage::Input },
+            WizardStage::DnsConfirm(_)
+            | WizardStage::ProbeConfirm(_)
+            | WizardStage::CreateConfirm(_)
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) =>
+            {
+                WizardStage::Input
+            }
+            WizardStage::Checking(_, cancel) if key.code == KeyCode::Esc => {
+                let _ = cancel.send(());
+                WizardStage::Input
+            }
+            WizardStage::Resolving(_, cancel) if key.code == KeyCode::Esc => {
+                let _ = cancel.send(());
+                WizardStage::Input
+            }
             WizardStage::Done(_) if key.code == KeyCode::Esc => return true,
             other => other,
         };
         false
     }
     fn poll(&mut self) -> Option<Editor> {
-        if let Some(panel) = self.registration.as_mut() { return panel.poll(); }
+        if let Some(panel) = self.registration.as_mut() {
+            return panel.poll();
+        }
         let result = match &self.stage {
             WizardStage::Resolving(rx, _) => match rx.try_recv() {
                 Ok(value) => value.map(|v| WizardStage::ProbeConfirm(Box::new(v))),
@@ -516,11 +733,19 @@ impl Wizard {
             },
             _ => return None,
         };
-        self.stage = match result { Ok(stage) => stage, Err(error) => { self.error = format!("ОТКАЗ: {error}"); WizardStage::Input } };
+        self.stage = match result {
+            Ok(stage) => stage,
+            Err(error) => {
+                self.error = format!("ОТКАЗ: {error}");
+                WizardStage::Input
+            }
+        };
         None
     }
     fn body(&self) -> String {
-        if let Some(panel) = &self.registration { return panel.body(); }
+        if let Some(panel) = &self.registration {
+            return panel.body();
+        }
         match &self.stage {
             WizardStage::Input => {
                 let mut out = String::from("Новый REALITY inbound. Без TLS cert/key.\n");
@@ -573,7 +798,10 @@ impl ProvisionPanel {
     }
 
     pub(crate) fn paste(&mut self, text: &str) {
-        if let Some(wizard) = self.wizard.as_mut() { wizard.paste(text); return; }
+        if let Some(wizard) = self.wizard.as_mut() {
+            wizard.paste(text);
+            return;
+        }
         if !matches!(self.stage, Stage::Input) {
             return;
         }
@@ -586,7 +814,9 @@ impl ProvisionPanel {
     }
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
-        if let Some(wizard) = self.wizard.as_mut() { return wizard.key(key); }
+        if let Some(wizard) = self.wizard.as_mut() {
+            return wizard.key(key);
+        }
         match &self.stage {
             Stage::Loading(_) | Stage::LoadingPlan(_) | Stage::Applying(_) => return false,
             Stage::Checking { .. } => {
@@ -692,7 +922,9 @@ impl ProvisionPanel {
     }
 
     pub(crate) fn poll(&mut self) -> Option<Editor> {
-        if let Some(wizard) = self.wizard.as_mut() { return wizard.poll(); }
+        if let Some(wizard) = self.wizard.as_mut() {
+            return wizard.poll();
+        }
         let result = match &self.stage {
             Stage::Loading(rx) => match rx.try_recv() {
                 Ok(result) => result.map(Stage::Confirm),
@@ -728,7 +960,9 @@ impl ProvisionPanel {
     }
 
     pub(crate) fn body(&self) -> String {
-        if let Some(wizard) = &self.wizard { return wizard.body(); }
+        if let Some(wizard) = &self.wizard {
+            return wizard.body();
+        }
         match &self.stage {
             Stage::Input => format!("Абсолютные пути. Для новой проверки задайте Plan и новый Health; для ранее согласованного Health оставьте Plan пустым.\n{} Health: {}\n{} Каталог: {}\n{} Plan TOML: {}\nEnter: локальный предпросмотр; Tab: поле; Esc: отменить.\nСеть только после отдельного согласия.\n{}",
                 if self.focus == 0 { ">" } else { " " }, self.fields[0],
@@ -755,7 +989,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("theia-typed-wizard-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
-        std::fs::write(&path, include_str!("../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))).unwrap();
+        std::fs::write(
+            &path,
+            include_str!("../../../examples/server.toml")
+                .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64)),
+        )
+        .unwrap();
         let editor = Editor::load(Role::Server, &path).unwrap();
         let mut wizard = Wizard::new(&editor).unwrap();
         assert_eq!(wizard.fields[1], "443");
@@ -769,26 +1008,54 @@ mod tests {
         wizard.fields[3] = "127.0.0.1".into();
         wizard.fields[4] = "first.example.org=93.184.216.2,second.example.org=93.184.216.3".into();
         wizard.fields[5] = "device-a".into();
-        let input = WizardInput::parse(path.clone(), editor.saved_sha256(), &wizard.fields).unwrap();
-        let plan = input.plan(vec![
-            reference_health::Target { server_name: "first.example.org".into(), address: "93.184.216.2:443".parse().unwrap() },
-            reference_health::Target { server_name: "second.example.org".into(), address: "93.184.216.3:443".parse().unwrap() },
-        ]).unwrap();
-        let evidence = vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }, reference_health::Evidence { h2_status: Some(200), h3_status: Some(200) }];
+        let input =
+            WizardInput::parse(path.clone(), editor.saved_sha256(), &wizard.fields).unwrap();
+        let plan = input
+            .plan(vec![
+                reference_health::Target {
+                    server_name: "first.example.org".into(),
+                    address: "93.184.216.2:443".parse().unwrap(),
+                },
+                reference_health::Target {
+                    server_name: "second.example.org".into(),
+                    address: "93.184.216.3:443".parse().unwrap(),
+                },
+            ])
+            .unwrap();
+        let evidence = vec![
+            reference_health::Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            },
+            reference_health::Evidence {
+                h2_status: Some(200),
+                h3_status: Some(200),
+            },
+        ];
         let now = reference_health::unix_now().unwrap();
         let (state, report) = rank_checked(&input, plan.clone(), evidence.clone(), now).unwrap();
         let mut manual = input.clone();
         manual.automatic = false;
         let (ordered, _) = rank_checked(&manual, plan.clone(), evidence.clone(), now).unwrap();
-        assert_eq!(ordered.plan().references[0].server_name, "first.example.org");
+        assert_eq!(
+            ordered.plan().references[0].server_name,
+            "first.example.org"
+        );
         let mut failed = evidence.clone();
-        failed[0] = Evidence { h2_status: None, h3_status: None };
+        failed[0] = Evidence {
+            h2_status: None,
+            h3_status: None,
+        };
         assert!(rank_checked(&manual, plan.clone(), failed.clone(), now).is_err());
         let (filtered, _) = rank_checked(&input, plan.clone(), failed, now).unwrap();
         assert_eq!(filtered.plan().references.len(), 1);
         assert!(rank_checked(&input, plan.clone(), Vec::new(), now).is_err());
-        let resolved = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-            .block_on(input.resolve()).unwrap();
+        let resolved = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(input.resolve())
+            .unwrap();
         assert_eq!(resolved.digest().unwrap(), plan.digest().unwrap());
         assert_eq!(state.plan().references[0].server_name, "second.example.org");
         assert!(report.contains("100") && report.contains("80"));
@@ -801,7 +1068,8 @@ mod tests {
         let original = std::fs::read(&path).unwrap();
         // Cancel the registration after local creation, then repeat the same
         // operation: only our new root is removed and TOML stays byte-exact.
-        wizard.stage = WizardStage::CreateConfirm(Box::new((input.clone(), state.clone(), report.clone())));
+        wizard.stage =
+            WizardStage::CreateConfirm(Box::new((input.clone(), state.clone(), report.clone())));
         wizard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while wizard.registration.is_none() {
@@ -832,7 +1100,9 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), original);
         wizard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         let registered = loop {
-            if let Some(editor) = wizard.poll() { break editor; }
+            if let Some(editor) = wizard.poll() {
+                break editor;
+            }
             assert!(std::time::Instant::now() < deadline, "{}", wizard.body());
             std::thread::sleep(std::time::Duration::from_millis(10));
         };

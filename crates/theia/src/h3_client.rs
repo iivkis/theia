@@ -772,7 +772,9 @@ pub struct H3Tunnel {
 }
 
 impl H3Tunnel {
-    pub(crate) fn opened_stream_up(&self) -> bool { self.stream_up }
+    pub(crate) fn opened_stream_up(&self) -> bool {
+        self.stream_up
+    }
     #[cfg(test)]
     pub(crate) fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), ClientError> {
         self._lease

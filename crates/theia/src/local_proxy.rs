@@ -221,7 +221,9 @@ impl DirectClient {
             _ => false,
         }
     }
-    fn last_xhttp(&self) -> u8 { self.last_open.load(std::sync::atomic::Ordering::Relaxed) & 3 }
+    fn last_xhttp(&self) -> u8 {
+        self.last_open.load(std::sync::atomic::Ordering::Relaxed) & 3
+    }
     fn last_transport(&self) -> u8 {
         self.last_open.load(std::sync::atomic::Ordering::Relaxed) >> 2
     }
@@ -358,10 +360,9 @@ impl RealityClient {
         let generation = self.generation().await?;
         let result = generation.carrier.open(address, port).await;
         if let Ok(tunnel) = &result {
-            generation.last_open.store(
-                tunnel.open_code(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            generation
+                .last_open
+                .store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
         }
         result
     }
@@ -955,10 +956,9 @@ impl ProxyClient {
         match self {
             Self::Direct(client) => {
                 let tunnel = client.carrier.open(address, port).await?;
-                client.last_open.store(
-                    tunnel.open_code(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                client
+                    .last_open
+                    .store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
                 Ok(tunnel)
             }
             Self::Reality(client) => client.open(address, port).await,
@@ -973,7 +973,11 @@ impl ProxyClient {
 }
 
 pub(crate) fn xhttp_observation(code: u8) -> &'static str {
-    match code { 1 => "stream-one", 2 => "stream-up", _ => "не подтверждён" }
+    match code {
+        1 => "stream-one",
+        2 => "stream-up",
+        _ => "не подтверждён",
+    }
 }
 
 impl ProxyTunnel {
@@ -1060,9 +1064,20 @@ impl ClientRuntime {
                     fallback,
                 )
             }
-            ProxyClient::Direct(d) => (0, d.last_open.load(std::sync::atomic::Ordering::Relaxed), d.fallback()),
+            ProxyClient::Direct(d) => (
+                0,
+                d.last_open.load(std::sync::atomic::Ordering::Relaxed),
+                d.fallback(),
+            ),
         };
-        (view.revision, view.digest, desc, observed >> 2, observed & 3, fallback)
+        (
+            view.revision,
+            view.digest,
+            desc,
+            observed >> 2,
+            observed & 3,
+            fallback,
+        )
     }
     async fn candidate(
         &self,
@@ -1314,11 +1329,7 @@ impl PreparedLocalProxy {
             return Err(ClientError::Configuration);
         };
         if document.client.active_profile != id
-            || !document
-                .client
-                .profiles
-                .iter()
-                .any(|p| p.id == id)
+            || !document.client.profiles.iter().any(|p| p.id == id)
         {
             return Err(ClientError::Configuration);
         }

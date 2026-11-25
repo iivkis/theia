@@ -969,7 +969,9 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    pub(crate) fn opened_stream_up(&self) -> bool { self.stream_up }
+    pub(crate) fn opened_stream_up(&self) -> bool {
+        self.stream_up
+    }
     /// True when both tunnels share one verified transport connection.
     /// Does not reveal peer addresses, credentials or connection identifiers.
     pub fn shares_transport_with(&self, other: &Self) -> bool {

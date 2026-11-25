@@ -1230,16 +1230,17 @@ where
                     _ => return None,
                 };
                 let xhttp = match fields.next()?.strip_prefix("x=")? {
-                    "0" => 0, "1" => 1, "2" => 2, _ => return None,
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    _ => return None,
                 };
                 let fallback = match fields.next()?.strip_prefix("f=")? {
                     "0" => false,
                     "1" => true,
                     _ => return None,
                 };
-                if fields.next().is_some()
-                    || ((transport == 0) != (xhttp == 0))
-                {
+                if fields.next().is_some() || ((transport == 0) != (xhttp == 0)) {
                     return None;
                 }
                 Some(StatusReply::ClientRunning {
@@ -1873,7 +1874,13 @@ mod strict_wire_matrix_tests {
     async fn client_status_requires_canonical_fields_and_exact_revision_cas() {
         let hex = "ab".repeat(32);
         let status = StatusCommand::ClientStatus;
-        for (d, t, x, f) in [(0, 0, 0, false), (0, 2, 1, true), (0, 3, 2, false), (3, 2, 2, true), (4, 3, 1, false)] {
+        for (d, t, x, f) in [
+            (0, 0, 0, false),
+            (0, 2, 1, true),
+            (0, 3, 2, false),
+            (3, 2, 2, true),
+            (4, 3, 1, false),
+        ] {
             let response = format!(
                 "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={}\n",
                 u8::from(f)

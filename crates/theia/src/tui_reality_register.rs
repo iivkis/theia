@@ -144,8 +144,9 @@ fn preview(path: &Path, original: [u8; 32], request: Request, now: u64) -> Resul
         "y: сохранить; n/Esc: отменить."
     };
     let selected_id = match (&request, prepared.candidate()) {
-        (Request::Server(_), config::Config::Server(doc)) => doc.server.inbounds.last()
-            .ok_or(Error::Scope)?.id.clone(),
+        (Request::Server(_), config::Config::Server(doc)) => {
+            doc.server.inbounds.last().ok_or(Error::Scope)?.id.clone()
+        }
         (Request::ReplaceServer(request), _) => request.id.clone(),
         (Request::Client(request) | Request::Reenroll(request), _) => request.id.clone(),
         _ => return Err(Error::Scope),
@@ -175,12 +176,15 @@ impl RegistrationPanel {
             focus: 0,
             stage: Stage::Input,
             error: None,
-            owned: None, staged_save: None,
+            owned: None,
+            staged_save: None,
         })
     }
 
     pub(crate) fn from_provision(
-        config: PathBuf, original: [u8; 32], request: ServerRequest,
+        config: PathBuf,
+        original: [u8; 32],
+        request: ServerRequest,
     ) -> Result<Self, Error> {
         if !crate::bounded_input::explicit_file_path(&config) {
             return Err(Error::Storage);
@@ -189,12 +193,22 @@ impl RegistrationPanel {
         let fields = vec![
             request.health.to_str().ok_or(Error::Storage)?.to_owned(),
             request.bundle.to_str().ok_or(Error::Storage)?.to_owned(),
-            hex(request.health_sha256), hex(request.identity_sha256),
-            request.listen.to_string(), request.grants.join(","),
+            hex(request.health_sha256),
+            hex(request.identity_sha256),
+            request.listen.to_string(),
+            request.grants.join(","),
         ];
         Ok(Self {
-            role: Role::Server, reenroll_id: None, config, original, fields,
-            focus: 5, stage: Stage::Input, error: None, owned: None, staged_save: None,
+            role: Role::Server,
+            reenroll_id: None,
+            config,
+            original,
+            fields,
+            focus: 5,
+            stage: Stage::Input,
+            error: None,
+            owned: None,
+            staged_save: None,
         })
     }
 
@@ -224,7 +238,8 @@ impl RegistrationPanel {
             focus: 2,
             stage: Stage::Input,
             error: None,
-            owned: None, staged_save: None,
+            owned: None,
+            staged_save: None,
         })
     }
 
@@ -245,15 +260,22 @@ impl RegistrationPanel {
         Ok(panel)
     }
 
-    pub(crate) fn own_material(mut self, owned: crate::tui_staged_material::StagedMaterial) -> Self {
+    pub(crate) fn own_material(
+        mut self,
+        owned: crate::tui_staged_material::StagedMaterial,
+    ) -> Self {
         if self.role == Role::Client && self.fields[2].is_empty() {
-            if let Ok(id) = crate::tui_editor::generated_id("profile") { self.fields[2] = id; }
+            if let Ok(id) = crate::tui_editor::generated_id("profile") {
+                self.fields[2] = id;
+            }
         }
         self.owned = Some(owned);
         self
     }
     fn cancel_owned(&mut self) -> bool {
-        let Some(mut owned) = self.owned.take() else { return true; };
+        let Some(mut owned) = self.owned.take() else {
+            return true;
+        };
         if owned.cleanup().is_err() {
             self.stage = Stage::Done(format!("Очистка не подтверждена. Проверьте каталог {:?} и TOML; не повторяйте вслепую. Для целых материалов используйте M после независимой проверки. Esc: закрыть.", owned.root()));
             return false;
@@ -286,7 +308,9 @@ impl RegistrationPanel {
         if !matches!(self.stage, Stage::Input) {
             return;
         }
-        if self.owned.is_some() && (self.role == Role::Server || self.focus != 2) { return; }
+        if self.owned.is_some() && (self.role == Role::Server || self.focus != 2) {
+            return;
+        }
         let value = text.trim_end_matches(['\r', '\n']);
         let field = &mut self.fields[self.focus];
         if !value.chars().any(char::is_control)
@@ -302,7 +326,9 @@ impl RegistrationPanel {
             Stage::Done(_) => return key.code == KeyCode::Esc,
             Stage::Confirm(_) => {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('n') if self.owned.is_some() => return self.cancel_owned(),
+                    KeyCode::Esc | KeyCode::Char('n') if self.owned.is_some() => {
+                        return self.cancel_owned()
+                    }
                     KeyCode::Esc | KeyCode::Char('n') => self.stage = Stage::Input,
                     KeyCode::Char('y')
                         if self.reenroll_id.is_none() && key.modifiers.is_empty() =>
@@ -323,9 +349,15 @@ impl RegistrationPanel {
             Stage::Input => {}
         }
         if self.owned.is_some() {
-            if key.code == KeyCode::Esc { return self.cancel_owned(); }
-            if self.role == Role::Server && key.code != KeyCode::Enter { return false; }
-            if self.role == Role::Client && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) { return false; }
+            if key.code == KeyCode::Esc {
+                return self.cancel_owned();
+            }
+            if self.role == Role::Server && key.code != KeyCode::Enter {
+                return false;
+            }
+            if self.role == Role::Client && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                return false;
+            }
         }
         self.input_key(key)
     }
@@ -343,26 +375,34 @@ impl RegistrationPanel {
         let _worker = std::thread::spawn(move || {
             // Once publication starts, a panic or lost result must retain
             // material. Only a definite pre-replacement refusal permits cleanup.
-            if let Some(guard) = &mut owned { guard.preserve(); }
+            if let Some(guard) = &mut owned {
+                guard.preserve();
+            }
             let applied = reference_health::unix_now()
                 .map_err(|_| Error::Clock)
-                .and_then(|now| reality_config::apply(&path, &review.request, review.approval, now));
+                .and_then(|now| {
+                    reality_config::apply(&path, &review.request, review.approval, now)
+                });
             let applied = match applied {
                 Err(error) if error != Error::Indeterminate => {
                     if let Some(guard) = &mut owned {
                         guard.refuse();
-                        guard.cleanup().map_err(|_| Error::Indeterminate).and(Err(error))
-                    } else { Err(error) }
+                        guard
+                            .cleanup()
+                            .map_err(|_| Error::Indeterminate)
+                            .and(Err(error))
+                    } else {
+                        Err(error)
+                    }
                 }
                 other => other,
             };
-            let result = applied
-                .map_err(SaveError::Refused)
-                .and_then(|()| {
-                    let mut editor = Editor::load(role, &path).map_err(|_| SaveError::SavedReloadFailed)?;
-                    editor.select_id(&review.selected_id);
-                    Ok(editor)
-                });
+            let result = applied.map_err(SaveError::Refused).and_then(|()| {
+                let mut editor =
+                    Editor::load(role, &path).map_err(|_| SaveError::SavedReloadFailed)?;
+                editor.select_id(&review.selected_id);
+                Ok(editor)
+            });
             let _ = tx.send(result);
         });
     }
@@ -596,7 +636,8 @@ mod tests {
             focus: 0,
             stage: Stage::Input,
             error: None,
-            owned: None, staged_save: None,
+            owned: None,
+            staged_save: None,
         };
         let request = p.request().unwrap();
         assert!(matches!(&request, Request::ReplaceServer(r) if r.id == "selected"));
