@@ -163,7 +163,7 @@ impl H3Client {
             certificate_pin: None,
             stream_up: false,
             auto_mode: None,
-            pool: crate::connection_pool::Pool::default(),
+            pool: crate::connection_pool::Pool::with_rotation(&value.descriptor().rotation),
             reuse_connections: false,
         };
         let modes = value.effective_modes();
@@ -762,6 +762,7 @@ impl H3Tunnel {
                     let _ = upload_done.send(());
                     return Ok::<(), ClientError>(());
                 }
+                self._lease.record_data(n);
                 activity.data(n);
             }
         };
@@ -785,6 +786,7 @@ impl H3Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
+                        self._lease.record_data(data.len());
                         activity.data(data.len());
                     }
                     Frame::Fin => {

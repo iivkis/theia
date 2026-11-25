@@ -249,6 +249,7 @@ impl H2Client {
             .build()
             .map_err(|_| ClientError::Configuration)?;
         client.identity_routes = Some(routes);
+        client.pool = crate::connection_pool::Pool::with_rotation(&value.descriptor().rotation);
         let modes = value.effective_modes();
         client = if modes.stream_one && modes.stream_up {
             client.with_auto_stream_up(Duration::from_secs(900))?
@@ -938,6 +939,7 @@ impl Tunnel {
                     let _ = upload_done.send(());
                     return Ok::<(), ClientError>(());
                 }
+                self._lease.record_data(size);
                 activity.data(size);
             }
         };
@@ -961,6 +963,7 @@ impl Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
+                        self._lease.record_data(data.len());
                         activity.data(data.len());
                     }
                     Frame::Fin => {
