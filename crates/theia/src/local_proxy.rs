@@ -457,22 +457,22 @@ impl RealityClient {
                     continue;
                 }
             };
-            let background = async {
-                match &generation.carrier {
-                    Carrier::Auto(auto) => auto.maintain().await,
-                    _ => std::future::pending::<Result<(), ClientError>>().await,
+            let refresh = async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    // CAS binds refresh to the generation used for the GET.
+                    let ok = self.refresh(&generation).await.is_ok();
+                    generation.last_refresh.store(if ok { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+                    match self.generation().await {
+                        Ok(current) if Arc::ptr_eq(&current, &generation) => {},
+                        _ => break,
+                    }
                 }
             };
             tokio::select! {
                 _ = self.changed.notified() => {},
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    // No stale update can overwrite a new store revision;
-                    // update_matching performs a full CAS. Failure never
-                    // authorizes use of an expired/rolled-back generation.
-                    let ok=self.refresh(&generation).await.is_ok();
-                    generation.last_refresh.store(if ok{1}else{2},std::sync::atomic::Ordering::Relaxed);
-                }
-                result = background => return result,
+                _ = refresh => {},
+                result = generation.carrier.maintain() => return result,
             }
         }
     }
@@ -564,6 +564,7 @@ struct AutoClient {
     ttl: Duration,
     negative: Mutex<NegativeCache>,
     cache_changed: Notify,
+    recheck_gate: tokio::sync::Mutex<()>,
 }
 
 impl AutoClient {
@@ -600,7 +601,7 @@ impl AutoClient {
             }
             return Ok(false);
         }
-        if cache.generation != generation {
+        if cache.generation != generation || current.is_none() {
             return Ok(false);
         }
         if cache.record(generation, Instant::now(), self.ttl) {
@@ -609,18 +610,100 @@ impl AutoClient {
         Ok(true)
     }
 
-    /// One scoped maintenance future per running auto profile. No detached
-    /// task or application credentials, and no mutex held across an await.
+    /// Check the generation without consuming a due recheck. Both
+    /// foreground and maintenance use this before taking another step.
+    fn same_scope(&self, generation: u64) -> Result<bool, ClientError> {
+        let mut cache = self.negative.lock().map_err(|_| ClientError::Configuration)?;
+        let scope = crate::network_scope::observe(self.h3.remote());
+        if scope != cache.route || scope.is_none() {
+            cache.route = scope;
+            cache.invalidate();
+            self.cache_changed.notify_one();
+            return Ok(false);
+        }
+        Ok(cache.generation == generation)
+    }
+
+    /// The single fallback decision for tunnel, descriptor and background
+    /// probe operations. Only a pre-authenticated QuicUnreachable result
+    /// can reach the retry branch. Every other error remains terminal.
+    async fn attempt_h3<T, F, Fut>(
+        &self, generation: u64, mut attempt: F,
+    ) -> Result<Option<T>, ClientError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ClientError>>,
+    {
+        for index in 0..AUTO_QUIC_ATTEMPTS {
+            if !self.same_scope(generation)? {
+                return Err(ClientError::QuicUnreachable);
+            }
+            match attempt().await {
+                Ok(value) => {
+                    self.complete(generation, false)?;
+                    return Ok(Some(value));
+                }
+                Err(ClientError::QuicUnreachable) if index + 1 < AUTO_QUIC_ATTEMPTS => {}
+                Err(ClientError::QuicUnreachable) => {
+                    if self.complete(generation, true)? {
+                        return Ok(None);
+                    }
+                    crate::diag!(Warn, "client.auto", "stale_quic_probe_rejected",
+                        "generation" = Value::Count(generation));
+                    return Err(ClientError::QuicUnreachable);
+                }
+                Err(error) => {
+                    self.complete(generation, false)?;
+                    crate::diag!(Warn, "client.auto", "terminal_h3_failure_no_fallback",
+                        "generation" = Value::Count(generation),
+                        "reason" = Value::Label(error_kind(&error)));
+                    return Err(error);
+                }
+            }
+        }
+        Err(ClientError::Configuration)
+    }
+
+    /// A due negative-cache expiry has exactly one owner, whether a new
+    /// tunnel or the maintenance timer arrives first. Keep the async gate
+    /// only for that bounded credential-free probe, not for application OPEN.
+    /// Cancellation discards evidence and releases the gate; no fallback
+    /// can be published by a canceled probe.
+    async fn prepare(&self) -> Result<(u64, bool), ClientError> {
+        let _gate = self.recheck_gate.lock().await;
+        let recheck = {
+            let mut cache = self.negative.lock().map_err(|_| ClientError::Configuration)?;
+            let now = Instant::now();
+            let scope = crate::network_scope::observe(self.h3.remote());
+            match cache.expires {
+                Some(deadline) if now >= deadline => {
+                    let generation = cache.generation;
+                    cache.begin_recheck(generation, deadline, scope, now)
+                }
+                _ => None,
+            }
+        };
+        if let Some(generation) = recheck {
+            match self.attempt_h3(generation, || self.h3.probe()).await {
+                Ok(Some(())) => crate::diag!(Debug, "client.auto", "background_h3_verified"),
+                Ok(None) => {},
+                Err(error) => {
+                    crate::diag!(Warn, "client.auto", "background_h3_terminal_failure",
+                        "reason" = Value::Label(error_kind(&error)));
+                    return Err(error);
+                }
+            }
+        }
+        self.observe()
+    }
+
+    /// One maintenance future per immutable carrier generation. Foreground
+    /// requests use the exact same expiry gate. No detached probe survives
+    /// runtime shutdown or a security/credential generation replacement.
     async fn maintain(&self) -> Result<(), ClientError> {
         loop {
-            let pending = {
-                let cache = self
-                    .negative
-                    .lock()
-                    .map_err(|_| ClientError::Configuration)?;
-                cache.expires.map(|deadline| (cache.generation, deadline))
-            };
-            let Some((generation, deadline)) = pending else {
+            let pending = self.negative.lock().map_err(|_| ClientError::Configuration)?.expires;
+            let Some(deadline) = pending else {
                 self.cache_changed.notified().await;
                 continue;
             };
@@ -628,172 +711,51 @@ impl AutoClient {
                 _ = self.cache_changed.notified() => continue,
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
             }
-            let generation = {
-                let mut cache = self
-                    .negative
-                    .lock()
-                    .map_err(|_| ClientError::Configuration)?;
-                cache.begin_recheck(
-                    generation,
-                    deadline,
-                    crate::network_scope::observe(self.h3.remote()),
-                    Instant::now(),
-                )
-            };
-            let Some(generation) = generation else {
-                continue;
-            };
-            for attempt in 0..AUTO_QUIC_ATTEMPTS {
-                match self.h3.probe().await {
-                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
-                        if self.observe()?.0 != generation {
-                            break;
-                        }
-                    }
-                    Err(ClientError::QuicUnreachable) => {
-                        self.complete(generation, true)?;
-                        break;
-                    }
-                    result => {
-                        // Verified success or a terminal failure clears the
-                        // negative cache; a new tunnel must verify its own
-                        // connection. Never authorize H2 on a TLS error.
-                        self.complete(generation, false)?;
-                        match result {
-                            Ok(()) => crate::diag!(Debug, "client.auto", "background_h3_verified"),
-                            Err(error) => crate::diag!(
-                                Warn,
-                                "client.auto",
-                                "background_h3_terminal_failure",
-                                "reason" = Value::Label(error_kind(&error))
-                            ),
-                        }
-                        break;
-                    }
-                }
-            }
+            // Terminal remote errors invalidate evidence, not the running
+            // local listener. The next request still verifies independently.
+            let _ = self.prepare().await;
         }
     }
 
     async fn fetch_identity_document(&self, successor: bool) -> Result<String, ClientError> {
-        let (generation, cached) = self.observe()?;
+        let (generation, cached) = self.prepare().await?;
         if !cached {
-            for attempt in 0..AUTO_QUIC_ATTEMPTS {
-                match self.h3.fetch_identity_document(successor).await {
-                    Ok(value) => {
-                        self.complete(generation, false)?;
-                        return Ok(value);
-                    }
-                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
-                        if self.observe()?.0 != generation {
-                            return Err(ClientError::QuicUnreachable);
-                        }
-                    }
-                    Err(ClientError::QuicUnreachable) => {
-                        if !self.complete(generation, true)? {
-                            return Err(ClientError::QuicUnreachable);
-                        }
-                    }
-                    Err(error) => {
-                        self.complete(generation, false)?;
-                        return Err(error);
-                    }
-                }
+            if let Some(value) = self.attempt_h3(generation, || self.h3.fetch_identity_document(successor)).await? {
+                return Ok(value);
             }
         }
-        if self.observe()?.0 != generation {
+        if !self.same_scope(generation)? {
             return Err(ClientError::QuicUnreachable);
         }
         self.h2.fetch_identity_document(successor).await
     }
 
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
-        let (generation, cached) = self.observe()?;
-        crate::diag!(
-            Debug,
-            "client.auto",
-            "transport_select",
+        let (generation, cached) = self.prepare().await?;
+        crate::diag!(Debug, "client.auto", "transport_select",
             "generation" = Value::Count(generation),
-            "negative_cache_hit" = Value::Flag(cached)
-        );
-        // XHTTP observations belong to their carrier, not to the endpoint
-        // alone. H2 fallback retains the configured mode restriction but
-        // never inherits a cached H3 stream-up preference.
+            "negative_cache_hit" = Value::Flag(cached));
+        // XHTTP caches remain carrier-local; only the configured mode
+        // restriction crosses the transport boundary.
         if !cached {
-            for attempt in 0..AUTO_QUIC_ATTEMPTS {
-                match self
-                    .h3
-                    .open(address.clone(), port)
-                    .await
-                {
-                    Ok(tunnel) => {
-                        self.complete(generation, false)?;
-                        crate::diag!(
-                            Debug,
-                            "client.auto",
-                            "selected_h3",
-                            "generation" = Value::Count(generation)
-                        );
-                        eprintln!("transport=h3");
-                        return Ok(ProxyTunnel::H3(Box::new(tunnel)));
-                    }
-                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
-                        // Retry only a pre-authentication handshake with observed
-                        // UDP silence, and never carry evidence across a route change.
-                        if self.observe()?.0 != generation {
-                            return Err(ClientError::QuicUnreachable);
-                        }
-                    }
-                    Err(ClientError::QuicUnreachable) => {
-                        if !self.complete(generation, true)? {
-                            crate::diag!(
-                                Warn,
-                                "client.auto",
-                                "stale_quic_probe_rejected",
-                                "generation" = Value::Count(generation)
-                            );
-                            return Err(ClientError::QuicUnreachable);
-                        }
-                        crate::diag!(
-                            Warn,
-                            "client.auto",
-                            "h3_udp_silent_fallback_h2",
-                            "generation" = Value::Count(generation)
-                        );
-                        eprintln!("transport=h2 reason=quic_unreachable");
-                        break;
-                    }
-                    Err(error) => {
-                        // All errors except observed UDP silence remain terminal.
-                        self.complete(generation, false)?;
-                        crate::diag!(
-                            Warn,
-                            "client.auto",
-                            "terminal_h3_failure_no_fallback",
-                            "generation" = Value::Count(generation),
-                            "reason" = Value::Label(error_kind(&error))
-                        );
-                        return Err(error);
-                    }
-                }
+            if let Some(tunnel) = self.attempt_h3(generation, || self.h3.open(address.clone(), port)).await? {
+                crate::diag!(Debug, "client.auto", "selected_h3",
+                    "generation" = Value::Count(generation));
+                eprintln!("transport=h3");
+                return Ok(ProxyTunnel::H3(Box::new(tunnel)));
             }
+            crate::diag!(Warn, "client.auto", "h3_udp_silent_fallback_h2",
+                "generation" = Value::Count(generation));
+            eprintln!("transport=h2 reason=quic_unreachable");
         } else {
-            crate::diag!(
-                Debug,
-                "client.auto",
-                "negative_cache_fallback_h2",
-                "generation" = Value::Count(generation)
-            );
+            crate::diag!(Debug, "client.auto", "negative_cache_fallback_h2",
+                "generation" = Value::Count(generation));
             eprintln!("transport=h2 reason=quic_negative_cache");
         }
-        if self.observe()?.0 != generation {
+        if !self.same_scope(generation)? {
             return Err(ClientError::QuicUnreachable);
         }
-        self.h2
-            .open(address, port)
-            .await
-            .map(Box::new)
-            .map(ProxyTunnel::H2)
+        self.h2.open(address, port).await.map(Box::new).map(ProxyTunnel::H2)
     }
 }
 
@@ -808,6 +770,7 @@ impl Carrier {
             (Some(h2), Some(h3)) => Ok(Self::Auto(Arc::new(AutoClient {
                 h2, h3, ttl, negative: Mutex::new(NegativeCache::default()),
                 cache_changed: Notify::new(),
+                recheck_gate: tokio::sync::Mutex::new(()),
             }))),
             (Some(h2), None) => Ok(Self::H2(h2)),
             (None, Some(h3)) => Ok(Self::H3(h3)),
@@ -1017,11 +980,7 @@ impl ClientRuntime {
         loop {
             let view = changes.borrow_and_update().clone();
             let maintenance = async {
-                match &view.client {
-                    ProxyClient::Direct(a) => a.maintain().await,
-                    ProxyClient::Reality(r) => r.maintain().await,
-                    _ => std::future::pending::<Result<(), ClientError>>().await,
-                }
+                view.client.maintain().await
             };
             tokio::select! {
                 result=maintenance=>return result,
@@ -1281,11 +1240,7 @@ async fn serve_proxy(
     client: ProxyClient,
 ) -> Result<(), ClientError> {
     let maintenance = async {
-        match &client {
-            ProxyClient::Direct(a) => a.maintain().await,
-            ProxyClient::Reality(r) => r.maintain().await,
-            _ => std::future::pending::<Result<(), ClientError>>().await,
-        }
+        client.maintain().await
     };
     serve_proxy_loop(http, socks, || client.clone(), maintenance).await
 }
@@ -2214,6 +2169,7 @@ mod selector_tests {
             ttl: Duration::from_millis(100),
             negative: Mutex::new(NegativeCache::default()),
             cache_changed: Notify::new(),
+            recheck_gate: tokio::sync::Mutex::new(()),
         };
         let (generation, _) = auto.observe().unwrap();
         assert!(auto.complete(generation, true).unwrap());
