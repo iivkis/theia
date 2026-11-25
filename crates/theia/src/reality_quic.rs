@@ -235,12 +235,15 @@ impl Retired {
 struct Pending {
     flight: Flight,
     client: Cid,
+    version:u32,
     datagrams: Vec<Vec<u8>>,
     bytes: usize,
     deadline: Instant,
 }
 impl Pending {
     fn add(&mut self, data: Vec<u8>) -> Option<Inspection> {
+        let h=wire::long(&data)?;
+        if h.kind!=Kind::Initial||h.version!=self.version||h.scid!=self.client.as_slice(){return None;}
         let total = self.bytes.checked_add(data.len())?;
         if total > MAX_FIRST_BYTES || self.datagrams.len() >= QUEUE { return None; }
         let decision = self.flight.inspect(&data);
@@ -604,6 +607,7 @@ impl PreparedQuic {
                     let relay=route(&sessions,peer,data,local_peer||local_known||retired_tuple);
                     if (local_known || existing_local) && (relay.is_some() || sessions.values().any(|s|s.known(data))) { continue; }
                     if local_known || existing_local {
+                        if header.as_ref().is_some_and(|h|h.version!=wire::V1){continue;}
                         // An issued local CID alone is not authorization to
                         // create a fresh connection. Only a previously
                         // classified client Initial may reach TLS on it.
@@ -637,8 +641,11 @@ impl PreparedQuic {
                     if !pending.contains_key(&key) {
                         if pending.len() + sessions.len() >= SESSIONS { continue; }
                         let Some(flight) = Flight::new(&h) else { continue; };
-                        pending.insert(key.clone(), Pending { flight, client: h.scid.to_vec(), datagrams: Vec::new(), bytes: 0, deadline: now + FIRST_DEADLINE });
+                        pending.insert(key.clone(), Pending { flight, client: h.scid.to_vec(), version:h.version,datagrams: Vec::new(), bytes: 0, deadline: now + FIRST_DEADLINE });
                     }
+                    // Do not let an unrelated version/SCID invalidate an
+                    // already pending flight or consume its reassembly slot.
+                    if pending.get(&key).is_some_and(|p|p.version!=h.version||p.client.as_slice()!=h.scid){continue;}
                     let decision = pending.get_mut(&key).and_then(|p| {
                         if now >= p.deadline { None } else { p.add(data.to_vec()) }
                     });
@@ -670,7 +677,7 @@ impl PreparedQuic {
                         if sessions.len() + retired.len() >= RETIRED_LIMIT { continue; }
                         let Some(next) = sequence.checked_add(1) else { return Err(ServerError::Io); };
                         sequence = next;
-                        let mut s = Session::new(peer, h.dcid.to_vec(), p.client, h.version,now);
+                        let mut s = Session::new(peer, h.dcid.to_vec(), p.client, p.version,now);
                         s.generation=Some(generation.lease.clone());
                         s.reference_signer=Some(signer);
                         if !self.open_path(&mut workers, &reply_tx, sequence, &mut s, peer) { continue; }
@@ -735,6 +742,22 @@ mod tests {
         assert_eq!(route(&table, new, &known, false), None);
         assert_eq!(route(&table, old, &known, false), None);
     }
+    #[test]
+    fn first_flight_is_version_and_client_cid_bound(){
+        let mut initial=vec![0xc0,0,0,0,1,8];initial.extend_from_slice(&[1;8]);
+        initial.push(8);initial.extend_from_slice(&[2;8]);
+        initial.extend_from_slice(&[0,0x44,0x96]);initial.resize(1200,0);
+        let h=wire::long(&initial).unwrap();
+        let mut pending=Pending{flight:Flight::new(&h).unwrap(),client:h.scid.to_vec(),
+            version:h.version,datagrams:Vec::new(),bytes:0,deadline:Instant::now()+FIRST_DEADLINE};
+        let mut other=initial.clone();other[0]=0xd0;
+        other[1..5].copy_from_slice(&wire::V2.to_be_bytes());
+        assert!(pending.add(other).is_none());
+        let mut other=initial.clone();other[15]^=1;
+        assert!(pending.add(other).is_none());
+        assert!(pending.datagrams.is_empty()&&pending.bytes==0);
+    }
+
     #[test]
     fn zero_cid_and_retry_cid_cannot_authorize_migration(){
         let p=peer(1);
