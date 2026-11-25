@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "3fcef3e13d352c069241d991092c239c53e910ee",
+  "source_sha": "95d4b5a7ad69cf8ff5ac1114dbff7611546c4059",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -60,7 +60,7 @@
     {
       "scenario": "client-connection-modes",
       "file": "client-connection-modes.png",
-      "sha256": "eed3f13488b7a82a524f2b0c0a9ae5e79cb02ff785c873ec7f27f01ef616ee9c",
+      "sha256": "02f1c9c02a3701017d1199949696124ed17457bb74baeb1f4ee94193d13bf0f2",
       "state_fixture": false
     },
     {
@@ -72,7 +72,7 @@
     {
       "scenario": "client-first-key-connect",
       "file": "client-first-key-connect.png",
-      "sha256": "9ce79ab0c509d9b8836a204c5fe2d023fbfd202e9a53f7844b83a049c376ce0e",
+      "sha256": "02f1c9c02a3701017d1199949696124ed17457bb74baeb1f4ee94193d13bf0f2",
       "state_fixture": false
     },
     {
@@ -120,13 +120,13 @@
     {
       "scenario": "client-local-proxy-before-start",
       "file": "client-local-proxy-before-start.png",
-      "sha256": "98334e588c77e6071b76451b34186519cc14e155e6deee718f6e7e2e63a62e54",
+      "sha256": "6144ebcd71696be8067560ad997d3c84e52928c410ef7b30a776e3ef22ae8349",
       "state_fixture": false
     },
     {
       "scenario": "client-local-proxy-start-confirm",
       "file": "client-local-proxy-start-confirm.png",
-      "sha256": "a1af1c97b4fa792417f95d94087bd631cb7080be72f8b73ec2f971316292445e",
+      "sha256": "0e2ccafaea450c5b416c69a04f409f6125e3732a2f3908c93b7231b52f613c69",
       "state_fixture": false
     },
     {
@@ -156,7 +156,7 @@
     {
       "scenario": "client-page-proxy",
       "file": "client-page-proxy.png",
-      "sha256": "eed3f13488b7a82a524f2b0c0a9ae5e79cb02ff785c873ec7f27f01ef616ee9c",
+      "sha256": "02f1c9c02a3701017d1199949696124ed17457bb74baeb1f4ee94193d13bf0f2",
       "state_fixture": false
     },
     {
@@ -174,7 +174,7 @@
     {
       "scenario": "client-reality-key-connect",
       "file": "client-reality-key-connect.png",
-      "sha256": "232b2730b299aa9e89d26e378b746a73f63cffc0ac2b36c58c8dccacdedd93aa",
+      "sha256": "29f22123f5eed3e9dd7294b272cd01904f3733ad814c159d21a8edc7a2f4ef4f",
       "state_fixture": false
     },
     {
@@ -193,6 +193,18 @@
       "scenario": "client-reality-key-trust-review",
       "file": "client-reality-key-trust-review.png",
       "sha256": "5755ee06552e6d87919ba9827f00620d4d8b5ecc9a44c2c6dd31aa8c0c0109ab",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-reality-local-proxy-before-start",
+      "file": "client-reality-local-proxy-before-start.png",
+      "sha256": "e14581b97a7c7e91b0d139e1580eeb94bff51861a82fe47be3f523991ea6685f",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-reality-local-proxy-start-confirm",
+      "file": "client-reality-local-proxy-start-confirm.png",
+      "sha256": "0e2ccafaea450c5b416c69a04f409f6125e3732a2f3908c93b7231b52f613c69",
       "state_fixture": false
     },
     {
