@@ -818,6 +818,13 @@ pub(crate) fn guarded_trust_assert(path: &Path, expected: &[u8]) -> Result<(), C
     require_unchanged(path, expected)
 }
 
+/// Validate and publish a first configuration without replacing any existing file.
+pub(crate) fn guarded_create(path: &Path, config: &Config) -> Result<(), WriteFailure> {
+    let data = config.to_toml()?;
+    let _lock = editor_lock(path)?;
+    atomic_write_bytes(path, &data, None, true, sync_directory)
+}
+
 pub(crate) fn guarded_trust_write(
     path: &Path,
     data: &str,

@@ -22,18 +22,18 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable: theia
-            archive: tar.gz
+            artifact: theia-linux-x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             executable: theia.exe
-            archive: zip
+            artifact: theia-windows-x64.exe
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
       RELEASE_TARGET: ${{ matrix.target }}
       RELEASE_EXE: ${{ matrix.executable }}
-      RELEASE_ARCHIVE: ${{ matrix.archive }}
+      RELEASE_ARTIFACT: ${{ matrix.artifact }}
     defaults:
       run:
         shell: pwsh
@@ -63,7 +63,7 @@ jobs:
         run: |
           cargo build --locked --release --bin theia --target $env:RELEASE_TARGET
           if ($LASTEXITCODE -ne 0) { throw 'Release compilation failed' }
-      - name: Verify executable and package archive
+      - name: Verify and stage standalone executable
         run: |
           $ErrorActionPreference = 'Stop'
           $exe = Join-Path "target/$env:RELEASE_TARGET/release" $env:RELEASE_EXE
@@ -74,47 +74,34 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiler' }
           $cargo = cargo -V
           if ($LASTEXITCODE -ne 0) { throw 'Cannot identify Cargo' }
-          $stem = "theia-$env:RELEASE_TARGET-$($env:GITHUB_SHA.Substring(0,12))"
-          $stage = Join-Path $env:RUNNER_TEMP $stem
-          New-Item -ItemType Directory -Path $stage | Out-Null
-          Copy-Item -LiteralPath $exe -Destination (Join-Path $stage $env:RELEASE_EXE)
-          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $stage $env:RELEASE_EXE)).Hash.ToLowerInvariant()
-          "$digest  $env:RELEASE_EXE" | Set-Content -Encoding utf8 (Join-Path $stage 'SHA256SUMS')
-          [ordered]@{
-            source_sha = $env:GITHUB_SHA
-            branch = $env:GITHUB_REF_NAME
-            target = $env:RELEASE_TARGET
-            profile = 'release'
-            version = ($version -join "`n")
-            rustc = ($rust -join "`n")
-            cargo = ($cargo -join "`n")
-            binary_sha256 = $digest
-            run_id = $env:GITHUB_RUN_ID
-            run_attempt = $env:GITHUB_RUN_ATTEMPT
-            release_acceptance = 'not_evaluated'
-          } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $stage 'build-info.json')
-          New-Item -ItemType Directory -Path dist | Out-Null
-          $archive = Join-Path dist "$stem.$env:RELEASE_ARCHIVE"
-          if ($IsLinux) {
-            chmod 755 (Join-Path $stage $env:RELEASE_EXE)
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot preserve executable mode' }
-            tar -czf $archive -C $stage .
-            if ($LASTEXITCODE -ne 0) { throw 'tar packaging failed' }
-          } else {
-            Compress-Archive -Path "$stage/*" -DestinationPath $archive
+          if ($env:RELEASE_ARTIFACT.Length -gt 32 -or $env:RELEASE_ARTIFACT -notmatch '^[a-z0-9.-]+$') {
+            throw 'Invalid artifact name'
           }
-          if (!(Test-Path -LiteralPath $archive -PathType Leaf)) { throw 'Archive missing' }
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
-          "$hash  $([IO.Path]::GetFileName($archive))" | Set-Content -Encoding utf8 "$archive.sha256"
+          $stage = Join-Path $env:RUNNER_TEMP 'theia-dist'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          $binary = Join-Path $stage $env:RELEASE_ARTIFACT
+          Copy-Item -LiteralPath $exe -Destination $binary
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash.ToLowerInvariant()
+          $originalDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          if ($digest -ne $originalDigest) { throw 'Staged binary differs from compiled binary' }
           "### ${{ matrix.target }} release-profile build" >> $env:GITHUB_STEP_SUMMARY
           "Source: $env:GITHUB_SHA" >> $env:GITHUB_STEP_SUMMARY
-          "Archive: $([IO.Path]::GetFileName($archive))" >> $env:GITHUB_STEP_SUMMARY
+          "Branch: $env:GITHUB_REF_NAME" >> $env:GITHUB_STEP_SUMMARY
+          "Run: $env:GITHUB_RUN_ID / attempt $env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_STEP_SUMMARY
+          "Binary: $env:RELEASE_ARTIFACT" >> $env:GITHUB_STEP_SUMMARY
+          "Version: $($version -join '; ')" >> $env:GITHUB_STEP_SUMMARY
           "Binary SHA-256: $digest" >> $env:GITHUB_STEP_SUMMARY
+          "Cargo: $cargo" >> $env:GITHUB_STEP_SUMMARY
+          "Compiler:" >> $env:GITHUB_STEP_SUMMARY
+          '~~~text' >> $env:GITHUB_STEP_SUMMARY
+          $rust >> $env:GITHUB_STEP_SUMMARY
+          '~~~' >> $env:GITHUB_STEP_SUMMARY
           "Build only; acceptance and stable release publication are not performed here." >> $env:GITHUB_STEP_SUMMARY
-      - uses: actions/upload-artifact@v4
+      - name: Upload raw executable
+        uses: actions/upload-artifact@v7
         with:
-          name: theia-${{ matrix.target }}-${{ github.sha }}
-          path: dist/*
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/theia-dist/${{ matrix.artifact }}
+          archive: false
           if-no-files-found: error
           retention-days: 90
-          compression-level: 0

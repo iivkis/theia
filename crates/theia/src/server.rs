@@ -1551,6 +1551,7 @@ async fn relay_tcp(
     mut state: Session,
     session_id: u64,
 ) -> Result<(), ServerError> {
+    let traffic = crate::traffic::enter(crate::Role::Server, false);
     let (mut read, mut write) = tcp.into_split();
     let mut rx_state = state.clone();
     let mut tx_state = state.clone();
@@ -1576,6 +1577,7 @@ async fn relay_tcp(
                         .await
                         .map_err(|_| ServerError::TimedOut)?
                         .map_err(|_| ServerError::Io)?;
+                    traffic.upload(data.len());
                     activity.data(data.len());
                 }
                 Frame::Fin => {
@@ -1660,6 +1662,7 @@ async fn relay_tcp(
                 let _ = download_done.send(());
                 return Ok::<(), ServerError>(());
             }
+            traffic.download(size);
             activity.data(size);
         }
     };
@@ -1910,7 +1913,7 @@ pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
     );
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
-        run_supervised_file(document, config_path).await
+        run_supervised_file(document, config_path, None).await
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -2945,9 +2948,62 @@ impl<T> Drop for SupervisorTask<T> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+struct TuiServerControl {
+    expected: [u8; 32],
+    ready: Option<tokio::sync::oneshot::Sender<usize>>,
+    stop: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn saved_server_bytes(
+    path: &Path,
+    expected: [u8; 32],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, ServerError> {
+    use sha2::{Digest, Sha256};
+    let bytes =
+        zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ServerError::Config)?);
+    let digest: [u8; 32] = Sha256::digest(bytes.as_slice()).into();
+    if digest != expected {
+        return Err(ServerError::Config);
+    }
+    Ok(bytes)
+}
+
+/// Explicitly owned TUI runtime. No process-wide signals, elevation or new
+/// administrative ports; use the same supervisor and strict local IPC.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) async fn run_tui_file(
+    path: &Path,
+    expected: [u8; 32],
+    ready: tokio::sync::oneshot::Sender<usize>,
+    stop: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), ServerError> {
+    let bytes = saved_server_bytes(path, expected)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| ServerError::Config)?;
+    let Config::Server(document) = config::parse(text).map_err(|_| ServerError::Config)? else {
+        return Err(ServerError::Config);
+    };
+    drop(bytes);
+    if !document.server.enabled {
+        return Err(ServerError::Config);
+    }
+    run_supervised_file(
+        document,
+        path,
+        Some(TuiServerControl {
+            expected,
+            ready: Some(ready),
+            stop,
+        }),
+    )
+    .await
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn run_supervised_file(
     document: ServerDocument,
     config_path: &Path,
+    mut control: Option<TuiServerControl>,
 ) -> Result<(), ServerError> {
     crate::diag!(
         Info,
@@ -2958,7 +3014,18 @@ async fn run_supervised_file(
     let mut root_history = crate::reality_root_history::RootHistory::open(config_path, &document)
         .map_err(|_| ServerError::Config)?;
     let limits = GenerationLimits::new(&document);
-    let initial = prepare_generation(&document, 1, &limits, None).await?;
+    let initial = if let Some(control) = &mut control {
+        tokio::select! {
+            biased;
+            _ = &mut control.stop => return Ok(()),
+            result = prepare_generation(&document, 1, &limits, None) => result?,
+        }
+    } else {
+        prepare_generation(&document, 1, &limits, None).await?
+    };
+    if let Some(control) = &control {
+        saved_server_bytes(config_path, control.expected)?;
+    }
     root_history
         .advance(&document)
         .map_err(|_| ServerError::Config)?;
@@ -3008,6 +3075,11 @@ async fn run_supervised_file(
         }))
     });
     let mut running = RunningGeneration::launch(initial.listeners, GenerationPhase::Active);
+    if let Some(control) = &mut control {
+        if let Some(ready) = control.ready.take() {
+            let _ = ready.send(running.phases.len());
+        }
+    }
     crate::diag!(Info, "server.supervisor", "generation_active");
     let mut identities = current_identities;
     let mut retiring: Option<SupervisorTask<()>> = None;
@@ -3017,6 +3089,28 @@ async fn run_supervised_file(
     // publishing any structural generation or independent root replacement.
     loop {
         tokio::select! {
+            _ = async {
+                match &mut control {
+                    Some(control) => { let _ = (&mut control.stop).await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // Close admission before shutdown, and stop accepting further
+                // Apply requests. The retiring generation is already draining.
+                running.drain();
+                if let Some(mut service) = management_task.take() {
+                    service.0.abort();
+                    let _ = (&mut service.0).await;
+                }
+                let _ = timeout(GENERATION_DRAIN + Duration::from_secs(2), async {
+                    while running.tasks.join_next().await.is_some() {}
+                }).await;
+                running.tasks.shutdown().await;
+                if let Some(mut old) = retiring.take() {
+                    let _ = (&mut old.0).await;
+                }
+                return Ok(());
+            }
             request = queue.recv() => {
                 let Some(mut request) = request else {
                     return Err(ServerError::Io);
@@ -3673,6 +3767,81 @@ async fn run_document_with_config(
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[tokio::test]
+    async fn tui_server_owns_startup_and_releases_listeners_on_confirmed_stop() {
+        use std::fs;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("tui-server").unwrap());
+        fs::create_dir(&directory).unwrap();
+        let _cleanup = Cleanup(directory.clone());
+        let path = directory.join("server.toml");
+        let cert = directory.join("cert.pem");
+        let key = directory.join("key.pem");
+        let material = rcgen::generate_simple_self_signed(vec!["a.example.org".into()]).unwrap();
+        fs::write(&cert, material.cert.pem()).unwrap();
+        #[cfg(not(windows))]
+        fs::write(&key, material.key_pair.serialize_pem()).unwrap();
+        #[cfg(windows)]
+        crate::bounded_input::write_test_private(&key, material.key_pair.serialize_pem());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tcp_addr = tcp.local_addr().unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        let mut document = live_auth_fixture();
+        document.server.inbounds.truncate(1);
+        let inbound = &mut document.server.inbounds[0];
+        inbound.h2_listen = tcp_addr.to_string();
+        inbound.quic_listen = udp_addr.to_string();
+        inbound.tls_cert = format!("file:{}", cert.display());
+        inbound.tls_key = format!("file:{}", key.display());
+        let contents = Config::Server(document).to_toml().unwrap();
+        fs::write(&path, &contents).unwrap();
+        let expected: [u8; 32] = Sha256::digest(contents.as_bytes()).into();
+        let (bad_ready, _) = tokio::sync::oneshot::channel();
+        let (_bad_stop, bad_rx) = tokio::sync::oneshot::channel();
+        assert!(matches!(
+            run_tui_file(&path, [0; 32], bad_ready, bad_rx).await,
+            Err(ServerError::Config)
+        ));
+        drop(tcp);
+        drop(udp);
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let (stop, stop_rx) = tokio::sync::oneshot::channel();
+        let run_path = path.clone();
+        let task =
+            tokio::spawn(async move { run_tui_file(&run_path, expected, ready, stop_rx).await });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert!(std::net::TcpListener::bind(tcp_addr).is_err());
+        assert!(std::net::UdpSocket::bind(udp_addr).is_err());
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(std::net::TcpListener::bind(tcp_addr).is_ok());
+        assert!(std::net::UdpSocket::bind(udp_addr).is_ok());
+        assert_eq!(fs::read(&path).unwrap(), contents.as_bytes());
+    }
 
     #[test]
     fn pem_reader_refuses_oversized_and_relative_inputs() {

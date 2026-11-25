@@ -17,8 +17,10 @@ serde = { version = "=1.0.228", features = ["derive"] }
 toml = "=0.8.23"
 ratatui = "=0.29.0"
 crossterm = "=0.28.1"
-# QR matrix only, no image codecs or external process.
+# Local QR generation and bounded offline image decoding, no external process.
 qrcode = { version = "=0.14.1", default-features = false }
+png = "=0.18.1"
+quircs = "=0.10.3"
 base64 = "=0.22.1"
 bytes = "=1.10.1"
 h2 = "=0.4.19"

@@ -191,7 +191,7 @@ def drive(binary, config, scenario, expected):
             tty.send("y")  # never mutates even when the candidate is feasible
             revision(binary, expected)
         else:
-            tty.wait("Редактор TOML")
+            tty.wait("Параметры · Enter")
             if scenario == "apply":
                 # Both actual terminal creation paths must be reachable and
                 # cancel without touching the exact TOML or server revision.
@@ -213,7 +213,7 @@ def drive(binary, config, scenario, expected):
             if scenario == "dirty":
                 since = tty.snapshot()
                 tty.send("\r")
-                tty.wait("Ввод:", since=since)
+                tty.wait("Ввод ·", since=since)
                 tty.send("x\r")  # valid but unsaved changed TLS DNS
                 tty.wait("Не сохранено")
                 since = tty.snapshot()
@@ -323,7 +323,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     def open_panel():
         tty = Terminal(command)
         try:
-            tty.wait("Редактор TOML")
+            tty.wait("Параметры · Enter")
             tty.send("p")
             tty.wait("Состояние прочитано")
             return tty
@@ -378,7 +378,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
                 sock.settimeout(2)
                 assert sock.connect_ex(("127.0.0.1", port)) != 0, "listener leaked after stop"
         tty.send("\x1b")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         tty.send("q")
         tty.close()
     finally:
@@ -416,7 +416,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
         confirm(tty, "Восстановление журнала: Restored")
         proxy_status(binary, "NoJournal")
         tty.send("\x1b")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         tty.send("q")
         tty.close()
     finally:
@@ -461,13 +461,13 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             assert path.read_text(encoding="utf-8") not in tty.raw
         revision(binary, 1)
         tty.send("\x1b")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         return path
 
     server_cmd = [binary, "tui", "--role", "server", "--config", str(server)]
     tty = Terminal(server_cmd)
     try:
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         own_link = issue(tty, "own-user")
         tty.send("j")
         tty.wait("REALITY 2/2:")
@@ -511,7 +511,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             time.sleep(0.05)
         client_cmd = [binary, "tui", "--role", "client", "--config", str(client)]
         tty = Terminal(client_cmd)
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         original = client.read_bytes()
         tty.send("i")
         tty.wait("F-14: импорт подключения")
@@ -527,11 +527,11 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         assert read_config(client)["client"]["active_profile"] == "home"
         assert client_revision(1)
         tty.send("\x1b")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         assert read_config(client)["client"]["active_profile"] == "public"
         assert client_revision(1)
         tty.send("V")
@@ -549,7 +549,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         assert client_revision(2)
         test_tunnels(http_port, socks_port, echo_port)
         tty.send("\x1b")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         headless.terminate()
         headless.wait(timeout=3)
 
@@ -573,7 +573,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.send("g")
         tty.wait("Регистрация уже подготовленных материалов")
         tty.send("\x1b")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         assert set(base.glob(".theia-enroll-*")) == before
         assert client.read_bytes() == saved
 
@@ -588,11 +588,11 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Запись сохранена, редактор перечитан")
         assert read_config(client)["client"]["active_profile"] == "public"
         tty.send("\x1b")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         assert read_config(client)["client"]["active_profile"] == "reality-profile"
         tty.send("V")
         tty.wait("s: запустить локальный runtime")
@@ -620,13 +620,13 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
     before = server.read_bytes()
     tty = Terminal(server_cmd)
     try:
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         tty.send("v")
         tty.wait("revision=2")
         tty.send("b")
         tty.wait("Откат авторизации, revision=2")
         tty.send("n")
-        tty.wait("Редактор TOML")
+        tty.wait("Параметры · Enter")
         revision(binary, 2)
         tty.send("v")
         tty.wait("revision=2")

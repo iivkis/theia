@@ -130,6 +130,12 @@ mod tests {
         assert!(is_qr && first != second);
         let expected = qr_svg(&link).unwrap().unwrap();
         for path in [first, second] {
+            assert_eq!(
+                crate::qr_import::scan_file(path.to_str().unwrap())
+                    .unwrap()
+                    .as_str(),
+                link.as_str()
+            );
             let actual = crate::bounded_input::read(&path, 2 * 1024 * 1024, true, true).unwrap();
             assert_eq!(&actual[..], expected.as_bytes());
         }
