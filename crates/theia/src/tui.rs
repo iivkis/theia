@@ -530,10 +530,7 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
     let Some(editor) = editor else {
         return entries
             .iter()
-            .map(|(key, label)| ActionItem {
-                key: *key,
-                label,
-            })
+            .map(|(key, label)| ActionItem { key: *key, label })
             .collect();
     };
     // Presentation-only availability. Direct shortcuts still pass through all

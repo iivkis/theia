@@ -667,7 +667,8 @@ impl FileBrowser {
 
 // First-run input is independent of the security mode and contains no
 // editable protocol parameters. Only the existing validated backends save.
-type FirstInviteRead = Result<(Zeroizing<String>, crate::client_import::ProductSource), &'static str>;
+type FirstInviteRead =
+    Result<(Zeroizing<String>, crate::client_import::ProductSource), &'static str>;
 
 struct FirstInvite {
     source: Zeroizing<String>,
