@@ -34,9 +34,9 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
+    widgets::{List, ListItem, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 use std::{
@@ -2196,9 +2196,9 @@ fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
     if area.width < 90 || area.height < 18 {
         return None;
     }
-    let cols = Layout::horizontal([Constraint::Length(30), Constraint::Min(1)]).split(area);
+    let cols = Layout::horizontal([Constraint::Length(28), Constraint::Length(2), Constraint::Min(1)]).split(area);
     let left = Layout::vertical([Constraint::Length(8), Constraint::Min(1)]).split(cols[0]);
-    Some([left[0], left[1], cols[1]])
+    Some([left[0], left[1], cols[2]])
 }
 
 fn record_start(editor: &Editor, rect: Rect) -> usize {
@@ -2311,7 +2311,7 @@ fn panel_at(
     focused: bool,
     viewport: Option<&Viewport>,
 ) {
-    frame.render_widget(Clear, area);
+    tui_widgets::canvas(frame, area);
     let area = if viewport.is_some() { centered_column(area, 108) } else { area };
     let page = usize::from(area.height.saturating_sub(2)).max(1);
     let (rows, focus) = visual_rows(body, usize::from(area.width.saturating_sub(2)));
@@ -2389,7 +2389,9 @@ fn draw_guided(
         ]).style(Style::default().bg(SURFACE)), parts[0]);
     }
     if let Some(form) = form {
-        form.render(frame, parts[1], if parts[0].height == 0 { &caption } else { "Параметры" });
+        let title = if parts[0].height == 0 { caption.as_str() } else { "Параметры" };
+        if heading == "Выбор пользователей" { form.render_picker(frame, parts[1], title); }
+        else { form.render(frame, parts[1], title); }
     } else {
         panel_at(frame, parts[1], &caption, body, true, viewport);
     }
@@ -2481,7 +2483,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         ),
     }
     if interaction.is_some_and(|ui| ui.qr_scan.is_some()) {
-        frame.render_widget(Clear, parts[1]);
+        tui_widgets::canvas(frame, parts[1]);
         let cancelled = interaction
             .and_then(|ui| ui.qr_scan.as_ref())
             .is_some_and(|scan| scan.cancelled);
@@ -2497,19 +2499,19 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true
         );
     } else if let Some(dialog) = interaction.and_then(|ui| ui.config_dialog.as_ref()) {
-        frame.render_widget(Clear, parts[1]);
+        tui_widgets::canvas(frame, parts[1]);
         if let Some(guide) = dialog.guide() {
             draw_guided(frame, parts[1], dialog.title(), &dialog.body(), guide, viewport, dialog.form());
         } else if let Some(form) = dialog.form() {
-            form.render(frame, centered_column(parts[1], 108), dialog.title());
+            form.render_picker(frame, centered_column(parts[1], 108), dialog.title());
         } else {
             modal_panel!(frame, parts[1], dialog.title(), &dialog.body(), true);
         }
     } else if let Some(menu) = interaction.and_then(|ui| ui.menu.as_ref()) {
-        frame.render_widget(Clear, parts[1]);
+        tui_widgets::canvas(frame, parts[1]);
         menu.render(frame, parts[1]);
     } else if let Some(ui) = interaction.filter(|ui| ui.show_server_process) {
-        frame.render_widget(Clear, parts[1]);
+        tui_widgets::canvas(frame, parts[1]);
         let items = ui.server_process.actions();
         if let Some([report, controls]) = action_layout(parts[1], items.len()) {
             modal_panel!(frame, report, "Состояние сервера", &ui.server_process.summary(), false);
@@ -2518,7 +2520,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             modal_panel!(frame, parts[1], "Сервер • запуск и остановка", &ui.server_process.body(), true);
         }
     } else if let Some(monitor) = interaction.and_then(|ui| ui.traffic_monitor.as_ref()) {
-        frame.render_widget(Clear, parts[1]);
+        tui_widgets::canvas(frame, parts[1]);
         if parts[1].width < 46
             || parts[1].height < 17
             || (parts[1].width < 86 && parts[1].height < 27)
@@ -2528,7 +2530,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             monitor.render(frame, parts[1]);
         }
     } else if let Some(status) = interaction.and_then(|ui| ui.reality_status.as_ref()) {
-        frame.render_widget(Clear, parts[1]);
+        tui_widgets::canvas(frame, parts[1]);
         let items = status.actions();
         if let Some([report, controls]) = action_layout(parts[1], items.len()) {
             modal_panel!(frame, report, "Подключение и состояние REALITY", &status.summary(), false);
@@ -2666,7 +2668,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     }
     let footer = if interaction.is_some_and(|ui| !ui.workspace_visible()) {
-        "Активная операция · Shift+PgUp/PgDn или колесо: прокрутка · действия указаны в панели"
+        "Shift+PgUp/PgDn прокрутка · Esc назад (если доступно)"
     } else {
         match model.screen {
             Screen::Home => "↑↓ / Tab: роль • Enter: открыть • F1: помощь • q: выход",
@@ -3019,10 +3021,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
     let categories = labels.iter().map(|label| ListItem::new(format!("  {label}")));
     frame.render_widget(
         List::new(categories.collect::<Vec<_>>()).block(
-            Block::default()
-                .title(" Разделы · F2 ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(MUTED)),
+            tui_widgets::section(" Разделы · F2 ", false),
         ),
         nav,
     );
@@ -3051,7 +3050,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
                     } else {
                         " "
                     },
-                    if reality { "R" } else { "T" },
+                    if reality { "REALITY" } else { "TLS" },
                     id,
                     if active { " *" } else { "" }
                 ))
@@ -3059,16 +3058,13 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
             })
             .collect();
         let title = if role == Role::Server {
-            " Inbound · ↑↓ "
+            " Подключения · ↑↓ "
         } else {
             " Профили · ↑↓ "
         };
         frame.render_widget(
             List::new(items).block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ACCENT)),
+                tui_widgets::section(title, true),
             ),
             records,
         );
@@ -3117,8 +3113,8 @@ fn welcome_form(role: Role, selected: usize) -> Form {
 
 fn draw_welcome(frame: &mut Frame<'_>, area: Rect, role: Role, selected: usize) {
     let title = if role == Role::Server { "Для сервера · начало работы" } else { "Для клиента · начало работы" };
-    frame.render_widget(Clear, area);
-    welcome_form(role, selected).render(frame, centered_column(area, 88), title);
+    tui_widgets::canvas(frame, area);
+    welcome_form(role, selected).render_picker(frame, centered_column(area, 88), title);
 }
 
 fn centered_column(area: Rect, max_width: u16) -> Rect {
@@ -3126,7 +3122,9 @@ fn centered_column(area: Rect, max_width: u16) -> Rect {
     Rect::new(area.x + (area.width - width) / 2, area.y, width, area.height)
 }
 
-fn editor_layout(area: Rect) -> Option<[Rect; 4]> {
+fn editor_layout(mut area: Rect) -> Option<[Rect; 4]> {
+    area.height = area.height.min(28);
+    area.width = area.width.min(116);
     if area.height < 10 || area.width < 38 { return None; }
     if area.height >= 26 && area.width >= 48 {
         let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(7), Constraint::Length(8)]).split(area);
@@ -3224,7 +3222,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     ];
     let widget = Paragraph::new(status);
     if wide {
-        frame.render_widget(widget.block(Block::default().title("Обзор").borders(Borders::ALL).border_style(Style::default().fg(MUTED))), overview);
+        frame.render_widget(widget.block(tui_widgets::section("Обзор", false)), overview);
     } else {
         frame.render_widget(widget, overview);
     }
@@ -3238,7 +3236,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     });
     let mut table = Table::new(table_rows, [Constraint::Length(17), Constraint::Min(1)])
         .column_spacing(2)
-        .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(ACCENT)));
+        .block(tui_widgets::section(title, true));
     if header {
         table = table.header(Row::new(["Параметр", "Значение"]).style(Style::default().fg(TEXT)));
     }
