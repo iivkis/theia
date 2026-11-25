@@ -18,7 +18,7 @@ use crate::{
     tui_reality_status::StatusPanel,
     tui_runtime::RuntimePanel,
     tui_server_process::ProcessPanel,
-    tui_widgets::{action_layout, Actions, Field, Form},
+    tui_widgets::{self, action_layout, Actions, Field, Form, ACCENT, BG, ERROR, FOCUS, MUTED, SURFACE, TEXT, WARNING},
     Role,
 };
 use crossterm::{
@@ -771,26 +771,26 @@ impl Interaction {
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
             if let Some(form) = dialog.form() {
-                let target = if dialog.guide().is_some() { guided_form_area(body) } else { centered_column(body, 108) };
+                let target = if dialog.guide().is_some() { guided_form_area(body, form.fields.len()) } else { centered_column(body, 108) };
                 if let Some(id) = form.hit(target, event.column, event.row) { dialog.select_field(id); }
             }
             return;
         }
         if let Some(panel) = self.reality_provision.as_mut() {
             if let Some(form) = panel.form() {
-                if let Some(id) = form.hit(guided_form_area(body), event.column, event.row) { panel.select_field(id); }
+                if let Some(id) = form.hit(guided_form_area(body, form.fields.len()), event.column, event.row) { panel.select_field(id); }
             }
             return;
         }
         if let Some(panel) = self.reality_enrollment.as_mut() {
             if let Some(form) = panel.form() {
-                if let Some(id) = form.hit(guided_form_area(body), event.column, event.row) { panel.select_field(id); }
+                if let Some(id) = form.hit(guided_form_area(body, form.fields.len()), event.column, event.row) { panel.select_field(id); }
             }
             return;
         }
         if let Some(flow) = self.records.as_mut() {
             if let Some(form) = flow.form(self.editor.as_ref()) {
-                if let Some(id) = form.hit(guided_form_area(body), event.column, event.row) { flow.select_field(id); }
+                if let Some(id) = form.hit(guided_form_area(body, form.fields.len()), event.column, event.row) { flow.select_field(id); }
             }
             return;
         }
@@ -2172,9 +2172,9 @@ impl Interaction {
 
 fn shell_layout(area: Rect) -> [Rect; 3] {
     let parts = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(4),
-        Constraint::Length(3),
+        Constraint::Length(2),
+        Constraint::Min(6),
+        Constraint::Length(2),
     ])
     .split(area);
     [parts[0], parts[1], parts[2]]
@@ -2264,17 +2264,17 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
         let style = if selected {
             focus.get_or_insert(rows.len());
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(ACCENT)
+                .bg(FOCUS)
                 .add_modifier(Modifier::BOLD)
         } else if line.starts_with("Ошибка:") || line.starts_with("ОТКАЗ:") {
-            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+            Style::default().fg(ERROR).add_modifier(Modifier::BOLD)
         } else if line.starts_with("ШАГ ") || line.starts_with("ПРЕДЛОЖЕННЫЙ ") || line.starts_with("ПУТЬ К TOML") || line.starts_with("ВЫБЕРИТЕ ") || line.starts_with("НАЧАЛО РАБОТЫ") || line.starts_with("SMARTTHEIA REALITY") || line.starts_with("СЕТЬ ") || line == "ДОСТУП" || line == "OWN-TLS" || line == "ПРОФИЛИ" {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("КОНФИДЕНЦИАЛЬНО")
         {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(WARNING)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -2313,11 +2313,6 @@ fn panel_at(
 ) {
     frame.render_widget(Clear, area);
     let area = if viewport.is_some() { centered_column(area, 108) } else { area };
-    let style = Style::default().fg(if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    });
     let page = usize::from(area.height.saturating_sub(2)).max(1);
     let (rows, focus) = visual_rows(body, usize::from(area.width.saturating_sub(2)));
     let count = rows.len();
@@ -2338,10 +2333,7 @@ fn panel_at(
     let visible: Vec<_> = rows.into_iter().skip(offset).take(page).collect();
     frame.render_widget(
         Paragraph::new(visible).block(
-            Block::default()
-                .title(caption)
-                .borders(Borders::ALL)
-                .border_style(style),
+            tui_widgets::section(&caption, focused),
         ),
         area,
     );
@@ -2353,10 +2345,23 @@ fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bo
 
 /// A persistent step header and action strip separate guidance from the
 /// scrollable form/review. No display-only shortcut may commit a transaction.
-fn guided_form_area(area: Rect) -> Rect {
-    let area = centered_column(area, 108);
-    if area.height < 18 || area.width < 48 { return area; }
-    Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(3)]).split(area)[1]
+fn guided_layout(area: Rect, count: Option<usize>) -> [Rect; 3] {
+    let mut area = centered_column(area, 132);
+    if let Some(count) = count {
+        let preferred = (count.saturating_mul(3).saturating_add(10)).clamp(18, 36) as u16;
+        let height = area.height.min(preferred);
+        area.y += (area.height - height).min(8) / 2;
+        area.height = height;
+    }
+    if area.height < 10 {
+        return [Rect::new(area.x, area.y, area.width, 0), area, Rect::new(area.x, area.bottom(), area.width, 0)];
+    }
+    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(2)]).split(area);
+    [parts[0], parts[1], parts[2]]
+}
+
+fn guided_form_area(area: Rect, count: usize) -> Rect {
+    guided_layout(area, Some(count))[1]
 }
 
 fn draw_guided(
@@ -2369,44 +2374,31 @@ fn draw_guided(
     form: Option<Form>,
 ) {
     let (step, total, heading, keys) = guide;
-    let title = format!("{title} · ШАГ {step}/{total} · {heading}");
-    frame.render_widget(Clear, area);
-    if area.height < 18 || area.width < 48 {
-        if let Some(form) = form { form.render(frame, guided_form_area(area), &title); }
-        else { panel_at(frame, area, &title, body, true, viewport); }
-        return;
+    tui_widgets::canvas(frame, area);
+    let parts = guided_layout(area, form.as_ref().map(|f| f.fields.len()));
+    let caption = format!("{title} · ШАГ {step}/{total}");
+    if parts[0].height > 0 {
+        let mut segments = vec![Span::styled(format!(" {step}/{total} "), Style::default().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD)), Span::raw("  ")];
+        for number in 1..=total {
+            segments.push(Span::styled(if number <= step { "━━━ " } else { "─── " }, Style::default().fg(if number <= step { ACCENT } else { MUTED })));
+        }
+        segments.push(Span::styled(heading, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)));
+        frame.render_widget(Paragraph::new(vec![
+            Line::styled(caption.as_str(), Style::default().fg(MUTED)),
+            Line::from(segments),
+        ]).style(Style::default().bg(SURFACE)), parts[0]);
     }
-    let area = centered_column(area, 108);
-    let parts = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(4),
-        Constraint::Length(3),
-    ]).split(area);
-    let mut segments = vec![Span::styled(
-        format!(" {step}/{total}  "),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )];
-    for number in 1..=total {
-        segments.push(Span::styled(
-            if number <= step { "━━" } else { "──" },
-            Style::default().fg(if number <= step { Color::Cyan } else { Color::DarkGray }),
-        ));
-        segments.push(Span::raw(" "));
-    }
-    segments.push(Span::styled(heading, Style::default().add_modifier(Modifier::BOLD)));
-    frame.render_widget(
-        Paragraph::new(Line::from(segments)).block(Block::default().title(title.as_str()).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))),
-        parts[0],
-    );
     if let Some(form) = form {
-        form.render(frame, parts[1], "Параметры");
+        form.render(frame, parts[1], if parts[0].height == 0 { &caption } else { "Параметры" });
     } else {
-        panel_at(frame, parts[1], "Проверка", body, true, viewport);
+        panel_at(frame, parts[1], &caption, body, true, viewport);
     }
-    frame.render_widget(
-        Paragraph::new(keys).wrap(Wrap { trim: true }).block(Block::default().title("Следующее действие").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))),
-        parts[2],
-    );
+    if parts[2].height > 0 {
+        frame.render_widget(Paragraph::new(vec![
+            Line::styled("Следующее действие", Style::default().fg(MUTED)),
+            tui_widgets::key_line(keys),
+        ]).style(Style::default().bg(SURFACE)).wrap(Wrap { trim: true }), parts[2]);
+    }
 }
 
 fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>) {
@@ -2419,6 +2411,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
         return;
     }
+    tui_widgets::canvas(frame, area);
     let parts = shell_layout(area);
     let viewport = interaction.map(|ui| &ui.viewport);
     macro_rules! modal_panel {
@@ -2452,20 +2445,11 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         }
         _ => "THEIA  •  Локальное управление".into(),
     };
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            header,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        ),
-        parts[0],
-    );
+    let (brand, status) = header.split_once("  |  ").unwrap_or((header.as_str(), ""));
+    frame.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled(format!(" {brand} "), Style::default().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {status}"), Style::default().fg(TEXT)),
+    ])).style(Style::default().bg(SURFACE)), parts[0]);
     match model.screen {
         Screen::Home => {
             let cards = home_layout(parts[1]);
@@ -2698,14 +2682,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             }
         }
     };
-    frame.render_widget(
-        Paragraph::new(footer).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        ),
-        parts[2],
-    );
+    frame.render_widget(Paragraph::new(tui_widgets::key_line(footer))
+        .style(Style::default().bg(SURFACE)).wrap(Wrap { trim: true }), parts[2]);
 }
 
 fn eligible_users(editor: &Editor, disabled: bool) -> Vec<String> {
@@ -3044,7 +3022,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
             Block::default()
                 .title(" Разделы · F2 ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(MUTED)),
         ),
         nav,
     );
@@ -3060,8 +3038,8 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
             .map(|(index, (id, active, reality))| {
                 let style = if index == editor.workspace_selected() {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .fg(ACCENT)
+                        .bg(FOCUS)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -3090,7 +3068,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(ACCENT)),
             ),
             records,
         );
@@ -3238,7 +3216,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         return;
     };
     let wide = area.height >= 26 && area.width >= 48;
-    let state_color = if editor.write_uncertain() { Color::LightRed } else if editor.dirty() { Color::Yellow } else { Color::Green };
+    let state_color = if editor.write_uncertain() { ERROR } else if editor.dirty() { WARNING } else { ACCENT };
     let status = vec![
         Line::from(vec![Span::styled(dirty, Style::default().fg(state_color).add_modifier(Modifier::BOLD)), Span::raw(format!(" · {mode}"))]),
         Line::raw(editor.selection_summary()),
@@ -3246,7 +3224,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     ];
     let widget = Paragraph::new(status);
     if wide {
-        frame.render_widget(widget.block(Block::default().title("Обзор").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))), overview);
+        frame.render_widget(widget.block(Block::default().title("Обзор").borders(Borders::ALL).border_style(Style::default().fg(MUTED))), overview);
     } else {
         frame.render_widget(widget, overview);
     }
@@ -3254,15 +3232,15 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     let table_rows = editor.workspace_fields().into_iter().skip(start).take(rows).map(|(label, value, selected)| {
         let marker = if selected { "› " } else { "  " };
         let style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD)
         } else { Style::default() };
         Row::new(vec![format!("{marker}{label}"), value]).style(style)
     });
     let mut table = Table::new(table_rows, [Constraint::Length(17), Constraint::Min(1)])
         .column_spacing(2)
-        .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+        .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(ACCENT)));
     if header {
-        table = table.header(Row::new(["Параметр", "Значение"]).style(Style::default().fg(Color::Gray)));
+        table = table.header(Row::new(["Параметр", "Значение"]).style(Style::default().fg(TEXT)));
     }
     frame.render_widget(table, table_area);
     let error = editor.error.as_deref();
@@ -3281,8 +3259,8 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         panel(frame, parts[1], "Действия", actions, false);
     } else {
         let hint = error.unwrap_or(help);
-        frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: true }).style(Style::default().fg(if error.is_some() { Color::LightRed } else { Color::Gray })), detail);
-        frame.render_widget(Paragraph::new(actions).style(Style::default().fg(Color::Cyan)), bottom);
+        frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: true }).style(Style::default().fg(if error.is_some() { ERROR } else { TEXT })), detail);
+        frame.render_widget(Paragraph::new(actions).style(Style::default().fg(ACCENT)), bottom);
     }
 
 }
@@ -3610,7 +3588,7 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Enter));
         let dialog = ui.config_dialog.as_ref().unwrap();
         let form = dialog.form().unwrap();
-        let target = guided_form_area(body);
+        let target = guided_form_area(body, form.fields.len());
         let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y) == Some(4)).unwrap();
         ui.mouse(&mut model, click(target.x + 2, y), area);
         assert_eq!(ui.config_dialog.as_ref().unwrap().form().unwrap().selected, 4);
