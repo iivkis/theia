@@ -1214,18 +1214,25 @@ impl ProvisionPanel {
         let first = input.source.is_none();
         let details = vec![
             ("Адрес сервера", input.endpoint.clone()),
-            ("Порт TCP/UDP", input.listen.port().to_string()),
+            ("TCP/UDP bind", input.listen.to_string()),
             ("Пользователи", if first { format!("{} (отключён до выпуска токена)", input.grants.join(", ")) } else { input.grants.join(", ") }),
             ("TOML", input.config.display().to_string()),
         ];
+        let mut note = if first {
+            "Создание защищённых материалов и нового TOML. Сервер не запускается.".to_owned()
+        } else {
+            "Создание защищённых материалов. TOML сохраняется после отдельного подтверждения; сервер не запускается.".to_owned()
+        };
+        if input.endpoint.parse::<SocketAddr>().is_ok_and(|address| match address.ip() {
+            IpAddr::V4(ip) => ip.is_documentation(),
+            IpAddr::V6(ip) => ip.segments()[..2] == [0x2001, 0xdb8],
+        }) {
+            note.push_str("\nВнимание: адрес из диапазона для документации, не публичный адрес вашего VPS. Вернитесь назад и замените его перед реальным использованием.");
+        }
         Some(crate::tui_widgets::ReferenceReview {
             rows: review.rows.clone(),
             details,
-            note: if first {
-                "Y — создать защищённые материалы и новый TOML. Сервер не запускается. N / Esc — вернуться без записи.".into()
-            } else {
-                "Y — создать защищённые материалы; TOML сохраняется после отдельного подтверждения. Сервер не запускается. N / Esc — назад.".into()
-            },
+            note,
         })
     }
 
