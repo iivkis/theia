@@ -172,6 +172,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
             enabled: true,
             inbounds: vec![Inbound {
                 id: "edge".into(),
+        path_prefix: Some("/v1/theia-example".into()),
                 allowed_user_ids: vec!["device-a".into()],
                 h2_listen: format!("127.0.0.1:{tcp}"),
                 quic_listen: format!("127.0.0.1:{udp}"),
@@ -422,6 +423,7 @@ async fn compiled_client_proxy_conpty_lifecycle() {
             enabled: true,
             inbounds: vec![Inbound {
                 id: "edge".into(),
+        path_prefix: Some("/v1/theia-example".into()),
                 allowed_user_ids: vec!["device-a".into()],
                 h2_listen: format!("127.0.0.1:{tcp}"),
                 quic_listen: format!("127.0.0.1:{udp}"),

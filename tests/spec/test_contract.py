@@ -329,10 +329,10 @@ class SpecContractTests(unittest.TestCase):
         for path in ("client.rs", "h3_client.rs"):
             source = read("crates/theia/src/" + path)
             self.assertIn("pin.verify(", source)
-            self.assertIn("PINNED_PATH", source)
+            self.assertIn("with_path_prefix", source)
             self.assertIn("with_certificate_pin", source)
         server = read("crates/theia/src/server.rs")
-        self.assertIn("self.security_mode.path()", server)
+        self.assertIn("self.own_routes.as_ref()", server)
         self.assertIn("before.security_mode != after.security_mode",
                       read("crates/theia/src/reload_preflight.rs"))
         editor = read("crates/theia/src/tui_editor.rs")
@@ -347,8 +347,8 @@ class SpecContractTests(unittest.TestCase):
         split = read("crates/theia/src/split_http.rs")
         self.assertIn("UPLOAD_PATH", split)
         self.assertIn("DOWNLOAD_PATH", split)
-        self.assertIn('"/v1/stream-up/upload"', split)
-        self.assertIn('"/v1/stream-up/download"', split)
+        self.assertIn('"/v1/theia-example/stream-up/upload"', split)
+        self.assertIn('"/v1/theia-example/stream-up/download"', split)
         self.assertIn("stream_up_only_accepts_current_v1_routes", split)
         self.assertIn("PAIR_TIMEOUT", split)
         for path in ("client.rs", "h3_client.rs"):

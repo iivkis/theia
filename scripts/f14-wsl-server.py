@@ -110,6 +110,7 @@ def serve(args: argparse.Namespace) -> None:
 enabled = true
 
 [[server.inbounds]]
+path_prefix = "/v1/theia-example"
 id = "cross"
 allowed_user_ids = ["cross-user"]
 quic_listen = "0.0.0.0:{args.port}"
@@ -119,6 +120,7 @@ tls_cert = "file:{trusted}"
 tls_key = "file:{key}"
 
 [[server.inbounds]]
+path_prefix = "/v1/theia-example"
 id = "cross-pin"
 security_mode = "pinned-cert-v1"
 allowed_user_ids = ["cross-user"]
@@ -129,6 +131,7 @@ tls_cert = "file:{trusted}"
 tls_key = "file:{key}"
 
 [[server.inbounds]]
+path_prefix = "/v1/theia-example"
 id = "cross-split"
 security_mode = "pinned-cert-stream-up-v1"
 allowed_user_ids = ["cross-user"]

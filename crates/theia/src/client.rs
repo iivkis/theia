@@ -120,6 +120,7 @@ pub struct H2Client {
     wire_shape: H2WireShape,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
+    own_routes: Option<crate::split_http::IdentityRoutes>,
     stream_up: bool,
     auto_mode: Option<crate::split_http::AutoMode>,
     pool: crate::connection_pool::Pool<H2Connection>,
@@ -249,6 +250,7 @@ impl H2Client {
             .build()
             .map_err(|_| ClientError::Configuration)?;
         client.identity_routes = Some(routes);
+        client.own_routes = None;
         client.pool = crate::connection_pool::Pool::with_rotation(&value.descriptor().rotation);
         let modes = value.effective_modes();
         client = if modes.stream_one && modes.stream_up {
@@ -391,7 +393,7 @@ impl H2Client {
         let uri = http::Uri::builder()
             .scheme("https")
             .authority(name)
-            .path_and_query("/v1/session")
+            .path_and_query("/v1/theia-example/session")
             .build()
             .map_err(|_| ClientError::Configuration)?;
         Ok(Self {
@@ -403,6 +405,7 @@ impl H2Client {
             wire_shape,
             certificate_pin: None,
             identity_routes: None,
+            own_routes: Some(crate::split_http::IdentityRoutes::new(crate::split_http::EXAMPLE_PREFIX)?),
             stream_up: false,
             auto_mode: None,
             pool: crate::connection_pool::Pool::default(),
@@ -432,6 +435,19 @@ impl H2Client {
         self
     }
 
+    /// Set the exact configured inbound route, before admitting any session.
+    pub fn with_path_prefix(mut self, prefix: &str) -> Result<Self, ClientError> {
+        if self.identity_routes.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        let routes = crate::split_http::IdentityRoutes::new(prefix)?;
+        let mut parts = self.uri.clone().into_parts();
+        parts.path_and_query = Some(routes.single.parse().map_err(|_| ClientError::Configuration)?);
+        self.uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+        self.own_routes = Some(routes);
+        Ok(self)
+    }
+
     pub fn with_certificate_pin(
         mut self,
         pin: Option<crate::security_profile::CertificatePin>,
@@ -443,17 +459,6 @@ impl H2Client {
             if !matches!(&self.connector, H2Tls::Rustls(_)) {
                 return Err(ClientError::Configuration);
             }
-            self.uri = http::Uri::builder()
-                .scheme("https")
-                .authority(
-                    self.uri
-                        .authority()
-                        .ok_or(ClientError::Configuration)?
-                        .as_str(),
-                )
-                .path_and_query(crate::security_profile::PINNED_PATH)
-                .build()
-                .map_err(|_| ClientError::Configuration)?;
         } else if self.certificate_pin.is_some() {
             return Err(ClientError::Configuration);
         }
@@ -673,7 +678,7 @@ impl H2Client {
                     crate::channel_binding::attach(
                         binding,
                         split_http::request_for(
-                            self.identity_routes.as_ref(),
+                            self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                             &self.uri,
                             Leg::Download,
                             &self.authorization,
@@ -689,7 +694,7 @@ impl H2Client {
                     crate::channel_binding::attach(
                         binding,
                         split_http::request_for(
-                            self.identity_routes.as_ref(),
+                            self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                             &self.uri,
                             Leg::Upload,
                             &self.authorization,

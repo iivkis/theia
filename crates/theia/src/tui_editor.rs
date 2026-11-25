@@ -89,6 +89,7 @@ impl RecordAction {
                 ("TLS SNI", false),
                 ("CA (file:)", true),
                 ("Credential (env:/file:)", true),
+                ("XHTTP path prefix", false),
             ],
             Self::SetGrants => &[("Grants (ID через запятую)", false)],
             Self::DeleteUser => &[("ID пользователя", false)],
@@ -314,6 +315,7 @@ impl Editor {
         let profile = &document.client.profiles[index];
         if profile.server != invite.endpoint
             || profile.server_name != invite.server_name
+            || profile.path_prefix.as_deref() != Some(invite.path_prefix.as_str())
             || profile.tls_profile != invite.tls_profile()
             || (invite.xhttp_mode() != XhttpMode::Auto
                 && profile.effective_xhttp_mode() != invite.xhttp_mode())
@@ -725,6 +727,7 @@ impl Editor {
                 String::new(),
                 String::new(),
                 String::new(),
+                String::new(),
             ]),
             (_, RecordAction::DeleteRecord)
             | (Config::Client(_), RecordAction::ActivateProfile) => Ok(vec![]),
@@ -786,8 +789,10 @@ impl Editor {
                 if bind.port() == 0 {
                     return Err("Порт должен быть ненулевым.");
                 }
+                let prefix = format!("/v1/{}", generated_id("route")?);
                 doc.server.inbounds.push(config::Inbound {
                     id: fields[0].clone(),
+                    path_prefix: Some(prefix.clone()),
                     security_mode: Default::default(),
                     reality: None,
                     allowed_user_ids: grants.clone(),
@@ -799,7 +804,7 @@ impl Editor {
                 });
                 next_selection = doc.server.inbounds.len() - 1;
                 format!(
-                    "ID: {}\nBind TCP/UDP: {}\nSNI: {}\nGrants: {}\nCert/key: введены скрытые ссылки",
+                    "ID: {}\nBind TCP/UDP: {}\nSNI: {}\nXHTTP: {prefix}\nGrants: {}\nCert/key: введены скрытые ссылки",
                     fields[0], fields[1], fields[2], grants.join(", ")
                 )
             }
@@ -809,6 +814,7 @@ impl Editor {
                 }
                 doc.client.profiles.push(config::Profile {
                     id: fields[0].clone(),
+                    path_prefix: Some(fields[5].clone()),
                     server: fields[1].clone(),
                     server_name: fields[2].clone(),
                     auth_token: fields[4].clone(),
@@ -1504,6 +1510,7 @@ mod tests {
             "extra.example.org".into(),
             "file:/tmp/ca.pem".into(),
             "env:EXTRA_TOKEN".into(),
+            "/v1/extra".into(),
         ];
         let preview = editor
             .review_record(RecordAction::NewProfile, &fields)

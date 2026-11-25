@@ -431,6 +431,7 @@ mod tests {
         reality.h2_listen = "127.0.0.1:9443".into();
         reality.quic_listen = reality.h2_listen.clone();
         reality.security_mode = crate::security_profile::SecurityMode::SmartReality;
+        reality.path_prefix = None;
         reality.tls_cert.clear();
         reality.tls_key.clear();
         let base = std::env::temp_dir();

@@ -164,7 +164,7 @@ async fn measure(backend: Backend) -> Observation {
                 .expect("live H2 request")
                 .expect("first request stream");
             assert_eq!(request.method(), http::Method::POST);
-            assert_eq!(request.uri().path(), "/v1/session");
+            assert_eq!(request.uri().path(), "/v1/theia-example/session");
 
             let observation = {
                 let mut state = capture.lock().unwrap();

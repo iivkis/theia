@@ -560,6 +560,7 @@ mod tests {
         };
         let inbound = &mut doc.server.inbounds[0];
         inbound.security_mode = crate::security_profile::SecurityMode::SmartReality;
+        inbound.path_prefix = None;
         inbound.tls_cert.clear();
         inbound.tls_key.clear();
         let base = std::env::temp_dir();

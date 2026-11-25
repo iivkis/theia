@@ -24,6 +24,7 @@ const SECRET: [u8; 32] = [0x42; 32];
 fn inbound() -> Inbound {
     Inbound {
         id: "public".into(),
+        path_prefix: Some("/v1/theia-example".into()),
         allowed_user_ids: vec!["device-a".into()],
         quic_listen: "127.0.0.1:0".into(),
         h2_listen: "127.0.0.1:0".into(),
@@ -160,7 +161,7 @@ async fn client_with_window(
 fn request(token: &str) -> http::Request<()> {
     http::Request::builder()
         .method(http::Method::POST)
-        .uri("https://localhost/v1/session")
+        .uri("https://localhost/v1/theia-example/session")
         .header(http::header::CONTENT_TYPE, "application/octet-stream")
         .header(http::header::AUTHORIZATION, token)
         .body(())
@@ -397,7 +398,7 @@ async fn h2_tls_rejects_missing_bearer_before_smarttheia() {
         let (mut sender, driver) = client(address, connector).await;
         let req = http::Request::builder()
             .method(http::Method::POST)
-            .uri("https://localhost/v1/session")
+            .uri("https://localhost/v1/theia-example/session")
             .header(http::header::CONTENT_TYPE, "application/octet-stream")
             .body(())
             .unwrap();

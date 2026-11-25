@@ -46,6 +46,7 @@ fn fixture_with_roots(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask
     let client = quic_transport::client_endpoint(bind, roots.clone()).unwrap();
     let inbound = Inbound {
         id: "test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
         allowed_user_ids: vec!["allowed".into()],
         h2_listen: "127.0.0.1:0".into(),
         quic_listen: "127.0.0.1:0".into(),
@@ -79,7 +80,7 @@ fn fixture_with_roots(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask
 }
 
 fn request(auth: Option<&str>) -> Request<()> {
-    let mut request = Request::post("https://localhost/v1/session")
+    let mut request = Request::post("https://localhost/v1/theia-example/session")
         .header("content-type", "application/octet-stream");
     if let Some(token) = auth {
         request = request.header("authorization", format!("Bearer {token}"));
@@ -486,7 +487,7 @@ async fn f18_current_h3_active_probe_sees_unauthorized_response_but_no_tunnel() 
         });
 
         // An observer with a valid CA can distinguish this endpoint by a
-        // visible rejection on the production /v1/session route. It cannot
+        // visible rejection on the production /v1/theia-example/session route. It cannot
         // obtain an authorized tunnel, and this is not a pre-TLS proof.
         let mut anonymous = sender.send_request(request(None)).await.unwrap();
         assert_eq!(

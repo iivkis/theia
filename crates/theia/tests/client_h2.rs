@@ -101,6 +101,7 @@ fn listener_with_pem_bound_mode(
     roots.add(der).unwrap();
     let inbound = Inbound {
         id: "test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
         allowed_user_ids: vec!["client".into()],
         h2_listen: "127.0.0.1:0".into(),
         quic_listen: "127.0.0.1:0".into(),
@@ -744,6 +745,7 @@ async fn client_binary_chromium_socks5_over_h3() {
     let remote = endpoint.local_addr().unwrap().to_string();
     let inbound = Inbound {
         id: "browser-h3".into(),
+        path_prefix: Some("/v1/theia-example".into()),
         allowed_user_ids: vec!["client".into()],
         h2_listen: "127.0.0.1:0".into(),
         quic_listen: remote.clone(),
@@ -1218,6 +1220,7 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
         let remote = listener.local_addr().unwrap();
         let mut inbound = Inbound {
             id: "h2-test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
             allowed_user_ids: vec!["client".into()],
             h2_listen: remote.to_string(),
             quic_listen: remote.to_string(),
@@ -1325,6 +1328,7 @@ async fn pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_sil
         // a real target dial and HTTP 200, not just a transport timeout.
         let inbound = Inbound {
             id: "test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
             security_mode: SecurityMode::PinnedCertV1,
             reality: None,
             allowed_user_ids: vec!["client".into()],

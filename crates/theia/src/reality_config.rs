@@ -150,6 +150,7 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
             }
             document.server.inbounds.push(Inbound {
                 id: record.scope.inbound.clone(),
+                path_prefix: None,
                 security_mode: SecurityMode::SmartReality,
                 reality: Some(RealityBinding {
                     health_store: path_string(&r.health)?,
@@ -229,6 +230,7 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
             let host = profile.endpoint().rsplit_once(':').ok_or(Error::Scope)?.0;
             document.client.profiles.push(Profile {
                 id: r.id.clone(),
+                path_prefix: None,
                 server: profile.endpoint().to_owned(),
                 server_name: host.to_owned(),
                 auth_token: profile.credential_reference().to_owned(),

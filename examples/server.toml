@@ -5,6 +5,7 @@ schema_version = 1
 enabled = true
 
 [[server.inbounds]]
+path_prefix = "/v1/theia-example"
 id = "public"
 # Access to each inbound must be granted explicitly to global user IDs.
 allowed_user_ids = ["device-a"]

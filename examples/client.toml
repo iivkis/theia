@@ -5,6 +5,7 @@ schema_version = 1
 active_profile = "home"
 
 [[client.profiles]]
+path_prefix = "/v1/theia-example"
 id = "home"
 server = "edge.example.org:443"
 server_name = "edge.example.org"

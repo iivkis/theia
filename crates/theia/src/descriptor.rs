@@ -187,7 +187,6 @@ fn canonical_base64<const N: usize>(raw: &str) -> Result<[u8; N], Error> {
 
 impl Descriptor {
     fn validate(&self) -> Result<(), Error> {
-        let prefix = self.path_prefix.strip_prefix("/v1/").ok_or(Error::Format)?;
         if self.schema_version != 1
             || self.wire_version != 1
             || self.revision == 0
@@ -196,11 +195,7 @@ impl Descriptor {
             || !(1..=3).contains(&self.references.len())
             || usize::from(self.active_reference) >= self.references.len()
             || !(self.stream_one || self.stream_up)
-            || prefix.is_empty()
-            || prefix.len() > 64
-            || !prefix
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !crate::split_http::valid_prefix(&self.path_prefix)
             || self.padding.header_min > self.padding.header_max
             || self.padding.header_max > 8192
             || self.padding.frame_min > self.padding.frame_max

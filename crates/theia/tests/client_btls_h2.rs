@@ -77,6 +77,7 @@ async fn production_listener(allow_private: bool, alpn: &[u8]) -> (String, Strin
     let (acceptor, pem) = tls_fixture(alpn);
     let inbound = Inbound {
         id: "test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
         allowed_user_ids: vec!["client".into()],
         h2_listen: "127.0.0.1:0".into(),
         quic_listen: "127.0.0.1:0".into(),

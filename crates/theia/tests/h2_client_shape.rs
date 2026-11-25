@@ -146,7 +146,7 @@ async fn capture_first_flight(shape: H2Shape, request: Request<()>) -> Captured 
 }
 
 fn post(content_type_first: bool) -> Request<()> {
-    let builder = Request::post("https://localhost/v1/session");
+    let builder = Request::post("https://localhost/v1/theia-example/session");
     let builder = if content_type_first {
         builder
             .header(header::CONTENT_TYPE, "application/octet-stream")

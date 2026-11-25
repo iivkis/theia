@@ -77,6 +77,7 @@ impl Fixture {
         let h3 = udp.local_addr().unwrap();
         let inbound = Inbound {
             id: "test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
             security_mode: mode,
             reality: None,
             allowed_user_ids: vec!["client".into()],
@@ -112,7 +113,7 @@ impl Fixture {
                 let tls = acceptor.accept(socket).await.unwrap();
                 let mut connection = h2::server::handshake(tls).await.unwrap();
                 let (request, mut respond) = connection.accept().await.unwrap().unwrap();
-                assert_eq!(request.uri().path(), "/v1/session");
+                assert_eq!(request.uri().path(), "/v1/theia-example/session");
                 let mut body = request.into_body();
                 let _outgoing = respond
                     .send_response(
@@ -532,7 +533,7 @@ async fn own_tls_auto_h2_h3_rejects_auth_and_accepts_normal_stream_one() {
 
 // Independent wire witness, not a call to the production proof helper.
 fn raw_pinned_request(proof: Option<&HeaderValue>) -> Request<()> {
-    let mut request = Request::post("https://localhost/v1/pinned-session")
+    let mut request = Request::post("https://localhost/v1/theia-example/session")
         .header("content-type", "application/octet-stream")
         .header(
             "authorization",
@@ -554,7 +555,7 @@ fn witness(key: &[u8; 32]) -> HeaderValue {
     let mut data = b"SmartTheia/XHTTP/admission/v1\0".to_vec();
     for part in [
         b"POST".as_slice(),
-        b"/v1/pinned-session".as_slice(),
+        b"/v1/theia-example/session".as_slice(),
         request.headers()["authorization"].as_bytes(),
     ] {
         data.extend_from_slice(&(part.len() as u32).to_be_bytes());

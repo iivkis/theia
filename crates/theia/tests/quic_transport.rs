@@ -35,7 +35,7 @@ async fn production_quic_endpoints_exchange_smarttheia_over_h3() {
             let resolver = h3.accept().await.unwrap().unwrap();
             let (request, mut stream) = resolver.resolve_request().await.unwrap();
             assert_eq!(request.method(), http::Method::POST);
-            assert_eq!(request.uri().path(), "/v1/session");
+            assert_eq!(request.uri().path(), "/v1/theia-example/session");
             let mut decoder = Decoder::new();
             let mut session = Session::new(Role::Server);
             let hello = loop {
@@ -74,7 +74,7 @@ async fn production_quic_endpoints_exchange_smarttheia_over_h3() {
         let driver_task = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
-        let request = http::Request::post("https://localhost/v1/session")
+        let request = http::Request::post("https://localhost/v1/theia-example/session")
             .body(())
             .unwrap();
         let mut stream = sender.send_request(request).await.unwrap();

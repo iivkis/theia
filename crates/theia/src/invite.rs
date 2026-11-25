@@ -17,6 +17,7 @@ const MAX_URI: usize = 4096;
 /// This type may contain a live 32-byte bearer secret. No derived Debug.
 pub struct Invitation {
     pub id: String,
+    pub path_prefix: String,
     pub endpoint: String,
     pub server_name: String,
     pub transport: Transport,
@@ -71,6 +72,7 @@ enum WireSecurity {
 #[serde(deny_unknown_fields)]
 struct Wire {
     version: u32,
+    path_prefix: String,
     id: String,
     endpoint: String,
     server_name: String,
@@ -103,6 +105,7 @@ impl Invitation {
         }
         let invite = Self {
             id: profile.id.clone(),
+            path_prefix: profile.path_prefix.clone().ok_or(InviteError::Invalid)?,
             endpoint: profile.server.clone(),
             server_name: profile.server_name.clone(),
             transport: profile.transport,
@@ -159,6 +162,7 @@ impl Invitation {
         };
         let invite = Self {
             id: inbound.id.clone(),
+            path_prefix: inbound.path_prefix.clone().ok_or(InviteError::Invalid)?,
             endpoint: format!("{}:{}", inbound.server_name, h2.port()),
             server_name: inbound.server_name.clone(),
             transport: Transport::Auto,
@@ -237,6 +241,7 @@ impl Invitation {
         };
         let wire = Wire {
             version: 1,
+            path_prefix: self.path_prefix.clone(),
             id: self.id.clone(),
             endpoint: self.endpoint.clone(),
             server_name: self.server_name.clone(),
@@ -328,6 +333,7 @@ impl Invitation {
         };
         let invite = Self {
             id: std::mem::take(&mut wire.id),
+            path_prefix: std::mem::take(&mut wire.path_prefix),
             endpoint: std::mem::take(&mut wire.endpoint),
             server_name: std::mem::take(&mut wire.server_name),
             transport: wire.transport,
@@ -367,6 +373,7 @@ impl Invitation {
         self.check()?;
         validate_profile(Profile {
             id: self.id.clone(),
+            path_prefix: Some(self.path_prefix.clone()),
             server: self.endpoint.clone(),
             server_name: self.server_name.clone(),
             auth_token: secret_ref.into(),
@@ -400,6 +407,7 @@ impl Invitation {
     ) -> Result<Profile, InviteError> {
         validate_profile(Profile {
             id: self.id.clone(),
+            path_prefix: Some(self.path_prefix.clone()),
             server: self.endpoint.clone(),
             server_name: self.server_name.clone(),
             auth_token,

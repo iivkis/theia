@@ -80,6 +80,8 @@ pub struct ServerSettings {
 #[serde(deny_unknown_fields)]
 pub struct Inbound {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "crate::security_profile::SecurityMode::is_plain"
@@ -146,6 +148,8 @@ pub struct ClientSettings {
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
     pub server: String,
     pub server_name: String,
     pub auth_token: String,
@@ -452,7 +456,15 @@ impl ServerDocument {
             }
             let udp = listen(&inbound.quic_listen, &format!("{field}.quic_listen"))?;
             let tcp = listen(&inbound.h2_listen, &format!("{field}.h2_listen"))?;
-            if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
+            let reality = inbound.security_mode == crate::security_profile::SecurityMode::SmartReality;
+            ensure(
+                if reality { inbound.path_prefix.is_none() } else {
+                    inbound.path_prefix.as_deref().is_some_and(crate::split_http::valid_prefix)
+                },
+                format!("{field}.path_prefix"),
+                "own TLS requires an explicit /v1/<prefix>; REALITY uses the signed descriptor",
+            )?;
+            if reality {
                 ensure(
                     inbound.reality.as_ref().is_some_and(RealityBinding::valid),
                     format!("{field}.reality"),
@@ -578,6 +590,13 @@ impl ClientDocument {
                     .is_none_or(|path| valid_file_ref(path)),
                 format!("{field}.tls_ca"),
                 "expected absolute file: reference to PEM CA bundle",
+            )?;
+            ensure(
+                if profile.tls_profile == "smart-reality" { profile.path_prefix.is_none() } else {
+                    profile.path_prefix.as_deref().is_some_and(crate::split_http::valid_prefix)
+                },
+                format!("{field}.path_prefix"),
+                "own TLS requires an explicit /v1/<prefix>; REALITY uses the signed descriptor",
             )?;
             if profile.tls_profile == "smart-reality" {
                 ensure(
@@ -1113,6 +1132,7 @@ mod tests {
         let secondary = r#"
 [[server.inbounds]]
 id = "other"
+path_prefix = "/v1/other"
 allowed_user_ids = ["device-a"]
 quic_listen = "127.0.0.1:443"
 h2_listen = "[::]:443"

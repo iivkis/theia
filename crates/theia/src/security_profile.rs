@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-pub const PINNED_PATH: &str = "/v1/pinned-session";
 const PROFILE_PREFIX: &str = "pinned-cert-v1:";
 const SPLIT_PROFILE_PREFIX: &str = "pinned-cert-stream-up-v1:";
 
@@ -28,15 +27,6 @@ impl SecurityMode {
         self == Self::PinnedCertStreamUpV1
     }
 
-    pub(crate) fn path(self) -> &'static str {
-        match self {
-            Self::Plain => "/v1/session",
-            Self::PinnedCertV1 => PINNED_PATH,
-            Self::PinnedCertStreamUpV1 => crate::split_http::UPLOAD_PATH,
-            // No generic HTTP route is valid for this security mode.
-            Self::SmartReality => "",
-        }
-    }
 }
 
 /// Pin the entire DER leaf, not just the SPKI. Certificate renewal requires

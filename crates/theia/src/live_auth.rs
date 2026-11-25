@@ -279,6 +279,7 @@ mod tests {
                 enabled: true,
                 inbounds: vec![Inbound {
                     id: "alpha".into(),
+        path_prefix: Some("/v1/theia-example".into()),
                     allowed_user_ids: vec!["alice".into()],
                     h2_listen: "127.0.0.1:4443".into(),
                     quic_listen: "127.0.0.1:4443".into(),

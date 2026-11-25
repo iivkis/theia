@@ -136,6 +136,7 @@ pub struct ServerContext {
     pub inbound_id: String,
     security_mode: crate::security_profile::SecurityMode,
     identity_routes: Option<RwLock<IdentityRoutePolicy>>,
+    own_routes: Option<crate::split_http::IdentityRoutes>,
     identity_gate: Option<Arc<RwLock<bool>>>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
@@ -214,6 +215,7 @@ impl ServerContext {
             inbound_id: inbound.id.clone(),
             security_mode: inbound.security_mode,
             identity_routes: None,
+            own_routes: inbound.path_prefix.as_deref().and_then(|prefix| crate::split_http::IdentityRoutes::new(prefix).ok()),
             identity_gate: None,
             authorization,
             policy: policy.clone(),
@@ -304,6 +306,7 @@ impl ServerContext {
         Ok(Self {
             inbound_id: self.inbound_id.clone(),
             security_mode: self.security_mode,
+            own_routes: None,
             identity_routes: Some(RwLock::new(IdentityRoutePolicy {
                 paths,
                 stream_one: d.stream_one,
@@ -390,7 +393,7 @@ impl ServerContext {
                     None
                 }
             }
-            None => crate::split_http::leg(request),
+            None => self.own_routes.as_ref()?.leg(request),
         }
     }
 
@@ -493,7 +496,7 @@ impl ServerContext {
             }),
             None => {
                 !self.security_mode.is_stream_up()
-                    && request.uri().path() == self.security_mode.path()
+                    && self.own_routes.as_ref().is_some_and(|routes| request.uri().path() == routes.single)
             }
         };
         if !single_allowed
@@ -3611,6 +3614,7 @@ mod hardening_tests {
                 inbounds: vec![
                     Inbound {
                         id: "edge-a".into(),
+                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
                         allowed_user_ids: vec!["alice".into()],
                         h2_listen: "127.0.0.1:9443".into(),
                         quic_listen: "127.0.0.1:9443".into(),
@@ -3622,6 +3626,7 @@ mod hardening_tests {
                     },
                     Inbound {
                         id: "edge-b".into(),
+                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
                         allowed_user_ids: vec!["bob".into()],
                         h2_listen: "127.0.0.1:9444".into(),
                         quic_listen: "127.0.0.1:9444".into(),
@@ -4174,6 +4179,7 @@ mod hardening_tests {
         edge.h2_listen = addr.to_string();
         edge.quic_listen = addr.to_string();
         edge.security_mode = crate::security_profile::SecurityMode::SmartReality;
+        edge.path_prefix = None;
         edge.tls_cert.clear();
         edge.tls_key.clear();
         let now = crate::reference_health::unix_now().unwrap();

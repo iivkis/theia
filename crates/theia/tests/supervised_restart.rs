@@ -279,6 +279,7 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
                 enabled: true,
                 inbounds: vec![Inbound {
                     id: "edge".into(),
+        path_prefix: Some("/v1/theia-example".into()),
                     allowed_user_ids: vec!["device-a".into()],
                     h2_listen: format!("127.0.0.1:{old_tcp}"),
                     quic_listen: format!("127.0.0.1:{old_udp}"),
@@ -563,6 +564,7 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
                 enabled: true,
                 inbounds: vec![Inbound {
                     id: "edge".into(),
+        path_prefix: Some("/v1/theia-example".into()),
                     allowed_user_ids: vec!["device-a".into()],
                     h2_listen: format!("127.0.0.1:{tcp_port}"),
                     quic_listen: format!("127.0.0.1:{udp_port}"),
@@ -931,6 +933,7 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
                 enabled: true,
                 inbounds: vec![Inbound {
                     id: "edge".into(),
+        path_prefix: Some("/v1/theia-example".into()),
                     allowed_user_ids: vec!["device-a".into()],
                     h2_listen: format!("127.0.0.1:{tcp_port}"),
                     quic_listen: format!("127.0.0.1:{udp_port}"),

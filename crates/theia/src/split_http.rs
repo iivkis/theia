@@ -10,10 +10,19 @@ use std::{
 };
 use tokio::{sync::oneshot, time::timeout};
 
-pub(crate) const UPLOAD_PATH: &str = "/v1/stream-up/upload";
-pub(crate) const DOWNLOAD_PATH: &str = "/v1/stream-up/download";
-/// Paths derived from one authenticated descriptor. Never accept an
-/// arbitrary path supplied by a peer or fall back to default routes.
+#[cfg(test)]
+pub(crate) const UPLOAD_PATH: &str = "/v1/theia-example/stream-up/upload";
+#[cfg(test)]
+pub(crate) const DOWNLOAD_PATH: &str = "/v1/theia-example/stream-up/download";
+pub const EXAMPLE_PREFIX: &str = "/v1/theia-example";
+pub(crate) fn valid_prefix(prefix: &str) -> bool {
+    prefix.strip_prefix("/v1/").is_some_and(|tail| {
+        !tail.is_empty() && tail.len() <= 64
+            && tail.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
+/// Routes are derived identically for configured own-TLS and signed REALITY.
 #[derive(Clone)]
 pub(crate) struct IdentityRoutes {
     pub(crate) single: String,
@@ -25,15 +34,7 @@ pub(crate) struct IdentityRoutes {
 
 impl IdentityRoutes {
     pub(crate) fn new(prefix: &str) -> Result<Self, ClientError> {
-        let tail = prefix
-            .strip_prefix("/v1/")
-            .ok_or(ClientError::Configuration)?;
-        if tail.is_empty()
-            || tail.len() > 64
-            || !tail
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
+        if !valid_prefix(prefix) {
             return Err(ClientError::Configuration);
         }
         Ok(Self {
@@ -45,7 +46,8 @@ impl IdentityRoutes {
         })
     }
 
-    pub(crate) fn leg<T>(&self, request: &Request<T>) -> Option<Leg> {
+    #[cfg(test)]
+pub(crate) fn leg<T>(&self, request: &Request<T>) -> Option<Leg> {
         leg_at(request, &self.upload, &self.download)
     }
 
@@ -226,24 +228,6 @@ fn leg_at<T>(request: &Request<T>, upload: &str, download: &str) -> Option<Leg> 
     }
 }
 
-pub(crate) fn request(
-    uri: &Uri,
-    leg: Leg,
-    authorization: &HeaderValue,
-    id: u32,
-) -> Result<Request<()>, ClientError> {
-    request_at(
-        uri,
-        leg,
-        authorization,
-        id,
-        match leg {
-            Leg::Upload => UPLOAD_PATH,
-            Leg::Download => DOWNLOAD_PATH,
-        },
-    )
-}
-
 fn request_at(
     uri: &Uri,
     leg: Leg,
@@ -278,7 +262,7 @@ pub(crate) fn request_for(
 ) -> Result<Request<()>, ClientError> {
     match routes {
         Some(routes) => routes.request(uri, leg, authorization, id),
-        None => request(uri, leg, authorization, id),
+        None => Err(ClientError::Configuration),
     }
 }
 

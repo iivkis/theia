@@ -30,6 +30,7 @@ pub struct H3Client {
     roots: RootCertStore,
     identity_quic: Option<quinn::ClientConfig>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
+    own_routes: Option<crate::split_http::IdentityRoutes>,
     connect_timeout: Duration,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     stream_up: bool,
@@ -56,7 +57,7 @@ impl H3Client {
         let uri = Uri::builder()
             .scheme("https")
             .authority(name)
-            .path_and_query("/v1/session")
+            .path_and_query("/v1/theia-example/session")
             .build()
             .map_err(|_| ClientError::Configuration)?;
         Ok(Self {
@@ -67,6 +68,7 @@ impl H3Client {
             roots,
             identity_quic: None,
             identity_routes: None,
+            own_routes: Some(crate::split_http::IdentityRoutes::new(crate::split_http::EXAMPLE_PREFIX)?),
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
             stream_up: false,
@@ -159,6 +161,7 @@ impl H3Client {
             roots: RootCertStore::empty(),
             identity_quic: Some(quic),
             identity_routes: Some(routes),
+            own_routes: None,
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
             stream_up: false,
@@ -263,6 +266,19 @@ impl H3Client {
         self
     }
 
+    /// Set the exact configured inbound route, before admitting any session.
+    pub fn with_path_prefix(mut self, prefix: &str) -> Result<Self, ClientError> {
+        if self.identity_routes.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        let routes = crate::split_http::IdentityRoutes::new(prefix)?;
+        let mut parts = self.uri.clone().into_parts();
+        parts.path_and_query = Some(routes.single.parse().map_err(|_| ClientError::Configuration)?);
+        self.uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+        self.own_routes = Some(routes);
+        Ok(self)
+    }
+
     pub fn with_certificate_pin(
         mut self,
         pin: Option<crate::security_profile::CertificatePin>,
@@ -270,14 +286,7 @@ impl H3Client {
         if pin.is_some() && self.auto_mode.is_some() {
             return Err(ClientError::Configuration);
         }
-        if pin.is_some() {
-            self.uri = Uri::builder()
-                .scheme("https")
-                .authority(self.name.as_str())
-                .path_and_query(crate::security_profile::PINNED_PATH)
-                .build()
-                .map_err(|_| ClientError::Configuration)?;
-        } else if self.certificate_pin.is_some() {
+        if pin.is_none() && self.certificate_pin.is_some() {
             return Err(ClientError::Configuration);
         }
         self.certificate_pin = pin;
@@ -496,7 +505,7 @@ impl H3Client {
                 .send_request(crate::channel_binding::attach(
                     binding,
                     split_http::request_for(
-                        self.identity_routes.as_ref(),
+                        self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                         &self.uri,
                         Leg::Download,
                         &self.authorization,
@@ -510,7 +519,7 @@ impl H3Client {
                 .send_request(crate::channel_binding::attach(
                     binding,
                     split_http::request_for(
-                        self.identity_routes.as_ref(),
+                        self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                         &self.uri,
                         Leg::Upload,
                         &self.authorization,

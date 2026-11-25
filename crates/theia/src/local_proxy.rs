@@ -79,6 +79,7 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
             .map(Arc::new)
             .map(ProxyClient::Reality);
     }
+    let prefix = profile.path_prefix.as_deref().ok_or(ClientError::Configuration)?;
     let cert = load_file(
         profile
             .tls_ca
@@ -110,11 +111,12 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
         #[cfg(feature = "experimental-btls-h2")]
         {
             return H2Client::new_browser_h2_v1(
-                &profile.server,
+                &resolve_server(profile).await?.to_string(),
                 &profile.server_name,
                 &token,
                 &cert,
             )
+            .and_then(|client| client.with_path_prefix(prefix))
             .and_then(|client| Carrier::from_options(Some(Arc::new(client)), None, Duration::ZERO, budget))
             .map(ProxyClient::Direct);
         }
@@ -137,13 +139,10 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
     let ttl = Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s));
     match profile.transport {
         Transport::H2 => {
-            let endpoint = if certificate_pin.is_none() {
-                resolve_server(profile).await?.to_string()
-            } else {
-                profile.server.clone()
-            };
+            let endpoint = resolve_server(profile).await?.to_string();
             let client = H2Client::new(&endpoint, &profile.server_name, &token, roots)?
                 .with_certificate_pin(certificate_pin)?
+                .with_path_prefix(prefix)?
                 .with_stream_up(stream_up)?;
             let client = if auto_xhttp {
                 client.with_auto_stream_up(ttl)?
@@ -157,6 +156,7 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
             let remote = resolve_server(profile).await?;
             let h3 = H3Client::new(remote, &profile.server_name, &token, roots.clone())?
                 .with_certificate_pin(certificate_pin)?
+                .with_path_prefix(prefix)?
                 .with_stream_up(stream_up)?
                 .with_connect_timeout(Duration::from_millis(u64::from(
                     profile.quic_connect_timeout_ms,
@@ -175,6 +175,7 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
             // trust anchors, certificate pin and authorization unchanged.
             let h2 = H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
                 .with_certificate_pin(certificate_pin)?
+                .with_path_prefix(prefix)?
                 .with_stream_up(stream_up)?;
             let h2 = h2.with_connection_pool();
             let h2 = Arc::new(if auto_xhttp {
@@ -2476,6 +2477,7 @@ mod selector_tests {
 
         let inbound = Inbound {
             id: "edge".into(),
+                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
             allowed_user_ids: vec!["client".into()],
             h2_listen: "127.0.0.1:0".into(),
             quic_listen: "127.0.0.1:0".into(),
