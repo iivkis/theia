@@ -106,7 +106,14 @@ fn approval(original: &[u8], next: &str, evidence: [u8; 32]) -> [u8; 32] {
 fn approved_server_inbound(
     r: &ServerRequest,
     now: u64,
-) -> Result<(Inbound, reference_health::State, crate::reality_provision::Record), Error> {
+) -> Result<
+    (
+        Inbound,
+        reference_health::State,
+        crate::reality_provision::Record,
+    ),
+    Error,
+> {
     if r.listen.port() == 0 || r.grants.is_empty() || r.grants.len() > 256 {
         return Err(Error::Grant);
     }
@@ -115,7 +122,11 @@ fn approved_server_inbound(
         .inspect()
         .map_err(|_| Error::Health)?;
     let record = crate::reality_provision::inspect_initial(
-        &state, r.health_sha256, r.identity_sha256, &r.bundle, now,
+        &state,
+        r.health_sha256,
+        r.identity_sha256,
+        &r.bundle,
+        now,
     )?;
     let (host, port) = record.scope.endpoint.rsplit_once(':').ok_or(Error::Scope)?;
     if port.parse::<u16>().ok() != Some(r.listen.port()) {
@@ -151,11 +162,18 @@ pub(crate) fn first_server_candidate(r: &ServerRequest, now: u64) -> Result<Conf
     let (inbound, _, _) = approved_server_inbound(r, now)?;
     let mut random = Zeroizing::new([0u8; 32]);
     rustls::crypto::ring::default_provider()
-        .secure_random.fill(&mut random[..]).map_err(|_| Error::Storage)?;
+        .secure_random
+        .fill(&mut random[..])
+        .map_err(|_| Error::Storage)?;
     let candidate = Config::Server(config::ServerDocument {
         schema_version: 1,
-        management: config::Management { ipc: "auto".into(), log_level: "info".into() },
-        ui: config::Ui { language: "ru".into() },
+        management: config::Management {
+            ipc: "auto".into(),
+            log_level: "info".into(),
+        },
+        ui: config::Ui {
+            language: "ru".into(),
+        },
         server: config::ServerSettings {
             enabled: true,
             inbounds: vec![inbound],
@@ -176,7 +194,10 @@ pub(crate) fn first_server_candidate(r: &ServerRequest, now: u64) -> Result<Conf
     Ok(candidate)
 }
 
-fn approved_client_profile(r: &ClientRequest, now: u64) -> Result<(Profile, crate::descriptor::Verified), Error> {
+fn approved_client_profile(
+    r: &ClientRequest,
+    now: u64,
+) -> Result<(Profile, crate::descriptor::Verified), Error> {
     if !config::valid_id(&r.id) {
         return Err(Error::Scope);
     }
@@ -212,8 +233,13 @@ pub(crate) fn first_client_candidate(r: &ClientRequest, now: u64) -> Result<Conf
     let (profile, _) = approved_client_profile(r, now)?;
     let candidate = Config::Client(config::ClientDocument {
         schema_version: 1,
-        management: config::Management { ipc: "auto".into(), log_level: "info".into() },
-        ui: config::Ui { language: "ru".into() },
+        management: config::Management {
+            ipc: "auto".into(),
+            log_level: "info".into(),
+        },
+        ui: config::Ui {
+            language: "ru".into(),
+        },
         client: config::ClientSettings {
             active_profile: r.id.clone(),
             profiles: vec![profile],

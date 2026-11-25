@@ -24,11 +24,16 @@ impl OwnedEndpoint {
         let id = crate::tui_editor::generated_id("theia-ipc")?;
         let path = std::path::absolute(std::env::temp_dir().join(id))
             .map_err(|_| "Не удалось определить локальный каталог управления.")?;
-        std::fs::DirBuilder::new().mode(0o700).create(&path)
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
             .map_err(|_| "Не удалось создать закрытый каталог управления.")?;
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|_| "Не удалось проверить каталог управления.")?;
-        let endpoint = Self { path, identity: (metadata.dev(), metadata.ino()) };
+        let endpoint = Self {
+            path,
+            identity: (metadata.dev(), metadata.ino()),
+        };
         if !metadata.file_type().is_dir() || metadata.mode() & 0o777 != 0o700 {
             return Err("Каталог управления должен иметь права 0700.");
         }
@@ -37,7 +42,9 @@ impl OwnedEndpoint {
 
     #[cfg(target_os = "windows")]
     fn create() -> Result<Self, &'static str> {
-        Ok(Self { path: PathBuf::from(crate::tui_editor::generated_id("theia-ipc")?) })
+        Ok(Self {
+            path: PathBuf::from(crate::tui_editor::generated_id("theia-ipc")?),
+        })
     }
 }
 
@@ -46,9 +53,9 @@ impl Drop for OwnedEndpoint {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::MetadataExt;
-            if std::fs::symlink_metadata(&self.path).is_ok_and(|m| {
-                m.file_type().is_dir() && (m.dev(), m.ino()) == self.identity
-            }) {
+            if std::fs::symlink_metadata(&self.path)
+                .is_ok_and(|m| m.file_type().is_dir() && (m.dev(), m.ino()) == self.identity)
+            {
                 let _ = std::fs::remove_dir(&self.path);
             }
         }
@@ -102,7 +109,10 @@ impl ProcessPanel {
     }
 
     pub(crate) fn management_endpoint(&self) -> Option<PathBuf> {
-        self.worker.as_ref().and_then(|w| w.endpoint.as_ref()).map(|e| e.path.clone())
+        self.worker
+            .as_ref()
+            .and_then(|w| w.endpoint.as_ref())
+            .map(|e| e.path.clone())
     }
 
     fn start(&mut self, editor: &Editor) {
@@ -122,7 +132,10 @@ impl ProcessPanel {
             }
             let endpoint = match OwnedEndpoint::create() {
                 Ok(endpoint) => endpoint,
-                Err(message) => { self.notice = message.into(); return; }
+                Err(message) => {
+                    self.notice = message.into();
+                    return;
+                }
             };
             let management_path = endpoint.path.clone();
             let path = editor.saved_path().to_owned();
@@ -139,7 +152,11 @@ impl ProcessPanel {
                         .map_err(|_| ServerError::Io)
                         .and_then(|runtime| {
                             runtime.block_on(crate::server::run_tui_file(
-                                &path, digest, ready_tx, stopped, Some(management_path),
+                                &path,
+                                digest,
+                                ready_tx,
+                                stopped,
+                                Some(management_path),
                             ))
                         });
                     let _ = tx.send(result);
@@ -185,26 +202,42 @@ impl ProcessPanel {
         }
     }
 
-    pub(crate) fn confirmation(&self) -> Option<bool> { self.confirm }
+    pub(crate) fn confirmation(&self) -> Option<bool> {
+        self.confirm
+    }
 
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
-        if self.confirm.is_some() { return Vec::new(); }
+        if self.confirm.is_some() {
+            return Vec::new();
+        }
         match &self.worker {
-            None => vec![ActionItem { key: 's', label: "Запустить сервер" }],
-            Some(worker) if worker.stop.is_some() => vec![ActionItem { key: 'x', label: "Остановить сервер" }],
+            None => vec![ActionItem {
+                key: 's',
+                label: "Запустить сервер",
+            }],
+            Some(worker) if worker.stop.is_some() => vec![ActionItem {
+                key: 'x',
+                label: "Остановить сервер",
+            }],
             Some(_) => Vec::new(),
         }
     }
-    pub(crate) fn action_focus(&self) -> usize { self.action_focus }
+    pub(crate) fn action_focus(&self) -> usize {
+        self.action_focus
+    }
     pub(crate) fn select_action(&mut self, index: usize) {
-        if index < self.actions().len() { self.action_focus = index; }
+        if index < self.actions().len() {
+            self.action_focus = index;
+        }
     }
 
     /// Return true to close the panel. Closing the panel is not stopping.
     pub(crate) fn key(&mut self, key: KeyCode, editor: Option<&Editor>) -> bool {
         let items = self.actions();
-        let Some(key) = crate::tui_widgets::action_key(&items, &mut self.action_focus, key) else { return false; };
+        let Some(key) = crate::tui_widgets::action_key(&items, &mut self.action_focus, key) else {
+            return false;
+        };
         if let Some(start) = self.confirm {
             match key {
                 KeyCode::Char('y') => {
@@ -256,8 +289,13 @@ impl ProcessPanel {
 
     pub(crate) fn summary(&self) -> String {
         let report = match &self.worker {
-            Some(w) if w.stop.is_none() => "Остановка: новые подключения не принимаются, ожидается завершение задач.".into(),
-            Some(w) if w.inbounds.is_some() => format!("Сервер запущен. Inbound: {}.\nСостояние относится только к этому экземпляру.", w.inbounds.unwrap_or(0)),
+            Some(w) if w.stop.is_none() => {
+                "Остановка: новые подключения не принимаются, ожидается завершение задач.".into()
+            }
+            Some(w) if w.inbounds.is_some() => format!(
+                "Сервер запущен. Inbound: {}.\nСостояние относится только к этому экземпляру.",
+                w.inbounds.unwrap_or(0)
+            ),
             _ => self.notice.clone(),
         };
         format!("{}\n\n{report}\n\nEsc — назад, не останавливает сервер.\nВнешний сервис управляется отдельно через IPC.", self.status())
@@ -369,7 +407,10 @@ mod tests {
         let second = OwnedEndpoint::create().unwrap();
         assert_ne!(first.path, second.path);
         let path = first.path.clone();
-        assert_eq!(std::fs::symlink_metadata(&path).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().mode() & 0o777,
+            0o700
+        );
         drop(first);
         assert!(!path.exists());
         let path = second.path.clone();

@@ -3060,7 +3060,9 @@ async fn run_supervised_file(
     let (requests, mut queue) =
         tokio::sync::mpsc::channel::<crate::runtime_generation::RestartRequest>(1);
     let inbounds = runtime.snapshot().map_err(|_| ServerError::Io)?.inbounds;
-    let owned_endpoint = control.as_ref().and_then(|c| c.management_endpoint.as_deref());
+    let owned_endpoint = control
+        .as_ref()
+        .and_then(|c| c.management_endpoint.as_deref());
     // A TUI-started server binds its own private endpoint, never an unrelated
     // headless endpoint from process environment. Headless behavior is unchanged.
     #[cfg(target_os = "linux")]
@@ -3073,8 +3075,10 @@ async fn run_supervised_file(
     #[cfg(target_os = "windows")]
     let management = match owned_endpoint {
         Some(endpoint) => crate::windows_control::WindowsServer::bind(
-            endpoint.to_str().ok_or(ServerError::Io)?, inbounds,
-        ).map(Some),
+            endpoint.to_str().ok_or(ServerError::Io)?,
+            inbounds,
+        )
+        .map(Some),
         None => crate::windows_control::WindowsServer::from_environment(inbounds),
     }
     .map_err(|_| ServerError::Io)?
@@ -3840,7 +3844,8 @@ mod hardening_tests {
             endpoint
         };
         #[cfg(target_os = "windows")]
-        let endpoint = std::path::PathBuf::from(crate::tui_editor::generated_id("tui-ipc").unwrap());
+        let endpoint =
+            std::path::PathBuf::from(crate::tui_editor::generated_id("tui-ipc").unwrap());
         let run_endpoint = endpoint.clone();
         let task = tokio::spawn(async move {
             run_tui_file(&run_path, expected, ready, stop_rx, Some(run_endpoint)).await
@@ -3855,8 +3860,13 @@ mod hardening_tests {
         assert!(std::net::TcpListener::bind(tcp_addr).is_err());
         assert!(std::net::UdpSocket::bind(udp_addr).is_err());
         use crate::management::{StatusCommand, StatusReply};
-        let status = crate::tui_runtime::query_endpoint(&endpoint, StatusCommand::Status).await.unwrap();
-        assert!(matches!(status, StatusReply::RunningRevision { inbounds: 1, .. }));
+        let status = crate::tui_runtime::query_endpoint(&endpoint, StatusCommand::Status)
+            .await
+            .unwrap();
+        assert!(matches!(
+            status,
+            StatusReply::RunningRevision { inbounds: 1, .. }
+        ));
         stop.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(30), task)
             .await
@@ -3865,7 +3875,11 @@ mod hardening_tests {
             .unwrap();
         assert!(std::net::TcpListener::bind(tcp_addr).is_ok());
         assert!(std::net::UdpSocket::bind(udp_addr).is_ok());
-        assert!(crate::tui_runtime::query_endpoint(&endpoint, StatusCommand::Status).await.is_err());
+        assert!(
+            crate::tui_runtime::query_endpoint(&endpoint, StatusCommand::Status)
+                .await
+                .is_err()
+        );
         assert_eq!(fs::read(&path).unwrap(), contents.as_bytes());
     }
 

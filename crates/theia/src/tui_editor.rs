@@ -77,8 +77,14 @@ impl RecordAction {
             Self::SetGrants => &[("ID пользователей через запятую", false)],
             Self::SetQuota => &[("На пользователя", false), ("Всего", false)],
             Self::DeleteUser => &[("ID пользователя", false)],
-            Self::EditTls => &[("Сертификат (file:)", true), ("Закрытый ключ (file:)", true)],
-            Self::EditTrust => &[("Доверенный CA (file:)", true), ("Ссылка на токен (env:/file:)", true)],
+            Self::EditTls => &[
+                ("Сертификат (file:)", true),
+                ("Закрытый ключ (file:)", true),
+            ],
+            Self::EditTrust => &[
+                ("Доверенный CA (file:)", true),
+                ("Ссылка на токен (env:/file:)", true),
+            ],
             Self::DeleteRecord | Self::ActivateProfile => &[],
         }
     }
@@ -245,19 +251,34 @@ impl Editor {
             .map_err(|_| "Не удалось проверить доверенный сертификат.")?;
         let mut secret = if let Some(bytes) = invite.token_bytes() {
             let token = Zeroizing::new(bytes);
-            Some(PrivateBearer::create(&path, &token).map_err(|_| "Не удалось сохранить личный ключ.")?)
-        } else { None };
-        let credential = match secret.as_ref() {
-            Some(saved) => saved.reference().map_err(|_| "Не удалось создать ссылку на личный ключ.")?,
-            None => public_ref.filter(|r| client_import::valid_explicit_reference(r))
-                .ok_or("Публичному приглашению нужен отдельный ключ (env:ИМЯ).")?.to_owned(),
+            Some(
+                PrivateBearer::create(&path, &token)
+                    .map_err(|_| "Не удалось сохранить личный ключ.")?,
+            )
+        } else {
+            None
         };
-        let profile = invite.to_profile(&credential, ca)
+        let credential = match secret.as_ref() {
+            Some(saved) => saved
+                .reference()
+                .map_err(|_| "Не удалось создать ссылку на личный ключ.")?,
+            None => public_ref
+                .filter(|r| client_import::valid_explicit_reference(r))
+                .ok_or("Публичному приглашению нужен отдельный ключ (env:ИМЯ).")?
+                .to_owned(),
+        };
+        let profile = invite
+            .to_profile(&credential, ca)
             .map_err(|_| "Приглашение содержит недопустимые параметры.")?;
         let candidate = Config::Client(config::ClientDocument {
             schema_version: 1,
-            management: config::Management { ipc: "auto".into(), log_level: "info".into() },
-            ui: config::Ui { language: "ru".into() },
+            management: config::Management {
+                ipc: "auto".into(),
+                log_level: "info".into(),
+            },
+            ui: config::Ui {
+                language: "ru".into(),
+            },
             client: config::ClientSettings {
                 active_profile: profile.id.clone(),
                 profiles: vec![profile],
@@ -268,16 +289,31 @@ impl Editor {
                 },
             },
         });
-        candidate.validate().map_err(|_| "Профиль не прошёл проверку настроек.")?;
+        candidate
+            .validate()
+            .map_err(|_| "Профиль не прошёл проверку настроек.")?;
         match config::guarded_create(&path, &candidate) {
-            Ok(()) => { if let Some(secret) = secret.as_mut() { secret.commit(); } }
-            Err(config::WriteFailure::BeforeReplace(_)) => return Err("Файл не создан. Проверьте путь, права и отсутствие существующего файла."),
+            Ok(()) => {
+                if let Some(secret) = secret.as_mut() {
+                    secret.commit();
+                }
+            }
+            Err(config::WriteFailure::BeforeReplace(_)) => {
+                return Err(
+                    "Файл не создан. Проверьте путь, права и отсутствие существующего файла.",
+                )
+            }
             Err(config::WriteFailure::AfterReplace(_)) => {
-                if let Some(secret) = secret.as_mut() { secret.commit(); }
-                return Err("Создание не подтверждено. Откройте файл заново; не повторяйте импорт вслепую.");
+                if let Some(secret) = secret.as_mut() {
+                    secret.commit();
+                }
+                return Err(
+                    "Создание не подтверждено. Откройте файл заново; не повторяйте импорт вслепую.",
+                );
             }
         }
-        Self::load(Role::Client, &path).map_err(|_| "Файл записан, но открыть его не удалось. Откройте настройки заново.")
+        Self::load(Role::Client, &path)
+            .map_err(|_| "Файл записан, но открыть его не удалось. Откройте настройки заново.")
     }
 
     pub fn import_invitation(
@@ -1181,14 +1217,20 @@ impl Editor {
     #[cfg(any(windows, test))]
     pub(crate) fn review_system_proxy_permission(&self) -> Result<RecordReview, &'static str> {
         self.require_clean_records()?;
-        if self.write_uncertain { return Err("Откройте настройки заново."); }
+        if self.write_uncertain {
+            return Err("Откройте настройки заново.");
+        }
         let mut candidate = self.original.clone();
-        let Config::Client(doc) = &mut candidate else { return Err("Требуется клиентский профиль."); };
+        let Config::Client(doc) = &mut candidate else {
+            return Err("Требуется клиентский профиль.");
+        };
         if doc.client.active_profile != self.selected_record_id() {
             return Err("Сначала выберите активный профиль.");
         }
         doc.client.proxy.system_proxy = config::SystemProxy::Manual;
-        candidate.validate().map_err(|_| "Настройки клиента не прошли проверку.")?;
+        candidate
+            .validate()
+            .map_err(|_| "Настройки клиента не прошли проверку.")?;
         Ok(RecordReview {
             source: self.saved_sha256(),
             selected: self.selected_record_id().to_owned(),
@@ -1200,7 +1242,10 @@ impl Editor {
 
     pub(crate) fn client_proxy_addresses(&self) -> Option<(&str, &str)> {
         match &self.original {
-            Config::Client(doc) => Some((&doc.client.proxy.http_listen, &doc.client.proxy.socks5_listen)),
+            Config::Client(doc) => Some((
+                &doc.client.proxy.http_listen,
+                &doc.client.proxy.socks5_listen,
+            )),
             _ => None,
         }
     }
@@ -1213,7 +1258,9 @@ impl Editor {
     }
 
     pub fn selection_summary(&self) -> String {
-        if self.record_count() == 0 { return "Нет записей".into(); }
+        if self.record_count() == 0 {
+            return "Нет записей".into();
+        }
         if self.selected_reality() {
             return format!(
                 "REALITY {}/{}: {} [защищённое подключение]",
@@ -1384,11 +1431,21 @@ impl Editor {
                 })
                 .unwrap_or_default(),
         };
-        labels.iter().copied().zip(values).enumerate().map(|(index, (label, value))| {
-            let selected = self.selected_field == index;
-            let value = if self.editing && selected { self.input.clone() } else { value };
-            (label, value, selected)
-        }).collect()
+        labels
+            .iter()
+            .copied()
+            .zip(values)
+            .enumerate()
+            .map(|(index, (label, value))| {
+                let selected = self.selected_field == index;
+                let value = if self.editing && selected {
+                    self.input.clone()
+                } else {
+                    value
+                };
+                (label, value, selected)
+            })
+            .collect()
     }
 
     pub fn fields_overview(&self) -> String {
@@ -1471,8 +1528,12 @@ impl Editor {
 
     pub(crate) fn cycle_choice(&mut self, forward: bool) {
         let options = self.choice_options();
-        if !self.editing || options.is_empty() { return; }
-        let index = options.iter().position(|value| *value == self.input.as_str());
+        if !self.editing || options.is_empty() {
+            return;
+        }
+        let index = options
+            .iter()
+            .position(|value| *value == self.input.as_str());
         let next = match index {
             Some(i) if forward => (i + 1) % options.len(),
             Some(i) => (i + options.len() - 1) % options.len(),

@@ -18,11 +18,22 @@ pub(crate) async fn query_endpoint(
     command: StatusCommand,
 ) -> Result<StatusReply, ManagementError> {
     #[cfg(target_os = "linux")]
-    { crate::management::query_in(endpoint, command).await }
+    {
+        crate::management::query_in(endpoint, command).await
+    }
     #[cfg(target_os = "windows")]
-    { crate::windows_control::query_pipe(endpoint.to_str().ok_or(ManagementError::UnsafeEndpoint)?, command).await }
+    {
+        crate::windows_control::query_pipe(
+            endpoint.to_str().ok_or(ManagementError::UnsafeEndpoint)?,
+            command,
+        )
+        .await
+    }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    { let _ = (endpoint, command); Err(ManagementError::Unsupported) }
+    {
+        let _ = (endpoint, command);
+        Err(ManagementError::Unsupported)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -560,37 +571,96 @@ impl RuntimePanel {
         }
     }
 
-    pub(crate) fn apply_observation(&self) -> Option<([u8;32], &'static str, u64)> {
-        let (kind,revision)=match self.phase {
-            Phase::Applied{revision}=>("права доступа",revision),
-            Phase::QuotaApplied{revision}=>("лимиты",revision),
-            Phase::CutoverApplied{revision}=>("структура",revision),
-            _=>return None,
+    pub(crate) fn apply_observation(&self) -> Option<([u8; 32], &'static str, u64)> {
+        let (kind, revision) = match self.phase {
+            Phase::Applied { revision } => ("права доступа", revision),
+            Phase::QuotaApplied { revision } => ("лимиты", revision),
+            Phase::CutoverApplied { revision } => ("структура", revision),
+            _ => return None,
         };
-        Some((self.saved_sha256?,kind,revision))
+        Some((self.saved_sha256?, kind, revision))
     }
 
     pub(crate) fn invalidates_apply_observation(&self) -> bool {
-        matches!(self.phase,Phase::RollbackApplying|Phase::RollbackApplied{..}|Phase::TlsRollbackApplying|Phase::TlsRollbackApplied{..}|Phase::RestartRollbackApplying|Phase::RestartRollbackApplied{..}|Phase::Indeterminate|Phase::Unavailable|Phase::LegacyStatus)
+        matches!(
+            self.phase,
+            Phase::RollbackApplying
+                | Phase::RollbackApplied { .. }
+                | Phase::TlsRollbackApplying
+                | Phase::TlsRollbackApplied { .. }
+                | Phase::RestartRollbackApplying
+                | Phase::RestartRollbackApplied { .. }
+                | Phase::Indeterminate
+                | Phase::Unavailable
+                | Phase::LegacyStatus
+        )
     }
 
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
         let mut items = Vec::new();
-        if matches!(self.phase, Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. }) && self.saved_sha256.is_some() {
-            if matches!(self.phase, Phase::Viewing { .. }) { items.push(ActionItem { key:'a', label:"Применить права доступа" }); }
+        if matches!(
+            self.phase,
+            Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. }
+        ) && self.saved_sha256.is_some()
+        {
+            if matches!(self.phase, Phase::Viewing { .. }) {
+                items.push(ActionItem {
+                    key: 'a',
+                    label: "Применить права доступа",
+                });
+            }
             if matches!(self.phase, Phase::Viewing { .. } | Phase::Applied { .. }) {
-                items.push(ActionItem { key:'b', label:"Откатить права доступа" });
-                items.push(ActionItem { key:'c', label:"Применить лимиты" });
+                items.push(ActionItem {
+                    key: 'b',
+                    label: "Откатить права доступа",
+                });
+                items.push(ActionItem {
+                    key: 'c',
+                    label: "Применить лимиты",
+                });
             }
             items.extend([
-                ActionItem { key:'s', label:"Применить структуру сервера" },
-                ActionItem { key:'z', label:"Откатить структуру" },
-                ActionItem { key:'t', label:"Откатить TLS" },
+                ActionItem {
+                    key: 's',
+                    label: "Применить структуру сервера",
+                },
+                ActionItem {
+                    key: 'z',
+                    label: "Откатить структуру",
+                },
+                ActionItem {
+                    key: 't',
+                    label: "Откатить TLS",
+                },
             ]);
         }
-        if !matches!(self.phase, Phase::Checking | Phase::Applying | Phase::Confirming { .. } | Phase::RollbackChecking | Phase::RollbackConfirming { .. } | Phase::RollbackApplying | Phase::QuotaChecking { .. } | Phase::QuotaConfirming { .. } | Phase::QuotaApplying | Phase::CutoverChecking { .. } | Phase::CutoverConfirming { .. } | Phase::CutoverApplying | Phase::TlsRollbackChecking | Phase::TlsRollbackConfirming { .. } | Phase::TlsRollbackApplying | Phase::RestartRollbackChecking | Phase::RestartRollbackConfirming { .. } | Phase::RestartRollbackApplying | Phase::RestartChecking) {
-            items.push(ActionItem { key:'r', label:"Обновить состояние" });
+        if !matches!(
+            self.phase,
+            Phase::Checking
+                | Phase::Applying
+                | Phase::Confirming { .. }
+                | Phase::RollbackChecking
+                | Phase::RollbackConfirming { .. }
+                | Phase::RollbackApplying
+                | Phase::QuotaChecking { .. }
+                | Phase::QuotaConfirming { .. }
+                | Phase::QuotaApplying
+                | Phase::CutoverChecking { .. }
+                | Phase::CutoverConfirming { .. }
+                | Phase::CutoverApplying
+                | Phase::TlsRollbackChecking
+                | Phase::TlsRollbackConfirming { .. }
+                | Phase::TlsRollbackApplying
+                | Phase::RestartRollbackChecking
+                | Phase::RestartRollbackConfirming { .. }
+                | Phase::RestartRollbackApplying
+                | Phase::RestartChecking
+        ) {
+            items.push(ActionItem {
+                key: 'r',
+                label: "Обновить состояние",
+            });
         }
         items
     }

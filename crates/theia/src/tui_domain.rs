@@ -557,11 +557,14 @@ impl DomainPanel {
             _=>None,
         }
     }
-    pub(crate) fn select_field(&mut self,id:usize) {
+    pub(crate) fn select_field(&mut self, id: usize) {
         match self.state {
-            DomainState::Catalog if id<self.domains.len()=>{self.domain_index=id;self.reset_pins();}
-            DomainState::Resolved if id<self.addresses.len()=>self.address_index=id,
-            _=>{}
+            DomainState::Catalog if id < self.domains.len() => {
+                self.domain_index = id;
+                self.reset_pins();
+            }
+            DomainState::Resolved if id < self.addresses.len() => self.address_index = id,
+            _ => {}
         }
     }
 

@@ -92,11 +92,19 @@ impl Worker {
         let observed = native::observed_proxy();
         let known = observed.is_ok();
         let applied = self.lease.is_some()
-            && matches!(&observed, Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned)));
+            && matches!(
+                &observed,
+                Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned))
+            );
         let recovery = self.lease.is_none()
-            && matches!(&observed, Ok(ObservedProxy::Journal(
-                ProxyStatus::PendingOwned | ProxyStatus::PendingAlreadyRestored | ProxyStatus::PendingConflict
-            )));
+            && matches!(
+                &observed,
+                Ok(ObservedProxy::Journal(
+                    ProxyStatus::PendingOwned
+                        | ProxyStatus::PendingAlreadyRestored
+                        | ProxyStatus::PendingConflict
+                ))
+            );
         let status = match observed {
             Ok(ObservedProxy::Direct) => "Выключен: прямое подключение".into(),
             Ok(ObservedProxy::External) => "Настроен вне этой TUI".into(),
@@ -116,7 +124,10 @@ impl Worker {
             Err(error) => format!("Неизвестно: {error}"),
         };
         View {
-            running: self.local.as_ref().is_some_and(|local| !local.task.is_finished()),
+            running: self
+                .local
+                .as_ref()
+                .is_some_and(|local| !local.task.is_finished()),
             owned: self.lease.is_some(),
             applied,
             recovery,
@@ -136,16 +147,24 @@ impl Worker {
             Action::Enable if self.lease.is_none() => {
                 let bytes = saved_client_bytes(&self.path, self.digest)
                     .map_err(|error| error.to_string())?;
-                let source = std::str::from_utf8(&bytes).map_err(|_| "Некорректный файл клиента.")?;
+                let source =
+                    std::str::from_utf8(&bytes).map_err(|_| "Некорректный файл клиента.")?;
                 let crate::config::Config::Client(document) =
                     crate::config::parse(source).map_err(|_| "Некорректные настройки клиента.")?
                 else {
                     return Err("Требуется клиентский профиль.".into());
                 };
                 if document.client.proxy.system_proxy != crate::config::SystemProxy::Manual {
-                    return Err("Сначала разрешите управление системным прокси в настройках клиента.".into());
+                    return Err(
+                        "Сначала разрешите управление системным прокси в настройках клиента."
+                            .into(),
+                    );
                 }
-                let address: SocketAddr = document.client.proxy.http_listen.parse()
+                let address: SocketAddr = document
+                    .client
+                    .proxy
+                    .http_listen
+                    .parse()
                     .map_err(|_| "Некорректный адрес локального HTTP-прокси.")?;
                 if self.local.as_ref().is_some_and(|local| {
                     !local.manual || local.task.is_finished() || local.address != address
@@ -203,7 +222,12 @@ impl Worker {
         let manual = prepared.manual;
         let reality = prepared.reality_monitor();
         let task = tokio::spawn(prepared.serve());
-        self.local = Some(Local { address, manual, task, reality });
+        self.local = Some(Local {
+            address,
+            manual,
+            task,
+            reality,
+        });
         Ok(())
     }
 
@@ -214,8 +238,11 @@ impl Worker {
         }
         let result = (|| {
             self.unchanged()?;
-            self.local.as_ref()
-                .filter(|local| local.manual && !local.task.is_finished() && local.address == address)
+            self.local
+                .as_ref()
+                .filter(|local| {
+                    local.manual && !local.task.is_finished() && local.address == address
+                })
                 .ok_or("Локальный клиент не готов.")?;
             OwnedProxy::apply_reviewed(address, review).map_err(|error| error.to_string())
         })();
@@ -227,8 +254,12 @@ impl Worker {
             Err(error) => {
                 // If native apply may have written a journal, preserve the
                 // listeners until the user reviews recovery. Never claim success.
-                if started_here && matches!(native::observed_proxy(),
-                    Ok(ObservedProxy::Direct | ObservedProxy::External)) {
+                if started_here
+                    && matches!(
+                        native::observed_proxy(),
+                        Ok(ObservedProxy::Direct | ObservedProxy::External)
+                    )
+                {
                     self.stop().await?;
                 }
                 Err(error)
@@ -499,26 +530,52 @@ impl Panel {
 
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
-        if self.unavailable || self.phase == Phase::Busy { return Vec::new(); }
+        if self.unavailable || self.phase == Phase::Busy {
+            return Vec::new();
+        }
         if self.phase == Phase::Confirm {
             return vec![
-                ActionItem { key: 'n', label: "Отменить" },
-                ActionItem { key: 'y', label: "Подтвердить" },
+                ActionItem {
+                    key: 'n',
+                    label: "Отменить",
+                },
+                ActionItem {
+                    key: 'y',
+                    label: "Подтвердить",
+                },
             ];
         }
         let mut items = Vec::new();
         if self.view.owned {
-            items.push(ActionItem { key: 'x', label: "Выключить системный прокси и отключиться" });
-            items.push(ActionItem { key: 'r', label: "Выключить, оставить локальный прокси" });
+            items.push(ActionItem {
+                key: 'x',
+                label: "Выключить системный прокси и отключиться",
+            });
+            items.push(ActionItem {
+                key: 'r',
+                label: "Выключить, оставить локальный прокси",
+            });
         } else if self.view.recovery {
-            items.push(ActionItem { key: 'c', label: "Восстановить после сбоя" });
+            items.push(ActionItem {
+                key: 'c',
+                label: "Восстановить после сбоя",
+            });
         } else if self.view.known {
-            items.push(ActionItem { key: 'e', label: "Включить системный прокси" });
+            items.push(ActionItem {
+                key: 'e',
+                label: "Включить системный прокси",
+            });
         }
         if self.view.running && !self.view.owned {
-            items.push(ActionItem { key: 'x', label: "Остановить локальный прокси" });
+            items.push(ActionItem {
+                key: 'x',
+                label: "Остановить локальный прокси",
+            });
         }
-        items.push(ActionItem { key: 'v', label: "Обновить состояние" });
+        items.push(ActionItem {
+            key: 'v',
+            label: "Обновить состояние",
+        });
         items
     }
 
@@ -543,7 +600,9 @@ impl Panel {
             Phase::Busy => "Выполняется операция…",
             Phase::Confirm => "Выберите подтверждение или отмену (y / n, Esc).",
             Phase::Idle if self.view.owned => "Выключение восстановит исходные параметры Windows.",
-            Phase::Idle if self.view.recovery => "Сначала проверьте восстановление исходных параметров.",
+            Phase::Idle if self.view.recovery => {
+                "Сначала проверьте восстановление исходных параметров."
+            }
             Phase::Idle if !self.view.known => "Обновите состояние. Изменения не подтверждены.",
             Phase::Idle => "Выберите «Включить системный прокси». Esc — назад.",
         };
@@ -761,7 +820,10 @@ pub(crate) mod tests {
             events: incoming,
             thread: None,
             phase: Phase::Idle,
-            view: View { known: true, ..View::default() },
+            view: View {
+                known: true,
+                ..View::default()
+            },
             message: String::new(),
             unavailable: false,
         };
