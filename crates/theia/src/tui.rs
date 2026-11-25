@@ -417,7 +417,7 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
         (Role::Client, 0) => &[('P',"Режим подключения"),('i',"Импорт ключа Theia"),('V',"Локальный прокси"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
         (Role::Client, 1) => &[('V',"Подключить / отключить"),('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт приглашения"),('E',"Сертификат Own-TLS"),('D',"Удалить профиль")],
         (Role::Client, 2) => &[('i',"Импорт ключа, файла или QR"),('I',"Расширенный импорт REALITY")],
-        (Role::Client, 3) if cfg!(windows) => &[('p',"Системный прокси"),('V',"Локальный HTTP / SOCKS5"),('A',"Выбрать активный профиль"),('i',"Добавить ключ")],
+        (Role::Client, 3) if cfg!(windows) => &[('p',"Включить / выключить системный прокси"),('V',"Локальный HTTP / SOCKS5"),('A',"Выбрать активный профиль"),('i',"Добавить ключ")],
         (Role::Client, 3) => &[('V',"Локальный HTTP / SOCKS5"),('A',"Выбрать активный профиль"),('i',"Добавить ключ")],
         (Role::Client, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('V',"Состояние и применение"),('K',"Подтвердить доверие"),('M',"Регистрация материалов")],
         (Role::Client, 6) => &[('V',"Диагностика подключения")],
@@ -450,7 +450,7 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
             (Role::Server, 'E') => "Свой TLS-сертификат",
             (Role::Client, 'E') => "Доверенный сертификат и ключ",
             (Role::Client, 'V') if !active && page == 1 => "Состояние профиля",
-            (Role::Client, 'p') if !editor.system_proxy_allowed() => "Настроить системный прокси",
+            (Role::Client, 'p') if !editor.system_proxy_allowed() => "Настроить и включить системный прокси",
             (Role::Client, 'V') if page == 3 && !active => "Состояние выбранного профиля",
             _ => label,
         };
@@ -3972,7 +3972,7 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
         Line::raw(""),
         Line::styled("Системный прокси", Style::default().fg(if cfg!(windows) {TEXT} else {MUTED}).add_modifier(Modifier::BOLD)),
         Line::raw(if cfg!(windows) {
-            if editor.system_proxy_allowed() { "Windows · разрешён в настройках; состояние ОС проверяется отдельно." } else { "Windows · требуется разрешение и подтверждение запуска." }
+            if editor.system_proxy_allowed() { "Windows · включение и выключение в одном экране." } else { "Windows · при первом запуске потребуется разрешение." }
         } else { "Недоступен на Linux · системная интеграция не реализована." }),
         Line::styled("TUN / VPN", Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
         Line::styled("Недоступен · backend не реализован.", Style::default().fg(MUTED)),
@@ -4407,7 +4407,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         #[cfg(windows)]
         if let Some(proxy) = interaction.system_proxy.as_mut() {
-            proxy.poll();
+            if proxy.poll() {
+                interaction.modal_action = 0;
+            }
         }
         if let Some(discovery) = interaction.discovery.as_mut() {
             discovery.poll();
@@ -4585,6 +4587,8 @@ mod tests {
         assert!(ui.reality_status.is_none());
         let keys = page_actions(Role::Client, 3, ui.editor.as_ref());
         assert_eq!(keys.iter().any(|a| a.key == 'p'), cfg!(windows));
+        #[cfg(windows)]
+        assert_eq!(keys[0].label, "Настроить и включить системный прокси");
         ui.update(&mut model, press(KeyCode::Down));
         assert!(!ui.owned_running(Role::Client));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
