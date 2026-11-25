@@ -554,11 +554,10 @@ impl ConfigDialog {
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => self.input.clear(),
             KeyCode::Char(ch)
                 if !ch.is_control()
-                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                    && self.input.len().saturating_add(ch.len_utf8()) <= 4096 =>
             {
-                if self.input.len().saturating_add(ch.len_utf8()) <= 4096 {
-                    self.input.push(ch);
-                }
+                self.input.push(ch);
             }
             _ => {}
         }

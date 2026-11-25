@@ -2917,8 +2917,8 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
 
 fn draw_welcome(frame: &mut Frame<'_>, area: Rect, role: Role) {
     let (title, body) = match role {
-        Role::Server => ("Для сервера", "Начало работы\n\n1. Откройте серверную конфигурацию (Enter или F3).\n2. Выберите inbound, пользователей и права.\n3. Проверьте сохранённые изменения перед Apply.\n\nF2: действия   F5: управление сервером\nRuntime не запускается автоматически."),
-        Role::Client => ("Для клиента", "Начало работы\n\n1. Откройте клиентскую конфигурацию (Enter или F3).\n2. Импортируйте приглашение или выберите профиль.\n3. Откройте управление подключением.\n\nF2: действия   F4: монитор трафика\nСистемный прокси не меняется автоматически."),
+        Role::Server => ("Для сервера", "Начало работы\n\n1. Откройте серверную конфигурацию (Enter или F3).\n2. Выберите inbound, пользователей и права.\n3. Проверьте сохранённые изменения перед Apply.\n\nF2: действия   F5: управление сервером\nRuntime не запускается автоматически. Статус: защищённый IPC."),
+        Role::Client => ("Для клиента", "Начало работы\n\n1. Откройте клиентскую конфигурацию (Enter или F3).\n2. Импортируйте приглашение или выберите профиль.\n3. Откройте управление подключением.\n\nF2: действия   F4: монитор трафика\nТранспорт не проверялся. Системный прокси не меняется автоматически."),
     };
     panel(frame, area, title, body, true);
 }
@@ -4249,7 +4249,7 @@ mod tests {
         model.update(press(KeyCode::Char('2')));
         ui.update(&mut model, press(KeyCode::Char('I')));
         assert!(ui.reality_enrollment.is_some());
-        assert!(rendered_interaction(120, 40, &model, &ui).contains("F-18: импорт REALITY"));
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("Импорт REALITY"));
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.reality_enrollment.is_none());
     }
@@ -4263,7 +4263,7 @@ mod tests {
         model.update(press(KeyCode::Char('1')));
         ui.update(&mut model, press(KeyCode::Char('W')));
         assert!(ui.reality_provision.is_some());
-        assert!(rendered_interaction(120, 40, &model, &ui).contains("F-18: подготовка REALITY"));
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("Мастер REALITY"));
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.reality_provision.is_none());
         assert_eq!(model.screen, Screen::Server);
