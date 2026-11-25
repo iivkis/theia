@@ -3,6 +3,7 @@ No external traffic, credentials, marker, shared Rust TLS, or disabled PKI.
 Only the fixture's final DNS address is mapped to loopback by cfg(test).
 """
 import asyncio
+import errno
 import pathlib
 import ssl
 import sys
@@ -172,13 +173,28 @@ async def main(directory, relay_port):
     ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
     ctx.set_alpn_protocols(["h2"])
     ctx.load_cert_chain(str(cert), str(key))
-    h2_listener = await asyncio.start_server(
-        lambda r, w: h2_server(r, w, seen), "127.0.0.1", 0, ssl=ctx)
-    port = h2_listener.sockets[0].getsockname()[1]
     cfg = QuicConfiguration(is_client=False, alpn_protocols=H3_ALPN)
     cfg.load_cert_chain(str(cert), str(key))
-    h3_listener = await serve("127.0.0.1", port, configuration=cfg, retry=True,
-                              create_protocol=lambda *a, **kw: ReferenceH3(*a, seen=seen, **kw))
+    # TCP and UDP have separate ephemeral port pools/reservations, notably
+    # Windows excluded UDP ranges. Keep TCP bound while acquiring UDP, and
+    # retry only bind conflicts before publishing the shared fixture port.
+    for attempt in range(32):
+        h2_listener = await asyncio.start_server(
+            lambda r, w: h2_server(r, w, seen), "127.0.0.1", 0, ssl=ctx)
+        port = h2_listener.sockets[0].getsockname()[1]
+        try:
+            h3_listener = await serve(
+                "127.0.0.1", port, configuration=cfg, retry=True,
+                create_protocol=lambda *a, **kw: ReferenceH3(*a, seen=seen, **kw))
+        except BaseException as error:
+            h2_listener.close()
+            await h2_listener.wait_closed()
+            if (attempt == 31 or not isinstance(error, OSError)
+                    or (error.errno != errno.EADDRINUSE
+                        and getattr(error, "winerror", None) not in (10013, 10048))):
+                raise
+        else:
+            break
     try:
         tmp = directory / "reference-port.tmp"
         tmp.write_text(str(port), encoding="ascii")
