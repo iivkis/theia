@@ -36,6 +36,7 @@ pub(crate) struct ProcessPanel {
     worker: Option<Worker>,
     confirm: Option<bool>,
     notice: String,
+    action_focus: usize,
 }
 impl ProcessPanel {
     pub(crate) fn new() -> Self {
@@ -43,6 +44,7 @@ impl ProcessPanel {
             worker: None,
             confirm: None,
             notice: "Сервер этой панели не запущен.".into(),
+            action_focus: 0,
         }
     }
 
@@ -124,8 +126,24 @@ impl ProcessPanel {
         }
     }
 
+    pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if self.confirm.is_some() { return Vec::new(); }
+        match &self.worker {
+            None => vec![ActionItem { key: 's', label: "Запустить сервер" }],
+            Some(worker) if worker.stop.is_some() => vec![ActionItem { key: 'x', label: "Остановить сервер" }],
+            Some(_) => Vec::new(),
+        }
+    }
+    pub(crate) fn action_focus(&self) -> usize { self.action_focus }
+    pub(crate) fn select_action(&mut self, index: usize) {
+        if index < self.actions().len() { self.action_focus = index; }
+    }
+
     /// Return true to close the panel. Closing the panel is not stopping.
     pub(crate) fn key(&mut self, key: KeyCode, editor: Option<&Editor>) -> bool {
+        let items = self.actions();
+        let Some(key) = crate::tui_widgets::action_key(&items, &mut self.action_focus, key) else { return false; };
         if let Some(start) = self.confirm {
             match key {
                 KeyCode::Char('y') => {
@@ -173,6 +191,15 @@ impl ProcessPanel {
             Some(_) => "Подготовка",
             None => "Не запущен этой панелью",
         }
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        let report = match &self.worker {
+            Some(w) if w.stop.is_none() => "Остановка: admission закрывается, ожидается завершение задач.".into(),
+            Some(w) if w.inbounds.is_some() => format!("Сервер запущен. Inbound: {}.\nСостояние относится только к этому экземпляру.", w.inbounds.unwrap_or(0)),
+            _ => self.notice.clone(),
+        };
+        format!("{}\n\n{report}\n\nEsc — назад, не останавливает сервер.\nВнешний сервис управляется отдельно через IPC.", self.status())
     }
 
     pub(crate) fn body(&self) -> String {
