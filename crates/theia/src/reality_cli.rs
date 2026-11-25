@@ -11,6 +11,8 @@ use std::path::Path;
 
 pub const HELP: &str = "REALITY provisioning candidate; runtime UNCHANGED. All paths absolute.\n\
 theia reality registered-status --config PATH --id ID\n\
+theia reality credential-refresh-preview --config PATH --id ID --invitation PATH\n\
+theia reality credential-refresh-save --config PATH --id ID --invitation PATH --sha256 HEX --confirm\n\
 theia reality register-server-preview --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID\n\
 theia reality register-server-save --config PATH --health PATH --bundle DIRECTORY --health-sha256 HEX --identity-sha256 HEX --listen IP:PORT --grants ID,ID --sha256 HEX --confirm\n\
 theia reality register-client-preview --config PATH --profile PATH --identity-sha256 HEX --id ID\n\
@@ -48,6 +50,12 @@ Identity SHA-256 must be obtained independently. Import never changes active pro
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    CredentialRefresh {
+        config: String,
+        id: String,
+        invitation: String,
+        approval: Option<[u8; 32]>,
+    },
     RegisteredStatus {
         config: String,
         id: String,
@@ -215,6 +223,17 @@ fn registration_approval(kind: &str, tail: &[&str]) -> Result<Option<[u8; 32]>, 
 
 pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
     Ok(match args {
+        [kind @ ("credential-refresh-preview" | "credential-refresh-save"), "--config", c, "--id", id, "--invitation", i, tail @ ..]
+            if config::valid_id(id) =>
+        {
+            let approval = match (*kind, tail) {
+                ("credential-refresh-preview", []) => None,
+                ("credential-refresh-save", ["--sha256", digest, "--confirm"]) => Some(hash(digest)?),
+                _ => return Err(CliError::InvalidArguments),
+            };
+            Command::CredentialRefresh { config: path(c)?, id: (*id).to_owned(),
+                invitation: path(i)?, approval }
+        }
         ["registered-status", "--config", c, "--id", id] if config::valid_id(id) => {
             Command::RegisteredStatus {
                 config: path(c)?,
@@ -524,6 +543,17 @@ fn publication_status(
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
+        Command::CredentialRefresh { config, id, invitation, approval } => {
+            let path = Path::new(&config);
+            let source = Path::new(&invitation);
+            if let Some(expected) = approval {
+                reality_config::save_credential_refresh(path, &id, source, expected, now)?;
+                Ok("Credential saved; trust unchanged; runtime UNCHANGED; explicit Apply required".into())
+            } else {
+                let (digest, revision) = reality_config::preview_credential_refresh(path, &id, source, now)?;
+                Ok(format!("Credential-only refresh; profile={id}\nrevision={revision}\ntrust unchanged; runtime UNCHANGED\napproval_sha256={}", hex(digest)))
+            }
+        }
         Command::RegisteredStatus { config, id } => {
             reality_config::registered_status(Path::new(&config), &id, now)
         }
@@ -535,7 +565,7 @@ pub fn run(command: Command) -> Result<String, Error> {
             if let Some(expected) = approval {
                 reality_config::apply(Path::new(&config), &request, expected, now)?;
                 Ok(
-                    "REALITY record saved; runtime UNCHANGED; external backend not available"
+                    "REALITY record saved; runtime UNCHANGED; activation requires separate preflight/Apply"
                         .into(),
                 )
             } else {

@@ -980,8 +980,9 @@ impl ClientRuntime {
         // No in-place replacement of any existing independently enrolled root.
         for prior in &previous.document.client.profiles {
             if let Some(new) = candidate.client.profiles.iter().find(|p| p.id == prior.id) {
-                if prior.reality_profile != new.reality_profile
-                    || prior.tls_profile != new.tls_profile
+                if prior.tls_profile != new.tls_profile
+                    || (prior.reality_profile != new.reality_profile
+                        && !crate::reality_config::credential_only_change(prior, new))
                 {
                     return Err(ClientError::Configuration);
                 }
