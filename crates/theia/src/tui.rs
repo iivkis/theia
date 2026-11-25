@@ -2937,13 +2937,13 @@ fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bo
 /// A persistent step header and action strip separate guidance from the
 /// scrollable form/review. No display-only shortcut may commit a transaction.
 fn guided_layout(area: Rect, count: Option<usize>, review_rows: usize) -> [Rect; 3] {
-    let mut area = centered_column(area, 132);
+    let mut area = centered_column(area, 108);
     let preferred = count.map_or_else(
         || review_rows.saturating_add(8).clamp(10, 40),
         |count| count.saturating_mul(3).saturating_add(10).clamp(18, 36),
     ) as u16;
     let height = area.height.min(preferred);
-    area.y += (area.height - height).min(8) / 2;
+    area.y += u16::from(area.height > height + 1);
     area.height = height;
     if area.height < 10 {
         return [Rect::new(area.x, area.y, area.width, 0), area, Rect::new(area.x, area.bottom(), area.width, 0)];
@@ -2969,7 +2969,7 @@ fn draw_guided(
     let (form, review) = content;
     let (step, total, heading, keys) = guide;
     tui_widgets::canvas(frame, area);
-    let width = area.width.min(132).saturating_sub(4);
+    let width = area.width.min(108).saturating_sub(4);
     let review_lines = if form.is_none() {
         Some(match &review {
             Some(review) => review.lines(width),
@@ -3098,7 +3098,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: общий импорт URI/локального файла: own-TLS CA или REALITY fingerprint/admission, без запуска; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
+            "НАЧАЛО РАБОТЫ\n1 / 2: сервер / клиент\n↑↓ / Tab: выбрать   Enter: открыть   Esc: назад\nF1: справка   q / Ctrl+C: выйти\n\nНАВИГАЦИЯ\nF2: все действия   F3: открыть файл   F4: трафик\nF6: сменить область фокуса   Alt+←/→: раздел\nEnter: открыть действие или изменить выбранное поле\n\nСЕРВЕР\nN: новое подключение   W: мастер REALITY   F5: запуск и остановка\nu: новый пользователь   G: права доступа   x: отключение\nb: восстановление   t: новый токен   l: публичное приглашение\nv: состояние   Ctrl+R: предпросмотр применения прав\n\nКЛИЕНТ\ni: импорт ссылки, файла или QR   V: подключение и состояние\nN: новый профиль   A: выбрать активный профиль\n\nБЕЗОПАСНОСТЬ\nCtrl+S: сохранить файл, не менять работающий процесс.\nИзменение работающего процесса, доверия и сетевые запросы требуют отдельного подтверждения.",
             true,
         ),
     }
@@ -3178,6 +3178,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             modal_panel!(frame, parts[1], "Мастер REALITY", &provision.body(), true);
         }
     } else if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
+        tui_widgets::canvas(frame, parts[1]);
         let items=runtime.actions();
         if let Some([report,controls])=action_layout(parts[1],items.len()) {
             modal_panel!(frame,report,runtime.title(),&runtime.body(),false);
@@ -3731,25 +3732,23 @@ fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool)
 
 fn page_layout(area: Rect, role: Role, page: usize) -> Option<[Rect; 2]> {
     let count = page_actions(role, page).len();
-    if role == Role::Server && page == 0 && area.height >= 10 {
-        // Keep the next action visible without a separate focus screen.
-        if area.width >= 90 {
-            let split = Layout::horizontal([Constraint::Min(43), Constraint::Length(43)]).split(area);
-            return Some([split[0], split[1]]);
-        }
-        let height = (count as u16 + 2).min(area.height.saturating_sub(6)).max(4);
-        let split = Layout::vertical([Constraint::Min(6), Constraint::Length(height)]).split(area);
-        return Some([split[0], split[1]]);
+    if count == 0 || area.height < 10 { return None; }
+    let action_height = (count as u16).saturating_add(2);
+    // Actions stay near the information they operate on.
+    if area.width >= 76 && page != 1 && !(role == Role::Server && matches!(page, 2 | 3)) {
+        let controls_width = (area.width / 2).clamp(36, 43);
+        let parts = Layout::horizontal([Constraint::Min(36), Constraint::Length(controls_width)]).split(area);
+        let controls = Rect::new(parts[1].x, parts[1].y, parts[1].width, parts[1].height.min(action_height));
+        return Some([parts[0], controls]);
     }
-    if area.height < 14 || count == 0 { return None; }
-    if area.width >= 120 {
-        let split = Layout::horizontal([Constraint::Min(50), Constraint::Length(43)]).split(area);
-        Some([split[0], split[1]])
-    } else if area.height >= 25 || page > 1 {
-        let height = (count as u16 + 2).min(area.height / 2).max(4);
-        let split = Layout::vertical([Constraint::Min(8), Constraint::Length(height)]).split(area);
-        Some([split[0], split[1]])
-    } else { None }
+    if area.height < 14 { return None; }
+    let minimum = if page == 1 { 10 } else { 6 };
+    let height = action_height.min(area.height.saturating_sub(minimum)).max(3);
+    let preferred = if page == 1 { 24 } else if role == Role::Server && matches!(page, 2 | 3) { 12 } else { 10 };
+    let content_height = preferred.min(area.height.saturating_sub(height));
+    let content = Rect::new(area.x, area.y, area.width, content_height);
+    let controls = Rect::new(area.x, content.bottom(), area.width, height);
+    Some([content, controls])
 }
 fn user_table_start(selected: usize, count: usize, area: Rect) -> usize {
     let capacity = usize::from(area.height.saturating_sub(3)).max(1);
@@ -3820,11 +3819,12 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         }
     } else {
         let description = match (role,page) {
-            (Role::Client,2) => "Импортируйте ссылку или изображение QR. Подключение и доверие подтверждаются отдельно.",
-            (Role::Client,3) => "Управление системным прокси Windows. Это не VPN. На Linux эта функция недоступна.",
-            (_,4) => "Enter или F4 — открыть живой монитор трафика текущего процесса.",
-            (_,5) => "F3 — открыть файл; Ctrl+S — сохранить. Применение к работающему процессу выполняется отдельно.",
-            _ => "Проверки состояния и диагностика. Сетевые операции требуют отдельного согласия.",
+            (Role::Client,2) => "Получите приглашение у администратора.\n\n1. Вставьте ссылку или выберите файл / QR.\n2. Проверьте адрес и доверие.\n3. Сохраните профиль и отдельно подключитесь.\n\nИмпорт сам по себе не включает прокси.",
+            (Role::Client,3) if cfg!(windows) => "Системный HTTP-прокси Windows.\n\nВключается только по отдельному подтверждению. Это не VPN.",
+            (Role::Client,3) => "Системный прокси Windows недоступен на Linux.\n\nИспользуйте локальные HTTP/SOCKS-прокси клиента в настройках приложений.",
+            (_,4) => "Монитор трафика\n\nИсточник: локальный процесс Theia.\nПоказывает объём, скорость и активные туннели H2/H3.\nВнешние процессы не измеряются этой панелью.\n\nF4 — открыть монитор.",
+            (_,5) => "Настройки хранятся в файле TOML.\n\nСохранить — записать изменения на диск.\nПрименить — отдельно проверить и изменить работающий процесс.\n\nОткрытие другого файла не запускает сервис.",
+            _ => "Проверка состояния\n\nНачните с локальной диагностики.\nСетевые запросы требуют отдельного согласия.\nРезультат проверки не означает, что туннель уже работает.",
         };
         panel(frame, content, pages(role)[page], description, true);
     }
@@ -3964,8 +3964,8 @@ fn editor_layout(area: Rect) -> Option<[Rect; 4]> {
         let middle = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(parts[1]);
         return Some([parts[0], middle[0], middle[1], parts[2]]);
     }
-    if area.height >= 25 {
-        let parts = Layout::vertical([Constraint::Length(5), Constraint::Length(9), Constraint::Length(5), Constraint::Min(6)]).split(area);
+    if area.height >= 20 {
+        let parts = Layout::vertical([Constraint::Length(5), Constraint::Length(7), Constraint::Length(5), Constraint::Min(3)]).split(area);
         return Some([parts[0], parts[1], parts[2], parts[3]]);
     }
     let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(2), Constraint::Length(2)]).split(area);
@@ -3994,7 +3994,7 @@ fn editor_field_hit(area: Rect, editor: &Editor, x: u16, y: u16) -> Option<usize
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     let dirty = if editor.write_uncertain() { "Не сохранено: запись не подтверждена" }
         else if editor.dirty() { "Не сохранено" } else { "Сохранено" };
-    let state_color = if editor.write_uncertain() { ERROR } else if editor.dirty() { WARNING } else { ACCENT };
+    let state_color = if editor.write_uncertain() { ERROR } else if editor.dirty() { WARNING } else { MUTED };
     let reality = editor.selected_reality();
     let mode = if reality { "SmartTheia REALITY" } else { "Own-TLS" };
     let server = editor.role() == Role::Server;
@@ -4014,9 +4014,6 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     let actions = if server {
         "W Мастер REALITY · N Новое подключение · F5 Сервер"
     } else { "i Импорт приглашения · N Новый профиль · V Подключение" };
-    let secondary = if server {
-        "u Добавить пользователя · F2 Все действия · Ctrl+S Сохранить"
-    } else { "F2 Все действия · F4 Трафик · Ctrl+S Сохранить" };
     let next = if editor.record_count() == 0 {
         if server { "Создайте первое подключение (W или N)." } else { "Импортируйте приглашение (i) или создайте профиль (N)." }
     } else if editor.write_uncertain() { "Откройте конфигурацию заново, прежде чем продолжать." }
@@ -4055,8 +4052,8 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     }
 
     let (start, rows, header) = editor_table_window(table_area, editor);
-    let labels = if server { ["Домен TLS", "Адрес TCP (H2)", "Адрес UDP (H3)", ""] }
-        else { ["Адрес (Endpoint)", "Домен (TLS SNI)", "Транспорт", "Режим XHTTP"] };
+    let labels = if server { ["Имя сервера", "Адрес TCP (H2)", "Адрес UDP (H3)", ""] }
+        else { ["Адрес сервера", "Имя сервера (TLS)", "Транспорт", "Режим XHTTP"] };
     let label_width = (table_area.width / 2).clamp(12, 24);
     let value_width = table_area.width.saturating_sub(label_width + 5);
     let table_rows = fields.iter().enumerate().skip(start).take(rows).map(|(index, (_, value, selected))| {
@@ -4096,21 +4093,17 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         frame.render_widget(Paragraph::new(error.unwrap_or(help)).style(Style::default().fg(if error.is_some() { ERROR } else { TEXT })).wrap(Wrap { trim: true }), detail);
     }
     let mut lines = Vec::new();
-    if let Some(error) = error {
-        lines.push(Line::styled(format!("Ошибка: {error}"), Style::default().fg(ERROR).add_modifier(Modifier::BOLD)));
-    }
-    if !editor.notice.is_empty() {
+    // Errors already appear in the persistent notification strip.
+    lines.push(Line::styled(next, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)));
+    if bottom.height >= 6 && !editor.notice.is_empty() {
         lines.push(Line::styled(editor.notice, Style::default().fg(MUTED)));
     }
-    lines.push(Line::styled(next, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)));
-    lines.push(tui_widgets::key_line(actions));
-    lines.push(tui_widgets::key_line(secondary));
     if bottom.height >= 5 {
         let height = bottom.height.min(10);
         frame.render_widget(Paragraph::new(lines).block(tui_widgets::section("Что дальше", false)).wrap(Wrap { trim: true }),
             Rect::new(bottom.x, bottom.y, bottom.width, height));
     } else {
-        frame.render_widget(Paragraph::new(vec![tui_widgets::key_line(actions), tui_widgets::key_line(secondary)]).wrap(Wrap { trim: true }), bottom);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), bottom);
     }
 }
 
@@ -4494,6 +4487,19 @@ mod tests {
         assert_eq!(flow.form(None).unwrap().selected, 0);
         flow.select_field(99);
         assert_eq!(flow.form(None).unwrap().selected, 0);
+    }
+
+    #[test]
+    fn review_layout_keeps_actions_near_content_at_120_columns() {
+        let area = Rect::new(0, 0, 120, 40);
+        let [_, _, workspace] = workspace_columns(shell_layout(area)[1]).unwrap();
+        for role in [Role::Server, Role::Client] {
+            for page in [0, 2, 4, 5, 6] {
+                let [content, controls] = page_layout(workspace, role, page).unwrap();
+                assert!(controls.y <= content.y + 12);
+                assert!(controls.bottom() <= workspace.bottom());
+            }
+        }
     }
 
     #[test]
