@@ -972,7 +972,10 @@ mod tests {
 
     #[test]
     fn unavailable_endpoint_cannot_confirm_or_dispatch_mutations() {
-        let initial = Phase::Viewing { inbounds: 1, revision: 7 };
+        let initial = Phase::Viewing {
+            inbounds: 1,
+            revision: 7,
+        };
         for action in ['a', 'b', 'c', 's', 'z'] {
             let mut panel = fake(None, false);
             panel.phase = initial;
@@ -981,29 +984,55 @@ mod tests {
             assert!(panel.receiver.is_none());
         }
         for action in ['b', 'c', 's', 'z'] {
-            let mut panel = fake(Some([1;32]), false);
+            let mut panel = fake(Some([1; 32]), false);
             panel.phase = initial;
             assert!(!panel.key(key(KeyCode::Char(action))));
             assert_eq!(panel.phase, Phase::Unavailable);
             assert!(panel.receiver.is_none());
         }
         for phase in [
-            Phase::Confirming { inbounds: 1, revision: 7 },
+            Phase::Confirming {
+                inbounds: 1,
+                revision: 7,
+            },
             Phase::QuotaConfirming { revision: 7 },
-            Phase::CutoverConfirming { revision: 7, same_port: true, material_sha256: [2;32] },
-            Phase::RollbackConfirming { revision: 7, remaining_seconds: 10 },
-            Phase::RestartRollbackConfirming { revision: 7, remaining_seconds: 10 },
+            Phase::CutoverConfirming {
+                revision: 7,
+                same_port: true,
+                material_sha256: [2; 32],
+            },
+            Phase::RollbackConfirming {
+                revision: 7,
+                remaining_seconds: 10,
+            },
+            Phase::RestartRollbackConfirming {
+                revision: 7,
+                remaining_seconds: 10,
+            },
         ] {
-            let mut panel = fake(Some([1;32]), false);
+            let mut panel = fake(Some([1; 32]), false);
             panel.phase = phase;
             assert!(!panel.key(key(KeyCode::Char('y'))));
             assert_eq!(panel.phase, Phase::Unavailable);
             assert!(panel.receiver.is_none());
         }
         for (phase, refused) in [
-            (Phase::Confirming { inbounds: 1, revision: 7 }, Phase::Unavailable),
+            (
+                Phase::Confirming {
+                    inbounds: 1,
+                    revision: 7,
+                },
+                Phase::Unavailable,
+            ),
             (Phase::QuotaConfirming { revision: 7 }, Phase::QuotaRejected),
-            (Phase::CutoverConfirming { revision: 7, same_port: true, material_sha256: [2;32] }, Phase::CutoverRejected),
+            (
+                Phase::CutoverConfirming {
+                    revision: 7,
+                    same_port: true,
+                    material_sha256: [2; 32],
+                },
+                Phase::CutoverRejected,
+            ),
         ] {
             let mut panel = fake(None, false);
             panel.phase = phase;
@@ -1017,12 +1046,15 @@ mod tests {
     fn unsupported_mutations_never_display_success_or_retry() {
         for (phase, result) in [
             (Phase::CutoverApplying, Phase::CutoverRejected),
-            (Phase::RestartRollbackApplying, Phase::RestartRollbackUnavailable),
+            (
+                Phase::RestartRollbackApplying,
+                Phase::RestartRollbackUnavailable,
+            ),
             (Phase::QuotaApplying, Phase::QuotaRejected),
             (Phase::RollbackApplying, Phase::RollbackUnavailable),
             (Phase::Applying, Phase::Unavailable),
         ] {
-            let mut panel = fake(Some([1;32]), false);
+            let mut panel = fake(Some([1; 32]), false);
             panel.phase = phase;
             panel.complete(Err(ManagementError::Unsupported));
             assert_eq!(panel.phase, result);
@@ -1040,5 +1072,4 @@ mod tests {
         assert_eq!(panel.phase, Phase::RestartUnavailable);
         assert!(panel.receiver.is_none());
     }
-
 }

@@ -1419,22 +1419,132 @@ mod tests {
         let hash = digest.as_str();
         for args in [
             vec!["promotion-preview", "--profile", &p, "--descriptor", &d],
-            vec!["promotion-apply", "--profile", &p, "--descriptor", &d, "--expected-revision", "1", "--snapshot-sha256", hash, "--sha256", hash, "--identity-sha256", hash, "--confirm"],
+            vec![
+                "promotion-apply",
+                "--profile",
+                &p,
+                "--descriptor",
+                &d,
+                "--expected-revision",
+                "1",
+                "--snapshot-sha256",
+                hash,
+                "--sha256",
+                hash,
+                "--identity-sha256",
+                hash,
+                "--confirm",
+            ],
             vec!["recovery-preview", "--profile", &p, "--descriptor", &d],
-            vec!["recovery-apply", "--profile", &p, "--descriptor", &d, "--expected-revision", "1", "--snapshot-sha256", hash, "--sha256", hash, "--identity-sha256", hash, "--confirm"],
-            vec!["reenroll-preview", "--config", &output, "--profile", &p, "--identity-sha256", hash, "--id", "edge"],
-            vec!["reenroll-save", "--config", &output, "--profile", &p, "--identity-sha256", hash, "--id", "edge", "--sha256", hash, "--confirm-reenrollment"],
-            vec!["failover-preview", "--health", &h, "--publication", &publication],
-            vec!["failover-apply", "--health", &h, "--publication", &publication, "--sha256", hash, "--health-sha256", hash, "--reference", "0", "--confirm-recovery-plan"],
-            vec!["provision-apply", "--health", &h, "--output", &output, "--health-sha256", hash, "--confirm"],
+            vec![
+                "recovery-apply",
+                "--profile",
+                &p,
+                "--descriptor",
+                &d,
+                "--expected-revision",
+                "1",
+                "--snapshot-sha256",
+                hash,
+                "--sha256",
+                hash,
+                "--identity-sha256",
+                hash,
+                "--confirm",
+            ],
+            vec![
+                "reenroll-preview",
+                "--config",
+                &output,
+                "--profile",
+                &p,
+                "--identity-sha256",
+                hash,
+                "--id",
+                "edge",
+            ],
+            vec![
+                "reenroll-save",
+                "--config",
+                &output,
+                "--profile",
+                &p,
+                "--identity-sha256",
+                hash,
+                "--id",
+                "edge",
+                "--sha256",
+                hash,
+                "--confirm-reenrollment",
+            ],
+            vec![
+                "failover-preview",
+                "--health",
+                &h,
+                "--publication",
+                &publication,
+            ],
+            vec![
+                "failover-apply",
+                "--health",
+                &h,
+                "--publication",
+                &publication,
+                "--sha256",
+                hash,
+                "--health-sha256",
+                hash,
+                "--reference",
+                "0",
+                "--confirm-recovery-plan",
+            ],
+            vec![
+                "provision-apply",
+                "--health",
+                &h,
+                "--output",
+                &output,
+                "--health-sha256",
+                hash,
+                "--confirm",
+            ],
         ] {
             let command = parse(&args).expect("well-formed command");
             assert!(run(command).is_err(), "missing material accepted: {args:?}");
             assert!(!Path::new(&output).exists());
             assert!(!Path::new(&publication).exists());
         }
-        assert!(parse(&["reenroll-save", "--config", &output, "--profile", &p, "--identity-sha256", hash, "--id", "edge", "--sha256", hash, "--confirm"]).is_err());
-        assert!(parse(&["recovery-apply", "--profile", &p, "--descriptor", &d, "--expected-revision", "0", "--snapshot-sha256", hash, "--sha256", hash, "--identity-sha256", hash, "--confirm"]).is_err());
+        assert!(parse(&[
+            "reenroll-save",
+            "--config",
+            &output,
+            "--profile",
+            &p,
+            "--identity-sha256",
+            hash,
+            "--id",
+            "edge",
+            "--sha256",
+            hash,
+            "--confirm"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "recovery-apply",
+            "--profile",
+            &p,
+            "--descriptor",
+            &d,
+            "--expected-revision",
+            "0",
+            "--snapshot-sha256",
+            hash,
+            "--sha256",
+            hash,
+            "--identity-sha256",
+            hash,
+            "--confirm"
+        ])
+        .is_err());
     }
-
 }
