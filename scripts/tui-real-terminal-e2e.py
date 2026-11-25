@@ -14,6 +14,8 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
+from pathlib import Path
 
 import pyte
 
@@ -422,17 +424,243 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
             tty.close(expect_success=False)
 
 
+def drive_dual_product(binary, server, client, cert, admission, fingerprint,
+                       http_port, socks_port, echo_port):
+    # Full compiled-binary paths, not an injected TUI/IPC response. The
+    # reference inventory is a local, pre-provisioned fixture; no internet.
+    server = Path(server)
+    client = Path(client)
+    base = server.parent
+
+    def read_config(path):
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+
+    def finish(tty):
+        tty.send("\x1b")
+        time.sleep(0.15)
+        tty.send("q")
+        tty.close()
+
+    def issue(tty, name):
+        before = set(base.glob(".theia-export-*/invitation.theia"))
+        tty.send("u")
+        tty.wait("ID пользователя")
+        tty.send(name + "\r")
+        tty.wait("Подтверждение нового пользователя")
+        tty.send("y")
+        tty.wait("Одноразовая выдача конфиденциальной ссылки")
+        tty.send("f")
+        tty.wait("Подтверждение конфиденциального экспорта")
+        tty.send("y")
+        tty.wait("Конфиденциальный файл создан")
+        created = set(base.glob(".theia-export-*/invitation.theia")) - before
+        assert len(created) == 1
+        path = created.pop()
+        with tty.lock:
+            # The actual confidential URI must not be in the terminal stream.
+            assert path.read_text(encoding="utf-8") not in tty.raw
+        revision(binary, 1)
+        tty.send("\x1b")
+        tty.wait("Редактор TOML")
+        return path
+
+    server_cmd = [binary, "tui", "--role", "server", "--config", str(server)]
+    tty = Terminal(server_cmd)
+    try:
+        tty.wait("Редактор TOML")
+        own_link = issue(tty, "own-user")
+        tty.send("j")
+        tty.wait("REALITY 2/2:")
+        reality_link = issue(tty, "reality-user")
+        saved = read_config(server)["server"]
+        assert "own-user" in saved["inbounds"][0]["allowed_user_ids"]
+        assert "reality-user" in saved["inbounds"][1]["allowed_user_ids"]
+        assert "own-user" not in saved["inbounds"][1]["allowed_user_ids"]
+        tty.send("\x12")
+        tty.wait("Подтвердить применение авторизации")
+        revision(binary, 1)
+        tty.send("y")
+        tty.wait("Применено: подтверждено сервером")
+        revision(binary, 2)
+        finish(tty)
+    finally:
+        if tty.alive():
+            tty.close(expect_success=False)
+
+    # Headless Own-TLS client is a real native executable using protected IPC.
+    if os.name == "nt":
+        os.environ["THEIA_CLIENT_CONTROL_PIPE"] = f"tui-dual-{os.getpid()}"
+    else:
+        control = base / "client-ipc"
+        control.mkdir(mode=0o700)
+        os.environ["THEIA_CLIENT_CONTROL_DIR"] = str(control)
+
+    def client_revision(expected):
+        out = subprocess.run([binary, "client", "status"], capture_output=True,
+                             text=True, timeout=3)
+        return out.returncode == 0 and f"revision={expected};" in out.stdout
+
+    headless = subprocess.Popen([binary, "client", "run", "--config", str(client)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    tty = None
+    try:
+        deadline = time.monotonic() + 6
+        while not client_revision(1):
+            assert headless.poll() is None and time.monotonic() < deadline
+            time.sleep(0.05)
+        client_cmd = [binary, "tui", "--role", "client", "--config", str(client)]
+        tty = Terminal(client_cmd)
+        tty.wait("Редактор TOML")
+        original = client.read_bytes()
+        tty.send("i")
+        tty.wait("F-14: импорт подключения")
+        tty.send(str(own_link) + "\r")
+        tty.wait("F-14: безопасный предпросмотр подключения")
+        tty.send("c")
+        tty.wait("F-14: отдельный TLS trust")
+        tty.send("file:" + cert + "\r")
+        tty.wait("CA указан")
+        assert client.read_bytes() == original
+        tty.send("y")
+        tty.wait("Импорт сохранён")
+        assert read_config(client)["client"]["active_profile"] == "home"
+        assert client_revision(1)
+        tty.send("\x1b")
+        tty.wait("Редактор TOML")
+        tty.send("A")
+        tty.wait("Активный профиль в TOML:")
+        tty.send("y")
+        tty.wait("Редактор TOML")
+        assert read_config(client)["client"]["active_profile"] == "public"
+        assert client_revision(1)
+        tty.send("V")
+        tty.wait("Headless runtime: revision=1")
+        tty.send("h")
+        tty.wait("Headless Apply: revision=1")
+        assert client_revision(1)
+        tty.send("n")
+        tty.wait("h: headless Apply")
+        assert client_revision(1)
+        tty.send("h")
+        tty.wait("Headless Apply: revision=1")
+        tty.send("y")
+        tty.wait("Headless Apply подтверждён")
+        assert client_revision(2)
+        test_tunnels(http_port, socks_port, echo_port)
+        tty.send("\x1b")
+        tty.wait("Редактор TOML")
+        headless.terminate()
+        headless.wait(timeout=3)
+
+        def enroll():
+            tty.send("i")
+            tty.wait("F-14: импорт подключения")
+            tty.send(str(reality_link) + "\r")
+            tty.wait("Отдельный admission-файл")
+            tty.send(admission + "\t")
+            tty.send(fingerprint + "\r")
+            tty.wait("ПРЕДПРОСМОТР: fingerprint совпал")
+            tty.send("y")
+            tty.wait("Следующий шаг: g")
+
+        # First complete local enrollment, cancel before TOML registration.
+        before = set(base.glob(".theia-enroll-*"))
+        saved = client.read_bytes()
+        enroll()
+        assert client.read_bytes() == saved
+        assert len(set(base.glob(".theia-enroll-*")) - before) == 1
+        tty.send("g")
+        tty.wait("Регистрация уже подготовленных материалов")
+        tty.send("\x1b")
+        tty.wait("Редактор TOML")
+        assert set(base.glob(".theia-enroll-*")) == before
+        assert client.read_bytes() == saved
+
+        # Re-run and actually register: still no implicit activation.
+        enroll()
+        tty.send("g")
+        tty.wait("Регистрация уже подготовленных материалов")
+        tty.send("\x15reality-profile\r")
+        tty.wait("Register REALITY profile")
+        assert client.read_bytes() == saved
+        tty.send("y")
+        tty.wait("Запись сохранена, редактор перечитан")
+        assert read_config(client)["client"]["active_profile"] == "public"
+        tty.send("\x1b")
+        tty.wait("Редактор TOML")
+        tty.send("A")
+        tty.wait("Активный профиль в TOML:")
+        tty.send("y")
+        tty.wait("Редактор TOML")
+        assert read_config(client)["client"]["active_profile"] == "reality-profile"
+        tty.send("V")
+        tty.wait("s: запустить локальный runtime")
+        tty.send("s")
+        tty.wait("Запустить сохранённый активный профиль")
+        tty.send("y")
+        tty.wait("Loopback listeners работают")
+        test_tunnels(http_port, socks_port, echo_port)
+        tty.wait("last_open=H")
+        tty.send("x")
+        tty.wait("Остановить локальный runtime?")
+        tty.send("y")
+        tty.wait("Локальный runtime остановлен")
+        finish(tty)
+        tty = None
+    finally:
+        if tty is not None and tty.alive():
+            tty.close(expect_success=False)
+        if headless.poll() is None:
+            headless.kill()
+            headless.wait(timeout=3)
+
+    # Rollback is a separate, confirmed native server action. Refuse the
+    # first review and verify both revisions and exact saved bytes.
+    before = server.read_bytes()
+    tty = Terminal(server_cmd)
+    try:
+        tty.wait("Редактор TOML")
+        tty.send("v")
+        tty.wait("revision=2")
+        tty.send("b")
+        tty.wait("Откат авторизации, revision=2")
+        tty.send("n")
+        tty.wait("Редактор TOML")
+        revision(binary, 2)
+        tty.send("v")
+        tty.wait("revision=2")
+        tty.send("b")
+        tty.wait("Откат авторизации, revision=2")
+        tty.send("y")
+        tty.wait("Авторизация восстановлена, новая revision=3")
+        revision(binary, 3)
+        assert server.read_bytes() == before
+        finish(tty)
+    finally:
+        if tty.alive():
+            tty.close(expect_success=False)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--scenario", choices=("apply", "reject", "dirty", "readonly", "client", "client-proxy"), required=True)
+    parser.add_argument("--scenario", choices=("apply", "reject", "dirty", "readonly", "client", "client-proxy", "dual-product"), required=True)
     parser.add_argument("--revision", type=int, required=True)
     parser.add_argument("--http-port", type=int)
     parser.add_argument("--socks-port", type=int)
     parser.add_argument("--echo-port", type=int)
+    parser.add_argument("--client")
+    parser.add_argument("--cert")
+    parser.add_argument("--admission")
+    parser.add_argument("--fingerprint")
     args = parser.parse_args()
-    if args.scenario == "client-proxy":
+    if args.scenario == "dual-product":
+        drive_dual_product(args.binary, args.config, args.client, args.cert,
+                           args.admission, args.fingerprint, args.http_port,
+                           args.socks_port, args.echo_port)
+    elif args.scenario == "client-proxy":
         assert all(port and 0 < port < 65536 for port in
                    (args.http_port, args.socks_port, args.echo_port))
         drive_client_proxy(args.binary, args.config, args.http_port,
