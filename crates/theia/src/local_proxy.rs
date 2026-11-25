@@ -116,6 +116,7 @@ async fn load_client_with_budget(
             let endpoint = resolve_server(profile).await?.to_string();
             let client = H2Client::new(&endpoint, &profile.server_name, &token, roots)?
                 .with_path_prefix(prefix)?
+                .with_own_tls_policy()?
                 .with_stream_up(stream_up)?;
             let client = if auto_xhttp {
                 client.with_auto_stream_up(ttl)?
@@ -134,6 +135,7 @@ async fn load_client_with_budget(
             let remote = resolve_server(profile).await?;
             let h3 = H3Client::new(remote, &profile.server_name, &token, roots.clone())?
                 .with_path_prefix(prefix)?
+                .with_own_tls_policy()?
                 .with_stream_up(stream_up)?
                 .with_connect_timeout(Duration::from_millis(u64::from(
                     profile.quic_connect_timeout_ms,
@@ -157,6 +159,7 @@ async fn load_client_with_budget(
             // trust anchors, certificate pin and authorization unchanged.
             let h2 = H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
                 .with_path_prefix(prefix)?
+                .with_own_tls_policy()?
                 .with_stream_up(stream_up)?;
             let h2 = h2.with_connection_pool();
             let h2 = Arc::new(if auto_xhttp {

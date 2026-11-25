@@ -22,12 +22,8 @@ const MAX_PROFILE_CONNECTIONS: usize = 8;
 pub(crate) fn profile_budget() -> Arc<Semaphore> {
     Arc::new(Semaphore::new(MAX_PROFILE_CONNECTIONS))
 }
-// Own-TLS defaults are provisional local policy. REALITY derives its
-// bounds from the verified descriptor of this immutable client generation.
-const MAX_REUSE_AGE: Duration = Duration::from_secs(20);
-const MIN_REUSE_AGE_S: u64 = 15;
-const MIN_REUSE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_REUSE_BYTES: u64 = 64 * 1024 * 1024;
+// Own-TLS uses the fixed wire-v1 policy; REALITY derives its bounds
+// from the verified descriptor of this immutable client generation.
 
 #[derive(Clone, Copy)]
 struct RotationPolicy {
@@ -40,10 +36,10 @@ struct RotationPolicy {
 impl Default for RotationPolicy {
     fn default() -> Self {
         Self {
-            age_min: MIN_REUSE_AGE_S,
-            age_max: MAX_REUSE_AGE.as_secs(),
-            bytes_min: MIN_REUSE_BYTES,
-            bytes_max: MAX_REUSE_BYTES,
+            age_min: u64::from(crate::padding::OWN_TLS_ROTATION.lifetime_min_s),
+            age_max: u64::from(crate::padding::OWN_TLS_ROTATION.lifetime_max_s),
+            bytes_min: crate::padding::OWN_TLS_ROTATION.volume_min_bytes,
+            bytes_max: crate::padding::OWN_TLS_ROTATION.volume_max_bytes,
         }
     }
 }
@@ -369,7 +365,7 @@ mod tests {
         idle.admitted();
         drop(idle);
         tokio::task::yield_now().await;
-        tokio::time::advance(MAX_REUSE_AGE + Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(u64::from(crate::padding::OWN_TLS_ROTATION.lifetime_max_s)) + Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert!(pool.entries.lock().await.is_empty());
         assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);

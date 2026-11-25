@@ -232,6 +232,12 @@ impl ServerContext {
         }
     }
 
+    fn apply_own_tls_policy(&mut self) {
+        if self.security_mode.is_plain() && self.identity_routes.is_none() {
+            self.padding = crate::padding::OWN_TLS_PADDING;
+        }
+    }
+
     /// Build the identity-authenticated application context from an already
     /// independently verified document. No public listener is activated here.
     pub(crate) fn identity_fixture(
@@ -2101,6 +2107,7 @@ async fn prepare_selected_listeners(
             limits.peer_budget.clone(),
         );
         context.live_quota = Some(limits.ledger.clone());
+        context.apply_own_tls_policy();
         listeners.push(ReadyListener::Plain(
             listener,
             acceptor,
@@ -3246,6 +3253,7 @@ async fn run_reality_document_inner(
             peers.clone(),
         );
         context.live_quota = Some(ledger.clone());
+        context.apply_own_tls_policy();
         if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             loaded_identities.push(crate::reload_preflight::IdentityHash::reality(
@@ -3486,7 +3494,7 @@ async fn run_document_with_config(
                     crate::quic_transport::QuicError::Bind => ServerError::Io,
                     _ => ServerError::Tls,
                 })?;
-        let context = Arc::new(ServerContext::with_limits(
+        let mut context = ServerContext::with_limits(
             inbound,
             &policy,
             live_authorization.shared(),
@@ -3494,8 +3502,9 @@ async fn run_document_with_config(
             per_user.clone(),
             connections.clone(),
             peer_budget.clone(),
-        ));
-        prepared.push((listener, acceptor, endpoint, context));
+        );
+        context.apply_own_tls_policy();
+        prepared.push((listener, acceptor, endpoint, Arc::new(context)));
     }
     // Both platforms require explicit private local IPC opt-in. Advertise
     // status only AFTER all TCP/UDP listeners and TLS have been prepared.
@@ -3661,9 +3670,11 @@ mod hardening_tests {
         document.server.policy.allow_private_ips = true;
         document.server.policy.max_connections_per_user = 4;
         document.server.policy.max_connections_total = 8;
-        let context = Arc::new(ServerContext::new(
+        let mut context = ServerContext::new(
             &document.server.inbounds[0], &document.server.users, &document.server.policy,
-        ));
+        );
+        context.apply_own_tls_policy();
+        let context = Arc::new(context);
         let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = signed.cert.der().clone();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(signed.key_pair.serialize_der());
@@ -3697,7 +3708,7 @@ mod hardening_tests {
 
         macro_rules! exercise {
             ($client:expr) => {{
-                let client = $client.with_stream_up(split).unwrap().with_connection_pool();
+                let client = $client.with_own_tls_policy().unwrap().with_stream_up(split).unwrap().with_connection_pool();
                 let tunnel = client.open(address.clone(), target_port).await.unwrap();
                 let (mut upstream, _) = target.accept().await.unwrap();
                 let echo = tokio::spawn(async move {

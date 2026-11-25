@@ -271,6 +271,16 @@ impl H3Client {
         self
     }
 
+    /// Enable the common production Own-TLS padding policy. Identity
+    /// carriers always keep the immutable signed descriptor policy.
+    pub(crate) fn with_own_tls_policy(mut self) -> Result<Self, ClientError> {
+        if self.identity_routes.is_some() || self.certificate_pin.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        self.padding = crate::padding::OWN_TLS_PADDING;
+        Ok(self)
+    }
+
     /// Set the exact configured inbound route, before admitting any session.
     pub fn with_path_prefix(mut self, prefix: &str) -> Result<Self, ClientError> {
         if self.identity_routes.is_some() {
