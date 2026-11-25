@@ -205,7 +205,7 @@ impl ReloadPreflight {
         Ok(candidate)
     }
 
-    fn validate_candidate(
+    pub(crate) fn validate_candidate(
         &self,
         candidate: ServerDocument,
     ) -> Result<ServerDocument, ReloadCheckError> {

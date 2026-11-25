@@ -87,6 +87,8 @@ pub enum StatusCommand {
     CheckRestart,
     /// Advisory last-same-port-identity recovery readiness (no PEM values).
     CheckTlsRollback,
+    CheckAuthRollback,
+    ApplyAuthRollback { expected_revision:u64 },
     /// Explicit one-shot CAS on the protected native management endpoint.
     ApplyTlsRollback {
         expected_revision: u64,
@@ -153,6 +155,8 @@ pub enum StatusReply {
     TlsRollbackApplied {
         revision: u64,
     },
+    AuthRollbackReady { revision:u64, remaining_seconds:u64 },
+    AuthRollbackApplied { revision:u64 },
     Applied {
         revision: u64,
     },
@@ -462,6 +466,30 @@ where
                     "ERR unsupported\n".to_owned()
                 }
             }
+            b"auth-rollback-check" => {
+                if let Some(runtime)=&runtime{
+                    match runtime.auth_rollback_status(){
+                        Some((revision,seconds))=>format!("theia-auth-rollback-v1 ready revision={revision} seconds={seconds}\n"),
+                        None=>"theia-auth-rollback-v1 unavailable\n".to_owned(),
+                    }
+                }else{"ERR unsupported\n".to_owned()}
+            }
+            candidate if parse_auth_rollback_revision(candidate).is_some()=>{
+                if let (Some(runtime),Some(previous))=(&runtime,&observed){
+                    let expected=parse_auth_rollback_revision(candidate).expect("parsed");
+                    if let Some(document)=runtime.auth_rollback_candidate(previous,expected){
+                        let preflight=previous.preflight.clone();
+                        let checked=document.clone();
+                        let valid=tokio::task::spawn_blocking(move||preflight.validate_candidate(checked.as_ref().clone())).await;
+                        if matches!(valid,Ok(Ok(_))){
+                            match runtime.rollback_auth(previous,&document,expected){
+                                Ok(revision)=>format!("theia-auth-rollback-v1 applied revision={revision}\n"),
+                                Err(_)=>"theia-auth-rollback-v1 rejected\n".to_owned(),
+                            }
+                        }else{"theia-auth-rollback-v1 rejected\n".to_owned()}
+                    }else{"theia-auth-rollback-v1 rejected\n".to_owned()}
+                }else{"ERR unsupported\n".to_owned()}
+            }
             b"tls-rollback-check" => {
                 if let Some(runtime) = &runtime {
                     match runtime.rollback_status() {
@@ -682,6 +710,11 @@ fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_auth_rollback_revision(command:&[u8])->Option<u64>{
+    positive_decimal(std::str::from_utf8(command.strip_prefix(b"auth-rollback-apply rev=")?).ok()?)
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 fn parse_tls_rollback_revision(command: &[u8]) -> Option<u64> {
     let raw = std::str::from_utf8(command.strip_prefix(b"tls-rollback-apply rev=")?).ok()?;
     positive_decimal(raw)
@@ -713,6 +746,11 @@ where
         StatusCommand::Reload => b"reload\n".to_vec(),
         StatusCommand::CheckReload => b"check-reload\n".to_vec(),
         StatusCommand::CheckRestart => b"check-restart\n".to_vec(),
+        StatusCommand::CheckAuthRollback=>b"auth-rollback-check\n".to_vec(),
+        StatusCommand::ApplyAuthRollback{expected_revision}=>{
+            if expected_revision==0{return Err(ManagementError::InvalidReply);}
+            format!("auth-rollback-apply rev={expected_revision}\n").into_bytes()
+        }
         StatusCommand::CheckTlsRollback => b"tls-rollback-check\n".to_vec(),
         StatusCommand::ApplyTlsRollback { expected_revision } => {
             if expected_revision == 0 {
@@ -791,6 +829,31 @@ where
     }
     if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
         return Ok(StatusReply::Unsupported);
+    }
+    if command==StatusCommand::CheckAuthRollback{
+        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
+        if let Some((revision,seconds))=text.strip_prefix("theia-auth-rollback-v1 ready revision=")
+            .and_then(|s|s.strip_suffix('\n')).and_then(|s|s.split_once(" seconds=")){
+            if let (Some(revision),Some(remaining_seconds))=(positive_decimal(revision),positive_decimal(seconds)){
+                if remaining_seconds<=300{return Ok(StatusReply::AuthRollbackReady{revision,remaining_seconds});}
+            }
+        }
+        return match text{
+            "theia-auth-rollback-v1 unavailable\n"=>Err(ManagementError::CandidateRejected),
+            "ERR unsupported\n"=>Err(ManagementError::Unsupported),
+            _=>Err(ManagementError::InvalidReply),
+        };
+    }
+    if let StatusCommand::ApplyAuthRollback{expected_revision}=command{
+        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
+        let applied=text.strip_prefix("theia-auth-rollback-v1 applied revision=")
+            .and_then(|s|s.strip_suffix('\n')).and_then(positive_decimal);
+        return match applied{
+            Some(revision) if Some(revision)==expected_revision.checked_add(1)=>Ok(StatusReply::AuthRollbackApplied{revision}),
+            _ if text=="theia-auth-rollback-v1 rejected\n"=>Err(ManagementError::CandidateRejected),
+            _ if text=="ERR unsupported\n"=>Err(ManagementError::Unsupported),
+            _=>Err(ManagementError::InvalidReply),
+        };
     }
     if command == StatusCommand::CheckTlsRollback {
         let reply = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
@@ -973,6 +1036,8 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
         StatusCommand::Reload => "reload_rejected",
         StatusCommand::CheckReload => "check_reload",
         StatusCommand::CheckRestart => "check_restart",
+        StatusCommand::CheckAuthRollback=>"check_auth_rollback",
+        StatusCommand::ApplyAuthRollback{..}=>"apply_auth_rollback",
         StatusCommand::CheckTlsRollback => "check_tls_rollback",
         StatusCommand::ApplyTlsRollback { .. } => "apply_tls_rollback",
         StatusCommand::CheckQuota => "check_quota",

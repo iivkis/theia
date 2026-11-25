@@ -18,6 +18,11 @@ enum Phase {
     LegacyStatus,
     Confirming { inbounds: usize, revision: u64 },
     Applying,
+    RollbackChecking,
+    RollbackConfirming {revision:u64,remaining_seconds:u64},
+    RollbackApplying,
+    RollbackApplied {revision:u64},
+    RollbackUnavailable,
     Applied { revision: u64 },
     Rejected,
     Indeterminate,
@@ -178,6 +183,20 @@ impl RuntimePanel {
                     _ => Phase::RestartUnavailable,
                 };
             }
+            Phase::RollbackChecking=>{
+                self.phase=match result{
+                    Ok(StatusReply::AuthRollbackReady{revision,remaining_seconds})=>Phase::RollbackConfirming{revision,remaining_seconds},
+                    _=>Phase::RollbackUnavailable,
+                };
+            }
+            Phase::RollbackApplying=>{
+                self.phase=match result{
+                    Ok(StatusReply::AuthRollbackApplied{revision})=>Phase::RollbackApplied{revision},
+                    Err(ManagementError::CandidateRejected)=>Phase::Rejected,
+                    Err(ManagementError::Unsupported)=>Phase::RollbackUnavailable,
+                    _=>Phase::Indeterminate,
+                };
+            }
             Phase::Applying => {
                 self.phase = match result {
                     Ok(StatusReply::Applied { revision }) => Phase::Applied { revision },
@@ -231,7 +250,21 @@ impl RuntimePanel {
                 false
             }
             (Phase::Checking, KeyCode::Esc) => true,
-            (Phase::Checking | Phase::Applying, _) => false,
+            (Phase::Checking | Phase::Applying | Phase::RollbackApplying, _) => false,
+            (Phase::RollbackChecking,KeyCode::Esc)=>true,
+            (Phase::RollbackChecking,_)=>false,
+            (Phase::Viewing{..}|Phase::Applied{..},KeyCode::Char('b')) if self.saved_sha256.is_some()=>{
+                self.phase=Phase::RollbackChecking;
+                self.start(StatusCommand::CheckAuthRollback);
+                false
+            }
+            (Phase::RollbackConfirming{revision,..},KeyCode::Char('y'))=>{
+                self.phase=Phase::RollbackApplying;
+                self.start(StatusCommand::ApplyAuthRollback{expected_revision:revision});
+                false
+            }
+            (Phase::RollbackConfirming{..},KeyCode::Char('n')|KeyCode::Esc)=>true,
+            (Phase::RollbackConfirming{..},_)=>false,
             (Phase::Viewing { inbounds, revision }, KeyCode::Char('a'))
                 if self.saved_sha256.is_some() =>
             {
@@ -293,11 +326,17 @@ impl RuntimePanel {
             Phase::RestartFreshPortsBindable => "Все НОВЫЕ TCP и UDP порты удалось одновременно пробно открыть.\nОни уже освобождены: НЕТ гарантии будущего bind, НЕТ restart, НЕТ rollback.\nСервер работает БЕЗ ИЗМЕНЕНИЙ.\nr: перепроверить | Esc: закрыть".into(),
             Phase::RestartRejected => "Отказ: кандидат TOML, TLS identity или TCP/UDP bind не прошёл проверку.\nСтарые listeners, авторизация и туннели не изменены этой операцией.\nr: перепроверить | Esc: закрыть".into(),
             Phase::RestartUnavailable => "Нет доступного защищённого IPC/снимка конфигурации для проверки restart.\nНичего не изменено.\nr: повторить | Esc: закрыть".into(),
+            Phase::RollbackChecking=>"Проверка доступности одноразового отката авторизации REALITY. Только чтение.".into(),
+            Phase::RollbackConfirming{revision,remaining_seconds}=>format!(
+                "Откат авторизации, revision={revision}, осталось {remaining_seconds} с.\nПредыдущие grants, disabled и digest снова начнут действовать для новых запросов. Доверие, identity, дескрипторы и активные туннели не откатываются. TOML останется без изменений.\ny: подтвердить | n/Esc: отменить"),
+            Phase::RollbackApplying=>"Откат отправлен; при потере ответа сначала перечитайте runtime revision.".into(),
+            Phase::RollbackApplied{revision}=>format!("Авторизация восстановлена, новая revision={revision}. Слот отката израсходован. TOML не изменён.\nr: статус | Esc: закрыть"),
+            Phase::RollbackUnavailable=>"Одноразовый откат недоступен или истёк. Ничего не изменено.\nr: статус | Esc: закрыть".into(),
             Phase::Checking => "Запрос IPC status...\nТолько чтение; ничего не применяется.\nEsc: закрыть".into(),
             Phase::Viewing { inbounds, revision } => format!(
                 "Сервер работает. Inbounds: {inbounds}. Авторизация: revision={revision}.\n\n{}\nr: обновить статус | Esc: закрыть",
                 if self.saved_sha256.is_some() {
-                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются только token digest/disabled/grants прежних пользователей."
+                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются только token digest/disabled/grants прежних пользователей.\nb: проверить одноразовый откат авторизации REALITY (300 с)."
                 } else {
                     "Применение недоступно без явного --role server --config FILE."
                 }

@@ -27,6 +27,13 @@ pub(crate) struct State {
     // Only advisory metadata crosses IPC; the actual previous TLS private
     // configs live exclusively in the single supervisor, never in replies.
     rollback_until: RwLock<Option<Instant>>,
+    auth_rollback: RwLock<Option<AuthRollback>>,
+}
+
+struct AuthRollback {
+    document: Arc<ServerDocument>,
+    revision: u64,
+    until: Instant,
 }
 
 impl State {
@@ -34,6 +41,7 @@ impl State {
         Self {
             current: RwLock::new(Arc::new(initial)),
             rollback_until: RwLock::new(None),
+            auth_rollback: RwLock::new(None),
         }
     }
 
@@ -82,8 +90,13 @@ impl State {
         if !Arc::ptr_eq(&guard, view) {
             return Err(LiveAuthError::StaleRevision);
         }
+        let mut rollback=self.auth_rollback.write().map_err(|_|LiveAuthError::Unavailable)?;
         let staged = view.live.stage(candidate, expected)?;
         let revision = view.live.publish(staged)?;
+        *rollback=if view.document.server.inbounds.iter().any(|i|i.reality.is_some()){
+            Some(AuthRollback{document:view.document.clone(),revision,
+                until:Instant::now()+std::time::Duration::from_secs(300)})
+        }else{None};
         // The running TLS sockets, quotas and AuthCell remain the same.
         // Rebase the management snapshot so a later TLS-only rotation
         // compares against the MOST RECENT auth state, not startup TOML.
@@ -94,6 +107,49 @@ impl State {
             live: Arc::new(view.live.with_new_baseline(candidate.clone())),
         });
         Ok(revision)
+    }
+
+    pub(crate) fn auth_rollback_status(&self)->Option<(u64,u64)>{
+        let current=self.current.read().ok()?;
+        let mut slot=self.auth_rollback.write().ok()?;
+        let revision=current.live.revision().ok()?;
+        let remaining=slot.as_ref().and_then(|item| {
+            (item.revision==revision).then(||item.until.checked_duration_since(Instant::now())).flatten()
+        });
+        if let Some(remaining)=remaining{
+            Some((revision,remaining.as_secs().saturating_add(1).min(300)))
+        }else{*slot=None;None}
+    }
+
+    /// Clone only the previous authorization document, not TLS or trust
+    /// snapshots. Revalidation runs outside the commit locks.
+    pub(crate) fn auth_rollback_candidate(&self,view:&Arc<View>,expected:u64)->Option<Arc<ServerDocument>>{
+        let current=self.current.read().ok()?;
+        if !Arc::ptr_eq(&current,view) || view.live.revision()!=Ok(expected){return None;}
+        let slot=self.auth_rollback.read().ok()?;
+        let item=slot.as_ref()?;
+        if item.revision!=expected || item.until<=Instant::now(){return None;}
+        Some(item.document.clone())
+    }
+
+    /// One-shot rollback is a NEW auth revision. Never restore a previous
+    /// publication, health, admission key or quota. Saved TOML is untouched.
+    pub(crate) fn rollback_auth(&self,view:&Arc<View>,candidate:&Arc<ServerDocument>,expected:u64)
+        ->Result<u64,LiveAuthError>{
+        let mut current=self.current.write().map_err(|_|LiveAuthError::Unavailable)?;
+        if !Arc::ptr_eq(&current,view) || view.live.revision()!=Ok(expected){return Err(LiveAuthError::StaleRevision);}
+        let mut slot=self.auth_rollback.write().map_err(|_|LiveAuthError::Unavailable)?;
+        let Some(item)=slot.as_ref() else{return Err(LiveAuthError::StaleRevision);};
+        if item.revision!=expected || item.until<=Instant::now() || !Arc::ptr_eq(&item.document,candidate){
+            return Err(LiveAuthError::StaleRevision);
+        }
+        let staged=view.live.stage(candidate,expected)?;
+        let next=view.live.publish(staged)?;
+        *current=Arc::new(View{document:candidate.clone(),inbounds:view.inbounds,
+            preflight:Arc::new(view.preflight.rebased(candidate.as_ref().clone())),
+            live:Arc::new(view.live.with_new_baseline(candidate.as_ref().clone()))});
+        *slot=None;
+        Ok(next)
     }
 
     /// Same-port identity rotation: one short writer CAS for the persisted
@@ -216,6 +272,37 @@ pub(crate) struct RestartRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn reality_auth_rollback_is_single_use_and_monotonic(){
+        let source=include_str!("../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX",&"a".repeat(64));
+        let crate::config::Config::Server(mut doc)=crate::config::parse(&source).unwrap() else{panic!()};
+        let inbound=&mut doc.server.inbounds[0];
+        inbound.security_mode=crate::security_profile::SecurityMode::SmartReality;
+        inbound.tls_cert.clear();inbound.tls_key.clear();
+        let base=std::env::temp_dir();
+        inbound.reality=Some(crate::config::RealityBinding{
+            health_store:base.join("health").to_string_lossy().into_owned(),
+            bundle:base.join("bundle").to_string_lossy().into_owned(),
+            initial_health_sha256:[1;32],identity_sha256:[2;32],manifest_sha256:[3;32],
+        });
+        let live=Arc::new(LiveAuthorization::new(doc.clone()).unwrap());
+        let state=State::new(View{document:Arc::new(doc.clone()),inbounds:1,
+            preflight:Arc::new(ReloadPreflight::new(base.join("server.toml"),doc.clone(),Vec::new())),live});
+        let original=state.snapshot().unwrap();
+        let mut updated=doc.clone();
+        updated.server.users[0].disabled=true;
+        assert_eq!(state.apply_auth(&original,&updated,1),Ok(2));
+        let current=state.snapshot().unwrap();
+        assert_eq!(state.auth_rollback_status().unwrap().0,2);
+        assert!(state.auth_rollback_candidate(&current,1).is_none());
+        let previous=state.auth_rollback_candidate(&current,2).unwrap();
+        assert_eq!(state.rollback_auth(&current,&previous,2),Ok(3));
+        assert!(state.auth_rollback_status().is_none());
+        assert_eq!(state.snapshot().unwrap().document.as_ref(),&doc);
+        assert!(state.rollback_auth(&current,&previous,2).is_err());
+    }
 
     #[test]
     fn rollback_readiness_is_bounded_and_never_exposes_secret_material() {
