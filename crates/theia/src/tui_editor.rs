@@ -217,7 +217,7 @@ impl Editor {
             input: String::new(),
             editing: false,
             error: None,
-            notice: "Загружено. Изменения не применяются к runtime.",
+            notice: "Настройки открыты. Работающий процесс не изменён.",
         })
     }
 

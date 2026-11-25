@@ -402,7 +402,7 @@ fn pages(role: Role) -> &'static [&'static str] {
     }
 }
 
-fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
+fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionItem> {
     let entries: &[(char, &str)] = match (role, page) {
         (Role::Server, 0) => &[('N',"Создать подключение"),('u',"Добавить пользователя"),('b',"Восстановить доступ"),('G',"Выбрать пользователей"),('s',"Запуск / остановка"),('S',"Сохранить файл"),('a',"Применить права доступа"),('v',"Состояние / другие изменения"),('o',"Открыть другой файл")],
         (Role::Server, 1) => &[('N',"Создать подключение"),('G',"Кому разрешён доступ"),('V',"Состояние (только REALITY)"),('E',"Сертификат (только Own-TLS)"),('D',"Удалить подключение")],
@@ -419,7 +419,37 @@ fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
         (Role::Client, 6) => &[('V',"Диагностика подключения")],
         _ => &[],
     };
-    entries.iter().map(|(key,label)| ActionItem { key:*key, label:*label }).collect()
+    let Some(editor) = editor else {
+        return entries.iter().map(|(key,label)| ActionItem { key:*key, label:*label }).collect();
+    };
+    // Presentation-only availability. Direct shortcuts still pass through all
+    // existing validation/confirmation guards. Keep rendering and dispatch
+    // on this same list, including mouse hit testing.
+    let reality = editor.selected_reality();
+    let active = editor.selected_record_is_active();
+    let has_record = editor.record_count() > 0;
+    let users = if role == Role::Server { editor.workspace_users() } else { Vec::new() };
+    let can_recover = users.iter().any(|(_, disabled, granted)| *disabled && *granted);
+    let can_rotate = users.iter().any(|(_, disabled, granted)| !*disabled && *granted);
+    entries.iter().filter_map(|&(key, label)| {
+        let available = match (role, key) {
+            (Role::Server, 'V' | 'K') | (Role::Client, 'K') => has_record && reality,
+            (_, 'E') => has_record && !reality,
+            (Role::Server, 'D') => editor.record_count() > 1,
+            (Role::Client, 'D' | 'A') => has_record && !active,
+            (Role::Server, 'b') => can_recover,
+            (Role::Server, 'x' | 't') => can_rotate,
+            _ => true,
+        };
+        let label = match (role, key) {
+            (Role::Server, 'V') => "Состояние REALITY",
+            (Role::Server, 'E') => "Свой TLS-сертификат",
+            (Role::Client, 'E') => "Доверенный сертификат и ключ",
+            (Role::Client, 'V') if !active && page == 1 => "Состояние профиля",
+            _ => label,
+        };
+        available.then_some(ActionItem { key, label })
+    }).collect()
 }
 
 /// A recommendation is navigation only. It never writes, applies, or starts a process.
@@ -746,7 +776,7 @@ impl Interaction {
     fn recommended_action(&self, role: Role) -> usize {
         let Some(editor) = self.editor_for(role) else { return 0; };
         let (key, _) = recommended_step(editor, self.owned_running(role));
-        page_actions(role, 0).iter().position(|item| item.key == key).unwrap_or(0)
+        page_actions(role, 0, Some(editor)).iter().position(|item| item.key == key).unwrap_or(0)
     }
 
     fn visible_workspace_action(&self, role: Role) -> usize {
@@ -1084,8 +1114,8 @@ impl Interaction {
                 }
                 return;
             }
-            let items=page_actions(role,self.workspace_page);
-            let controls=page_layout(body,role,self.workspace_page).map(|p|p[1]).unwrap_or(if self.workspace_focus==WorkspaceFocus::Actions {body} else {Rect::default()});
+            let items=page_actions(role,self.workspace_page,self.editor_for(role));
+            let controls=page_layout(body,role,self.workspace_page,self.editor_for(role)).map(|p|p[1]).unwrap_or(if self.workspace_focus==WorkspaceFocus::Actions {body} else {Rect::default()});
             if let Some(i)=(Actions {items:&items,selected:self.visible_workspace_action(role)}).hit(controls,event.column,event.row) {
                 self.workspace_action=i; self.workspace_focus=WorkspaceFocus::Actions; return;
             }
@@ -1093,7 +1123,7 @@ impl Interaction {
                 return;
             }
             if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
-                let content=page_layout(body,role,self.workspace_page).map(|p|p[0]).unwrap_or(body);
+                let content=page_layout(body,role,self.workspace_page,Some(editor)).map(|p|p[0]).unwrap_or(body);
                 if self.workspace_page==1 {
                     if let Some(id)=editor_field_hit(content,editor,event.column,event.row) {editor.workspace_select_field(id);self.workspace_focus=WorkspaceFocus::Fields;}
                 } else if role==Role::Server && matches!(self.workspace_page, 2 | 3) && inside(content) && event.row>=content.y+2 && event.row<content.bottom().saturating_sub(1) {
@@ -1130,8 +1160,8 @@ impl Interaction {
         }
         let visible_action = self.visible_workspace_action(role);
         if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
-            if let Some([content, controls]) = page_layout(columns[2], role, self.workspace_page).or_else(||(self.workspace_focus==WorkspaceFocus::Actions).then_some([Rect::default(),columns[2]])) {
-                let items = page_actions(role, self.workspace_page);
+            if let Some([content, controls]) = page_layout(columns[2], role, self.workspace_page, Some(editor)).or_else(||(self.workspace_focus==WorkspaceFocus::Actions).then_some([Rect::default(),columns[2]])) {
+                let items = page_actions(role, self.workspace_page, Some(editor));
                 if let Some(i) = (Actions { items: &items, selected: visible_action }).hit(controls, event.column, event.row) {
                     self.workspace_action = i;
                     self.workspace_focus = WorkspaceFocus::Actions;
@@ -1595,7 +1625,7 @@ impl Interaction {
                         }
                     }
                     if self.workspace_focus == WorkspaceFocus::Actions {
-                        let items = page_actions(role, self.workspace_page);
+                        let items = page_actions(role, self.workspace_page, self.editor_for(role));
                         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                             self.workspace_focus = if key.code == KeyCode::Tab { WorkspaceFocus::Navigation } else if role == Role::Server && matches!(self.workspace_page, 2 | 3) { WorkspaceFocus::Users } else { WorkspaceFocus::Fields };
                             return false;
@@ -1652,7 +1682,7 @@ impl Interaction {
                     if self.workspace_page != 1
                         && !(role == Role::Server && matches!(self.workspace_page, 2 | 3))
                         && self.workspace_focus == WorkspaceFocus::Fields
-                        && !page_actions(role, self.workspace_page).is_empty()
+                        && !page_actions(role, self.workspace_page, self.editor_for(role)).is_empty()
                         && key.modifiers.is_empty()
                         && matches!(key.code, KeyCode::Enter | KeyCode::Up | KeyCode::Down)
                     {
@@ -3432,6 +3462,9 @@ fn draw_issuance(
     viewport: Option<&Viewport>,
     action_focus: usize,
 ) {
+    // The workspace is painted before modal flows. Clear all of it, not
+    // just the compact report, so no stale rows survive below the actions.
+    tui_widgets::canvas(frame, area);
     let rotating = kind == IssueKind::Rotation;
     let recovering = kind == IssueKind::Reenable;
     if let IssueFlow::Input(id) = flow {
@@ -3482,7 +3515,7 @@ fn draw_issuance(
             if recovering {
                 "Подтверждение восстановления доступа"
             } else if rotating {
-                "Подтверждение глобальной ротации токена"
+                "Подтверждение замены личного ключа"
             } else {
                 "Подтверждение нового пользователя"
             },
@@ -3525,12 +3558,12 @@ fn draw_issuance(
         IssueFlow::Offer => (
             "Одноразовая выдача конфиденциальной ссылки",
             if recovering {
-                "Восстановление и новый digest сохранены. Runtime не обновлён; отдельный Apply обязателен. Старый токен не восстанавливается.\n\ny: показать один раз  f: экспорт в защищённый файл  n/Esc: отказаться и стереть токен".into()
+                "Восстановление доступа сохранено в файле. Старый ключ восстановить нельзя.\nРаботающий сервер ещё не изменён. После передачи приглашения отдельно примените права доступа (Ctrl+R).\n\nКОНФИДЕНЦИАЛЬНО: передайте новую ссылку только её владельцу. После закрытия повторного показа не будет.\n\ny: показать ссылку один раз".into()
             } else if rotating {
-                "Новый digest сохранён в server.toml, runtime НЕ обновлён. Старый bearer ещё принимается runtime до отдельного auth-only CAS Apply. Ссылка содержит НОВЫЙ bearer, повторное восстановление невозможно.\n\ny: показать один раз  f: экспорт в защищённый файл  n/Esc: отказаться и стереть токен"
+                "Данные нового ключа сохранены. Работающий сервер ещё не изменён.\nСтарый ключ может использоваться для новых сеансов до отдельного применения прав (Ctrl+R).\n\nКОНФИДЕНЦИАЛЬНО: новая ссылка предназначена только её владельцу. После закрытия повторного показа не будет.\n\ny: показать ссылку один раз"
                     .into()
             } else {
-                "server.toml сохранён. Runtime ещё не обновлён.\nСсылка содержит действующий bearer-токен. Не публиковать.\nПовторного показа после закрытия не будет.\n\ny: показать ссылку один раз\nf: экспорт в защищённый файл\nn/Esc: отказаться и уничтожить токен в памяти"
+                "Новый пользователь сохранён в файле. Работающий сервер ещё не изменён.\nПосле передачи приглашения отдельно примените права доступа (Ctrl+R).\n\nКОНФИДЕНЦИАЛЬНО: ссылка содержит личный ключ. Не публикуйте её. После закрытия повторного показа не будет.\n\ny: показать ссылку один раз"
                     .into()
             },
         ),
@@ -3568,7 +3601,7 @@ fn draw_issuance(
         IssueFlow::Public(link) => (
             "Публичное приглашение без токена",
             format!(
-                "Только данные профиля. Не содержит bearer, CA или grant. Получателю нужны независимое доверие (CA или REALITY fingerprint/admission) и отдельный credential.\nQ: защищённый QR | c: буфер обмена | Enter/Esc: закрыть.\n\n{link}"
+                "Только данные профиля. Не содержит bearer, CA или grant. Получателю нужны независимое доверие (CA или REALITY fingerprint/admission) и отдельный credential.\nQ: защищённый QR | c: буфер обмена | Esc: закрыть.\n\n{link}"
             ),
         ),
         IssueFlow::Showing(link) => (
@@ -3585,8 +3618,16 @@ fn draw_issuance(
         } else {
             body
         }
-    } else if matches!(flow, IssueFlow::Offer | IssueFlow::Public(_)) {
-        format!("{body}\nQ: защищённый QR | c: буфер обмена (отдельное подтверждение)")
+    } else if matches!(flow, IssueFlow::Offer) {
+        // The reveal shortcut remains explicit, never an Enter action.
+        // Keep all keyboard alternatives available when the list cannot fit.
+        if action_layout(area, invitation_actions(flow).len()).is_none() {
+            format!("{body}\nf: сохранить в файл | Q: QR | c: копировать | n/Esc: закрыть")
+        } else {
+            format!("{body}\nEsc: закрыть без выдачи. Файл останется сохранённым.")
+        }
+    } else if matches!(flow, IssueFlow::Public(_)) {
+        body
     } else {
         body
     };
@@ -3653,8 +3694,8 @@ fn draw_revocation(
             ),
         ),
         DisableFlow::Done => (
-            "Пользователь отключён в TOML",
-            "Файл сохранён. Для отказа в новых подключениях требуется отдельно проверить revision и подтвердить auth-only Apply. Уже открытые туннели не разрываются.\n\nEnter/Esc: закрыть.".into(),
+            "Отключение сохранено",
+            "Настройки сохранены. Работающий сервер ещё не изменён.\n\nСледующий шаг: закройте это окно и выберите «Применить права доступа» (Ctrl+R). После подтверждения новые подключения пользователя будут запрещены. Уже открытые туннели продолжатся.\n\nEnter/Esc: закрыть.".into(),
         ),
     };
     let body = if let DisableFlow::Input(id) = flow {
@@ -3753,7 +3794,7 @@ fn draw_import(
             "Старый файл сохранён. Проверьте доступ отдельно; соединение и системный прокси не менялись. Enter/Esc: закрыть.".into(),
         ),
         ImportFlow::Saving => ("F-14: безопасное сохранение", "Создание нового приватного bearer и guarded TOML commit. Секрет не отображается.\nНикакого подключения или системного прокси.".into()),
-        ImportFlow::Done => ("Импорт сохранён", "Новый профиль добавлен, исходный active_profile не изменён.\nTLS trust должен быть независимо проверен при подключении.\nНикаких сетевых соединений или OS proxy изменений.\n\nEnter/Esc: закрыть".into()),
+        ImportFlow::Done => ("Приглашение импортировано", "Новый профиль сохранён. Ранее выбранный активный профиль не изменён.\nСетевые соединения не открывались; системный прокси не изменён.\n\nСледующий шаг: откройте «Профили», выберите новый профиль и сделайте его активным (A). Затем сохраните настройки и откройте «Подключить / отключить» (V). Доверие к сертификату нужно проверить независимо.\n\nEnter/Esc: закрыть".into()),
         ImportFlow::Failed => (
             "Импорт НЕ подтверждён",
             format!(
@@ -3787,8 +3828,8 @@ fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool)
     frame.render_widget(Paragraph::new(lines).style(Style::default().bg(bg)).wrap(Wrap { trim: true }), area);
 }
 
-fn page_layout(area: Rect, role: Role, page: usize) -> Option<[Rect; 2]> {
-    let count = page_actions(role, page).len();
+fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> Option<[Rect; 2]> {
+    let count = page_actions(role, page, editor).len();
     if count == 0 || area.height < 10 || (page == 1 && area.height < 25) { return None; }
     let action_height = (count as u16).saturating_add(2);
     // Actions stay near the information they operate on.
@@ -3803,7 +3844,7 @@ fn page_layout(area: Rect, role: Role, page: usize) -> Option<[Rect; 2]> {
     if area.height < 14 { return None; }
     let minimum = if page == 1 { 10 } else { 6 };
     let height = action_height.min(area.height.saturating_sub(minimum)).max(3);
-    let preferred = if page == 1 { 24 } else if role == Role::Server && matches!(page, 2 | 3) { 12 } else { 10 };
+    let preferred = if page == 1 { 20 } else if role == Role::Server && matches!(page, 2 | 3) { 12 } else { 10 };
     let content_height = preferred.min(area.height.saturating_sub(height));
     let content = Rect::new(area.x, area.y, area.width, content_height);
     let controls = Rect::new(area.x, content.bottom(), area.width, height);
@@ -3815,7 +3856,7 @@ fn user_table_start(selected: usize, count: usize, area: Rect) -> usize {
 }
 fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui: Option<&Interaction>, compact: bool) {
     let page = ui.map_or(0, |u| u.workspace_page.min(6));
-    let items = page_actions(role, page);
+    let items = page_actions(role, page, Some(editor));
     let focus = ui.map_or(WorkspaceFocus::Fields, |u| u.workspace_focus);
     let selected = ui.map_or(0, |u| u.visible_workspace_action(role));
     if compact && focus==WorkspaceFocus::Navigation {
@@ -3823,7 +3864,7 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         frame.render_widget(List::new(rows.collect::<Vec<_>>()).block(tui_widgets::section("Разделы · ↑↓ Enter",true)),area);
         return;
     }
-    let [content, controls] = page_layout(area, role, page).unwrap_or([area, Rect::default()]);
+    let [content, controls] = page_layout(area, role, page, Some(editor)).unwrap_or([area, Rect::default()]);
     if page == 0 {
         let local=if role==Role::Server {ui.map_or("Неизвестно",|u|u.server_process.status())}
             else if ui.is_some_and(|u|u.client_background.as_ref().is_some_and(StatusPanel::local_running)||u.reality_status.as_ref().is_some_and(StatusPanel::local_running)) {"Локальный процесс запущен или запускается"} else {"Локальный процесс не запущен"};
@@ -4568,11 +4609,57 @@ mod tests {
         let [_, _, workspace] = workspace_columns(shell_layout(area)[1]).unwrap();
         for role in [Role::Server, Role::Client] {
             for page in [0, 2, 4, 5, 6] {
-                let [content, controls] = page_layout(workspace, role, page).unwrap();
+                let [content, controls] = page_layout(workspace, role, page, None).unwrap();
                 assert!(controls.y <= content.y + 12);
                 assert!(controls.bottom() <= workspace.bottom());
             }
         }
+    }
+
+    #[test]
+    fn invitation_offer_clears_workspace_and_keeps_reveal_explicit() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("review-offer").unwrap());
+        let original = server_issuance_fixture();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let model = Model::new(Some(Role::Server));
+        ui.workspace_page = 1;
+        let before = rendered_interaction(120, 40, &model, &ui);
+        assert!(before.contains("Что это значит"));
+        for kind in [IssueKind::NewUser, IssueKind::Rotation, IssueKind::Reenable] {
+            ui.issue_kind = kind;
+            ui.issuance = Some(IssueFlow::Offer);
+            let screen = rendered_interaction(120, 40, &model, &ui);
+            assert!(screen.contains("показать ссылку один раз"));
+            assert!(screen.contains("Сохранить приглашение в файл"));
+            assert!(!screen.contains("Что это значит"));
+            assert!(!screen.contains("edge.example.org"));
+            assert!(!screen.contains("доступ пользователю."));
+            assert!(!screen.contains("theia://"));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_actions_follow_record_mode_and_eligibility() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("review-actions").unwrap());
+        std::fs::write(&path, server_issuance_fixture()).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let keys = |page| page_actions(Role::Server, page, Some(&editor)).iter().map(|a| a.key).collect::<Vec<_>>();
+        assert!(keys(1).contains(&'E'));
+        assert!(!keys(1).contains(&'V'));
+        assert!(!keys(1).contains(&'D'));
+        assert!(!keys(2).contains(&'b'));
+        assert!(keys(2).contains(&'t'));
+        std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
+        let editor = Editor::load(Role::Client, &path).unwrap();
+        let items = page_actions(Role::Client, 1, Some(&editor));
+        assert!(!items.iter().any(|a| matches!(a.key, 'A' | 'D')));
+        assert!(items.iter().any(|a| a.key == 'V'));
+        let mut selected = 0;
+        assert_eq!(tui_widgets::action_key(&items, &mut selected, KeyCode::Enter), Some(KeyCode::Char('V')));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -4737,7 +4824,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let details = workspace_columns(body).unwrap()[2];
-        let details=page_layout(details,Role::Client,1).map(|p|p[0]).unwrap_or(details);
+        let details=page_layout(details,Role::Client,1,ui.editor.as_ref()).map(|p|p[0]).unwrap_or(details);
         let table = editor_layout(details).unwrap()[1];
         let y = (table.y..table.bottom()).find(|&y| editor_field_hit(details, ui.editor.as_ref().unwrap(), table.x + 2, y) == Some(1)).unwrap();
         ui.mouse(&mut model, click(table.x + 2, y), area);
@@ -6099,7 +6186,7 @@ mod tests {
             assert!(failed.contains("ссылка заблокирована"));
             let offer = render(|f, a| draw_issuance(f, a, &IssueFlow::Offer, None, kind, None, 0));
             assert!(offer.contains("Одноразовая"));
-            assert!(offer.contains("Runtime") || offer.contains("runtime"));
+            assert!(offer.contains("сервер ещё не изменён"));
             assert!(!offer.contains(hidden));
         }
         for (flow, label) in [
@@ -6140,7 +6227,7 @@ mod tests {
             ),
             (DisableFlow::Saving, "Runtime не изменяется"),
             (DisableFlow::SaveFailed, "Изменения НЕ сохранены"),
-            (DisableFlow::Done, "подтвердить auth-only Apply"),
+            (DisableFlow::Done, "Применить права доступа"),
         ] {
             let screen = render(|f, a| draw_revocation(f, a, &flow, None, None));
             assert!(screen.contains(label), "{screen}");
@@ -6163,7 +6250,7 @@ mod tests {
                 "соединение и системный прокси не менялись",
             ),
             (ImportFlow::Saving, "Секрет не отображается"),
-            (ImportFlow::Done, "исходный active_profile не изменён"),
+            (ImportFlow::Done, "активный профиль не изменён"),
             (ImportFlow::Failed, "Импорт НЕ подтверждён"),
         ] {
             let screen = render(|f, a| draw_import(f, a, &flow, None, None));

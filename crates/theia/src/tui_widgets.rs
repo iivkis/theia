@@ -333,6 +333,7 @@ impl Actions<'_> {
 
     pub(crate) fn render_with_focus(&self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
         use ratatui::widgets::{List, ListItem};
+        canvas(frame, area);
         let selected = self.selected.min(self.items.len().saturating_sub(1));
         let rows = usize::from(area.height.saturating_sub(2));
         let items = self.items.iter().enumerate().skip(self.start(area)).take(rows).map(|(i, item)| {
