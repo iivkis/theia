@@ -9,7 +9,7 @@ use crate::{
     tui_candidates::CandidateReview,
     tui_discovery::DiscoveryPanel,
     tui_domain::DomainPanel,
-    tui_editor::{Editor, PinnedModeReview, RecordAction, RecordReview},
+    tui_editor::{Editor, RecordAction, RecordReview},
     tui_probe::ProbePanel,
     tui_reality_enroll::EnrollmentPanel,
     tui_reality_provision::ProvisionPanel,
@@ -255,7 +255,6 @@ enum DisableFlow {
 /// UI dispatch is separate from all configuration/OS effects. A queued
 /// transition never runs until the user saves, discards or cancels explicitly.
 type ExportResult = (Editor, Result<PathBuf, &'static str>);
-type PinnedReviewResult = (Editor, Result<PinnedModeReview, &'static str>);
 
 enum RecordFlow {
     Input {
@@ -315,8 +314,6 @@ struct Interaction {
     reality_registration: Option<RegistrationPanel>,
     reality_status: Option<StatusPanel>,
     runtime: Option<RuntimePanel>,
-    pinned_review: Option<PinnedModeReview>,
-    pinned_loading: Option<mpsc::Receiver<PinnedReviewResult>>,
     #[cfg(windows)]
     system_proxy: Option<crate::tui_system_proxy::Panel>,
     pending: Option<KeyEvent>,
@@ -343,8 +340,6 @@ impl Interaction {
             reality_registration: None,
             reality_status: None,
             runtime: None,
-            pinned_review: None,
-            pinned_loading: None,
             #[cfg(windows)]
             system_proxy: None,
             pending: None,
@@ -363,34 +358,6 @@ impl Interaction {
         let _save_worker = std::thread::spawn(move || {
             let saved = editor.save();
             let _ = tx.send((editor, saved));
-        });
-    }
-
-    fn start_pinned_review(&mut self, stream_up: bool) {
-        let Some(mut editor) = self.editor.take() else {
-            return;
-        };
-        let (tx, rx) = mpsc::channel();
-        self.pinned_loading = Some(rx);
-        let _worker = std::thread::spawn(move || {
-            let result = editor.review_pinned_mode(stream_up);
-            editor.error = result.as_ref().err().map(|message| (*message).to_owned());
-            let _ = tx.send((editor, result));
-        });
-    }
-
-    fn start_pinned_save(&mut self, review: PinnedModeReview) {
-        let Some(mut editor) = self.editor.take() else {
-            return;
-        };
-        let (tx, rx) = mpsc::channel();
-        self.saving = Some(rx);
-        let _worker = std::thread::spawn(move || {
-            let result = editor.apply_pinned_mode(&review);
-            if let Err(message) = result {
-                editor.error = Some(message.into());
-            }
-            let _ = tx.send((editor, result.is_ok()));
         });
     }
 
@@ -475,18 +442,6 @@ impl Interaction {
     }
 
     fn poll_save(&mut self, model: &mut Model) -> Result<bool, TuiError> {
-        if let Some(receiver) = self.pinned_loading.as_ref() {
-            match receiver.try_recv() {
-                Ok((editor, result)) => {
-                    self.pinned_loading = None;
-                    self.editor = Some(editor);
-                    self.pinned_review = result.ok();
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => return Err(TuiError::Io),
-            }
-            return Ok(false);
-        }
         if let Some(receiver) = self.exporting.as_ref() {
             match receiver.try_recv() {
                 Ok((mut editor, result)) => {
@@ -560,7 +515,6 @@ impl Interaction {
         if key.kind != KeyEventKind::Press
             || self.saving.is_some()
             || self.exporting.is_some()
-            || self.pinned_loading.is_some()
         {
             return false;
         }
@@ -592,14 +546,6 @@ impl Interaction {
         if let Some(panel) = self.reality_provision.as_mut() {
             if panel.key(key) {
                 self.reality_provision = None;
-            }
-            return false;
-        }
-        if let Some(review) = self.pinned_review.take() {
-            match key.code {
-                KeyCode::Char('y') => self.start_pinned_save(review),
-                KeyCode::Esc | KeyCode::Char('n') => {}
-                _ => self.pinned_review = Some(review),
             }
             return false;
         }
@@ -1385,10 +1331,6 @@ impl Interaction {
                 }
                 return false;
             }
-            if editor.role() == Role::Server && matches!(key.code, KeyCode::Char('P' | 'X')) {
-                self.start_pinned_review(key.code == KeyCode::Char('X'));
-                return false;
-            }
             if editor.role() == Role::Server && key.code == KeyCode::Char('W') {
                 if editor.dirty() {
                     editor.error =
@@ -1629,7 +1571,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели P: локальный pinned-cert-v1 (stream-one), X: собственный XHTTP stream-up с pin; y подтверждает сохранение (не полноценный REALITY), u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
+            "1 / 2: сервер / клиент\nTab / Shift+Tab: сменить выбор\nEnter: открыть выбранную панель\nEsc: назад\n? / F1: справка\nq / Ctrl+C: выйти\n\nС явными --role и --config: j/k выбирают inbound/профиль, Tab поле, Enter/e правит поле. l: публичная ссылка без токена. В клиентской панели i: безопасный импорт URI/локального файла с отдельной проверкой CA и сохранением bearer; p: Windows system proxy (отдельные действия и подтверждения). В серверной панели u создаёт пользователя, t: подтверждённая ротация bearer существующего активного пользователя, x: глобальное отключение существующего пользователя (только TOML), b: восстановление с новым токеном. В сетевом обзоре p: пассивный IP обзор, i: согласие ipify; r: группы кандидатов и ручной CIDR (только офлайн), b: IP-список до 8 (Space), d: домен из каталога (отдельные DNS и H2/H3 согласия), t: один IP H2+H3. Ручное v проверяет состояние; Ctrl+R на сохранённой серверной конфигурации открывает отдельное подтверждение CAS Apply (y), а не молча перезапускает. Открытие панелей не выполняет сетевых запросов и не меняет системный прокси.",
             true,
         ),
     }
@@ -1667,16 +1609,6 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     } else if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
         panel(frame, parts[1], runtime.title(), &runtime.body(), true);
-    } else if let Some(review) = interaction.and_then(|ui| ui.pinned_review.as_ref()) {
-        panel(
-            frame,
-            parts[1],
-            "H2/H3: дополнительная identity pin (не REALITY)",
-            &review.body(),
-            true,
-        );
-    } else if interaction.is_some_and(|ui| ui.pinned_loading.is_some()) {
-        panel(frame, parts[1], "Локальная проверка TLS identity", "Проверяются сохранённый TOML и собственная пара сертификат/ключ. Сеть не используется.", true);
     } else if interaction.is_some_and(|ui| ui.saving.is_some()) {
         panel(
             frame,
@@ -1966,7 +1898,7 @@ fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Opt
         ImportFlow::Preview { invitation, ca, public_ref } => (
             "F-14: безопасный предпросмотр подключения",
             format!(
-                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nTLS profile: {}\nTransport: {:?}\nXHTTP: {:?}\nBearer: {}\nCA trust: {}\nPin из приглашения сверяйте по доверенному каналу; это не CA.\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
+                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nTLS profile: {}\nTransport: {:?}\nXHTTP: {:?}\nBearer: {}\nCA trust: {}\nДоверенный CA проверяется отдельно от приглашения.\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
                 invitation.id, invitation.endpoint, invitation.server_name,
                 invitation.tls_profile(), invitation.transport, invitation.xhttp_mode(),
                 if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },

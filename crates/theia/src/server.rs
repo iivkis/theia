@@ -1662,25 +1662,6 @@ struct TlsMaterial {
     identity: crate::reload_preflight::IdentityHash,
 }
 
-pub(crate) fn configured_certificate_pin(
-    inbound: &Inbound,
-) -> Result<crate::security_profile::CertificatePin, ServerError> {
-    let material = tls_material(inbound)?;
-    let pin = crate::security_profile::CertificatePin::from_der(
-        material.certs.first().ok_or(ServerError::Config)?.as_ref(),
-    );
-    // Validate the actual cert/key pair with the existing TLS backend.
-    let _ = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| ServerError::Tls)?
-    .with_no_client_auth()
-    .with_single_cert(material.certs, material.key)
-    .map_err(|_| ServerError::Tls)?;
-    Ok(pin)
-}
-
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
     if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality
         || inbound.reality.is_some()

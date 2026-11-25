@@ -73,6 +73,9 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
 }
 
 async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> Result<ProxyClient, ClientError> {
+    if profile.tls_profile != "default" && profile.tls_profile != "smart-reality" {
+        return Err(ClientError::Configuration);
+    }
     if profile.tls_profile == "smart-reality" || profile.reality_profile.is_some() {
         return RealityClient::prepare_with_budget(profile, budget)
             .await
@@ -98,41 +101,6 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
     if roots.is_empty() {
         return Err(ClientError::Configuration);
     }
-    // F-13: runtime selection must match strict typed TOML validation even
-    // if a direct library caller bypasses document parsing. Never downgrade
-    // a named browser-style profile to rustls or apply it to QUIC/H3/auto.
-    if profile.xhttp_mode.is_some() && profile.tls_profile != "default" {
-        return Err(ClientError::Configuration);
-    }
-    if profile.tls_profile == "browser-h2-btls-v1" {
-        if profile.transport != Transport::H2 {
-            return Err(ClientError::Configuration);
-        }
-        #[cfg(feature = "experimental-btls-h2")]
-        {
-            return H2Client::new_browser_h2_v1(
-                &resolve_server(profile).await?.to_string(),
-                &profile.server_name,
-                &token,
-                &cert,
-            )
-            .and_then(|client| client.with_path_prefix(prefix))
-            .and_then(|client| Carrier::from_options(Some(Arc::new(client)), None, Duration::ZERO, budget))
-            .map(ProxyClient::Direct);
-        }
-        #[cfg(not(feature = "experimental-btls-h2"))]
-        {
-            return Err(ClientError::Configuration);
-        }
-    }
-    let certificate_pin = if profile.tls_profile == "default" {
-        None
-    } else {
-        Some(
-            crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile)
-                .ok_or(ClientError::Configuration)?,
-        )
-    };
     let mode = profile.effective_xhttp_mode();
     let stream_up = mode == XhttpMode::StreamUp;
     let auto_xhttp = mode == XhttpMode::Auto;
@@ -141,7 +109,6 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
         Transport::H2 => {
             let endpoint = resolve_server(profile).await?.to_string();
             let client = H2Client::new(&endpoint, &profile.server_name, &token, roots)?
-                .with_certificate_pin(certificate_pin)?
                 .with_path_prefix(prefix)?
                 .with_stream_up(stream_up)?;
             let client = if auto_xhttp {
@@ -155,7 +122,6 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
             // Resolve the configured server only, never the requested target.
             let remote = resolve_server(profile).await?;
             let h3 = H3Client::new(remote, &profile.server_name, &token, roots.clone())?
-                .with_certificate_pin(certificate_pin)?
                 .with_path_prefix(prefix)?
                 .with_stream_up(stream_up)?
                 .with_connect_timeout(Duration::from_millis(u64::from(
@@ -174,7 +140,6 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
             // the hostname again during fallback; retain the configured SNI,
             // trust anchors, certificate pin and authorization unchanged.
             let h2 = H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
-                .with_certificate_pin(certificate_pin)?
                 .with_path_prefix(prefix)?
                 .with_stream_up(stream_up)?;
             let h2 = h2.with_connection_pool();
@@ -2500,19 +2465,12 @@ mod selector_tests {
         invalid.xhttp_mode = None;
         invalid.transport = Transport::H3;
         assert!(load_client(&invalid).await.is_err());
-        #[cfg(feature = "experimental-btls-h2")]
-        {
-            invalid.transport = Transport::H2;
-            assert!(matches!(
-                load_client(&invalid).await,
-                Ok(ProxyClient::Direct(Carrier::H2(_)))
-            ));
-        }
+        invalid.transport = Transport::H2;
+        assert!(load_client(&invalid).await.is_err());
         let mut pinned = profile.clone();
         pinned.xhttp_mode = None;
-        pinned.tls_profile =
-            crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
-        assert!(matches!(load_client(&pinned).await, Ok(ProxyClient::Direct(Carrier::H2(_)))));
+        pinned.tls_profile = crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
+        assert!(load_client(&pinned).await.is_err());
         let mut automatic_mode = profile.clone();
         automatic_mode.xhttp_mode = Some(XhttpMode::Auto);
         assert!(matches!(

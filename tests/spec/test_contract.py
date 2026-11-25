@@ -301,6 +301,18 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn('get("result") != "success"', gate)
         self.assertIn("raise SystemExit", gate)
 
+    def test_retired_profiles_are_excluded_from_product_configuration(self):
+        source = read("crates/theia/src/config.rs")
+        self.assertIn("retired_security_modes_are_rejected_even_with_experimental_backend", source)
+        self.assertNotIn("CertificatePin::parse_profile(&profile.tls_profile)", source)
+        editor = read("crates/theia/src/tui_editor.rs")
+        self.assertNotIn("review_pinned_mode", editor)
+        self.assertNotIn("apply_pinned_mode", editor)
+        invite = read("crates/theia/src/invite.rs")
+        self.assertNotIn("PinnedTls,", invite)
+        self.assertIn("retired_product_security_profiles_are_rejected_before_network",
+                      read("crates/theia/tests/client_h2.rs"))
+
     def test_m22_local_proxy_gate_and_cli_wiring(self):
         implementation = read("crates/theia/src/local_proxy.rs")
         client = read("crates/theia/src/client.rs")
@@ -321,27 +333,6 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("production_h3_client_refuses_incompatible_alpn_before_application_data",
                       read("crates/theia/tests/h3_server.rs"))
         self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
-
-    def test_pinned_identity_is_additional_and_mode_is_explicit(self):
-        security = read("crates/theia/src/security_profile.rs")
-        self.assertIn("pinned-cert-v1:", security)
-        self.assertIn("ConstantTimeEq", security)
-        for path in ("client.rs", "h3_client.rs"):
-            source = read("crates/theia/src/" + path)
-            self.assertIn("pin.verify(", source)
-            self.assertIn("with_path_prefix", source)
-            self.assertIn("with_certificate_pin", source)
-        server = read("crates/theia/src/server.rs")
-        self.assertIn("self.own_routes.as_ref()", server)
-        self.assertIn("before.security_mode != after.security_mode",
-                      read("crates/theia/src/reload_preflight.rs"))
-        editor = read("crates/theia/src/tui_editor.rs")
-        self.assertIn("review_pinned_mode", editor)
-        self.assertIn("apply_pinned_mode", editor)
-        self.assertIn("h2_h3_pinned_identity_and_mode_are_fail_closed",
-                      read("crates/theia/tests/security_profile.rs"))
-        self.assertIn("pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_silence",
-                      read("crates/theia/tests/client_h2.rs"))
 
     def test_smarttheia_native_xhttp_contract(self):
         split = read("crates/theia/src/split_http.rs")
