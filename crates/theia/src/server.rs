@@ -2494,6 +2494,10 @@ async fn run_supervised_file(
     let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
     let mut rollback: Option<RollbackSlot> = None;
     let mut structural_rollback:Option<StructuralRollbackSlot>=None;
+    // Independent replacement is irreversible within this supervisor,
+    // even after removal/re-addition or a subsequent fresh-port cutover.
+    let mut replaced_roots=std::collections::HashSet::<[u8;32]>::new();
+    const MAX_REPLACED_ROOTS:usize=4096;
     loop {
         tokio::select! {
             request = queue.recv() => {
@@ -2538,6 +2542,20 @@ async fn run_supervised_file(
                     request.candidate=previous.as_ref().clone();
                     request.material=Some(material);
                 }
+                if request.candidate.server.inbounds.iter().any(|i|i.reality.as_ref().is_some_and(|b|replaced_roots.contains(&b.identity_sha256))){
+                    let _=request.complete.send(Err(()));continue;
+                }
+                let replacing:Vec<_>=request.previous.document.server.inbounds.iter().filter_map(|old|{
+                    let root=old.reality.as_ref()?;
+                    request.candidate.server.inbounds.iter().any(|new|
+                        new.id==old.id && new.server_name==old.server_name &&
+                        new.h2_listen.parse::<SocketAddr>().ok().map(|v|v.port())==old.h2_listen.parse::<SocketAddr>().ok().map(|v|v.port()) &&
+                        new.reality.as_ref().map(|v|v.identity_sha256)!=Some(root.identity_sha256))
+                        .then_some(root.identity_sha256)
+                }).collect();
+                if replaced_roots.len().saturating_add(replacing.len())>MAX_REPLACED_ROOTS{
+                    let _=request.complete.send(Err(()));continue;
+                }
                 if request.kind == crate::runtime_generation::ChangeKind::Rollback {
                     let applied = rollback.as_ref().ok_or(()).and_then(|slot| {
                         commit_tls_rollback(
@@ -2573,6 +2591,7 @@ async fn run_supervised_file(
                     match result{
                         Ok((next,revision))=>{
                             identities=next;
+                            replaced_roots.extend(replacing.iter().copied());
                             // Independent enrollment is not reversible TLS
                             // rotation; never resurrect the replaced root.
                             rollback=None;structural_rollback=None;
@@ -2669,13 +2688,8 @@ async fn run_supervised_file(
                 // An independent root replacement on the same logical endpoint
                 // is not a reversible listener operation. Never offer its old root
                 // as a structural rollback target.
-                let replaced_root=request.previous.document.server.inbounds.iter().any(|old|
-                    old.reality.as_ref().is_some_and(|root|
-                        request.candidate.server.inbounds.iter().any(|new|
-                            new.id==old.id && new.server_name==old.server_name &&
-                            new.h2_listen.parse::<std::net::SocketAddr>().ok().map(|v|v.port())==
-                                old.h2_listen.parse::<std::net::SocketAddr>().ok().map(|v|v.port()) &&
-                            new.reality.as_ref().map(|v|v.identity_sha256)!=Some(root.identity_sha256))));
+                let replaced_root=!replacing.is_empty();
+                replaced_roots.extend(replacing);
                 if structural || replaced_root{
                     structural_rollback=None;
                     runtime.set_restart_rollback(None);
@@ -3617,5 +3631,65 @@ mod hardening_tests {
         tokio::time::timeout(Duration::from_secs(5), reap_previous(successor))
             .await
             .unwrap();
+
+        // Real registered bundle plus ordinary TLS. PEM rotation and its
+        // rollback must not replace the REALITY route table or UDP endpoint.
+        let mut mixed=initial.clone();
+        let reservations=addresses(&mut mixed);
+        drop(reservations);
+        let (tcp,udp)=loop{
+            let tcp=StdTcp::bind("127.0.0.1:0").unwrap();
+            if let Ok(udp)=StdUdp::bind(tcp.local_addr().unwrap()){break(tcp,udp);}
+        };
+        let addr=tcp.local_addr().unwrap();
+        let edge=&mut mixed.server.inbounds[1];
+        edge.h2_listen=addr.to_string();edge.quic_listen=addr.to_string();
+        edge.security_mode=crate::security_profile::SecurityMode::SmartReality;
+        edge.tls_cert.clear();edge.tls_key.clear();
+        let now=crate::reference_health::unix_now().unwrap();
+        let health=crate::reference_health::State::new(crate::reference_health::Plan{
+            schema_version:1,inbound:edge.id.clone(),endpoint:format!("{}:{}",edge.server_name,addr.port()),
+            own_ips:vec![addr.ip()],references:vec![crate::reference_health::Target{
+                server_name:"ref.example.org".into(),address:"93.184.216.2:443".parse().unwrap()}],
+        },vec![crate::reference_health::Evidence{h2_status:Some(200),h3_status:Some(200)}],now).unwrap();
+        let health_path=directory.join("mixed-health");
+        crate::reference_health::Store::new(&health_path).unwrap().enroll(&health).unwrap();
+        let bundle=directory.join("mixed-bundle");
+        let digest=health.snapshot_sha256().unwrap();
+        let record=crate::reality_provision::create(&health,digest,&bundle,now).unwrap();
+        edge.reality=Some(crate::config::RealityBinding{health_store:health_path.to_string_lossy().into_owned(),
+            bundle:bundle.to_string_lossy().into_owned(),initial_health_sha256:digest,
+            identity_sha256:record.identity_sha256,manifest_sha256:record.manifest_sha256().unwrap()});
+        drop((tcp,udp));
+        let captured=CapturedTls::capture(&mixed).unwrap();
+        let mixed_ids=captured.identities();
+        let mixed_limits=GenerationLimits::new(&mixed);
+        let prepared=prepare_generation(&mixed,1,&mixed_limits,Some(&captured)).await.unwrap();
+        let state=State::new(View{document:Arc::new(mixed.clone()),inbounds:2,
+            preflight:Arc::new(ReloadPreflight::new(path.clone(),mixed.clone(),mixed_ids.clone())),
+            live:prepared.live}).with_reality(prepared.reality).with_reality_ledger(mixed_limits.ledger.clone());
+        let mut running=RunningGeneration::launch(prepared.listeners,GenerationPhase::Active);
+        let live=running.reality[0].carrier.clone();
+        let generation=live.current().unwrap();
+        let mut rotated=mixed.clone();
+        rotated.server.inbounds[0].tls_cert=new_cert;
+        rotated.server.inbounds[0].tls_key=new_key;
+        let (complete,_rx)=tokio::sync::oneshot::channel();
+        let request=RestartRequest{kind:ChangeKind::Restart,previous:state.snapshot().unwrap(),expected_revision:1,
+            material:Some(CapturedTls::capture(&rotated).unwrap()),candidate:rotated,complete};
+        let (updated,revision,slot)=commit_same_port_tls(&state,&mut running,&request,&mixed_ids,&path).unwrap();
+        assert_eq!(revision,2);
+        assert!(updated[0]!=mixed_ids[0]&&updated[1]==mixed_ids[1]);
+        assert!(Arc::ptr_eq(&live,&running.reality[0].carrier));
+        assert!(Arc::ptr_eq(&generation,&live.current().unwrap()));
+        let (restored,revision)=commit_tls_rollback(&state,&mut running,&slot,2,&path).unwrap();
+        assert_eq!(revision,3);
+        assert!(restored==mixed_ids);
+        assert!(Arc::ptr_eq(&generation,&live.current().unwrap()));
+        assert!(StdTcp::bind(addr).is_err());
+        assert!(StdUdp::bind(addr).is_err());
+        // REALITY groups need not finish naturally before the drain timeout;
+        // dropping the test-owned group cancels every listener task.
+        running.tasks.shutdown().await;
     }
 }

@@ -440,7 +440,7 @@ impl RuntimePanel {
             Phase::QuotaRejected=>"Кандидат квот отклонён. Ничего не применено.\nr: статус | Esc: закрыть".into(),
             Phase::RollbackChecking=>"Проверка доступности одноразового отката авторизации REALITY. Только чтение.".into(),
             Phase::RollbackConfirming{revision,remaining_seconds}=>format!(
-                "Откат авторизации, revision={revision}, осталось {remaining_seconds} с.\nПредыдущие grants, disabled и digest снова начнут действовать для новых запросов. Доверие, identity, дескрипторы и активные туннели не откатываются. TOML останется без изменений.\ny: подтвердить | n/Esc: отменить"),
+                "Откат авторизации, revision={revision}, осталось {remaining_seconds} с.\nПредыдущие пользователи, grants, disabled и digest снова начнут действовать для новых запросов; занятые квоты сохраняются. Доверие, identity, дескрипторы и активные туннели не откатываются. TOML останется без изменений.\ny: подтвердить | n/Esc: отменить"),
             Phase::RollbackApplying=>"Откат отправлен; при потере ответа сначала перечитайте runtime revision.".into(),
             Phase::RollbackApplied{revision}=>format!("Авторизация восстановлена, новая revision={revision}. Слот отката израсходован. TOML не изменён.\nr: статус | Esc: закрыть"),
             Phase::RollbackUnavailable=>"Одноразовый откат недоступен или истёк. Ничего не изменено.\nr: статус | Esc: закрыть".into(),
@@ -448,7 +448,7 @@ impl RuntimePanel {
             Phase::Viewing { inbounds, revision } => format!(
                 "Сервер работает. Inbounds: {inbounds}. Авторизация: revision={revision}.\n\n{}\nr: обновить статус | Esc: закрыть",
                 if self.saved_sha256.is_some() {
-                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются только token digest/disabled/grants прежних пользователей.\nb: проверить одноразовый откат авторизации REALITY (300 с).\nc: проверить quota-only Apply.\ns: проверить структурный Apply.\nz: проверить структурный откат."
+                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются пользователи, token digest, disabled и grants; занятость удалённых ID сохраняется до завершения их туннелей.\nb: проверить одноразовый откат авторизации REALITY (300 с).\nc: проверить quota-only Apply.\ns: проверить структурный Apply.\nz: проверить структурный откат."
                 } else {
                     "Применение недоступно без явного --role server --config FILE."
                 }
