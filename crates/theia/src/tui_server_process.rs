@@ -324,7 +324,7 @@ mod tests {
         panel.key(KeyCode::Char('y'), None);
         stopped.try_recv().unwrap();
         assert_eq!(panel.status(), "Останавливается");
-        assert!(panel.body().contains("admission"));
+        assert!(panel.body().contains("новые подключения не принимаются"));
         done_tx.send(Ok(())).unwrap();
         panel.poll();
         assert!(!panel.running());

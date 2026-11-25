@@ -4576,6 +4576,28 @@ mod tests {
     }
 
     #[test]
+    fn recovery_without_eligible_users_cannot_reach_confirmation() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("review-no-users").unwrap());
+        let original = server_issuance_fixture();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.update(&mut model, press(KeyCode::Char('b')));
+        assert!(matches!(ui.issuance, Some(IssueFlow::Input(_))));
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("нет отключённых пользователей"));
+        for key in [KeyCode::Char('a'), KeyCode::Enter, KeyCode::Char('y')] {
+            ui.update(&mut model, press(key));
+            assert!(matches!(ui.issuance, Some(IssueFlow::Input(_))));
+        }
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.issuance.is_none());
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn review_client_import_opens_directly_from_page_without_writing() {
         let path = std::env::temp_dir().join(crate::tui_editor::generated_id("review-import").unwrap());
         let original = include_str!("../../../examples/client.toml");
