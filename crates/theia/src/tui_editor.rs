@@ -44,15 +44,15 @@ pub(crate) enum RecordAction {
 impl RecordAction {
     pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::NewInbound => "Создать inbound (собственный TLS)",
+            Self::NewInbound => "Создать подключение (собственный TLS)",
             Self::NewProfile => "Создать клиентский профиль (собственный TLS)",
             Self::DeleteRecord => "Удалить выбранную запись",
             Self::ActivateProfile => "Выбрать активный профиль",
-            Self::SetGrants => "Заменить список grants",
+            Self::SetGrants => "Изменить список пользователей с доступом",
             Self::SetQuota => "Изменить лимиты соединений",
-            Self::DeleteUser => "Удалить пользователя без grants",
-            Self::EditTls => "Изменить ссылки cert/key",
-            Self::EditTrust => "Изменить CA и ссылку credential",
+            Self::DeleteUser => "Удалить пользователя без прав доступа",
+            Self::EditTls => "Настроить сертификат и закрытый ключ",
+            Self::EditTrust => "Настроить доверие и токен",
         }
     }
 
@@ -74,11 +74,11 @@ impl RecordAction {
                 ("Ссылка на токен (env:/file:)", true),
                 ("Путь XHTTP", false),
             ],
-            Self::SetGrants => &[("Grants (ID через запятую)", false)],
+            Self::SetGrants => &[("ID пользователей через запятую", false)],
             Self::SetQuota => &[("На пользователя", false), ("Всего", false)],
             Self::DeleteUser => &[("ID пользователя", false)],
-            Self::EditTls => &[("cert (file:)", true), ("key (file:)", true)],
-            Self::EditTrust => &[("CA (file:)", true), ("Credential (env:/file:)", true)],
+            Self::EditTls => &[("Сертификат (file:)", true), ("Закрытый ключ (file:)", true)],
+            Self::EditTrust => &[("Доверенный CA (file:)", true), ("Ссылка на токен (env:/file:)", true)],
             Self::DeleteRecord | Self::ActivateProfile => &[],
         }
     }
