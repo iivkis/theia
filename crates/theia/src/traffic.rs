@@ -2,6 +2,8 @@
 //! Counts complete relay writes/accepted frames, not IP/wire bytes or peer ACKs.
 //! No per-destination state, payload, credentials, unbounded history or I/O.
 use crate::Role;
+use ratatui::{Frame, layout::{Constraint, Layout, Rect}, style::{Color, Style, Modifier}, widgets::{Block, Borders, Clear, Paragraph, Sparkline, Wrap}};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -99,12 +101,13 @@ pub(crate) struct Monitor {
     current: [Snapshot; 2],
     rate: [(u64, u64); 2],
     sampled: Instant,
+    history: VecDeque<[u64; 2]>,
 }
 impl Monitor {
     pub(crate) fn new(role: Role) -> Self {
         let current = snapshot(role);
         Self {
-            role, previous: current, current, rate: [(0, 0); 2], sampled: Instant::now(),
+            role, previous: current, current, rate: [(0, 0); 2], sampled: Instant::now(), history: VecDeque::with_capacity(60),
         }
     }
     pub(crate) fn poll(&mut self) {
@@ -117,9 +120,58 @@ impl Monitor {
                 (now.download.saturating_sub(old.download) as f64 / elapsed) as u64,
             );
         }
+        if self.history.len() == 60 { self.history.pop_front(); }
+        self.history.push_back(self.rate.map(|(up, down)| up.saturating_add(down)));
         self.previous = self.current;
         self.sampled = Instant::now();
     }
+    /// Render only measured process-local aggregates. Each transport uses
+    /// the same chart scale; the history is bounded to 60 sampled intervals.
+    pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(Clear, area);
+        let border = Style::default().fg(Color::DarkGray);
+        if area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
+            frame.render_widget(Paragraph::new(self.body()).wrap(Wrap { trim: false })
+                .block(Block::default().title(" Монитор трафика ").borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))), area);
+            return;
+        }
+        let layout = Layout::vertical([Constraint::Length(4), Constraint::Min(1), Constraint::Length(3)]).split(area);
+        let active = self.current.iter().map(|s| s.active).fold(0u64, u64::saturating_add);
+        let opened = self.current.iter().map(|s| s.opened).fold(0u64, u64::saturating_add);
+        let scope = format!("Активные relay: {active}   •   Всего открыто: {opened}\nТолько DATA текущего процесса, не сетевые байты и не подтверждение доставки.");
+        frame.render_widget(Paragraph::new(scope).wrap(Wrap {trim:true})
+            .block(Block::default().title(" Обзор ").borders(Borders::ALL).border_style(border)), layout[0]);
+        let panels = if area.width >= 86 {
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(layout[1])
+        } else {
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(layout[1])
+        };
+        let max = self.history.iter().flat_map(|v| v.iter().copied()).max().unwrap_or(0).max(1);
+        for (i, panel) in panels.iter().copied().enumerate() {
+            let color = if i == 0 { Color::Cyan } else { Color::LightBlue };
+            let title = if i == 0 { " H2 · TCP " } else { " H3 · QUIC " };
+            let block = Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(color));
+            let inner = block.inner(panel);
+            frame.render_widget(block, panel);
+            let regions = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(inner);
+            let s = self.current[i];
+            let (up, down) = self.rate[i];
+            let (up_rate, down_rate) = if self.history.is_empty() { ("…".into(), "…".into()) }
+                else { (format!("{} /с", bytes(up)), format!("{} /с", bytes(down))) };
+            frame.render_widget(Paragraph::new(format!("Активно: {}  •  Всего: {}\n↑ {up_rate}  ·  {}\n↓ {down_rate}  ·  {}",
+                s.active, s.opened, bytes(s.upload), bytes(s.download))).wrap(Wrap {trim:true}), regions[0]);
+            let history: Vec<_> = self.history.iter().map(|sample| sample[i]).collect();
+            let chart = Sparkline::default().data(&history).max(max)
+                .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+                .block(Block::default().title(" ↑+↓ DATA/с · 60 отсчётов ").borders(Borders::TOP));
+            frame.render_widget(chart, regions[1]);
+        }
+        let note = format!("Общая шкала: {} /с  •  1 с  •  внешние сервисы не измеряются  •  Esc назад", bytes(max));
+        frame.render_widget(Paragraph::new(note).wrap(Wrap {trim:true})
+            .block(Block::default().borders(Borders::ALL).border_style(border)), layout[2]);
+    }
+
     pub(crate) fn body(&self) -> String {
         let mut result = String::from("Только трафик текущего процесса Theia; внешние сервисы не измеряются.\nDATA после OPEN_OK, без TLS/HTTP/QUIC overhead. Не подтверждение доставки peer.\n");
         for (i, s) in self.current.iter().enumerate() {
@@ -130,6 +182,7 @@ impl Monitor {
                 s.active, s.opened, bytes(s.upload), bytes(up), bytes(s.download), bytes(down)
             ));
         }
+        if self.history.is_empty() { result.push_str("\nСбор первого интервала скорости; нулевой отсчёт не означает отсутствие трафика."); }
         result.push_str("\nОбновление 1 с • Esc: назад");
         result
     }
@@ -152,6 +205,17 @@ mod tests {
         }
         assert_eq!(c.snapshot(), Snapshot { active: 0, opened: 2, upload: 12, download: 23 });
     }
+    #[test]
+    fn history_is_bounded_and_waits_for_first_sample() {
+        let mut monitor = Monitor::new(Role::Client);
+        assert!(monitor.history.is_empty());
+        for _ in 0..80 {
+            monitor.sampled -= std::time::Duration::from_secs(1);
+            monitor.poll();
+        }
+        assert_eq!(monitor.history.len(), 60);
+    }
+
     #[test]
     fn monitor_has_two_transports_and_truthful_scope() {
         let mut m = Monitor::new(Role::Client);
