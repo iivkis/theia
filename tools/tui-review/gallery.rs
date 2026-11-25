@@ -30,6 +30,7 @@ fn visual_review_gallery() {
     first_key_import_fixture(&root.join("first-own-tls"), review_capture);
     // Exercise a self-contained REALITY key through the actual first-run UI.
     {
+        use crate::config;
         use sha2::{Digest, Sha256};
         use crate::reference_health::{Evidence, Plan, State, Target};
         let now = crate::reference_health::unix_now().unwrap();
@@ -60,7 +61,7 @@ fn visual_review_gallery() {
         review_capture("client-reality-key-masked", &model, &ui);
         ui.update(&mut model, press(KeyCode::Enter));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ui.config_dialog.as_ref().is_some_and(|d| d.title() == "Импорт REALITY" && d.guide().is_some_and(|g| g.0 == 3)) {
+        while !ui.config_dialog.as_ref().is_some_and(|d| d.title() == "Импорт REALITY" && d.guide().is_some_and(|g| g.2 == "Подтверждение доверия")) {
             ui.poll_navigation(&mut model);
             assert!(std::time::Instant::now() < deadline, "REALITY key review did not appear");
             std::thread::sleep(std::time::Duration::from_millis(5));
