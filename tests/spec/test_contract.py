@@ -424,7 +424,9 @@ class SpecContractTests(unittest.TestCase):
 
     def test_m31_explicit_h3_cli_wiring(self):
         proxy = read("crates/theia/src/local_proxy.rs")
-        self.assertIn("ProxyClient::H3", proxy)
+        self.assertIn("enum Carrier", proxy)
+        self.assertIn("(None, Some(h3)) => Ok(Self::H3(h3))", proxy)
+        self.assertIn("Self::H3(client) => client.open(address, port)", proxy)
         self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
         server = read("crates/theia/src/server.rs")
         self.assertIn("crate::h3_server::serve(endpoint, context)", server)
@@ -437,15 +439,19 @@ class SpecContractTests(unittest.TestCase):
         quic = read("crates/theia/src/quic_transport.rs")
         self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
         self.assertIn("self.observation.sent.load", quic)
-        self.assertIn("!self.observation.received.load", quic)
+        self.assertIn("self.observation.received.load", quic)
+        self.assertIn("handshake_timeout_error", quic)
+        self.assertIn("only_destination_send_network_errors_are_definitive", quic)
+        self.assertIn("QuicEndpointNetworkRefused", proxy)
+        self.assertIn("AUTO_QUIC_ATTEMPTS", proxy)
         self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", proxy)
         self.assertIn("recheck_deadline_is_not_extended_and_only_one_generation_can_claim_it", proxy)
         self.assertIn("idle_profile_rechecks_quic_without_opening_an_application_tunnel", proxy)
         self.assertIn("result = &mut maintenance => return result", proxy)
-        self.assertIn("self.h3.probe().await", proxy)
+        self.assertIn("self.attempt_h3(generation, || self.h3.probe()).await", proxy)
         self.assertIn("self.verified_connection().await.map(|_| ())", read("crates/theia/src/h3_client.rs"))
         self.assertIn("route_change_rejects_stale_results_and_unknown_route_disables_cache", proxy)
-        self.assertIn("route_source(self.h3.remote())", proxy)
+        self.assertIn("crate::network_scope::observe(self.h3.remote())", proxy)
         tests = read("crates/theia/tests/client_h2.rs")
         for name in ("auto_falls_back_only_after_udp_silence_and_uses_negative_cache",
                      "auto_wrong_h3_certificate_never_retries_working_h2",
