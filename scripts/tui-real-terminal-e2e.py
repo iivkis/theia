@@ -459,7 +459,11 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             # The actual confidential URI must not be in the terminal stream.
             assert path.read_text(encoding="utf-8") not in tty.raw
         revision(binary, 1)
+        # Do not concatenate ESC and the next navigation key: real terminals
+        # may interpret the resulting sequence as an Alt-modified key.
         tty.send("\x1b")
+        tty.wait("Параметры · Enter" if name == "own-user" else
+                 "Защищённое подключение · только просмотр")
         return path
 
     server_cmd = [binary, "tui", "--role", "server", "--config", str(server)]
@@ -468,7 +472,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Параметры · Enter")
         own_link = issue(tty, "own-user")
         tty.send("j")
-        tty.wait("SmartTheia REALITY · только просмотр")
+        tty.wait("Защищённое подключение · только просмотр")
         reality_link = issue(tty, "reality-user")
         saved = read_config(server)["server"]
         assert "own-user" in saved["inbounds"][0]["allowed_user_ids"]
@@ -561,7 +565,8 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             tty.send(fingerprint + "\r")
             tty.wait("ПРЕДПРОСМОТР: fingerprint совпал")
             tty.send("y")
-            tty.wait("Следующий шаг: g")
+            # Successful managed enrollment opens registration automatically.
+            tty.wait("Материалы подготовлены")
 
         # First complete local enrollment, cancel before TOML registration.
         before = set(base.glob(".theia-enroll-*"))
@@ -569,8 +574,6 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         enroll()
         assert client.read_bytes() == saved
         assert len(set(base.glob(".theia-enroll-*")) - before) == 1
-        tty.send("g")
-        tty.wait("Материалы подготовлены")
         tty.send("\x1b")
         tty.wait("Режим подключения")
         assert set(base.glob(".theia-enroll-*")) == before
@@ -578,8 +581,6 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
 
         # Re-run and actually register: still no implicit activation.
         enroll()
-        tty.send("g")
-        tty.wait("Материалы подготовлены")
         tty.send("\x15reality-profile\r")
         tty.wait("Register REALITY profile")
         assert client.read_bytes() == saved
