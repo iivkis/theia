@@ -194,6 +194,16 @@ pub(crate) fn new_private_directory(path: &Path) -> io::Result<()> {
     builder.mode(0o700);
     builder.create(path)
 }
+/// Create a fresh private file at an explicit absolute path. The caller must
+/// supply a trusted parent directory. Existing files are never overwritten.
+/// Uses mode 0600 on Unix and an explicit protected user/System DACL on Windows.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    if !crate::bounded_input::explicit_file_path(path) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid private file path"));
+    }
+    new_private_file(path)
+}
+
 #[cfg(unix)]
 fn new_private_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
