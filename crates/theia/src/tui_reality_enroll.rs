@@ -171,6 +171,7 @@ pub(crate) struct EnrollmentPanel {
     new_config: Option<PathBuf>,
     registration: Option<crate::tui_reality_register::RegistrationPanel>,
     owned: Option<crate::tui_staged_material::StagedMaterial>,
+    browser: Option<crate::tui_menu::FileBrowser>,
 }
 
 impl EnrollmentPanel {
@@ -184,6 +185,7 @@ impl EnrollmentPanel {
             new_config: None,
             registration: None,
             owned: None,
+            browser: None,
         }
     }
 
@@ -275,6 +277,7 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn paste(&mut self, value: &str) {
+        if self.browser.is_some(){return;}
         if let Some(panel) = self.registration.as_mut() {
             panel.paste(value);
             return;
@@ -295,6 +298,20 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
+        if let Some(browser)=self.browser.as_mut() {
+            if key.code==KeyCode::Esc {self.browser=None;return false;}
+            if let Some(path)=browser.key(key.code,"") {
+                if let Some(path)=path.to_str().filter(|s|!s.chars().any(char::is_control)) {
+                    let limit=if self.focus==0 {bootstrap::MAX_URI} else {LIMIT};
+                    if path.len()<=limit {
+                        self.fields[self.focus]=Zeroizing::new(path.to_owned());
+                        self.error=None;
+                    } else {self.error=Some("Путь слишком длинный. Выберите другой файл.".into());}
+                }
+                self.browser=None;
+            }
+            return false;
+        }
         if let Some(panel) = self.registration.as_mut() {
             return panel.key(key);
         }
@@ -398,6 +415,9 @@ impl EnrollmentPanel {
         }
         match key.code {
             KeyCode::Esc => return true,
+            KeyCode::F(6) if self.focus<=1 => {
+                self.browser=Some(crate::tui_menu::FileBrowser::files(self.fields[self.focus].as_str()));
+            }
             KeyCode::F(8) => {
                 self.focus = if self.focus < 4 {4} else {0};
             }
@@ -493,13 +513,14 @@ impl EnrollmentPanel {
 
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
+        if let Some(browser)=&self.browser{return Some(browser.form());}
         if let Some(panel)=&self.registration {return panel.form();}
         if !matches!(self.stage, Stage::Input) {
             return None;
         }
         let hints = [
-            "Вставьте theia:// приглашение или абсолютный путь к защищённому URI-файлу.",
-            "Попросите администратора прислать файл допуска отдельно от ссылки. Укажите путь к этому файлу.",
+            "Вставьте ссылку theia:// или нажмите F6, чтобы выбрать присланный файл приглашения.",
+            "Попросите администратора прислать файл допуска отдельно от ссылки. F6 — выбрать этот файл.",
             "Абсолютный путь нового файла профиля.",
             "Абсолютный путь нового хранилища доверия.",
             "Сверьте отпечаток (64 шестнадцатеричных символа) с администратором по другому доверенному каналу.",
@@ -517,6 +538,7 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn select_field(&mut self, id: usize) {
+        if let Some(browser)=self.browser.as_mut(){browser.select_field(id);return;}
         if let Some(panel)=self.registration.as_mut(){panel.select_field(id);return;}
         if matches!(self.stage, Stage::Input)
             && id < LABELS.len() && (!self.managed_paths() || !matches!(id, 2 | 3)) {
@@ -526,11 +548,12 @@ impl EnrollmentPanel {
 
     pub(crate) fn guide(&self) -> (usize, usize, &'static str, &'static str) {
         let total=if self.managed_paths(){4}else{3};
+        if self.browser.is_some(){return (1,total,"Выбор локального файла","↑↓ выбрать · Enter выбрать путь · Esc назад");}
         if self.registration.is_some() {
             return (total,total,"Регистрация в TOML","Enter предпросмотр · Y сохранить · Esc назад");
         }
         match &self.stage {
-            Stage::Input if self.managed_paths() && self.focus<4 => (1,4,"Приглашение и файл допуска","↑↓ поле · F8 далее · Enter продолжить · Ctrl+U очистить · Esc назад"),
+            Stage::Input if self.managed_paths() && self.focus<4 => (1,4,"Приглашение и файл допуска","↑↓ поле · F6 файл · F8 далее · Enter продолжить · Esc назад"),
             Stage::Input if self.managed_paths() => (2,4,"Проверка доверия и токена","↑↓ поле · F8 назад · Enter проверить · Ctrl+U очистить · Esc отменить"),
             Stage::Input => (1,3,"Приглашение и доверие","↑↓ поле · F8 раздел · Enter проверить · Ctrl+U очистить · Esc назад"),
             Stage::Loading(_) => (total-1,total,"Проверка приглашения","Идёт локальная проверка"),

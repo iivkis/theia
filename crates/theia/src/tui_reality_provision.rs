@@ -1307,6 +1307,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn novice_errors_focus_the_missing_field_without_creating_files() {
+        let dir=std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-errors").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let mut wizard=Wizard::first(dir.join("server.toml")).unwrap();
+        let enter=KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE);
+        wizard.key(enter);
+        assert_eq!(wizard.focus,2);
+        wizard.fields[2]="edge.example.org".into();
+        wizard.key(enter);
+        assert_eq!(wizard.focus,3);
+        wizard.fields[3]="192.0.2.10".into();
+        wizard.key(enter);
+        assert_eq!(wizard.focus,5);
+        assert!(matches!(wizard.stage,WizardStage::Input));
+        assert!(!wizard.config.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn grant_picker_is_explicit_and_cancel_restores_previous_draft() {
         let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("grant-picker").unwrap());
         std::fs::create_dir(&dir).unwrap();

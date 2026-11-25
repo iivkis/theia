@@ -456,7 +456,8 @@ impl Menu {
 }
 
 /// Read-only local chooser. Picking a path never opens, creates or overwrites a configuration.
-struct FileBrowser {
+pub(crate) struct FileBrowser {
+    config_only: bool,
     directory: std::path::PathBuf,
     entries: Vec<(std::path::PathBuf, bool)>,
     focus: usize,
@@ -464,10 +465,16 @@ struct FileBrowser {
 }
 impl FileBrowser {
     fn new(input: &str) -> Self {
+        Self::with_mode(input, true)
+    }
+    pub(crate) fn files(input: &str) -> Self {
+        Self::with_mode(if input.starts_with("theia://") { "" } else { input }, false)
+    }
+    fn with_mode(input: &str, config_only: bool) -> Self {
         let path = std::path::PathBuf::from(input);
         let directory = if path.is_dir() { path } else { path.parent().filter(|p| p.is_dir()).map(std::path::Path::to_path_buf).unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into())) };
         let directory = std::path::absolute(&directory).unwrap_or(directory);
-        let mut browser = Self { directory, entries: Vec::new(), focus: 0, error: String::new() };
+        let mut browser = Self { config_only, directory, entries: Vec::new(), focus: 0, error: String::new() };
         browser.refresh();
         browser
     }
@@ -481,7 +488,7 @@ impl FileBrowser {
                     let Ok(kind) = entry.file_type() else { continue; };
                     let path = entry.path();
                     if path.to_str().is_none_or(|s| s.len() > 4096 || s.chars().any(char::is_control)) { continue; }
-                    if kind.is_dir() || (kind.is_file() && path.extension().is_some_and(|s| s.eq_ignore_ascii_case("toml"))) {
+                    if kind.is_dir() || (kind.is_file() && (!self.config_only || path.extension().is_some_and(|s| s.eq_ignore_ascii_case("toml")))) {
                         self.entries.push((path, kind.is_dir()));
                     }
                 }
@@ -490,20 +497,26 @@ impl FileBrowser {
             Err(_) => self.error = "Каталог недоступен. Выберите родительский каталог или вернитесь к ручному вводу.".into(),
         }
     }
-    fn form(&self) -> crate::tui_widgets::Form {
+    fn entry_offset(&self) -> usize { if self.config_only {2} else {1} }
+    pub(crate) fn select_field(&mut self,id:usize) {
+        if id < self.entries.len()+self.entry_offset() { self.focus=id; }
+    }
+    pub(crate) fn form(&self) -> crate::tui_widgets::Form {
         use crate::tui_widgets::{Field, Form};
         let mut fields = vec![
             Field { id:0, label:"Родительский каталог", value:"..".into(), hint:"Enter — подняться на уровень выше." },
-            Field { id:1, label:"Выбрать этот каталог", value:self.directory.display().to_string(), hint:"Enter — использовать каталог и вернуться к имени файла." },
         ];
+        if self.config_only {
+            fields.push(Field { id:1, label:"Выбрать этот каталог", value:self.directory.display().to_string(), hint:"Enter — использовать каталог и вернуться к имени файла." });
+        }
         fields.extend(self.entries.iter().enumerate().map(|(i,(path,dir))| Field {
-            id:i+2, label:if *dir {"Каталог"} else {"Конфигурация TOML"}, value:path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            id:i+self.entry_offset(), label:if *dir {"Каталог"} else if self.config_only {"Конфигурация TOML"} else {"Файл"}, value:path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
             hint:if *dir {"Enter — открыть каталог."} else {"Enter — выбрать путь без загрузки файла."},
         }));
         Form { fields, selected:self.focus, lead:format!("Каталог: {} · до 2048 записей",self.directory.display()), error:self.error.clone() }
     }
-    fn key(&mut self, key: KeyCode, filename: &str) -> Option<std::path::PathBuf> {
-        let count = self.entries.len()+2;
+    pub(crate) fn key(&mut self, key: KeyCode, filename: &str) -> Option<std::path::PathBuf> {
+        let count = self.entries.len()+self.entry_offset();
         match key {
             KeyCode::Up | KeyCode::BackTab => self.focus = (self.focus+count-1)%count,
             KeyCode::Down | KeyCode::Tab => self.focus = (self.focus+1)%count,
@@ -511,8 +524,8 @@ impl FileBrowser {
             KeyCode::End => self.focus=count-1,
             KeyCode::Enter => match self.focus {
                 0 => if let Some(parent)=self.directory.parent() { self.directory=parent.to_path_buf(); self.refresh(); },
-                1 => return Some(self.directory.join(filename)),
-                i => if let Some((path,dir))=self.entries.get(i-2).cloned() {
+                1 if self.config_only => return Some(self.directory.join(filename)),
+                i => if let Some((path,dir))=self.entries.get(i-self.entry_offset()).cloned() {
                     if dir { self.directory=path; self.refresh(); } else { return Some(path); }
                 },
             },
@@ -560,6 +573,10 @@ impl ConfigDialog {
             creating: false,
             browser: None,
         }
+    }
+    pub(crate) fn suggested_mode(role: Role) -> usize {
+        let filename=if role==Role::Server {"server.toml"} else {"client.toml"};
+        if default_config(filename).is_file() {0} else {1}
     }
     pub(crate) fn prefer_reality(&mut self) {
         self.prefer_mode(1);
@@ -799,7 +816,7 @@ impl ConfigDialog {
     pub(crate) fn select_field(&mut self, id: usize) {
         if self.loading.is_some() { return; }
         if let Some(browser) = self.browser.as_mut() {
-            if id < browser.entries.len()+2 { browser.focus = id; }
+            browser.select_field(id);
             return;
         }
         if let Some(panel) = self.reality.as_mut() { panel.select_field(id); }
@@ -1290,6 +1307,21 @@ mod tests {
         assert!(dialog.loading.is_none());
         assert!(!dialog.creating);
         assert!(dialog.body().contains("Операция не подтверждена"));
+    }
+
+    #[test]
+    fn general_file_browser_selects_invite_without_reading_contents() {
+        let root=std::env::temp_dir().join(crate::tui_editor::generated_id("invite-browser").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let invite=root.join("invite.theia");
+        std::fs::write(&invite,"PRIVATE-INVITATION-TEST").unwrap();
+        let mut browser=FileBrowser::files(root.to_str().unwrap());
+        let form=browser.form();
+        assert!(form.fields.iter().all(|f|!f.value.contains("PRIVATE-INVITATION-TEST")));
+        browser.select_field(1);
+        assert_eq!(browser.key(KeyCode::Enter,"").unwrap(),invite);
+        assert_eq!(std::fs::read_to_string(&invite).unwrap(),"PRIVATE-INVITATION-TEST");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

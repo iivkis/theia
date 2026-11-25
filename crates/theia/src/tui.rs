@@ -10,7 +10,7 @@ use crate::{
     tui_discovery::DiscoveryPanel,
     tui_domain::DomainPanel,
     tui_editor::{Editor, RecordAction, RecordReview},
-    tui_menu::{Action as MenuAction, ConfigDialog, Menu},
+    tui_menu::{Action as MenuAction, ConfigDialog, FileBrowser, Menu},
     tui_probe::ProbePanel,
     tui_reality_enroll::EnrollmentPanel,
     tui_reality_provision::ProvisionPanel,
@@ -373,14 +373,14 @@ fn pages(role: Role) -> &'static [&'static str] {
 
 fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
     let entries: &[(char, &str)] = match (role, page) {
-        (Role::Server, 0) => &[('s',"Запустить / остановить сервер"),('W',"Создать REALITY"),('N',"Новое подключение"),('v',"Проверить / применить изменения"),('u',"Добавить пользователя и приглашение"),('b',"Выдать доступ отключённому"),('S',"Сохранить настройки")],
+        (Role::Server, 0) => &[('s',"Запустить / остановить сервер"),('W',"Создать REALITY"),('N',"Новое подключение"),('v',"Проверить / применить изменения"),('u',"Добавить пользователя и приглашение"),('b',"Выдать доступ отключённому"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
         (Role::Server, 1) => &[('N',"Создать подключение"),('W',"Мастер REALITY"),('V',"Состояние REALITY"),('G',"Настроить доступ"),('Q',"Лимиты"),('E',"Сертификат TLS"),('D',"Удалить подключение")],
         (Role::Server, 2) => &[('u',"Добавить пользователя"),('x',"Отключить"),('b',"Восстановить доступ"),('t',"Обновить токен"),('G',"Назначить доступ"),('U',"Удалить пользователя")],
         (Role::Server, 3) => &[('u',"Создать пользователя и приглашение"),('b',"Выдать приглашение отключённому"),('t',"Обновить приглашение"),('l',"Публичная ссылка")],
         (_, 4) => &[('4',"Открыть монитор трафика")],
         (Role::Server, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('v',"Статус и применение изменений"),('R',"Проверить готовность перезапуска"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
         (Role::Server, 6) => &[('p',"Сетевая диагностика"),('V',"Состояние REALITY")],
-        (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки")],
+        (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
         (Role::Client, 1) => &[('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт"),('E',"Доверие Own-TLS"),('D',"Удалить профиль")],
         (Role::Client, 2) => &[('i',"Импорт ссылки или QR"),('I',"Импорт REALITY")],
         (Role::Client, 3) if cfg!(windows) => &[('p',"Управление системным прокси")],
@@ -455,6 +455,7 @@ struct Interaction {
     issue_kind: IssueKind,
     revocation: Option<DisableFlow>,
     importing: Option<ImportFlow>,
+    import_browser: Option<FileBrowser>,
     qr_scan: Option<QrScan>,
     records: Option<RecordFlow>,
     discovery: Option<DiscoveryPanel>,
@@ -500,6 +501,7 @@ impl Interaction {
             issue_kind: IssueKind::NewUser,
             revocation: None,
             importing: None,
+            import_browser: None,
             qr_scan: None,
             records: None,
             discovery: None,
@@ -611,6 +613,7 @@ impl Interaction {
 
     /// Bracketed-paste source text stays in memory and is never rendered.
     fn paste_import_source(&mut self, text: &str) {
+        if self.import_browser.is_some() { return; }
         if let Some(ImportFlow::Input(source)) = self.importing.as_mut() {
             let input = text.trim_end_matches(['\r', '\n']);
             if source.len().saturating_add(input.len()) <= crate::invite::MAX_URI
@@ -660,6 +663,7 @@ impl Interaction {
                 self.saving = None;
                 self.editor = Some(editor);
                 if matches!(self.issuance, Some(IssueFlow::Saving)) {
+                    self.modal_action=0;
                     self.issuance = Some(if saved {
                         IssueFlow::Offer
                     } else {
@@ -813,6 +817,7 @@ impl Interaction {
     /// Mouse interaction is confined to harmless selection and navigation.
     /// No click is translated into a save, Apply, start, reveal or confirmation.
     fn active_form(&self) -> Option<Form> {
+        if let Some(browser)=&self.import_browser {return Some(browser.form());}
         if let Some(d)=&self.config_dialog {return d.form();}
         if let Some(p)=&self.reality_provision {return p.form();}
         if let Some(p)=&self.reality_enrollment {return p.form();}
@@ -904,6 +909,11 @@ impl Interaction {
                     panel.select_action(index);
                 }
             }
+            return;
+        }
+        if let Some(browser)=self.import_browser.as_mut() {
+            let form=browser.form();
+            if let Some(id)=form.hit(guided_form_area(body,form.fields.len()),event.column,event.row){browser.select_field(id);}
             return;
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
@@ -1723,12 +1733,12 @@ impl Interaction {
             let key = KeyEvent { code, ..key };
             match flow {
                 IssueFlow::Input(mut id) => match key.code {
-                    KeyCode::Up | KeyCode::Down if self.issue_kind != IssueKind::NewUser => {
+                    KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab if self.issue_kind != IssueKind::NewUser => {
                         id = cycle_user(
                             editor,
                             &id,
                             self.issue_kind == IssueKind::Reenable,
-                            key.code == KeyCode::Down,
+                            matches!(key.code,KeyCode::Down|KeyCode::Tab),
                         );
                         self.issuance = Some(IssueFlow::Input(id));
                     }
@@ -1897,8 +1907,8 @@ impl Interaction {
         if let Some(flow) = self.revocation.take() {
             match flow {
                 DisableFlow::Input(mut id) => match key.code {
-                    KeyCode::Up | KeyCode::Down => {
-                        id = cycle_user(editor, &id, false, key.code == KeyCode::Down);
+                    KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                        id = cycle_user(editor, &id, false, matches!(key.code,KeyCode::Down|KeyCode::Tab));
                         self.revocation = Some(DisableFlow::Input(id));
                     }
                     KeyCode::Esc => {}
@@ -1949,9 +1959,30 @@ impl Interaction {
             return false;
         }
 
+        if let Some(browser)=self.import_browser.as_mut() {
+            if key.code==KeyCode::Esc {self.import_browser=None;return false;}
+            if let Some(path)=browser.key(key.code,"") {
+                if let (Some(path),Some(ImportFlow::Input(source)))=(path.to_str(),self.importing.as_mut()) {
+                    if path.len()<=crate::invite::MAX_URI && !path.chars().any(char::is_control) {
+                        *source=Zeroizing::new(path.to_owned());
+                        editor.error=None;
+                    }
+                }
+                self.import_browser=None;
+            }
+            return false;
+        }
         if let Some(flow) = self.importing.take() {
             match flow {
                 ImportFlow::Input(mut source) => match key.code {
+                    KeyCode::F(6) => {
+                        self.import_browser=Some(FileBrowser::files(source.as_str()));
+                        self.importing=Some(ImportFlow::Input(source));
+                    }
+                    KeyCode::Char('u') if key.modifiers==KeyModifiers::CONTROL => {
+                        self.importing=Some(ImportFlow::Input(Zeroizing::new(String::new())));
+                        editor.error=None;
+                    }
                     KeyCode::Esc => {}
                     KeyCode::Enter if !source.is_empty() => {
                         if crate::qr_import::image_path(source.trim()) {
@@ -2436,6 +2467,7 @@ impl Interaction {
                 match editor.public_share() {
                     Ok(link) => {
                         editor.error = None;
+                        self.modal_action=0;
                         self.issuance = Some(IssueFlow::Public(link));
                     }
                     Err(message) => editor.error = Some(message.into()),
@@ -2471,7 +2503,8 @@ impl Interaction {
                 } else {
                     editor.error = None;
                     self.issue_kind = IssueKind::Reenable;
-                    self.issuance = Some(IssueFlow::Input(String::new()));
+                    let users=eligible_users(editor,true);
+                    self.issuance = Some(IssueFlow::Input(if users.len()==1 {users[0].clone()}else{String::new()}));
                 }
                 return false;
             }
@@ -3040,6 +3073,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             interaction.and_then(|ui| ui.editor.as_ref()),
             viewport,
         );
+    } else if let Some(browser)=interaction.and_then(|ui|ui.import_browser.as_ref()) {
+        draw_guided(frame,parts[1],"Выбрать файл приглашения или QR","",(1,2,"Выбор файла","↑↓ выбрать · Enter выбрать путь · Esc назад"),viewport,(Some(browser.form()),None));
     } else if let Some(flow) = interaction.and_then(|ui| ui.importing.as_ref()) {
         draw_import(
             frame,
@@ -3427,13 +3462,13 @@ fn draw_import(
             fields: vec![Field {
                 id: 0, label: "Приглашение или локальный файл",
                 value: if source.is_empty() { String::new() } else { format!("Введено {} байт (скрыто)", source.len()) },
-                hint: "Вставьте ссылку theia:// или абсолютный путь к URI-файлу, PNG или SVG QR. Содержимое скрыто.",
+                hint: "Вставьте ссылку theia:// или нажмите F6, чтобы выбрать файл приглашения или изображение PNG/SVG QR. Содержимое скрыто.",
             }],
             selected: 0,
             lead: "Получите личное приглашение у администратора. Вставьте ссылку или путь к присланному файлу. Подключение не запустится автоматически.".into(),
             error: editor.and_then(|e| e.error.clone()).unwrap_or_default(),
         };
-        draw_guided(frame, area, "Импорт подключения", "", (1, 2, "Источник приглашения", "Enter проверить · Esc отменить"), viewport, (Some(form), None));
+        draw_guided(frame, area, "Импорт подключения", "", (1, 2, "Источник приглашения", "Enter проверить · F6 выбрать файл · Ctrl+U очистить · Esc отменить"), viewport, (Some(form), None));
         return;
     }
     let (title, body) = match flow {
@@ -3906,6 +3941,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut model = Model::new(role);
     let mut interaction = Interaction::new(editor);
+    if interaction.editor.is_none() {
+        interaction.welcome_choice = ConfigDialog::suggested_mode(model.selected);
+    }
     loop {
         interaction.poll_navigation(&mut model);
         if interaction.poll_save(&mut model)? {
@@ -5670,7 +5708,7 @@ mod tests {
             (IssueKind::Reenable, "Восстановление отключённого"),
         ] {
             let input = render(|f, a| {
-                draw_issuance(f, a, &IssueFlow::Input("device-a".into()), None, kind, None)
+                draw_issuance(f, a, &IssueFlow::Input("device-a".into()), None, kind, None, 0)
             });
             assert!(input.contains(label));
             let confirm = render(|f, a| {
@@ -5681,14 +5719,15 @@ mod tests {
                     None,
                     kind,
                     None,
+                    0,
                 )
             });
             assert!(confirm.contains("Подтверждение"));
             assert!(confirm.contains("y: подтвердить"));
             let failed =
-                render(|f, a| draw_issuance(f, a, &IssueFlow::SaveFailed, None, kind, None));
+                render(|f, a| draw_issuance(f, a, &IssueFlow::SaveFailed, None, kind, None, 0));
             assert!(failed.contains("ссылка заблокирована"));
-            let offer = render(|f, a| draw_issuance(f, a, &IssueFlow::Offer, None, kind, None));
+            let offer = render(|f, a| draw_issuance(f, a, &IssueFlow::Offer, None, kind, None, 0));
             assert!(offer.contains("Одноразовая"));
             assert!(offer.contains("Runtime") || offer.contains("runtime"));
             assert!(!offer.contains(hidden));
@@ -5703,7 +5742,7 @@ mod tests {
             ),
             (IssueFlow::ExportFailed, "Секрет повторно не выдаётся"),
         ] {
-            let screen = render(|f, a| draw_issuance(f, a, &flow, None, IssueKind::NewUser, None));
+            let screen = render(|f, a| draw_issuance(f, a, &flow, None, IssueKind::NewUser, None, 0));
             assert!(screen.contains(label), "{screen}");
             assert!(!screen.contains(hidden));
         }
@@ -5715,6 +5754,7 @@ mod tests {
                 None,
                 IssueKind::NewUser,
                 None,
+                0,
             )
         });
         assert!(shown.contains(hidden));
