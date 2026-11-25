@@ -43,9 +43,9 @@ impl Form {
             Constraint::Length(lead), Constraint::Min(0), Constraint::Length(help),
         ]).split(inner);
         let count = self.fields.len();
-        let stride = if parts[1].height as usize >= count.saturating_mul(3) && parts[1].width >= 42 {
+        let stride = if usize::from(parts[1].height) >= count.saturating_mul(3) && parts[1].width >= 42 {
             3
-        } else if parts[1].height as usize >= count.saturating_mul(2) {
+        } else if usize::from(parts[1].height) >= count.saturating_mul(2) {
             2
         } else {
             1
@@ -192,7 +192,8 @@ fn fit_value(value: &str, width: u16, tail: bool) -> String {
     let mut out = Vec::new();
     let mut add = |c: char| {
         let mut encoded = [0; 4];
-        let w = Span::raw(&*c.encode_utf8(&mut encoded)).width();
+        let encoded: &str = c.encode_utf8(&mut encoded);
+        let w = Span::raw(encoded).width();
         if used + w > width { return false; }
         used += w;
         out.push(c);
@@ -213,6 +214,29 @@ fn fit_value(value: &str, width: u16, tail: bool) -> String {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+    #[test]
+    fn action_selection_matches_rendered_rows_and_enter_dispatches_only_one_key() {
+        use crossterm::event::KeyCode;
+        let items = [ActionItem { key: 's', label: "Запуск" }, ActionItem { key: 'x', label: "Остановка" }, ActionItem { key: 'r', label: "Обновить" }];
+        let mut focus = 0;
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Down), None);
+        assert_eq!(focus, 1);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Enter), Some(KeyCode::Char('x')));
+        assert_eq!(action_key(&[], &mut focus, KeyCode::Enter), Some(KeyCode::Enter));
+        for (w, h) in [(60, 12), (120, 30)] {
+            let area = Rect::new(0, 0, w, h);
+            let [_, controls] = action_layout(area, items.len()).unwrap();
+            let actions = Actions { items: &items, selected: focus };
+            let first = actions.start(controls);
+            assert_eq!(actions.hit(controls, controls.x + 1, controls.y + 1), Some(first));
+            assert_eq!(actions.hit(controls, controls.x, controls.y), None);
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|frame| actions.render(frame, controls)).unwrap();
+            let screen = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
+            assert!(screen.contains("Остановка"));
+        }
+    }
+
     #[test]
     fn controls_keep_focus_and_hit_regions_in_sync() {
         let form = Form {
