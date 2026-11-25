@@ -362,10 +362,9 @@ impl Drop for ChildProcess {
 async fn wait_for_proxy(address: std::net::SocketAddr, child: &mut ChildProcess) {
     timeout(Duration::from_secs(10), async {
         loop {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "client executable exited before binding"
-            );
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!("Theia executable exited before binding {address}: {status}");
+            }
             if TcpStream::connect(address).await.is_ok() {
                 break;
             }
@@ -912,18 +911,13 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
         let cert_path = dir.0.join("cert.pem");
         let key_path = dir.0.join("key.pem");
         std::fs::write(&cert_path, &pem).unwrap();
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
         {
             use std::io::Write;
-            let mut key = options.open(&key_path).unwrap();
+            let mut key = theia::client_import::create_private_file(&key_path)
+                .expect("create protected TLS key fixture");
             key.write_all(cert.key_pair.serialize_pem().as_bytes())
                 .unwrap();
+            key.sync_all().unwrap();
         }
         // The v1 server issuer requires a common TCP/UDP port. Reserve both
         // before starting the binary; retry only local fixture allocation.
@@ -952,6 +946,8 @@ async fn h3_server_and_client_binaries_curl_both_local_proxies() {
         doc.server.policy.allow_private_ips = true;
         let config = dir.0.join("server.toml");
         theia::config::atomic_write(&config, &theia::config::Config::Server(doc)).unwrap();
+        assert!(theia::server::tls_fingerprint_file(&config).is_ok(),
+            "server fixture must pass the real protected PEM reader and TLS builders");
         let mut issuer = theia::tui_editor::Editor::load(theia::Role::Server, &config).unwrap();
         issuer.issue_user("export-device").unwrap();
         assert!(issuer.save());

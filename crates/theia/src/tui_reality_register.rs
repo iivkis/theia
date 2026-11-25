@@ -48,7 +48,7 @@ struct Review {
 enum Stage {
     Input,
     Preview(Receiver<Result<Review, Error>>),
-    Confirm(Review),
+    Confirm(Box<Review>),
     Saving(Receiver<Result<Editor, SaveError>>),
     Done(String),
 }
@@ -338,7 +338,7 @@ impl RegistrationPanel {
     pub(crate) fn poll(&mut self) -> Option<Editor> {
         match &self.stage {
             Stage::Preview(rx) => match rx.try_recv() {
-                Ok(Ok(review)) => self.stage = Stage::Confirm(review),
+                Ok(Ok(review)) => self.stage = Stage::Confirm(Box::new(review)),
                 Ok(Err(error)) => {
                     self.error = Some(format!("ОТКАЗ: {error}"));
                     self.stage = Stage::Input;
