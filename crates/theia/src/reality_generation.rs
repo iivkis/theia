@@ -131,6 +131,76 @@ impl Manager {
         Ok(Self { inbound: inbound.clone(), scope, slot: Mutex::new(Slot { last: first, last_checked_at: now }) })
     }
 
+    /// Independently root both files even while the active reference is
+    /// degraded. Advance the durable floor before further probes or writes:
+    /// a failed capture must not make stale healthy evidence acceptable.
+    fn maintenance_snapshot(&self,now:u64)->Result<(State,crate::descriptor::Verified,Stamp),Error>{
+        let binding=self.inbound.reality.as_ref().ok_or(Error::Format)?;
+        let health=Store::new(Path::new(&binding.health_store)).map_err(|_|Error::Health)?
+            .inspect().map_err(|_|Error::Health)?;
+        let (value,stamp)=crate::reality_provision::inspect_registered_snapshot(
+            Path::new(&binding.bundle),binding,&health,&self.scope,now)?;
+        reality_checkpoint::accept(Path::new(&binding.bundle),stamp,now)?;
+        Ok((health,value,stamp))
+    }
+
+    /// One owner-scoped maintenance cycle. Only the immutable enrolled plan
+    /// may be probed. The publication has its own exact-byte CAS, and the
+    /// health digest is re-read immediately before each publication change.
+    /// A changed/expired trust chain is never replaced with an unrooted one.
+    pub(crate) async fn maintain(&self,live:&crate::reality_live::Live)->Result<Lease,Error>{
+        use crate::{identity_publication::{Publication,FailoverApproval},reference_health::{self,PrimaryStatus}};
+        let binding=self.inbound.reality.as_ref().ok_or(Error::Format)?;
+        let store=Store::new(Path::new(&binding.health_store)).map_err(|_|Error::Health)?;
+        let publication=Publication::new(&Path::new(&binding.bundle).join("publication.toml"))?;
+        let mut now=reference_health::unix_now().map_err(|_|Error::Clock)?;
+        let (mut health,mut value,mut stamp)=self.maintenance_snapshot(now)?;
+        let approved=health.plan().digest().map_err(|_|Error::Health)?;
+        let due=health.next_active_check_at(value.descriptor(),now).map_err(|_|Error::Health)?;
+        let status=publication.inspect(now)?;
+        if status.snapshot_sha256!=stamp.publication || status.plan_sha256!=approved{return Err(Error::Approval);}
+        let expiry_due=status.valid_now && status.next_fingerprint.is_none()
+            && status.not_after.saturating_sub(now)<=24*60*60;
+        let (active,_)=health.active_status(value.descriptor(),now).map_err(|_|Error::Health)?;
+        // A suspect/unavailable reference stops new admissions; previously
+        // accepted connections and relay sockets retain their own leases.
+        if active!=PrimaryStatus::Healthy {live.suspend();}
+        let fresh=now.saturating_sub(health.last_checked_at())<=60;
+        if now>=due || (expiry_due && !fresh) {
+            store.recheck(health.revision(),approved).await.map_err(|_|Error::Health)?;
+            now=reference_health::unix_now().map_err(|_|Error::Clock)?;
+            (health,value,stamp)=self.maintenance_snapshot(now)?;
+        }
+        let (active,reserve)=health.active_status(value.descriptor(),now).map_err(|_|Error::Health)?;
+        if active!=PrimaryStatus::Healthy {live.suspend();}
+        let status=publication.inspect(now)?;
+        if status.snapshot_sha256!=stamp.publication || status.plan_sha256!=approved{return Err(Error::Approval);}
+        let fresh=now.saturating_sub(health.last_checked_at())<=60;
+        if active==PrimaryStatus::Degraded && reserve.is_some() && fresh && status.valid_now
+            && status.next_fingerprint.is_none(){
+            // Existing clients can bootstrap using any signed reference
+            // alias at the same pinned endpoint, but only after admission
+            // and independent identity verification. No relay alias.
+            if let Ok(preview)=publication.preview_failover(&health,now){
+                if preview.publication_sha256!=stamp.publication || preview.health_sha256!=stamp.health
+                    || Some(usize::from(preview.selected_reference))!=reserve{return Err(Error::Approval);}
+                let (_,_,exact)=self.maintenance_snapshot(now)?;
+                if exact!=stamp{return Err(Error::Approval);}
+                publication.apply_failover(&health,FailoverApproval{
+                    publication_sha256:preview.publication_sha256,health_sha256:preview.health_sha256,
+                    selected_reference:preview.selected_reference,
+                },now)?;
+                crate::diag!(Info,"server.reality","approved_reference_switched");
+            }
+        }else if active==PrimaryStatus::Healthy && fresh && status.valid_now
+            && status.next_fingerprint.is_none() && status.not_after.saturating_sub(now)<=24*60*60 {
+            let (_,_,exact)=self.maintenance_snapshot(now)?;
+            if exact!=stamp{return Err(Error::Approval);}
+            publication.refresh(&health,stamp.publication,now)?;
+        }
+        self.refresh(reference_health::unix_now().map_err(|_|Error::Clock)?)
+    }
+
     /// Serialize candidate changes, revalidate private materials on each
     /// refresh, and refuse stale, equivocated or unhealthy generations.
     /// Never hand out the prior candidate on failure. The lock is intended

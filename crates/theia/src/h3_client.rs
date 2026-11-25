@@ -150,6 +150,10 @@ impl H3Client {
     }
 
     pub(crate) async fn fetch_identity_descriptor(&self) -> Result<String, ClientError> {
+        self.fetch_identity_document(false).await
+    }
+
+    pub(crate) async fn fetch_identity_document(&self,successor:bool) -> Result<String, ClientError> {
         let routes = self
             .identity_routes
             .as_ref()
@@ -163,8 +167,7 @@ impl H3Client {
                 .clone();
             let mut parts = self.uri.clone().into_parts();
             parts.path_and_query = Some(
-                routes
-                    .descriptor
+                (if successor { &routes.successor } else { &routes.descriptor })
                     .parse()
                     .map_err(|_| ClientError::Configuration)?,
             );

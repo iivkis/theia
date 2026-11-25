@@ -27,6 +27,7 @@ impl Route {
         let p = self.lease.publication();
         if self.successor { p.next().expect("prepared successor") } else { p.active() }
     }
+    pub(crate) fn publication_id(&self)->[u8;32]{self.lease.publication().snapshot_sha256()}
     pub(crate) fn current(&self, now: u64) -> bool {
         let v = self.material().verified();
         v.check_time(now).is_ok() && self.lease.health().validate_active(v.descriptor(),now).is_ok()
@@ -118,8 +119,11 @@ pub(crate) struct Live {
 }
 impl Live {
     pub(crate) fn new(lease:Arc<Lease>,base:Arc<ServerContext>,now:u64)->Result<Arc<Self>,ServerError>{
-        let guard=Arc::new(ReplayGuard::new(65536,now).map_err(|_|ServerError::Config)?);
-        let handshake=Arc::new(ReplayGuard::new(65536,now).map_err(|_|ServerError::Config)?);
+        Self::with_guard_start(lease,base,now,now)
+    }
+    pub(crate) fn with_guard_start(lease:Arc<Lease>,base:Arc<ServerContext>,now:u64,guard_start:u64)->Result<Arc<Self>,ServerError>{
+        let guard=Arc::new(ReplayGuard::new(65536,guard_start).map_err(|_|ServerError::Config)?);
+        let handshake=Arc::new(ReplayGuard::new(65536,guard_start).map_err(|_|ServerError::Config)?);
         let initial=Arc::new(Generation::prepare(lease,&base,&handshake,now)?);
         let h3=initial.default_quic().is_some();
         Ok(Arc::new(Self{base,slot:RwLock::new(Some(initial)),guard,handshake,h3}))

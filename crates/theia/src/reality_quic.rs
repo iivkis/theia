@@ -426,9 +426,7 @@ impl PreparedQuic {
         let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
         let manager = Manager::new(document, inbound_id, now).map_err(|_| ServerError::Config)?;
         let generation = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
-        let material = generation.publication().active();
-        let context = Arc::new(ServerContext::identity_context(inbound, &doc.server.users,
-            &doc.server.policy, material.verified(), Arc::from(material.signed()))?);
+        let context=Arc::new(ServerContext::new(inbound,&doc.server.users,&doc.server.policy));
         Self::from_shared(socket, generation, context, now)
     }
 
@@ -475,7 +473,9 @@ impl PreparedQuic {
                     let ticket=self.tickets.lock().map_err(|_|ServerError::Io)?.remove(&key);
                     let Some(ticket)=ticket else{incoming.ignore();continue;};
                     let Ok(now)=crate::reference_health::unix_now() else{incoming.ignore();continue;};
-                    if ticket.until<=Instant::now() || !ticket.route.current(now) {
+                    let still_current=self.live.current().is_some_and(|g|
+                        g.lease.publication().snapshot_sha256()==ticket.route.publication_id());
+                    if ticket.until<=Instant::now() || !still_current || !ticket.route.current(now) {
                         incoming.ignore();continue;
                     }
                     let Some(config)=ticket.route.quic.clone() else{incoming.ignore();continue;};

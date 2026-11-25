@@ -308,9 +308,41 @@ impl RealityClient {
             RealityCarrier::H3(h3) => h3.fetch_identity_descriptor().await?,
             // Same route-generation and two-silent-attempt policy as the
             // ordinary auto tunnel. Authentication/HTTP errors are terminal.
-            RealityCarrier::Auto(auto) => auto.fetch_identity_descriptor().await?,
+            RealityCarrier::Auto(auto) => auto.fetch_identity_document(false).await?,
         };
         store.update_matching(&signed, &generation.value, Self::now()?).map_err(|_| ClientError::Tls)?;
+        let current=store.load(Self::now()?).map_err(|_|ClientError::Tls)?;
+        if current.descriptor().next_identity.is_some(){
+            // Read the successor only on the still-authenticated old
+            // identity. Its key must match the signed announcement and
+            // its operational parameters must match exactly.
+            let successor=match &generation.carrier {
+                RealityCarrier::H2(h2)=>h2.fetch_identity_document(true).await?,
+                RealityCarrier::H3(h3)=>h3.fetch_identity_document(true).await?,
+                RealityCarrier::Auto(auto)=>auto.fetch_identity_document(true).await?,
+            };
+            let now=Self::now()?;
+            let preview=enrollment.preview_promotion(&successor,now).map_err(|_|ClientError::Tls)?;
+            if preview.expected_revision!=current.descriptor().revision
+                || preview.current_identity_sha256!=crate::reality_bootstrap::fingerprint(current.signer()){
+                return Err(ClientError::Tls);
+            }
+            // Prepare a carrier for the proposed signer before committing
+            // the CAS. Verify actual successor TLS identity on a new
+            // connection; possession is not inferred from a signed file.
+            let (_,_,candidate)=store.preview_promotion_bound(&successor,now).map_err(|_|ClientError::Tls)?;
+            let next=Self::build(&self.profile,self.remote,&enrollment,candidate,Some(generation.credential_digest))?;
+            let seen=match &next.carrier{
+                RealityCarrier::H2(h2)=>h2.fetch_identity_descriptor().await?,
+                RealityCarrier::H3(h3)=>h3.fetch_identity_descriptor().await?,
+                RealityCarrier::Auto(auto)=>auto.fetch_identity_document(false).await?,
+            };
+            if seen!=successor{return Err(ClientError::Tls);}
+            enrollment.promote(&successor,crate::reality_bootstrap::PromotionApproval{
+                expected_revision:preview.expected_revision,snapshot_sha256:preview.snapshot_sha256,
+                document_sha256:preview.document_sha256,next_identity_sha256:preview.next_identity_sha256,
+            },Self::now()?).map_err(|_|ClientError::Tls)?;
+        }
         Ok(())
     }
     async fn maintain(&self) -> Result<(), ClientError> {
@@ -536,11 +568,11 @@ impl AutoClient {
         }
     }
 
-    async fn fetch_identity_descriptor(&self) -> Result<String, ClientError> {
+    async fn fetch_identity_document(&self,successor:bool) -> Result<String, ClientError> {
         let (generation,cached) = self.observe()?;
         if !cached {
             for attempt in 0..AUTO_QUIC_ATTEMPTS {
-                match self.h3.fetch_identity_descriptor().await {
+                match self.h3.fetch_identity_document(successor).await {
                     Ok(value) => { self.complete(generation,false)?; return Ok(value); }
                     Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
                         if self.observe()?.0 != generation { return Err(ClientError::QuicUnreachable); }
@@ -552,7 +584,7 @@ impl AutoClient {
                 }
             }
         }
-        self.h2.fetch_identity_descriptor().await
+        self.h2.fetch_identity_document(successor).await
     }
 
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {

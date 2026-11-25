@@ -2440,6 +2440,11 @@ pub(crate) async fn run_reality_document_with_ready(
                 .map_err(|_| ServerError::Config)?;
             let generation = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
             let h3=generation.publication().active().verified().descriptor().h3;
+            #[cfg(test)]
+            let live_generation=if started.is_some(){
+                crate::reality_live::Live::with_guard_start(generation,Arc::new(context),now,now.saturating_sub(121))?
+            }else{crate::reality_live::Live::new(generation,Arc::new(context),now)?};
+            #[cfg(not(test))]
             let live_generation=crate::reality_live::Live::new(generation,Arc::new(context),now)?;
             let tcp=crate::reality_tcp::PreparedTcp::from_live(listener,live_generation.clone())?;
             let udp = tokio::net::UdpSocket::bind(udp_addr).await.map_err(|_| ServerError::Io)?;
@@ -2477,9 +2482,11 @@ pub(crate) async fn run_reality_document_with_ready(
                 tasks.spawn(async move {
                     loop {
                         tokio::time::sleep(Duration::from_secs(5)).await;
-                        let Ok(now)=crate::reference_health::unix_now() else{live_generation.suspend();continue;};
-                        match manager.refresh(now) {
-                            Ok(lease)=>if live_generation.publish(Arc::new(lease),now).is_err(){live_generation.suspend();},
+                        match manager.maintain(&live_generation).await {
+                            Ok(lease)=>{
+                                let Ok(now)=crate::reference_health::unix_now() else{live_generation.suspend();continue;};
+                                if live_generation.publish(Arc::new(lease),now).is_err(){live_generation.suspend();}
+                            }
                             Err(_)=>live_generation.suspend(),
                         }
                     }

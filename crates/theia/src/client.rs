@@ -223,6 +223,10 @@ impl H2Client {
     /// Authenticated descriptor GET; never send a bearer before the pinned
     /// identity handshake, never interpret the body as a routing command.
     pub(crate) async fn fetch_identity_descriptor(&self) -> Result<String, ClientError> {
+        self.fetch_identity_document(false).await
+    }
+
+    pub(crate) async fn fetch_identity_document(&self,successor:bool) -> Result<String, ClientError> {
         let routes = self
             .identity_routes
             .as_ref()
@@ -237,8 +241,7 @@ impl H2Client {
             let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
             let mut parts = self.uri.clone().into_parts();
             parts.path_and_query = Some(
-                routes
-                    .descriptor
+                (if successor { &routes.successor } else { &routes.descriptor })
                     .parse()
                     .map_err(|_| ClientError::Configuration)?,
             );

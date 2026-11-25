@@ -309,9 +309,7 @@ impl PreparedTcp {
         let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
         let manager = Manager::new(document, inbound_id, now).map_err(|_| ServerError::Config)?;
         let lease = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
-        let material = lease.publication().active();
-        let context = Arc::new(ServerContext::identity_context(inbound, &doc.server.users,
-            &doc.server.policy, material.verified(), Arc::from(material.signed()))?);
+        let context=Arc::new(ServerContext::new(inbound,&doc.server.users,&doc.server.policy));
         Self::from_shared(listener, lease, context, now)
     }
 
