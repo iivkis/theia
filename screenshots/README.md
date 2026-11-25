@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: e93a197f79e985b9948c6558d2ecb861ee7ae921
+Source: 26f1e21496ca4f5d98c4bb15338c48611ab34738
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
