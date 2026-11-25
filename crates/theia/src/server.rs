@@ -875,6 +875,18 @@ pub(crate) async fn await_generation_activation(
     }
 }
 
+/// A closed controller is also a drain request. A receiver cloned after
+/// publication must observe Drain even if no further notification arrives.
+pub(crate) fn generation_draining(phase: &watch::Receiver<GenerationPhase>) -> bool {
+    *phase.borrow() == GenerationPhase::Drain || phase.has_changed().is_err()
+}
+
+pub(crate) async fn await_generation_drain(phase: &mut watch::Receiver<GenerationPhase>) {
+    while !generation_draining(phase) {
+        if phase.changed().await.is_err() { break; }
+    }
+}
+
 pub async fn serve(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -944,7 +956,7 @@ pub(crate) async fn serve_generation_with_tls(
                     current.clone()
                 };
                 let context = context.clone();
-                connections.spawn(serve_h2_socket(socket, tls_acceptor, context, peer, slot, connection_id));
+                connections.spawn(serve_h2_socket(socket, tls_acceptor, context, peer, slot, connection_id, phase.clone()));
             }
         }
     }
@@ -969,6 +981,7 @@ pub(crate) async fn serve_h2_socket<S>(
     peer: std::net::SocketAddr,
     slot: ConnectionSlot,
     connection_id: u64,
+    mut phase: watch::Receiver<GenerationPhase>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1043,21 +1056,29 @@ pub(crate) async fn serve_h2_socket<S>(
     );
     let mut handlers = JoinSet::new();
     let pair = Arc::new(crate::split_http::Pair::new());
+    let mut draining = false;
     loop {
-        let accepted = if handlers.is_empty() {
-            match timeout(AUTH_WINDOW, connection.accept()).await {
-                Ok(accepted) => accepted,
-                Err(_) => break,
+        let idle = handlers.is_empty();
+        let accepted = tokio::select! {
+            biased;
+            _ = await_generation_drain(&mut phase), if !draining => {
+                connection.graceful_shutdown();
+                draining = true;
+                continue;
             }
-        } else {
-            tokio::select! {
-                _ = handlers.join_next() => continue,
-                accepted = connection.accept() => accepted,
-            }
+            _ = handlers.join_next(), if !idle => continue,
+            accepted = connection.accept() => accepted,
+            _ = tokio::time::sleep(AUTH_WINDOW), if idle => break,
         };
-        let Some(Ok((request, respond))) = accepted else {
+        let Some(Ok((request, mut respond))) = accepted else {
             break;
         };
+        // During the initial GOAWAY/PING exchange h2 may still deliver
+        // in-flight streams. Never authorize a new request after drain.
+        if draining || generation_draining(&phase) {
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            continue;
+        }
         let context = context.clone();
         let pair = pair.clone();
         let binding = binding.clone();
@@ -2241,7 +2262,7 @@ impl RunningGeneration {
                         if !await_generation_activation(&mut phase).await {
                             return Ok(());
                         }
-                        tcp.serve().await
+                        tcp.serve_generation(phase).await
                     });
                     if let Some(quic) = quic {
                         let mut phase = receiver.clone();
@@ -2249,7 +2270,7 @@ impl RunningGeneration {
                             if !await_generation_activation(&mut phase).await {
                                 return Ok(());
                             }
-                            quic.serve().await
+                            quic.serve_generation(phase).await
                         });
                     }
                     if let Some(socket) = silent {

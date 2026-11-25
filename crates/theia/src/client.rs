@@ -702,9 +702,9 @@ impl H2Client {
         // retry. The lease's Drop removes the draining connection from reuse
         // while other admitted leases retain it.
         let mut admission_error = |error: h2::Error| {
-            if error.is_go_away()
-                && error.is_remote()
-                && error.reason() == Some(h2::Reason::NO_ERROR)
+            if error.is_remote()
+                && ((error.is_go_away() && error.reason() == Some(h2::Reason::NO_ERROR))
+                    || (error.is_reset() && error.reason() == Some(h2::Reason::REFUSED_STREAM)))
             {
                 lease.retire();
                 *stage = crate::split_http::HelloOutcome::Draining;
