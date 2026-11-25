@@ -570,7 +570,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         assert client.read_bytes() == saved
         assert len(set(base.glob(".theia-enroll-*")) - before) == 1
         tty.send("g")
-        tty.wait("Регистрация уже подготовленных материалов")
+        tty.wait("Материалы подготовлены")
         tty.send("\x1b")
         tty.wait("Параметры · Enter")
         assert set(base.glob(".theia-enroll-*")) == before
@@ -579,7 +579,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         # Re-run and actually register: still no implicit activation.
         enroll()
         tty.send("g")
-        tty.wait("Регистрация уже подготовленных материалов")
+        tty.wait("Материалы подготовлены")
         tty.send("\x15reality-profile\r")
         tty.wait("Register REALITY profile")
         assert client.read_bytes() == saved
