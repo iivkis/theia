@@ -3137,7 +3137,7 @@ async fn run_supervised_file(
                             if root_history.pending() { return Err(ServerError::Io); }
                             let _=request.complete.send(Err(()));continue;
                         }
-                        let root_changed=root_history.pending();
+                        let root_changed=root_history.retiring();
                         let revision=runtime.commit_partial_layout(&request.previous,request.expected_revision,next_view,auth,&plan.removed,prepared.reality);
                         let Ok(revision)=revision else{
                             if root_history.pending() { return Err(ServerError::Io); }
@@ -3183,7 +3183,7 @@ async fn run_supervised_file(
                     if root_history.pending() { return Err(ServerError::Io); }
                     let _=request.complete.send(Err(()));continue;
                 }
-                let root_changed=root_history.pending();
+                let root_changed=root_history.retiring();
                 if runtime.commit_restart_with_reality(
                     &request.previous,
                     request.expected_revision,

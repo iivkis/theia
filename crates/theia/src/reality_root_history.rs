@@ -85,6 +85,7 @@ pub(crate) struct RootHistory {
     // succeeded but publication fails, the supervisor MUST exit rather
     // than continue admitting traffic under a potentially retired root.
     pending: bool,
+    retiring: bool,
 }
 impl RootHistory {
     pub(crate) fn open(config_path: &Path, document: &ServerDocument) -> Result<Self, ()> {
@@ -97,6 +98,7 @@ impl RootHistory {
             current: History::default(),
             raw: None,
             pending: false,
+            retiring: false,
         };
         let exists = history.exists()?;
         if exists || document.server.inbounds.iter().any(|i| i.reality.is_some()) {
@@ -154,11 +156,13 @@ impl RootHistory {
             return config::guarded_trust_assert(&self.path, raw.as_bytes()).map_err(|_| ());
         }
         let encoded = next.encode()?;
+        let retiring = next.retired != self.current.retired;
         match config::guarded_trust_write(&self.path, &encoded, self.raw.as_deref().map(str::as_bytes)) {
             Ok(()) => {
                 self.current = next;
                 self.raw = Some(encoded);
                 self.pending = true;
+                self.retiring = retiring;
                 Ok(())
             }
             Err(WriteFailure::BeforeReplace(_)) => Err(()),
@@ -170,7 +174,8 @@ impl RootHistory {
     }
 
     pub(crate) fn pending(&self) -> bool { self.pending }
-    pub(crate) fn committed(&mut self) { self.pending = false; }
+    pub(crate) fn retiring(&self) -> bool { self.retiring }
+    pub(crate) fn committed(&mut self) { self.pending = false; self.retiring = false; }
 }
 
 #[cfg(test)]
