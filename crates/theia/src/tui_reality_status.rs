@@ -1,9 +1,9 @@
 //! Guarded server identity controls plus separate saved/runtime status.
-use crate::{reality_bootstrap::Error,reality_config::{self,RotationReview},reference_health,tui_editor::Editor,Role};
+use crate::{reality_bootstrap::Error,reality_config::{self,RotationReview,TrustReview},reference_health,tui_editor::Editor,Role};
 use crossterm::event::{KeyCode,KeyEvent};
 use std::{path::PathBuf,sync::mpsc::{self,Receiver,TryRecvError}};
 
-enum Update { Report(String), Review(RotationReview) }
+enum Update { Report(String), Review(RotationReview), Trust(TrustReview) }
 struct ClientRun{
     stop:Option<tokio::sync::oneshot::Sender<()>>,
     done:Receiver<Result<(),crate::client::ClientError>>,
@@ -21,13 +21,15 @@ pub(crate) struct StatusPanel {
     client_active:bool,
     client_confirm:Option<bool>,
     client_run:Option<ClientRun>,
+    trust_input:Option<(bool,String)>,
+    trust_review:Option<TrustReview>,
 }
 impl StatusPanel{
     pub(crate) fn open(editor:&Editor)->Self{
         let mut panel=Self{path:editor.saved_path().to_owned(),digest:editor.saved_sha256(),
             id:editor.selected_record_id().to_owned(),server:editor.role()==Role::Server,
             pending:None,review:None,committing:false,report:String::new(),
-            client_active:editor.selected_record_is_active(),client_confirm:None,client_run:None};
+            client_active:editor.selected_record_is_active(),client_confirm:None,client_run:None,trust_input:None,trust_review:None};
         panel.start(None);
         panel
     }
@@ -69,6 +71,32 @@ impl StatusPanel{
             let _=tx.send(result);
         });
     }
+    pub(crate) fn paste(&mut self,text:&str){
+        if let Some((_,field))=&mut self.trust_input{
+            let text=text.trim_end_matches(['\r','\n']);
+            if !text.chars().any(char::is_control)&&field.len()+text.len()<=1024{field.push_str(text);}
+        }
+    }
+    fn start_trust(&mut self,promote:bool,source:PathBuf){
+        let path=self.path.clone();let digest=self.digest;let id=self.id.clone();
+        let (tx,rx)=mpsc::channel();self.pending=Some(rx);
+        let _worker=std::thread::spawn(move||{
+            let result=std::path::absolute(path).map_err(|_|Error::Storage)
+                .and_then(|path|reference_health::unix_now().map_err(|_|Error::Clock)
+                    .and_then(|now|TrustReview::prepare(&path,digest,&id,&source,promote,now))).map(Update::Trust);
+            let _=tx.send(result);
+        });
+    }
+    fn apply_trust(&mut self,review:TrustReview){
+        let path=self.path.clone();let digest=self.digest;let id=self.id.clone();
+        let (tx,rx)=mpsc::channel();self.pending=Some(rx);self.committing=true;
+        let _worker=std::thread::spawn(move||{
+            let result=std::path::absolute(path).map_err(|_|Error::Storage)
+                .and_then(|path|reference_health::unix_now().map_err(|_|Error::Clock)
+                    .and_then(|now|review.apply(&path,digest,&id,now))).map(Update::Report);
+            let _=tx.send(result);
+        });
+    }
     fn start_client(&mut self){
         if !self.client_active||self.client_run.is_some(){return;}
         let path=self.path.clone();let digest=self.digest;let id=self.id.clone();
@@ -93,6 +121,28 @@ impl StatusPanel{
     }
     pub(crate) fn key(&mut self,key:KeyEvent)->bool{
         if !self.server{
+            if self.trust_review.is_some(){
+                match key.code{
+                    KeyCode::Char('y')=>{if let Some(review)=self.trust_review.take(){self.apply_trust(review);}},
+                    KeyCode::Char('n')|KeyCode::Esc=>self.trust_review=None,
+                    _=>{},
+                }
+                return false;
+            }
+            if let Some((promote,field))=self.trust_input.as_mut(){
+                match key.code{
+                    KeyCode::Esc=>self.trust_input=None,
+                    KeyCode::Enter=>{
+                        let promote=*promote;let source=PathBuf::from(field.as_str());
+                        self.trust_input=None;self.start_trust(promote,source);
+                    }
+                    KeyCode::Backspace=>{field.pop();}
+                    KeyCode::Char(ch) if !ch.is_control()&&field.len()+ch.len_utf8()<=1024
+                        && (key.modifiers.is_empty()||key.modifiers==crossterm::event::KeyModifiers::SHIFT)=>field.push(ch),
+                    _=>{},
+                }
+                return false;
+            }
             if let Some(start)=self.client_confirm{
                 match key.code{
                     KeyCode::Char('y')=>{self.client_confirm=None;if start{self.start_client();}else if let Some(run)=self.client_run.as_mut(){if let Some(stop)=run.stop.take(){let _=stop.send(());}}},
@@ -104,6 +154,9 @@ impl StatusPanel{
             if self.client_run.is_some(){
                 if key.code==KeyCode::Char('x'){self.client_confirm=Some(false);}
                 return false;
+            }
+            if self.pending.is_none()&&!self.committing&&matches!(key.code,KeyCode::Char('o'|'k')){
+                self.trust_input=Some((key.code==KeyCode::Char('k'),String::new()));return false;
             }
             if self.pending.is_none()&&self.client_active&&key.code==KeyCode::Char('s'){
                 self.client_confirm=Some(true);return false;
@@ -140,10 +193,14 @@ impl StatusPanel{
         match result{
             Ok(Update::Report(report))=>self.report=report,
             Ok(Update::Review(review))=>self.review=Some(review),
+            Ok(Update::Trust(review))=>self.trust_review=Some(review),
             Err(error)=>self.report=format!("Операция не подтверждена: {error}\nПри неопределённой записи сначала перечитайте сохранённый и runtime статус. Не повторяйте вслепую."),
         }
     }
     pub(crate) fn body(&self)->String{
+        if let Some((promote,field))=&self.trust_input{return format!("{}\nАбсолютный путь к подписанному descriptor: [скрыто, {} bytes]\nEnter: предпросмотр | Esc: отменить",
+            if *promote{"Плановый переход identity"}else{"Offline recovery"},field.len());}
+        if let Some(review)=&self.trust_review{return format!("{}\n\ny: подтвердить | n/Esc: отменить",review.report());}
         if let Some(start)=self.client_confirm{return if start{"Запустить сохранённый активный REALITY-профиль с двумя loopback listeners? OS proxy не изменяется.\ny: подтвердить | n/Esc: отменить".into()}else{"Остановить локальный runtime? Открытые туннели будут закрыты.\ny: подтвердить | n/Esc: отменить".into()};}
         if let Some(run)=&self.client_run{
             if run.stop.is_none(){return "Остановка локального runtime...".into();}
@@ -154,6 +211,6 @@ impl StatusPanel{
         if self.pending.is_some(){return "Проверка сохранённых материалов/локального IPC. Ничего не применяется.\nEsc: закрыть.".into();}
         if let Some(review)=&self.review{return format!("{}\n\ny: подтвердить запись | n/Esc: отменить",review.report());}
         format!("{}\n\nr: перечитать | {}Esc: закрыть",self.report,
-            if self.server{"t: начать ротацию | p: отозвать старый ключ после overlap | "}else if self.client_active{"s: запустить локальный runtime | "}else{"сначала выберите профиль активным и сохраните TOML | "})
+            if self.server{"t: начать ротацию | p: отозвать старый ключ после overlap | "}else if self.client_active{"s: запустить локальный runtime | o: recovery | k: promotion | "}else{"o: recovery | k: promotion | для запуска выберите активный профиль | "})
     }
 }

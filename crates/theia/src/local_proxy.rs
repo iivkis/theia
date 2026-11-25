@@ -218,7 +218,7 @@ struct RealityGeneration {
     last_transport:std::sync::atomic::AtomicU8,
     last_refresh:std::sync::atomic::AtomicU8,
 }
-struct RealityClient {
+pub(crate) struct RealityClient {
     profile: Profile,
     remote: SocketAddr,
     current: tokio::sync::Mutex<Arc<RealityGeneration>>,
@@ -307,7 +307,7 @@ impl RealityClient {
         result
     }
 
-    async fn runtime_report(&self)->String{
+    pub(crate) async fn runtime_report(&self)->String{
         use std::sync::atomic::Ordering;
         let generation=self.current.lock().await.clone();
         let value=&generation.value;
@@ -322,8 +322,9 @@ impl RealityClient {
         let transport=match generation.last_transport.load(Ordering::Relaxed){2=>"H2",3=>"H3",_=>"ещё нет подтверждённого OPEN"};
         let refresh=match generation.last_refresh.load(Ordering::Relaxed){1=>"успешно",2=>"отклонено/недоступно",_=>"ещё не выполнялось"};
         // Read the pinned durable state without refreshing or changing it.
-        let trust=crate::reality_config::pinned_client(&self.profile).ok()
-            .and_then(|p|p.load(Self::now().ok()?).ok());
+        let profile=self.profile.clone();
+        let trust=tokio::task::spawn_blocking(move||crate::reality_config::pinned_client(&profile).ok()
+            .and_then(|p|p.load(Self::now().ok()?).ok())).await.ok().flatten();
         let trust_state=match trust{Some(v) if v.payload_sha256()==value.payload_sha256()=>"совпадает",Some(_)=>"изменилось, новые запросы перепроверят",None=>"не подтверждено, новые запросы могут быть отклонены"};
         format!("Loopback listeners работают (не доказательство удалённого соединения)\nrevision={} reference_index={} valid_now={valid}\npolicy={policy} last_open={transport}\nH3 negative cache: {}\nDescriptor refresh: {refresh}\nSaved trust: {trust_state}",
             value.descriptor().revision,value.descriptor().active_reference,
@@ -892,6 +893,10 @@ impl PreparedLocalProxy {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn reality_monitor(&self)->Option<Arc<RealityClient>>{
+        match &self.client{ProxyClient::Reality(r)=>Some(r.clone()),_=>None}
+    }
     #[cfg(windows)]
     pub(crate) fn http_address(&self) -> Result<SocketAddr, ClientError> {
         self.http.local_addr().map_err(|_| ClientError::Io)

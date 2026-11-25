@@ -563,6 +563,7 @@ impl PreparedQuic {
                     let data = &buf[..n];
                     let header = wire::long(data);
                     let short = data[0] & 0x80 == 0;
+                    if !short && (header.is_none()||!wire::coherent_datagram(data)){continue;}
                     let local_peer = admitted.keys().any(|(addr, _)| *addr == peer);
                     let local_known = if short {
                         data.get(1..1 + LOCAL_CID_LEN).is_some_and(|cid| self.local_cids.matches(cid))

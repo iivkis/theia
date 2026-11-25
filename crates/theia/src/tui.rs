@@ -438,6 +438,7 @@ impl Interaction {
     }
 
     fn paste_record_field(&mut self, text: &str) {
+        if let Some(panel)=self.reality_status.as_mut(){panel.paste(text);return;}
         if let Some(panel) = self.reality_registration.as_mut() {
             panel.paste(text);
             return;

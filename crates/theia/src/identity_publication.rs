@@ -453,7 +453,7 @@ impl Publication {
         let (raw, record, checked) = self.snapshot()?;
         record.check_clock(now)?;
         if bootstrap::digest(&raw) != expected { return Err(Error::Approval); }
-        Ok(checked.current)
+        Ok(if checked.current.check_time(now).is_err(){checked.next.map(|(_,v)|v).unwrap_or(checked.current)}else{checked.current})
     }
 
     fn check_root(record: &Record, scope: &Scope, expected_root: [u8; 32],
@@ -559,17 +559,16 @@ impl Publication {
     pub fn documents(&self, now: u64) -> Result<(String, Option<String>), Error> {
         let (_, record, checked) = self.snapshot()?;
         record.check_clock(now)?;
-        checked
-            .current
-            .check_time(now)
-            .map_err(|_| Error::Descriptor)?;
-        if let Some((_, next)) = &checked.next {
-            next.check_time(now).map_err(|_| Error::Descriptor)?;
+        if checked.current.check_time(now).is_err(){
+            let pending=record.pending.ok_or(Error::Descriptor)?;
+            let (_,next)=checked.next.ok_or(Error::Descriptor)?;
+            next.check_time(now).map_err(|_|Error::Descriptor)?;
+            // Only the successor is exportable after overlap. Never export
+            // the expired old announcement as the current document.
+            return Ok((pending.successor_live.unwrap_or(pending.successor),None));
         }
-        Ok((
-            record.active_document,
-            record.pending.map(|pending| pending.successor),
-        ))
+        if let Some((_,next))=&checked.next{next.check_time(now).map_err(|_|Error::Descriptor)?;}
+        Ok((record.active_document,record.pending.map(|p|p.successor)))
     }
 
     pub fn refresh(

@@ -265,6 +265,61 @@ pub(crate) fn status_expected(path: &Path, expected: [u8; 32], id: &str, now: u6
 }
 
 
+fn exact_client_record(path:&Path,expected:[u8;32],id:&str)->Result<Profile,Error>{
+    path_string(path)?;
+    let raw=config::editor_bytes(path).map_err(|_|Error::Storage)?;
+    let digest:[u8;32]=Sha256::digest(&raw).into();
+    if digest!=expected{return Err(Error::Approval);}
+    let Config::Client(doc)=config::parse(std::str::from_utf8(&raw).map_err(|_|Error::Format)?)
+        .map_err(|_|Error::Format)? else{return Err(Error::Format);};
+    doc.client.profiles.into_iter().find(|p|p.id==id&&p.tls_profile=="smart-reality").ok_or(Error::Scope)
+}
+
+enum TrustApproval{
+    Recover(bootstrap::RecoveryApproval),
+    Promote(bootstrap::PromotionApproval),
+}
+pub(crate) struct TrustReview{
+    source:PathBuf,
+    approval:TrustApproval,
+    report:String,
+}
+impl TrustReview{
+    pub(crate) fn report(&self)->&str{&self.report}
+    pub(crate) fn prepare(path:&Path,digest:[u8;32],id:&str,source:&Path,promote:bool,now:u64)->Result<Self,Error>{
+        path_string(source)?;
+        let profile=exact_client_record(path,digest,id)?;
+        let enrollment=pinned_client(&profile)?;
+        let raw=bootstrap::read_text(source,crate::descriptor::MAX_DOCUMENT,false)?;
+        let (approval,report)=if promote{
+            let p=enrollment.preview_promotion(&raw,now)?;
+            (TrustApproval::Promote(bootstrap::PromotionApproval{
+                expected_revision:p.expected_revision,snapshot_sha256:p.snapshot_sha256,
+                document_sha256:p.document_sha256,next_identity_sha256:p.next_identity_sha256,
+            }),format!("Плановый переход identity\nrevision {} -> {}\nТекущий fingerprint={}\nСледующий fingerprint={}\nOverlap ends={}\nСверьте новый fingerprint по доверенному каналу. Это не recovery после компрометации; удалённое владение ключом будет проверено до bearer при подключении.",
+                p.expected_revision,p.next_revision,hex(p.current_identity_sha256),hex(p.next_identity_sha256),p.overlap_ends_at))
+        }else{
+            let p=enrollment.preview_recovery(&raw,now)?;
+            (TrustApproval::Recover(bootstrap::RecoveryApproval{
+                expected_revision:p.expected_revision,snapshot_sha256:p.snapshot_sha256,
+                document_sha256:p.document_sha256,identity_sha256:p.identity_sha256,
+            }),format!("Восстановление дескриптора под текущим закреплённым ключом\nrevision {} -> {}\nFingerprint={}\nИстёк={}; reference changed={}\nСмена identity запрещена.",
+                p.expected_revision,p.next_revision,hex(p.identity_sha256),p.current_expired,p.reference_changed))
+        };
+        Ok(Self{source:source.to_owned(),approval,report})
+    }
+    pub(crate) fn apply(self,path:&Path,digest:[u8;32],id:&str,now:u64)->Result<String,Error>{
+        let profile=exact_client_record(path,digest,id)?;
+        let enrollment=pinned_client(&profile)?;
+        let raw=bootstrap::read_text(&self.source,crate::descriptor::MAX_DOCUMENT,false)?;
+        match self.approval{
+            TrustApproval::Recover(approval)=>enrollment.recover(&raw,approval,now)?,
+            TrustApproval::Promote(approval)=>enrollment.promote(&raw,approval,now)?,
+        }
+        Ok("Trust store обновлён с CAS. TOML, bearer и OS proxy не изменены. Для проверки удалённого соединения запустите runtime отдельно.".into())
+    }
+}
+
 fn exact_server_record(path:&Path,expected:[u8;32],id:&str)->Result<Inbound,Error>{
     path_string(path)?;
     let bytes=config::editor_bytes(path).map_err(|_|Error::Storage)?;
