@@ -529,6 +529,7 @@ struct Wizard {
     focus: usize,
     advanced: bool,
     users: String,
+    available_users: Vec<String>,
     stage: WizardStage,
     error: String,
     registration: Option<RegistrationPanel>,
@@ -559,6 +560,7 @@ impl Wizard {
             users: editor
                 .record_user_catalog(crate::tui_editor::RecordAction::NewInbound)
                 .unwrap_or_default(),
+            available_users: editor.workspace_users().into_iter().filter_map(|(id, disabled, _)| (!disabled).then_some(id)).collect(),
             stage: WizardStage::Input,
             error: String::new(),
             registration: None,
@@ -586,6 +588,7 @@ impl Wizard {
             focus: 1,
             advanced: false,
             users: "Введите ID первого пользователя. Он будет отключён до явного выпуска токена.".into(),
+            available_users: Vec::new(),
             stage: WizardStage::Input,
             error: String::new(),
             registration: None,
@@ -635,6 +638,11 @@ impl Wizard {
                         if !self.visible_fields().contains(&self.focus) {
                             self.focus = 1;
                         }
+                    }
+                    KeyCode::F(6) if self.focus == 5 && !self.available_users.is_empty() => {
+                        let next = self.available_users.iter().position(|id| id == &self.fields[5])
+                            .map_or(0, |i| (i + 1) % self.available_users.len());
+                        self.fields[5] = self.available_users[next].clone();
                     }
                     KeyCode::Tab | KeyCode::Down => self.move_focus(true),
                     KeyCode::BackTab | KeyCode::Up => self.move_focus(false),
@@ -854,14 +862,26 @@ impl Wizard {
         }
         match &self.stage {
             WizardStage::Input => {
-                let mut out = String::from("Новый REALITY inbound. Без TLS cert/key.\n");
+                let mut out = String::from("СЕТЬ · без собственного TLS-сертификата\n\n");
                 for &i in self.visible_fields() {
-                    let label = if i == 1 && !self.advanced { "Порт (или bind)" } else if i == 5 && self.source.is_none() { "ID первого пользователя" } else { WIZARD_LABELS[i] };
-                    out.push_str(&format!("{} {label}: {}\n", if i == self.focus { ">" } else { " " }, self.fields[i]));
+                    if i == 5 { out.push_str("\nДОСТУП\n"); }
+                    let label = match i {
+                        1 if !self.advanced => "Порт TCP/UDP",
+                        2 => "Адрес сервера для клиентов (домен/IP без порта)",
+                        3 => "Собственные IP сервера (через запятую)",
+                        5 if self.source.is_none() => "ID первого пользователя",
+                        5 => "Пользователи с доступом (ID через запятую)",
+                        _ => WIZARD_LABELS[i],
+                    };
+                    let value = if self.fields[i].is_empty() { "[введите значение]" } else { self.fields[i].as_str() };
+                    out.push_str(&format!("{} {label}: {value}\n", if i == self.focus { ">" } else { " " }));
                 }
                 out.push_str(if self.advanced { "auto: подобрать по оценкам; manual: сохранить порядок.\nF2: скрыть расширенные.\n" } else { "ID создаётся автоматически; референсы подбираются из каталога.\nУкажите все собственные IP, включая публичный/NAT: это обязательная защита от self-reference.\nF2: расширенные (ID, домены/IP, manual).\n" });
                 out.push_str(&self.users);
-                out.push_str("\nEnter: проверить и подобрать; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
+                if !self.available_users.is_empty() {
+                    out.push_str("\nF6 на поле доступа: выбрать пользователя из списка.");
+                }
+                out.push_str("\nEnter: проверить и подобрать; ↑↓ / Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
                 out.push_str(&self.error); out
             }
             WizardStage::DnsConfirm(input) => format!("DNS: только перечисленные домены без заданного IP.\n{}\nНет TLS/QUIC соединений. y: DNS; n/Esc: отменить.", input.candidates.iter().map(|(name, ip)| format!("{name}: {}", ip.map_or("DNS".into(), |ip| ip.to_string()))).collect::<Vec<_>>().join("\n")),
@@ -1075,6 +1095,23 @@ impl ProvisionPanel {
             }
         }
         None
+    }
+
+    pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
+        let wizard = self.wizard.as_ref()?;
+        if wizard.registration.is_some() {
+            return Some((5, 5, "Сохранение TOML", "Enter предпросмотр · Y подтвердить · Esc назад"));
+        }
+        Some(match &wizard.stage {
+            WizardStage::Input => (1, 5, "Настройка сервера", "↑↓ поле · F2 расширенные · Enter проверить · Esc назад"),
+            WizardStage::DnsConfirm(_) => (2, 5, "Разрешение DNS", "Y разрешить DNS · N / Esc назад"),
+            WizardStage::Resolving(_, _) => (2, 5, "Получение адресов", "Esc отменить"),
+            WizardStage::ProbeConfirm(_) => (3, 5, "Проверка референсов", "Y проверить перечисленные адреса · N / Esc назад"),
+            WizardStage::Checking(_, _) => (3, 5, "Проверка TLS / QUIC", "Esc отменить"),
+            WizardStage::CreateConfirm(_) => (4, 5, "Результат подбора", "Y создать · N / Esc назад"),
+            WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => (5, 5, "Сохранение", "Идёт запись; сервер не запускается"),
+            WizardStage::Done(_) => (5, 5, "Результат записи", "Esc закрыть"),
+        })
     }
 
     pub(crate) fn body(&self) -> String {
