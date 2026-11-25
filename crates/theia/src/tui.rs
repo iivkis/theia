@@ -6227,6 +6227,265 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+
+    fn click_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn click_form_field(ui: &mut Interaction, model: &mut Model, area: Rect, id: usize) {
+        let form = ui.active_form().expect("visible form");
+        let target = guided_form_area(shell_layout(area)[1], form.fields.len());
+        let y = (target.y..target.bottom())
+            .find(|&y| form.hit(target, target.x + 2, y) == Some(id))
+            .expect("visible field");
+        ui.mouse(model, click_at(target.x + 2, y), area);
+        assert_eq!(ui.active_form().unwrap().selected, id);
+    }
+
+    #[test]
+    fn workspace_navigation_mouse_and_keyboard_never_commit_or_start() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("workspace-nav").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        for role in [Role::Server, Role::Client] {
+            let path = root.join(if role == Role::Server { "server.toml" } else { "client.toml" });
+            let original = if role == Role::Server {
+                server_issuance_fixture()
+            } else {
+                let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+                    panic!("client fixture");
+                };
+                let mut backup = doc.client.profiles[0].clone();
+                backup.id = "backup".into();
+                backup.server = "backup.example.org:443".into();
+                doc.client.profiles.push(backup);
+                Config::Client(doc).to_toml().unwrap()
+            };
+            std::fs::write(&path, &original).unwrap();
+            let mut model = Model::new(Some(role));
+            let mut ui = Interaction::new(Some(Editor::load(role, &path).unwrap()));
+            for area in [Rect::new(0, 0, 160, 42), Rect::new(0, 0, 70, 34)] {
+                let body = shell_layout(area)[1];
+                let columns = workspace_columns(body);
+                let nav = columns.map_or(body, |c| c[0]);
+                for page in 0..pages(role).len() {
+                    ui.workspace_focus = WorkspaceFocus::Navigation;
+                    ui.mouse(&mut model, click_at(nav.x + 2, nav.y + 1 + page as u16), area);
+                    assert_eq!(ui.workspace_page, page);
+                    assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+                    let navigation = rendered_interaction(area.width, area.height, &model, &ui);
+                    assert!(navigation.contains(pages(role)[page]));
+                    ui.update(&mut model, press(KeyCode::Enter));
+                    let expected_focus = if page == 1 { WorkspaceFocus::Fields } else if role == Role::Server && matches!(page, 2 | 3) { WorkspaceFocus::Users } else { WorkspaceFocus::Actions };
+                    assert_eq!(ui.workspace_focus, expected_focus);
+                    let view = rendered_interaction(area.width, area.height, &model, &ui);
+                    assert!(!view.contains("THEIA_AUTH_TOKEN"));
+                    assert!(!view.contains("token_sha256"));
+                    let details = columns.map_or(body, |c| c[2]);
+                    let layout = page_layout(details, role, page, ui.editor.as_ref());
+                    if page == 1 {
+                        let content = layout.map_or(details, |p| p[0]);
+                        let table = editor_layout(content).unwrap()[1];
+                        let y = (table.y..table.bottom()).find(|&y| editor_field_hit(content, ui.editor.as_ref().unwrap(), table.x + 2, y) == Some(1)).unwrap();
+                        ui.mouse(&mut model, click_at(table.x + 2, y), area);
+                        assert_eq!(ui.editor.as_ref().unwrap().workspace_field_index(), 1);
+                        assert!(!ui.editor.as_ref().unwrap().editing);
+                    } else if role == Role::Server && matches!(page, 2 | 3) {
+                        let content = layout.unwrap()[0];
+                        ui.mouse(&mut model, click_at(content.x + 2, content.y + 2), area);
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Users);
+                        assert_eq!(ui.workspace_user, 0);
+                        ui.update(&mut model, press(KeyCode::Down));
+                        assert_eq!(ui.workspace_user, 0);
+                        ui.update(&mut model, press(KeyCode::Tab));
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+                        ui.update(&mut model, press(KeyCode::BackTab));
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Users);
+                    }
+                    if let Some([_, controls]) = layout {
+                        let items = page_actions(role, page, ui.editor.as_ref());
+                        let actions = Actions { items: &items, selected: ui.visible_workspace_action(role) };
+                        let found = (controls.y..controls.bottom()).find_map(|y| actions.hit(controls, controls.x + 2, y).map(|i| (y, i)));
+                        if let Some((y, i)) = found {
+                            ui.mouse(&mut model, click_at(controls.x + 2, y), area);
+                            assert_eq!(ui.workspace_action, i);
+                            assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+                            ui.update(&mut model, press(KeyCode::End));
+                            assert_eq!(ui.workspace_action, items.len() - 1);
+                            ui.update(&mut model, press(KeyCode::Home));
+                            assert_eq!(ui.workspace_action, 0);
+                            ui.update(&mut model, press(KeyCode::Tab));
+                            assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+                        }
+                    }
+                    assert!(ui.workspace_visible());
+                    assert!(!ui.owned_running(role));
+                    assert!(!ui.editor.as_ref().unwrap().dirty());
+                }
+            }
+            ui.select_workspace_page(role, 0);
+            ui.update(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+            assert_eq!(ui.workspace_page, pages(role).len() - 1);
+            ui.update(&mut model, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+            assert_eq!(ui.workspace_page, 0);
+            ui.update(&mut model, press(KeyCode::F(6)));
+            assert_eq!(ui.workspace_focus, WorkspaceFocus::Fields);
+            ui.update(&mut model, press(KeyCode::F(6)));
+            assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+            ui.update(&mut model, press(KeyCode::F(6)));
+            assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+            if role == Role::Client {
+                let area = Rect::new(0, 0, 160, 42);
+                let records = workspace_columns(shell_layout(area)[1]).unwrap()[1];
+                ui.select_workspace_page(role, 3);
+                ui.mouse(&mut model, click_at(records.x + 2, records.y + 2), area);
+                let editor = ui.editor.as_ref().unwrap();
+                assert_eq!(editor.selected_record_id(), "backup");
+                assert!(!editor.selected_record_is_active());
+                assert_eq!(recommended_step(editor, false).0, 'A');
+                assert_eq!(recommended_step(editor, true).0, 'V');
+                let view = rendered_interaction(160, 42, &model, &ui);
+                assert!(view.contains("Активный профиль: home"));
+                assert!(view.contains("Перед запуском подтвердите выбор профиля"));
+            }
+            ui.select_workspace_page(role, 4);
+            ui.update(&mut model, press(KeyCode::Enter));
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(ui.traffic_monitor.is_some());
+            assert!(rendered_interaction(60, 18, &model, &ui).contains("Монитор трафика"));
+            ui.poll_navigation(&mut model);
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(ui.traffic_monitor.is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(!ui.owned_running(role));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn modal_mouse_and_safe_preview_select_fields_without_side_effects() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("modal-mouse").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("server.toml");
+        let original = server_issuance_fixture();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        let area = Rect::new(0, 0, 160, 42);
+        ui.records = Some(RecordFlow::ChooseMode(Role::Server, 0));
+        click_form_field(&mut ui, &mut model, area, 1);
+        ui.update(&mut model, press(KeyCode::F(7)));
+        assert!(ui.value_preview);
+        assert!(rendered_interaction(160, 42, &model, &ui).contains("SmartTheia REALITY"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.records.is_some());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.records.is_none());
+
+        ui.reality_registration = Some(RegistrationPanel::new(ui.editor.as_ref().unwrap()).unwrap());
+        click_form_field(&mut ui, &mut model, area, 1);
+        ui.paste_record_field("test-material");
+        ui.update(&mut model, press(KeyCode::F(7)));
+        assert!(ui.value_preview);
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.reality_registration.is_none());
+
+        ui.reality_provision = Some(ProvisionPanel::new());
+        click_form_field(&mut ui, &mut model, area, 1);
+        ui.paste_record_field("test-reference");
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.reality_provision.is_none());
+
+        ui.issue_kind = IssueKind::Rotation;
+        ui.issuance = Some(IssueFlow::Input(String::new()));
+        let form = user_picker(ui.editor.as_ref(), "", false).unwrap();
+        let target = guided_form_area(shell_layout(area)[1], form.fields.len());
+        let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y) == Some(0)).unwrap();
+        ui.mouse(&mut model, click_at(target.x + 2, y), area);
+        assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-a"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.revocation = Some(DisableFlow::Input(String::new()));
+        ui.mouse(&mut model, click_at(target.x + 2, y), area);
+        assert!(matches!(&ui.revocation, Some(DisableFlow::Input(id)) if id == "device-a"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.revocation.is_none());
+        assert!(!ui.owned_running(Role::Server));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let path = root.join("client.toml");
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.reality_enrollment = Some(EnrollmentPanel::new());
+        click_form_field(&mut ui, &mut model, area, 1);
+        ui.paste_record_field("test-admission");
+        ui.update(&mut model, press(KeyCode::F(7)));
+        assert!(ui.value_preview);
+        assert!(!rendered_interaction(160, 42, &model, &ui).contains("test-admission"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.reality_enrollment.is_none());
+        ui.importing = Some(ImportFlow::Input(Zeroizing::new(String::new())));
+        ui.paste_import_source("not-an-invitation");
+        ui.update(&mut model, press(KeyCode::F(6)));
+        assert!(ui.import_browser.is_some());
+        let form = ui.active_form().unwrap();
+        let target = guided_form_area(shell_layout(area)[1], form.fields.len());
+        let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y).is_some()).unwrap();
+        ui.mouse(&mut model, click_at(target.x + 2, y), area);
+        assert!(ui.import_browser.is_some());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.import_browser.is_none());
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "not-an-invitation"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(!ui.owned_running(Role::Client));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn qr_worker_cancellation_and_failure_never_import_or_write() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("qr-events").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("client.toml");
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        let (tx, rx) = mpsc::channel();
+        ui.qr_scan = Some(QrScan { source: Zeroizing::new("local.png".into()), done: rx, cancelled: false });
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("Локальное декодирование"));
+        ui.poll_navigation(&mut model);
+        assert!(ui.qr_scan.is_some());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("Импорт отменён"));
+        tx.send(Ok(Zeroizing::new("discarded-private-value".into()))).unwrap();
+        ui.poll_navigation(&mut model);
+        assert!(ui.qr_scan.is_none() && ui.importing.is_none());
+        for disconnected in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            ui.qr_scan = Some(QrScan { source: Zeroizing::new("local.png".into()), done: rx, cancelled: false });
+            if !disconnected {
+                tx.send(Err("QR image rejected")).unwrap();
+            }
+            drop(tx);
+            ui.poll_navigation(&mut model);
+            assert!(ui.qr_scan.is_none());
+            assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "local.png"));
+            assert!(ui.editor.as_ref().unwrap().error.is_some());
+            ui.update(&mut model, press(KeyCode::Esc));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!ui.owned_running(Role::Client));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn render(width: u16, height: u16, model: Model) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
