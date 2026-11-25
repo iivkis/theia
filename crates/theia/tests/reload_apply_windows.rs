@@ -9,7 +9,7 @@ use rustls::RootCertStore;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    net::{TcpListener as StdTcp, UdpSocket},
+    io::Write,
     path::Path,
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -31,6 +31,9 @@ use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
 };
+#[path = "support/shared_port.rs"]
+mod shared_port;
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Running(Child);
 impl Drop for Running {
@@ -97,17 +100,16 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
             STANDARD.encode(generated.key_pair.serialize_der())
         );
         fs::write(&cert_path, &cert).unwrap();
-        fs::write(&key_path, &key).unwrap();
+        {
+            let mut private = theia::client_import::create_private_file(&key_path)
+                .expect("create protected Windows TLS key fixture");
+            private.write_all(key.as_bytes()).unwrap();
+            private.sync_all().unwrap();
+        }
 
         let mut roots = RootCertStore::empty();
         roots.add(generated.cert.der().clone()).unwrap();
-        let (tcp_reservation, udp_reservation) = (0..32)
-            .find_map(|_| {
-                let tcp = StdTcp::bind("127.0.0.1:0").ok()?;
-                let udp = UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
-                Some((tcp, udp))
-            })
-            .expect("reserve common TCP/UDP port");
+        let (tcp_reservation, udp_reservation) = shared_port::reserve_shared_port();
         let tcp = tcp_reservation.local_addr().unwrap().port();
         let udp = udp_reservation.local_addr().unwrap().port();
         let mut doc = ServerDocument {
@@ -146,6 +148,10 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
             },
         };
         save(&toml, &doc);
+        assert!(
+            theia::server::tls_fingerprint_file(&toml).is_ok(),
+            "Windows Apply fixture must satisfy the protected PEM reader and TLS builders"
+        );
         drop(tcp_reservation);
         drop(udp_reservation);
         let mut server = Running(
@@ -169,7 +175,9 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
                 {
                     break;
                 }
-                assert!(server.0.try_wait().unwrap().is_none(), "server exited");
+                if let Some(status) = server.0.try_wait().unwrap() {
+                    panic!("Windows Apply server exited before management readiness: {status}");
+                }
                 sleep(Duration::from_millis(25)).await;
             }
         })
