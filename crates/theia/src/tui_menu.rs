@@ -200,7 +200,11 @@ impl Menu {
         let count = self.count();
         self.notice = None;
         let next = match key {
-            KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::F(10) => {
+            KeyCode::Left => {
+                self.item = None;
+                return None;
+            }
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::F(10) => {
                 if self.item.take().is_none() || key == KeyCode::F(10) {
                     return Some(Action::Close);
                 }
@@ -2044,7 +2048,11 @@ mod tests {
     #[test]
     fn opens_existing_actions_without_requiring_shortcuts() {
         let mut m = Menu::new(Role::Server, true);
-        assert_eq!(m.key(KeyCode::Enter), None);
+        assert_eq!(m.key(KeyCode::Left), None);
+        assert!(m.item.is_none());
+        assert_eq!(m.key(KeyCode::Right), None);
+        assert_eq!(m.item, Some(0));
+        assert_eq!(m.key(KeyCode::Right), None);
         assert_eq!(m.key(KeyCode::Enter), Some(Action::ServerProcess));
         assert_eq!(m.key(KeyCode::Down), None);
         assert_eq!(m.key(KeyCode::Enter), Some(key('v')));

@@ -578,7 +578,15 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
                 (Role::Client, 'V') if page == 3 && !active => "Состояние выбранного профиля",
                 _ => label,
             };
-            available.then_some(ActionItem { key, label })
+            // The overview is a starting point, not a second command catalog.
+            // Keep the next recommended action (both possible runtime states)
+            // and the everyday entry points; the dedicated sections retain the
+            // rest of the operations.
+            let overview = page != 0
+                || matches!((role, key), (Role::Server, 's' | 'N' | 'u') | (Role::Client, 'P' | 'i'))
+                || key == recommended_step(editor, false).0
+                || key == recommended_step(editor, true).0;
+            (available && overview).then_some(ActionItem { key, label })
         })
         .collect()
 }
@@ -1084,6 +1092,7 @@ impl Interaction {
         let field = self.editor_for(role).map_or(0, Editor::workspace_field_index);
         let users = self.editor_for(role).map_or(0, |e| e.workspace_users().len());
         let action_count = page_actions(role, self.workspace_page, self.editor_for(role)).len();
+        self.workspace_action = self.workspace_action.min(action_count.saturating_sub(1));
         let from_detail = if count > 0 && (self.workspace_page == 1
             || (role == Role::Server && matches!(self.workspace_page, 2 | 3))
             || (role == Role::Client && self.workspace_page == 3)) {
@@ -2501,11 +2510,10 @@ impl Interaction {
                 } {
                     KeyCode::Up
                     | KeyCode::Down
-                    | KeyCode::Left
-                    | KeyCode::Right
                     | KeyCode::Tab
                     | KeyCode::BackTab => {
-                        self.records = Some(RecordFlow::ChooseMode(role, 1 - selected));
+                        let next = if matches!(key.code, KeyCode::Down | KeyCode::Tab) { 1 } else { 0 };
+                        self.records = Some(RecordFlow::ChooseMode(role, next));
                     }
                     KeyCode::Char('1') => {
                         let action = if role == Role::Server {
@@ -4199,7 +4207,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "НАЧАЛО РАБОТЫ\n← →: выбрать роль   Enter: открыть   Esc: назад\nF1: справка   q / Ctrl+C: выйти\n\nНАВИГАЦИЯ\nF2: все действия   F3: открыть файл   F4: трафик\n← →: перейти между областями   ↑ ↓: выбрать строку\nВнизу списка разделов можно перейти к профилям или подключениям.\nВнизу таблицы параметров или пользователей — к действиям.\nEnter: открыть или изменить выбранное поле\nTab, F6 и Alt+←/→ доступны как дополнительные shortcuts.\n\nСЕРВЕР\nN: новое подключение   W: мастер REALITY   F5: запуск и остановка\nu: новый пользователь   G: права доступа   x: отключение\nb: восстановление   t: новый токен   l: публичное приглашение\nv: состояние   Ctrl+R: предпросмотр применения прав\n\nКЛИЕНТ\ni: импорт ссылки, файла или QR   V: подключение и состояние\nN: новый профиль   A: выбрать активный профиль\n\nБЕЗОПАСНОСТЬ\nCtrl+S: сохранить файл, не менять работающий процесс.\nИзменение работающего процесса, доверия и сетевые запросы требуют отдельного подтверждения.",
+            "НАЧАЛО РАБОТЫ\n← →: выбрать роль   Enter: открыть   Esc: назад\nF1: справка   q / Ctrl+C: выйти\n\nНАВИГАЦИЯ\nF2: все действия   F3: открыть файл   F4: трафик\n← →: перейти между областями   ↑ ↓: выбрать строку\nВнизу списка разделов можно перейти к профилям или подключениям.\nВнизу таблицы параметров или пользователей — к действиям.\nEnter: открыть или изменить выбранное поле\nTab, F6 и Alt+←/→ — дополнительные сочетания.\n\nСЕРВЕР\nN: новое подключение   W: мастер REALITY   F5: запуск и остановка\nu: новый пользователь   G: права доступа   x: отключение\nb: восстановление   t: новый токен   l: публичное приглашение\nv: состояние   Ctrl+R: предпросмотр применения прав\n\nКЛИЕНТ\ni: импорт ссылки, файла или QR   V: подключение и состояние\nN: новый профиль   A: выбрать активный профиль\n\nБЕЗОПАСНОСТЬ\nCtrl+S: сохранить файл, не менять работающий процесс.\nИзменение работающего процесса, доверия и сетевые запросы требуют отдельного подтверждения.",
             true,
         ),
     }
@@ -4618,11 +4626,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             Screen::Server | Screen::Client if interaction.is_some_and(|ui| Interaction::panel_role(model).is_some_and(|role| ui.editor_for(role).is_none())) => {
                 "↑ ↓ выбор · Enter открыть · Esc назад · F1 помощь"
             }
-            Screen::Server => {
-                "← → область · ↑ ↓ выбор · Enter открыть · Esc назад · F1 помощь"
-            }
-            Screen::Client => {
-                "← → область · ↑ ↓ выбор · Enter открыть · Esc назад · F1 помощь"
+            Screen::Server | Screen::Client => {
+                match interaction.map(|ui| ui.workspace_focus) {
+                    Some(WorkspaceFocus::Navigation) => "↑ ↓ разделы / записи · → открыть область · Esc назад · F1 помощь",
+                    Some(WorkspaceFocus::Records) => "↑ ↓ записи · ← разделы · → открыть область · Esc назад",
+                    Some(WorkspaceFocus::Fields | WorkspaceFocus::Users) => "↑ ↓ строки / действия · ← список записей · Enter открыть · Esc назад",
+                    _ => "↑ ↓ действия · ← назад к списку · Enter открыть · Esc назад · F1 помощь",
+                }
             }
         }
     };
@@ -5553,10 +5563,6 @@ fn draw_page(
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Line::raw(help),
-                Line::styled(
-                    next_label,
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                ),
                 Line::raw("Сохранение не запускает процесс."),
             ];
             frame.render_widget(

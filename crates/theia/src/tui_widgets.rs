@@ -796,7 +796,14 @@ mod tests {
             },
         ];
         let mut focus = 0;
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Up), None);
+        assert_eq!(focus, 0);
         assert_eq!(action_key(&items, &mut focus, KeyCode::Down), None);
+        assert_eq!(focus, 1);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::End), None);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Down), None);
+        assert_eq!(focus, 2);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Up), None);
         assert_eq!(focus, 1);
         assert_eq!(
             action_key(&items, &mut focus, KeyCode::Enter),
