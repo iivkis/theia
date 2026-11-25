@@ -38,9 +38,10 @@ pub(crate) fn section(title: &str, active: bool) -> Block<'_> {
 /// Reports share semantic title and key styling without interpreting their
 /// contents as commands. In particular, an invitation can never trigger an action.
 pub(crate) fn report_section(title: &str, active: bool) -> Block<'_> {
-    let color = if title.contains("Ошибка") || title.contains("НЕ удалось") || title.contains("не выполнен") || title.contains("заблокирована") {
+    let lower = title.to_lowercase();
+    let color = if lower.contains("ошибка") || lower.contains("не удалось") || lower.contains("не выполнен") || lower.contains("заблокирована") || lower.contains("не подтверждён") {
         ERROR
-    } else if title.contains("Подтверждение") || title.contains("СЕКРЕТ") || title.contains("Не сохранено") {
+    } else if lower.contains("подтверждение") || lower.contains("секрет") || lower.contains("не сохранено") {
         WARNING
     } else if active { ACCENT } else { MUTED };
     Block::default()
@@ -193,7 +194,7 @@ impl Form {
             }
         }
         let field = self.fields.iter().find(|f| f.id == self.selected);
-        let hint = field.map_or("", |f| f.hint);
+        let hint = field.map_or("Выберите строку стрелками или мышью.", |f| f.hint);
         let (message, color) = if self.error.is_empty() { (hint, MUTED) } else { (self.error.as_str(), ERROR) };
         if g.help.height > 0 {
             if g.help.x >= g.rows.right() {
