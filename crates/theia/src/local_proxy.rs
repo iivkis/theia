@@ -1883,7 +1883,8 @@ mod selector_tests {
                     task.abort();
                     let _ = task.await;
                 }
-                assert!(matches!((&current.carrier, socks_mode),
+                assert!(matches!(
+                    (&current.carrier, socks_mode),
                     (RealityCarrier::H2(_), false) | (RealityCarrier::H3(_), true)
                 ));
                 let http = TcpListener::bind("127.0.0.1:0").await.unwrap();

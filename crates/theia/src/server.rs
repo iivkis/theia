@@ -2023,7 +2023,13 @@ async fn prepare_selected_listeners(
                 inbound.id.clone(),
                 (binding.manifest_sha256, carrier.clone()),
             );
-            listeners.push(ReadyListener::Reality(tcp, quic, silent, Box::new(manager), carrier));
+            listeners.push(ReadyListener::Reality(
+                tcp,
+                quic,
+                silent,
+                Box::new(manager),
+                carrier,
+            ));
             continue;
         }
         let material = match captured {
@@ -3254,7 +3260,13 @@ async fn run_reality_document_inner(
                     live_generation.clone(),
                 ),
             );
-            ready.push(Ready::Reality(tcp, quic, silent, Box::new(manager), live_generation));
+            ready.push(Ready::Reality(
+                tcp,
+                quic,
+                silent,
+                Box::new(manager),
+                live_generation,
+            ));
         } else {
             let material = tls_material(inbound)?;
             #[cfg(any(target_os = "linux", target_os = "windows"))]
