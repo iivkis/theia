@@ -301,8 +301,8 @@ require("test_independent_h2_probe.py" in spec and "test_ci_timing.py" in spec,
         "cheap probe and timing regressions must run")
 require("client_binary_chromium_socks5_over_h3 -- --ignored --exact" in job("browser-e2e"),
         "native browser functional navigation over explicit H3 must run")
-require("actual_chromium_h2_settings_and_pseudo_order_reference" in job("browser-e2e"),
-        "real browser H2 reference remains mandatory")
+require("run_f13_observations.py f13-observations" in browser,
+        "real browser reference runner remains mandatory")
 
 require(
     "concurrency:" in workflow
@@ -362,11 +362,17 @@ require("native_binary_performance_comparison" in browser
         and "--require-comparison --policy tests/benchmark/native-diagnostic-policy.json" in browser
         and "Build exact native baseline before candidate" in browser,
         "native baseline and candidate comparison remains mandatory")
-require("actual_native_h3_client_initial_reference" in browser
-        and "real_default_h2_settings_and_pseudo_headers_are_measured" in browser
-        and "check_f13_observations.py f13-observations" in browser
+f13_runner = Path("tests/benchmark/run_f13_observations.py").read_text(encoding="utf-8")
+require(all(case in f13_runner for case in (
+            "actual_native_h3_client_initial_reference",
+            "real_default_h2_settings_and_pseudo_headers_are_measured",
+            "actual_chromium_h2_settings_and_pseudo_order_reference",
+            "actual_chromium_h3_initial_reference"))
+        and "run_f13_observations.py f13-observations" in browser
+        and "--samples 3" in browser
+        and "check_f13_observations.py f13-observations --expected-revision" in browser
         and "test_f13_observations.py" in spec,
-        "real native and browser first-flight observation matrix must remain mandatory")
+        "repeated exact-revision native and browser observation matrix must remain mandatory")
 require("test_benchmark_ports.py" in spec and "test_benchmark_ports.py" in browser,
         "native benchmark transport-specific port reservation regressions remain mandatory")
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")

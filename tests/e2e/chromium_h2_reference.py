@@ -7,16 +7,19 @@ loopback fixture certificate. Production Theia never changes TLS verification.
 No external URLs, proxies, raw HPACK, or credentials are recorded.
 """
 import asyncio
+import base64
 import ipaddress
 import sys
 from playwright.async_api import async_playwright
 
 
-async def scenario(endpoint: str) -> None:
+async def scenario(endpoint: str, spki: str) -> None:
     host, sep, port = endpoint.rpartition(":")
     assert sep and host == "127.0.0.1" and port.isdigit()
     assert ipaddress.ip_address(host).is_loopback
     assert 1 <= int(port) <= 65535
+    if len(base64.b64decode(spki, validate=True)) != 32:
+        raise ValueError("exact fixture SHA-256 SPKI pin required")
     url = f"https://localhost:{port}/ci-chromium-h2-reference"
 
     async with async_playwright() as playwright:
@@ -26,6 +29,7 @@ async def scenario(endpoint: str) -> None:
                 "--disable-background-networking",
                 "--disable-component-update",
                 "--disable-quic",
+                f"--ignore-certificate-errors-spki-list={spki}",
                 "--no-first-run",
                 "--no-proxy-server",
                 "--host-resolver-rules=MAP localhost 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
@@ -33,11 +37,10 @@ async def scenario(endpoint: str) -> None:
             timeout=20000,
         )
         try:
-            # Narrow trust exception for browser REFERENCE ONLY, never Theia.
-            # The test server is generated and reachable only via 127.0.0.1.
-            context = await browser.new_context(
-                ignore_https_errors=True, service_workers="block"
-            )
+            if browser.version != "159.0.8154.6":
+                raise RuntimeError("unexpected Chromium reference version")
+            # The exact ephemeral fixture SPKI is the only trust exception.
+            context = await browser.new_context(service_workers="block")
             try:
                 async def only_fixture(route):
                     if route.request.url == url:
@@ -52,6 +55,8 @@ async def scenario(endpoint: str) -> None:
                 )
                 assert response is not None and response.status == 200
                 assert (await page.locator("#h2-reference").inner_text()) == "chromium-h2"
+                protocol = await page.evaluate("performance.getEntriesByType('navigation')[0].nextHopProtocol")
+                assert protocol == "h2", "browser did not use HTTP/2"
                 print("Actual Chromium HTTPS/H2 loopback navigation succeeded")
             finally:
                 await context.close()
@@ -60,6 +65,6 @@ async def scenario(endpoint: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: chromium_h2_reference.py <127.0.0.1:port>")
-    asyncio.run(asyncio.wait_for(scenario(sys.argv[1]), timeout=45))
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: chromium_h2_reference.py <127.0.0.1:port> SPKI_SHA256")
+    asyncio.run(asyncio.wait_for(scenario(sys.argv[1], sys.argv[2]), timeout=45))

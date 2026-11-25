@@ -31,6 +31,9 @@ class ClassifierEvidenceTests(unittest.TestCase):
         self.assertEqual(row["delta_tpr"], -1)
         self.assertEqual(row["paired_outcomes"], dict(off_only=1,on_only=0,both=0,neither=0))
         self.assertGreater(row["true_positive_on"]["upper95"], 0)
+        lo, hi = row["paired_delta_tpr_interval95_approx"]
+        self.assertLessEqual(lo, -1)
+        self.assertGreater(hi, 0)
 
     def test_provenance_and_full_matrix_are_required_when_requested(self):
         doc = example()
@@ -61,6 +64,31 @@ class ClassifierEvidenceTests(unittest.TestCase):
             change(d)
             with self.assertRaises(ValueError):
                 checker.report(d)
+
+    def test_policy_never_confers_acceptance_and_requires_full_matrix(self):
+        d = example()
+        policy = dict(schema=1, baseline_revision=d["baseline_revision"],
+                      candidate_revision=d["candidate_revision"], model_sha256=d["model_sha256"],
+                      calibration_sha256=d["calibration_sha256"], threshold=d["threshold"],
+                      min_reference_groups_per_stratum=400, min_tunnel_pairs_per_stratum=100,
+                      max_upper95_fpr=.01, min_absolute_tpr_reduction=.1)
+        with self.assertRaises(ValueError):
+            checker.evaluate_predeclared_policy(checker.report(d), policy)
+        # Synthetic groups exercise numeric checks only, not evidence of efficacy.
+        original = d["rows"]
+        d["required_strata"] = [[p,t] for p in ("linux","windows") for t in ("h2","h3")]
+        d["rows"] = []
+        for i, (p,t) in enumerate(d["required_strata"]):
+            for row in original:
+                d["rows"].append(dict(row, platform=p, transport=t,
+                                      group=f"{int(row['group'], 16)+1000*(i+1):064x}"))
+        result = checker.evaluate_predeclared_policy(checker.report(d, full_matrix=True), policy)
+        self.assertEqual(result["status"], "numeric_prerequisites_not_met")
+        self.assertEqual(result["acceptance"], "not_evaluated")
+        self.assertTrue(all("insufficient_tunnel_pairs" in r["failures"] for r in result["strata"]))
+        policy["threshold"] = .9
+        with self.assertRaises(ValueError):
+            checker.evaluate_predeclared_policy(checker.report(d), policy)
 
 
 if __name__ == "__main__":

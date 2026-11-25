@@ -1,7 +1,7 @@
 //! M3.4g CI-only actual Chromium H2 reference, not a TLS/X.509 verification
 //! test. This is a research comparison with Theia's measured H2 baseline.
-//! The browser context alone accepts a generated loopback-only test cert;
-//! production Theia (default rustls/optional BoringSSL) still verifies PKI.
+//! Chromium trusts only the generated loopback fixture SPKI. This does not
+//! establish browser PKI parity; production Theia still verifies PKI.
 #[path = "../../../spikes/m0_1/src/client_hello.rs"]
 mod client_hello;
 #[path = "support/f13_evidence.rs"]
@@ -28,7 +28,9 @@ fn emit_tls(name: &str, capture: &Arc<Mutex<Capture>>) {
     f13_evidence::emit(name, &json);
 }
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use h2_wire::{inspect, Observation, MAX_CAPTURE_BYTES};
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::{
@@ -114,6 +116,7 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
         let cert =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
                 .unwrap();
+        let spki = STANDARD.encode(Sha256::digest(cert.key_pair.public_key_der()));
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -210,6 +213,7 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
             Command::new("python")
                 .arg(reference_script)
                 .arg(&endpoint)
+                .arg(spki)
                 .output()
                 .expect("Playwright Chromium runner available in CI")
         });

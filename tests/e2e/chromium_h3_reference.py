@@ -28,6 +28,8 @@ async def scenario(endpoint: str, spki: str) -> None:
             timeout=15000,
         )
         try:
+            if browser.version != "159.0.8154.6":
+                raise RuntimeError("unexpected Chromium reference version")
             context = await browser.new_context(service_workers="block")
             try:
                 async def only_fixture(route):

@@ -401,6 +401,19 @@ fn emit_initial(name: &str, initial: InitialShape) {
     f13_evidence::emit(name, &json);
 }
 
+// Server-side negotiated facts, not an estimate of encrypted packet contents.
+// No SNI text, header names/values, key material, or raw frames are retained.
+fn emit_h3_session(name: &str, connection: &quinn::Connection, request: &http::Request<()>) {
+    let handshake = connection.handshake_data().unwrap()
+        .downcast::<quinn::crypto::rustls::HandshakeData>().unwrap();
+    assert_eq!(handshake.protocol.as_deref(), Some(b"h3".as_slice()));
+    let json = format!(
+        "{{\"alpn_h3\":true,\"sni_present\":{},\"ordinary_fields\":{}}}",
+        handshake.server_name.is_some(), request.headers().len()
+    );
+    f13_evidence::emit(name, &json);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_native_h3_client_initial_reference() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -433,6 +446,7 @@ async fn actual_native_h3_client_initial_reference() {
                 .unwrap();
             assert_eq!(request.method(), http::Method::POST);
             assert_eq!(request.uri().path(), "/v1/theia-example/session");
+            emit_h3_session("native-h3-session.json", &connection, &request);
             stream
                 .send_response(http::Response::builder().status(403).body(()).unwrap())
                 .await
@@ -498,6 +512,7 @@ async fn actual_chromium_h3_initial_reference() {
             let (request, mut stream) = resolver.resolve_request().await.unwrap();
             assert_eq!(request.method(), http::Method::GET);
             assert_eq!(request.uri().path(), "/ci-chromium-h3-reference");
+            emit_h3_session("browser-h3-session.json", &connection, &request);
             assert!(stream.recv_data().await.unwrap().is_none());
             stream.send_response(http::Response::builder().status(200)
                 .header("content-type", "text/html; charset=utf-8").body(()).unwrap())
