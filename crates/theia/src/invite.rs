@@ -17,6 +17,7 @@ const MAX_URI: usize = 4096;
 /// This type may contain a live 32-byte bearer secret. No derived Debug.
 pub struct Invitation {
     pub id: String,
+    pub path_prefix: String,
     pub endpoint: String,
     pub server_name: String,
     pub transport: Transport,
@@ -64,21 +65,19 @@ impl Drop for Invitation {
 #[serde(rename_all = "kebab-case")]
 enum WireSecurity {
     OwnTls,
-    PinnedTls,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Wire {
     version: u32,
+    path_prefix: String,
     id: String,
     endpoint: String,
     server_name: String,
     carrier: String,
     security_mode: WireSecurity,
     xhttp_mode: XhttpMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    leaf_sha256: Option<String>,
     transport: Transport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
@@ -97,12 +96,13 @@ impl Invitation {
     pub fn public_from_profile(profile: &Profile) -> Result<Self, InviteError> {
         if profile.reality_profile.is_some()
             || profile.tls_profile == "smart-reality"
-            || (profile.xhttp_mode.is_some() && profile.tls_profile != "default")
+            || profile.tls_profile != "default"
         {
             return Err(InviteError::Invalid);
         }
         let invite = Self {
             id: profile.id.clone(),
+            path_prefix: profile.path_prefix.clone().ok_or(InviteError::Invalid)?,
             endpoint: profile.server.clone(),
             server_name: profile.server_name.clone(),
             transport: profile.transport,
@@ -146,30 +146,17 @@ impl Invitation {
         if h2.port() != h3.port() {
             return Err(InviteError::IncompatiblePorts);
         }
-        let tls_profile = if inbound.security_mode.is_plain() {
-            "default".into()
-        } else {
-            let pin = crate::server::configured_certificate_pin(inbound)
-                .map_err(|_| InviteError::Unavailable)?;
-            if inbound.security_mode.is_stream_up() {
-                pin.stream_up_profile()
-            } else {
-                pin.profile()
-            }
-        };
+        if !inbound.security_mode.is_plain() {
+            return Err(InviteError::Unavailable);
+        }
         let invite = Self {
             id: inbound.id.clone(),
+            path_prefix: inbound.path_prefix.clone().ok_or(InviteError::Invalid)?,
             endpoint: format!("{}:{}", inbound.server_name, h2.port()),
             server_name: inbound.server_name.clone(),
             transport: Transport::Auto,
-            tls_profile,
-            xhttp_mode: if inbound.security_mode.is_plain() {
-                XhttpMode::Auto
-            } else if inbound.security_mode.is_stream_up() {
-                XhttpMode::StreamUp
-            } else {
-                XhttpMode::StreamOne
-            },
+            tls_profile: "default".into(),
+            xhttp_mode: XhttpMode::Auto,
             token: None,
         };
         invite.check()?;
@@ -214,36 +201,15 @@ impl Invitation {
     /// Returned URI is confidential whenever it contains a token.
     pub fn encode(&self) -> Result<String, InviteError> {
         self.check()?;
-        let (security_mode, xhttp_mode, leaf_sha256) = if self.tls_profile == "default" {
-            (WireSecurity::OwnTls, self.xhttp_mode, None)
-        } else {
-            let pin = crate::security_profile::CertificatePin::parse_profile(&self.tls_profile)
-                .ok_or(InviteError::Invalid)?;
-            let stream_up =
-                crate::security_profile::CertificatePin::is_stream_up_profile(&self.tls_profile);
-            let profile = pin.profile();
-            let leaf = profile
-                .strip_prefix("pinned-cert-v1:")
-                .ok_or(InviteError::Invalid)?;
-            (
-                WireSecurity::PinnedTls,
-                if stream_up {
-                    XhttpMode::StreamUp
-                } else {
-                    XhttpMode::StreamOne
-                },
-                Some(leaf.to_owned()),
-            )
-        };
         let wire = Wire {
             version: 1,
+            path_prefix: self.path_prefix.clone(),
             id: self.id.clone(),
             endpoint: self.endpoint.clone(),
             server_name: self.server_name.clone(),
             carrier: "smarttheia-xhttp".into(),
-            security_mode,
-            xhttp_mode,
-            leaf_sha256,
+            security_mode: WireSecurity::OwnTls,
+            xhttp_mode: self.xhttp_mode,
             transport: self.transport,
             token: self.token.as_ref().map(|v| URL_SAFE_NO_PAD.encode(v)),
         };
@@ -287,25 +253,8 @@ impl Invitation {
         if wire.version != 1 || wire.carrier != "smarttheia-xhttp" {
             return Err(InviteError::Invalid);
         }
-        let tls_profile = match (
-            wire.security_mode,
-            wire.xhttp_mode,
-            wire.leaf_sha256.as_deref(),
-        ) {
-            (WireSecurity::OwnTls, _, None) => "default".into(),
-            (WireSecurity::PinnedTls, mode, Some(leaf)) => {
-                let prefix = match mode {
-                    XhttpMode::StreamOne => "pinned-cert-v1:",
-                    XhttpMode::StreamUp => "pinned-cert-stream-up-v1:",
-                    XhttpMode::Auto => return Err(InviteError::Invalid),
-                };
-                let profile = format!("{prefix}{leaf}");
-                crate::security_profile::CertificatePin::parse_profile(&profile)
-                    .ok_or(InviteError::Invalid)?;
-                profile
-            }
-            _ => return Err(InviteError::Invalid),
-        };
+        let WireSecurity::OwnTls = wire.security_mode;
+        let tls_profile = "default".into();
         let token = match wire.token.as_ref() {
             Some(raw) => {
                 let value = Zeroizing::new(
@@ -328,6 +277,7 @@ impl Invitation {
         };
         let invite = Self {
             id: std::mem::take(&mut wire.id),
+            path_prefix: std::mem::take(&mut wire.path_prefix),
             endpoint: std::mem::take(&mut wire.endpoint),
             server_name: std::mem::take(&mut wire.server_name),
             transport: wire.transport,
@@ -367,6 +317,7 @@ impl Invitation {
         self.check()?;
         validate_profile(Profile {
             id: self.id.clone(),
+            path_prefix: Some(self.path_prefix.clone()),
             server: self.endpoint.clone(),
             server_name: self.server_name.clone(),
             auth_token: secret_ref.into(),
@@ -381,9 +332,7 @@ impl Invitation {
     }
 
     fn check(&self) -> Result<(), InviteError> {
-        if self.tls_profile != "default"
-            && crate::security_profile::CertificatePin::parse_profile(&self.tls_profile).is_none()
-        {
+        if self.tls_profile != "default" {
             return Err(InviteError::Invalid);
         }
         let profile = self.to_profile_unchecked("env:THEIA_INVITE_TOKEN".into(), None)?;
@@ -400,6 +349,7 @@ impl Invitation {
     ) -> Result<Profile, InviteError> {
         validate_profile(Profile {
             id: self.id.clone(),
+            path_prefix: Some(self.path_prefix.clone()),
             server: self.endpoint.clone(),
             server_name: self.server_name.clone(),
             auth_token,
@@ -599,93 +549,33 @@ mod tests {
     }
 
     #[test]
-    fn replacement_v1_roundtrips_all_supported_profiles_and_refuses_legacy() {
-        use crate::security_profile::CertificatePin;
-
-        let Config::Client(doc) =
-            crate::config::parse(include_str!("../../../examples/client.toml")).unwrap()
-        else {
-            panic!("client fixture");
-        };
+    fn replacement_v1_roundtrips_own_tls_and_rejects_retired_profiles() {
+        let Config::Client(doc) = crate::config::parse(include_str!("../../../examples/client.toml")).unwrap() else { panic!() };
         let mut profile = doc.client.profiles[0].clone();
-        let pin = CertificatePin::from_der(b"fixture");
-        for mode in ["default".into(), pin.profile(), pin.stream_up_profile()] {
-            profile.tls_profile = mode.clone();
-            for transport in [Transport::H2, Transport::H3, Transport::Auto] {
-                profile.transport = transport;
-                let link = Invitation::public_from_profile(&profile)
-                    .unwrap()
-                    .encode()
-                    .unwrap();
-                let payload = link.strip_prefix(PREFIX).unwrap();
-                let decoded = Invitation::decode(&link).unwrap();
-                assert_eq!(decoded.tls_profile(), mode);
-                assert!(!decoded.has_token());
-                let restored = decoded.to_profile("env:TOKEN", None).unwrap();
-                assert_eq!(restored.tls_profile, mode);
-                assert_eq!(restored.transport, transport);
-                assert!(restored.tls_ca.is_none());
-                assert_eq!(decoded.encode().unwrap(), link);
-                assert!(Invitation::decode(&format!("theia://v2/{payload}")).is_err());
-                let raw = String::from_utf8(URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
-                for altered in [
-                    raw.replace("version = 1", "version = 2"),
-                    raw.replace("smarttheia-xhttp", "legacy-http"),
-                    raw.lines()
-                        .filter(|line| !line.starts_with("carrier = "))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    raw.lines()
-                        .filter(|line| !line.starts_with("security_mode = "))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    raw.lines()
-                        .filter(|line| !line.starts_with("xhttp_mode = "))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    format!("{raw}tls_ca = \"file:/untrusted.pem\"\n"),
-                    format!("{raw}tls_profile = \"default\"\n"),
-                    format!("{raw}security_mode = \"own-tls\"\n"),
-                ] {
-                    assert_ne!(altered, raw);
-                    assert!(Invitation::decode(&format!(
-                        "{PREFIX}{}",
-                        URL_SAFE_NO_PAD.encode(altered)
-                    ))
-                    .is_err());
-                }
-                if mode != "default" {
-                    for altered in [
-                        raw.replace("pinned-tls", "own-tls"),
-                        raw.lines()
-                            .filter(|line| !line.starts_with("leaf_sha256 = "))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        raw.replace("stream-one", "unknown")
-                            .replace("stream-up", "unknown"),
-                    ] {
-                        assert!(Invitation::decode(&format!(
-                            "{PREFIX}{}",
-                            URL_SAFE_NO_PAD.encode(altered)
-                        ))
-                        .is_err());
-                    }
-                } else {
-                    let invalid = format!("{raw}leaf_sha256 = \"{}\"\n", "42".repeat(32));
-                    assert!(Invitation::decode(&format!(
-                        "{PREFIX}{}",
-                        URL_SAFE_NO_PAD.encode(invalid)
-                    ))
-                    .is_err());
-                }
+        for transport in [Transport::H2, Transport::H3, Transport::Auto] {
+            profile.transport = transport;
+            let link = Invitation::public_from_profile(&profile).unwrap().encode().unwrap();
+            let payload = link.strip_prefix(PREFIX).unwrap();
+            let raw = String::from_utf8(URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+            let decoded = Invitation::decode(&link).unwrap();
+            assert_eq!(decoded.to_profile("env:TOKEN", None).unwrap().path_prefix, profile.path_prefix);
+            assert_eq!(decoded.transport, transport);
+            assert_eq!(decoded.encode().unwrap(), link);
+            for bad in [
+                raw.replace("own-tls", "pinned-tls"),
+                raw.replace("own-tls", "browser-h2-btls-v1"),
+                raw.replace("/v1/theia-example", "/v1/../x"),
+                raw.lines().filter(|line| !line.starts_with("path_prefix = ")).collect::<Vec<_>>().join("\n"),
+                format!("{raw}leaf_sha256 = \"{}\"\n", "42".repeat(32)),
+                format!("{raw}tls_ca = \"file:/untrusted.pem\"\n"),
+            ] {
+                assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bad))).is_err());
             }
         }
-        let legacy = "version = 1\nid = \"home\"\nendpoint = \"edge.example.org:443\"\nserver_name = \"edge.example.org\"\ntls_profile = \"default\"\ntransport = \"auto\"\n";
-        assert!(
-            Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(legacy))).is_err()
-        );
-        profile.tls_profile = "browser-h2-btls-v1".into();
-        assert!(Invitation::public_from_profile(&profile).is_err());
+        for mode in ["browser-h2-btls-v1".into(), format!("pinned-cert-v1:{}", "42".repeat(32)), format!("pinned-cert-stream-up-v1:{}", "42".repeat(32))] {
+            profile.tls_profile = mode;
+            assert!(Invitation::public_from_profile(&profile).is_err());
+        }
     }
 
     #[test]

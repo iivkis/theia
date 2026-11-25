@@ -450,7 +450,7 @@ impl Invitation {
 /// The imported independent root lives outside the mutable signed history.
 /// This record is published last, after the trust snapshot exists. A failed
 /// import cannot overwrite a profile, change the active profile or OS proxy.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     schema_version: u16,
@@ -516,6 +516,52 @@ impl Profile {
     pub fn store(&self) -> Result<descriptor::Store, Error> {
         descriptor::Store::new(Path::new(&self.trust_store), self.anchor()?)
             .map_err(|_| Error::Storage)
+    }
+
+    /// Credential rotation is bound to the exact current trusted descriptor.
+    /// A confidential link may carry a new bearer, never new trust.
+    pub(crate) fn credential_material(
+        &self,
+        uri: &str,
+        now: u64,
+    ) -> Result<([u8; 32], Zeroizing<[u8; 32]>, u64), Error> {
+        self.admission()?;
+        let (snapshot, current) = self.store()?.inspect_bound(now).map_err(|_| Error::Descriptor)?;
+        current.check_time(now).map_err(|_| Error::Descriptor)?;
+        let invite = Invitation::decode(uri, now)?;
+        if invite.scope != current.descriptor().scope
+            || invite.public != current.signer()
+            || invite.revision != current.descriptor().revision
+        {
+            return Err(Error::Approval);
+        }
+        let verified = verify(&invite.signed, &invite.scope, invite.public,
+            invite.revision, self.policy(), now)?;
+        if verified.payload_sha256() != current.payload_sha256() {
+            return Err(Error::Approval);
+        }
+        Ok((snapshot, invite.bearer.ok_or(Error::Credential)?, invite.revision))
+    }
+
+    pub(crate) fn same_trust_as(&self, other: &Self) -> bool {
+        let mut comparison = other.clone();
+        comparison.auth_token.clone_from(&self.auth_token);
+        self == &comparison
+    }
+
+    pub(crate) fn credential_enrollment(
+        &self,
+        reference: &str,
+    ) -> Result<Zeroizing<String>, Error> {
+        let mut next = self.clone();
+        next.auth_token = reference.to_owned();
+        next.anchor()?;
+        next.admission()?;
+        let encoded = Zeroizing::new(toml::to_string(&next).map_err(|_| Error::Format)?);
+        if encoded.len() > MAX_PROFILE {
+            return Err(Error::Format);
+        }
+        Ok(encoded)
     }
 
     /// Offline recovery from an expired descriptor or missed revisions.

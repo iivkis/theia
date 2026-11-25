@@ -26,6 +26,7 @@ pub enum ClientError {
     Http2,
     Http3,
     QuicUnreachable,
+    QuicEndpointNetworkRefused,
     Unauthorized,
     SystemProxy,
     Rejected(u16),
@@ -45,6 +46,7 @@ impl fmt::Display for ClientError {
             Self::Http2 => f.write_str("HTTP/2 transport failed"),
             Self::Http3 => f.write_str("HTTP/3 transport failed"),
             Self::QuicUnreachable => f.write_str("quic_unreachable"),
+            Self::QuicEndpointNetworkRefused => f.write_str("quic_endpoint_network_refused"),
             Self::Unauthorized => f.write_str("server rejected authentication"),
             Self::SystemProxy => f.write_str("Windows user proxy CAS/recovery failed; inspect client proxy --status and recover explicitly"),
             Self::Rejected(status) => write!(f, "server rejected request (HTTP {status})"),
@@ -67,6 +69,7 @@ pub(crate) fn error_kind(error: &ClientError) -> &'static str {
         ClientError::Http2 => "h2",
         ClientError::Http3 => "h3",
         ClientError::QuicUnreachable => "quic_unreachable",
+        ClientError::QuicEndpointNetworkRefused => "quic_endpoint_network_refused",
         ClientError::Unauthorized => "unauthorized",
         ClientError::SystemProxy => "system_proxy",
         ClientError::Rejected(_) => "http_rejected",
@@ -120,6 +123,8 @@ pub struct H2Client {
     wire_shape: H2WireShape,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
+    padding: crate::descriptor::Padding,
+    own_routes: Option<crate::split_http::IdentityRoutes>,
     stream_up: bool,
     auto_mode: Option<crate::split_http::AutoMode>,
     pool: crate::connection_pool::Pool<H2Connection>,
@@ -249,6 +254,9 @@ impl H2Client {
             .build()
             .map_err(|_| ClientError::Configuration)?;
         client.identity_routes = Some(routes);
+        client.padding = d.padding.clone();
+        client.own_routes = None;
+        client.pool = crate::connection_pool::Pool::with_rotation(&value.descriptor().rotation);
         let modes = value.effective_modes();
         client = if modes.stream_one && modes.stream_up {
             client.with_auto_stream_up(Duration::from_secs(900))?
@@ -296,7 +304,7 @@ impl H2Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let (response, _) = sender
-                .send_request(request, true)
+                .send_request(self.padding.request(request)?, true)
                 .map_err(|_| ClientError::Http2)?;
             let response = response.await.map_err(|_| ClientError::Http2)?;
             crate::split_http::check_status(response.status())?;
@@ -390,7 +398,7 @@ impl H2Client {
         let uri = http::Uri::builder()
             .scheme("https")
             .authority(name)
-            .path_and_query("/v1/session")
+            .path_and_query("/v1/theia-example/session")
             .build()
             .map_err(|_| ClientError::Configuration)?;
         Ok(Self {
@@ -402,6 +410,8 @@ impl H2Client {
             wire_shape,
             certificate_pin: None,
             identity_routes: None,
+            padding: crate::descriptor::Padding::default(),
+            own_routes: Some(crate::split_http::IdentityRoutes::new(crate::split_http::EXAMPLE_PREFIX)?),
             stream_up: false,
             auto_mode: None,
             pool: crate::connection_pool::Pool::default(),
@@ -411,9 +421,37 @@ impl H2Client {
 
     /// Opt in to an additional exact leaf certificate identity, retaining PKI.
     /// Reuse verified own-TLS connections within this immutable profile.
+    pub(crate) fn set_profile_budget(&mut self, budget: std::sync::Arc<tokio::sync::Semaphore>) {
+        self.pool.set_profile_budget(budget);
+    }
+
+    pub(crate) fn profile_budget(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        self.pool.profile_budget()
+    }
+
+    pub(crate) fn with_mode_cache_ttl(mut self, ttl: Duration) -> Self {
+        if let Some(mode) = self.auto_mode.as_mut() {
+            mode.set_ttl(ttl);
+        }
+        self
+    }
+
     pub fn with_connection_pool(mut self) -> Self {
         self.reuse_connections = true;
         self
+    }
+
+    /// Set the exact configured inbound route, before admitting any session.
+    pub fn with_path_prefix(mut self, prefix: &str) -> Result<Self, ClientError> {
+        if self.identity_routes.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        let routes = crate::split_http::IdentityRoutes::new(prefix)?;
+        let mut parts = self.uri.clone().into_parts();
+        parts.path_and_query = Some(routes.single.parse().map_err(|_| ClientError::Configuration)?);
+        self.uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+        self.own_routes = Some(routes);
+        Ok(self)
     }
 
     pub fn with_certificate_pin(
@@ -427,17 +465,6 @@ impl H2Client {
             if !matches!(&self.connector, H2Tls::Rustls(_)) {
                 return Err(ClientError::Configuration);
             }
-            self.uri = http::Uri::builder()
-                .scheme("https")
-                .authority(
-                    self.uri
-                        .authority()
-                        .ok_or(ClientError::Configuration)?
-                        .as_str(),
-                )
-                .path_and_query(crate::security_profile::PINNED_PATH)
-                .build()
-                .map_err(|_| ClientError::Configuration)?;
         } else if self.certificate_pin.is_some() {
             return Err(ClientError::Configuration);
         }
@@ -478,15 +505,6 @@ impl H2Client {
     /// encoded verbatim as OPEN_TCP and are never resolved by this client.
     /// A successful return is possible only after a valid OPEN_OK.
     pub async fn open(&self, address: Address, port: u16) -> Result<Tunnel, ClientError> {
-        self.open_preferred(address, port, None).await
-    }
-
-    pub(crate) async fn open_preferred(
-        &self,
-        address: Address,
-        port: u16,
-        preferred: Option<bool>,
-    ) -> Result<Tunnel, ClientError> {
         let operation = diagnostics::next_id();
         crate::diag!(
             Debug,
@@ -496,7 +514,7 @@ impl H2Client {
         );
         let open = Frame::OpenTcp { address, port };
         protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation, preferred))
+        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation))
             .await
             .map_err(|_| ClientError::Timeout)
             .and_then(|result| result);
@@ -522,34 +540,46 @@ impl H2Client {
         &self,
         open: Frame,
         operation: u64,
-        preferred: Option<bool>,
     ) -> Result<Tunnel, ClientError> {
         use crate::split_http::HelloOutcome;
         let mut stage = HelloOutcome::Pending;
         let Some(mode) = &self.auto_mode else {
             return self
-                .open_inner(&open, operation, self.stream_up, &mut stage)
+                .open_mode(&open, operation, self.stream_up, &mut stage)
                 .await;
         };
         let ticket = mode.select()?;
-        let stream_up = preferred.unwrap_or(ticket.stream_up);
+        let stream_up = ticket.stream_up;
         let result = self
-            .open_inner(&open, operation, stream_up, &mut stage)
+            .open_mode(&open, operation, stream_up, &mut stage)
             .await;
-        if stream_up && stage == HelloOutcome::Acked {
-            mode.remember(ticket)?;
-        }
-        if stream_up || stage != HelloOutcome::Silent || !mode.current(ticket)? {
+        if !mode.after_attempt(ticket, stream_up, stage)? {
             return result;
         }
         // The first attempt is fully dropped and never sent OPEN_TCP.
         crate::diag!(Debug, "client.h2", "xhttp_pre_open_stream_up_retry");
         let mut stage = HelloOutcome::Pending;
-        let result = self.open_inner(&open, operation, true, &mut stage).await;
-        if stage == HelloOutcome::Acked {
-            mode.remember(ticket)?;
-        }
+        let result = self.open_mode(&open, operation, true, &mut stage).await;
+        mode.after_attempt(ticket, true, stage)?;
         result
+    }
+
+    /// At most one fresh connection after an explicit graceful GOAWAY
+    /// before any HELLO/OPEN. Never replay a body or change XHTTP mode.
+    async fn open_mode(
+        &self,
+        open: &Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &mut crate::split_http::HelloOutcome,
+    ) -> Result<Tunnel, ClientError> {
+        use crate::split_http::HelloOutcome;
+        let result = self.open_inner(open, operation, stream_up, stage).await;
+        if *stage != HelloOutcome::Draining {
+            return result;
+        }
+        *stage = HelloOutcome::Pending;
+        self.open_inner(open, operation, stream_up, stage).await
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H2Connection, ClientError> {
@@ -636,7 +666,7 @@ impl H2Client {
             .endpoint
             .parse()
             .ok()
-            .and_then(crate::local_proxy::route_source);
+            .and_then(crate::network_scope::observe);
         let reusable = self.reuse_connections
             && self.certificate_pin.is_none()
             && matches!(&self.connector, H2Tls::Rustls(_));
@@ -644,12 +674,30 @@ impl H2Client {
             .pool
             .acquire(
                 route,
-                stream_up,
                 reusable,
                 |connection| !connection.driver.0.is_finished(),
                 self.connect_verified(operation),
             )
             .await?;
+        // A network transition during a queued/dialing admission invalidates
+        // reuse before any HTTP headers or bearer are sent.
+        if route.is_some() && self.endpoint.parse().ok().and_then(crate::network_scope::observe) != route {
+            lease.retire();
+            return Err(ClientError::Io);
+        }
+        if !lease.accepting_new_streams() {
+            return Err(ClientError::Http2);
+        }
+        // Only a protocol-level graceful refusal during HTTP admission can
+        // retry. The lease's Drop removes the draining connection from reuse
+        // while other admitted leases retain it.
+        let mut admission_error = |error: h2::Error| {
+            if error.is_go_away() && error.is_remote() && error.reason() == Some(h2::Reason::NO_ERROR) {
+                lease.retire();
+                *stage = crate::split_http::HelloOutcome::Draining;
+            }
+            ClientError::Http2
+        };
         let connection = lease.connection();
         let binding = connection.binding.as_ref();
         let sender = connection
@@ -657,7 +705,7 @@ impl H2Client {
             .lock()
             .map_err(|_| ClientError::Http2)?
             .clone();
-        let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+        let mut sender = sender.ready().await.map_err(&mut admission_error)?;
         let pair_id = lease.id();
         // Bearer is sent only on a verified connection.
         let (response, mut outgoing) = if stream_up {
@@ -666,34 +714,34 @@ impl H2Client {
                 .send_request(
                     crate::channel_binding::attach(
                         binding,
-                        split_http::request_for(
-                            self.identity_routes.as_ref(),
+                        self.padding.request(split_http::request_for(
+                            self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                             &self.uri,
                             Leg::Download,
                             &self.authorization,
                             pair_id,
-                        )?,
+                        )?)?,
                     )?,
                     true,
                 )
-                .map_err(|_| ClientError::Http2)?;
-            let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+                .map_err(&mut admission_error)?;
+            let mut sender = sender.ready().await.map_err(&mut admission_error)?;
             let (upload, tx) = sender
                 .send_request(
                     crate::channel_binding::attach(
                         binding,
-                        split_http::request_for(
-                            self.identity_routes.as_ref(),
+                        self.padding.request(split_http::request_for(
+                            self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                             &self.uri,
                             Leg::Upload,
                             &self.authorization,
                             pair_id,
-                        )?,
+                        )?)?,
                     )?,
                     false,
                 )
-                .map_err(|_| ClientError::Http2)?;
-            let upload = upload.await.map_err(|_| ClientError::Http2)?;
+                .map_err(&mut admission_error)?;
+            let upload = upload.await.map_err(&mut admission_error)?;
             split_http::check_status(upload.status())?;
             let mut empty = upload.into_body();
             if empty.data().await.is_some()
@@ -705,7 +753,7 @@ impl H2Client {
             {
                 return Err(ClientError::Protocol);
             }
-            (download.await.map_err(|_| ClientError::Http2)?, tx)
+            (download.await.map_err(&mut admission_error)?, tx)
         } else {
             let request = Request::post(self.uri.clone())
                 .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -713,9 +761,9 @@ impl H2Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let (response, tx) = sender
-                .send_request(crate::channel_binding::attach(binding, request)?, false)
-                .map_err(|_| ClientError::Http2)?;
-            (response.await.map_err(|_| ClientError::Http2)?, tx)
+                .send_request(crate::channel_binding::attach(binding, self.padding.request(request)?)?, false)
+                .map_err(&mut admission_error)?;
+            (response.await.map_err(&mut admission_error)?, tx)
         };
         crate::diag!(
             Trace,
@@ -770,10 +818,14 @@ impl H2Client {
             "hello_ack_received",
             "op" = Value::Count(operation)
         );
-        if !matches!(ack, Frame::HelloAck { .. }) {
+        let Frame::HelloAck { accepted_capabilities, .. } = ack else {
             return Err(ClientError::Protocol);
-        }
+        };
         *stage = crate::split_http::HelloOutcome::Acked;
+        if let Some(padding) = self.padding.frame(accepted_capabilities)? {
+            state.apply(Direction::Send, &padding).map_err(|_| ClientError::Protocol)?;
+            send_frame(&mut outgoing, &padding, false).await?;
+        }
         state
             .apply(Direction::Send, open)
             .map_err(|_| ClientError::Protocol)?;
@@ -938,6 +990,7 @@ impl Tunnel {
                     let _ = upload_done.send(());
                     return Ok::<(), ClientError>(());
                 }
+                self._lease.record_data(size);
                 activity.data(size);
             }
         };
@@ -961,6 +1014,7 @@ impl Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
+                        self._lease.record_data(data.len());
                         activity.data(data.len());
                     }
                     Frame::Fin => {

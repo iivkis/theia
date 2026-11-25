@@ -301,6 +301,27 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn('get("result") != "success"', gate)
         self.assertIn("raise SystemExit", gate)
 
+    def test_retired_profiles_are_excluded_from_product_configuration(self):
+        source = read("crates/theia/src/config.rs")
+        self.assertIn("retired_security_modes_are_rejected_even_with_experimental_backend", source)
+        self.assertNotIn("CertificatePin::parse_profile(&profile.tls_profile)", source)
+        editor = read("crates/theia/src/tui_editor.rs")
+        self.assertNotIn("review_pinned_mode", editor)
+        self.assertNotIn("apply_pinned_mode", editor)
+        invite = read("crates/theia/src/invite.rs")
+        self.assertNotIn("PinnedTls,", invite)
+        self.assertIn("retired_product_security_profiles_are_rejected_before_network",
+                      read("crates/theia/tests/client_h2.rs"))
+
+    def test_real_goaway_regression_matrix_is_present(self):
+        code = read("crates/theia/tests/goaway.rs")
+        for term in ("real_h2_goaway_drains_live_streams_without_reusing_carrier",
+                     "real_h3_goaway_drains_live_streams_without_reusing_carrier",
+                     "connection.graceful_shutdown()", "connection.shutdown(0).await",
+                     "shares_transport_with", "h2_scenario(true)", "h3_scenario(true)"):
+            self.assertIn(term, code)
+        self.assertIn("cargo test --workspace --all-targets --locked", read(".github/workflows/ci.yml"))
+
     def test_m22_local_proxy_gate_and_cli_wiring(self):
         implementation = read("crates/theia/src/local_proxy.rs")
         client = read("crates/theia/src/client.rs")
@@ -322,33 +343,12 @@ class SpecContractTests(unittest.TestCase):
                       read("crates/theia/tests/h3_server.rs"))
         self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
 
-    def test_pinned_identity_is_additional_and_mode_is_explicit(self):
-        security = read("crates/theia/src/security_profile.rs")
-        self.assertIn("pinned-cert-v1:", security)
-        self.assertIn("ConstantTimeEq", security)
-        for path in ("client.rs", "h3_client.rs"):
-            source = read("crates/theia/src/" + path)
-            self.assertIn("pin.verify(", source)
-            self.assertIn("PINNED_PATH", source)
-            self.assertIn("with_certificate_pin", source)
-        server = read("crates/theia/src/server.rs")
-        self.assertIn("self.security_mode.path()", server)
-        self.assertIn("before.security_mode != after.security_mode",
-                      read("crates/theia/src/reload_preflight.rs"))
-        editor = read("crates/theia/src/tui_editor.rs")
-        self.assertIn("review_pinned_mode", editor)
-        self.assertIn("apply_pinned_mode", editor)
-        self.assertIn("h2_h3_pinned_identity_and_mode_are_fail_closed",
-                      read("crates/theia/tests/security_profile.rs"))
-        self.assertIn("pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_silence",
-                      read("crates/theia/tests/client_h2.rs"))
-
     def test_smarttheia_native_xhttp_contract(self):
         split = read("crates/theia/src/split_http.rs")
         self.assertIn("UPLOAD_PATH", split)
         self.assertIn("DOWNLOAD_PATH", split)
-        self.assertIn('"/v1/stream-up/upload"', split)
-        self.assertIn('"/v1/stream-up/download"', split)
+        self.assertIn('"/v1/theia-example/stream-up/upload"', split)
+        self.assertIn('"/v1/theia-example/stream-up/download"', split)
         self.assertIn("stream_up_only_accepts_current_v1_routes", split)
         self.assertIn("PAIR_TIMEOUT", split)
         for path in ("client.rs", "h3_client.rs"):
@@ -535,7 +535,7 @@ class SpecContractTests(unittest.TestCase):
         self.assertIsNotNone(wire_security)
         self.assertEqual(
             [item.strip() for item in wire_security.group(1).split(",") if item.strip()],
-            ["OwnTls", "PinnedTls"],
+            ["OwnTls"],
         )
         self.assertRegex(
             invite,
@@ -573,10 +573,10 @@ class SpecContractTests(unittest.TestCase):
             self.assertIn(name, tests)
         self.assertIn('profile.tls_profile == "default"', config)
         self.assertIn('wire.carrier != "smarttheia-xhttp"', invite)
-        self.assertIn("replacement_v1_roundtrips_all_supported_profiles_and_refuses_legacy", invite)
+        self.assertIn("replacement_v1_roundtrips_own_tls_and_rejects_retired_profiles", invite)
         self.assertNotIn("PREFIX_V2", invite)
         self.assertNotIn("portable_from_profile", invite)
-        self.assertIn("leaf_sha256: Option<String>", invite)
+        self.assertNotIn("leaf_sha256: Option<String>", invite)
 
 
 if __name__ == "__main__":

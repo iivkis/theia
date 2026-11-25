@@ -112,6 +112,7 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
                 enabled: true,
                 inbounds: vec![Inbound {
                     id: "edge".into(),
+        path_prefix: Some("/v1/theia-example".into()),
                     allowed_user_ids: vec!["device-a".into()],
                     h2_listen: format!("127.0.0.1:{tcp}"),
                     quic_listen: format!("127.0.0.1:{udp}"),

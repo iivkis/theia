@@ -16,7 +16,6 @@ use theia::{
     client_import,
     config::{self, ClientDocument, Config, SystemProxy, Transport},
     invite::Invitation,
-    security_profile::CertificatePin,
     tui_editor::Editor,
     Role,
 };
@@ -253,26 +252,13 @@ async fn client_scenario(
 // The Linux fixture key never crosses to Windows. Construct a public
 // invitation from independently transferred public trust material and
 // provision the known per-run bearer via an explicit env reference.
-async fn pinned_client_scenario(
+async fn explicit_xhttp_client_scenario(
     fixture: &CrossOsFixture<'_>,
     transport: Transport,
     stream_up: bool,
 ) {
-    let mut endpoint = fixture.endpoint.parse::<SocketAddr>().unwrap();
-    endpoint.set_port(endpoint.port() + if stream_up { 2 } else { 1 });
-    let trusted = fs::read(fixture.ca).unwrap();
-    let leaf = rustls_pemfile::certs(&mut std::io::BufReader::new(trusted.as_slice()))
-        .next()
-        .unwrap()
-        .unwrap();
-    let pin = CertificatePin::from_der(leaf.as_ref());
+    let endpoint = fixture.endpoint.parse::<SocketAddr>().unwrap();
     let wrong_ca = std::env::var("THEIA_F14_XHOST_WRONG_CA").unwrap();
-    let wrong = fs::read(wrong_ca).unwrap();
-    let other = rustls_pemfile::certs(&mut std::io::BufReader::new(wrong.as_slice()))
-        .next()
-        .unwrap()
-        .unwrap();
-    let wrong_pin = CertificatePin::from_der(other.as_ref());
 
     let dir = Directory(std::env::temp_dir().join(format!(
         "theia-f18-cross-os-{}-{transport:?}-{stream_up}",
@@ -289,17 +275,13 @@ async fn pinned_client_scenario(
     profile.id = if stream_up {
         "cross-split"
     } else {
-        "cross-pin"
+        "cross-one"
     }
     .into();
     profile.server = endpoint.to_string();
     profile.server_name = "localhost".into();
     profile.transport = transport;
-    profile.tls_profile = if stream_up {
-        pin.stream_up_profile()
-    } else {
-        pin.profile()
-    };
+    profile.xhttp_mode = Some(if stream_up { config::XhttpMode::StreamUp } else { config::XhttpMode::StreamOne });
     let uri = Invitation::public_from_profile(&profile)
         .unwrap()
         .encode()
@@ -323,18 +305,10 @@ async fn pinned_client_scenario(
     run_client(&config_path, imported.clone(), fixture.origin, true).await;
 
     let mut invalid = imported.clone();
-    invalid.client.profiles[1].tls_profile = if stream_up {
-        wrong_pin.stream_up_profile()
-    } else {
-        wrong_pin.profile()
-    };
+    invalid.client.profiles[1].tls_ca = Some(format!("file:{wrong_ca}"));
     run_client(&config_path, invalid, fixture.origin, false).await;
-    // Correct pin with the opposite HTTP mode must not open a tunnel.
-    imported.client.profiles[1].tls_profile = if stream_up {
-        pin.profile()
-    } else {
-        pin.stream_up_profile()
-    };
+    // A valid CA and bearer must not authorize an unknown inbound route.
+    imported.client.profiles[1].path_prefix = Some("/v1/incorrect-cross-host".into());
     run_client(&config_path, imported, fixture.origin, false).await;
 }
 
@@ -413,11 +387,11 @@ async fn linux_server_windows_client_f14_h2_h3_open_ok() {
             client_scenario(&fixture, transport, true, false).await;
             client_scenario(&fixture, transport, false, true).await;
             for stream_up in [false, true] {
-                pinned_client_scenario(&fixture, transport, stream_up).await;
+                explicit_xhttp_client_scenario(&fixture, transport, stream_up).await;
             }
         }
         for stream_up in [false, true] {
-            pinned_client_scenario(&fixture, Transport::Auto, stream_up).await;
+            explicit_xhttp_client_scenario(&fixture, Transport::Auto, stream_up).await;
         }
     })
     .await

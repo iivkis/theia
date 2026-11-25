@@ -80,6 +80,8 @@ pub struct ServerSettings {
 #[serde(deny_unknown_fields)]
 pub struct Inbound {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "crate::security_profile::SecurityMode::is_plain"
@@ -146,6 +148,8 @@ pub struct ClientSettings {
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
     pub server: String,
     pub server_name: String,
     pub auth_token: String,
@@ -194,16 +198,9 @@ pub enum XhttpMode {
 }
 
 impl Profile {
-    /// Own TLS defaults to adaptive XHTTP. Experimental security adapters
-    /// currently have a fixed mode and never silently downgrade.
+    /// Both supported security modes use the same XHTTP selection.
     pub fn effective_xhttp_mode(&self) -> XhttpMode {
-        if self.tls_profile == "default" || self.tls_profile == "smart-reality" {
-            self.xhttp_mode.unwrap_or(XhttpMode::Auto)
-        } else if crate::security_profile::CertificatePin::is_stream_up_profile(&self.tls_profile) {
-            XhttpMode::StreamUp
-        } else {
-            XhttpMode::StreamOne
-        }
+        self.xhttp_mode.unwrap_or(XhttpMode::Auto)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,7 +449,20 @@ impl ServerDocument {
             }
             let udp = listen(&inbound.quic_listen, &format!("{field}.quic_listen"))?;
             let tcp = listen(&inbound.h2_listen, &format!("{field}.h2_listen"))?;
-            if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
+            let reality = inbound.security_mode == crate::security_profile::SecurityMode::SmartReality;
+            ensure(
+                reality || inbound.security_mode.is_plain(),
+                format!("{field}.security_mode"),
+                "only own TLS and smart-reality are supported",
+            )?;
+            ensure(
+                if reality { inbound.path_prefix.is_none() } else {
+                    inbound.path_prefix.as_deref().is_some_and(crate::split_http::valid_prefix)
+                },
+                format!("{field}.path_prefix"),
+                "own TLS requires an explicit /v1/<prefix>; REALITY uses the signed descriptor",
+            )?;
+            if reality {
                 ensure(
                     inbound.reality.as_ref().is_some_and(RealityBinding::valid),
                     format!("{field}.reality"),
@@ -579,6 +589,13 @@ impl ClientDocument {
                 format!("{field}.tls_ca"),
                 "expected absolute file: reference to PEM CA bundle",
             )?;
+            ensure(
+                if profile.tls_profile == "smart-reality" { profile.path_prefix.is_none() } else {
+                    profile.path_prefix.as_deref().is_some_and(crate::split_http::valid_prefix)
+                },
+                format!("{field}.path_prefix"),
+                "own TLS requires an explicit /v1/<prefix>; REALITY uses the signed descriptor",
+            )?;
             if profile.tls_profile == "smart-reality" {
                 ensure(
                     profile
@@ -613,17 +630,10 @@ impl ClientDocument {
                     "invalid TLS server name",
                 )?;
                 ensure(
-                    profile.tls_profile == "default"
-                        || crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile).is_some()
-                        || (cfg!(feature = "experimental-btls-h2")
-                            && profile.tls_profile == "browser-h2-btls-v1"
-                            && profile.transport == Transport::H2),
+                    profile.tls_profile == "default",
                     format!("{field}.tls_profile"),
-                    "unsupported TLS/HTTP fingerprint profile for this transport/backend (fail closed)",
+                    "only own TLS (default) and smart-reality are supported",
                 )?;
-                ensure(profile.xhttp_mode.is_none() || profile.tls_profile == "default",
-                    format!("{field}.xhttp_mode"),
-                    "explicit XHTTP selection requires own TLS; experimental profiles have a fixed mode")?;
             }
             ensure(
                 (500..=15_000).contains(&profile.quic_connect_timeout_ms),
@@ -913,6 +923,19 @@ mod tests {
         }
     }
     #[test]
+    fn own_tls_requires_explicit_valid_prefix() {
+        for source in [server(), client()] {
+            for bad in ["", "/v1/", "/v1/a/b", "/v1/../x", "/v1/a?b", "/v1/a%2fb"] {
+                let invalid = source.replace("/v1/theia-example", bad);
+                assert!(parse(&invalid).unwrap_err().field.contains("path_prefix"));
+            }
+            let missing = source.lines().filter(|line| !line.starts_with("path_prefix = "))
+                .collect::<Vec<_>>().join("\n");
+            assert!(parse(&missing).unwrap_err().field.contains("path_prefix"));
+        }
+    }
+
+    #[test]
     fn server_denies_invalid_ids_digests_and_grants() {
         let original = server();
         for (from, to, expected) in [
@@ -980,7 +1003,7 @@ mod tests {
                 "tls_profile = \"default\"",
                 &format!("tls_profile = \"pinned-cert-v1:{}\"", "42".repeat(32)),
             );
-            assert!(parse(&pinned).unwrap_err().field.contains("xhttp_mode"));
+            assert!(parse(&pinned).unwrap_err().field.contains("tls_profile"));
         }
         let invalid = original.replacen(
             "tls_profile = \"default\"",
@@ -1037,56 +1060,20 @@ mod tests {
             );
         }
     }
-    #[cfg(feature = "experimental-btls-h2")]
     #[test]
-    fn f13_named_browser_h2_backend_is_explicit_and_never_downgrades_to_h3_or_auto() {
-        let named = client()
-            .replace(
-                "tls_profile = \"default\"",
-                "tls_profile = \"browser-h2-btls-v1\"",
-            )
-            .replace("transport = \"auto\"", "transport = \"h2\"");
-        let accepted = parse(&named).expect("real named browser-like H2 TLS/HTTP profile");
-        assert_eq!(parse(&accepted.to_toml().unwrap()).unwrap(), accepted);
-        // The production profile does not yet have a compatible QUIC TLS
-        // first flight, so neither h3 nor auto can silently use rustls.
-        for transport in ["h3", "auto"] {
-            let forbidden = named.replace(
-                "transport = \"h2\"",
-                &format!("transport = \"{transport}\""),
-            );
-            assert_eq!(
-                parse(&forbidden).unwrap_err().field,
-                "client.profiles[0].tls_profile",
-            );
+    fn retired_security_modes_are_rejected_even_with_experimental_backend() {
+        let source = client();
+        for mode in ["browser-h2-btls-v1".into(), format!("pinned-cert-v1:{}", "42".repeat(32)), format!("pinned-cert-stream-up-v1:{}", "42".repeat(32))] {
+            for transport in ["h2", "h3", "auto"] {
+                let bad = source.replace("tls_profile = \"default\"", &format!("tls_profile = \"{mode}\""))
+                    .replace("transport = \"auto\"", &format!("transport = \"{transport}\""));
+                assert!(parse(&bad).is_err());
+            }
         }
-        for unsupported in [
-            "chrome133",
-            "chrome159",
-            "browser-h2-btls-v2",
-            "default;unsafe",
-        ] {
-            let candidate = named.replace("browser-h2-btls-v1", unsupported);
-            assert_eq!(
-                parse(&candidate).unwrap_err().field,
-                "client.profiles[0].tls_profile",
-            );
+        for mode in ["pinned-cert-v1", "pinned-cert-stream-up-v1"] {
+            let bad = server().replace("[[server.inbounds]]", &format!("[[server.inbounds]]\nsecurity_mode = \"{mode}\""));
+            assert!(parse(&bad).is_err());
         }
-    }
-
-    #[cfg(not(feature = "experimental-btls-h2"))]
-    #[test]
-    fn f13_named_browser_profile_refuses_binary_without_compiled_boring_ssl() {
-        let named = client()
-            .replace(
-                "tls_profile = \"default\"",
-                "tls_profile = \"browser-h2-btls-v1\"",
-            )
-            .replace("transport = \"auto\"", "transport = \"h2\"");
-        assert_eq!(
-            parse(&named).unwrap_err().field,
-            "client.profiles[0].tls_profile",
-        );
     }
 
     #[test]
@@ -1113,6 +1100,7 @@ mod tests {
         let secondary = r#"
 [[server.inbounds]]
 id = "other"
+path_prefix = "/v1/other"
 allowed_user_ids = ["device-a"]
 quic_listen = "127.0.0.1:443"
 h2_listen = "[::]:443"

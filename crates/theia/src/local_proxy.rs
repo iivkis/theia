@@ -69,12 +69,20 @@ fn read_token(profile: &Profile) -> Result<zeroize::Zeroizing<String>, ClientErr
 }
 
 async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
+    load_client_with_budget(profile, crate::connection_pool::profile_budget()).await
+}
+
+async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> Result<ProxyClient, ClientError> {
+    if profile.tls_profile != "default" && profile.tls_profile != "smart-reality" {
+        return Err(ClientError::Configuration);
+    }
     if profile.tls_profile == "smart-reality" || profile.reality_profile.is_some() {
-        return RealityClient::prepare(profile)
+        return RealityClient::prepare_with_budget(profile, budget)
             .await
             .map(Arc::new)
             .map(ProxyClient::Reality);
     }
+    let prefix = profile.path_prefix.as_deref().ok_or(ClientError::Configuration)?;
     let cert = load_file(
         profile
             .tls_ca
@@ -93,66 +101,28 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
     if roots.is_empty() {
         return Err(ClientError::Configuration);
     }
-    // F-13: runtime selection must match strict typed TOML validation even
-    // if a direct library caller bypasses document parsing. Never downgrade
-    // a named browser-style profile to rustls or apply it to QUIC/H3/auto.
-    if profile.xhttp_mode.is_some() && profile.tls_profile != "default" {
-        return Err(ClientError::Configuration);
-    }
-    if profile.tls_profile == "browser-h2-btls-v1" {
-        if profile.transport != Transport::H2 {
-            return Err(ClientError::Configuration);
-        }
-        #[cfg(feature = "experimental-btls-h2")]
-        {
-            return H2Client::new_browser_h2_v1(
-                &profile.server,
-                &profile.server_name,
-                &token,
-                &cert,
-            )
-            .map(Arc::new)
-            .map(ProxyClient::H2);
-        }
-        #[cfg(not(feature = "experimental-btls-h2"))]
-        {
-            return Err(ClientError::Configuration);
-        }
-    }
-    let certificate_pin = if profile.tls_profile == "default" {
-        None
-    } else {
-        Some(
-            crate::security_profile::CertificatePin::parse_profile(&profile.tls_profile)
-                .ok_or(ClientError::Configuration)?,
-        )
-    };
     let mode = profile.effective_xhttp_mode();
     let stream_up = mode == XhttpMode::StreamUp;
     let auto_xhttp = mode == XhttpMode::Auto;
     let ttl = Duration::from_secs(u64::from(profile.quic_negative_cache_ttl_s));
     match profile.transport {
         Transport::H2 => {
-            let endpoint = if certificate_pin.is_none() {
-                resolve_server(profile).await?.to_string()
-            } else {
-                profile.server.clone()
-            };
+            let endpoint = resolve_server(profile).await?.to_string();
             let client = H2Client::new(&endpoint, &profile.server_name, &token, roots)?
-                .with_certificate_pin(certificate_pin)?
+                .with_path_prefix(prefix)?
                 .with_stream_up(stream_up)?;
             let client = if auto_xhttp {
                 client.with_auto_stream_up(ttl)?
             } else {
                 client
             };
-            Ok(ProxyClient::H2(Arc::new(client.with_connection_pool())))
+            Ok(ProxyClient::Direct(Carrier::from_options(Some(Arc::new(client.with_connection_pool())), None, ttl, budget)?))
         }
         Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
             let remote = resolve_server(profile).await?;
             let h3 = H3Client::new(remote, &profile.server_name, &token, roots.clone())?
-                .with_certificate_pin(certificate_pin)?
+                .with_path_prefix(prefix)?
                 .with_stream_up(stream_up)?
                 .with_connect_timeout(Duration::from_millis(u64::from(
                     profile.quic_connect_timeout_ms,
@@ -164,13 +134,13 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
                 h3
             });
             if profile.transport == Transport::H3 {
-                return Ok(ProxyClient::H3(h3));
+                return Ok(ProxyClient::Direct(Carrier::from_options(None, Some(h3), ttl, budget)?));
             }
             // Both carriers use the same resolved endpoint. Do not resolve
             // the hostname again during fallback; retain the configured SNI,
             // trust anchors, certificate pin and authorization unchanged.
             let h2 = H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
-                .with_certificate_pin(certificate_pin)?
+                .with_path_prefix(prefix)?
                 .with_stream_up(stream_up)?;
             let h2 = h2.with_connection_pool();
             let h2 = Arc::new(if auto_xhttp {
@@ -178,13 +148,7 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
             } else {
                 h2
             });
-            Ok(ProxyClient::Auto(Arc::new(AutoClient {
-                h2,
-                h3,
-                ttl,
-                negative: Mutex::new(NegativeCache::default()),
-                cache_changed: Notify::new(),
-            })))
+            Ok(ProxyClient::Direct(Carrier::from_options(Some(h2), Some(h3), ttl, budget)?))
         }
     }
 }
@@ -200,9 +164,7 @@ async fn resolve_server(profile: &Profile) -> Result<SocketAddr, ClientError> {
 
 #[derive(Clone)]
 enum ProxyClient {
-    H2(Arc<H2Client>),
-    H3(Arc<H3Client>),
-    Auto(Arc<AutoClient>),
+    Direct(Carrier),
     Reality(Arc<RealityClient>),
 }
 
@@ -210,14 +172,15 @@ enum ProxyClient {
 /// New logical tunnels re-read the persistent trust floor. A changed
 /// descriptor creates new carrier pools and an independent fallback cache;
 /// established tunnels retain their own transport leases.
-enum RealityCarrier {
+#[derive(Clone)]
+enum Carrier {
     H2(Arc<H2Client>),
     H3(Arc<H3Client>),
     Auto(Arc<AutoClient>),
 }
 struct RealityGeneration {
     value: crate::descriptor::Verified,
-    carrier: RealityCarrier,
+    carrier: Carrier,
     credential_digest: [u8; 32],
     last_transport: std::sync::atomic::AtomicU8,
     last_refresh: std::sync::atomic::AtomicU8,
@@ -225,6 +188,7 @@ struct RealityGeneration {
 pub(crate) struct RealityClient {
     profile: Profile,
     remote: SocketAddr,
+    budget: Arc<Semaphore>,
     current: tokio::sync::Mutex<Arc<RealityGeneration>>,
     changed: Notify,
 }
@@ -232,7 +196,7 @@ impl RealityClient {
     fn now() -> Result<u64, ClientError> {
         crate::reference_health::unix_now().map_err(|_| ClientError::Tls)
     }
-    async fn prepare(profile: &Profile) -> Result<Self, ClientError> {
+    async fn prepare_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> Result<Self, ClientError> {
         // No DNS/credential use before the enrollment and independent trust
         // anchor have been checked.
         let enrollment = crate::reality_config::pinned_client(profile)
@@ -241,10 +205,11 @@ impl RealityClient {
             .load(Self::now()?)
             .map_err(|_| ClientError::Tls)?;
         let remote = resolve_server(profile).await?;
-        let first = Self::build(profile, remote, &enrollment, value, None)?;
+        let first = Self::build(profile, remote, &enrollment, value, None, budget.clone())?;
         Ok(Self {
             profile: profile.clone(),
             remote,
+            budget,
             current: tokio::sync::Mutex::new(Arc::new(first)),
             changed: Notify::new(),
         })
@@ -255,6 +220,7 @@ impl RealityClient {
         enrollment: &crate::reality_bootstrap::Profile,
         value: crate::descriptor::Verified,
         expected_credential: Option<[u8; 32]>,
+        budget: Arc<Semaphore>,
     ) -> Result<RealityGeneration, ClientError> {
         if value.descriptor().scope.endpoint != profile.server {
             return Err(ClientError::Configuration);
@@ -272,6 +238,7 @@ impl RealityClient {
         let h2 = if modes.h2 {
             Some(Arc::new(
                 H2Client::admitted_runtime(remote, &token, &value, secret.clone())?
+                    .with_mode_cache_ttl(ttl)
                     .with_connection_pool(),
             ))
         } else {
@@ -280,24 +247,14 @@ impl RealityClient {
         let h3 = if modes.h3 {
             Some(Arc::new(
                 H3Client::admitted_runtime(remote, &token, &value, secret)?
+                    .with_mode_cache_ttl(ttl)
                     .with_connect_timeout(timeout)?
                     .with_connection_pool(),
             ))
         } else {
             None
         };
-        let carrier = match (h2, h3) {
-            (Some(h2), Some(h3)) => RealityCarrier::Auto(Arc::new(AutoClient {
-                h2,
-                h3,
-                ttl,
-                negative: Mutex::new(NegativeCache::default()),
-                cache_changed: Notify::new(),
-            })),
-            (Some(h2), None) => RealityCarrier::H2(h2),
-            (None, Some(h3)) => RealityCarrier::H3(h3),
-            _ => return Err(ClientError::Configuration),
-        };
+        let carrier = Carrier::from_options(h2, h3, ttl, budget)?;
         Ok(RealityGeneration {
             value,
             carrier,
@@ -340,6 +297,7 @@ impl RealityClient {
             &enrollment,
             value,
             Some(slot.credential_digest),
+            self.budget.clone(),
         )?);
         *slot = next.clone();
         self.changed.notify_one();
@@ -347,19 +305,7 @@ impl RealityClient {
     }
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let generation = self.generation().await?;
-        let result = match &generation.carrier {
-            RealityCarrier::H2(h2) => h2
-                .open(address, port)
-                .await
-                .map(Box::new)
-                .map(ProxyTunnel::H2),
-            RealityCarrier::H3(h3) => h3
-                .open(address, port)
-                .await
-                .map(Box::new)
-                .map(ProxyTunnel::H3),
-            RealityCarrier::Auto(auto) => auto.open(address, port).await,
-        };
+        let result = generation.carrier.open(address, port).await;
         if let Ok(tunnel) = &result {
             generation.last_transport.store(
                 match tunnel {
@@ -378,14 +324,14 @@ impl RealityClient {
         let value = &generation.value;
         let valid = Self::now().is_ok_and(|now| value.check_time(now).is_ok());
         let policy = match &generation.carrier {
-            RealityCarrier::H2(_) => "h2",
-            RealityCarrier::H3(_) => "h3",
-            RealityCarrier::Auto(_) => "auto",
+            Carrier::H2(_) => "h2",
+            Carrier::H3(_) => "h3",
+            Carrier::Auto(_) => "auto",
         };
         let fallback = match &generation.carrier {
-            RealityCarrier::Auto(auto) => auto.negative.lock().ok().map(|cache| {
+            Carrier::Auto(auto) => auto.negative.lock().ok().map(|cache| {
                 cache.route.is_some()
-                    && cache.route == route_source(auto.h3.remote())
+                    && cache.route == crate::network_scope::observe(auto.h3.remote())
                     && cache.expires.is_some_and(|until| until > Instant::now())
             }),
             _ => None,
@@ -423,13 +369,7 @@ impl RealityClient {
         let enrollment = crate::reality_config::pinned_client(&self.profile)
             .map_err(|_| ClientError::Configuration)?;
         let store = enrollment.store().map_err(|_| ClientError::Tls)?;
-        let signed = match &generation.carrier {
-            RealityCarrier::H2(h2) => h2.fetch_identity_descriptor().await?,
-            RealityCarrier::H3(h3) => h3.fetch_identity_descriptor().await?,
-            // Same route-generation and two-silent-attempt policy as the
-            // ordinary auto tunnel. Authentication/HTTP errors are terminal.
-            RealityCarrier::Auto(auto) => auto.fetch_identity_document(false).await?,
-        };
+        let signed = generation.carrier.fetch_identity_document(false).await?;
         store
             .update_matching(&signed, &generation.value, Self::now()?)
             .map_err(|_| ClientError::Tls)?;
@@ -438,11 +378,7 @@ impl RealityClient {
             // Read the successor only on the still-authenticated old
             // identity. Its key must match the signed announcement and
             // its operational parameters must match exactly.
-            let successor = match &generation.carrier {
-                RealityCarrier::H2(h2) => h2.fetch_identity_document(true).await?,
-                RealityCarrier::H3(h3) => h3.fetch_identity_document(true).await?,
-                RealityCarrier::Auto(auto) => auto.fetch_identity_document(true).await?,
-            };
+            let successor = generation.carrier.fetch_identity_document(true).await?;
             let now = Self::now()?;
             let preview = enrollment
                 .preview_promotion(&successor, now)
@@ -465,12 +401,9 @@ impl RealityClient {
                 &enrollment,
                 candidate,
                 Some(generation.credential_digest),
+                self.budget.clone(),
             )?;
-            let seen = match &next.carrier {
-                RealityCarrier::H2(h2) => h2.fetch_identity_descriptor().await?,
-                RealityCarrier::H3(h3) => h3.fetch_identity_descriptor().await?,
-                RealityCarrier::Auto(auto) => auto.fetch_identity_document(false).await?,
-            };
+            let seen = next.carrier.fetch_identity_document(false).await?;
             if seen != successor {
                 return Err(ClientError::Tls);
             }
@@ -498,22 +431,22 @@ impl RealityClient {
                     continue;
                 }
             };
-            let background = async {
-                match &generation.carrier {
-                    RealityCarrier::Auto(auto) => auto.maintain().await,
-                    _ => std::future::pending::<Result<(), ClientError>>().await,
+            let refresh = async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    // CAS binds refresh to the generation used for the GET.
+                    let ok = self.refresh(&generation).await.is_ok();
+                    generation.last_refresh.store(if ok { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+                    match self.generation().await {
+                        Ok(current) if Arc::ptr_eq(&current, &generation) => {},
+                        _ => break,
+                    }
                 }
             };
             tokio::select! {
                 _ = self.changed.notified() => {},
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    // No stale update can overwrite a new store revision;
-                    // update_matching performs a full CAS. Failure never
-                    // authorizes use of an expired/rolled-back generation.
-                    let ok=self.refresh(&generation).await.is_ok();
-                    generation.last_refresh.store(if ok{1}else{2},std::sync::atomic::Ordering::Relaxed);
-                }
-                result = background => return result,
+                _ = refresh => {},
+                result = generation.carrier.maintain() => return result,
             }
         }
     }
@@ -541,13 +474,13 @@ pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
 
 #[derive(Default)]
 struct NegativeCache {
-    route: Option<SocketAddr>,
+    route: Option<crate::network_scope::Scope>,
     generation: u64,
     expires: Option<Instant>,
 }
 
 impl NegativeCache {
-    fn observe(&mut self, route: Option<SocketAddr>, now: Instant) -> (u64, bool) {
+    fn observe(&mut self, route: Option<crate::network_scope::Scope>, now: Instant) -> (u64, bool) {
         if route.is_none() || self.route != route {
             self.route = route;
             self.invalidate();
@@ -583,7 +516,7 @@ impl NegativeCache {
         &mut self,
         generation: u64,
         deadline: Instant,
-        route: Option<SocketAddr>,
+        route: Option<crate::network_scope::Scope>,
         now: Instant,
     ) -> Option<u64> {
         if self.generation != generation || self.expires != Some(deadline) || now < deadline {
@@ -605,6 +538,7 @@ struct AutoClient {
     ttl: Duration,
     negative: Mutex<NegativeCache>,
     cache_changed: Notify,
+    recheck_gate: tokio::sync::Mutex<()>,
 }
 
 impl AutoClient {
@@ -614,7 +548,7 @@ impl AutoClient {
             .lock()
             .map_err(|_| ClientError::Configuration)?;
         let previous = cache.generation;
-        let observed = cache.observe(route_source(self.h3.remote()), Instant::now());
+        let observed = cache.observe(crate::network_scope::observe(self.h3.remote()), Instant::now());
         if previous != cache.generation {
             self.cache_changed.notify_one();
         }
@@ -626,7 +560,7 @@ impl AutoClient {
             .negative
             .lock()
             .map_err(|_| ClientError::Configuration)?;
-        let current = route_source(self.h3.remote());
+        let current = crate::network_scope::observe(self.h3.remote());
         // Unknown routing is never cached. A known changed route must not
         // inherit a fallback decision obtained on the previous network.
         if current != cache.route {
@@ -641,7 +575,7 @@ impl AutoClient {
             }
             return Ok(false);
         }
-        if cache.generation != generation {
+        if cache.generation != generation || current.is_none() {
             return Ok(false);
         }
         if cache.record(generation, Instant::now(), self.ttl) {
@@ -650,18 +584,102 @@ impl AutoClient {
         Ok(true)
     }
 
-    /// One scoped maintenance future per running auto profile. No detached
-    /// task or application credentials, and no mutex held across an await.
+    /// Check the generation without consuming a due recheck. Both
+    /// foreground and maintenance use this before taking another step.
+    fn same_scope(&self, generation: u64) -> Result<bool, ClientError> {
+        let mut cache = self.negative.lock().map_err(|_| ClientError::Configuration)?;
+        let scope = crate::network_scope::observe(self.h3.remote());
+        if scope != cache.route || scope.is_none() {
+            cache.route = scope;
+            cache.invalidate();
+            self.cache_changed.notify_one();
+            return Ok(false);
+        }
+        Ok(cache.generation == generation)
+    }
+
+    /// The single fallback decision for tunnel, descriptor and background
+    /// probe operations. Only a pre-authenticated QuicUnreachable result
+    /// can reach the retry branch. Every other error remains terminal.
+    async fn attempt_h3<T, F, Fut>(
+        &self, generation: u64, mut attempt: F,
+    ) -> Result<Option<T>, ClientError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ClientError>>,
+    {
+        for index in 0..AUTO_QUIC_ATTEMPTS {
+            // Unknown network scope disables reuse and fallback, not a
+            // first authenticated H3 connection attempt.
+            if index > 0 && !self.same_scope(generation)? {
+                return Err(ClientError::QuicUnreachable);
+            }
+            match attempt().await {
+                Ok(value) => {
+                    self.complete(generation, false)?;
+                    return Ok(Some(value));
+                }
+                Err(ClientError::QuicUnreachable) if index + 1 < AUTO_QUIC_ATTEMPTS => {}
+                Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => {
+                    if self.complete(generation, true)? {
+                        return Ok(None);
+                    }
+                    crate::diag!(Warn, "client.auto", "stale_quic_probe_rejected",
+                        "generation" = Value::Count(generation));
+                    return Err(ClientError::QuicUnreachable);
+                }
+                Err(error) => {
+                    self.complete(generation, false)?;
+                    crate::diag!(Warn, "client.auto", "terminal_h3_failure_no_fallback",
+                        "generation" = Value::Count(generation),
+                        "reason" = Value::Label(error_kind(&error)));
+                    return Err(error);
+                }
+            }
+        }
+        Err(ClientError::Configuration)
+    }
+
+    /// A due negative-cache expiry has exactly one owner, whether a new
+    /// tunnel or the maintenance timer arrives first. Keep the async gate
+    /// only for that bounded credential-free probe, not for application OPEN.
+    /// Cancellation discards evidence and releases the gate; no fallback
+    /// can be published by a canceled probe.
+    async fn prepare(&self) -> Result<(u64, bool), ClientError> {
+        let _gate = self.recheck_gate.lock().await;
+        let recheck = {
+            let mut cache = self.negative.lock().map_err(|_| ClientError::Configuration)?;
+            let now = Instant::now();
+            let scope = crate::network_scope::observe(self.h3.remote());
+            match cache.expires {
+                Some(deadline) if now >= deadline => {
+                    let generation = cache.generation;
+                    cache.begin_recheck(generation, deadline, scope, now)
+                }
+                _ => None,
+            }
+        };
+        if let Some(generation) = recheck {
+            match self.attempt_h3(generation, || self.h3.probe()).await {
+                Ok(Some(())) => crate::diag!(Debug, "client.auto", "background_h3_verified"),
+                Ok(None) => {},
+                Err(error) => {
+                    crate::diag!(Warn, "client.auto", "background_h3_terminal_failure",
+                        "reason" = Value::Label(error_kind(&error)));
+                    return Err(error);
+                }
+            }
+        }
+        self.observe()
+    }
+
+    /// One maintenance future per immutable carrier generation. Foreground
+    /// requests use the exact same expiry gate. No detached probe survives
+    /// runtime shutdown or a security/credential generation replacement.
     async fn maintain(&self) -> Result<(), ClientError> {
         loop {
-            let pending = {
-                let cache = self
-                    .negative
-                    .lock()
-                    .map_err(|_| ClientError::Configuration)?;
-                cache.expires.map(|deadline| (cache.generation, deadline))
-            };
-            let Some((generation, deadline)) = pending else {
+            let pending = self.negative.lock().map_err(|_| ClientError::Configuration)?.expires;
+            let Some(deadline) = pending else {
                 self.cache_changed.notified().await;
                 continue;
             };
@@ -669,170 +687,51 @@ impl AutoClient {
                 _ = self.cache_changed.notified() => continue,
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
             }
-            let generation = {
-                let mut cache = self
-                    .negative
-                    .lock()
-                    .map_err(|_| ClientError::Configuration)?;
-                cache.begin_recheck(
-                    generation,
-                    deadline,
-                    route_source(self.h3.remote()),
-                    Instant::now(),
-                )
-            };
-            let Some(generation) = generation else {
-                continue;
-            };
-            for attempt in 0..AUTO_QUIC_ATTEMPTS {
-                match self.h3.probe().await {
-                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
-                        if self.observe()?.0 != generation {
-                            break;
-                        }
-                    }
-                    Err(ClientError::QuicUnreachable) => {
-                        self.complete(generation, true)?;
-                        break;
-                    }
-                    result => {
-                        // Verified success or a terminal failure clears the
-                        // negative cache; a new tunnel must verify its own
-                        // connection. Never authorize H2 on a TLS error.
-                        self.complete(generation, false)?;
-                        match result {
-                            Ok(()) => crate::diag!(Debug, "client.auto", "background_h3_verified"),
-                            Err(error) => crate::diag!(
-                                Warn,
-                                "client.auto",
-                                "background_h3_terminal_failure",
-                                "reason" = Value::Label(error_kind(&error))
-                            ),
-                        }
-                        break;
-                    }
-                }
-            }
+            // Terminal remote errors invalidate evidence, not the running
+            // local listener. The next request still verifies independently.
+            let _ = self.prepare().await;
         }
     }
 
     async fn fetch_identity_document(&self, successor: bool) -> Result<String, ClientError> {
-        let (generation, cached) = self.observe()?;
+        let (generation, cached) = self.prepare().await?;
         if !cached {
-            for attempt in 0..AUTO_QUIC_ATTEMPTS {
-                match self.h3.fetch_identity_document(successor).await {
-                    Ok(value) => {
-                        self.complete(generation, false)?;
-                        return Ok(value);
-                    }
-                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
-                        if self.observe()?.0 != generation {
-                            return Err(ClientError::QuicUnreachable);
-                        }
-                    }
-                    Err(ClientError::QuicUnreachable) => {
-                        if !self.complete(generation, true)? {
-                            return Err(ClientError::QuicUnreachable);
-                        }
-                    }
-                    Err(error) => {
-                        self.complete(generation, false)?;
-                        return Err(error);
-                    }
-                }
+            if let Some(value) = self.attempt_h3(generation, || self.h3.fetch_identity_document(successor)).await? {
+                return Ok(value);
             }
+        }
+        if !self.same_scope(generation)? {
+            return Err(ClientError::QuicUnreachable);
         }
         self.h2.fetch_identity_document(successor).await
     }
 
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
-        let (generation, cached) = self.observe()?;
-        crate::diag!(
-            Debug,
-            "client.auto",
-            "transport_select",
+        let (generation, cached) = self.prepare().await?;
+        crate::diag!(Debug, "client.auto", "transport_select",
             "generation" = Value::Count(generation),
-            "negative_cache_hit" = Value::Flag(cached)
-        );
-        // Keep the actual initial XHTTP mode across a fresh H3-to-H2
-        // fallback. Cached H2-only requests may use their own carrier cache.
-        let preferred = if cached {
-            None
-        } else {
-            Some(self.h3.preferred_stream_up()?)
-        };
+            "negative_cache_hit" = Value::Flag(cached));
+        // XHTTP caches remain carrier-local; only the configured mode
+        // restriction crosses the transport boundary.
         if !cached {
-            for attempt in 0..AUTO_QUIC_ATTEMPTS {
-                match self
-                    .h3
-                    .open_preferred(address.clone(), port, preferred)
-                    .await
-                {
-                    Ok(tunnel) => {
-                        self.complete(generation, false)?;
-                        crate::diag!(
-                            Debug,
-                            "client.auto",
-                            "selected_h3",
-                            "generation" = Value::Count(generation)
-                        );
-                        eprintln!("transport=h3");
-                        return Ok(ProxyTunnel::H3(Box::new(tunnel)));
-                    }
-                    Err(ClientError::QuicUnreachable) if attempt + 1 < AUTO_QUIC_ATTEMPTS => {
-                        // Retry only a pre-authentication handshake with observed
-                        // UDP silence, and never carry evidence across a route change.
-                        if self.observe()?.0 != generation {
-                            return Err(ClientError::QuicUnreachable);
-                        }
-                    }
-                    Err(ClientError::QuicUnreachable) => {
-                        if !self.complete(generation, true)? {
-                            crate::diag!(
-                                Warn,
-                                "client.auto",
-                                "stale_quic_probe_rejected",
-                                "generation" = Value::Count(generation)
-                            );
-                            return Err(ClientError::QuicUnreachable);
-                        }
-                        crate::diag!(
-                            Warn,
-                            "client.auto",
-                            "h3_udp_silent_fallback_h2",
-                            "generation" = Value::Count(generation)
-                        );
-                        eprintln!("transport=h2 reason=quic_unreachable");
-                        break;
-                    }
-                    Err(error) => {
-                        // All errors except observed UDP silence remain terminal.
-                        self.complete(generation, false)?;
-                        crate::diag!(
-                            Warn,
-                            "client.auto",
-                            "terminal_h3_failure_no_fallback",
-                            "generation" = Value::Count(generation),
-                            "reason" = Value::Label(error_kind(&error))
-                        );
-                        return Err(error);
-                    }
-                }
+            if let Some(tunnel) = self.attempt_h3(generation, || self.h3.open(address.clone(), port)).await? {
+                crate::diag!(Debug, "client.auto", "selected_h3",
+                    "generation" = Value::Count(generation));
+                eprintln!("transport=h3");
+                return Ok(ProxyTunnel::H3(Box::new(tunnel)));
             }
+            crate::diag!(Warn, "client.auto", "h3_udp_silent_fallback_h2",
+                "generation" = Value::Count(generation));
+            eprintln!("transport=h2 reason=quic_unreachable");
         } else {
-            crate::diag!(
-                Debug,
-                "client.auto",
-                "negative_cache_fallback_h2",
-                "generation" = Value::Count(generation)
-            );
+            crate::diag!(Debug, "client.auto", "negative_cache_fallback_h2",
+                "generation" = Value::Count(generation));
             eprintln!("transport=h2 reason=quic_negative_cache");
         }
-        self.h2
-            .open_preferred(address, port, preferred)
-            .await
-            .map(Box::new)
-            .map(ProxyTunnel::H2)
+        if !self.same_scope(generation)? {
+            return Err(ClientError::QuicUnreachable);
+        }
+        self.h2.open(address, port).await.map(Box::new).map(ProxyTunnel::H2)
     }
 }
 
@@ -841,21 +740,76 @@ enum ProxyTunnel {
     H3(Box<H3Tunnel>),
 }
 
-impl ProxyClient {
+impl Carrier {
+    fn profile_budget(&self) -> Arc<Semaphore> {
+        match self {
+            Self::H2(client) => client.profile_budget(),
+            Self::H3(client) => client.profile_budget(),
+            Self::Auto(client) => client.h2.profile_budget(),
+        }
+    }
+
+    fn from_options(mut h2: Option<Arc<H2Client>>, mut h3: Option<Arc<H3Client>>, ttl: Duration, budget: Arc<Semaphore>) -> Result<Self, ClientError> {
+        if let Some(client) = h2.as_mut() {
+            Arc::get_mut(client).ok_or(ClientError::Configuration)?.set_profile_budget(budget.clone());
+        }
+        if let Some(client) = h3.as_mut() {
+            Arc::get_mut(client).ok_or(ClientError::Configuration)?.set_profile_budget(budget);
+        }
+        match (h2, h3) {
+            (Some(h2), Some(h3)) => Ok(Self::Auto(Arc::new(AutoClient {
+                h2, h3, ttl, negative: Mutex::new(NegativeCache::default()),
+                cache_changed: Notify::new(),
+                recheck_gate: tokio::sync::Mutex::new(()),
+            }))),
+            (Some(h2), None) => Ok(Self::H2(h2)),
+            (None, Some(h3)) => Ok(Self::H3(h3)),
+            _ => Err(ClientError::Configuration),
+        }
+    }
+
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
-            Self::H2(client) => client
-                .open(address, port)
-                .await
-                .map(Box::new)
-                .map(ProxyTunnel::H2),
-            Self::H3(client) => client
-                .open(address, port)
-                .await
-                .map(Box::new)
-                .map(ProxyTunnel::H3),
+            Self::H2(client) => client.open(address, port).await.map(Box::new).map(ProxyTunnel::H2),
+            Self::H3(client) => client.open(address, port).await.map(Box::new).map(ProxyTunnel::H3),
             Self::Auto(client) => client.open(address, port).await,
+        }
+    }
+
+    async fn fetch_identity_document(&self, successor: bool) -> Result<String, ClientError> {
+        match self {
+            Self::H2(client) => client.fetch_identity_document(successor).await,
+            Self::H3(client) => client.fetch_identity_document(successor).await,
+            Self::Auto(client) => client.fetch_identity_document(successor).await,
+        }
+    }
+
+    async fn maintain(&self) -> Result<(), ClientError> {
+        match self {
+            Self::Auto(client) => client.maintain().await,
+            _ => std::future::pending().await,
+        }
+    }
+}
+
+impl ProxyClient {
+    fn profile_budget(&self) -> Arc<Semaphore> {
+        match self {
+            Self::Direct(client) => client.profile_budget(),
+            Self::Reality(client) => client.budget.clone(),
+        }
+    }
+
+    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+        match self {
+            Self::Direct(client) => client.open(address, port).await,
             Self::Reality(client) => client.open(address, port).await,
+        }
+    }
+    async fn maintain(&self) -> Result<(), ClientError> {
+        match self {
+            Self::Direct(client) => client.maintain().await,
+            Self::Reality(client) => client.maintain().await,
         }
     }
 }
@@ -923,9 +877,9 @@ impl ClientRuntime {
             ProxyClient::Reality(r) => {
                 let g = r.current.lock().await.clone();
                 let fallback = match &g.carrier {
-                    RealityCarrier::Auto(a) => a.negative.lock().ok().is_some_and(|c| {
+                    Carrier::Auto(a) => a.negative.lock().ok().is_some_and(|c| {
                         c.route.is_some()
-                            && c.route == route_source(a.h3.remote())
+                            && c.route == crate::network_scope::observe(a.h3.remote())
                             && c.expires.is_some_and(|t| t > Instant::now())
                     }),
                     _ => false,
@@ -974,8 +928,9 @@ impl ClientRuntime {
         // No in-place replacement of any existing independently enrolled root.
         for prior in &previous.document.client.profiles {
             if let Some(new) = candidate.client.profiles.iter().find(|p| p.id == prior.id) {
-                if prior.reality_profile != new.reality_profile
-                    || prior.tls_profile != new.tls_profile
+                if prior.tls_profile != new.tls_profile
+                    || (prior.reality_profile != new.reality_profile
+                        && !crate::reality_config::credential_only_change(prior, new))
                 {
                     return Err(ClientError::Configuration);
                 }
@@ -984,7 +939,11 @@ impl ClientRuntime {
         if old.tls_profile != next.tls_profile {
             return Err(ClientError::Configuration);
         }
-        let client = load_client(next).await?;
+        let client = if old.id == next.id {
+            load_client_with_budget(next, previous.client.profile_budget()).await?
+        } else {
+            load_client(next).await?
+        };
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
     }
@@ -1022,11 +981,7 @@ impl ClientRuntime {
         loop {
             let view = changes.borrow_and_update().clone();
             let maintenance = async {
-                match &view.client {
-                    ProxyClient::Auto(a) => a.maintain().await,
-                    ProxyClient::Reality(r) => r.maintain().await,
-                    _ => std::future::pending::<Result<(), ClientError>>().await,
-                }
+                view.client.maintain().await
             };
             tokio::select! {
                 result=maintenance=>return result,
@@ -1277,7 +1232,7 @@ pub async fn serve(
     socks: TcpListener,
     client: Arc<H2Client>,
 ) -> Result<(), ClientError> {
-    serve_proxy(http, socks, ProxyClient::H2(client)).await
+    serve_proxy(http, socks, ProxyClient::Direct(Carrier::H2(client))).await
 }
 
 async fn serve_proxy(
@@ -1286,11 +1241,7 @@ async fn serve_proxy(
     client: ProxyClient,
 ) -> Result<(), ClientError> {
     let maintenance = async {
-        match &client {
-            ProxyClient::Auto(a) => a.maintain().await,
-            ProxyClient::Reality(r) => r.maintain().await,
-            _ => std::future::pending::<Result<(), ClientError>>().await,
-        }
+        client.maintain().await
     };
     serve_proxy_loop(http, socks, || client.clone(), maintenance).await
 }
@@ -1627,6 +1578,7 @@ async fn handle(
                     }
                     ClientError::Timeout
                     | ClientError::QuicUnreachable
+                    | ClientError::QuicEndpointNetworkRefused
                     | ClientError::Open(ErrorCode::DialTimeout) => HTTP_TIMEOUT,
                     _ => HTTP_FAILED,
                 };
@@ -1857,7 +1809,7 @@ mod selector_tests {
                 assert!(report.contains("last_open=ещё нет подтверждённого OPEN"));
                 assert!(report.contains(if socks_mode { "policy=h3" } else { "policy=h2" }));
                 managed_clients.push(managed.clone());
-                if let RealityCarrier::H3(h3) = &current.carrier {
+                if let Carrier::H3(h3) = &current.carrier {
                     // Use the production dispatcher and a real OPEN_OK
                     // tunnel. Rebind the same Quinn endpoint, not a new
                     // connection or a new admission handshake.
@@ -1889,7 +1841,7 @@ mod selector_tests {
                 }
                 assert!(matches!(
                     (&current.carrier, socks_mode),
-                    (RealityCarrier::H2(_), false) | (RealityCarrier::H3(_), true)
+                    (Carrier::H2(_), false) | (Carrier::H3(_), true)
                 ));
                 let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2196,6 +2148,55 @@ mod selector_tests {
     }
 
     #[tokio::test]
+    async fn auto_retries_only_two_silent_pre_authentication_attempts() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let token = URL_SAFE_NO_PAD.encode([0x42u8; 32]);
+        let auto = AutoClient {
+            h2: Arc::new(H2Client::new(&remote.to_string(), "localhost", &token, roots.clone()).unwrap()),
+            h3: Arc::new(H3Client::new(remote, "localhost", &token, roots).unwrap()),
+            ttl: Duration::from_secs(900),
+            negative: Mutex::new(NegativeCache::default()),
+            cache_changed: Notify::new(),
+            recheck_gate: tokio::sync::Mutex::new(()),
+        };
+        for error in [ClientError::Tls, ClientError::Unauthorized, ClientError::Protocol,
+            ClientError::Timeout, ClientError::Io, ClientError::Http3, ClientError::Rejected(429)] {
+            let (generation, _) = auto.observe().unwrap();
+            let mut calls = 0;
+            let result = auto.attempt_h3(generation, || {
+                calls += 1;
+                std::future::ready(Err::<(), _>(error))
+            }).await;
+            assert!(matches!(result, Err(actual) if actual == error));
+            assert_eq!(calls, 1);
+            assert!(!auto.observe().unwrap().1);
+        }
+        let (generation, _) = auto.observe().unwrap();
+        let mut calls = 0;
+        let result = auto.attempt_h3(generation, || {
+            calls += 1;
+            std::future::ready(Err::<(), _>(ClientError::QuicUnreachable))
+        }).await;
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(calls, AUTO_QUIC_ATTEMPTS);
+        assert!(auto.observe().unwrap().1);
+        auto.complete(generation, false).unwrap();
+        let (generation, _) = auto.observe().unwrap();
+        let mut calls = 0;
+        let result = auto.attempt_h3(generation, || {
+            calls += 1;
+            std::future::ready(Err::<(), _>(ClientError::QuicEndpointNetworkRefused))
+        }).await;
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(calls, 1);
+        assert!(auto.observe().unwrap().1);
+    }
+
+    #[tokio::test]
     async fn idle_profile_rechecks_quic_without_opening_an_application_tunnel() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
@@ -2219,6 +2220,7 @@ mod selector_tests {
             ttl: Duration::from_millis(100),
             negative: Mutex::new(NegativeCache::default()),
             cache_changed: Notify::new(),
+            recheck_gate: tokio::sync::Mutex::new(()),
         };
         let (generation, _) = auto.observe().unwrap();
         assert!(auto.complete(generation, true).unwrap());
@@ -2270,6 +2272,21 @@ mod selector_tests {
         cache.record(unknown, now, ttl);
         assert!(!cache.observe(None, now).1);
         assert!(!cache.observe(b, now).1);
+    }
+
+    #[test]
+    fn same_ip_network_epoch_invalidates_quic_failure() {
+        let mut cache = NegativeCache::default();
+        let now = Instant::now();
+        let source = "192.0.2.1:0".parse().unwrap();
+        let a = Some(crate::network_scope::Scope::fixture(source, 1));
+        let b = Some(crate::network_scope::Scope::fixture(source, 2));
+        let (old, _) = cache.observe(a, now);
+        assert!(cache.record(old, now, Duration::from_secs(900)));
+        let (new, cached) = cache.observe(b, now);
+        assert_ne!(old, new);
+        assert!(!cached);
+        assert!(!cache.record(old, now, Duration::from_secs(900)));
     }
 
     #[test]
@@ -2448,33 +2465,27 @@ mod selector_tests {
         invalid.xhttp_mode = None;
         invalid.transport = Transport::H3;
         assert!(load_client(&invalid).await.is_err());
-        #[cfg(feature = "experimental-btls-h2")]
-        {
-            invalid.transport = Transport::H2;
-            assert!(matches!(
-                load_client(&invalid).await,
-                Ok(ProxyClient::H2(_))
-            ));
-        }
+        invalid.transport = Transport::H2;
+        assert!(load_client(&invalid).await.is_err());
         let mut pinned = profile.clone();
         pinned.xhttp_mode = None;
-        pinned.tls_profile =
-            crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
-        assert!(matches!(load_client(&pinned).await, Ok(ProxyClient::H2(_))));
+        pinned.tls_profile = crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
+        assert!(load_client(&pinned).await.is_err());
         let mut automatic_mode = profile.clone();
         automatic_mode.xhttp_mode = Some(XhttpMode::Auto);
         assert!(matches!(
             load_client(&automatic_mode).await,
-            Ok(ProxyClient::H2(_))
+            Ok(ProxyClient::Direct(Carrier::H2(_)))
         ));
         automatic_mode.transport = Transport::Auto;
         assert!(matches!(
             load_client(&automatic_mode).await,
-            Ok(ProxyClient::Auto(_))
+            Ok(ProxyClient::Direct(Carrier::Auto(_)))
         ));
 
         let inbound = Inbound {
             id: "edge".into(),
+                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
             allowed_user_ids: vec!["client".into()],
             h2_listen: "127.0.0.1:0".into(),
             quic_listen: "127.0.0.1:0".into(),

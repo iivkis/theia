@@ -101,6 +101,7 @@ fn listener_with_pem_bound_mode(
     roots.add(der).unwrap();
     let inbound = Inbound {
         id: "test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
         allowed_user_ids: vec!["client".into()],
         h2_listen: "127.0.0.1:0".into(),
         quic_listen: "127.0.0.1:0".into(),
@@ -632,15 +633,6 @@ async fn client_binary_curl_connect_and_socks5h() {
     check_native_binary_connect_and_socks5("default", "curl").await;
 }
 
-#[cfg(feature = "experimental-btls-h2")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn named_browser_h2_profile_binary_connect_and_socks5_real_open_ok() {
-    // Uses ordinary client.toml selection (not an experimental-only API)
-    // in the actual compiled Windows/Linux client. Both local proxy
-    // protocols must reach the real SmartTheia OPEN_OK gate.
-    check_native_binary_connect_and_socks5("browser-h2-btls-v1", "browser-h2").await;
-}
-
 async fn check_native_binary_connect_and_socks5(tls_profile: &str, label: &str) {
     timeout(Duration::from_secs(40), async {
         let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
@@ -744,6 +736,7 @@ async fn client_binary_chromium_socks5_over_h3() {
     let remote = endpoint.local_addr().unwrap().to_string();
     let inbound = Inbound {
         id: "browser-h3".into(),
+        path_prefix: Some("/v1/theia-example".into()),
         allowed_user_ids: vec!["client".into()],
         h2_listen: "127.0.0.1:0".into(),
         quic_listen: remote.clone(),
@@ -1218,6 +1211,7 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
         let remote = listener.local_addr().unwrap();
         let mut inbound = Inbound {
             id: "h2-test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
             allowed_user_ids: vec!["client".into()],
             h2_listen: remote.to_string(),
             quic_listen: remote.to_string(),
@@ -1271,103 +1265,11 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pinned_auto_rejects_wrong_trusted_h3_pin_and_falls_back_only_on_udp_silence() {
-    use theia::security_profile::{CertificatePin, SecurityMode};
-    timeout(Duration::from_secs(35), async {
-        let (reserved, tcp) = shared_async_listeners();
-        let (endpoint, _roots, pem, server) =
-            listener_with_pem_bound_mode(true, tcp, SecurityMode::PinnedCertV1);
-        let pin = CertificatePin::from_der(
-            rustls_pemfile::certs(&mut pem.as_bytes())
-                .next()
-                .unwrap()
-                .unwrap()
-                .as_ref(),
-        );
-        let profile = pin.profile();
-        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = target.local_addr().unwrap().port();
-
-        // Prove the fallback branch is a working pinned H2 endpoint.
-        let blackhole = tokio::spawn(async move {
-            let mut buf = [0; 2048];
-            loop {
-                reserved.recv_from(&mut buf).await.unwrap();
-            }
-        });
-        {
-            let (_dir, _child, http, _) = launch_client_with_profile(
-                endpoint.clone(),
-                pem.clone(),
-                "pinned-auto-silence",
-                theia::config::Transport::Auto,
-                &profile,
-            )
-            .await;
-            assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
-            let (mut socket, _) = target.accept().await.unwrap();
-            socket.shutdown().await.unwrap();
-        }
-        blackhole.abort();
-        let _ = blackhole.await;
-
-        // Both certs trusted and same hostname, but only H2 is pinned. The
-        // QUIC handshake must succeed and its wrong pin must be terminal.
-        let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let udp = theia::quic_transport::server_endpoint(
-            endpoint.parse().unwrap(),
-            vec![other.cert.der().clone()],
-            PrivatePkcs8KeyDer::from(other.key_pair.serialize_der()).into(),
-        )
-        .unwrap();
-        // A fully functional H3 endpoint: skipping the pin would cause
-        // a real target dial and HTTP 200, not just a transport timeout.
-        let inbound = Inbound {
-            id: "test".into(),
-            security_mode: SecurityMode::PinnedCertV1,
-            reality: None,
-            allowed_user_ids: vec!["client".into()],
-            h2_listen: endpoint.clone(),
-            quic_listen: endpoint.clone(),
-            server_name: "localhost".into(),
-            tls_cert: "unused".into(),
-            tls_key: "unused".into(),
-        };
-        let user = User {
-            id: "client".into(),
-            token_sha256: format!("{:x}", Sha256::digest(TOKEN)),
-            disabled: false,
-        };
-        let policy = ServerPolicy {
-            allow_private_ips: true,
-            max_connections_per_user: 8,
-            max_connections_total: 8,
-            connect_timeout_ms: 2000,
-        };
-        let quic = tokio::spawn(theia::h3_server::serve(
-            udp,
-            Arc::new(ServerContext::new(&inbound, &[user], &policy)),
-        ));
-        let combined = format!("{pem}\n{}", other.cert.pem());
-        let (_dir, _child, http, _) = launch_client_with_profile(
-            endpoint,
-            combined,
-            "pinned-auto-wrong-pin",
-            theia::config::Transport::Auto,
-            &profile,
-        )
-        .await;
-        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 502 "));
-        assert!(
-            timeout(Duration::from_millis(250), target.accept())
-                .await
-                .is_err(),
-            "wrong H3 pin must not dial using H2"
-        );
-        quic.abort();
-        server.abort();
-    })
-    .await
-    .expect("bounded binary pinned auto policy");
+#[test]
+fn retired_product_security_profiles_are_rejected_before_network() {
+    let source = include_str!("../../../examples/client.toml");
+    for mode in ["browser-h2-btls-v1".into(), format!("pinned-cert-v1:{}", "42".repeat(32)), format!("pinned-cert-stream-up-v1:{}", "42".repeat(32))] {
+        let invalid = source.replace("tls_profile = \"default\"", &format!("tls_profile = \"{mode}\""));
+        assert!(theia::config::parse(&invalid).is_err());
+    }
 }

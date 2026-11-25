@@ -77,6 +77,7 @@ impl Fixture {
         let h3 = udp.local_addr().unwrap();
         let inbound = Inbound {
             id: "test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
             allowed_user_ids: vec!["client".into()],
             h2_listen: h2.to_string(),
             quic_listen: h3.to_string(),

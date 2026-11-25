@@ -12,6 +12,7 @@ fn baseline() -> ServerDocument {
             enabled: true,
             inbounds: vec![Inbound {
                 id: "edge".into(),
+        path_prefix: Some("/v1/theia-example".into()),
                 allowed_user_ids: vec!["a".into()],
                 quic_listen: "0.0.0.0:8443".into(),
                 h2_listen: "0.0.0.0:8443".into(),

@@ -81,6 +81,7 @@ async fn live_binary_preflight_accepts_safe_delta_rejects_identity_drift_and_nev
             enabled: true,
             inbounds: vec![Inbound {
                 id: "edge".into(),
+        path_prefix: Some("/v1/theia-example".into()),
                 allowed_user_ids: vec!["device-a".into()],
                 h2_listen: format!("127.0.0.1:{h2}"),
                 quic_listen: format!("127.0.0.1:{h3}"),

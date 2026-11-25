@@ -10,10 +10,19 @@ use std::{
 };
 use tokio::{sync::oneshot, time::timeout};
 
-pub(crate) const UPLOAD_PATH: &str = "/v1/stream-up/upload";
-pub(crate) const DOWNLOAD_PATH: &str = "/v1/stream-up/download";
-/// Paths derived from one authenticated descriptor. Never accept an
-/// arbitrary path supplied by a peer or fall back to default routes.
+#[cfg(test)]
+pub(crate) const UPLOAD_PATH: &str = "/v1/theia-example/stream-up/upload";
+#[cfg(test)]
+pub(crate) const DOWNLOAD_PATH: &str = "/v1/theia-example/stream-up/download";
+pub const EXAMPLE_PREFIX: &str = "/v1/theia-example";
+pub(crate) fn valid_prefix(prefix: &str) -> bool {
+    prefix.strip_prefix("/v1/").is_some_and(|tail| {
+        !tail.is_empty() && tail.len() <= 64
+            && tail.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
+/// Routes are derived identically for configured own-TLS and signed REALITY.
 #[derive(Clone)]
 pub(crate) struct IdentityRoutes {
     pub(crate) single: String,
@@ -25,15 +34,7 @@ pub(crate) struct IdentityRoutes {
 
 impl IdentityRoutes {
     pub(crate) fn new(prefix: &str) -> Result<Self, ClientError> {
-        let tail = prefix
-            .strip_prefix("/v1/")
-            .ok_or(ClientError::Configuration)?;
-        if tail.is_empty()
-            || tail.len() > 64
-            || !tail
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
+        if !valid_prefix(prefix) {
             return Err(ClientError::Configuration);
         }
         Ok(Self {
@@ -89,6 +90,7 @@ pub(crate) enum HelloOutcome {
     #[default]
     Pending,
     Silent,
+    Draining,
     Acked,
 }
 
@@ -100,13 +102,13 @@ pub(crate) struct ModeTicket {
 
 #[derive(Default)]
 struct ModeCache {
-    route: Option<SocketAddr>,
+    route: Option<crate::network_scope::Scope>,
     generation: u64,
     expires: Option<Instant>,
 }
 
 impl ModeCache {
-    fn observe(&mut self, route: Option<SocketAddr>, now: Instant) -> ModeTicket {
+    fn observe(&mut self, route: Option<crate::network_scope::Scope>, now: Instant) -> ModeTicket {
         if route.is_none()
             || route != self.route
             || self.expires.is_some_and(|expires| now >= expires)
@@ -152,24 +154,40 @@ impl AutoMode {
     pub(crate) fn select(&self) -> Result<ModeTicket, ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
         Ok(cache.observe(
-            crate::local_proxy::route_source(self.remote),
+            crate::network_scope::observe(self.remote),
             Instant::now(),
         ))
     }
 
-    pub(crate) fn current(&self, ticket: ModeTicket) -> Result<bool, ClientError> {
+    fn current(&self, ticket: ModeTicket) -> Result<bool, ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
         cache.observe(
-            crate::local_proxy::route_source(self.remote),
+            crate::network_scope::observe(self.remote),
             Instant::now(),
         );
         Ok(cache.current(ticket))
     }
 
-    pub(crate) fn remember(&self, ticket: ModeTicket) -> Result<(), ClientError> {
+    /// Shared H2/H3 decision: retry only the first silent admitted HELLO.
+    /// A successful split ACK is the only evidence that can cache split.
+    /// Never import a different transport's decision or retry after OPEN.
+    pub(crate) fn after_attempt(
+        &self, ticket: ModeTicket, stream_up: bool, outcome: HelloOutcome,
+    ) -> Result<bool, ClientError> {
+        if stream_up && outcome == HelloOutcome::Acked {
+            self.remember(ticket)?;
+        }
+        Ok(!stream_up && outcome == HelloOutcome::Silent && self.current(ticket)?)
+    }
+
+    pub(crate) fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
+    fn remember(&self, ticket: ModeTicket) -> Result<(), ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
         let now = Instant::now();
-        cache.observe(crate::local_proxy::route_source(self.remote), now);
+        cache.observe(crate::network_scope::observe(self.remote), now);
         cache.remember(ticket, now, self.ttl);
         Ok(())
     }
@@ -181,6 +199,7 @@ pub(crate) enum Leg {
     Download,
 }
 
+#[cfg(test)]
 pub(crate) fn leg<T>(request: &Request<T>) -> Option<Leg> {
     leg_at(request, UPLOAD_PATH, DOWNLOAD_PATH)
 }
@@ -208,24 +227,6 @@ fn leg_at<T>(request: &Request<T>, upload: &str, download: &str) -> Option<Leg> 
     } else {
         None
     }
-}
-
-pub(crate) fn request(
-    uri: &Uri,
-    leg: Leg,
-    authorization: &HeaderValue,
-    id: u32,
-) -> Result<Request<()>, ClientError> {
-    request_at(
-        uri,
-        leg,
-        authorization,
-        id,
-        match leg {
-            Leg::Upload => UPLOAD_PATH,
-            Leg::Download => DOWNLOAD_PATH,
-        },
-    )
 }
 
 fn request_at(
@@ -262,7 +263,7 @@ pub(crate) fn request_for(
 ) -> Result<Request<()>, ClientError> {
     match routes {
         Some(routes) => routes.request(uri, leg, authorization, id),
-        None => request(uri, leg, authorization, id),
+        None => Err(ClientError::Configuration),
     }
 }
 
@@ -365,6 +366,25 @@ mod tests {
                 .body(())
                 .unwrap();
             assert!(leg(&req) == expected);
+        }
+    }
+
+    #[test]
+    fn configured_prefix_is_identical_for_upload_and_download_and_no_alias_is_accepted() {
+        let routes = IdentityRoutes::new("/v1/edge_42").unwrap();
+        let other = IdentityRoutes::new("/v1/other").unwrap();
+        let uri: Uri = "https://localhost/v1/edge_42/session".parse().unwrap();
+        let authorization = HeaderValue::from_static("Bearer fixture");
+        assert_eq!(routes.single, uri.path());
+        for side in [Leg::Upload, Leg::Download] {
+            let request = routes.request(&uri, side, &authorization, 17).unwrap();
+            assert!(routes.leg(&request) == Some(side));
+            assert!(other.leg(&request).is_none());
+            assert!(leg(&request).is_none());
+            assert_eq!(pair_id(&request), Some(17));
+        }
+        for prefix in ["/v1", "/v1/", "/v1/../x", "/v1/a/b", "/v1/a?b", "/v1/a%2fb", "/v2/edge"] {
+            assert!(IdentityRoutes::new(prefix).is_err());
         }
     }
 
@@ -478,6 +498,20 @@ mod tests {
 #[cfg(test)]
 mod auto_tests {
     use super::*;
+
+    #[test]
+    fn same_ip_new_network_invalidates_stream_up_evidence() {
+        let source = "192.0.2.1:0".parse().unwrap();
+        let a = Some(crate::network_scope::Scope::fixture(source, 1));
+        let b = Some(crate::network_scope::Scope::fixture(source, 2));
+        let now = Instant::now();
+        let mut cache = ModeCache::default();
+        let ticket = cache.observe(a, now);
+        cache.remember(ticket, now, Duration::from_secs(60));
+        assert!(cache.observe(a, now).stream_up);
+        assert!(!cache.observe(b, now).stream_up);
+        assert!(!cache.current(ticket));
+    }
 
     #[test]
     fn mode_cache_expires_and_rejects_stale_or_unknown_routes() {

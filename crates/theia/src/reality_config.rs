@@ -150,6 +150,7 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
             }
             document.server.inbounds.push(Inbound {
                 id: record.scope.inbound.clone(),
+                path_prefix: None,
                 security_mode: SecurityMode::SmartReality,
                 reality: Some(RealityBinding {
                     health_store: path_string(&r.health)?,
@@ -229,6 +230,7 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
             let host = profile.endpoint().rsplit_once(':').ok_or(Error::Scope)?.0;
             document.client.profiles.push(Profile {
                 id: r.id.clone(),
+                path_prefix: None,
                 server: profile.endpoint().to_owned(),
                 server_name: host.to_owned(),
                 auth_token: profile.credential_reference().to_owned(),
@@ -360,6 +362,111 @@ pub(crate) fn pinned_client(profile: &Profile) -> Result<bootstrap::Profile, Err
         return Err(Error::Approval);
     }
     Ok(enrollment)
+}
+
+/// A credential refresh stages new private files; the config CAS is the
+/// publication point. Neither the original enrollment nor trust is rewritten.
+struct CredentialPrepared {
+    original: Vec<u8>,
+    candidate: Config,
+    enrollment: bootstrap::Profile,
+    bearer: zeroize::Zeroizing<[u8; 32]>,
+    trust_snapshot: [u8; 32],
+    approval: [u8; 32],
+    revision: u64,
+}
+
+fn prepare_credential(
+    path: &Path, id: &str, source: &Path, now: u64,
+) -> Result<CredentialPrepared, Error> {
+    path_string(path)?;
+    path_string(source)?;
+    let original = config::editor_bytes(path).map_err(|_| Error::Storage)?;
+    let candidate = config::parse(std::str::from_utf8(&original).map_err(|_| Error::Format)?)
+        .map_err(|_| Error::Format)?;
+    let Config::Client(doc) = &candidate else { return Err(Error::Format); };
+    let profile = doc.client.profiles.iter().find(|p| p.id == id).ok_or(Error::Scope)?;
+    let enrollment = pinned_client(profile)?;
+    let uri = bootstrap::read_text(source, bootstrap::MAX_URI, true)?;
+    let (trust_snapshot, bearer, revision) = enrollment.credential_material(&uri, now)?;
+    let mut h = Sha256::new();
+    h.update(b"Theia/REALITY-credential-refresh/v1\0");
+    for part in [original.as_slice(), id.as_bytes(), uri.as_bytes(), trust_snapshot.as_slice()] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    Ok(CredentialPrepared { original, candidate, enrollment, bearer,
+        trust_snapshot, approval: h.finalize().into(), revision })
+}
+
+pub(crate) fn preview_credential_refresh(
+    path: &Path, id: &str, source: &Path, now: u64,
+) -> Result<([u8; 32], u64), Error> {
+    let p = prepare_credential(path, id, source, now)?;
+    Ok((p.approval, p.revision))
+}
+
+pub(crate) fn preview_credential_refresh_for_editor(
+    path: &Path, digest: [u8; 32], id: &str, source: &Path, now: u64,
+) -> Result<([u8; 32], u64), Error> {
+    let p = prepare_credential(path, id, source, now)?;
+    if <[u8; 32]>::from(Sha256::digest(&p.original)) != digest {
+        return Err(Error::Approval);
+    }
+    Ok((p.approval, p.revision))
+}
+
+pub(crate) fn save_credential_refresh(
+    path: &Path, id: &str, source: &Path, expected: [u8; 32], now: u64,
+) -> Result<(), Error> {
+    let mut p = prepare_credential(path, id, source, now)?;
+    if !bool::from(p.approval.ct_eq(&expected)) {
+        return Err(Error::Approval);
+    }
+    let mut bearer = crate::client_import::PrivateBearer::create(path, &p.bearer)
+        .map_err(|_| Error::Storage)?;
+    let reference = bearer.reference().map_err(|_| Error::Storage)?;
+    let raw = p.enrollment.credential_enrollment(&reference)?;
+    let mut enrollment = crate::client_import::PrivateBearer::create_payload(
+        path, "enrollment", "profile.toml", raw.as_bytes(),
+    ).map_err(|_| Error::Storage)?;
+    let enrollment_ref = enrollment.reference().map_err(|_| Error::Storage)?;
+    let enrollment_path = enrollment_ref.strip_prefix("file:").ok_or(Error::Storage)?;
+    let Config::Client(doc) = &mut p.candidate else { return Err(Error::Format); };
+    let profile = doc.client.profiles.iter_mut().find(|x| x.id == id).ok_or(Error::Scope)?;
+    let binding = profile.reality_profile.as_mut().ok_or(Error::Format)?;
+    binding.enrollment = enrollment_path.to_owned();
+    binding.enrollment_sha256 = bootstrap::digest(&raw);
+    profile.auth_token = reference;
+    // Check the trust snapshot again before publishing. Later legitimate
+    // trust updates use the same store and retain its monotonic floor.
+    let (snapshot, _) = p.enrollment.store()?.inspect_bound(now).map_err(|_| Error::Descriptor)?;
+    if snapshot != p.trust_snapshot {
+        return Err(Error::Approval);
+    }
+    let updated = pinned_client(profile)?;
+    if !p.enrollment.same_trust_as(&updated) {
+        return Err(Error::Approval);
+    }
+    match config::guarded_write(path, &p.candidate, &p.original) {
+        Ok(_) => { bearer.commit(); enrollment.commit(); Ok(()) }
+        Err(WriteFailure::AfterReplace(_)) => {
+            bearer.commit(); enrollment.commit(); Err(Error::Indeterminate)
+        }
+        Err(WriteFailure::BeforeReplace(_)) => Err(Error::Storage),
+    }
+}
+
+/// Runtime Apply may accept a replacement enrollment only if every
+/// trust-bearing field stays equal and the selected credential changes.
+pub(crate) fn credential_only_change(old: &Profile, new: &Profile) -> bool {
+    if old.auth_token == new.auth_token {
+        return false;
+    }
+    match (pinned_client(old), pinned_client(new)) {
+        (Ok(a), Ok(b)) => a.same_trust_as(&b),
+        _ => false,
+    }
 }
 
 pub fn validate_client(profile: &Profile, now: u64) -> Result<crate::descriptor::Verified, Error> {
@@ -1093,6 +1200,76 @@ mod tests {
         assert_eq!(std::fs::read(&old_trust).unwrap(), old_bytes);
         assert!(old_path.exists() && new_trust.exists());
         assert!(prepare(&cfg, &request, expired + 1).is_err());
+    }
+
+    #[test]
+    fn credential_refresh_binds_current_trust_and_preserves_active_profile() {
+        let dir = Scratch::new();
+        let state = health();
+        let scope = Scope { inbound: state.plan().inbound.clone(), endpoint: state.plan().endpoint.clone() };
+        let identity = Identity::generate(scope.clone()).unwrap();
+        let signed = bootstrap::initial_descriptor(&state, &identity, 1000).unwrap();
+        let public = bootstrap::Invitation::public(&identity, &signed, 1000).unwrap();
+        let uri = public.encode().unwrap();
+        let admission = dir.0.join("admission");
+        Secret::generate().unwrap().save_new(&scope, &admission).unwrap();
+        let enrollment = dir.0.join("enrollment");
+        let trust = dir.0.join("trust");
+        let pin = public.fingerprint();
+        bootstrap::import(&uri, bootstrap::ImportApproval {
+            document_sha256: bootstrap::digest(&uri), identity_sha256: pin,
+        }, &enrollment, &trust, bootstrap::EnrollmentMaterial {
+            admission_path: &admission, expected_admission: None, external_token: Some("env:THEIA_TEST"),
+        }, bootstrap::auto_policy(), 1000).unwrap();
+        let client = dir.0.join("client.toml");
+        std::fs::write(&client, include_str!("../../../examples/client.toml")).unwrap();
+        let req = Request::Client(ClientRequest { enrollment: enrollment.clone(), identity_sha256: pin,
+            id: "reality-client".into() });
+        let approval = prepare(&client, &req, 1000).unwrap().approval_sha256();
+        apply(&client, &req, approval, 1000).unwrap();
+        let Config::Client(old) = config::read_file(&client).unwrap() else { panic!() };
+        let before = std::fs::read(&client).unwrap();
+        let old_enrollment = std::fs::read(&enrollment).unwrap();
+        let before_trust = std::fs::read(&trust).unwrap();
+        let invite_path = dir.0.join("invite");
+        bootstrap::create_text(&invite_path, &uri).unwrap();
+        assert!(preview_credential_refresh(&client, "reality-client", &invite_path, 1000).is_err());
+        let token = [71u8; 32];
+        let server_source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &format!("{:x}", Sha256::digest(token)));
+        let Config::Server(mut server) = config::parse(&server_source).unwrap() else { panic!() };
+        server.server.enabled = true;
+        server.server.inbounds[0].id = scope.inbound.clone();
+        server.server.inbounds[0].server_name = "edge.example.org".into();
+        server.server.inbounds[0].h2_listen = "127.0.0.1:9443".into();
+        server.server.inbounds[0].quic_listen = "127.0.0.1:9443".into();
+        let user = server.server.users[0].id.clone();
+        server.server.users[0].disabled = false;
+        server.server.inbounds[0].allowed_user_ids = vec![user.clone()];
+        let issued = bootstrap::Invitation::issued(&identity, &signed, &server, &user, &token, 1000).unwrap();
+        std::fs::write(&invite_path, issued.encode().unwrap().as_bytes()).unwrap();
+        let (approval, revision) = preview_credential_refresh(&client, "reality-client", &invite_path, 1000).unwrap();
+        assert_eq!(revision, 1);
+        assert!(save_credential_refresh(&client, "reality-client", &invite_path, [0; 32], 1000).is_err());
+        assert_eq!(std::fs::read(&client).unwrap(), before);
+        std::fs::write(&client, [before.as_slice(), b"\n# changed"].concat()).unwrap();
+        assert!(save_credential_refresh(&client, "reality-client", &invite_path, approval, 1000).is_err());
+        std::fs::write(&client, &before).unwrap();
+        save_credential_refresh(&client, "reality-client", &invite_path, approval, 1000).unwrap();
+        let Config::Client(new) = config::read_file(&client).unwrap() else { panic!() };
+        assert_eq!(old.client.active_profile, new.client.active_profile);
+        assert_eq!(old.client.proxy, new.client.proxy);
+        let old_p = old.client.profiles.last().unwrap();
+        let new_p = new.client.profiles.last().unwrap();
+        assert!(credential_only_change(old_p, new_p));
+        assert!(validate_client(new_p, 1000).is_ok());
+        assert!(!credential_only_change(new_p, new_p));
+        let mut tampered = new_p.clone();
+        tampered.reality_profile.as_mut().unwrap().identity_sha256 = [5; 32];
+        assert!(!credential_only_change(old_p, &tampered));
+        assert_eq!(std::fs::read(&enrollment).unwrap(), old_enrollment);
+        assert_eq!(std::fs::read(&trust).unwrap(), before_trust);
+        assert!(save_credential_refresh(&client, "reality-client", &invite_path, approval, 1000).is_err());
     }
 
     #[test]

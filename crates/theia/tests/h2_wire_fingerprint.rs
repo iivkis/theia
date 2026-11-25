@@ -164,7 +164,7 @@ async fn measure(backend: Backend) -> Observation {
                 .expect("live H2 request")
                 .expect("first request stream");
             assert_eq!(request.method(), http::Method::POST);
-            assert_eq!(request.uri().path(), "/v1/session");
+            assert_eq!(request.uri().path(), "/v1/theia-example/session");
 
             let observation = {
                 let mut state = capture.lock().unwrap();
@@ -246,8 +246,8 @@ async fn measure(backend: Backend) -> Observation {
     .expect("bounded H2 wire fingerprint loopback")
 }
 
-/// F-13: measure the *actual* production H2Client selected by the named
-/// profile, after independently verified TLS1.3/CA/SNI/ALPN. Both default and
+/// F-13: measure the experimental H2Client adapter directly, outside
+/// product security-mode selection, with verified TLS1.3/CA/SNI/ALPN. Both default and
 /// named profiles use the real HTTP/2 request and never return OPEN_OK on 403.
 #[cfg(feature = "experimental-btls-h2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

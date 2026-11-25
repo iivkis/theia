@@ -44,6 +44,7 @@ fn policy(allow_private_ips: bool) -> ServerPolicy {
 fn config(remote: SocketAddr) -> (Inbound, Vec<User>) {
     let inbound = Inbound {
         id: "edge".into(),
+        path_prefix: Some("/v1/theia-example".into()),
         security_mode: Default::default(),
         reality: None,
         allowed_user_ids: vec!["allowed".into()],

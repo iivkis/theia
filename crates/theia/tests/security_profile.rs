@@ -77,6 +77,7 @@ impl Fixture {
         let h3 = udp.local_addr().unwrap();
         let inbound = Inbound {
             id: "test".into(),
+        path_prefix: Some("/v1/theia-example".into()),
             security_mode: mode,
             reality: None,
             allowed_user_ids: vec!["client".into()],
@@ -112,7 +113,7 @@ impl Fixture {
                 let tls = acceptor.accept(socket).await.unwrap();
                 let mut connection = h2::server::handshake(tls).await.unwrap();
                 let (request, mut respond) = connection.accept().await.unwrap().unwrap();
-                assert_eq!(request.uri().path(), "/v1/session");
+                assert_eq!(request.uri().path(), "/v1/theia-example/session");
                 let mut body = request.into_body();
                 let _outgoing = respond
                     .send_response(
@@ -220,38 +221,22 @@ impl Fixture {
             profile.server = if h3 { self.h3 } else { self.h2 }.to_string();
             profile.server_name = "localhost".into();
             profile.transport = if h3 { Transport::H3 } else { Transport::H2 };
-            profile.tls_profile = pin.map_or_else(
-                || "default".into(),
-                |pin| {
-                    if self.stream_up {
-                        pin.stream_up_profile()
-                    } else {
-                        pin.profile()
-                    }
-                },
-            );
-            if pin.is_none() {
-                profile.xhttp_mode = Some(if self.stream_up {
-                    config::XhttpMode::StreamUp
-                } else {
-                    config::XhttpMode::StreamOne
-                });
-            }
-            let invite = Invitation::public_from_profile(&profile)
-                .unwrap()
-                .encode()
-                .unwrap();
-            let received = Invitation::decode(&invite)
-                .unwrap()
-                .to_profile("env:TEST_TOKEN", None)
-                .unwrap();
-            assert_eq!(received.tls_profile, profile.tls_profile);
+            profile.xhttp_mode = Some(if self.stream_up {
+                config::XhttpMode::StreamUp
+            } else {
+                config::XhttpMode::StreamOne
+            });
+            // Only supported Own-TLS profiles are serialized. Additional
+            // certificate pins below are laboratory-only API inputs.
+            let received = if pin.is_none() {
+                let invite = Invitation::public_from_profile(&profile).unwrap().encode().unwrap();
+                Invitation::decode(&invite).unwrap().to_profile("env:TEST_TOKEN", None).unwrap()
+            } else {
+                profile.clone()
+            };
             assert_eq!(received.transport, profile.transport);
-            let imported_pin = CertificatePin::parse_profile(&received.tls_profile);
-            assert_eq!(
-                received.effective_xhttp_mode(),
-                profile.effective_xhttp_mode()
-            );
+            assert_eq!(received.effective_xhttp_mode(), profile.effective_xhttp_mode());
+            let imported_pin = pin;
             let stream_up = received.effective_xhttp_mode() == config::XhttpMode::StreamUp;
             let token = URL_SAFE_NO_PAD.encode(TOKEN);
             let (mut app, local) = tokio::io::duplex(4096);
@@ -532,7 +517,7 @@ async fn own_tls_auto_h2_h3_rejects_auth_and_accepts_normal_stream_one() {
 
 // Independent wire witness, not a call to the production proof helper.
 fn raw_pinned_request(proof: Option<&HeaderValue>) -> Request<()> {
-    let mut request = Request::post("https://localhost/v1/pinned-session")
+    let mut request = Request::post("https://localhost/v1/theia-example/session")
         .header("content-type", "application/octet-stream")
         .header(
             "authorization",
@@ -554,7 +539,7 @@ fn witness(key: &[u8; 32]) -> HeaderValue {
     let mut data = b"SmartTheia/XHTTP/admission/v1\0".to_vec();
     for part in [
         b"POST".as_slice(),
-        b"/v1/pinned-session".as_slice(),
+        b"/v1/theia-example/session".as_slice(),
         request.headers()["authorization"].as_bytes(),
     ] {
         data.extend_from_slice(&(part.len() as u32).to_be_bytes());

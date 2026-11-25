@@ -442,3 +442,52 @@ fn padding_v1_golden_vectors_and_capability_subset() {
         negotiated.finish().unwrap();
     }
 }
+
+/// Deterministic bounded adversarial corpus. Exercises both complete decode
+/// and streaming decode across arbitrary fragmentation; no network or
+/// credentials. This is a regression corpus, not an exhaustive fuzz audit.
+#[test]
+fn bounded_mutation_corpus_never_panics_or_exceeds_decoder_bound() {
+    let mut seed = 0x9e37_79b9u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let valid = [hello(), ack(), open(), Frame::OpenOk, Frame::Fin,
+        Frame::Data(vec![0x5a; 64]), Frame::Padding(vec![0; 32])];
+    for iteration in 0..4096 {
+        let mut wire = if iteration % 2 == 0 {
+            encode(&valid[iteration % valid.len()]).unwrap()
+        } else {
+            (0..(next() % 128)).map(|_| next() as u8).collect()
+        };
+        if !wire.is_empty() && iteration % 3 != 0 {
+            let index = next() as usize % wire.len();
+            wire[index] ^= (next() as u8) | 1;
+        }
+        if let Ok(frame) = decode(&wire) {
+            assert_eq!(decode(&encode(&frame).unwrap()).unwrap(), frame);
+        }
+        let mut decoder = Decoder::new();
+        let mut observed = Vec::new();
+        let mut at = 0;
+        while at < wire.len() {
+            let end = (at + 1 + next() as usize % 19).min(wire.len());
+            let result = decoder.feed_each(&wire[at..end], |frame| {
+                observed.push(frame);
+                Ok(())
+            });
+            assert!(decoder.pending_len() <= MAX_PAYLOAD + HEADER_LEN);
+            if result.is_err() {
+                break;
+            }
+            at = end;
+        }
+        if at == wire.len() && decoder.finish().is_ok() {
+            let canonical: Vec<u8> = observed.iter().flat_map(|frame| encode(frame).unwrap()).collect();
+            assert_eq!(canonical, wire);
+        }
+    }
+}

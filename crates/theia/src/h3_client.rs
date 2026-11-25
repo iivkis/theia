@@ -30,6 +30,8 @@ pub struct H3Client {
     roots: RootCertStore,
     identity_quic: Option<quinn::ClientConfig>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
+    padding: crate::descriptor::Padding,
+    own_routes: Option<crate::split_http::IdentityRoutes>,
     connect_timeout: Duration,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     stream_up: bool,
@@ -56,7 +58,7 @@ impl H3Client {
         let uri = Uri::builder()
             .scheme("https")
             .authority(name)
-            .path_and_query("/v1/session")
+            .path_and_query("/v1/theia-example/session")
             .build()
             .map_err(|_| ClientError::Configuration)?;
         Ok(Self {
@@ -67,6 +69,8 @@ impl H3Client {
             roots,
             identity_quic: None,
             identity_routes: None,
+            padding: crate::descriptor::Padding::default(),
+            own_routes: Some(crate::split_http::IdentityRoutes::new(crate::split_http::EXAMPLE_PREFIX)?),
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
             stream_up: false,
@@ -159,11 +163,13 @@ impl H3Client {
             roots: RootCertStore::empty(),
             identity_quic: Some(quic),
             identity_routes: Some(routes),
+            padding: d.padding.clone(),
+            own_routes: None,
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
             stream_up: false,
             auto_mode: None,
-            pool: crate::connection_pool::Pool::default(),
+            pool: crate::connection_pool::Pool::with_rotation(&value.descriptor().rotation),
             reuse_connections: false,
         };
         let modes = value.effective_modes();
@@ -210,7 +216,7 @@ impl H3Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let mut stream = sender
-                .send_request(request)
+                .send_request(self.padding.request(request)?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             stream.finish().await.map_err(|_| ClientError::Http3)?;
@@ -243,9 +249,37 @@ impl H3Client {
     }
 
     /// Reuse verified own-TLS connections within this immutable profile.
+    pub(crate) fn set_profile_budget(&mut self, budget: std::sync::Arc<tokio::sync::Semaphore>) {
+        self.pool.set_profile_budget(budget);
+    }
+
+    pub(crate) fn profile_budget(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        self.pool.profile_budget()
+    }
+
+    pub(crate) fn with_mode_cache_ttl(mut self, ttl: Duration) -> Self {
+        if let Some(mode) = self.auto_mode.as_mut() {
+            mode.set_ttl(ttl);
+        }
+        self
+    }
+
     pub fn with_connection_pool(mut self) -> Self {
         self.reuse_connections = true;
         self
+    }
+
+    /// Set the exact configured inbound route, before admitting any session.
+    pub fn with_path_prefix(mut self, prefix: &str) -> Result<Self, ClientError> {
+        if self.identity_routes.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        let routes = crate::split_http::IdentityRoutes::new(prefix)?;
+        let mut parts = self.uri.clone().into_parts();
+        parts.path_and_query = Some(routes.single.parse().map_err(|_| ClientError::Configuration)?);
+        self.uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+        self.own_routes = Some(routes);
+        Ok(self)
     }
 
     pub fn with_certificate_pin(
@@ -255,14 +289,7 @@ impl H3Client {
         if pin.is_some() && self.auto_mode.is_some() {
             return Err(ClientError::Configuration);
         }
-        if pin.is_some() {
-            self.uri = Uri::builder()
-                .scheme("https")
-                .authority(self.name.as_str())
-                .path_and_query(crate::security_profile::PINNED_PATH)
-                .build()
-                .map_err(|_| ClientError::Configuration)?;
-        } else if self.certificate_pin.is_some() {
+        if pin.is_none() && self.certificate_pin.is_some() {
             return Err(ClientError::Configuration);
         }
         self.certificate_pin = pin;
@@ -287,13 +314,6 @@ impl H3Client {
         Ok(self)
     }
 
-    pub(crate) fn preferred_stream_up(&self) -> Result<bool, ClientError> {
-        match &self.auto_mode {
-            Some(mode) => Ok(mode.select()?.stream_up),
-            None => Ok(self.stream_up),
-        }
-    }
-
     pub(crate) fn remote(&self) -> SocketAddr {
         self.remote
     }
@@ -307,15 +327,6 @@ impl H3Client {
     }
 
     pub async fn open(&self, address: Address, port: u16) -> Result<H3Tunnel, ClientError> {
-        self.open_preferred(address, port, None).await
-    }
-
-    pub(crate) async fn open_preferred(
-        &self,
-        address: Address,
-        port: u16,
-        preferred: Option<bool>,
-    ) -> Result<H3Tunnel, ClientError> {
         let operation = diagnostics::next_id();
         crate::diag!(
             Debug,
@@ -325,7 +336,7 @@ impl H3Client {
         );
         let open = Frame::OpenTcp { address, port };
         protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation, preferred))
+        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation))
             .await
             .map_err(|_| ClientError::Timeout)
             .and_then(|result| result);
@@ -388,37 +399,53 @@ impl H3Client {
         &self,
         open: Frame,
         operation: u64,
-        preferred: Option<bool>,
     ) -> Result<H3Tunnel, ClientError> {
         use crate::split_http::HelloOutcome;
         let mut stage = HelloOutcome::Pending;
         let Some(mode) = &self.auto_mode else {
             return self
-                .open_inner(&open, operation, self.stream_up, &mut stage)
+                .open_mode(&open, operation, self.stream_up, &mut stage)
                 .await;
         };
         let ticket = mode.select()?;
-        let stream_up = preferred.unwrap_or(ticket.stream_up);
+        let stream_up = ticket.stream_up;
         let result = self
-            .open_inner(&open, operation, stream_up, &mut stage)
+            .open_mode(&open, operation, stream_up, &mut stage)
             .await;
-        if stream_up && stage == HelloOutcome::Acked {
-            mode.remember(ticket)?;
-        }
-        if stream_up || stage != HelloOutcome::Silent || !mode.current(ticket)? {
+        if !mode.after_attempt(ticket, stream_up, stage)? {
             return result;
         }
         // The first attempt is fully dropped and never sent OPEN_TCP.
         crate::diag!(Debug, "client.h3", "xhttp_pre_open_stream_up_retry");
         let mut stage = HelloOutcome::Pending;
-        let result = self.open_inner(&open, operation, true, &mut stage).await;
-        if stage == HelloOutcome::Acked {
-            mode.remember(ticket)?;
-        }
+        let result = self.open_mode(&open, operation, true, &mut stage).await;
+        mode.after_attempt(ticket, true, stage)?;
         // The original H3 attempt already completed HTTP admission.
         // UDP silence in the second attempt must not authorize H2 fallback.
         match result {
-            Err(ClientError::QuicUnreachable) => Err(ClientError::Timeout),
+            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => Err(ClientError::Timeout),
+            other => other,
+        }
+    }
+
+    /// At most one fresh connection after an explicit graceful GOAWAY
+    /// before any HELLO/OPEN. Never replay a body or change XHTTP mode.
+    async fn open_mode(
+        &self,
+        open: &Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &mut crate::split_http::HelloOutcome,
+    ) -> Result<H3Tunnel, ClientError> {
+        use crate::split_http::HelloOutcome;
+        let result = self.open_inner(open, operation, stream_up, stage).await;
+        if *stage != HelloOutcome::Draining {
+            return result;
+        }
+        *stage = HelloOutcome::Pending;
+        let result = self.open_inner(open, operation, stream_up, stage).await;
+        match result {
+            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => Err(ClientError::Timeout),
             other => other,
         }
     }
@@ -472,18 +499,36 @@ impl H3Client {
         stream_up: bool,
         stage: &mut crate::split_http::HelloOutcome,
     ) -> Result<H3Tunnel, ClientError> {
-        let route = crate::local_proxy::route_source(self.remote);
+        let route = crate::network_scope::observe(self.remote);
         let reusable = self.reuse_connections && self.certificate_pin.is_none();
         let mut lease = self
             .pool
             .acquire(
                 route,
-                stream_up,
                 reusable,
                 |connection| !connection.driver.0.is_finished(),
                 self.connect_verified(operation),
             )
             .await?;
+        // A network transition during a queued/dialing admission invalidates
+        // reuse before any HTTP headers or bearer are sent.
+        if route.is_some() && crate::network_scope::observe(self.remote) != route {
+            lease.retire();
+            return Err(ClientError::Io);
+        }
+        if !lease.accepting_new_streams() {
+            return Err(ClientError::Http3);
+        }
+        // Only a protocol-level graceful refusal during HTTP admission can
+        // retry. The lease's Drop removes the draining connection from reuse
+        // while other admitted leases retain it.
+        let mut admission_error = |error: h3::error::StreamError| {
+            if matches!(error, h3::error::StreamError::RemoteClosing { .. }) {
+                lease.retire();
+                *stage = crate::split_http::HelloOutcome::Draining;
+            }
+            ClientError::Http3
+        };
         let connection = lease.connection();
         let binding = connection.binding.as_ref();
         let mut sender = connection
@@ -497,34 +542,34 @@ impl H3Client {
             let mut download = sender
                 .send_request(crate::channel_binding::attach(
                     binding,
-                    split_http::request_for(
-                        self.identity_routes.as_ref(),
+                    self.padding.request(split_http::request_for(
+                        self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                         &self.uri,
                         Leg::Download,
                         &self.authorization,
                         pair_id,
-                    )?,
+                    )?)?,
                 )?)
                 .await
-                .map_err(|_| ClientError::Http3)?;
-            download.finish().await.map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
+            download.finish().await.map_err(&mut admission_error)?;
             let mut upload = sender
                 .send_request(crate::channel_binding::attach(
                     binding,
-                    split_http::request_for(
-                        self.identity_routes.as_ref(),
+                    self.padding.request(split_http::request_for(
+                        self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                         &self.uri,
                         Leg::Upload,
                         &self.authorization,
                         pair_id,
-                    )?,
+                    )?)?,
                 )?)
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             let upload_response = upload
                 .recv_response()
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             split_http::check_status(upload_response.status())?;
             if upload
                 .recv_data()
@@ -542,7 +587,7 @@ impl H3Client {
             let response = download
                 .recv_response()
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             let (tx, _) = upload.split();
             let (_, rx) = download.split();
             (response, tx, rx)
@@ -553,13 +598,13 @@ impl H3Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let mut stream = sender
-                .send_request(crate::channel_binding::attach(binding, request)?)
+                .send_request(crate::channel_binding::attach(binding, self.padding.request(request)?)?)
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             let response = stream
                 .recv_response()
                 .await
-                .map_err(|_| ClientError::Http3)?;
+                .map_err(&mut admission_error)?;
             let (tx, rx) = stream.split();
             (response, tx, rx)
         };
@@ -611,10 +656,14 @@ impl H3Client {
             "hello_ack_received",
             "op" = Value::Count(operation)
         );
-        if !matches!(ack, Frame::HelloAck { .. }) {
+        let Frame::HelloAck { accepted_capabilities, .. } = ack else {
             return Err(ClientError::Protocol);
-        }
+        };
         *stage = crate::split_http::HelloOutcome::Acked;
+        if let Some(padding) = self.padding.frame(accepted_capabilities)? {
+            state.apply(Direction::Send, &padding).map_err(|_| ClientError::Protocol)?;
+            send(&mut tx, &padding).await?;
+        }
         state
             .apply(Direction::Send, open)
             .map_err(|_| ClientError::Protocol)?;
@@ -665,6 +714,7 @@ fn quic_error(error: QuicError) -> ClientError {
         QuicError::Bind => ClientError::Io,
         QuicError::Timeout => ClientError::Timeout,
         QuicError::Unreachable => ClientError::QuicUnreachable,
+        QuicError::EndpointNetworkRefused => ClientError::QuicEndpointNetworkRefused,
         QuicError::Handshake | QuicError::Alpn => ClientError::Tls,
         QuicError::CongestionController => ClientError::Http3,
     }
@@ -762,6 +812,7 @@ impl H3Tunnel {
                     let _ = upload_done.send(());
                     return Ok::<(), ClientError>(());
                 }
+                self._lease.record_data(n);
                 activity.data(n);
             }
         };
@@ -785,6 +836,7 @@ impl H3Tunnel {
                             .await
                             .map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Io)?;
+                        self._lease.record_data(data.len());
                         activity.data(data.len());
                     }
                     Frame::Fin => {

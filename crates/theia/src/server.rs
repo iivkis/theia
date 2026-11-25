@@ -136,6 +136,8 @@ pub struct ServerContext {
     pub inbound_id: String,
     security_mode: crate::security_profile::SecurityMode,
     identity_routes: Option<RwLock<IdentityRoutePolicy>>,
+    own_routes: Option<crate::split_http::IdentityRoutes>,
+    padding: crate::descriptor::Padding,
     identity_gate: Option<Arc<RwLock<bool>>>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
@@ -214,6 +216,8 @@ impl ServerContext {
             inbound_id: inbound.id.clone(),
             security_mode: inbound.security_mode,
             identity_routes: None,
+            padding: crate::descriptor::Padding::default(),
+            own_routes: inbound.path_prefix.as_deref().and_then(|prefix| crate::split_http::IdentityRoutes::new(prefix).ok()),
             identity_gate: None,
             authorization,
             policy: policy.clone(),
@@ -269,6 +273,7 @@ impl ServerContext {
         }
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
+        self.padding = d.padding.clone();
         self.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
             paths,
             stream_one: d.stream_one,
@@ -304,6 +309,8 @@ impl ServerContext {
         Ok(Self {
             inbound_id: self.inbound_id.clone(),
             security_mode: self.security_mode,
+            own_routes: None,
+            padding: d.padding.clone(),
             identity_routes: Some(RwLock::new(IdentityRoutePolicy {
                 paths,
                 stream_one: d.stream_one,
@@ -380,6 +387,15 @@ impl ServerContext {
         Ok(next.revision)
     }
 
+    pub(crate) fn pad_response<T>(&self, mut response: Response<T>) -> Result<Response<T>, ServerError> {
+        self.padding.add_header(response.headers_mut()).map_err(|_| ServerError::Config)?;
+        Ok(response)
+    }
+
+    pub(crate) fn padding_frame(&self, accepted: u32) -> Result<Option<Frame>, ServerError> {
+        self.padding.frame(accepted).map_err(|_| ServerError::Config)
+    }
+
     pub(crate) fn split_leg<T>(&self, request: &Request<T>) -> Option<crate::split_http::Leg> {
         match &self.identity_routes {
             Some(routes) => {
@@ -390,7 +406,7 @@ impl ServerContext {
                     None
                 }
             }
-            None => crate::split_http::leg(request),
+            None => self.own_routes.as_ref()?.leg(request),
         }
     }
 
@@ -493,7 +509,7 @@ impl ServerContext {
             }),
             None => {
                 !self.security_mode.is_stream_up()
-                    && request.uri().path() == self.security_mode.path()
+                    && self.own_routes.as_ref().is_some_and(|routes| request.uri().path() == routes.single)
             }
         };
         if !single_allowed
@@ -1104,7 +1120,7 @@ async fn handle_descriptor(
         .body(())
         .map_err(|_| ServerError::Http2)?;
     let mut output = respond
-        .send_response(response, false)
+        .send_response(context.pad_response(response)?, false)
         .map_err(|_| ServerError::Http2)?;
     timeout(CLOSE_TIMEOUT, async {
         output.reserve_capacity(signed.len());
@@ -1178,7 +1194,7 @@ async fn handle_request(
         .map_err(|_| ServerError::Http2)?;
     // HTTP 200 acknowledges transport/auth headers, NOT remote TCP OPEN.
     let outgoing = respond
-        .send_response(response, false)
+        .send_response(context.pad_response(response)?, false)
         .map_err(|_| ServerError::Http2)?;
     let result = relay_request(inbound, outgoing, &context, session_id).await;
     drop(permit);
@@ -1239,9 +1255,10 @@ async fn handle_split_request(
         .map_err(|_| ServerError::Http2)?;
     // POST response contains only an empty acknowledgement. All downstream
     // SmartTheia frames travel on the independent GET response.
-    reject(&mut up, StatusCode::OK).await?;
+    let upload_ack = Response::builder().status(StatusCode::OK).body(()).map_err(|_| ServerError::Http2)?;
+    up.send_response(context.pad_response(upload_ack)?, true).map_err(|_| ServerError::Http2)?;
     let outgoing = down
-        .send_response(response, false)
+        .send_response(context.pad_response(response)?, false)
         .map_err(|_| ServerError::Http2)?;
     let result = relay_request(
         upload.into_body(),
@@ -1388,6 +1405,10 @@ async fn handle_frames(
             .apply(Direction::Send, &ack)
             .map_err(|_| ServerError::Protocol)?;
         send_frame(outgoing, &ack).await?;
+        if let Some(padding) = context.padding_frame(capabilities & protocol::CAP_PADDING)? {
+            state.apply(Direction::Send, &padding).map_err(|_| ServerError::Protocol)?;
+            send_frame(outgoing, &padding).await?;
+        }
         let open = loop {
             let frame = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
             state
@@ -1639,25 +1660,6 @@ struct TlsMaterial {
     key: rustls::pki_types::PrivateKeyDer<'static>,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     identity: crate::reload_preflight::IdentityHash,
-}
-
-pub(crate) fn configured_certificate_pin(
-    inbound: &Inbound,
-) -> Result<crate::security_profile::CertificatePin, ServerError> {
-    let material = tls_material(inbound)?;
-    let pin = crate::security_profile::CertificatePin::from_der(
-        material.certs.first().ok_or(ServerError::Config)?.as_ref(),
-    );
-    // Validate the actual cert/key pair with the existing TLS backend.
-    let _ = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| ServerError::Tls)?
-    .with_no_client_auth()
-    .with_single_cert(material.certs, material.key)
-    .map_err(|_| ServerError::Tls)?;
-    Ok(pin)
 }
 
 fn tls_material(inbound: &Inbound) -> Result<TlsMaterial, ServerError> {
@@ -3611,6 +3613,7 @@ mod hardening_tests {
                 inbounds: vec![
                     Inbound {
                         id: "edge-a".into(),
+                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
                         allowed_user_ids: vec!["alice".into()],
                         h2_listen: "127.0.0.1:9443".into(),
                         quic_listen: "127.0.0.1:9443".into(),
@@ -3622,6 +3625,7 @@ mod hardening_tests {
                     },
                     Inbound {
                         id: "edge-b".into(),
+                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
                         allowed_user_ids: vec!["bob".into()],
                         h2_listen: "127.0.0.1:9444".into(),
                         quic_listen: "127.0.0.1:9444".into(),
@@ -4174,6 +4178,7 @@ mod hardening_tests {
         edge.h2_listen = addr.to_string();
         edge.quic_listen = addr.to_string();
         edge.security_mode = crate::security_profile::SecurityMode::SmartReality;
+        edge.path_prefix = None;
         edge.tls_cert.clear();
         edge.tls_key.clear();
         let now = crate::reference_health::unix_now().unwrap();
