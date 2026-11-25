@@ -376,4 +376,6 @@ require(all(case in f13_runner for case in (
         "repeated exact-revision native and browser observation matrix must remain mandatory")
 require("test_benchmark_ports.py" in spec and "test_benchmark_ports.py" in browser,
         "native benchmark transport-specific port reservation regressions remain mandatory")
+require("native_clients_require_pki_and_exact_alpn -- --ignored --exact" in browser,
+        "independent native-client TLS trust and ALPN matrix must remain mandatory")
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")

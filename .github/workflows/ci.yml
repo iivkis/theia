@@ -510,6 +510,8 @@ jobs:
           retention-days: 7
       - name: Install pinned independent REALITY reference implementations
         run: python -m pip install h2==4.2.0 aioquic==1.2.0
+      - name: Independent native client PKI and ALPN matrix over H2/H3
+        run: cargo test --workspace --locked --test independent_native_tls native_clients_require_pki_and_exact_alpn -- --ignored --exact --nocapture
       - name: Independent external TLS and QUIC through registered REALITY dispatchers
         run: cargo test --workspace --locked --lib server::hardening_tests::independent_external_reference_through_registered_reality_dispatchers -- --ignored --exact --nocapture
       - name: Install pinned native benchmark measurement dependency
