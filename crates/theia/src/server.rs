@@ -2418,6 +2418,7 @@ async fn run_reality_document_inner(document:ServerDocument,
     if !document.server.enabled { return Err(ServerError::Config); }
     let live = Arc::new(LiveAuthorization::new(document.clone()).map_err(|_| ServerError::Config)?);
     let policy = &document.server.policy;
+    let ledger=crate::quota::Ledger::new(policy,&document.server.users);
     let global = Arc::new(Semaphore::new(policy.max_connections_total as usize));
     let connections = Arc::new(Semaphore::new(policy.max_connections_total as usize));
     let peers = Arc::new(PeerBudget::default());
@@ -2441,8 +2442,9 @@ async fn run_reality_document_inner(document:ServerDocument,
             crate::tcp_bbr::Error::Network => ServerError::Io,
             crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
         })?;
-        let context = ServerContext::with_limits(inbound, policy, live.shared(), global.clone(),
+        let mut context = ServerContext::with_limits(inbound, policy, live.shared(), global.clone(),
             users.clone(), connections.clone(), peers.clone());
+        context.live_quota=Some(ledger.clone());
         if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
             #[cfg(any(target_os="linux",target_os="windows"))]
             loaded_identities.push(crate::reload_preflight::IdentityHash::reality(inbound.reality.as_ref().ok_or(ServerError::Config)?));
@@ -2486,7 +2488,7 @@ async fn run_reality_document_inner(document:ServerDocument,
     let runtime=config_path.map(|path|Arc::new(crate::runtime_generation::State::new(
         crate::runtime_generation::View{document:Arc::new(document.clone()),inbounds:ready.len(),
             preflight:Arc::new(crate::reload_preflight::ReloadPreflight::new(path.to_owned(),document.clone(),loaded_identities)),
-            live:live.clone()}).with_reality(reality_status)));
+            live:live.clone()}).with_reality(reality_status).with_reality_ledger(ledger.clone())));
     #[cfg(target_os = "linux")]
     let management = crate::management::StatusServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?
         .map(|server|if let Some(runtime)=runtime{server.with_runtime(runtime)}else{server});

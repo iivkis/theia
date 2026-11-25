@@ -239,23 +239,9 @@ impl ReloadPreflight {
     /// The quota transaction MUST NOT smuggle a TLS file update via an
     /// unchanged file: reference; actual loaded PEM bytes remain authoritative.
     pub(crate) fn loaded_tls_unchanged(&self, candidate: &ServerDocument) -> bool {
-        if candidate.server.inbounds.len() != self.identities.len() {
-            return false;
-        }
-        candidate
-            .server
-            .inbounds
-            .iter()
-            .zip(&self.identities)
-            .all(|(inbound, identity)| {
-                let Ok(cert) = crate::server::pem_data(&inbound.tls_cert, false) else {
-                    return false;
-                };
-                let Ok(key) = crate::server::pem_data(&inbound.tls_key, true) else {
-                    return false;
-                };
-                identity.matches(&cert, &key)
-            })
+        let mut normalized=candidate.clone();
+        normalized.server.policy=self.active.server.policy.clone();
+        self.validate_candidate(normalized).is_ok()
     }
 
     /// Bound and typed TOML is the ONE candidate the native supervisor sees.
@@ -315,6 +301,15 @@ impl ReloadPreflight {
             Ok(Config::Server(document)) => document,
             _ => return Err(crate::restart_guard::RestartError::InvalidConfig),
         };
+        if self.active.server.inbounds.iter().any(|i|i.reality.is_some()){
+            if self.validate_candidate(candidate.clone()).is_ok(){
+                return Ok(crate::restart_guard::RestartVerdict::AuthorizationOnly);
+            }
+            // No claim of same-port PEM rotation or fresh-port staging for
+            // a structural REALITY replacement through the own-TLS path.
+            Config::Server(candidate).validate().map_err(|_|crate::restart_guard::RestartError::InvalidConfig)?;
+            return Ok(crate::restart_guard::RestartVerdict::RequiresMaintenance);
+        }
         crate::restart_guard::probe(&self.active, &self.identities, &candidate)
     }
 

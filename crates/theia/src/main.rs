@@ -105,6 +105,27 @@ async fn main() {
                 Err(error) => Err(CliError::Management(error)),
             }
         }
+        Ok(Command::ServerApplyReloadBound{expected_revision,candidate_sha256})=>{
+            match management::query_environment(management::StatusCommand::ApplyReloadBound{expected_revision,candidate_sha256}).await{
+                Ok(management::StatusReply::Applied{revision})=>Ok(format!("authorization applied; revision={revision}; existing tunnels retained")),
+                Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error)=>Err(CliError::Management(error)),
+            }
+        }
+        Ok(Command::ServerAuthRollbackCheck)=>{
+            match management::query_environment(management::StatusCommand::CheckAuthRollback).await{
+                Ok(management::StatusReply::AuthRollbackReady{revision,remaining_seconds})=>Ok(format!("authorization rollback ready; revision={revision}; remaining_seconds={remaining_seconds}; no change applied")),
+                Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error)=>Err(CliError::Management(error)),
+            }
+        }
+        Ok(Command::ServerAuthRollbackApply{expected_revision})=>{
+            match management::query_environment(management::StatusCommand::ApplyAuthRollback{expected_revision}).await{
+                Ok(management::StatusReply::AuthRollbackApplied{revision})=>Ok(format!("authorization rollback applied; revision={revision}; slot consumed; saved TOML unchanged")),
+                Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error)=>Err(CliError::Management(error)),
+            }
+        }
         Ok(Command::ServerApplyReload { expected_revision }) => {
             match management::query_environment(management::StatusCommand::ApplyReload {
                 expected_revision,

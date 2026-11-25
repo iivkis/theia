@@ -23,6 +23,11 @@ enum Phase {
     RollbackApplying,
     RollbackApplied {revision:u64},
     RollbackUnavailable,
+    QuotaChecking {revision:u64},
+    QuotaConfirming {revision:u64},
+    QuotaApplying,
+    QuotaApplied {revision:u64},
+    QuotaRejected,
     Applied { revision: u64 },
     Rejected,
     Indeterminate,
@@ -183,6 +188,16 @@ impl RuntimePanel {
                     _ => Phase::RestartUnavailable,
                 };
             }
+            Phase::QuotaChecking{revision}=>{
+                self.phase=match result{Ok(StatusReply::QuotaReady)=>Phase::QuotaConfirming{revision},_=>Phase::QuotaRejected};
+            }
+            Phase::QuotaApplying=>{
+                self.phase=match result{
+                    Ok(StatusReply::QuotaApplied{revision})=>Phase::QuotaApplied{revision},
+                    Err(ManagementError::CandidateRejected|ManagementError::Unsupported)=>Phase::QuotaRejected,
+                    _=>Phase::Indeterminate,
+                };
+            }
             Phase::RollbackChecking=>{
                 self.phase=match result{
                     Ok(StatusReply::AuthRollbackReady{revision,remaining_seconds})=>Phase::RollbackConfirming{revision,remaining_seconds},
@@ -250,7 +265,19 @@ impl RuntimePanel {
                 false
             }
             (Phase::Checking, KeyCode::Esc) => true,
-            (Phase::Checking | Phase::Applying | Phase::RollbackApplying, _) => false,
+            (Phase::Checking | Phase::Applying | Phase::RollbackApplying | Phase::QuotaApplying, _) => false,
+            (Phase::QuotaChecking{..},KeyCode::Esc)=>true,
+            (Phase::QuotaChecking{..},_)=>false,
+            (Phase::Viewing{revision,..}|Phase::Applied{revision},KeyCode::Char('c')) if self.saved_sha256.is_some()=>{
+                self.phase=Phase::QuotaChecking{revision};self.start(StatusCommand::CheckQuota);false
+            }
+            (Phase::QuotaConfirming{revision},KeyCode::Char('y'))=>{
+                let Some(candidate_sha256)=self.saved_sha256 else{self.phase=Phase::QuotaRejected;return false;};
+                self.phase=Phase::QuotaApplying;
+                self.start(StatusCommand::ApplyQuotaBound{expected_revision:revision,candidate_sha256});false
+            }
+            (Phase::QuotaConfirming{..},KeyCode::Char('n')|KeyCode::Esc)=>true,
+            (Phase::QuotaConfirming{..},_)=>false,
             (Phase::RollbackChecking,KeyCode::Esc)=>true,
             (Phase::RollbackChecking,_)=>false,
             (Phase::Viewing{..}|Phase::Applied{..},KeyCode::Char('b')) if self.saved_sha256.is_some()=>{
@@ -326,6 +353,11 @@ impl RuntimePanel {
             Phase::RestartFreshPortsBindable => "Все НОВЫЕ TCP и UDP порты удалось одновременно пробно открыть.\nОни уже освобождены: НЕТ гарантии будущего bind, НЕТ restart, НЕТ rollback.\nСервер работает БЕЗ ИЗМЕНЕНИЙ.\nr: перепроверить | Esc: закрыть".into(),
             Phase::RestartRejected => "Отказ: кандидат TOML, TLS identity или TCP/UDP bind не прошёл проверку.\nСтарые listeners, авторизация и туннели не изменены этой операцией.\nr: перепроверить | Esc: закрыть".into(),
             Phase::RestartUnavailable => "Нет доступного защищённого IPC/снимка конфигурации для проверки restart.\nНичего не изменено.\nr: повторить | Esc: закрыть".into(),
+            Phase::QuotaChecking{..}=>"Проверка quota-only кандидата. Runtime не изменяется.".into(),
+            Phase::QuotaConfirming{revision}=>format!("Подтвердить изменение только двух лимитов квот, revision={revision}.\nПри уменьшении лимита действующие соединения остаются; новые ждут освобождения занятых слотов.\ny: применить | n/Esc: отменить"),
+            Phase::QuotaApplying=>"Отправлен CAS квот. При потере ACK сначала перечитайте revision.".into(),
+            Phase::QuotaApplied{revision}=>format!("Квоты применены, revision={revision}. Действующие туннели сохранены.\nr: статус | Esc: закрыть"),
+            Phase::QuotaRejected=>"Кандидат квот отклонён. Ничего не применено.\nr: статус | Esc: закрыть".into(),
             Phase::RollbackChecking=>"Проверка доступности одноразового отката авторизации REALITY. Только чтение.".into(),
             Phase::RollbackConfirming{revision,remaining_seconds}=>format!(
                 "Откат авторизации, revision={revision}, осталось {remaining_seconds} с.\nПредыдущие grants, disabled и digest снова начнут действовать для новых запросов. Доверие, identity, дескрипторы и активные туннели не откатываются. TOML останется без изменений.\ny: подтвердить | n/Esc: отменить"),
@@ -336,7 +368,7 @@ impl RuntimePanel {
             Phase::Viewing { inbounds, revision } => format!(
                 "Сервер работает. Inbounds: {inbounds}. Авторизация: revision={revision}.\n\n{}\nr: обновить статус | Esc: закрыть",
                 if self.saved_sha256.is_some() {
-                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются только token digest/disabled/grants прежних пользователей.\nb: проверить одноразовый откат авторизации REALITY (300 с)."
+                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются только token digest/disabled/grants прежних пользователей.\nb: проверить одноразовый откат авторизации REALITY (300 с).\nc: проверить quota-only Apply."
                 } else {
                     "Применение недоступно без явного --role server --config FILE."
                 }

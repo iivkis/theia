@@ -29,6 +29,7 @@ pub(crate) struct State {
     rollback_until: RwLock<Option<Instant>>,
     auth_rollback: RwLock<Option<AuthRollback>>,
     reality: std::collections::HashMap<String,([u8;32],Arc<crate::reality_live::Live>)>,
+    reality_ledger:Option<Arc<crate::quota::Ledger>>,
 }
 
 struct AuthRollback {
@@ -44,12 +45,28 @@ impl State {
             rollback_until: RwLock::new(None),
             auth_rollback: RwLock::new(None),
             reality:std::collections::HashMap::new(),
+            reality_ledger:None,
         }
     }
 
     pub(crate) fn with_reality(mut self,entries:std::collections::HashMap<String,([u8;32],Arc<crate::reality_live::Live>)>)->Self{
         self.reality=entries;
         self
+    }
+    pub(crate) fn with_reality_ledger(mut self,ledger:Arc<crate::quota::Ledger>)->Self{
+        self.reality_ledger=Some(ledger);self
+    }
+    pub(crate) fn has_reality_ledger(&self)->bool{self.reality_ledger.is_some()}
+    pub(crate) fn apply_reality_quota(&self,previous:&Arc<View>,expected:u64,candidate:&ServerDocument)
+        ->Result<u64,LiveAuthError>{
+        let ledger=self.reality_ledger.as_ref().ok_or(LiveAuthError::Unavailable)?;
+        if !crate::restart_guard::quota_only(previous.document.as_ref(),candidate){
+            return Err(LiveAuthError::RequiresRestart);
+        }
+        let (live,stage)=previous.live.prepare_tls_rebase(candidate,expected)?;
+        let next=View{document:Arc::new(candidate.clone()),inbounds:previous.inbounds,
+            preflight:Arc::new(previous.preflight.rebased(candidate.clone())),live:Arc::new(live)};
+        self.commit_quota(previous,expected,next,stage,ledger)
     }
     pub(crate) fn reality_status(&self,id:&str,manifest:[u8;32])->Option<Option<crate::reality_generation::Status>>{
         let (expected,live)=self.reality.get(id)?;
@@ -220,6 +237,7 @@ impl State {
         let expected_next = expected
             .checked_add(1)
             .ok_or(LiveAuthError::RevisionExhausted)?;
+        let mut rollback=self.auth_rollback.write().map_err(|_|LiveAuthError::Unavailable)?;
         let held = ledger
             .prepare_resize(&next.document.server.policy)
             .map_err(|_| LiveAuthError::Unavailable)?;
@@ -228,6 +246,7 @@ impl State {
         let revision = previous.live.publish(authorization)?;
         debug_assert_eq!(revision, expected_next);
         held.commit();
+        *rollback=None;
         *guard = Arc::new(next);
         Ok(revision)
     }

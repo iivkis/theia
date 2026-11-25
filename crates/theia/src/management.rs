@@ -395,6 +395,20 @@ where
                     format!("theia-status-v1 running inbounds={inbounds}\n")
                 }
             }
+            candidate if parse_quota_revision(candidate).is_some()
+                && runtime.as_ref().is_some_and(|r|r.has_reality_ledger())=>{
+                if let (Some(preflight),Some(runtime),Some(previous))=(&preflight,&runtime,&observed){
+                    let (expected,digest)=parse_quota_revision(candidate).expect("parsed");
+                    let preflight=preflight.clone();
+                    match tokio::task::spawn_blocking(move||preflight.load_quota_candidate_bound(digest)).await{
+                        Ok(Ok(document))=>match runtime.apply_reality_quota(previous,expected,&document){
+                            Ok(revision)=>format!("theia-quota-v1 applied revision={revision}\n"),
+                            Err(_)=>"theia-quota-v1 rejected\n".into(),
+                        },
+                        _=>"theia-quota-v1 rejected\n".into(),
+                    }
+                }else{"ERR unsupported\n".into()}
+            }
             candidate
                 if parse_restart_revision(candidate).is_some()
                     || parse_quota_revision(candidate).is_some() =>
