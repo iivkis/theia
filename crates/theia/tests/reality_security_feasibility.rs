@@ -131,10 +131,10 @@ fn v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile() {
     let changed = baseline.replace("schema_version = 1", "schema_version = 2");
     assert_ne!(changed, baseline);
     assert!(config::parse(&changed).is_err());
-    let anchor = "tls_profile = \"default\"\n";
+    let anchor = "security_mode = \"own-tls\"\n";
     assert!(baseline.contains(anchor));
     for unsupported in ["smart-reality-v1", "reality", "chrome133", "insecure"] {
-        let changed = baseline.replacen(anchor, &format!("tls_profile = \"{unsupported}\"\n"), 1);
+        let changed = baseline.replacen(anchor, &format!("security_mode = \"{unsupported}\"\n"), 1);
         assert!(
             config::parse(&changed).is_err(),
             "unimplemented named TLS/security mode must fail closed"

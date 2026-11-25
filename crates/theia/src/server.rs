@@ -232,6 +232,12 @@ impl ServerContext {
         }
     }
 
+    fn apply_own_tls_policy(&mut self) {
+        if self.security_mode.is_plain() && self.identity_routes.is_none() {
+            self.padding = crate::padding::OWN_TLS_PADDING;
+        }
+    }
+
     /// Build the identity-authenticated application context from an already
     /// independently verified document. No public listener is activated here.
     pub(crate) fn identity_fixture(
@@ -875,6 +881,18 @@ pub(crate) async fn await_generation_activation(
     }
 }
 
+/// A closed controller is also a drain request. A receiver cloned after
+/// publication must observe Drain even if no further notification arrives.
+pub(crate) fn generation_draining(phase: &watch::Receiver<GenerationPhase>) -> bool {
+    *phase.borrow() == GenerationPhase::Drain || phase.has_changed().is_err()
+}
+
+pub(crate) async fn await_generation_drain(phase: &mut watch::Receiver<GenerationPhase>) {
+    while !generation_draining(phase) {
+        if phase.changed().await.is_err() { break; }
+    }
+}
+
 pub async fn serve(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -944,7 +962,7 @@ pub(crate) async fn serve_generation_with_tls(
                     current.clone()
                 };
                 let context = context.clone();
-                connections.spawn(serve_h2_socket(socket, tls_acceptor, context, peer, slot, connection_id));
+                connections.spawn(serve_h2_socket(socket, tls_acceptor, context, peer, slot, connection_id, phase.clone()));
             }
         }
     }
@@ -969,6 +987,7 @@ pub(crate) async fn serve_h2_socket<S>(
     peer: std::net::SocketAddr,
     slot: ConnectionSlot,
     connection_id: u64,
+    mut phase: watch::Receiver<GenerationPhase>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1043,21 +1062,29 @@ pub(crate) async fn serve_h2_socket<S>(
     );
     let mut handlers = JoinSet::new();
     let pair = Arc::new(crate::split_http::Pair::new());
+    let mut draining = false;
     loop {
-        let accepted = if handlers.is_empty() {
-            match timeout(AUTH_WINDOW, connection.accept()).await {
-                Ok(accepted) => accepted,
-                Err(_) => break,
+        let idle = handlers.is_empty();
+        let accepted = tokio::select! {
+            biased;
+            _ = await_generation_drain(&mut phase), if !draining => {
+                connection.graceful_shutdown();
+                draining = true;
+                continue;
             }
-        } else {
-            tokio::select! {
-                _ = handlers.join_next() => continue,
-                accepted = connection.accept() => accepted,
-            }
+            _ = handlers.join_next(), if !idle => continue,
+            accepted = connection.accept() => accepted,
+            _ = tokio::time::sleep(AUTH_WINDOW), if idle => break,
         };
-        let Some(Ok((request, respond))) = accepted else {
+        let Some(Ok((request, mut respond))) = accepted else {
             break;
         };
+        // During the initial GOAWAY/PING exchange h2 may still deliver
+        // in-flight streams. Never authorize a new request after drain.
+        if draining || generation_draining(&phase) {
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            continue;
+        }
         let context = context.clone();
         let pair = pair.clone();
         let binding = binding.clone();
@@ -1978,6 +2005,22 @@ async fn prepare_selected_listeners(
     live: Arc<LiveAuthorization>,
     only: Option<&std::collections::HashSet<String>>,
 ) -> Result<PreparedGeneration, ServerError> {
+    prepare_selected_listeners_inner(
+        document, limits, captured, live, only,
+        #[cfg(test)]
+        None,
+    ).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn prepare_selected_listeners_inner(
+    document: &ServerDocument,
+    limits: &GenerationLimits,
+    captured: Option<&CapturedTls>,
+    live: Arc<LiveAuthorization>,
+    only: Option<&std::collections::HashSet<String>>,
+    #[cfg(test)] guard_start: Option<u64>,
+) -> Result<PreparedGeneration, ServerError> {
     let mut listeners = Vec::with_capacity(document.server.inbounds.len());
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
     let mut reality = HashMap::new();
@@ -2019,6 +2062,13 @@ async fn prepare_selected_listeners(
                 limits.peer_budget.clone(),
             );
             context.live_quota = Some(limits.ledger.clone());
+            #[cfg(test)]
+            let carrier = if let Some(start) = guard_start {
+                crate::reality_live::Live::with_guard_start(Arc::new(lease), Arc::new(context), now, start)?
+            } else {
+                crate::reality_live::Live::new(Arc::new(lease), Arc::new(context), now)?
+            };
+            #[cfg(not(test))]
             let carrier = crate::reality_live::Live::new(Arc::new(lease), Arc::new(context), now)?;
             let listener = crate::tcp_bbr::bind(tcp_addr).map_err(|e| match e {
                 crate::tcp_bbr::Error::Network => ServerError::Io,
@@ -2080,6 +2130,7 @@ async fn prepare_selected_listeners(
             limits.peer_budget.clone(),
         );
         context.live_quota = Some(limits.ledger.clone());
+        context.apply_own_tls_policy();
         listeners.push(ReadyListener::Plain(
             listener,
             acceptor,
@@ -2241,7 +2292,7 @@ impl RunningGeneration {
                         if !await_generation_activation(&mut phase).await {
                             return Ok(());
                         }
-                        tcp.serve().await
+                        tcp.serve_generation(phase).await
                     });
                     if let Some(quic) = quic {
                         let mut phase = receiver.clone();
@@ -2249,7 +2300,7 @@ impl RunningGeneration {
                             if !await_generation_activation(&mut phase).await {
                                 return Ok(());
                             }
-                            quic.serve().await
+                            quic.serve_generation(phase).await
                         });
                     }
                     if let Some(socket) = silent {
@@ -2343,12 +2394,8 @@ impl RunningGeneration {
         }
     }
     fn remove_inbounds(&mut self, removed: &std::collections::HashSet<String>) {
-        for id in removed {
-            if let Some(phase) = self.phases.get(id) {
-                self.draining.insert(id.clone());
-                phase.send_replace(GenerationPhase::Drain);
-            }
-        }
+        // Revoke admissions on all removed REALITY contexts before signalling
+        // GOAWAY. Existing tunnel permits and retained inbounds are unaffected.
         self.reality.retain(|hot| {
             if removed.contains(&hot.id) {
                 hot.carrier.retire();
@@ -2357,6 +2404,12 @@ impl RunningGeneration {
                 true
             }
         });
+        for id in removed {
+            if let Some(phase) = self.phases.get(id) {
+                self.draining.insert(id.clone());
+                phase.send_replace(GenerationPhase::Drain);
+            }
+        }
         let old = std::mem::take(&mut self.identities);
         let configs = std::mem::take(&mut self.active_h3);
         for (hot, cfg) in old.into_iter().zip(configs) {
@@ -2391,6 +2444,45 @@ impl RunningGeneration {
         self.phases.remove(id);
         true
     }
+}
+
+/// Exercise the real supervisor preparation, launch and partial removal
+/// path. The replay clock override is compiled only into the test harness.
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+pub(crate) async fn registered_reality_drain_fixture(
+    document: ServerDocument,
+    ready: tokio::sync::oneshot::Sender<()>,
+    drain: tokio::sync::oneshot::Receiver<()>,
+    draining: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), ServerError> {
+    let limits = GenerationLimits::new(&document);
+    let authorization = Arc::new(LiveAuthorization::new(document.clone())
+        .map_err(|_| ServerError::Config)?);
+    let start = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?
+        .saturating_sub(121);
+    let prepared = prepare_selected_listeners_inner(
+        &document, &limits, None, authorization, None, Some(start),
+    ).await?;
+    let mut running = RunningGeneration::launch(prepared.listeners, GenerationPhase::Active);
+    ready.send(()).map_err(|_| ServerError::Io)?;
+    tokio::select! {
+        signal = drain => signal.map_err(|_| ServerError::Io)?,
+        _ = running.tasks.join_next() => return Err(ServerError::Io),
+    }
+    let removed = document.server.inbounds.iter().map(|inbound| inbound.id.clone()).collect();
+    running.remove_inbounds(&removed);
+    draining.send(()).map_err(|_| ServerError::Io)?;
+    while let Some(result) = running.tasks.join_next().await {
+        let (id, result) = result.map_err(|_| ServerError::Io)?;
+        result?;
+        if !running.finish_draining(&id) {
+            return Err(ServerError::Io);
+        }
+    }
+    if running.has_draining() {
+        return Err(ServerError::Io);
+    }
+    Ok(())
 }
 
 /// Reaper is capped at one at a time. After a bounded 20-second drain, all
@@ -3225,6 +3317,7 @@ async fn run_reality_document_inner(
             peers.clone(),
         );
         context.live_quota = Some(ledger.clone());
+        context.apply_own_tls_policy();
         if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             loaded_identities.push(crate::reload_preflight::IdentityHash::reality(
@@ -3465,7 +3558,7 @@ async fn run_document_with_config(
                     crate::quic_transport::QuicError::Bind => ServerError::Io,
                     _ => ServerError::Tls,
                 })?;
-        let context = Arc::new(ServerContext::with_limits(
+        let mut context = ServerContext::with_limits(
             inbound,
             &policy,
             live_authorization.shared(),
@@ -3473,8 +3566,9 @@ async fn run_document_with_config(
             per_user.clone(),
             connections.clone(),
             peer_budget.clone(),
-        ));
-        prepared.push((listener, acceptor, endpoint, context));
+        );
+        context.apply_own_tls_policy();
+        prepared.push((listener, acceptor, endpoint, Arc::new(context)));
     }
     // Both platforms require explicit private local IPC opt-in. Advertise
     // status only AFTER all TCP/UDP listeners and TLS have been prepared.
@@ -3615,6 +3709,117 @@ mod hardening_tests {
         })
         .await;
         assert_eq!(result, Ok(second));
+    }
+
+    #[tokio::test]
+    async fn generation_drain_observes_late_receivers_and_controller_loss() {
+        let (owner, mut receiver) = watch::channel(GenerationPhase::Prepared);
+        owner.send_replace(GenerationPhase::Active);
+        assert!(!generation_draining(&receiver));
+        owner.send_replace(GenerationPhase::Drain);
+        let mut late = owner.subscribe();
+        await_generation_drain(&mut receiver).await;
+        await_generation_drain(&mut late).await;
+        assert!(generation_draining(&receiver));
+        assert!(generation_draining(&late));
+
+        let (owner, mut receiver) = watch::channel(GenerationPhase::Active);
+        drop(owner);
+        await_generation_drain(&mut receiver).await;
+        assert!(generation_draining(&receiver));
+    }
+
+    async fn production_listener_drain(h3: bool, split: bool) {
+        let mut document = live_auth_fixture();
+        document.server.policy.allow_private_ips = true;
+        document.server.policy.max_connections_per_user = 4;
+        document.server.policy.max_connections_total = 8;
+        let mut context = ServerContext::new(
+            &document.server.inbounds[0], &document.server.users, &document.server.policy,
+        );
+        context.apply_own_tls_policy();
+        let context = Arc::new(context);
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = signed.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(signed.key_pair.serialize_der());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let (owner, phase) = watch::channel(GenerationPhase::Active);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = if h3 {
+            let endpoint = crate::quic_transport::server_endpoint(remote, vec![cert], key.into()).unwrap();
+            drop(listener);
+            tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase))
+        } else {
+            let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
+                .with_no_client_auth().with_single_cert(vec![cert], key.into()).unwrap();
+            tls.alpn_protocols = vec![b"h2".to_vec()];
+            tokio::spawn(serve_generation(listener, TlsAcceptor::from(Arc::new(tls)), context, phase))
+        };
+        let token = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let address = Address::V4([127, 0, 0, 1]);
+
+        async fn exchange(app: &mut tokio::io::DuplexStream, data: &[u8]) {
+            app.write_all(data).await.unwrap();
+            let mut reply = vec![0; data.len()];
+            app.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, data);
+        }
+
+        macro_rules! exercise {
+            ($client:expr) => {{
+                let client = $client.with_own_tls_policy().unwrap().with_stream_up(split).unwrap().with_connection_pool();
+                let tunnel = client.open(address.clone(), target_port).await.unwrap();
+                let (mut upstream, _) = target.accept().await.unwrap();
+                let echo = tokio::spawn(async move {
+                    let (mut read, mut write) = upstream.split();
+                    tokio::io::copy(&mut read, &mut write).await.unwrap();
+                    write.shutdown().await.unwrap();
+                });
+                let (mut app, local) = tokio::io::duplex(4096);
+                let relay = tokio::spawn(tunnel.relay(local));
+                exchange(&mut app, b"before drain").await;
+                owner.send_replace(GenerationPhase::Drain);
+                exchange(&mut app, b"existing stream after drain").await;
+                // Allow the native GOAWAY control exchange to be driven;
+                // new admission must fail while the old tunnel still works.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(client.open(address.clone(), target_port).await.is_err());
+                assert!(timeout(Duration::from_millis(50), target.accept()).await.is_err());
+                exchange(&mut app, b"existing stream after rejected admission").await;
+                app.shutdown().await.unwrap();
+                let mut tail = Vec::new();
+                app.read_to_end(&mut tail).await.unwrap();
+                assert!(tail.is_empty());
+                relay.await.unwrap().unwrap();
+                echo.await.unwrap();
+                drop(client);
+            }};
+        }
+
+        if h3 {
+            exercise!(crate::h3_client::H3Client::new(remote, "localhost", &token, roots)
+                .unwrap().with_connect_timeout(Duration::from_millis(500)).unwrap());
+        } else {
+            exercise!(crate::client::H2Client::new(&remote.to_string(), "localhost", &token, roots).unwrap());
+        }
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_generation_drain_preserves_admitted_h2_h3_tunnels() {
+        timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                production_listener_drain(false, false),
+                production_listener_drain(false, true),
+                production_listener_drain(true, false),
+                production_listener_drain(true, true),
+            );
+        }).await.expect("bounded production drain matrix");
     }
 
     fn live_auth_fixture() -> ServerDocument {

@@ -6,6 +6,7 @@ use crate::{
     diagnostics::{self, Value},
     h3_client::{H3Client, H3Tunnel},
     protocol::{self, Address, ErrorCode, Frame},
+    security_profile::SecurityMode,
 };
 use rustls::RootCertStore;
 use std::{
@@ -76,14 +77,15 @@ async fn load_client_with_budget(
     profile: &Profile,
     budget: Arc<Semaphore>,
 ) -> Result<ProxyClient, ClientError> {
-    if profile.tls_profile != "default" && profile.tls_profile != "smart-reality" {
-        return Err(ClientError::Configuration);
-    }
-    if profile.tls_profile == "smart-reality" || profile.reality_profile.is_some() {
-        return RealityClient::prepare_with_budget(profile, budget)
-            .await
-            .map(Arc::new)
-            .map(ProxyClient::Reality);
+    match profile.security_mode {
+        SecurityMode::SmartReality if profile.reality_profile.is_some() && profile.tls_ca.is_none() => {
+            return RealityClient::prepare_with_budget(profile, budget)
+                .await
+                .map(Arc::new)
+                .map(ProxyClient::Reality);
+        }
+        SecurityMode::Plain if profile.reality_profile.is_none() => {}
+        _ => return Err(ClientError::Configuration),
     }
     let prefix = profile
         .path_prefix
@@ -116,6 +118,7 @@ async fn load_client_with_budget(
             let endpoint = resolve_server(profile).await?.to_string();
             let client = H2Client::new(&endpoint, &profile.server_name, &token, roots)?
                 .with_path_prefix(prefix)?
+                .with_own_tls_policy()?
                 .with_stream_up(stream_up)?;
             let client = if auto_xhttp {
                 client.with_auto_stream_up(ttl)?
@@ -134,6 +137,7 @@ async fn load_client_with_budget(
             let remote = resolve_server(profile).await?;
             let h3 = H3Client::new(remote, &profile.server_name, &token, roots.clone())?
                 .with_path_prefix(prefix)?
+                .with_own_tls_policy()?
                 .with_stream_up(stream_up)?
                 .with_connect_timeout(Duration::from_millis(u64::from(
                     profile.quic_connect_timeout_ms,
@@ -157,6 +161,7 @@ async fn load_client_with_budget(
             // trust anchors, certificate pin and authorization unchanged.
             let h2 = H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
                 .with_path_prefix(prefix)?
+                .with_own_tls_policy()?
                 .with_stream_up(stream_up)?;
             let h2 = h2.with_connection_pool();
             let h2 = Arc::new(if auto_xhttp {
@@ -1027,7 +1032,7 @@ impl ClientRuntime {
         // No in-place replacement of any existing independently enrolled root.
         for prior in &previous.document.client.profiles {
             if let Some(new) = candidate.client.profiles.iter().find(|p| p.id == prior.id) {
-                if prior.tls_profile != new.tls_profile
+                if prior.security_mode != new.security_mode
                     || (prior.reality_profile != new.reality_profile
                         && !crate::reality_config::credential_only_change(prior, new))
                 {
@@ -1035,7 +1040,7 @@ impl ClientRuntime {
                 }
             }
         }
-        if old.tls_profile != next.tls_profile {
+        if old.security_mode != next.security_mode {
             return Err(ClientError::Configuration);
         }
         let client = if old.id == next.id {
@@ -1247,7 +1252,7 @@ impl PreparedLocalProxy {
                 .client
                 .profiles
                 .iter()
-                .any(|p| p.id == id && p.tls_profile == "smart-reality")
+                .any(|p| p.id == id && p.security_mode == SecurityMode::SmartReality)
         {
             return Err(ClientError::Configuration);
         }
@@ -1702,6 +1707,16 @@ mod selector_tests {
     // this does not assert external reference parity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn registered_reality_live_rotation_keeps_native_connect_and_socks5_open() {
+        registered_reality_scenario(false).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registered_reality_production_drain_preserves_h2_h3_both_xhttp_modes() {
+        registered_reality_scenario(true).await;
+    }
+
+    async fn registered_reality_scenario(drain_only: bool) {
         use crate::{
             descriptor::ClientPolicy,
             reality_bootstrap as bootstrap,
@@ -1727,7 +1742,7 @@ mod selector_tests {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         )));
         std::fs::create_dir(&dir.0).unwrap();
-        timeout(Duration::from_secs(80), async {
+        timeout(Duration::from_secs(if drain_only { 55 } else { 80 }), async {
             let remote = {
                 let mut selected = None;
                 for _ in 0..16 {
@@ -1741,7 +1756,8 @@ mod selector_tests {
                 }
                 selected.unwrap()
             };
-            let now = reference_health::unix_now().unwrap().saturating_sub(3700);
+            let now = reference_health::unix_now().unwrap()
+                .saturating_sub(if drain_only { 0 } else { 3700 });
             let state = State::new(
                 Plan {
                     schema_version: 1,
@@ -1822,7 +1838,13 @@ mod selector_tests {
             let reference = bearer.reference().unwrap();
             bearer.commit();
             std::fs::write(&client_path, include_str!("../../../examples/client.toml")).unwrap();
-            for (id, transport) in [("native-h2", Transport::H2), ("native-h3", Transport::H3)] {
+            for (id, transport, mode) in [
+                ("native-h2", Transport::H2, XhttpMode::StreamOne),
+                ("native-h3", Transport::H3, XhttpMode::StreamOne),
+                ("split-h2", Transport::H2, XhttpMode::StreamUp),
+                ("split-h3", Transport::H3, XhttpMode::StreamUp),
+            ] {
+                if !drain_only && mode == XhttpMode::StreamUp { continue; }
                 let enrollment = dir.0.join(format!("{id}.toml"));
                 let trust = dir.0.join(format!("{id}-trust.toml"));
                 bootstrap::import(
@@ -1840,7 +1862,7 @@ mod selector_tests {
                     },
                     ClientPolicy {
                         transport,
-                        xhttp_mode: XhttpMode::StreamOne,
+                        xhttp_mode: mode,
                     },
                     now,
                 )
@@ -1856,6 +1878,84 @@ mod selector_tests {
             }
             // A single signed snapshot is the source of both native carriers.
             drop(lease);
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            if drain_only {
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let (drain, stop) = tokio::sync::oneshot::channel();
+                let (draining, acknowledged) = tokio::sync::oneshot::channel();
+                let mut server = JoinSet::new();
+                server.spawn(crate::server::registered_reality_drain_fixture(
+                    server_doc, started, stop, draining,
+                ));
+                ready.await.unwrap();
+                let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let target_port = target.local_addr().unwrap().port();
+                let Config::Client(client_doc) = config::read_file(&client_path).unwrap() else {
+                    panic!("client fixture");
+                };
+                let mut clients = Vec::new();
+                let mut apps = Vec::new();
+                let mut relays = JoinSet::new();
+                let mut echoes = JoinSet::new();
+                let address = Address::V4([127, 0, 0, 1]);
+                async fn exchange(app: &mut TcpStream, data: &[u8]) {
+                    app.write_all(data).await.unwrap();
+                    let mut got = vec![0; data.len()];
+                    app.read_exact(&mut got).await.unwrap();
+                    assert_eq!(got, data);
+                }
+                for id in ["native-h2", "native-h3", "split-h2", "split-h3"] {
+                    let profile = client_doc.client.profiles.iter().find(|p| p.id == id).unwrap();
+                    let client = load_client(profile).await.unwrap();
+                    // Real marker/identity admission and OPEN_OK through the
+                    // registered production TCP/UDP listeners.
+                    let tunnel = client.open(address.clone(), target_port).await.unwrap();
+                    let (mut upstream, _) = target.accept().await.unwrap();
+                    echoes.spawn(async move {
+                        let (mut read, mut write) = upstream.split();
+                        tokio::io::copy(&mut read, &mut write).await.unwrap();
+                        write.shutdown().await.unwrap();
+                    });
+                    let (mut app, local) = paired().await;
+                    relays.spawn(tunnel.relay(local));
+                    exchange(&mut app, id.as_bytes()).await;
+                    clients.push(client);
+                    apps.push(app);
+                }
+                drain.send(()).unwrap();
+                acknowledged.await.unwrap();
+                for app in &mut apps {
+                    exchange(app, b"old OPEN_OK tunnel after drain").await;
+                }
+                // Exercise all four modes concurrently within the production
+                // drain deadline. No new upstream dial is permitted.
+                let mut refusals = JoinSet::new();
+                for client in clients {
+                    let address = address.clone();
+                    refusals.spawn(async move {
+                        let refusal = timeout(Duration::from_secs(5),
+                            client.open(address, target_port)).await;
+                        assert!(matches!(refusal, Ok(Err(_))));
+                    });
+                }
+                while let Some(result) = refusals.join_next().await { result.unwrap(); }
+                assert!(timeout(Duration::from_millis(100), target.accept()).await.is_err());
+                for mut app in apps {
+                    exchange(&mut app, b"still alive after refused admission").await;
+                    app.shutdown().await.unwrap();
+                    let mut tail = Vec::new();
+                    app.read_to_end(&mut tail).await.unwrap();
+                    assert!(tail.is_empty());
+                }
+                while let Some(result) = relays.join_next().await { result.unwrap().unwrap(); }
+                while let Some(result) = echoes.join_next().await { result.unwrap(); }
+                server.join_next().await.unwrap().unwrap().unwrap();
+                // The supervisor has released both sockets after drain.
+                let tcp = TcpListener::bind(remote).await.unwrap();
+                let udp = tokio::net::UdpSocket::bind(remote).await.unwrap();
+                drop((tcp, udp));
+                return;
+            }
             let (started, ready) = tokio::sync::oneshot::channel();
             let mut server = JoinSet::new();
             server.spawn(crate::server::run_reality_document_with_ready(
@@ -2567,10 +2667,10 @@ mod selector_tests {
         invalid.auth_token = "file:relative".into();
         assert!(load_client(&invalid).await.is_err());
         invalid = profile.clone();
-        invalid.tls_profile = "unknown".into();
+        invalid.security_mode = SecurityMode::SmartReality;
         assert!(load_client(&invalid).await.is_err());
         invalid = profile.clone();
-        invalid.tls_profile = "browser-h2-btls-v1".into();
+        invalid.security_mode = SecurityMode::PinnedCertV1;
         assert!(load_client(&invalid).await.is_err());
         invalid.xhttp_mode = None;
         invalid.transport = Transport::H3;
@@ -2579,8 +2679,7 @@ mod selector_tests {
         assert!(load_client(&invalid).await.is_err());
         let mut pinned = profile.clone();
         pinned.xhttp_mode = None;
-        pinned.tls_profile =
-            crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
+        pinned.security_mode = SecurityMode::PinnedCertStreamUpV1;
         assert!(load_client(&pinned).await.is_err());
         let mut automatic_mode = profile.clone();
         automatic_mode.xhttp_mode = Some(XhttpMode::Auto);

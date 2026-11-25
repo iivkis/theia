@@ -87,6 +87,7 @@ pub(crate) async fn serve_generation(
                     continue;
                 };
                 let context = context.clone();
+                let connection_phase = phase.clone();
                 connections.spawn(async move {
                     let _slot = slot;
                     let Ok(connection) = quic_transport::accept(incoming).await else {
@@ -96,7 +97,7 @@ pub(crate) async fn serve_generation(
                     };
                     crate::diag!(Debug, "server.h3", "quic_verified",
                         "connection" = Value::Count(connection_id));
-                    run_connection(connection, context).await;
+                    run_connection(connection, context, connection_phase).await;
                 });
             }
         }
@@ -123,7 +124,7 @@ pub(crate) async fn serve_generation(
     Ok(())
 }
 
-pub(crate) async fn run_connection(connection: quinn::Connection, context: Arc<ServerContext>) {
+pub(crate) async fn run_connection(connection: quinn::Connection, context: Arc<ServerContext>, mut phase: watch::Receiver<GenerationPhase>) {
     let guard = ConnectionGuard(connection);
     let peer = guard.0.remote_address().ip();
     let binding = if context.requires_channel_binding() {
@@ -157,29 +158,44 @@ pub(crate) async fn run_connection(connection: quinn::Connection, context: Arc<S
     crate::diag!(Trace, "server.h3", "h3_connection_ready");
     let mut handlers = JoinSet::new();
     let pair = Arc::new(crate::split_http::Pair::new());
+    let mut draining = false;
     loop {
-        // Do not accumulate unresolved header readers indefinitely.
-        if handlers.len() >= MAX_HANDLERS {
-            tokio::select! {
-                _ = handlers.join_next() => continue,
-                _ = guard.0.closed() => break,
+        // Keep driving the control stream after GOAWAY. Existing admitted
+        // streams have their own handlers and retain their context.
+        let idle = handlers.is_empty();
+        let request = tokio::select! {
+            biased;
+            _ = server::await_generation_drain(&mut phase), if !draining => {
+                if !matches!(timeout(CLOSE_TIMEOUT, h3.shutdown(0)).await, Ok(Ok(()))) {
+                    break;
+                }
+                draining = true;
+                continue;
             }
+            _ = handlers.join_next(), if !idle => continue,
+            request = h3.accept(), if handlers.len() < MAX_HANDLERS => request,
+            _ = guard.0.closed() => break,
+            _ = tokio::time::sleep(IDLE_TIMEOUT), if idle => break,
+        };
+        let resolver = match request {
+            Ok(Some(resolver)) => resolver,
+            Ok(None) if draining => {
+                // Do not drop already-admitted streams when the H3 accept
+                // side reports no further requests. Quinn drives DATA/FIN.
+                while handlers.join_next().await.is_some() {}
+                let _ = timeout(CLOSE_TIMEOUT, guard.0.closed()).await;
+                break;
+            }
+            _ => break,
+        };
+        if draining || server::generation_draining(&phase) {
+            // Resolve only to reject the HTTP stream; no bearer or OPEN.
+            if let Ok(Ok((_, mut stream))) = timeout(CLOSE_TIMEOUT, resolver.resolve_request()).await {
+                stream.stop_stream(Code::H3_REQUEST_REJECTED);
+                stream.stop_sending(Code::H3_REQUEST_REJECTED);
+            }
+            continue;
         }
-        let request = if handlers.is_empty() {
-            match timeout(IDLE_TIMEOUT, h3.accept()).await {
-                Ok(request) => request,
-                Err(_) => break,
-            }
-        } else {
-            tokio::select! {
-                _ = handlers.join_next() => continue,
-                request = h3.accept() => request,
-                _ = guard.0.closed() => break,
-            }
-        };
-        let Ok(Some(resolver)) = request else {
-            break;
-        };
         let context = context.clone();
         let pair = pair.clone();
         let binding = binding.clone();

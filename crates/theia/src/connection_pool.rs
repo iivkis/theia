@@ -22,12 +22,8 @@ const MAX_PROFILE_CONNECTIONS: usize = 8;
 pub(crate) fn profile_budget() -> Arc<Semaphore> {
     Arc::new(Semaphore::new(MAX_PROFILE_CONNECTIONS))
 }
-// Own-TLS defaults are provisional local policy. REALITY derives its
-// bounds from the verified descriptor of this immutable client generation.
-const MAX_REUSE_AGE: Duration = Duration::from_secs(20);
-const MIN_REUSE_AGE_S: u64 = 15;
-const MIN_REUSE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_REUSE_BYTES: u64 = 64 * 1024 * 1024;
+// Own-TLS uses the fixed wire-v1 policy; REALITY derives its bounds
+// from the verified descriptor of this immutable client generation.
 
 #[derive(Clone, Copy)]
 struct RotationPolicy {
@@ -40,10 +36,10 @@ struct RotationPolicy {
 impl Default for RotationPolicy {
     fn default() -> Self {
         Self {
-            age_min: MIN_REUSE_AGE_S,
-            age_max: MAX_REUSE_AGE.as_secs(),
-            bytes_min: MIN_REUSE_BYTES,
-            bytes_max: MAX_REUSE_BYTES,
+            age_min: u64::from(crate::padding::OWN_TLS_ROTATION.lifetime_min_s),
+            age_max: u64::from(crate::padding::OWN_TLS_ROTATION.lifetime_max_s),
+            bytes_min: crate::padding::OWN_TLS_ROTATION.volume_min_bytes,
+            bytes_max: crate::padding::OWN_TLS_ROTATION.volume_max_bytes,
         }
     }
 }
@@ -127,7 +123,9 @@ impl<C> Lease<C> {
         self.entry.retire();
     }
     pub(crate) fn accepting_new_streams(&self) -> bool {
-        !self.entry.retired.load(Ordering::Acquire) && Instant::now() < self.entry.deadline
+        !self.entry.retired.load(Ordering::Acquire)
+            && Instant::now() < self.entry.deadline
+            && self.entry.bytes.load(Ordering::Acquire) < self.entry.byte_limit
     }
     pub(crate) fn admitted(&mut self) {
         self.admitted = true;
@@ -320,14 +318,15 @@ impl<C: Send + Sync + 'static> Pool<C> {
                     _ = wake_cleanup.notified() => {},
                     _ = lifetime.changed() => {},
                 }
-                if let (Some(entries), Some(expired)) =
-                    (weak_entries.upgrade(), weak_entry.upgrade())
-                {
-                    expired.retire();
-                    entries
-                        .lock()
-                        .await
-                        .retain(|candidate| !Arc::ptr_eq(candidate, &expired));
+                // Acquire the entries lock before taking a strong reference to
+                // the carrier. Otherwise eviction could race a cleanup task
+                // holding the last Arc and falsely report exhausted capacity.
+                if let Some(entries) = weak_entries.upgrade() {
+                    let mut entries = entries.lock().await;
+                    if let Some(expired) = weak_entry.upgrade() {
+                        expired.retire();
+                        entries.retain(|candidate| !Arc::ptr_eq(candidate, &expired));
+                    }
                 }
             });
         }
@@ -369,7 +368,7 @@ mod tests {
         idle.admitted();
         drop(idle);
         tokio::task::yield_now().await;
-        tokio::time::advance(MAX_REUSE_AGE + Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(u64::from(crate::padding::OWN_TLS_ROTATION.lifetime_max_s)) + Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert!(pool.entries.lock().await.is_empty());
         assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);
@@ -542,6 +541,64 @@ mod tests {
         assert_eq!(*fresh.connection(), 8);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn pair_namespace_exhaustion_rotates_without_reusing_ids() {
+        let pool = Pool::default();
+        let route = Some("127.0.0.1:0".parse().unwrap());
+        let mut original = pool.acquire(route, true, |_| true, async { Ok(1) }).await.unwrap();
+        original.admitted();
+        for id in 2..=crate::split_http::MAX_PAIR_IDS {
+            let mut lease = pool.acquire(route, true, |_| true, async { Ok(2) }).await.unwrap();
+            assert_eq!(lease.id(), id);
+            assert!(lease.shares_connection(&original));
+            lease.admitted();
+        }
+        let mut replacement = pool.acquire(route, true, |_| true, async { Ok(3) }).await.unwrap();
+        replacement.admitted();
+        assert_eq!(replacement.id(), 1);
+        assert!(!original.shares_connection(&replacement));
+        assert!(!original.accepting_new_streams());
+        assert_eq!(*original.connection(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saturated_pool_releases_permits_after_cancellation_and_idle_eviction() {
+        let pool = Pool::default();
+        let route = Some("127.0.0.1:0".parse().unwrap());
+        let mut leases = Vec::new();
+        for _ in 0..MAX_CONNECTIONS * MAX_TUNNELS {
+            let mut lease = pool.acquire(route, true, |_| true, async { Ok(1) }).await.unwrap();
+            lease.admitted();
+            leases.push(lease);
+        }
+        assert_eq!(pool.connections.available_permits(), 0);
+        assert!(matches!(pool.acquire(route, true, |_| true, async { Ok(2) }).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))));
+        // One freed stream slot is enough; no physical connection is replaced.
+        let old = leases.pop().unwrap();
+        let id = old.id();
+        drop(old);
+        let mut reused = pool.acquire(route, true, |_| true, async { Ok(3) }).await.unwrap();
+        assert_eq!(*reused.connection(), 1);
+        assert!(reused.id() > id);
+        reused.admitted();
+        drop(reused);
+        // Release the final group's other leases and deliberately refuse reuse.
+        leases.truncate(MAX_TUNNELS * (MAX_CONNECTIONS - 1));
+        let mut fresh = pool.acquire(route, false, |_| true, async { Ok(4) }).await.unwrap();
+        fresh.admitted();
+        assert_eq!(*fresh.connection(), 4);
+        assert_eq!(pool.connections.available_permits(), 0);
+        drop(fresh);
+        assert_eq!(pool.connections.available_permits(), 1);
+        // Cancellation while dialing must release both semaphore permits.
+        let before = pool.profile.available_permits();
+        assert!(tokio::time::timeout(Duration::from_millis(1),
+            pool.acquire(route, false, |_| true, std::future::pending())).await.is_err());
+        assert_eq!(pool.connections.available_permits(), 1);
+        assert_eq!(pool.profile.available_permits(), before);
+    }
+
     #[tokio::test]
     async fn scope_retirement_and_capacity_keep_live_leases() {
         let pool = Pool::default();
@@ -566,6 +623,8 @@ mod tests {
             .unwrap();
         c.admitted();
         assert_eq!((*a.connection(), *c.connection()), (1, 3));
+        assert_eq!(c.id(), 1);
+        assert!(!a.shares_connection(&c));
         let mut d = pool
             .acquire(route, false, |_| true, async { Ok(4) })
             .await

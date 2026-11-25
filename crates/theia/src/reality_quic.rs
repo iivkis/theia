@@ -11,7 +11,7 @@ use crate::{
     reality_generation::{Lease, Manager},
     reality_live::{Live, Route},
     reality_quic_wire::{self as wire, Cid, Flight, Inspection, Kind},
-    server::{ServerContext, ServerError},
+    server::{self, ServerContext, ServerError},
 };
 use quinn::{
     udp::{RecvMeta, Transmit},
@@ -38,7 +38,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, Semaphore},
+    sync::{mpsc, watch, Semaphore},
     task::JoinSet,
     time::{timeout, Instant},
 };
@@ -769,19 +769,26 @@ impl PreparedQuic {
     }
 
     pub async fn serve(self) -> Result<(), ServerError> {
+        let (_owner, phase) = watch::channel(server::GenerationPhase::Active);
+        self.serve_generation(phase).await
+    }
+
+    pub(crate) async fn serve_generation(self, phase: watch::Receiver<server::GenerationPhase>) -> Result<(), ServerError> {
         let endpoint = self.endpoint.clone();
         let result = tokio::select! {
-            result = self.accept_native() => result,
-            result = self.dispatch() => result,
+            result = self.accept_native(phase.clone()) => result,
+            result = self.dispatch(phase) => result,
         };
         endpoint.close(0u32.into(), b"backend closed");
         result
     }
 
-    async fn accept_native(&self) -> Result<(), ServerError> {
+    async fn accept_native(&self, mut phase: watch::Receiver<server::GenerationPhase>) -> Result<(), ServerError> {
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
+                biased;
+                _=server::await_generation_drain(&mut phase)=>break,
                 _=tasks.join_next(),if !tasks.is_empty()=>{},
                 incoming=self.endpoint.accept()=>{
                     let Some(incoming)=incoming else{return Err(ServerError::Io);};
@@ -797,15 +804,29 @@ impl PreparedQuic {
                     let Some(config)=ticket.route.quic.clone() else{incoming.ignore();continue;};
                     let context=ticket.route.context.clone();
                     let Some(slot)=context.connection_slot() else{incoming.refuse();continue;};
+                    let connection_phase=phase.clone();
                     tasks.spawn(async move{
                         let _slot=slot;
                         if let Ok(connection)=crate::quic_transport::accept_with(incoming,config).await{
-                            crate::h3_server::run_connection(connection,context).await;
+                            crate::h3_server::run_connection(connection,context,connection_phase).await;
                         }
                     });
                 }
             }
         }
+        // The dispatcher remains alive in serve_generation while native
+        // streams drain; new unclassified sessions are no longer admitted.
+        let _ = timeout(server::GENERATION_DRAIN, async {
+            while !tasks.is_empty() {
+                tokio::select! {
+                    _=tasks.join_next()=>{},
+                    incoming=self.endpoint.accept()=> {
+                        if let Some(incoming)=incoming { incoming.refuse(); } else { break; }
+                    }
+                }
+            }
+        }).await;
+        Ok(())
     }
 
     fn open_path(
@@ -850,7 +871,7 @@ impl PreparedQuic {
         true
     }
 
-    async fn dispatch(&self) -> Result<(), ServerError> {
+    async fn dispatch(&self, phase: watch::Receiver<server::GenerationPhase>) -> Result<(), ServerError> {
         let mut pending: HashMap<(SocketAddr, Cid), Pending> = HashMap::new();
         let mut sessions: HashMap<SessionId, Session> = HashMap::new();
         let mut retired: Vec<Retired> = Vec::new();
@@ -942,7 +963,7 @@ impl PreparedQuic {
                         }
                         continue;
                     }
-                    if short { continue; }
+                    if short || server::generation_draining(&phase) { continue; }
                     let Some(h) = header else { continue; };
                     if h.kind != Kind::Initial || n < wire::MIN_INITIAL || h.dcid.len() < 8 { continue; }
                     // A known but ambiguous long-header CID must not

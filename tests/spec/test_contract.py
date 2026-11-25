@@ -92,7 +92,7 @@ class SpecContractTests(unittest.TestCase):
         for profile in profiles:
             self.assertIn(profile["transport"], ("auto", "h3", "h2"))
             self.assertTrue(profile["auth_token"].startswith(("env:", "file:")))
-            self.assertEqual(profile["tls_profile"], "default")
+            self.assertEqual(profile["security_mode"], "own-tls")
         proxy = client["proxy"]
         self.assertEqual(proxy["system_proxy"], "off")
         for name in ("http_listen", "socks5_listen"):
@@ -112,7 +112,7 @@ class SpecContractTests(unittest.TestCase):
                       "NotApproved", "fingerprint", "TLS1.3"):
             with self.subTest(token=token):
                 self.assertIn(token.lower(), tests.lower())
-        self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
+        self.assertIn('profile.security_mode.is_plain()', read("crates/theia/src/config.rs"))
 
     def test_m35b1_code_contract_does_not_claim_active_scan_or_reality(self):
         code = read("crates/theia/src/camouflage_discovery.rs")
@@ -125,16 +125,16 @@ class SpecContractTests(unittest.TestCase):
         for token in ("google.com", "samsung.com", "amd.com",
                       "zero-I/O", "REALITY"):
             self.assertIn(token.lower(), (code + tests).lower())
-        self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
+        self.assertIn('profile.security_mode.is_plain()', read("crates/theia/src/config.rs"))
 
     def test_f18_picker_discovers_server_range_and_popular_domains_without_manual_seed(self):
         # Research and docs do not enable any new production security mode.
-        self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
+        self.assertIn('profile.security_mode.is_plain()', read("crates/theia/src/config.rs"))
 
     def test_future_reality_like_and_tls_in_tls_are_p0_but_not_claimed_live(self):
         client = toml("examples/client.toml")["client"]
-        self.assertTrue(all(p["tls_profile"] == "default" for p in client["profiles"]))
-        self.assertIn('profile.tls_profile == "default"', read("crates/theia/src/config.rs"))
+        self.assertTrue(all(p["security_mode"] == "own-tls" for p in client["profiles"]))
+        self.assertIn('profile.security_mode.is_plain()', read("crates/theia/src/config.rs"))
 
     def test_windows_manual_proxy_is_not_auto_enabled(self):
         self.assertNotIn('system_proxy = "on"', read("examples/client.toml"))
@@ -304,7 +304,7 @@ class SpecContractTests(unittest.TestCase):
     def test_retired_profiles_are_excluded_from_product_configuration(self):
         source = read("crates/theia/src/config.rs")
         self.assertIn("retired_security_modes_are_rejected_even_with_experimental_backend", source)
-        self.assertNotIn("CertificatePin::parse_profile(&profile.tls_profile)", source)
+        self.assertNotIn("CertificatePin::parse_profile(&profile.security_mode)", source)
         editor = read("crates/theia/src/tui_editor.rs")
         self.assertNotIn("review_pinned_mode", editor)
         self.assertNotIn("apply_pinned_mode", editor)
@@ -534,18 +534,18 @@ class SpecContractTests(unittest.TestCase):
         self.assertFalse((ROOT / "crates/theia/src/reality_identity.rs").exists())
         self.assertNotIn("SmartRealityV1", read("crates/theia/src/security_profile.rs"))
         # Registered external REALITY is not the retired local-TLS invitation.
-        # The ordinary invitation codec must still reject both registered REALITY
-        # profiles and server inbounds instead of exporting a generic TLS pin.
+        # Shared v1 envelope supports both modes; the own-TLS adapter must
+        # still reject REALITY instead of exporting a generic TLS pin.
         invite = read("crates/theia/src/invite.rs")
         wire_security = re.search(r"enum WireSecurity\s*\{([^}]+)\}", invite)
         self.assertIsNotNone(wire_security)
         self.assertEqual(
             [item.strip() for item in wire_security.group(1).split(",") if item.strip()],
-            ["OwnTls"],
+            ["OwnTls", "SmartReality"],
         )
         self.assertRegex(
             invite,
-            r'if profile\.reality_profile\.is_some\(\)\s*\|\|\s*profile\.tls_profile == "smart-reality"[\s\S]*?return Err\(InviteError::Invalid\);',
+            r'if profile\.reality_profile\.is_some\(\)\s*\|\|\s*!profile\.security_mode\.is_plain\(\)[\s\S]*?return Err\(InviteError::Invalid\);',
         )
         self.assertRegex(
             invite,
@@ -577,7 +577,7 @@ class SpecContractTests(unittest.TestCase):
             "replacement_v1_invite_rejects_unsupported_mode_and_identity_injection",
         ):
             self.assertIn(name, tests)
-        self.assertIn('profile.tls_profile == "default"', config)
+        self.assertIn('profile.security_mode.is_plain()', config)
         self.assertIn('wire.carrier != "smarttheia-xhttp"', invite)
         self.assertIn("replacement_v1_roundtrips_own_tls_and_rejects_retired_profiles", invite)
         self.assertNotIn("PREFIX_V2", invite)

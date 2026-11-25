@@ -3,6 +3,7 @@ use crate::config::{
     ClientDocument, ClientSettings, Config, LocalProxy, Management, Profile, SystemProxy,
     Transport, Ui, XhttpMode,
 };
+use crate::security_profile::SecurityMode;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,9 +11,10 @@ use std::{fmt, net::SocketAddr};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-const PREFIX: &str = "theia://v1/";
-const MAX_DATA: usize = 3072;
-const MAX_URI: usize = 4096;
+pub(crate) const PREFIX: &str = "theia://v1/";
+const MAX_DATA: usize = 24 * 1024;
+// One envelope must accommodate the full signed REALITY descriptor.
+pub const MAX_URI: usize = 32 * 1024;
 
 /// This type may contain a live 32-byte bearer secret. No derived Debug.
 pub struct Invitation {
@@ -21,7 +23,6 @@ pub struct Invitation {
     pub endpoint: String,
     pub server_name: String,
     pub transport: Transport,
-    tls_profile: String,
     xhttp_mode: XhttpMode,
     token: Option<[u8; 32]>,
 }
@@ -45,7 +46,7 @@ impl fmt::Debug for Invitation {
             .field("endpoint", &self.endpoint)
             .field("server_name", &self.server_name)
             .field("transport", &self.transport)
-            .field("tls_profile", &self.tls_profile)
+            .field("security_mode", &self.security_mode())
             .field("xhttp_mode", &self.xhttp_mode)
             .field("contains_token", &self.has_token())
             .finish()
@@ -61,26 +62,33 @@ impl Drop for Invitation {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum WireSecurity {
+pub(crate) enum WireSecurity {
     OwnTls,
+    SmartReality,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Wire {
-    version: u32,
-    path_prefix: String,
-    id: String,
-    endpoint: String,
-    server_name: String,
-    carrier: String,
-    security_mode: WireSecurity,
-    xhttp_mode: XhttpMode,
-    transport: Transport,
+pub(crate) struct Wire {
+    pub(crate) version: u32,
+    pub(crate) path_prefix: String,
+    pub(crate) id: String,
+    pub(crate) endpoint: String,
+    pub(crate) server_name: String,
+    pub(crate) carrier: String,
+    pub(crate) security_mode: WireSecurity,
+    pub(crate) xhttp_mode: XhttpMode,
+    pub(crate) transport: Transport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
+    pub(crate) public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) minimum_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) descriptor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token: Option<String>,
 }
 
 impl Drop for Wire {
@@ -91,13 +99,59 @@ impl Drop for Wire {
     }
 }
 
+fn check_wire(wire: &Wire) -> Result<(), InviteError> {
+    if wire.version != 1 || wire.carrier != "smarttheia-xhttp"
+        || !crate::config::valid_id(&wire.id)
+        || !crate::config::valid_remote(&wire.endpoint)
+        || !crate::split_http::valid_prefix(&wire.path_prefix)
+    {
+        return Err(InviteError::Invalid);
+    }
+    let valid = match wire.security_mode {
+        WireSecurity::OwnTls => wire.public_key.is_none()
+            && wire.minimum_revision.is_none() && wire.descriptor.is_none(),
+        WireSecurity::SmartReality => wire.public_key.is_some()
+            && wire.minimum_revision.is_some_and(|revision| revision > 0)
+            && wire.descriptor.as_ref().is_some_and(|value| !value.is_empty()
+                && value.len() <= crate::descriptor::MAX_DOCUMENT),
+    };
+    if !valid { return Err(InviteError::Invalid); }
+    Ok(())
+}
+
+pub(crate) fn encode_wire(wire: &Wire) -> Result<Zeroizing<String>, InviteError> {
+    check_wire(wire)?;
+    let text = Zeroizing::new(toml::to_string(wire).map_err(|_| InviteError::Invalid)?);
+    if text.len() > MAX_DATA { return Err(InviteError::Invalid); }
+    let mut uri = Zeroizing::new(PREFIX.to_owned());
+    URL_SAFE_NO_PAD.encode_string(text.as_bytes(), &mut uri);
+    if uri.len() > MAX_URI { return Err(InviteError::Invalid); }
+    Ok(uri)
+}
+
+pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
+    if uri.len() > MAX_URI { return Err(InviteError::Invalid); }
+    let encoded = uri.strip_prefix(PREFIX).ok_or(InviteError::Invalid)?;
+    if encoded.is_empty() || encoded.bytes().any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_') {
+        return Err(InviteError::Invalid);
+    }
+    let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded).map_err(|_| InviteError::Invalid)?);
+    let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice()));
+    if bytes.len() > MAX_DATA || canonical.as_str() != encoded { return Err(InviteError::Invalid); }
+    let text = std::str::from_utf8(&bytes).map_err(|_| InviteError::Invalid)?;
+    let wire: Wire = toml::from_str(text).map_err(|_| InviteError::Invalid)?;
+    check_wire(&wire)?;
+    // Preserve the authenticated REALITY bootstrap's canonical TOML contract.
+    if wire.security_mode == WireSecurity::SmartReality
+        && Zeroizing::new(toml::to_string(&wire).map_err(|_| InviteError::Invalid)?).as_str() != text
+    { return Err(InviteError::Invalid); }
+    Ok(wire)
+}
+
 impl Invitation {
     /// Safe token-free export of an exact supported profile.
     pub fn public_from_profile(profile: &Profile) -> Result<Self, InviteError> {
-        if profile.reality_profile.is_some()
-            || profile.tls_profile == "smart-reality"
-            || profile.tls_profile != "default"
-        {
+        if profile.reality_profile.is_some() || !profile.security_mode.is_plain() {
             return Err(InviteError::Invalid);
         }
         let invite = Self {
@@ -106,7 +160,6 @@ impl Invitation {
             endpoint: profile.server.clone(),
             server_name: profile.server_name.clone(),
             transport: profile.transport,
-            tls_profile: profile.tls_profile.clone(),
             xhttp_mode: profile.effective_xhttp_mode(),
             token: None,
         };
@@ -155,7 +208,6 @@ impl Invitation {
             endpoint: format!("{}:{}", inbound.server_name, h2.port()),
             server_name: inbound.server_name.clone(),
             transport: Transport::Auto,
-            tls_profile: "default".into(),
             xhttp_mode: XhttpMode::Auto,
             token: None,
         };
@@ -211,50 +263,22 @@ impl Invitation {
             security_mode: WireSecurity::OwnTls,
             xhttp_mode: self.xhttp_mode,
             transport: self.transport,
+            public_key: None,
+            minimum_revision: None,
+            descriptor: None,
             token: self.token.as_ref().map(|v| URL_SAFE_NO_PAD.encode(v)),
         };
-        let text = Zeroizing::new(toml::to_string(&wire).map_err(|_| InviteError::Invalid)?);
-        if text.len() > MAX_DATA {
-            return Err(InviteError::Invalid);
-        }
-        let mut uri = Zeroizing::new(PREFIX.to_owned());
-        URL_SAFE_NO_PAD.encode_string(text.as_bytes(), &mut uri);
-        if uri.len() > MAX_URI {
-            return Err(InviteError::Invalid);
-        }
+        let mut uri = encode_wire(&wire)?;
         Ok(std::mem::take(&mut *uri))
     }
 
     /// Reject non-canonical base64url, unknown fields/versions, invalid
     /// credential lengths, and invalid core profile fields.
     pub fn decode(uri: &str) -> Result<Self, InviteError> {
-        if uri.len() > MAX_URI {
+        let mut wire = decode_wire(uri)?;
+        if wire.security_mode != WireSecurity::OwnTls {
             return Err(InviteError::Invalid);
         }
-        let encoded = uri.strip_prefix(PREFIX).ok_or(InviteError::Invalid)?;
-        if encoded.is_empty()
-            || encoded
-                .bytes()
-                .any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_')
-        {
-            return Err(InviteError::Invalid);
-        }
-        let bytes = Zeroizing::new(
-            URL_SAFE_NO_PAD
-                .decode(encoded)
-                .map_err(|_| InviteError::Invalid)?,
-        );
-        let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice()));
-        if bytes.len() > MAX_DATA || canonical.as_str() != encoded {
-            return Err(InviteError::Invalid);
-        }
-        let text = std::str::from_utf8(&bytes).map_err(|_| InviteError::Invalid)?;
-        let mut wire: Wire = toml::from_str(text).map_err(|_| InviteError::Invalid)?;
-        if wire.version != 1 || wire.carrier != "smarttheia-xhttp" {
-            return Err(InviteError::Invalid);
-        }
-        let WireSecurity::OwnTls = wire.security_mode;
-        let tls_profile = "default".into();
         let token = match wire.token.as_ref() {
             Some(raw) => {
                 let value = Zeroizing::new(
@@ -281,7 +305,6 @@ impl Invitation {
             endpoint: std::mem::take(&mut wire.endpoint),
             server_name: std::mem::take(&mut wire.server_name),
             transport: wire.transport,
-            tls_profile,
             xhttp_mode: wire.xhttp_mode,
             token,
         };
@@ -290,8 +313,8 @@ impl Invitation {
     }
 
     /// Non-secret, exact security/carrier selection for safe preview.
-    pub fn tls_profile(&self) -> &str {
-        &self.tls_profile
+    pub fn security_mode(&self) -> SecurityMode {
+        SecurityMode::Plain
     }
 
     pub fn xhttp_mode(&self) -> XhttpMode {
@@ -321,9 +344,9 @@ impl Invitation {
             server: self.endpoint.clone(),
             server_name: self.server_name.clone(),
             auth_token: secret_ref.into(),
-            tls_profile: self.tls_profile.clone(),
+            security_mode: self.security_mode(),
             reality_profile: None,
-            xhttp_mode: (self.tls_profile == "default").then_some(self.xhttp_mode),
+            xhttp_mode: Some(self.xhttp_mode),
             tls_ca,
             transport: self.transport,
             quic_connect_timeout_ms: 1600,
@@ -332,9 +355,6 @@ impl Invitation {
     }
 
     fn check(&self) -> Result<(), InviteError> {
-        if self.tls_profile != "default" {
-            return Err(InviteError::Invalid);
-        }
         let profile = self.to_profile_unchecked("env:THEIA_INVITE_TOKEN".into(), None)?;
         if profile.effective_xhttp_mode() != self.xhttp_mode {
             return Err(InviteError::Invalid);
@@ -353,9 +373,9 @@ impl Invitation {
             server: self.endpoint.clone(),
             server_name: self.server_name.clone(),
             auth_token,
-            tls_profile: self.tls_profile.clone(),
+            security_mode: self.security_mode(),
             reality_profile: None,
-            xhttp_mode: (self.tls_profile == "default").then_some(self.xhttp_mode),
+            xhttp_mode: Some(self.xhttp_mode),
             tls_ca,
             transport: self.transport,
             quic_connect_timeout_ms: 1600,
@@ -484,11 +504,11 @@ mod tests {
             let decoded = Invitation::decode(&encoded).unwrap();
             assert!(!decoded.has_token());
             let restored = decoded.to_profile("env:TOKEN", None).unwrap();
-            assert_eq!(restored.tls_profile, "default");
+            assert_eq!(restored.security_mode, SecurityMode::Plain);
             assert_eq!(restored.transport, transport);
         }
-        for name in ["browser-h2-btls-v1", "smart-reality-v1", "unknown", ""] {
-            profile.tls_profile = name.into();
+        for mode in [SecurityMode::PinnedCertV1, SecurityMode::PinnedCertStreamUpV1, SecurityMode::SmartReality] {
+            profile.security_mode = mode;
             for transport in [Transport::Auto, Transport::H2, Transport::H3] {
                 profile.transport = transport;
                 assert_eq!(
@@ -588,12 +608,8 @@ mod tests {
                 );
             }
         }
-        for mode in [
-            "browser-h2-btls-v1".into(),
-            format!("pinned-cert-v1:{}", "42".repeat(32)),
-            format!("pinned-cert-stream-up-v1:{}", "42".repeat(32)),
-        ] {
-            profile.tls_profile = mode;
+        for mode in [SecurityMode::PinnedCertV1, SecurityMode::PinnedCertStreamUpV1, SecurityMode::SmartReality] {
+            profile.security_mode = mode;
             assert!(Invitation::public_from_profile(&profile).is_err());
         }
     }
@@ -626,7 +642,7 @@ mod tests {
         assert!(
             Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(retired))).is_err()
         );
-        profile.tls_profile = format!("smart-reality-v1:{key}");
+        profile.security_mode = SecurityMode::SmartReality;
         for transport in [Transport::H2, Transport::H3, Transport::Auto] {
             profile.transport = transport;
             assert!(Invitation::public_from_profile(&profile).is_err());

@@ -11,6 +11,22 @@ use ring::rand::{SecureRandom, SystemRandom};
 pub(crate) const MAX_HEADER: u16 = 4096;
 const HEADER: &str = "theia-padding";
 
+// Fixed, shared Own-TLS wire-v1 defaults. No remote policy input or new
+// trust mechanism. These are conservative engineering candidates, not
+// measured optimal settings; REALITY continues to use its signed policy.
+pub(crate) const OWN_TLS_PADDING: Padding = Padding {
+    header_min: 16,
+    header_max: 64,
+    frame_min: 16,
+    frame_max: 128,
+};
+pub(crate) const OWN_TLS_ROTATION: crate::descriptor::Rotation = crate::descriptor::Rotation {
+    lifetime_min_s: 15,
+    lifetime_max_s: 20,
+    volume_min_bytes: 32 * 1024 * 1024,
+    volume_max_bytes: 64 * 1024 * 1024,
+};
+
 impl Padding {
     pub(crate) fn valid(&self) -> bool {
         self.header_min <= self.header_max
@@ -86,6 +102,17 @@ fn random_bytes(min: u32, max: u32) -> Result<Vec<u8>, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn own_tls_v1_policy_is_bounded_and_requires_capability() {
+        assert!(OWN_TLS_PADDING.valid());
+        let mut headers = HeaderMap::new();
+        OWN_TLS_PADDING.add_header(&mut headers).unwrap();
+        assert!((16..=64).contains(&headers[HEADER].as_bytes().len()));
+        assert!(OWN_TLS_PADDING.frame(0).unwrap().is_none());
+        assert!(matches!(OWN_TLS_PADDING.frame(protocol::CAP_PADDING).unwrap(),
+            Some(Frame::Padding(bytes)) if (16..=128).contains(&bytes.len())));
+    }
+
     #[test]
     fn bounded_header_and_negotiated_frame() {
         let policy = Padding {

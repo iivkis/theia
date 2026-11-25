@@ -291,7 +291,7 @@ async fn explicit_xhttp_client_scenario(
         .encode()
         .unwrap();
     let invitation = client_import::read_source(&uri).unwrap();
-    assert_eq!(invitation.tls_profile(), profile.tls_profile);
+    assert_eq!(invitation.security_mode(), profile.security_mode);
     assert!(!invitation.has_token());
 
     let mut editor = Editor::load(Role::Client, &config_path).unwrap();
@@ -303,7 +303,7 @@ async fn explicit_xhttp_client_scenario(
         panic!("imported client");
     };
     assert_eq!(imported.client.active_profile, "home");
-    assert_eq!(imported.client.profiles[1].tls_profile, profile.tls_profile);
+    assert_eq!(imported.client.profiles[1].security_mode, profile.security_mode);
     assert_eq!(imported.client.profiles[1].transport, transport);
     imported.client.active_profile = profile.id;
     run_client(&config_path, imported.clone(), fixture.origin, true).await;

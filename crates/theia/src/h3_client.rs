@@ -271,6 +271,16 @@ impl H3Client {
         self
     }
 
+    /// Enable the common production Own-TLS padding policy. Identity
+    /// carriers always keep the immutable signed descriptor policy.
+    pub(crate) fn with_own_tls_policy(mut self) -> Result<Self, ClientError> {
+        if self.identity_routes.is_some() || self.certificate_pin.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        self.padding = crate::padding::OWN_TLS_PADDING;
+        Ok(self)
+    }
+
     /// Set the exact configured inbound route, before admitting any session.
     pub fn with_path_prefix(mut self, prefix: &str) -> Result<Self, ClientError> {
         if self.identity_routes.is_some() {
@@ -530,7 +540,10 @@ impl H3Client {
         // retry. The lease's Drop removes the draining connection from reuse
         // while other admitted leases retain it.
         let mut admission_error = |error: h3::error::StreamError| {
-            if matches!(error, h3::error::StreamError::RemoteClosing { .. }) {
+            if matches!(&error, h3::error::StreamError::RemoteClosing { .. })
+                || matches!(&error, h3::error::StreamError::RemoteTerminate { code, .. }
+                    if *code == h3::error::Code::H3_REQUEST_REJECTED)
+            {
                 lease.retire();
                 *stage = crate::split_http::HelloOutcome::Draining;
             }
