@@ -145,9 +145,17 @@ fn visual_review_gallery() {
     review_capture("client-local-proxy-start-confirm", &client_model, &modes);
     modes.update(&mut client_model, press(KeyCode::Char('n')));
     assert!(!modes.owned_running(Role::Client));
-    let model = Model::new(None);
-    let ui = Interaction::new(None);
+    let mut model = Model::new(None);
+    let mut ui = Interaction::new(None);
     review_capture("home-role-selection", &model, &ui);
+    ui.update(&mut model, press(KeyCode::Down));
+    assert_eq!(model.selected, Role::Server);
+    ui.update(&mut model, press(KeyCode::Right));
+    assert_eq!(model.selected, Role::Client);
+    assert_eq!(model.screen, Screen::Home);
+    review_capture("home-role-selection-client", &model, &ui);
+    ui.update(&mut model, press(KeyCode::Left));
+    assert_eq!(model.selected, Role::Server);
     let mut help = model;
     help.update(press(KeyCode::Char('?')));
     review_capture("help", &help, &ui);
@@ -204,11 +212,23 @@ fn visual_review_gallery() {
             ui.update(&mut model, press(KeyCode::Esc));
             assert!(!ui.server_process.running());
         }
-        // Capture both focus states without confirming an action.
+        // Navigate through the actual arrow-only workspace route.
         let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
         ui.select_workspace_page(role, 0);
         review_capture(&format!("{prefix}-focus-navigation"), &model, &ui);
-        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Down));
+        assert_eq!(ui.workspace_page, 1);
+        ui.update(&mut model, press(KeyCode::Right));
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Fields);
+        review_capture(&format!("{prefix}-focus-fields"), &model, &ui);
+        ui.update(&mut model, press(KeyCode::Left));
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
+        review_capture(&format!("{prefix}-focus-records"), &model, &ui);
+        ui.update(&mut model, press(KeyCode::Left));
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+        ui.update(&mut model, press(KeyCode::Up));
+        assert_eq!(ui.workspace_page, 0);
+        ui.update(&mut model, press(KeyCode::Right));
         assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
         // Show a different focused row than the default overview screenshot.
         // Moving focus must not open a workflow or change saved configuration.
