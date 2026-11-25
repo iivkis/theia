@@ -72,7 +72,7 @@ const SERVER: &[Group] = &[
 ];
 const CLIENT: &[Group] = &[
     Group { title: "Подключение", entries: &[
-        entry("Состояние / подключить / отключить / Apply", key('V')),
+        always("Состояние / подключить / отключить / Apply", key('V')),
         always("Монитор трафика этого процесса", Action::Traffic),
         entry("Системный прокси Windows", key('p')),
     ]},
@@ -174,11 +174,13 @@ impl Menu {
         let end = (start + height).min(count);
         let title = if self.item.is_some() { groups[self.group].title } else { "Выберите раздел" };
         let mut out = format!("{title}  •  {} / {}\n", selected + 1, count);
-        for i in start..end {
+        for (i, (name, available)) in (start..end).map(|i| {
             let (name, available) = if self.item.is_some() {
                 let e = groups[self.group].entries[i];
                 (e.label, !e.requires_config || self.configured)
             } else { (groups[i].title, true) };
+            (i, (name, available))
+        }) {
             out.push_str(if i == selected { "› " } else { "  " });
             out.push_str(name);
             if !available { out.push_str(" [нужен TOML]"); }
@@ -260,6 +262,8 @@ impl ConfigDialog {
 }
 
 fn default_config(filename: &str) -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    if filename == "server.toml" { return std::path::PathBuf::from("/etc/theia/server.toml"); }
     #[cfg(windows)]
     let root = std::env::var_os("APPDATA").map(|p| std::path::PathBuf::from(p).join("Theia"));
     #[cfg(not(windows))]
@@ -287,11 +291,12 @@ mod tests {
     fn unconfigured_actions_do_not_mutate_and_selection_is_visible() {
         let mut m = Menu::new(Role::Client, false);
         m.key(KeyCode::Enter);
-        assert_eq!(m.key(KeyCode::Enter), None);
-        assert!(m.body(10).contains("Сначала откройте"));
+        assert_eq!(m.key(KeyCode::Enter), Some(key('V')));
         m.key(KeyCode::Down);
         assert_eq!(m.key(KeyCode::Enter), Some(Action::Traffic));
         m.key(KeyCode::End);
+        assert_eq!(m.key(KeyCode::Enter), None);
+        assert!(m.body(10).contains("Сначала откройте"));
         assert!(m.body(6).contains("Системный прокси"));
         m.key(KeyCode::Esc);
         m.key(KeyCode::End);

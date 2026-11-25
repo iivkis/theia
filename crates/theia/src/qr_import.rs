@@ -81,7 +81,7 @@ fn theia_svg(data: &[u8]) -> Result<(usize, Zeroizing<Vec<u8>>), &'static str> {
     let rest = text.strip_prefix(prefix).ok_or(INVALID)?;
     let (n, _) = rest.split_once(' ').ok_or(INVALID)?;
     let size: usize = n.parse().map_err(|_| INVALID)?;
-    if !(29..=185).contains(&size) || (size - 29) % 4 != 0 { return Err(INVALID); }
+    if !(29..=185).contains(&size) || (size - 29) & 3 != 0 { return Err(INVALID); }
     let scaled = size * 4;
     let header = format!("{prefix}{size} {size}\" width=\"{scaled}\" height=\"{scaled}\" shape-rendering=\"crispEdges\"><rect width=\"100%\" height=\"100%\" fill=\"white\"/><path fill=\"black\" d=\"");
     let mut path = text.strip_prefix(&header).and_then(|s| s.strip_suffix("\"/></svg>")).ok_or(INVALID)?;
@@ -144,7 +144,7 @@ mod tests {
         }
         let (w,h,p) = png_pixels(&png).unwrap();
         assert_eq!(decode(w,h,&p).unwrap().as_str(), link.as_str());
-        assert!(decode(64,64,&vec![255;4096]).is_err());
+        assert!(decode(64,64,&[255;4096]).is_err());
         assert!(pixel_count(4096,4096).is_err());
         assert!(theia_svg(b"<svg onload='invalid'/>").is_err());
     }

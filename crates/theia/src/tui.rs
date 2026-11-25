@@ -311,6 +311,12 @@ impl RecordFlow {
     }
 }
 
+struct QrScan {
+    source: Zeroizing<String>,
+    done: mpsc::Receiver<Result<Zeroizing<String>, &'static str>>,
+    cancelled: bool,
+}
+
 struct Interaction {
     editor: Option<Editor>,
     menu: Option<Menu>,
@@ -323,7 +329,7 @@ struct Interaction {
     issue_kind: IssueKind,
     revocation: Option<DisableFlow>,
     importing: Option<ImportFlow>,
-    qr_scan: Option<(Zeroizing<String>, mpsc::Receiver<Result<Zeroizing<String>, &'static str>>)>,
+    qr_scan: Option<QrScan>,
     records: Option<RecordFlow>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
@@ -585,18 +591,19 @@ impl Interaction {
             }
             return;
         }
+        if role == Role::Client { self.client_background = None; }
         self.config_dialog = Some(ConfigDialog::new(role, self.editor_for(role).map(Editor::saved_path)));
     }
 
     fn poll_navigation(&mut self, model: &mut Model) {
-        if let Some((_, rx)) = self.qr_scan.as_ref() {
-            let result = match rx.try_recv() {
+        if let Some(scan) = self.qr_scan.as_ref() {
+            let result = match scan.done.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err("Чтение QR не подтверждено.")),
             };
             if let Some(result) = result {
-                if let Some((source, _)) = self.qr_scan.take() {
+                if let Some(scan) = self.qr_scan.take().filter(|s| !s.cancelled) {
                     match result {
                         Ok(uri) => {
                             self.importing = Some(ImportFlow::Input(uri));
@@ -604,7 +611,7 @@ impl Interaction {
                         }
                         Err(message) => {
                             if let Some(editor) = self.editor.as_mut() { editor.error = Some(message.into()); }
-                            self.importing = Some(ImportFlow::Input(source));
+                            self.importing = Some(ImportFlow::Input(scan.source));
                         }
                     }
                 }
@@ -632,8 +639,8 @@ impl Interaction {
         {
             return false;
         }
-        if self.qr_scan.is_some() {
-            if key.code == KeyCode::Esc { self.qr_scan = None; }
+        if let Some(scan) = self.qr_scan.as_mut() {
+            if key.code == KeyCode::Esc { scan.cancelled = true; }
             return false;
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
@@ -881,7 +888,7 @@ impl Interaction {
             }
             if let Some(role) = role {
                 let configured = self.editor_for(role).is_some();
-                if key.code == KeyCode::F(3) || (!configured && key.code == KeyCode::Enter) {
+                if key.code == KeyCode::F(3) || (!configured && (key.code == KeyCode::Enter || (role == Role::Client && key.code == KeyCode::Char('V')))) {
                     self.open_config(role);
                     return false;
                 }
@@ -1238,7 +1245,7 @@ impl Interaction {
                             match std::thread::Builder::new().name("theia-qr-import".into()).spawn(move || {
                                 let _ = tx.send(crate::qr_import::scan_file(&path));
                             }) {
-                                Ok(_) => self.qr_scan = Some((source, rx)),
+                                Ok(_) => self.qr_scan = Some(QrScan { source, done: rx, cancelled: false }),
                                 Err(_) => {
                                     editor.error = Some("Не удалось запустить сканирование QR.".into());
                                     self.importing = Some(ImportFlow::Input(source));
@@ -1916,7 +1923,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     if interaction.is_some_and(|ui| ui.qr_scan.is_some()) {
         frame.render_widget(Clear, parts[1]);
-        panel(frame, parts[1], "Чтение QR", "Локальное декодирование изображения. Никакой сети или записи. Esc: отменить.", true);
+        let cancelled = interaction.and_then(|ui| ui.qr_scan.as_ref()).is_some_and(|scan| scan.cancelled);
+        panel(frame, parts[1], "Чтение QR", if cancelled { "Импорт отменён. Результат декодирования будет отброшен." } else { "Локальное декодирование изображения. Никакой сети или записи. Esc: отменить." }, true);
     } else if let Some(dialog) = interaction.and_then(|ui| ui.config_dialog.as_ref()) {
         frame.render_widget(Clear, parts[1]);
         panel(frame, parts[1], "Открыть конфигурацию", &dialog.body(), true);
@@ -2344,7 +2352,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     panel(
         frame,
         area,
-        if editor.role() == Role::Server { "Сервер • входящие подключения" } else { "Клиент • профили" },
+        if editor.role() == Role::Server { "Сервер • Редактор TOML" } else { "Клиент • Редактор TOML" },
         &message,
         true,
     );
