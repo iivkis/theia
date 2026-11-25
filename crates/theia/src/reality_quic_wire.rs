@@ -1,4 +1,4 @@
-//! QUIC v1 public-header and Initial inspection. RFC 9000/9001.
+//! QUIC v1/v2 public-header and Initial inspection. RFC 9000/9001/9369.
 //! Initial keys are public; successful decryption is NOT address or identity
 //! authentication. Never rewrite a datagram that is passed to the reference.
 #![forbid(unsafe_code)]
@@ -8,6 +8,8 @@ use ring::{aead, hkdf};
 pub(crate) type Cid = Vec<u8>;
 pub(crate) const MAX_DATAGRAM: usize = 65527;
 pub(crate) const MIN_INITIAL: usize = 1200;
+pub(crate) const V1:u32=1;
+pub(crate) const V2:u32=0x6b3343cf;
 const MAX_CRYPTO: usize = crate::reality_admission::MAX_HELLO;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +18,7 @@ pub(crate) enum Kind { Initial, ZeroRtt, Handshake, Retry, VersionNegotiation }
 #[derive(Debug)]
 pub(crate) struct Long<'a> {
     pub kind: Kind,
+    pub version:u32,
     pub dcid: &'a [u8],
     pub scid: &'a [u8],
     pub token: &'a [u8],
@@ -54,17 +57,24 @@ pub(crate) fn long(bytes: &[u8]) -> Option<Long<'_>> {
     if version == 0 {
         let rest = bytes.len().checked_sub(pos)?;
         if rest == 0 || rest % 4 != 0 { return None; }
-        return Some(Long { kind: Kind::VersionNegotiation, dcid, scid, token: &[], pn: 0, end: bytes.len() });
+        return Some(Long { kind: Kind::VersionNegotiation, version, dcid, scid, token: &[], pn: 0, end: bytes.len() });
     }
-    if version != 1 || first & 0x40 == 0 { return None; }
-    let kind = match (first >> 4) & 3 {
-        0 => Kind::Initial, 1 => Kind::ZeroRtt, 2 => Kind::Handshake, _ => Kind::Retry,
+    if !matches!(version,V1|V2){return None;}
+    // RFC 9287 permits greasing the fixed bit after negotiation (including
+    // remembered parameters). This is an observer parser, not an endpoint
+    // accepting packets: no inference of negotiated transport parameters.
+    let ty=(first>>4)&3;
+    let kind=match (version,ty){
+        (V1,0)|(V2,1)=>Kind::Initial,
+        (V1,1)|(V2,2)=>Kind::ZeroRtt,
+        (V1,2)|(V2,3)=>Kind::Handshake,
+        _=>Kind::Retry,
     };
     if kind == Kind::Retry {
         let end = bytes.len().checked_sub(16)?;
         let token = bytes.get(pos..end)?;
         if token.is_empty() { return None; }
-        return Some(Long { kind, dcid, scid, token, pn: 0, end: bytes.len() });
+        return Some(Long { kind, version, dcid, scid, token, pn: 0, end: bytes.len() });
     }
     let token = if kind == Kind::Initial {
         let n = usize::try_from(varint(bytes, &mut pos)?).ok()?;
@@ -73,7 +83,7 @@ pub(crate) fn long(bytes: &[u8]) -> Option<Long<'_>> {
     let n = usize::try_from(varint(bytes, &mut pos)?).ok()?;
     let end = pos.checked_add(n)?;
     if n < 17 || end > bytes.len() { return None; }
-    Some(Long { kind, dcid, scid, token, pn: pos, end })
+    Some(Long { kind, version, dcid, scid, token, pn: pos, end })
 }
 
 /// Every packet in a coalesced datagram must have the same destination
@@ -93,14 +103,14 @@ pub(crate) fn coherent_datagram(bytes:&[u8])->bool{
                 tail.get(1..1+first.dcid.len())==Some(first.dcid);
         }
         let Some(next)=long(tail)else{return false;};
-        if next.dcid!=first.dcid||matches!(next.kind,Kind::Retry|Kind::VersionNegotiation){return false;}
+        if next.dcid!=first.dcid||next.version!=first.version||matches!(next.kind,Kind::Retry|Kind::VersionNegotiation){return false;}
         offset+=next.end;
     }
     true
 }
 
 pub(crate) fn short_matches(bytes: &[u8], cid: &[u8]) -> bool {
-    !cid.is_empty() && bytes.first().is_some_and(|b| b & 0xc0 == 0x40)
+    !cid.is_empty() && bytes.first().is_some_and(|b| b & 0x80 == 0)
         && bytes.len() >= 1 + cid.len() + 17
         && bytes.get(1..1 + cid.len()) == Some(cid)
 }
@@ -110,16 +120,23 @@ pub(crate) fn short_matches(bytes: &[u8], cid: &[u8]) -> bool {
 pub(crate) fn retry_valid(bytes: &[u8], original: &[u8]) -> bool {
     const KEY: [u8; 16] = [0xbe,0x0c,0x69,0x0b,0x9f,0x66,0x57,0x5a,0x1d,0x76,0x6b,0x54,0xe3,0x68,0xc8,0x4e];
     const NONCE: [u8; 12] = [0x46,0x15,0x99,0xd3,0x5d,0x63,0x2b,0xf2,0x23,0x98,0x25,0xbb];
-    if original.len() > 20 || !long(bytes).is_some_and(|h| h.kind == Kind::Retry) { return false; }
+    let Some(header)=long(bytes)else{return false;};
+    if original.len()>20||header.kind!=Kind::Retry{return false;}
+    let (key,nonce)=match header.version{
+        V1=>(KEY,NONCE),
+        V2=>([0x8f,0xb4,0xb0,0x1b,0x56,0xac,0x48,0xe2,0x60,0xfb,0xcb,0xce,0xad,0x7c,0xcc,0x92],
+            [0xd8,0x69,0x69,0xbc,0x2d,0x7c,0x6d,0x99,0x90,0xef,0xb0,0x4a]),
+        _=>return false,
+    };
     let split = bytes.len() - 16;
     let mut aad = Vec::with_capacity(1 + original.len() + split);
     aad.push(original.len() as u8);
     aad.extend_from_slice(original);
     aad.extend_from_slice(&bytes[..split]);
-    let Ok(key) = aead::UnboundKey::new(&aead::AES_128_GCM, &KEY) else { return false; };
+    let Ok(key) = aead::UnboundKey::new(&aead::AES_128_GCM, &key) else { return false; };
     let mut tag = bytes[split..].to_vec();
     aead::LessSafeKey::new(key).open_in_place(
-        aead::Nonce::assume_unique_for_key(NONCE), aead::Aad::from(aad), &mut tag
+        aead::Nonce::assume_unique_for_key(nonce), aead::Aad::from(aad), &mut tag
     ).is_ok()
 }
 
@@ -143,15 +160,22 @@ struct InitialKeys {
     iv: [u8; 12],
 }
 impl InitialKeys {
-    fn client(dcid: &[u8]) -> Option<Self> {
+    fn client(dcid: &[u8],version:u32) -> Option<Self> {
         const SALT: [u8; 20] = [0x38,0x76,0x2c,0xf7,0xf5,0x59,0x34,0xb3,0x4d,0x17,
             0x9a,0xe6,0xa4,0xc8,0x0c,0xad,0xcc,0xbb,0x7f,0x0a];
-        let initial = hkdf::Salt::new(hkdf::HKDF_SHA256, &SALT).extract(dcid);
+        const SALT_V2:[u8;20]=[0x0d,0xed,0xe3,0xde,0xf7,0x00,0xa6,0xdb,0x81,0x93,
+            0x81,0xbe,0x6e,0x26,0x9d,0xcb,0xf9,0xbd,0x2e,0xd9];
+        let (salt,key_label,iv_label,hp_label):(&[u8],&[u8],&[u8],&[u8])=match version{
+            V1=>(&SALT,b"quic key",b"quic iv",b"quic hp"),
+            V2=>(&SALT_V2,b"quicv2 key",b"quicv2 iv",b"quicv2 hp"),
+            _=>return None,
+        };
+        let initial=hkdf::Salt::new(hkdf::HKDF_SHA256,salt).extract(dcid);
         let secret = expand::<32>(&initial, b"client in")?;
         let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &secret);
-        let hp = aead::quic::HeaderProtectionKey::new(&aead::quic::AES_128, &expand::<16>(&prk, b"quic hp")?).ok()?;
-        let packet = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &expand::<16>(&prk, b"quic key")?).ok()?);
-        Some(Self { hp, packet, iv: expand::<12>(&prk, b"quic iv")? })
+        let hp = aead::quic::HeaderProtectionKey::new(&aead::quic::AES_128, &expand::<16>(&prk, hp_label)?).ok()?;
+        let packet = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &expand::<16>(&prk, key_label)?).ok()?);
+        Some(Self { hp, packet, iv: expand::<12>(&prk, iv_label)? })
     }
 
     fn open(&self, bytes: &[u8], header: &Long<'_>, largest: Option<u64>) -> Option<(u64, Vec<u8>)> {
@@ -196,6 +220,7 @@ pub(crate) enum Inspection { Pending, Hello(Vec<u8>), Invalid }
 /// guessing. Retransmissions are harmless and do not grow memory.
 pub(crate) struct Flight {
     keys: InitialKeys,
+    version:u32,
     dcid: Cid,
     scid: Cid,
     largest: Option<u64>,
@@ -205,7 +230,7 @@ pub(crate) struct Flight {
 impl Flight {
     pub fn new(header: &Long<'_>) -> Option<Self> {
         if header.kind != Kind::Initial || header.dcid.len() < 8 { return None; }
-        Some(Self { keys: InitialKeys::client(header.dcid)?, dcid: header.dcid.to_vec(),
+        Some(Self { keys: InitialKeys::client(header.dcid,header.version)?, version:header.version, dcid: header.dcid.to_vec(),
             scid: header.scid.to_vec(), largest: None, crypto: vec![None; MAX_CRYPTO], contiguous: 0 })
     }
     pub fn inspect(&mut self, datagram: &[u8]) -> Inspection {
@@ -215,7 +240,7 @@ impl Flight {
         while offset < datagram.len() {
             let Some(header) = long(&datagram[offset..]) else { break; };
             if header.kind == Kind::Initial {
-                if header.dcid != self.dcid || header.scid != self.scid { return Inspection::Invalid; }
+                if header.version!=self.version || header.dcid != self.dcid || header.scid != self.scid { return Inspection::Invalid; }
                 let Some((pn, plain)) = self.keys.open(&datagram[offset..], &header, self.largest) else {
                     return Inspection::Invalid;
                 };
@@ -296,11 +321,24 @@ mod tests {
     #[test]
     fn rfc9001_client_key_derivation() {
         let dcid = hex("8394c8f03e515708");
-        let keys = InitialKeys::client(&dcid).unwrap();
+        let keys = InitialKeys::client(&dcid,V1).unwrap();
         assert_eq!(keys.iv.as_slice(), hex("fa044b2f42a3fd3b46fb255c"));
         assert_eq!(keys.hp.new_mask(&hex("d1b1c98dd7689fb8ec11d242b123dc9b")).unwrap().as_slice(), hex("437b9aec36"));
         assert_eq!(decode_number(0,1,Some(255)), Some(256));
         assert_eq!(decode_number(255,1,Some(256)), Some(255));
+    }
+    #[test]
+    fn rfc9369_retry_and_initial_key_vectors(){
+        let dcid=hex("8394c8f03e515708");
+        let retry=hex("cf6b3343cf0008f067a5502a4262b5746f6b656ec8646ce8bfe33952d955543665dcc7b6");
+        assert_eq!(long(&retry).unwrap().version,V2);
+        assert!(retry_valid(&retry,&dcid));
+        let mut bad=retry.clone();bad[20]^=1;
+        assert!(!retry_valid(&bad,&dcid));
+        assert!(!retry_valid(&retry,&[0;8]));
+        let keys=InitialKeys::client(&dcid,V2).unwrap();
+        assert_eq!(keys.iv.as_slice(),hex("91f73e2351d8fa91660e909f"));
+        assert!(InitialKeys::client(&dcid,0).is_none());
     }
     #[test]
     fn reassembly_rejects_conflicting_overlap_and_limits() {
@@ -316,10 +354,12 @@ mod tests {
         for n in 0..raw.len() { assert!(long(&raw[..n]).is_none()); }
     }
 
-    fn initial_packet(pn: u16, frames: &[u8]) -> Vec<u8> {
+    fn initial_packet(pn: u16, frames: &[u8],version:u32) -> Vec<u8> {
         let dcid = [1,2,3,4,5,6,7,8];
-        let keys = InitialKeys::client(&dcid).unwrap();
-        let mut packet = vec![0xc1,0,0,0,1,8];
+        let keys=InitialKeys::client(&dcid,version).unwrap();
+        let mut packet=vec![if version==V1{0xc1}else{0xd1}];
+        packet.extend_from_slice(&version.to_be_bytes());
+        packet.push(8);
         packet.extend_from_slice(&dcid);
         packet.extend_from_slice(&[8,9,10,11,12,13,14,15,16,0]);
         // Two-byte length, two-byte packet number, 16-byte tag.
@@ -351,12 +391,18 @@ mod tests {
         tail.extend_from_slice(&hello[12..]);
         let mut head = vec![6,0,12];
         head.extend_from_slice(&hello[..12]);
-        let second = initial_packet(1, &tail);
-        let first = initial_packet(0, &head);
+        let second = initial_packet(1, &tail,V1);
+        let first = initial_packet(0, &head,V1);
         let mut flight = Flight::new(&long(&second).unwrap()).unwrap();
         assert!(matches!(flight.inspect(&second), Inspection::Pending));
         assert!(matches!(flight.inspect(&second), Inspection::Pending));
         assert!(matches!(flight.inspect(&first), Inspection::Hello(value) if value == hello));
+        let v2=initial_packet(0,&head,V2);
+        let v2_tail=initial_packet(1,&tail,V2);
+        let mut flight=Flight::new(&long(&v2).unwrap()).unwrap();
+        assert!(matches!(flight.inspect(&v2),Inspection::Pending));
+        assert!(matches!(flight.inspect(&v2_tail),Inspection::Hello(value) if value==hello));
+        assert!(matches!(Flight::new(&long(&v2).unwrap()).unwrap().inspect(&first),Inspection::Invalid));
         let mut forged = first.clone();
         forged[1199] ^= 1;
         assert!(matches!(Flight::new(&long(&forged).unwrap()).unwrap().inspect(&forged), Inspection::Invalid));

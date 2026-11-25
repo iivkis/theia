@@ -1,4 +1,4 @@
-//! External QUIC v1 reference relay for a prepared REALITY generation.
+//! External QUIC v1/v2 reference relay for a prepared REALITY generation.
 //! The relay never terminates reference TLS or rewrites datagrams. Admission
 //! is decided before opening a reference socket. A valid marker is handed
 //! exclusively to the local QUIC endpoint via a bounded virtual UDP socket.
@@ -61,6 +61,8 @@ struct Retry { cid: Cid, token: Vec<u8> }
 struct Session {
     original: Cid,
     client: Cid,
+    original_version:u32,
+    negotiated_version:Option<u32>,
     server: HashSet<Cid>,
     retry: Option<Retry>,
     retry_echoed: bool,
@@ -76,8 +78,8 @@ struct Session {
     reference_signer: Option<[u8;32]>,
 }
 impl Session {
-    fn new(peer: SocketAddr, original: Cid, client: Cid, now: Instant) -> Self {
-        Self { original, client, server: HashSet::new(), retry: None, retry_echoed: false, server_initial: false, first_peer: peer,
+    fn new(peer: SocketAddr, original: Cid, client: Cid, version:u32,now: Instant) -> Self {
+        Self { original, client, original_version:version,negotiated_version:None,server: HashSet::new(), retry: None, retry_echoed: false, server_initial: false, first_peer: peer,
             paths: HashMap::new(), deadline: now + LIFETIME, last: now, remaining: BYTES, paths_opened: 0, closed_paths: HashSet::new(), generation: None, reference_signer:None }
     }
     fn expired(&self, now: Instant) -> bool {
@@ -103,6 +105,8 @@ impl Session {
         if let Some(h) = wire::long(datagram) {
             if !wire::coherent_datagram(datagram){return false;}
             if peer != self.first_peer && !self.paths.contains_key(&peer) { return false; }
+            let version=self.negotiated_version.unwrap_or(self.original_version);
+            if h.version!=version{return false;}
             if h.kind == Kind::Initial {
                 if datagram.len() < wire::MIN_INITIAL || h.scid != self.client { return false; }
                 if let Some(retry) = &self.retry {
@@ -115,7 +119,7 @@ impl Session {
             }
             self.known(datagram)
         } else {
-            datagram.first().is_some_and(|b| b & 0x80 == 0) &&
+            self.server_initial && datagram.len()>=18 && datagram.first().is_some_and(|b| b & 0x80 == 0) &&
                 (self.paths.contains_key(&peer) || self.known(datagram))
         }
     }
@@ -128,10 +132,11 @@ impl Session {
             if !wire::coherent_datagram(packet){return false;}
             if h.dcid != self.client { return false; }
             if h.kind == Kind::VersionNegotiation {
-                return self.retry.is_none() && h.scid == self.original;
+                // VN is advisory, never a path validation or CID update.
+                return peer==self.first_peer && self.retry.is_none() && !self.server_initial && h.scid==self.original;
             }
             if h.kind == Kind::Retry {
-                if peer != self.first_peer || self.server_initial || h.scid.is_empty() || h.scid == self.original
+                if h.version!=self.original_version || peer != self.first_peer || self.server_initial || h.scid.is_empty() || h.scid == self.original
                     || !wire::retry_valid(packet, &self.original) { return false; }
                 if let Some(old) = &self.retry { return old.cid == h.scid && old.token == h.token; }
                 if !self.server.is_empty() { return false; }
@@ -140,6 +145,14 @@ impl Session {
                 return false;
             } else {
                 if self.retry.is_some() && !self.retry_echoed { return false; }
+                // Compatible v1/v2 negotiation may change version on the
+                // first server Initial, never on Retry or a later packet.
+                if let Some(version)=self.negotiated_version{
+                    if h.version!=version{return false;}
+                }else{
+                    if peer!=self.first_peer||h.kind!=Kind::Initial{return false;}
+                    self.negotiated_version=Some(h.version);
+                }
                 if h.kind == Kind::Initial { self.server_initial = true; }
             }
             if !h.scid.is_empty() && !self.server.contains(h.scid) {
@@ -148,9 +161,8 @@ impl Session {
             }
             true
         } else {
-            packet.first().is_some_and(|b| b & 0x80 == 0) &&
-                (self.client.is_empty() || wire::short_matches(packet, &self.client)
-                    || self.paths.contains_key(&peer))
+            self.server_initial && packet.len()>=18 && packet.first().is_some_and(|b| b & 0x80 == 0) &&
+                self.paths.contains_key(&peer)
         }
     }
 
@@ -301,7 +313,7 @@ fn route(sessions: &HashMap<SessionId, Session>, peer: SocketAddr, bytes: &[u8],
     // On an existing, unambiguous physical tuple the reference can decrypt
     // packets carrying an encrypted, newly issued CID. Do not learn it from
     // unauthenticated bytes or guess which of several connections owns it.
-    if admitted_peer || bytes.len()<18 || !bytes.first().is_some_and(|b| b & 0xc0 == 0x40) { return None; }
+    if admitted_peer || bytes.len()<18 || !bytes.first().is_some_and(|b| b & 0x80 == 0) { return None; }
     unique(sessions.iter().filter(|(_, s)| s.paths.contains_key(&peer)).map(|(&id, _)| id))
 }
 
@@ -560,7 +572,7 @@ impl PreparedQuic {
                     let data = &buf[..n];
                     let header = wire::long(data);
                     let short = data[0] & 0x80 == 0;
-                    if short && (n<18||data[0]&0xc0!=0x40){continue;}
+                    if short && n<18{continue;}
                     if !short && (header.is_none()||!wire::coherent_datagram(data)){continue;}
                     let local_peer = admitted.keys().any(|(addr, _)| *addr == peer);
                     let local_known = if short {
@@ -627,6 +639,9 @@ impl PreparedQuic {
                         Inspection::Pending=>continue,
                     };
                     if let Some(route)=selected{
+                        // The native Quinn contract currently supports v1 only.
+                        // A valid v2 marker must never be sent to the reference.
+                        if h.version!=wire::V1{continue;}
                         if admitted.len()>=SESSIONS || p.datagrams.iter().any(|packet|packet.len()>LOCAL_MAX){continue;}
                         {
                             let mut tickets=self.tickets.lock().map_err(|_|ServerError::Io)?;
@@ -641,7 +656,7 @@ impl PreparedQuic {
                         if sessions.len() + retired.len() >= RETIRED_LIMIT { continue; }
                         let Some(next) = sequence.checked_add(1) else { return Err(ServerError::Io); };
                         sequence = next;
-                        let mut s = Session::new(peer, h.dcid.to_vec(), p.client, now);
+                        let mut s = Session::new(peer, h.dcid.to_vec(), p.client, h.version,now);
                         s.generation=Some(generation.lease.clone());
                         s.reference_signer=Some(signer);
                         if !self.open_path(&mut workers, &reply_tx, sequence, &mut s, peer) { continue; }
@@ -659,8 +674,10 @@ mod tests {
     use super::*;
     fn peer(port: u16) -> SocketAddr { SocketAddr::from(([127,0,0,1], port)) }
     fn session(p: SocketAddr, server: &[u8]) -> Session {
-        let mut s = Session::new(p, vec![1;8], vec![2;8], Instant::now());
+        let mut s = Session::new(p, vec![1;8], vec![2;8], wire::V1,Instant::now());
         s.server.insert(server.to_vec());
+        s.server_initial=true;
+        s.negotiated_version=Some(wire::V1);
         let (queue, _rx) = mpsc::channel(1);
         s.paths.insert(p, Path { queue, budget: Budget::default(), last: Instant::now() });
         s
@@ -692,6 +709,11 @@ mod tests {
         assert_eq!(route(&table, new, &known, false), Some(1));
         assert_eq!(route(&table, old, &rotated, false), Some(1));
         assert_eq!(route(&table, new, &rotated, false), None);
+        let mut greased=known;greased[0]=0;
+        assert_eq!(route(&table,new,&greased,false),Some(1));
+        let mut greased_unknown=rotated;greased_unknown[0]=0;
+        assert_eq!(route(&table,old,&greased_unknown,false),Some(1));
+        assert_eq!(route(&table,new,&greased_unknown,false),None);
         assert_eq!(route(&table, old, &rotated, true), None);
         table.insert(2, session(old, &[5;8]));
         assert_eq!(route(&table, old, &rotated, false), None);
@@ -837,6 +859,7 @@ mod tests {
     fn retry_token_never_transfers_to_another_path_or_grants_credit() {
         let p = peer(10);
         let mut s = session(p,&[3;8]);
+        s.server_initial=false;s.negotiated_version=None;
         s.retry = Some(Retry { cid: vec![3;8], token: vec![9] });
         let (tx,_rx) = mpsc::channel(2);
         s.paths.get_mut(&p).unwrap().queue = tx;
