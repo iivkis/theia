@@ -29,6 +29,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+#[path = "support/private_pem.rs"]
+mod private_pem;
+
 struct Running(Child);
 impl Drop for Running {
     fn drop(&mut self) {
@@ -44,20 +47,11 @@ impl Drop for Temp {
     }
 }
 
-fn port(tcp: bool) -> u16 {
-    if tcp {
-        StdTcp::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    } else {
-        StdUdp::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
+fn reserve_ports() -> (StdTcp, StdUdp) {
+    (
+        StdTcp::bind("127.0.0.1:0").unwrap(),
+        StdUdp::bind("127.0.0.1:0").unwrap(),
+    )
 }
 
 fn credential(byte: u8) -> String {
@@ -220,18 +214,18 @@ fn write_identity(cert: &Path, key: &Path, generated: &rcgen::CertifiedKey) {
         ),
     )
     .unwrap();
-    fs::write(
-        key,
-        format!(
-            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-            STANDARD.encode(generated.key_pair.serialize_der())
-        ),
-    )
-    .unwrap();
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
+    let pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        STANDARD.encode(generated.key_pair.serialize_der())
+    );
+    // Substitution/restore cases deliberately change the same fixture path.
+    // Preserve the protected ACL/mode of an existing test-owned regular file.
+    if key.exists() {
+        let mut file = fs::OpenOptions::new().write(true).truncate(true).open(key).unwrap();
+        file.write_all(pem.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+    } else {
+        private_pem::write_new_key(key, pem);
     }
 }
 
@@ -272,8 +266,9 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         roots.add(old_identity.cert.der().clone()).unwrap();
         roots.add(new_identity.cert.der().clone()).unwrap();
 
-        let old_tcp = port(true);
-        let old_udp = port(false);
+        let reservations = reserve_ports();
+        let old_tcp = reservations.0.local_addr().unwrap().port();
+        let old_udp = reservations.1.local_addr().unwrap().port();
         let mut document = ServerDocument {
             schema_version: 1,
             server: ServerSettings {
@@ -310,6 +305,8 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
             },
         };
         save(&config_path, &document);
+        assert!(theia::server::tls_fingerprint_file(&config_path).is_ok(),
+            "initial fixture must pass protected PEM validation and production TLS builders");
         #[cfg(target_os = "linux")]
         let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
         #[cfg(target_os = "windows")]
@@ -317,6 +314,7 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
             "THEIA_CONTROL_PIPE",
             format!("m42h{}{}", std::process::id(), old_tcp),
         );
+        drop(reservations);
         let mut server = Running(
             Command::new(env!("CARGO_BIN_EXE_theia"))
                 .args(["server", "run", "--config"])
@@ -333,7 +331,9 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
                 if revision(env_key, &endpoint, 1) {
                     break;
                 }
-                assert!(server.0.try_wait().unwrap().is_none(), "server exited");
+                if let Some(status) = server.0.try_wait().unwrap() {
+                    panic!("supervised server exited before management readiness: {status}");
+                }
                 sleep(Duration::from_millis(35)).await;
             }
         })
@@ -369,13 +369,15 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
         rollback(env_key, &endpoint, 1, false);
 
         let mut next = document.clone();
-        let next_tcp = port(true);
-        let next_udp = port(false);
+        let reservations = reserve_ports();
+        let next_tcp = reservations.0.local_addr().unwrap().port();
+        let next_udp = reservations.1.local_addr().unwrap().port();
         next.server.inbounds[0].h2_listen = format!("127.0.0.1:{next_tcp}");
         next.server.inbounds[0].quic_listen = format!("127.0.0.1:{next_udp}");
         next.server.inbounds[0].tls_cert = format!("file:{}", new_cert.display());
         next.server.inbounds[0].tls_key = format!("file:{}", new_key.display());
         let next_sha = save(&config_path, &next);
+        drop(reservations);
 
         apply(env_key, &endpoint, 1, &"0".repeat(64), false, &config_path);
         assert!(revision(env_key, &endpoint, 1));
@@ -546,8 +548,9 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
         let mut roots = RootCertStore::empty();
         roots.add(old_identity.cert.der().clone()).unwrap();
         roots.add(next_identity.cert.der().clone()).unwrap();
-        let tcp_port = port(true);
-        let udp_port = port(false);
+        let reservations = reserve_ports();
+        let tcp_port = reservations.0.local_addr().unwrap().port();
+        let udp_port = reservations.1.local_addr().unwrap().port();
         let mut document = ServerDocument {
             schema_version: 1,
             server: ServerSettings {
@@ -584,6 +587,8 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             },
         };
         save(&config_path, &document);
+        assert!(theia::server::tls_fingerprint_file(&config_path).is_ok(),
+            "initial fixture must pass protected PEM validation and production TLS builders");
         #[cfg(target_os = "linux")]
         let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
         #[cfg(target_os = "windows")]
@@ -591,6 +596,7 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
             "THEIA_CONTROL_PIPE",
             format!("m42i{}{}", std::process::id(), tcp_port),
         );
+        drop(reservations);
         let mut server = Running(
             Command::new(env!("CARGO_BIN_EXE_theia"))
                 .args(["server", "run", "--config"])
@@ -607,7 +613,9 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
                 if revision(env_key, &endpoint, 1) {
                     break;
                 }
-                assert!(server.0.try_wait().unwrap().is_none(), "server exited");
+                if let Some(status) = server.0.try_wait().unwrap() {
+                    panic!("supervised server exited before management readiness: {status}");
+                }
                 sleep(Duration::from_millis(35)).await;
             }
         })
@@ -906,8 +914,9 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
         write_identity(&cert, &key, &identity);
         let mut roots = RootCertStore::empty();
         roots.add(identity.cert.der().clone()).unwrap();
-        let tcp_port = port(true);
-        let udp_port = port(false);
+        let reservations = reserve_ports();
+        let tcp_port = reservations.0.local_addr().unwrap().port();
+        let udp_port = reservations.1.local_addr().unwrap().port();
         let mut document = ServerDocument {
             schema_version: 1,
             server: ServerSettings {
@@ -944,6 +953,8 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
             },
         };
         save(&config, &document);
+        assert!(theia::server::tls_fingerprint_file(&config).is_ok(),
+            "quota fixture must pass protected PEM validation and production TLS builders");
         #[cfg(target_os = "linux")]
         let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
         #[cfg(target_os = "windows")]
@@ -951,6 +962,7 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
             "THEIA_CONTROL_PIPE",
             format!("m42j{}{}", std::process::id(), tcp_port),
         );
+        drop(reservations);
         let mut server = Running(
             Command::new(env!("CARGO_BIN_EXE_theia"))
                 .args(["server", "run", "--config"])
@@ -967,7 +979,9 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
                 if revision(env_key, &endpoint, 1) {
                     break;
                 }
-                assert!(server.0.try_wait().unwrap().is_none(), "server exited");
+                if let Some(status) = server.0.try_wait().unwrap() {
+                    panic!("supervised server exited before management readiness: {status}");
+                }
                 sleep(Duration::from_millis(35)).await;
             }
         })

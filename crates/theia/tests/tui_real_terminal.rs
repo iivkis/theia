@@ -17,6 +17,9 @@ use theia::config::{
 };
 use tokio::time::{sleep, timeout};
 
+#[path = "support/private_pem.rs"]
+mod private_pem;
+
 struct Running(Child);
 impl Drop for Running {
     fn drop(&mut self) {
@@ -25,20 +28,11 @@ impl Drop for Running {
     }
 }
 
-fn free_port(tcp: bool) -> u16 {
-    if tcp {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    } else {
-        UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
+fn reserve_ports() -> (TcpListener, UdpSocket) {
+    (
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        UdpSocket::bind("127.0.0.1:0").unwrap(),
+    )
 }
 
 fn digest(byte: u8) -> String {
@@ -162,21 +156,16 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
         ),
     )
     .unwrap();
-    fs::write(
+    private_pem::write_new_key(
         &key_path,
         format!(
             "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
             STANDARD.encode(generated.key_pair.serialize_der())
         ),
-    )
-    .unwrap();
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
-    }
-    let tcp = free_port(true);
-    let udp = free_port(false);
+    );
+    let reservations = reserve_ports();
+    let tcp = reservations.0.local_addr().unwrap().port();
+    let udp = reservations.1.local_addr().unwrap().port();
     let mut doc = ServerDocument {
         schema_version: 1,
         server: ServerSettings {
@@ -213,6 +202,8 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
         },
     };
     save(&server_file, &doc);
+    assert!(theia::server::tls_fingerprint_file(&server_file).is_ok(),
+        "TUI fixture must pass protected PEM validation and production TLS builders");
     let binary = env!("CARGO_BIN_EXE_theia");
     #[cfg(target_os = "linux")]
     let (env_key, endpoint) = ("THEIA_CONTROL_DIR", base.to_string_lossy().into_owned());
@@ -221,6 +212,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
         "THEIA_CONTROL_PIPE",
         format!("m42f{}{}", std::process::id(), tcp),
     );
+    drop(reservations);
     let mut running = Running(
         Command::new(binary)
             .args(["server", "run", "--config"])
@@ -237,10 +229,9 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
             if cli_status(binary, env_key, &endpoint, 1) {
                 break;
             }
-            assert!(
-                running.0.try_wait().unwrap().is_none(),
-                "server exited before IPC"
-            );
+            if let Some(status) = running.0.try_wait().unwrap() {
+                panic!("TUI server exited before management readiness: {status}");
+            }
             sleep(Duration::from_millis(40)).await;
         }
     })
@@ -253,9 +244,11 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
 
     let old_doc = doc.clone();
     let mut moved = doc.clone();
-    moved.server.inbounds[0].h2_listen = format!("127.0.0.1:{}", free_port(true));
-    moved.server.inbounds[0].quic_listen = format!("127.0.0.1:{}", free_port(false));
+    let reservations = reserve_ports();
+    moved.server.inbounds[0].h2_listen = reservations.0.local_addr().unwrap().to_string();
+    moved.server.inbounds[0].quic_listen = reservations.1.local_addr().unwrap().to_string();
     save(&server_file, &moved);
+    drop(reservations);
     assert_restart_check(
         binary,
         env_key,
@@ -320,19 +313,13 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
         ),
     )
     .unwrap();
-    fs::write(
+    private_pem::write_new_key(
         &other_key,
         format!(
             "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
             STANDARD.encode(alien.key_pair.serialize_der())
         ),
-    )
-    .unwrap();
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&other_key, fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    );
     let mut bad_identity = moved;
     bad_identity.server.inbounds[0].tls_cert = format!("file:{}", other_cert.display());
     bad_identity.server.inbounds[0].tls_key = format!("file:{}", other_key.display());
@@ -416,17 +403,17 @@ async fn compiled_client_proxy_conpty_lifecycle() {
     let client_file = base.join("client.toml");
     let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     fs::write(&cert_path, generated.cert.pem()).unwrap();
-    fs::write(
+    private_pem::write_new_key(
         &key_path,
         format!(
             "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
             STANDARD.encode(generated.key_pair.serialize_der())
         ),
-    )
-    .unwrap();
+    );
 
-    let tcp = free_port(true);
-    let udp = free_port(false);
+    let reservations = reserve_ports();
+    let tcp = reservations.0.local_addr().unwrap().port();
+    let udp = reservations.1.local_addr().unwrap().port();
     let server = ServerDocument {
         schema_version: 1,
         server: ServerSettings {
@@ -463,8 +450,11 @@ async fn compiled_client_proxy_conpty_lifecycle() {
         },
     };
     save(&server_file, &server);
+    assert!(theia::server::tls_fingerprint_file(&server_file).is_ok(),
+        "ConPTY fixture must pass protected PEM validation and production TLS builders");
     let binary = env!("CARGO_BIN_EXE_theia");
     let pipe = format!("proxyconpty{}", std::process::id());
+    drop(reservations);
     let mut running = Running(
         Command::new(binary)
             .args(["server", "run", "--config"])
@@ -481,7 +471,9 @@ async fn compiled_client_proxy_conpty_lifecycle() {
             if cli_status(binary, "THEIA_CONTROL_PIPE", &pipe, 1) {
                 break;
             }
-            assert!(running.0.try_wait().unwrap().is_none());
+            if let Some(status) = running.0.try_wait().unwrap() {
+                panic!("ConPTY server exited before management readiness: {status}");
+            }
             sleep(Duration::from_millis(40)).await;
         }
     })
