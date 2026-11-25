@@ -1157,7 +1157,8 @@ impl ProvisionPanel {
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
         let wizard = self.wizard.as_ref()?;
-        if wizard.registration.is_some() || !matches!(wizard.stage, WizardStage::Input) {
+        if let Some(panel)=&wizard.registration{return panel.form();}
+        if !matches!(wizard.stage, WizardStage::Input) {
             return None;
         }
         if let Some(picker) = &wizard.grant_picker {
@@ -1176,8 +1177,8 @@ impl ProvisionPanel {
         let labels = [
             ("ID подключения", "Уникальное имя подключения, создаётся автоматически."),
             ("Порт TCP/UDP", "443 по умолчанию. Можно указать конкретный адрес:порт."),
-            ("Адрес сервера для клиентов", "Публичный домен или IP без порта. Не домен референса."),
-            ("Собственные IP сервера", "Все адреса сервера, включая публичный/NAT, через запятую."),
+            ("Адрес сервера для клиентов", "Адрес вашего сервера, который получат клиенты. Например vpn.example.com. Не адрес стороннего сайта."),
+            ("Собственные IP сервера", "Перечислите все IP этого сервера через запятую, включая публичный адрес и NAT. Это исключает выбор самого себя."),
             ("Домены референсов", "До трёх доменов или домен=IP, через запятую."),
             (if first { "ID первого пользователя" } else { "Пользователи с доступом" },
              if first { "Пользователь отключён до явного выпуска токена." } else { "ID через запятую; F6 открывает список с флажками доступа." }),
@@ -1195,6 +1196,7 @@ impl ProvisionPanel {
 
     pub(crate) fn select_field(&mut self, id: usize) {
         if let Some(wizard) = self.wizard.as_mut() {
+            if let Some(panel)=wizard.registration.as_mut(){panel.select_field(id);return;}
             if let Some(picker) = wizard.grant_picker.as_mut() {
                 if id < picker.selected.len() { picker.focus = id; }
                 return;
@@ -1243,7 +1245,7 @@ impl ProvisionPanel {
         }
         if wizard.grant_picker.is_some() { return Some((1, 5, "Выбор пользователей", "↑↓ пользователь · Пробел отметить · Enter готово · Esc отменить")); }
         Some(match &wizard.stage {
-            WizardStage::Input => (1, 5, "Настройка сервера", "↑↓ поле · F2 расширенные · Enter проверить · Esc назад"),
+            WizardStage::Input => (1, 5, "Настройка сервера", "↑↓ поле · Enter проверить и подобрать · F2 расширенные · Esc назад"),
             WizardStage::DnsConfirm(_) => (2, 5, "Разрешение DNS", "Y разрешить DNS · N / Esc назад"),
             WizardStage::Resolving(_, _) => (2, 5, "Получение адресов", "Esc отменить"),
             WizardStage::ProbeConfirm(_) => (3, 5, "Проверка референсов", "Y проверить перечисленные адреса · N / Esc назад"),

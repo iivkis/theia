@@ -415,15 +415,15 @@ impl StatusPanel {
         }
         let mut items = Vec::new();
         if !self.server && self.client_active {
-            items.push(ActionItem { key: 's', label: "запустить локальный runtime" });
-            items.push(ActionItem { key: 'h', label: "headless Apply" });
+            items.push(ActionItem { key: 's', label: "Запустить подключение" });
+            items.push(ActionItem { key: 'h', label: "Настройки внешнего клиента" });
         }
         items.push(ActionItem { key: 'r', label: "Обновить состояние" });
         if self.server {
             items.extend([
-                ActionItem { key: 't', label: "Начать ротацию identity" },
+                ActionItem { key: 't', label: "Начать замену ключей доверия" },
                 ActionItem { key: 'p', label: "Отозвать старый ключ" },
-                ActionItem { key: 'e', label: "Восстановить descriptor" },
+                ActionItem { key: 'e', label: "Восстановить подписанное описание" },
             ]);
         } else if self.reality {
             items.extend([

@@ -423,6 +423,19 @@ impl Panel {
         false
     }
 
+    pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if self.phase != Phase::Idle || self.unavailable { return Vec::new(); }
+        vec![
+            ActionItem { key:'s', label:"Запустить локальный прокси" },
+            ActionItem { key:'a', label:"Включить системный прокси" },
+            ActionItem { key:'r', label:"Восстановить настройки" },
+            ActionItem { key:'c', label:"Восстановить после сбоя" },
+            ActionItem { key:'x', label:"Остановить" },
+            ActionItem { key:'v', label:"Обновить состояние" },
+        ]
+    }
+
     pub(crate) fn body(&self) -> String {
         let status = if self.unavailable || self.phase == Phase::Busy {
             "Операция не подтверждена / состояние обновляется"
@@ -432,10 +445,10 @@ impl Panel {
         let controls = match self.phase {
             Phase::Busy => "Ожидается результат worker.",
             Phase::Confirm => "y: подтвердить  n/Esc: отменить",
-            Phase::Idle => "s: local start  a: WinINet  r: restore  c: recovery  x: stop  v: status  Esc: назад",
+            Phase::Idle => "s: запустить локальный прокси\na: включить системный прокси\nr: восстановить прежние настройки\nc: восстановление после сбоя\nx: остановить\nv: обновить состояние\nEsc: назад",
         };
         format!(
-            "WinINet: {status}\nLocal: {} | manual: {}\nTransport/OPEN_OK: см. REALITY runtime выше; для own-TLS не проверяются этим экраном\n{}\n{controls}",
+            "Системный прокси (WinINet): {status}\nЛокальный слушатель: {} | ручной режим: {}\nСостояние туннеля проверяется отдельно. Этот экран не подтверждает подключение.\n{}\n{controls}",
             if self.unavailable || self.phase == Phase::Busy {
                 "неизвестно"
             } else if self.view.running {

@@ -14,12 +14,12 @@ use zeroize::Zeroizing;
 
 const LIMIT: usize = 1024;
 const LABELS: [&str; 6] = [
-    "URI или защищённый файл приглашения",
-    "Отдельный admission-файл",
+    "Приглашение (ссылка или файл)",
+    "Файл допуска (admission)",
     "Новый файл профиля",
-    "Новый trust store",
-    "Fingerprint из независимого канала",
-    "Ссылка bearer (если нет в приглашении)",
+    "Хранилище доверия",
+    "Отпечаток сервера (Fingerprint)",
+    "Ссылка на токен (если его нет в приглашении)",
 ];
 
 struct Input {
@@ -398,6 +398,9 @@ impl EnrollmentPanel {
         }
         match key.code {
             KeyCode::Esc => return true,
+            KeyCode::F(8) => {
+                self.focus = if self.focus < 4 {4} else {0};
+            }
             KeyCode::Tab | KeyCode::Down => {
                 self.focus = (self.focus + 1) % LABELS.len();
                 if self.managed_paths() && self.focus == 2 {
@@ -415,6 +418,10 @@ impl EnrollmentPanel {
             }
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
                 self.fields[self.focus] = Zeroizing::new(String::new());
+            }
+            KeyCode::Enter if self.managed_paths() && self.focus < 4 && !self.fields[0].is_empty() && !self.fields[1].is_empty() && self.fields[4].is_empty() => {
+                self.focus=4;
+                self.error=None;
             }
             KeyCode::Enter => match self.input() {
                 Ok(input) => {
@@ -486,45 +493,50 @@ impl EnrollmentPanel {
 
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
-        if self.registration.is_some() || !matches!(self.stage, Stage::Input) {
+        if let Some(panel)=&self.registration {return panel.form();}
+        if !matches!(self.stage, Stage::Input) {
             return None;
         }
         let hints = [
             "Вставьте theia:// приглашение или абсолютный путь к защищённому URI-файлу.",
-            "Отдельно полученный admission-файл от администратора сервера.",
+            "Попросите администратора прислать файл допуска отдельно от ссылки. Укажите путь к этому файлу.",
             "Абсолютный путь нового файла профиля.",
             "Абсолютный путь нового хранилища доверия.",
-            "Сверьте 64 hex-символа по независимому доверенному каналу.",
+            "Сверьте отпечаток (64 шестнадцатеричных символа) с администратором по другому доверенному каналу.",
             "Только env:/file: ссылка, если в приглашении нет токена.",
         ];
         Some(Form {
-            fields: LABELS.iter().enumerate().filter(|(id, _)| !self.managed_paths() || !matches!(*id, 2 | 3)).map(|(id, label)| Field {
+            fields: LABELS.iter().enumerate().filter(|(id, _)| !self.managed_paths() || (if self.focus<4 {*id<2} else {*id>=4})).map(|(id, label)| Field {
                 id, label, hint: hints[id],
                 value: if self.fields[id].is_empty() { String::new() } else { format!("Скрыто · {} байт", self.fields[id].len()) },
             }).collect(),
             selected: self.focus,
-            lead: "Подтвердите источник доверия. Секретные значения скрыты.".into(),
+            lead: if self.managed_paths() && self.focus<4 {"1. Получите приглашение и отдельный файл допуска у администратора. Далее — проверка отпечатка (F8 или Tab).".into()} else {"Отпечаток сверяется независимо от приглашения. Ссылка на токен нужна только при его отсутствии в приглашении. Значения скрыты.".into()},
             error: self.error.clone().unwrap_or_default(),
         })
     }
 
     pub(crate) fn select_field(&mut self, id: usize) {
-        if self.registration.is_none() && matches!(self.stage, Stage::Input)
+        if let Some(panel)=self.registration.as_mut(){panel.select_field(id);return;}
+        if matches!(self.stage, Stage::Input)
             && id < LABELS.len() && (!self.managed_paths() || !matches!(id, 2 | 3)) {
             self.focus = id;
         }
     }
 
     pub(crate) fn guide(&self) -> (usize, usize, &'static str, &'static str) {
+        let total=if self.managed_paths(){4}else{3};
         if self.registration.is_some() {
-            return (3, 3, "Регистрация в TOML", "Enter предпросмотр · Y сохранить · Esc назад");
+            return (total,total,"Регистрация в TOML","Enter предпросмотр · Y сохранить · Esc назад");
         }
         match &self.stage {
-            Stage::Input => (1, 3, "Приглашение и доверие", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад"),
-            Stage::Loading(_) => (2, 3, "Проверка приглашения", "Идёт локальная проверка"),
-            Stage::Confirm(_) => (2, 3, "Подтверждение доверия", "Y сохранить · N / Esc назад"),
-            Stage::Applying(_) | Stage::Creating(_) => (3, 3, "Сохранение", "Идёт запись; подключения нет"),
-            Stage::Done(_) => (3, 3, "Результат", "G зарегистрировать, если доступно · Esc назад"),
+            Stage::Input if self.managed_paths() && self.focus<4 => (1,4,"Приглашение и файл допуска","↑↓ поле · F8 далее · Enter продолжить · Ctrl+U очистить · Esc назад"),
+            Stage::Input if self.managed_paths() => (2,4,"Проверка доверия и токена","↑↓ поле · F8 назад · Enter проверить · Ctrl+U очистить · Esc отменить"),
+            Stage::Input => (1,3,"Приглашение и доверие","↑↓ поле · F8 раздел · Enter проверить · Ctrl+U очистить · Esc назад"),
+            Stage::Loading(_) => (total-1,total,"Проверка приглашения","Идёт локальная проверка"),
+            Stage::Confirm(_) => (total-1,total,"Подтверждение доверия","Y сохранить · N / Esc назад"),
+            Stage::Applying(_) | Stage::Creating(_) => (total,total,"Сохранение","Идёт запись; подключения нет"),
+            Stage::Done(_) => (total,total,"Результат","G зарегистрировать, если доступно · Esc назад"),
         }
     }
 
