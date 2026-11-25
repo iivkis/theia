@@ -2051,7 +2051,6 @@ mod tests {
         assert_eq!(menu.key(KeyCode::Enter), Some(key('Q')));
     }
 
-
     #[test]
     fn compact_menu_preserves_selection_and_configuration_guards() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -2065,9 +2064,16 @@ mod tests {
                     menu.click(area, 2, 1 + group as u16);
                     assert_eq!(menu.group, group);
                     assert!(menu.item.is_none());
-                    let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+                    let mut terminal =
+                        Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
                     terminal.draw(|frame| menu.render(frame, area)).unwrap();
-                    let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+                    let rendered = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
                     assert!(rendered.contains(menu.groups()[group].title));
                     assert_eq!(menu.key(KeyCode::Enter), None);
                     assert_eq!(menu.item, Some(0));
@@ -2081,7 +2087,13 @@ mod tests {
                         assert_eq!(menu.notice.is_some(), !allowed);
                         if !allowed {
                             terminal.draw(|frame| menu.render(frame, area)).unwrap();
-                            let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+                            let rendered = terminal
+                                .backend()
+                                .buffer()
+                                .content()
+                                .iter()
+                                .map(|cell| cell.symbol())
+                                .collect::<String>();
                             assert!(rendered.contains("Сначала откройте конфигурацию"));
                         }
                     }

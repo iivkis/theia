@@ -6227,7 +6227,6 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-
     fn click_at(column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -6249,14 +6248,21 @@ mod tests {
 
     #[test]
     fn workspace_navigation_mouse_and_keyboard_never_commit_or_start() {
-        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("workspace-nav").unwrap());
+        let root =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("workspace-nav").unwrap());
         std::fs::create_dir(&root).unwrap();
         for role in [Role::Server, Role::Client] {
-            let path = root.join(if role == Role::Server { "server.toml" } else { "client.toml" });
+            let path = root.join(if role == Role::Server {
+                "server.toml"
+            } else {
+                "client.toml"
+            });
             let original = if role == Role::Server {
                 server_issuance_fixture()
             } else {
-                let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else {
+                let Config::Client(mut doc) =
+                    config::parse(include_str!("../../../examples/client.toml")).unwrap()
+                else {
                     panic!("client fixture");
                 };
                 let mut backup = doc.client.profiles[0].clone();
@@ -6274,13 +6280,23 @@ mod tests {
                 let nav = columns.map_or(body, |c| c[0]);
                 for page in 0..pages(role).len() {
                     ui.workspace_focus = WorkspaceFocus::Navigation;
-                    ui.mouse(&mut model, click_at(nav.x + 2, nav.y + 1 + page as u16), area);
+                    ui.mouse(
+                        &mut model,
+                        click_at(nav.x + 2, nav.y + 1 + page as u16),
+                        area,
+                    );
                     assert_eq!(ui.workspace_page, page);
                     assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
                     let navigation = rendered_interaction(area.width, area.height, &model, &ui);
                     assert!(navigation.contains(pages(role)[page]));
                     ui.update(&mut model, press(KeyCode::Enter));
-                    let expected_focus = if page == 1 { WorkspaceFocus::Fields } else if role == Role::Server && matches!(page, 2 | 3) { WorkspaceFocus::Users } else { WorkspaceFocus::Actions };
+                    let expected_focus = if page == 1 {
+                        WorkspaceFocus::Fields
+                    } else if role == Role::Server && matches!(page, 2 | 3) {
+                        WorkspaceFocus::Users
+                    } else {
+                        WorkspaceFocus::Actions
+                    };
                     assert_eq!(ui.workspace_focus, expected_focus);
                     let view = rendered_interaction(area.width, area.height, &model, &ui);
                     assert!(!view.contains("THEIA_AUTH_TOKEN"));
@@ -6290,7 +6306,16 @@ mod tests {
                     if page == 1 {
                         let content = layout.map_or(details, |p| p[0]);
                         let table = editor_layout(content).unwrap()[1];
-                        let y = (table.y..table.bottom()).find(|&y| editor_field_hit(content, ui.editor.as_ref().unwrap(), table.x + 2, y) == Some(1)).unwrap();
+                        let y = (table.y..table.bottom())
+                            .find(|&y| {
+                                editor_field_hit(
+                                    content,
+                                    ui.editor.as_ref().unwrap(),
+                                    table.x + 2,
+                                    y,
+                                ) == Some(1)
+                            })
+                            .unwrap();
                         ui.mouse(&mut model, click_at(table.x + 2, y), area);
                         assert_eq!(ui.editor.as_ref().unwrap().workspace_field_index(), 1);
                         assert!(!ui.editor.as_ref().unwrap().editing);
@@ -6308,8 +6333,12 @@ mod tests {
                     }
                     if let Some([_, controls]) = layout {
                         let items = page_actions(role, page, ui.editor.as_ref());
-                        let actions = Actions { items: &items, selected: ui.visible_workspace_action(role) };
-                        let found = (controls.y..controls.bottom()).find_map(|y| actions.hit(controls, controls.x + 2, y).map(|i| (y, i)));
+                        let actions = Actions {
+                            items: &items,
+                            selected: ui.visible_workspace_action(role),
+                        };
+                        let found = (controls.y..controls.bottom())
+                            .find_map(|y| actions.hit(controls, controls.x + 2, y).map(|i| (y, i)));
                         if let Some((y, i)) = found {
                             ui.mouse(&mut model, click_at(controls.x + 2, y), area);
                             assert_eq!(ui.workspace_action, i);
@@ -6368,7 +6397,8 @@ mod tests {
 
     #[test]
     fn modal_mouse_and_safe_preview_select_fields_without_side_effects() {
-        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("modal-mouse").unwrap());
+        let root =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("modal-mouse").unwrap());
         std::fs::create_dir(&root).unwrap();
         let path = root.join("server.toml");
         let original = server_issuance_fixture();
@@ -6386,7 +6416,8 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.records.is_none());
 
-        ui.reality_registration = Some(RegistrationPanel::new(ui.editor.as_ref().unwrap()).unwrap());
+        ui.reality_registration =
+            Some(RegistrationPanel::new(ui.editor.as_ref().unwrap()).unwrap());
         click_form_field(&mut ui, &mut model, area, 1);
         ui.paste_record_field("test-material");
         ui.update(&mut model, press(KeyCode::F(7)));
@@ -6405,7 +6436,9 @@ mod tests {
         ui.issuance = Some(IssueFlow::Input(String::new()));
         let form = user_picker(ui.editor.as_ref(), "", false).unwrap();
         let target = guided_form_area(shell_layout(area)[1], form.fields.len());
-        let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y) == Some(0)).unwrap();
+        let y = (target.y..target.bottom())
+            .find(|&y| form.hit(target, target.x + 2, y) == Some(0))
+            .unwrap();
         ui.mouse(&mut model, click_at(target.x + 2, y), area);
         assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-a"));
         ui.update(&mut model, press(KeyCode::Esc));
@@ -6437,24 +6470,28 @@ mod tests {
         assert!(ui.import_browser.is_some());
         let form = ui.active_form().unwrap();
         let target = guided_form_area(shell_layout(area)[1], form.fields.len());
-        let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y).is_some()).unwrap();
+        let y = (target.y..target.bottom())
+            .find(|&y| form.hit(target, target.x + 2, y).is_some())
+            .unwrap();
         ui.mouse(&mut model, click_at(target.x + 2, y), area);
         assert!(ui.import_browser.is_some());
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.import_browser.is_none());
-        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "not-an-invitation"));
+        assert!(
+            matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "not-an-invitation")
+        );
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(!ui.owned_running(Role::Client));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         std::fs::remove_dir_all(root).unwrap();
     }
 
-
     #[test]
     fn server_workspace_action_selection_and_diagnostics_require_separate_consent() {
         use crate::camouflage_interfaces::{InterfaceSource, NativeInterfaces, ObservedInterface};
         use crate::camouflage_workflow::{build_preview, PreviewScope};
-        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("server-controls").unwrap());
+        let root =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("server-controls").unwrap());
         std::fs::create_dir(&root).unwrap();
         let path = root.join("server.toml");
         let original = server_issuance_fixture().replace("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"device-a\", \"device-b\"]").replace("[server.policy]", &format!("[[server.users]]\nid = \"device-b\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]", "11".repeat(32)));
@@ -6474,9 +6511,15 @@ mod tests {
             ui.workspace_action = items.iter().position(|item| item.key == command).unwrap();
             ui.update(&mut model, press(KeyCode::Enter));
             match command {
-                'x' => assert!(matches!(&ui.revocation, Some(DisableFlow::Input(id)) if id == "device-b")),
-                't' => assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-b")),
-                'U' => assert!(matches!(&ui.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) if fields.first().is_some_and(|id| id == "device-b"))),
+                'x' => assert!(
+                    matches!(&ui.revocation, Some(DisableFlow::Input(id)) if id == "device-b")
+                ),
+                't' => {
+                    assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-b"))
+                }
+                'U' => assert!(
+                    matches!(&ui.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) if fields.first().is_some_and(|id| id == "device-b"))
+                ),
                 _ => unreachable!(),
             }
             ui.update(&mut model, press(KeyCode::Esc));
@@ -6499,8 +6542,19 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(!ui.show_server_process);
 
-        let native = NativeInterfaces { interfaces: vec![ObservedInterface { interface_name: "test".into(), address: "93.184.216.10".parse().unwrap(), prefix_len: 29, is_up: true, source: InterfaceSource::LinuxGetifaddrs }] };
-        ui.candidate_batch = Some(CandidateBatchPanel::new(build_preview(&native, None, PreviewScope::PassiveOnly), Some("edge.example.org".into())));
+        let native = NativeInterfaces {
+            interfaces: vec![ObservedInterface {
+                interface_name: "test".into(),
+                address: "93.184.216.10".parse().unwrap(),
+                prefix_len: 29,
+                is_up: true,
+                source: InterfaceSource::LinuxGetifaddrs,
+            }],
+        };
+        ui.candidate_batch = Some(CandidateBatchPanel::new(
+            build_preview(&native, None, PreviewScope::PassiveOnly),
+            Some("edge.example.org".into()),
+        ));
         click_form_field(&mut ui, &mut model, area, 0);
         assert_eq!(ui.candidate_batch.as_ref().unwrap().selected_count(), 0);
         assert!(!ui.candidate_batch.as_ref().unwrap().is_running());
@@ -6515,7 +6569,11 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.candidate_batch.is_none());
 
-        ui.domain = Some(DomainPanel::new(build_preview(&native, None, PreviewScope::PassiveOnly)));
+        ui.domain = Some(DomainPanel::new(build_preview(
+            &native,
+            None,
+            PreviewScope::PassiveOnly,
+        )));
         click_form_field(&mut ui, &mut model, area, 1);
         assert_eq!(ui.domain.as_ref().unwrap().domain(), Some("samsung.com"));
         assert_eq!(ui.domain.as_ref().unwrap().selected_count(), 0);
@@ -6549,25 +6607,36 @@ mod tests {
         let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
         let (tx, rx) = mpsc::channel();
-        ui.qr_scan = Some(QrScan { source: Zeroizing::new("local.png".into()), done: rx, cancelled: false });
+        ui.qr_scan = Some(QrScan {
+            source: Zeroizing::new("local.png".into()),
+            done: rx,
+            cancelled: false,
+        });
         assert!(rendered_interaction(120, 40, &model, &ui).contains("Локальное декодирование"));
         ui.poll_navigation(&mut model);
         assert!(ui.qr_scan.is_some());
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(rendered_interaction(120, 40, &model, &ui).contains("Импорт отменён"));
-        tx.send(Ok(Zeroizing::new("discarded-private-value".into()))).unwrap();
+        tx.send(Ok(Zeroizing::new("discarded-private-value".into())))
+            .unwrap();
         ui.poll_navigation(&mut model);
         assert!(ui.qr_scan.is_none() && ui.importing.is_none());
         for disconnected in [false, true] {
             let (tx, rx) = mpsc::channel();
-            ui.qr_scan = Some(QrScan { source: Zeroizing::new("local.png".into()), done: rx, cancelled: false });
+            ui.qr_scan = Some(QrScan {
+                source: Zeroizing::new("local.png".into()),
+                done: rx,
+                cancelled: false,
+            });
             if !disconnected {
                 tx.send(Err("QR image rejected")).unwrap();
             }
             drop(tx);
             ui.poll_navigation(&mut model);
             assert!(ui.qr_scan.is_none());
-            assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "local.png"));
+            assert!(
+                matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "local.png")
+            );
             assert!(ui.editor.as_ref().unwrap().error.is_some());
             ui.update(&mut model, press(KeyCode::Esc));
         }
