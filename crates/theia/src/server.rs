@@ -2637,6 +2637,7 @@ fn commit_same_port_reality(
     request: &crate::runtime_generation::RestartRequest,
     loaded: &[crate::reload_preflight::IdentityHash],
     path: &Path,
+    root_history: &mut crate::reality_root_history::RootHistory,
 ) -> Result<(Vec<crate::reload_preflight::IdentityHash>, u64), ()> {
     use crate::restart_guard::{self, RestartVerdict};
     let previous = request.previous.document.as_ref();
@@ -2694,6 +2695,7 @@ fn commit_same_port_reality(
     if request.complete.is_closed() {
         return Err(());
     }
+    root_history.advance(candidate)?;
     let revision = hot.carrier.commit_replacement(prepared, |publish| {
         runtime
             .commit_reality_replacement(
@@ -2710,6 +2712,7 @@ fn commit_same_port_reality(
             .map_err(|_| ())
     })?;
     hot.used_roots.insert(binding.identity_sha256);
+    root_history.committed();
     Ok((identities, revision))
 }
 
@@ -2946,8 +2949,12 @@ async fn run_supervised_file(
         "initial_generation_preflight_begin",
         "inbounds" = Value::Count(document.server.inbounds.len() as u64)
     );
+    let mut root_history = crate::reality_root_history::RootHistory::open(config_path, &document)
+        .map_err(|_| ServerError::Config)?;
     let limits = GenerationLimits::new(&document);
     let initial = prepare_generation(&document, 1, &limits, None).await?;
+    root_history.advance(&document).map_err(|_| ServerError::Config)?;
+    root_history.committed();
     crate::diag!(
         Info,
         "server.supervisor",
@@ -2996,10 +3003,8 @@ async fn run_supervised_file(
     let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
     let mut rollback: Option<RollbackSlot> = None;
     let mut structural_rollback: Option<StructuralRollbackSlot> = None;
-    // Independent replacement is irreversible within this supervisor,
-    // even after removal/re-addition or a subsequent fresh-port cutover.
-    let mut replaced_roots = std::collections::HashSet::<[u8; 32]>::new();
-    const MAX_REPLACED_ROOTS: usize = 4096;
+    // Root history is retained for the entire supervisor and persisted before
+    // publishing any structural generation or independent root replacement.
     loop {
         tokio::select! {
             request = queue.recv() => {
@@ -3044,18 +3049,7 @@ async fn run_supervised_file(
                     request.candidate=previous.as_ref().clone();
                     request.material=Some(material);
                 }
-                if request.candidate.server.inbounds.iter().any(|i|i.reality.as_ref().is_some_and(|b|replaced_roots.contains(&b.identity_sha256))){
-                    let _=request.complete.send(Err(()));continue;
-                }
-                let replacing:Vec<_>=request.previous.document.server.inbounds.iter().filter_map(|old|{
-                    let root=old.reality.as_ref()?;
-                    request.candidate.server.inbounds.iter().any(|new|
-                        new.id==old.id && new.server_name==old.server_name &&
-                        new.h2_listen.parse::<SocketAddr>().ok().map(|v|v.port())==old.h2_listen.parse::<SocketAddr>().ok().map(|v|v.port()) &&
-                        new.reality.as_ref().map(|v|v.identity_sha256)!=Some(root.identity_sha256))
-                        .then_some(root.identity_sha256)
-                }).collect();
-                if replaced_roots.len().saturating_add(replacing.len())>MAX_REPLACED_ROOTS{
+                if root_history.check(&request.candidate).is_err() {
                     let _=request.complete.send(Err(()));continue;
                 }
                 if request.kind == crate::runtime_generation::ChangeKind::Rollback {
@@ -3089,19 +3083,21 @@ async fn run_supervised_file(
                     continue;
                 }
                 if crate::restart_guard::same_port_reality_only(request.previous.document.as_ref(),&request.candidate).is_some(){
-                    let result=commit_same_port_reality(&runtime,&mut running,&request,&identities,config_path);
+                    let result=commit_same_port_reality(&runtime,&mut running,&request,&identities,config_path,&mut root_history);
                     match result{
                         Ok((next,revision))=>{
                             identities=next;
-                            replaced_roots.extend(replacing.iter().copied());
-                            // Independent enrollment is not reversible TLS
+                             // Independent enrollment is not reversible TLS
                             // rotation; never resurrect the replaced root.
                             rollback=None;structural_rollback=None;
                             runtime.set_rollback_until(None);
                             runtime.set_restart_rollback(None);
                             let _=request.complete.send(Ok(revision));
                         }
-                        Err(())=>{let _=request.complete.send(Err(()));}
+                        Err(())=>{
+                            if root_history.pending() { return Err(ServerError::Io); }
+                            let _=request.complete.send(Err(()));
+                        }
                     }
                     continue;
                 }
@@ -3137,14 +3133,23 @@ async fn run_supervised_file(
                         let staged=stage_partial_generation(&request,&identities,&limits,config_path,&plan).await;
                         let Ok((prepared,next_view,auth))=staged else{let _=request.complete.send(Err(()));continue;};
                         if request.complete.is_closed(){continue;}
+                        if root_history.advance(&request.candidate).is_err() {
+                            if root_history.pending() { return Err(ServerError::Io); }
+                            let _=request.complete.send(Err(()));continue;
+                        }
+                        let root_changed=root_history.pending();
                         let revision=runtime.commit_partial_layout(&request.previous,request.expected_revision,next_view,auth,&plan.removed,prepared.reality);
-                        let Ok(revision)=revision else{let _=request.complete.send(Err(()));continue;};
+                        let Ok(revision)=revision else{
+                            if root_history.pending() { return Err(ServerError::Io); }
+                            let _=request.complete.send(Err(()));continue;
+                        };
+                        root_history.committed();
                         running.remove_inbounds(&plan.removed);
                         running.append(prepared.listeners,GenerationPhase::Active);
                         running.order_plain(&request.candidate);
                         rollback=None;
                         runtime.set_rollback_until(None);
-                        if structural{
+                        if structural || root_changed{
                             structural_rollback=None;runtime.set_restart_rollback(None);
                         }else{
                             let now=Instant::now();
@@ -3174,14 +3179,21 @@ async fn run_supervised_file(
                 if request.complete.is_closed() {
                     continue;
                 }
+                if root_history.advance(&request.candidate).is_err() {
+                    if root_history.pending() { return Err(ServerError::Io); }
+                    let _=request.complete.send(Err(()));continue;
+                }
+                let root_changed=root_history.pending();
                 if runtime.commit_restart_with_reality(
                     &request.previous,
                     request.expected_revision,
                     next_view,next_reality,
                 ).is_err() {
+                    if root_history.pending() { return Err(ServerError::Io); }
                     let _ = request.complete.send(Err(()));
                     continue;
                 }
+                root_history.committed();
                 next_running.start();
                 let previous=std::mem::replace(&mut running,next_running);
                 // No key or health rollback: previous own-TLS PEM digest
@@ -3190,9 +3202,7 @@ async fn run_supervised_file(
                 // An independent root replacement on the same logical endpoint
                 // is not a reversible listener operation. Never offer its old root
                 // as a structural rollback target.
-                let replaced_root=!replacing.is_empty();
-                replaced_roots.extend(replacing);
-                if structural || replaced_root{
+                if structural || root_changed{
                     structural_rollback=None;
                     runtime.set_restart_rollback(None);
                 }else{
