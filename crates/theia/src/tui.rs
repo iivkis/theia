@@ -3549,6 +3549,55 @@ mod tests {
     }
 
     #[test]
+    fn welcome_and_parameter_mouse_hits_change_focus_without_writes() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("mouse-focus").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let area = Rect::new(0, 0, 120, 40);
+        let body = shell_layout(area)[1];
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(None);
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column, row, modifiers: KeyModifiers::NONE,
+        };
+        let target = centered_column(body, 88);
+        let form = welcome_form(Role::Client, 0);
+        let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y) == Some(1)).unwrap();
+        ui.mouse(&mut model, click(target.x + 2, y), area);
+        assert_eq!(ui.welcome_choice, 1);
+        assert!(ui.config_dialog.is_none());
+        ui.update(&mut model, press(KeyCode::Enter));
+        let path = root.join("first.toml");
+        let dialog = ui.config_dialog.as_mut().unwrap();
+        dialog.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        dialog.paste(path.to_str().unwrap());
+        assert_eq!(dialog.form().unwrap().selected, 1);
+        ui.update(&mut model, press(KeyCode::Enter));
+        let dialog = ui.config_dialog.as_ref().unwrap();
+        let form = dialog.form().unwrap();
+        let target = guided_form_area(body);
+        let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y) == Some(4)).unwrap();
+        ui.mouse(&mut model, click(target.x + 2, y), area);
+        assert_eq!(ui.config_dialog.as_ref().unwrap().form().unwrap().selected, 4);
+        assert!(!path.exists());
+        assert!(!ui.server_process.running());
+
+        let path = root.join("existing.toml");
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let details = workspace_columns(body).unwrap()[2];
+        let table = editor_layout(details).unwrap()[1];
+        let y = (table.y..table.bottom()).find(|&y| editor_field_hit(details, ui.editor.as_ref().unwrap(), table.x + 2, y) == Some(1)).unwrap();
+        ui.mouse(&mut model, click(table.x + 2, y), area);
+        let editor = ui.editor.as_ref().unwrap();
+        assert_eq!(editor.workspace_field_index(), 1);
+        assert!(!editor.editing && !editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn first_run_modes_are_visible_and_reality_wizard_has_progress() {
         let root = std::env::temp_dir().join(crate::tui_editor::generated_id("first-run-ui").unwrap());
         std::fs::create_dir(&root).unwrap();
