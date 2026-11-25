@@ -177,9 +177,15 @@ mod platform {
 
     fn changed() {
         // Saturation disables caching instead of reusing an old generation.
-        let _ = EPOCH.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            Some(n.saturating_add(1))
-        });
+        let mut current = EPOCH.load(Ordering::Acquire);
+        while let Err(actual) = EPOCH.compare_exchange_weak(
+            current,
+            current.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            current = actual;
+        }
     }
 
     unsafe extern "system" fn route(
