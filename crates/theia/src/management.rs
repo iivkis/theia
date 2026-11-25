@@ -89,6 +89,9 @@ pub enum StatusCommand {
     CheckTlsRollback,
     CheckAuthRollback,
     ApplyAuthRollback { expected_revision:u64 },
+    CheckRestartRollback,
+    ApplyRestartRollback{expected_revision:u64},
+    CheckRestartBound{expected_revision:u64,candidate_sha256:[u8;32]},
     RealityStatus { id:[u8;64], len:u8, manifest:[u8;32] },
     /// Explicit one-shot CAS on the protected native management endpoint.
     ApplyTlsRollback {
@@ -158,6 +161,9 @@ pub enum StatusReply {
     },
     AuthRollbackReady { revision:u64, remaining_seconds:u64 },
     AuthRollbackApplied { revision:u64 },
+    RestartRollbackReady{revision:u64,remaining_seconds:u64},
+    RestartRollbackApplied{revision:u64},
+    RestartPreview{same_port:bool,material_sha256:[u8;32]},
     RealityRunning { generation:u64, revision:u64, health_revision:u64, active_reference:u8, overlap:bool },
     RealitySuspended,
     Applied {
@@ -491,6 +497,46 @@ where
                     "ERR unsupported\n".to_owned()
                 }
             }
+            candidate if parse_restart_preview(candidate).is_some()=>{
+                if let (Some(runtime),Some(previous),Some(preflight))=(&runtime,&observed,&preflight){
+                    let (expected,digest)=parse_restart_preview(candidate).expect("parsed");
+                    let preflight=preflight.clone();
+                    let result=tokio::task::spawn_blocking(move||preflight.preview_restart_bound(digest)).await;
+                    match result{
+                        Ok(Ok((same_port,material))) if runtime.still_current(previous,expected)=>{
+                            let hex=material.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                            let mode=if same_port{"same-port"}else{"fresh"};
+                            format!("theia-restart-preview-v1 {mode} sha256={hex}\n")
+                        }
+                        _=>"theia-restart-preview-v1 rejected\n".into(),
+                    }
+                }else{"ERR unsupported\n".into()}
+            }
+            b"restart-rollback-check"=>{
+                match runtime.as_ref().and_then(|r|r.restart_rollback_status()){
+                    Some((revision,seconds))=>format!("theia-restart-rollback-v1 ready revision={revision} seconds={seconds}\n"),
+                    None=>"theia-restart-rollback-v1 unavailable\n".into(),
+                }
+            }
+            candidate if parse_restart_rollback(candidate).is_some()=>{
+                if let (Some(runtime),Some(previous),Some(restarts))=(&runtime,&observed,&restarts){
+                    let expected=parse_restart_rollback(candidate).expect("parsed");
+                    if runtime.still_current(previous,expected)&&runtime.restart_rollback_status().map(|(r,_)|r)==Some(expected){
+                        let (complete,response)=oneshot::channel();
+                        let request=crate::runtime_generation::RestartRequest{
+                            kind:crate::runtime_generation::ChangeKind::StructuralRollback,
+                            previous:previous.clone(),expected_revision:expected,
+                            candidate:previous.document.as_ref().clone(),material:None,complete,
+                        };
+                        if restarts.try_send(request).is_ok(){
+                            match response.await{
+                                Ok(Ok(revision))=>format!("theia-restart-rollback-v1 applied revision={revision}\n"),
+                                _=>"theia-restart-rollback-v1 rejected\n".into(),
+                            }
+                        }else{"theia-restart-rollback-v1 rejected\n".into()}
+                    }else{"theia-restart-rollback-v1 rejected\n".into()}
+                }else{"ERR unsupported\n".into()}
+            }
             candidate if parse_reality_status(candidate).is_some()=>{
                 let (id,manifest)=parse_reality_status(candidate).expect("parsed");
                 match runtime.as_ref().and_then(|state|state.reality_status(id,manifest)){
@@ -744,6 +790,14 @@ fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_restart_preview(command:&[u8])->Option<(u64,[u8;32])>{
+    parse_bound_command(command,b"restart-preview rev=")
+}
+#[cfg(any(target_os="linux",target_os="windows"))]
+fn parse_restart_rollback(command:&[u8])->Option<u64>{
+    positive_decimal(std::str::from_utf8(command.strip_prefix(b"restart-rollback-apply rev=")?).ok()?)
+}
+#[cfg(any(target_os="linux",target_os="windows"))]
 fn parse_reality_status(command:&[u8])->Option<(&str,[u8;32])>{
     let raw=std::str::from_utf8(command.strip_prefix(b"reality-status id=")?).ok()?;
     let (id,digest)=raw.split_once(" manifest=")?;
@@ -788,6 +842,16 @@ where
         StatusCommand::Reload => b"reload\n".to_vec(),
         StatusCommand::CheckReload => b"check-reload\n".to_vec(),
         StatusCommand::CheckRestart => b"check-restart\n".to_vec(),
+        StatusCommand::CheckRestartBound{expected_revision,candidate_sha256}=>{
+            if expected_revision==0{return Err(ManagementError::InvalidReply);}
+            let digest=candidate_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
+            format!("restart-preview rev={expected_revision} sha256={digest}\n").into_bytes()
+        }
+        StatusCommand::CheckRestartRollback=>b"restart-rollback-check\n".to_vec(),
+        StatusCommand::ApplyRestartRollback{expected_revision}=>{
+            if expected_revision==0{return Err(ManagementError::InvalidReply);}
+            format!("restart-rollback-apply rev={expected_revision}\n").into_bytes()
+        }
         StatusCommand::RealityStatus{id,len,manifest}=>{
             let raw=id.get(..usize::from(len)).ok_or(ManagementError::InvalidReply)?;
             let name=std::str::from_utf8(raw).map_err(|_|ManagementError::InvalidReply)?;
@@ -878,6 +942,35 @@ where
     }
     if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
         return Ok(StatusReply::Unsupported);
+    }
+    if matches!(command,StatusCommand::CheckRestartBound{..}){
+        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
+        if let Some((mode,digest))=text.strip_prefix("theia-restart-preview-v1 ").and_then(|s|s.strip_suffix('\n'))
+            .and_then(|s|s.split_once(" sha256=")){
+            let same_port=match mode{"same-port"=>true,"fresh"=>false,_=>return Err(ManagementError::InvalidReply)};
+            return Ok(StatusReply::RestartPreview{same_port,material_sha256:decode_digest(digest).ok_or(ManagementError::InvalidReply)?});
+        }
+        return match text{"theia-restart-preview-v1 rejected\n"=>Err(ManagementError::CandidateRejected),
+            "ERR unsupported\n"=>Err(ManagementError::Unsupported),_=>Err(ManagementError::InvalidReply)};
+    }
+    if command==StatusCommand::CheckRestartRollback{
+        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
+        if let Some((revision,seconds))=text.strip_prefix("theia-restart-rollback-v1 ready revision=")
+            .and_then(|s|s.strip_suffix('\n')).and_then(|s|s.split_once(" seconds=")){
+            if let (Some(revision),Some(remaining_seconds))=(positive_decimal(revision),positive_decimal(seconds)){
+                if remaining_seconds<=300{return Ok(StatusReply::RestartRollbackReady{revision,remaining_seconds});}
+            }
+        }
+        return match text{"theia-restart-rollback-v1 unavailable\n"=>Err(ManagementError::CandidateRejected),
+            "ERR unsupported\n"=>Err(ManagementError::Unsupported),_=>Err(ManagementError::InvalidReply)};
+    }
+    if let StatusCommand::ApplyRestartRollback{expected_revision}=command{
+        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
+        let applied=text.strip_prefix("theia-restart-rollback-v1 applied revision=").and_then(|s|s.strip_suffix('\n')).and_then(positive_decimal);
+        return match applied{
+            Some(revision) if Some(revision)==expected_revision.checked_add(1)=>Ok(StatusReply::RestartRollbackApplied{revision}),
+            _ if text=="theia-restart-rollback-v1 rejected\n"=>Err(ManagementError::CandidateRejected),
+            _ if text=="ERR unsupported\n"=>Err(ManagementError::Unsupported),_=>Err(ManagementError::InvalidReply)};
     }
     if matches!(command,StatusCommand::RealityStatus{..}){
         let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
@@ -1101,6 +1194,9 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
         StatusCommand::Reload => "reload_rejected",
         StatusCommand::CheckReload => "check_reload",
         StatusCommand::CheckRestart => "check_restart",
+        StatusCommand::CheckRestartBound{..}=>"restart_preview",
+        StatusCommand::CheckRestartRollback=>"restart_rollback_check",
+        StatusCommand::ApplyRestartRollback{..}=>"restart_rollback_apply",
         StatusCommand::RealityStatus{..}=>"reality_status",
         StatusCommand::CheckAuthRollback=>"check_auth_rollback",
         StatusCommand::ApplyAuthRollback{..}=>"apply_auth_rollback",

@@ -177,6 +177,21 @@ impl ReloadPreflight {
         self.validate_candidate(candidate)
     }
 
+    pub(crate) fn preview_restart_bound(&self,digest:[u8;32])->Result<(bool,[u8;32]),crate::restart_guard::RestartError>{
+        use crate::restart_guard::{RestartError,RestartVerdict};
+        let _probe=self.restart_probe_lock.try_lock().map_err(|_|RestartError::ProbeBusy)?;
+        let candidate=self.load_restart_candidate_bound(digest)?;
+        if !crate::restart_guard::same_shared_limits(&self.active,&candidate){return Err(RestartError::InvalidConfig);}
+        let material=crate::server::CapturedTls::capture(&candidate).map_err(|_|RestartError::InvalidTlsIdentity)?;
+        let verdict=crate::restart_guard::probe_captured(&self.active,&self.identities,&candidate,&material)?;
+        let same_port=match verdict{
+            RestartVerdict::SamePortTlsReady=>true,
+            RestartVerdict::FreshPortsBindable=>false,
+            _=>return Err(RestartError::InvalidConfig),
+        };
+        Ok((same_port,material.fingerprint()))
+    }
+
     /// Content-bound restart candidate, read ONCE by a cancel-safe worker.
     /// Unlike auth-only Apply this deliberately allows changed listeners/TLS,
     /// but still never commits or opens a production socket on the worker.

@@ -112,6 +112,18 @@ async fn main() {
                 Err(error)=>Err(CliError::Management(error)),
             }
         }
+        Ok(Command::ServerRestartRollbackCheck)=>{
+            match management::query_environment(management::StatusCommand::CheckRestartRollback).await{
+                Ok(management::StatusReply::RestartRollbackReady{revision,remaining_seconds})=>Ok(format!("structural rollback ready; revision={revision}; remaining_seconds={remaining_seconds}; no change applied")),
+                Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),Err(error)=>Err(CliError::Management(error)),
+            }
+        }
+        Ok(Command::ServerRestartRollbackApply{expected_revision})=>{
+            match management::query_environment(management::StatusCommand::ApplyRestartRollback{expected_revision}).await{
+                Ok(management::StatusReply::RestartRollbackApplied{revision})=>Ok(format!("structural rollback applied; revision={revision}; saved TOML unchanged; latest rooted identity retained")),
+                Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),Err(error)=>Err(CliError::Management(error)),
+            }
+        }
         Ok(Command::ServerAuthRollbackCheck)=>{
             match management::query_environment(management::StatusCommand::CheckAuthRollback).await{
                 Ok(management::StatusReply::AuthRollbackReady{revision,remaining_seconds})=>Ok(format!("authorization rollback ready; revision={revision}; remaining_seconds={remaining_seconds}; no change applied")),

@@ -129,6 +129,8 @@ pub enum Command {
     ServerApplyReloadBound{expected_revision:u64,candidate_sha256:[u8;32]},
     ServerAuthRollbackCheck,
     ServerAuthRollbackApply{expected_revision:u64},
+    ServerRestartRollbackCheck,
+    ServerRestartRollbackApply{expected_revision:u64},
     ClientRun {
         config: String,
     },
@@ -305,6 +307,10 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["server","reload","--apply","--expected-revision",revision,"--sha256",digest,"--confirm"]=>Ok(Command::ServerApplyReloadBound{
             expected_revision:expected_revision(revision)?,
             candidate_sha256:parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
+        }),
+        ["server","restart","rollback","--check"]=>Ok(Command::ServerRestartRollbackCheck),
+        ["server","restart","rollback","--apply","--expected-revision",revision,"--confirm"]=>Ok(Command::ServerRestartRollbackApply{
+            expected_revision:expected_revision(revision)?,
         }),
         ["server","auth","rollback","--check"]=>Ok(Command::ServerAuthRollbackCheck),
         ["server","auth","rollback","--apply","--expected-revision",revision,"--confirm"]=>Ok(Command::ServerAuthRollbackApply{

@@ -1643,6 +1643,8 @@ impl CapturedTls {
         })
     }
 
+    pub(crate) fn fingerprint(&self)->[u8;32]{self.fingerprint}
+
     pub(crate) fn matches(&self, expected: &[u8; 32]) -> bool {
         self.fingerprint.ct_eq(expected).unwrap_u8() == 1
     }
@@ -1904,6 +1906,15 @@ fn prepare_same_port_tls(
 /// after ONE same-port rotation. TLS ServerConfig owns private signing keys;
 /// this slot never holds raw PEM bytes and never touches disk on rollback.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+struct StructuralRollbackSlot {
+    document:Arc<ServerDocument>,
+    identities:Vec<crate::reload_preflight::IdentityHash>,
+    revision:u64,
+    ready_at:Instant,
+    expires:Instant,
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 struct RollbackSlot {
     expires: Instant,
     h2: Vec<TlsAcceptor>,
@@ -2345,10 +2356,11 @@ async fn run_supervised_file(
     let mut identities = current_identities;
     let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
     let mut rollback: Option<RollbackSlot> = None;
+    let mut structural_rollback:Option<StructuralRollbackSlot>=None;
     loop {
         tokio::select! {
             request = queue.recv() => {
-                let Some(request) = request else {
+                let Some(mut request) = request else {
                     return Err(ServerError::Io);
                 };
                 // No unbounded retired-generation backlog and no double
@@ -2369,6 +2381,25 @@ async fn run_supervised_file(
                 // is no longer listening for its result.
                 if request.complete.is_closed() {
                     continue;
+                }
+                let structural=request.kind==crate::runtime_generation::ChangeKind::StructuralRollback;
+                if structural{
+                    let Some(slot)=structural_rollback.as_ref()else{let _=request.complete.send(Err(()));continue;};
+                    let now=Instant::now();
+                    if slot.revision!=request.expected_revision||now<slot.ready_at||now>=slot.expires{
+                        let _=request.complete.send(Err(()));continue;
+                    }
+                    let previous=slot.document.clone();
+                    let previous_ids=slot.identities.clone();
+                    let result=tokio::task::spawn_blocking(move||{
+                        let material=CapturedTls::capture(&previous).map_err(|_|())?;
+                        if material.identities()!=previous_ids{return Err(());}
+                        Ok((previous,material))
+                    }).await;
+                    let Ok(Ok((previous,material)))=result else{let _=request.complete.send(Err(()));continue;};
+                    if request.complete.is_closed(){continue;}
+                    request.candidate=previous.as_ref().clone();
+                    request.material=Some(material);
                 }
                 if request.kind == crate::runtime_generation::ChangeKind::Rollback {
                     let applied = rollback.as_ref().ok_or(()).and_then(|slot| {
@@ -2415,7 +2446,9 @@ async fn run_supervised_file(
                         Ok((new_identities, revision, previous_tls)) => {
                             identities = new_identities;
                             runtime.set_rollback_until(Some(previous_tls.expires));
-                            rollback = Some(previous_tls);
+                            rollback=Some(previous_tls);
+                            structural_rollback=None;
+                            runtime.set_restart_rollback(None);
                             let _ = request.complete.send(Ok(revision));
                         }
                         Err(()) => {
@@ -2449,9 +2482,25 @@ async fn run_supervised_file(
                     continue;
                 }
                 next_running.start();
-                let previous = std::mem::replace(&mut running, next_running);
-                identities = next_identities;
-                rollback = None;
+                let previous=std::mem::replace(&mut running,next_running);
+                // No key or health rollback: previous own-TLS PEM digest
+                // must still match, REALITY reopens its CURRENT rooted
+                // publication and floor when the operator confirms.
+                if structural{
+                    structural_rollback=None;
+                    runtime.set_restart_rollback(None);
+                }else{
+                    let now=Instant::now();
+                    let ready_at=now+GENERATION_DRAIN+Duration::from_secs(2);
+                    let expires=now+Duration::from_secs(300);
+                    structural_rollback=Some(StructuralRollbackSlot{
+                        document:request.previous.document.clone(),identities:identities.clone(),
+                        revision,ready_at,expires,
+                    });
+                    runtime.set_restart_rollback(Some((revision,ready_at,expires)));
+                }
+                identities=next_identities;
+                rollback=None;
                 runtime.set_rollback_until(None);
                 retiring = Some(tokio::spawn(reap_previous(previous)));
                 // This ACK is AFTER commit. Lost ACK is indeterminate:
@@ -2467,6 +2516,14 @@ async fn run_supervised_file(
             } => {
                 rollback = None;
                 runtime.set_rollback_until(None);
+            }
+            _=async{
+                if let Some(slot)=&structural_rollback{
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(slot.expires)).await;
+                }else{std::future::pending::<()>().await;}
+            }=>{
+                structural_rollback=None;
+                runtime.set_restart_rollback(None);
             }
             result = running.tasks.join_next() => {
                 // An unexpected H2/H3 accept-loop exit is fatal, not a
@@ -3299,7 +3356,7 @@ mod hardening_tests {
             .await
             .is_err());
         drop(fresh_reservations);
-        let (successor, next, next_ids, revision) =
+        let (successor,next,next_ids,next_reality,revision)=
             stage_fresh_generation(&fresh, &restored, &limits, &path)
                 .await
                 .unwrap();
@@ -3309,7 +3366,7 @@ mod hardening_tests {
         assert!(StdTcp::bind(&initial.server.inbounds[0].h2_listen).is_err());
         assert!(StdTcp::bind(&candidate.server.inbounds[0].h2_listen).is_err());
         runtime
-            .commit_restart(&fresh.previous, fresh.expected_revision, next)
+            .commit_restart_with_reality(&fresh.previous,fresh.expected_revision,next,next_reality)
             .unwrap();
         successor.start();
         assert_eq!(runtime.snapshot().unwrap().live.revision(), Ok(5));

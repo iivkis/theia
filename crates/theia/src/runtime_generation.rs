@@ -29,6 +29,7 @@ pub(crate) struct State {
     // Only advisory metadata crosses IPC; the actual previous TLS private
     // configs live exclusively in the single supervisor, never in replies.
     rollback_until: RwLock<Option<Instant>>,
+    restart_rollback:RwLock<Option<(u64,Instant,Instant)>>,
     auth_rollback: RwLock<Option<AuthRollback>>,
     reality:RwLock<RealityMap>,
     reality_ledger:Option<Arc<crate::quota::Ledger>>,
@@ -45,6 +46,7 @@ impl State {
         Self {
             current: RwLock::new(Arc::new(initial)),
             rollback_until: RwLock::new(None),
+            restart_rollback:RwLock::new(None),
             auth_rollback: RwLock::new(None),
             reality:RwLock::new(RealityMap::new()),
             reality_ledger:None,
@@ -88,6 +90,19 @@ impl State {
         Some((revision, remaining.as_secs().saturating_add(1)))
     }
 
+    pub(crate) fn set_restart_rollback(&self,slot:Option<(u64,Instant,Instant)>){
+        if let Ok(mut guard)=self.restart_rollback.write(){*guard=slot;}
+    }
+    pub(crate) fn restart_rollback_status(&self)->Option<(u64,u64)>{
+        let view=self.current.read().ok()?;
+        let revision=view.live.revision().ok()?;
+        let mut slot=self.restart_rollback.write().ok()?;
+        let (expected,ready,until)=(*slot)?;
+        let now=Instant::now();
+        if expected!=revision||now>=until{*slot=None;return None;}
+        if now<ready{return None;}
+        Some((revision,until.saturating_duration_since(now).as_secs().saturating_add(1).min(300)))
+    }
     pub(crate) fn set_rollback_until(&self, deadline: Option<Instant>) {
         if let Ok(mut slot) = self.rollback_until.write() {
             *slot = deadline;
@@ -301,6 +316,7 @@ pub(crate) enum ChangeKind {
     Restart,
     Quota,
     Rollback,
+    StructuralRollback,
 }
 
 pub(crate) struct RestartRequest {
