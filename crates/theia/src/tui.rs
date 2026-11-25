@@ -316,7 +316,7 @@ impl RecordFlow {
                 id,
                 label: if selected.contains(name) { "[x] Доступ разрешён" } else { "[ ] Нет доступа" },
                 value: if *disabled { format!("{name} (отключён)") } else { name.clone() },
-                hint: "Пробел меняет право на это подключение. Отключённый пользователь не включается.",
+                hint: "Пробел меняет право на это подключение. Статус отключённой учётной записи не изменится.",
             }).collect();
             return Some(Form {
                 fields,
@@ -395,12 +395,12 @@ fn pages(role: Role) -> &'static [&'static str] {
 
 fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
     let entries: &[(char, &str)] = match (role, page) {
-        (Role::Server, 0) => &[('N',"Создать подключение"),('u',"Добавить пользователя"),('b',"Выдать доступ"),('G',"Выбрать пользователей"),('s',"Запуск / остановка"),('S',"Сохранить файл"),('a',"Применить к серверу"),('v',"Проверить состояние"),('o',"Открыть другой файл")],
+        (Role::Server, 0) => &[('N',"Создать подключение"),('u',"Добавить пользователя"),('b',"Выдать доступ"),('G',"Выбрать пользователей"),('s',"Запуск / остановка"),('S',"Сохранить файл"),('a',"Применить права доступа"),('v',"Состояние / другие изменения"),('o',"Открыть другой файл")],
         (Role::Server, 1) => &[('N',"Создать подключение"),('G',"Кому разрешён доступ"),('V',"Состояние REALITY"),('E',"Сертификат Own-TLS"),('D',"Удалить подключение")],
         (Role::Server, 2) => &[('u',"Добавить пользователя"),('G',"Выбрать права доступа"),('b',"Восстановить доступ"),('x',"Отключить пользователя"),('t',"Заменить приглашение"),('U',"Удалить пользователя")],
         (Role::Server, 3) => &[('u',"Новый пользователь и ссылка"),('b',"Восстановить доступ"),('t',"Заменить приглашение"),('l',"Ссылка без секрета")],
         (_, 4) => &[('4',"Открыть монитор трафика")],
-        (Role::Server, 5) => &[('S',"Сохранить файл"),('a',"Применить к серверу"),('v',"Состояние сервера"),('Q',"Лимиты подключений"),('o',"Открыть файл"),('R',"Проверить перезапуск"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
+        (Role::Server, 5) => &[('S',"Сохранить файл"),('a',"Применить права доступа"),('v',"Состояние / другие изменения"),('Q',"Лимиты подключений"),('o',"Открыть файл"),('R',"Проверить перезапуск"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
         (Role::Server, 6) => &[('p',"Сетевая диагностика"),('V',"Состояние REALITY")],
         (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
         (Role::Client, 1) => &[('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт"),('E',"Доверие Own-TLS"),('D',"Удалить профиль")],
@@ -430,7 +430,7 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
             return ('u', "Создайте пользователя и получите его личное приглашение.");
         }
         if !owned_running { return ('s', "Запустите сервер, если он ещё не работает как внешний сервис."); }
-        ('v', "Проверьте состояние работающего сервера. Если файл изменился, примените его отдельно.")
+        ('v', "Проверьте состояние сервера. Права, лимиты и структура применяются отдельно.")
     } else if editor.record_count() == 0 {
         ('i', "Получите приглашение у администратора и импортируйте его.")
     } else if owned_running {
@@ -758,14 +758,12 @@ impl Interaction {
         }
     }
     fn open_config(&mut self, role: Role) {
-        if self
-            .editor
-            .as_ref()
-            .is_some_and(|e| e.dirty() || e.write_uncertain())
-        {
+        if self.editor.as_ref().is_some_and(|e| {
+            e.dirty() && !(e.write_uncertain() && e.role() == role)
+        }) {
             if let Some(editor) = self.editor.as_mut() {
                 editor.error = Some(
-                    "Сначала сохраните черновик; при неопределённой записи проверьте файл.".into(),
+                    "Сначала сохраните или отмените черновик в текущей панели.".into(),
                 );
             }
             return;
@@ -787,6 +785,9 @@ impl Interaction {
         if role == Role::Client {
             self.client_background = None;
         }
+        // An uncertain save cannot be retried. Opening a file explicitly
+        // re-reads it using the normal loader; the old editor is kept until
+        // a successful load. No materials or original file are removed.
         self.config_dialog = Some(ConfigDialog::new(
             role,
             self.editor_for(role).map(Editor::saved_path),
@@ -1073,7 +1074,7 @@ impl Interaction {
                 let content=page_layout(body,role,self.workspace_page).map(|p|p[0]).unwrap_or(body);
                 if self.workspace_page==1 {
                     if let Some(id)=editor_field_hit(content,editor,event.column,event.row) {editor.workspace_select_field(id);self.workspace_focus=WorkspaceFocus::Fields;}
-                } else if role==Role::Server && self.workspace_page==2 && inside(content) && event.row>=content.y+2 && event.row<content.bottom().saturating_sub(1) {
+                } else if role==Role::Server && matches!(self.workspace_page, 2 | 3) && inside(content) && event.row>=content.y+2 && event.row<content.bottom().saturating_sub(1) {
                     let users=editor.workspace_users();
                     let i=user_table_start(self.workspace_user,users.len(),content)+usize::from(event.row-content.y-2);
                     if i<users.len(){self.workspace_user=i;self.workspace_focus=WorkspaceFocus::Users;}
@@ -1113,7 +1114,7 @@ impl Interaction {
                     self.workspace_focus = WorkspaceFocus::Actions;
                     return;
                 }
-                if role == Role::Server && self.workspace_page == 2 && inside(content) && event.row >= content.y + 2 {
+                if role == Role::Server && matches!(self.workspace_page, 2 | 3) && inside(content) && event.row >= content.y + 2 {
                     let users = editor.workspace_users();
                     let start = user_table_start(self.workspace_user, users.len(), content);
                     let i = start + usize::from(event.row - content.y - 2);
@@ -1525,7 +1526,7 @@ impl Interaction {
                         self.workspace_focus = match self.workspace_focus {
                             WorkspaceFocus::Fields | WorkspaceFocus::Users => WorkspaceFocus::Actions,
                             WorkspaceFocus::Actions => WorkspaceFocus::Navigation,
-                            WorkspaceFocus::Navigation => if role == Role::Server && self.workspace_page == 2 { WorkspaceFocus::Users } else { WorkspaceFocus::Fields },
+                            WorkspaceFocus::Navigation => if role == Role::Server && matches!(self.workspace_page, 2 | 3) { WorkspaceFocus::Users } else { WorkspaceFocus::Fields },
                         };
                         return false;
                     }
@@ -1544,7 +1545,7 @@ impl Interaction {
                                 return false;
                             }
                             KeyCode::Enter | KeyCode::Tab => {
-                                self.workspace_focus = if role == Role::Server && self.workspace_page == 2 { WorkspaceFocus::Users } else if self.workspace_page == 1 { WorkspaceFocus::Fields } else { WorkspaceFocus::Actions };
+                                self.workspace_focus = if role == Role::Server && matches!(self.workspace_page, 2 | 3) { WorkspaceFocus::Users } else if self.workspace_page == 1 { WorkspaceFocus::Fields } else { WorkspaceFocus::Actions };
                                 return false;
                             }
                             KeyCode::BackTab => {
@@ -1554,7 +1555,7 @@ impl Interaction {
                             _ => {}
                         }
                     }
-                    if role == Role::Server && self.workspace_page == 2 && matches!(self.workspace_focus, WorkspaceFocus::Fields | WorkspaceFocus::Users) {
+                    if role == Role::Server && matches!(self.workspace_page, 2 | 3) && matches!(self.workspace_focus, WorkspaceFocus::Fields | WorkspaceFocus::Users) {
                         let count = self.editor_for(role).map_or(0, |e| e.workspace_users().len());
                         self.workspace_focus = WorkspaceFocus::Users;
                         match key.code {
@@ -1573,7 +1574,7 @@ impl Interaction {
                     if self.workspace_focus == WorkspaceFocus::Actions {
                         let items = page_actions(role, self.workspace_page);
                         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-                            self.workspace_focus = if key.code == KeyCode::Tab { WorkspaceFocus::Navigation } else if role == Role::Server && self.workspace_page == 2 { WorkspaceFocus::Users } else { WorkspaceFocus::Fields };
+                            self.workspace_focus = if key.code == KeyCode::Tab { WorkspaceFocus::Navigation } else if role == Role::Server && matches!(self.workspace_page, 2 | 3) { WorkspaceFocus::Users } else { WorkspaceFocus::Fields };
                             return false;
                         }
                         if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::Enter)
@@ -1583,7 +1584,7 @@ impl Interaction {
                                 return false;
                             }
                             if let Some(KeyCode::Char(ch)) = tui_widgets::action_key(&items, &mut self.workspace_action, key.code) {
-                                let selected = if role == Role::Server && self.workspace_page == 2 {
+                                let selected = if role == Role::Server && matches!(self.workspace_page, 2 | 3) {
                                     self.editor_for(role).and_then(|e| e.workspace_users().get(self.workspace_user).map(|u| u.0.clone()))
                                 } else if role == Role::Server && key.code==KeyCode::Enter && matches!(ch,'b'|'x'|'t') {
                                     self.editor_for(role).and_then(|e| {
@@ -1761,7 +1762,7 @@ impl Interaction {
                         }
                         KeyCode::Enter => {
                             if selected.is_empty() {
-                                editor.error = Some("Выберите хотя бы одного пользователя. Для полного запрета доступа отключите пользователя.".into());
+                                editor.error = Some("Нужен хотя бы один пользователь. Глобальное отключение доступно отдельно и действует на все подключения.".into());
                             } else {
                                 match editor.review_record(RecordAction::SetGrants, &[selected.join(",")]) {
                                     Ok(review) => {
@@ -3782,7 +3783,7 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         }
     } else if page == 1 {
         draw_editor(frame, content, editor);
-    } else if role == Role::Server && page == 2 {
+    } else if role == Role::Server && matches!(page, 2 | 3) {
         let users = editor.workspace_users();
         let selected = ui.map_or(0, |u| u.workspace_user).min(users.len().saturating_sub(1));
         let start = user_table_start(selected, users.len(), content);
@@ -3793,25 +3794,19 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         });
         frame.render_widget(Table::new(rows,[Constraint::Percentage(50),Constraint::Percentage(20),Constraint::Percentage(30)])
             .header(Row::new(["Пользователь","Доступ","В файле"]).style(Style::default().fg(MUTED)))
-            .block(tui_widgets::section(&format!("Доступ к: {}", editor.selected_record_id()), focus == WorkspaceFocus::Users)),content);
+            .block(tui_widgets::section(&format!("{}: {}", if page == 3 { "Приглашения для" } else { "Доступ к" }, editor.selected_record_id()), focus == WorkspaceFocus::Users)),content);
         if users.is_empty() && content.height > 3 {
             frame.render_widget(Paragraph::new("Нет пользователей. Добавьте первого через действия."), Rect::new(content.x+1,content.y+2,content.width.saturating_sub(2),1));
         }
     } else {
         let description = match (role,page) {
-            (Role::Server,3) => "Приглашения дают доступ к выбранному подключению. Приватная ссылка показывается только после подтверждённого сохранения.",
             (Role::Client,2) => "Импортируйте ссылку или изображение QR. Подключение и доверие подтверждаются отдельно.",
             (Role::Client,3) => "Управление системным прокси Windows. Это не VPN. На Linux эта функция недоступна.",
             (_,4) => "Enter или F4 — открыть живой монитор трафика текущего процесса.",
             (_,5) => "F3 — открыть файл; Ctrl+S — сохранить. Применение к работающему процессу выполняется отдельно.",
             _ => "Проверки состояния и диагностика. Сетевые операции требуют отдельного согласия.",
         };
-        if role == Role::Server && page == 3 {
-            let body = format!("Подключение: {}\n\n{}\n\nСуществующий токен не восстанавливается. Замена приглашения создаёт новый токен; примените изменение отдельно.", editor.selected_record_id(), description);
-            panel(frame, content, pages(role)[page], &body, true);
-        } else {
-            panel(frame, content, pages(role)[page], description, true);
-        }
+        panel(frame, content, pages(role)[page], description, true);
     }
     if controls.height > 0 {
         Actions { items: &items, selected }.render(frame, controls);
@@ -4373,7 +4368,10 @@ mod tests {
     #[test]
     fn server_grant_picker_is_explicit_and_cancel_is_read_only() {
         let path = std::env::temp_dir().join(crate::tui_editor::generated_id("grant-picker").unwrap());
-        let original = server_issuance_fixture();
+        let original = server_issuance_fixture().replace("[server.policy]", &format!(
+            "[[server.users]]\nid = \"device-b\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]",
+            "11".repeat(32),
+        ));
         std::fs::write(&path, &original).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
         let mut model = Model::new(Some(Role::Server));
@@ -4384,6 +4382,7 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Char(' ')));
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(matches!(&ui.records, Some(RecordFlow::GrantPicker { selected, .. }) if selected.is_empty()));
+        ui.update(&mut model, press(KeyCode::Down));
         ui.update(&mut model, press(KeyCode::Char(' ')));
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(matches!(&ui.records, Some(RecordFlow::Confirm(_))));
