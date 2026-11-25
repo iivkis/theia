@@ -31,6 +31,7 @@ pub mod invite;
 pub mod live_auth;
 pub mod local_proxy;
 pub mod management;
+mod network_scope;
 pub mod protocol;
 pub mod quic_transport;
 pub(crate) mod quota;

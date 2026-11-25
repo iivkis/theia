@@ -4,7 +4,6 @@
 use crate::client::ClientError;
 use std::{
     future::Future,
-    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -12,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore},
+    sync::{watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
 
@@ -82,10 +81,11 @@ pub(crate) struct Pool<C> {
     entries: Arc<Mutex<Vec<Arc<Entry<C>>>>>,
     connections: Arc<Semaphore>,
     policy: RotationPolicy,
+    lifetime: watch::Sender<()>,
 }
 struct Entry<C> {
     connection: C,
-    route: Option<SocketAddr>,
+    route: Option<crate::network_scope::Scope>,
     split: bool,
     deadline: Instant,
     byte_limit: u64,
@@ -150,6 +150,7 @@ impl<C> Default for Pool<C> {
             entries: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             policy: RotationPolicy::default(),
+            lifetime: watch::channel(()).0,
         }
     }
 }
@@ -168,7 +169,7 @@ impl<C: Send + Sync + 'static> Pool<C> {
 
     pub(crate) async fn acquire(
         &self,
-        route: Option<SocketAddr>,
+        route: Option<crate::network_scope::Scope>,
         split: bool,
         reusable: bool,
         alive: impl Fn(&C) -> bool,
@@ -176,12 +177,16 @@ impl<C: Send + Sync + 'static> Pool<C> {
     ) -> Result<Lease<C>, ClientError> {
         let mut entries = self.entries.lock().await;
         entries.retain(|entry| {
-            !entry.retired.load(Ordering::Acquire)
+            let retain = !entry.retired.load(Ordering::Acquire)
                 && entry.route == route
                 && Instant::now() < entry.deadline
                 && entry.bytes.load(Ordering::Acquire) < entry.byte_limit
                 && entry.next_id.load(Ordering::Acquire) <= crate::split_http::MAX_PAIR_IDS as usize
-                && alive(&entry.connection)
+                && alive(&entry.connection);
+            if !retain {
+                entry.retire();
+            }
+            retain
         });
         if reusable && route.is_some() {
             for entry in entries.iter() {
@@ -209,7 +214,7 @@ impl<C: Send + Sync + 'static> Pool<C> {
                 .iter()
                 .position(|entry| entry.active.load(Ordering::Acquire) == 0)
             {
-                entries.remove(index);
+                entries.remove(index).retire();
             }
         }
         let permit = self
@@ -241,10 +246,12 @@ impl<C: Send + Sync + 'static> Pool<C> {
             let weak_entries = Arc::downgrade(&self.entries);
             let weak_entry = Arc::downgrade(&entry);
             let wake_cleanup = entry.wake_cleanup.clone();
+            let mut lifetime = self.lifetime.subscribe();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = tokio::time::sleep_until(deadline) => {},
                     _ = wake_cleanup.notified() => {},
+                    _ = lifetime.changed() => {},
                 }
                 if let (Some(entries), Some(expired)) =
                     (weak_entries.upgrade(), weak_entry.upgrade())
@@ -346,6 +353,23 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::task::yield_now().await;
         assert!(pool.entries.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_source_network_change_retires_pool_without_cutting_tunnels() {
+        use crate::network_scope::Scope;
+        let pool = Pool::default();
+        let source = "127.0.0.1:0".parse().unwrap();
+        let a = Some(Scope::fixture(source, 1));
+        let b = Some(Scope::fixture(source, 2));
+        let mut old = pool.acquire(a, false, true, |_| true, async { Ok(1) }).await.unwrap();
+        old.admitted();
+        let mut fresh = pool.acquire(b, false, true, |_| true, async { Ok(2) }).await.unwrap();
+        fresh.admitted();
+        assert!(old.entry.retired.load(Ordering::Acquire));
+        assert_eq!(*old.connection(), 1);
+        assert_eq!(*fresh.connection(), 2);
+        assert!(!old.shares_connection(&fresh));
     }
 
     #[tokio::test]

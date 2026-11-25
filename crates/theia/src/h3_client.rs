@@ -472,7 +472,7 @@ impl H3Client {
         stream_up: bool,
         stage: &mut crate::split_http::HelloOutcome,
     ) -> Result<H3Tunnel, ClientError> {
-        let route = crate::local_proxy::route_source(self.remote);
+        let route = crate::network_scope::observe(self.remote);
         let reusable = self.reuse_connections && self.certificate_pin.is_none();
         let mut lease = self
             .pool

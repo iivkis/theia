@@ -637,7 +637,7 @@ impl H2Client {
             .endpoint
             .parse()
             .ok()
-            .and_then(crate::local_proxy::route_source);
+            .and_then(crate::network_scope::observe);
         let reusable = self.reuse_connections
             && self.certificate_pin.is_none()
             && matches!(&self.connector, H2Tls::Rustls(_));

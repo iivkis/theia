@@ -385,7 +385,7 @@ impl RealityClient {
         let fallback = match &generation.carrier {
             RealityCarrier::Auto(auto) => auto.negative.lock().ok().map(|cache| {
                 cache.route.is_some()
-                    && cache.route == route_source(auto.h3.remote())
+                    && cache.route == crate::network_scope::observe(auto.h3.remote())
                     && cache.expires.is_some_and(|until| until > Instant::now())
             }),
             _ => None,
@@ -541,13 +541,13 @@ pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
 
 #[derive(Default)]
 struct NegativeCache {
-    route: Option<SocketAddr>,
+    route: Option<crate::network_scope::Scope>,
     generation: u64,
     expires: Option<Instant>,
 }
 
 impl NegativeCache {
-    fn observe(&mut self, route: Option<SocketAddr>, now: Instant) -> (u64, bool) {
+    fn observe(&mut self, route: Option<crate::network_scope::Scope>, now: Instant) -> (u64, bool) {
         if route.is_none() || self.route != route {
             self.route = route;
             self.invalidate();
@@ -583,7 +583,7 @@ impl NegativeCache {
         &mut self,
         generation: u64,
         deadline: Instant,
-        route: Option<SocketAddr>,
+        route: Option<crate::network_scope::Scope>,
         now: Instant,
     ) -> Option<u64> {
         if self.generation != generation || self.expires != Some(deadline) || now < deadline {
@@ -614,7 +614,7 @@ impl AutoClient {
             .lock()
             .map_err(|_| ClientError::Configuration)?;
         let previous = cache.generation;
-        let observed = cache.observe(route_source(self.h3.remote()), Instant::now());
+        let observed = cache.observe(crate::network_scope::observe(self.h3.remote()), Instant::now());
         if previous != cache.generation {
             self.cache_changed.notify_one();
         }
@@ -626,7 +626,7 @@ impl AutoClient {
             .negative
             .lock()
             .map_err(|_| ClientError::Configuration)?;
-        let current = route_source(self.h3.remote());
+        let current = crate::network_scope::observe(self.h3.remote());
         // Unknown routing is never cached. A known changed route must not
         // inherit a fallback decision obtained on the previous network.
         if current != cache.route {
@@ -677,7 +677,7 @@ impl AutoClient {
                 cache.begin_recheck(
                     generation,
                     deadline,
-                    route_source(self.h3.remote()),
+                    crate::network_scope::observe(self.h3.remote()),
                     Instant::now(),
                 )
             };
@@ -741,6 +741,9 @@ impl AutoClient {
                     }
                 }
             }
+        }
+        if self.observe()?.0 != generation {
+            return Err(ClientError::QuicUnreachable);
         }
         self.h2.fetch_identity_document(successor).await
     }
@@ -827,6 +830,9 @@ impl AutoClient {
                 "generation" = Value::Count(generation)
             );
             eprintln!("transport=h2 reason=quic_negative_cache");
+        }
+        if self.observe()?.0 != generation {
+            return Err(ClientError::QuicUnreachable);
         }
         self.h2
             .open_preferred(address, port, preferred)
@@ -925,7 +931,7 @@ impl ClientRuntime {
                 let fallback = match &g.carrier {
                     RealityCarrier::Auto(a) => a.negative.lock().ok().is_some_and(|c| {
                         c.route.is_some()
-                            && c.route == route_source(a.h3.remote())
+                            && c.route == crate::network_scope::observe(a.h3.remote())
                             && c.expires.is_some_and(|t| t > Instant::now())
                     }),
                     _ => false,
@@ -2270,6 +2276,21 @@ mod selector_tests {
         cache.record(unknown, now, ttl);
         assert!(!cache.observe(None, now).1);
         assert!(!cache.observe(b, now).1);
+    }
+
+    #[test]
+    fn same_ip_network_epoch_invalidates_quic_failure() {
+        let mut cache = NegativeCache::default();
+        let now = Instant::now();
+        let source = "192.0.2.1:0".parse().unwrap();
+        let a = Some(crate::network_scope::Scope::fixture(source, 1));
+        let b = Some(crate::network_scope::Scope::fixture(source, 2));
+        let (old, _) = cache.observe(a, now);
+        assert!(cache.record(old, now, Duration::from_secs(900)));
+        let (new, cached) = cache.observe(b, now);
+        assert_ne!(old, new);
+        assert!(!cached);
+        assert!(!cache.record(old, now, Duration::from_secs(900)));
     }
 
     #[test]

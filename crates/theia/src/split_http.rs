@@ -100,13 +100,13 @@ pub(crate) struct ModeTicket {
 
 #[derive(Default)]
 struct ModeCache {
-    route: Option<SocketAddr>,
+    route: Option<crate::network_scope::Scope>,
     generation: u64,
     expires: Option<Instant>,
 }
 
 impl ModeCache {
-    fn observe(&mut self, route: Option<SocketAddr>, now: Instant) -> ModeTicket {
+    fn observe(&mut self, route: Option<crate::network_scope::Scope>, now: Instant) -> ModeTicket {
         if route.is_none()
             || route != self.route
             || self.expires.is_some_and(|expires| now >= expires)
@@ -152,7 +152,7 @@ impl AutoMode {
     pub(crate) fn select(&self) -> Result<ModeTicket, ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
         Ok(cache.observe(
-            crate::local_proxy::route_source(self.remote),
+            crate::network_scope::observe(self.remote),
             Instant::now(),
         ))
     }
@@ -160,7 +160,7 @@ impl AutoMode {
     pub(crate) fn current(&self, ticket: ModeTicket) -> Result<bool, ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
         cache.observe(
-            crate::local_proxy::route_source(self.remote),
+            crate::network_scope::observe(self.remote),
             Instant::now(),
         );
         Ok(cache.current(ticket))
@@ -169,7 +169,7 @@ impl AutoMode {
     pub(crate) fn remember(&self, ticket: ModeTicket) -> Result<(), ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
         let now = Instant::now();
-        cache.observe(crate::local_proxy::route_source(self.remote), now);
+        cache.observe(crate::network_scope::observe(self.remote), now);
         cache.remember(ticket, now, self.ttl);
         Ok(())
     }
@@ -478,6 +478,20 @@ mod tests {
 #[cfg(test)]
 mod auto_tests {
     use super::*;
+
+    #[test]
+    fn same_ip_new_network_invalidates_stream_up_evidence() {
+        let source = "192.0.2.1:0".parse().unwrap();
+        let a = Some(crate::network_scope::Scope::fixture(source, 1));
+        let b = Some(crate::network_scope::Scope::fixture(source, 2));
+        let now = Instant::now();
+        let mut cache = ModeCache::default();
+        let ticket = cache.observe(a, now);
+        cache.remember(ticket, now, Duration::from_secs(60));
+        assert!(cache.observe(a, now).stream_up);
+        assert!(!cache.observe(b, now).stream_up);
+        assert!(!cache.current(ticket));
+    }
 
     #[test]
     fn mode_cache_expires_and_rejects_stale_or_unknown_routes() {
