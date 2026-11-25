@@ -43,7 +43,11 @@ pub(crate) fn report_section(title: &str, active: bool) -> Block<'_> {
     } else if title.contains("Подтверждение") || title.contains("СЕКРЕТ") || title.contains("Не сохранено") {
         WARNING
     } else if active { ACCENT } else { MUTED };
-    section(title, active).title_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+    Block::default()
+        .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(SURFACE).bg(SURFACE))
+        .style(Style::default().fg(TEXT).bg(SURFACE))
 }
 
 pub(crate) fn report_row<'a>(value: &'a str, style: Style, first: bool) -> Line<'a> {
@@ -346,7 +350,8 @@ pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
     if count == 0 || area.height < 8 { return None; }
     if area.width >= 104 {
         let parts = Layout::horizontal([Constraint::Min(44), Constraint::Length((area.width / 3).clamp(42, 64))]).split(area);
-        Some([parts[0], parts[1]])
+        let controls = Rect::new(parts[1].x, parts[1].y, parts[1].width, parts[1].height.min((count as u16).saturating_add(2)));
+        Some([parts[0], controls])
     } else {
         let height = (count as u16).saturating_add(2).min(area.height / 2).max(3);
         let parts = Layout::vertical([Constraint::Min(4), Constraint::Length(height)]).split(area);

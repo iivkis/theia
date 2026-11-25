@@ -808,6 +808,25 @@ impl Interaction {
             }
             return;
         }
+        if let Some(IssueFlow::Input(id)) = self.issuance.as_mut() {
+            if self.issue_kind != IssueKind::NewUser {
+                let disabled = self.issue_kind == IssueKind::Reenable;
+                if let Some(form) = user_picker(self.editor.as_ref(), id, disabled) {
+                    if let Some(index) = form.hit(guided_form_area(body, form.fields.len()), event.column, event.row) {
+                        if let Some(field) = form.fields.get(index) { *id = field.value.clone(); }
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(DisableFlow::Input(id)) = self.revocation.as_mut() {
+            if let Some(form) = user_picker(self.editor.as_ref(), id, false) {
+                if let Some(index) = form.hit(guided_form_area(body, form.fields.len()), event.column, event.row) {
+                    if let Some(field) = form.fields.get(index) { *id = field.value.clone(); }
+                }
+            }
+            return;
+        }
         if !self.workspace_visible() {
             return;
         }
@@ -2238,11 +2257,13 @@ struct Viewport {
     max: Cell<usize>,
     page: Cell<usize>,
     signature: Cell<u64>,
+    focused_row: Cell<Option<usize>>,
 }
 impl Viewport {
     fn reset(&self) {
         self.offset.set(0);
         self.signature.set(0);
+        self.focused_row.set(None);
     }
     fn move_by(&self, delta: isize) {
         self.offset.set(
@@ -2265,6 +2286,16 @@ impl Viewport {
                     .map_or(0, |i| i.saturating_sub(page.saturating_sub(3)))
                     .min(max),
             );
+        }
+        if self.focused_row.replace(focus) != focus {
+            if let Some(row) = focus {
+                let current = self.offset.get();
+                if row < current {
+                    self.offset.set(row.min(max));
+                } else if row >= current.saturating_add(page) {
+                    self.offset.set(row.saturating_sub(page.saturating_sub(1)).min(max));
+                }
+            }
         }
         self.max.set(max);
         self.page.set(page);
@@ -2424,7 +2455,7 @@ fn draw_guided(
     }
     if let Some(form) = form {
         let title = if parts[0].height == 0 { caption.as_str() } else { "Параметры" };
-        if matches!(heading, "Выбор пользователей" | "Выбор защиты") { form.render_picker(frame, parts[1], title); }
+        if matches!(heading, "Выбор пользователей" | "Выбор пользователя" | "Выбор защиты") { form.render_picker(frame, parts[1], title); }
         else { form.render(frame, parts[1], title); }
     } else if let Some(lines) = review_lines {
         // Same width as stepper and key bar: never re-center a nested report.
@@ -2754,6 +2785,23 @@ fn cycle_user(editor: &Editor, current: &str, disabled: bool, forward: bool) -> 
     users[next].clone()
 }
 
+fn user_picker(editor: Option<&Editor>, current: &str, disabled: bool) -> Option<Form> {
+    let editor = editor?;
+    let users = eligible_users(editor, disabled);
+    if users.is_empty() { return None; }
+    let selected = users.iter().position(|id| id == current).unwrap_or(usize::MAX);
+    Some(Form {
+        fields: users.into_iter().enumerate().map(|(id, value)| Field {
+            id, label: if disabled { "Отключённый пользователь" } else { "Пользователь с доступом" },
+            value, hint: "Enter — проверить выбранного пользователя. Изменение требует отдельного подтверждения.",
+        }).collect(),
+        selected,
+        lead: if current.is_empty() { "Выберите пользователя стрелками или мышью.".into() }
+            else { format!("Выбран: {current}") },
+        error: editor.error.clone().unwrap_or_default(),
+    })
+}
+
 fn user_choices(editor: Option<&Editor>, current: &str, disabled: bool) -> String {
     let users = editor
         .map(|e| eligible_users(e, disabled))
@@ -2794,6 +2842,11 @@ fn draw_issuance(
                 error: editor.and_then(|e| e.error.clone()).unwrap_or_default(),
             };
             draw_guided(frame, area, "Новый пользователь", "", (1, 2, "Доступ", "Enter продолжить · Backspace удалить · Esc отменить"), viewport, (Some(form), None));
+            return;
+        }
+        if let Some(form) = user_picker(editor, id, recovering) {
+            let title = if recovering { "Восстановление отключённого пользователя" } else { "Ротация токена" };
+            draw_guided(frame, area, title, "", (1, 2, "Выбор пользователя", "↑↓ выбрать · Enter проверить · Esc отменить"), viewport, (Some(form), None));
             return;
         }
     }
@@ -2940,6 +2993,12 @@ fn draw_revocation(
     editor: Option<&Editor>,
     viewport: Option<&Viewport>,
 ) {
+    if let DisableFlow::Input(id) = flow {
+        if let Some(form) = user_picker(editor, id, false) {
+            draw_guided(frame, area, "Отключить существующего пользователя", "", (1, 2, "Выбор пользователя", "↑↓ выбрать · Enter проверить · Esc отменить"), viewport, (Some(form), None));
+            return;
+        }
+    }
     let (title, body) = match flow {
         DisableFlow::Input(id) => (
             "Отключить существующего пользователя",
@@ -3357,7 +3416,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
         lines.push(Line::styled(format!("Ошибка: {error}"), Style::default().fg(ERROR).add_modifier(Modifier::BOLD)));
     }
     if !editor.notice.is_empty() {
-        lines.push(Line::styled(editor.notice.as_str(), Style::default().fg(MUTED)));
+        lines.push(Line::styled(editor.notice, Style::default().fg(MUTED)));
     }
     lines.push(Line::styled(next, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)));
     lines.push(tui_widgets::key_line(actions));
@@ -3619,6 +3678,10 @@ mod tests {
         viewport.move_by(500);
         assert_eq!(viewport.position("review", 40, 10, None), 30);
         assert_eq!(viewport.position("new review", 40, 10, None), 0);
+        assert_eq!(viewport.position("typed", 40, 10, Some(2)), 0);
+        assert_eq!(viewport.position("typed", 40, 10, Some(18)), 9);
+        viewport.move_by(-3);
+        assert_eq!(viewport.position("typed", 40, 10, Some(18)), 6);
         let (rows, _) = visual_rows("one two three four", 5);
         assert!(rows.len() >= 4);
         assert!(rows.iter().all(|row| row.width() <= 5));
