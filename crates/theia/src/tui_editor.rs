@@ -968,7 +968,7 @@ impl Editor {
             }
             (Config::Server(doc), RecordAction::DeleteRecord) => {
                 if doc.server.inbounds.len() <= 1 {
-                    return Err("Нельзя удалить последний inbound в текущей схеме.");
+                    return Err("Нельзя удалить последнее подключение. Сначала создайте другое.");
                 }
                 if self.selected_record >= doc.server.inbounds.len() {
                     return Err("Inbound missing");
@@ -982,7 +982,7 @@ impl Editor {
             }
             (Config::Client(doc), RecordAction::DeleteRecord) => {
                 if doc.client.active_profile == selected {
-                    return Err("Сначала явно выберите другой активный профиль.");
+                    return Err("Выберите другой активный профиль (A), затем повторите удаление.");
                 }
                 if self.selected_record >= doc.client.profiles.len() {
                     return Err("Profile missing");
@@ -993,7 +993,7 @@ impl Editor {
             }
             (Config::Client(doc), RecordAction::ActivateProfile) => {
                 if doc.client.active_profile == selected {
-                    return Err("Профиль уже активен в TOML.");
+                    return Err("Этот профиль уже выбран. Откройте «Подключить / отключить» (V).");
                 }
                 let previous = std::mem::replace(&mut doc.client.active_profile, selected.clone());
                 format!(

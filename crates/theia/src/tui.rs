@@ -750,7 +750,7 @@ impl Interaction {
     }
 
     fn visible_workspace_action(&self, role: Role) -> usize {
-        if role == Role::Server && self.workspace_page == 0 && self.workspace_focus == WorkspaceFocus::Fields {
+        if self.workspace_page == 0 && self.workspace_focus == WorkspaceFocus::Fields {
             self.recommended_action(role)
         } else { self.workspace_action }
     }
@@ -1649,14 +1649,18 @@ impl Interaction {
                             self.workspace_focus=WorkspaceFocus::Navigation; return false;
                         }
                     }
-                    if role == Role::Server && self.workspace_page == 0
+                    if self.workspace_page != 1
+                        && !(role == Role::Server && matches!(self.workspace_page, 2 | 3))
                         && self.workspace_focus == WorkspaceFocus::Fields
+                        && !page_actions(role, self.workspace_page).is_empty()
                         && key.modifiers.is_empty()
                         && matches!(key.code, KeyCode::Enter | KeyCode::Up | KeyCode::Down)
                     {
-                        self.workspace_action = self.recommended_action(role);
+                        if self.workspace_page == 0 {
+                            self.workspace_action = self.recommended_action(role);
+                        }
                         self.workspace_focus = WorkspaceFocus::Actions;
-                        // Open the reviewed workflow, not its confirmation.
+                        // Open the selected workflow, not its confirmation.
                         return self.update(model, key);
                     }
                     if self.workspace_page != 1 && matches!(key.code, KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab) {
@@ -3088,7 +3092,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             file.filter(|e| !e.dirty() && e.saved_sha256()==digest).map(|_|format!("Последнее подтверждение: {kind}, rev {revision}"))
         })
     }else{None};
-    let state = if status.is_empty() { String::new() } else { format!("{saved} · {}",applied.unwrap_or_else(||"Применение: не подтверждено этой панелью".into())) };
+    let state = if status.is_empty() { String::new() } else if file.is_none() {
+        saved.to_owned()
+    } else { format!("{saved} · {}",applied.unwrap_or_else(||"Работа с этими настройками не подтверждена".into())) };
     frame.render_widget(Paragraph::new(vec![Line::from(vec![
         Span::styled(format!(" {brand} "), Style::default().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {status}"), Style::default().fg(TEXT)),
@@ -3096,6 +3102,10 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     match model.screen {
         Screen::Home => {
             let cards = home_layout(parts[1]);
+            if cards[0].y > parts[1].y {
+                frame.render_widget(Paragraph::new("Что вы хотите сделать?").style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+                    Rect::new(cards[0].x + 1, parts[1].y, cards[0].width.saturating_sub(2), 1));
+            }
             draw_role_card(frame, cards[0], Role::Server, model.selected == Role::Server);
             draw_role_card(frame, cards[1], Role::Client, model.selected == Role::Client);
         }
@@ -3320,10 +3330,10 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 "↑↓ выбрать · Enter продолжить · F2 все действия · Esc назад"
             }
             Screen::Server => {
-                "↑↓ выбор · Enter открыть · Tab / F6 фокус · Alt+←/→ раздел · j/k подключение · F2 все команды · Ctrl+S сохранить"
+                "↑↓ выбор · Enter открыть · Tab сменить область · Alt+←/→ раздел · F2 меню · Ctrl+S сохранить"
             }
             Screen::Client => {
-                "Tab / F6 Фокус · Alt+←/→ Раздел · F7 Значение · F3 Файл · F2 Меню · Ctrl+S Сохранить"
+                "↑↓ выбор · Enter открыть · Tab сменить область · Alt+←/→ раздел · F2 меню · Ctrl+S сохранить"
             }
         }
     };
@@ -3384,7 +3394,7 @@ fn user_choices(editor: Option<&Editor>, current: &str, disabled: bool) -> Strin
         .map(|e| eligible_users(e, disabled))
         .unwrap_or_default();
     if users.is_empty() {
-        return "Нет подходящих пользователей в выбранном inbound.".into();
+        return "Нет подходящих пользователей в выбранном подключении. Esc — вернуться.".into();
     }
     let selected = users.iter().position(|id| id == current).unwrap_or(0);
     let start = selected
@@ -3461,11 +3471,11 @@ fn draw_issuance(
                 "Пользователь: {id}\nInbound: {}\n\n{}\n\ny: подтвердить и сохранить  n/Esc: отменить",
                 editor.map_or("", |e| e.selected_record_id()),
                 if recovering {
-                    "ВНИМАНИЕ: восстановление глобально по существующим grants. Создаётся НОВЫЙ bearer; прежний токен не восстанавливается. Только отдельный auth-only CAS Apply меняет runtime."
+                    "ВНИМАНИЕ: доступ восстановится для всех ранее разрешённых подключений.\nБудет создан новый ключ; старый восстановить нельзя.\nЧтобы изменить работающий сервер, отдельно примените права (CAS Apply)."
                 } else if rotating {
-                    "ВНИМАНИЕ: замена bearer глобальна для всех inbound данного пользователя. Старый токен станет недействительным для НОВЫХ подключений только после отдельного auth-only CAS Apply. Уже открытые туннели не разрываются. Grants и disabled не меняются. Runtime НЕ обновляется автоматически."
+                    "ВНИМАНИЕ: новый ключ заменит старый для всех подключений пользователя.\nСтарый ключ перестанет работать для новых сеансов после отдельного применения прав (CAS Apply).\nТекущие сеансы продолжатся. Права и состояние пользователя не изменятся."
                 } else {
-                    "Создать токен CSPRNG и сохранить новую запись в server.toml? Это НЕ перезагружает сервер."
+                    "Создать личный ключ и сохранить пользователя?\nСервер не перезапускается. После записи отдельно примените права доступа."
                 }
             ),
         ),
@@ -3594,7 +3604,7 @@ fn draw_revocation(
         DisableFlow::Confirm(id) => (
             "Подтверждение отзыва доступа",
             format!(
-                "Пользователь: {id}\nВыбранный inbound: {}\n\nВНИМАНИЕ: отключение глобальное для всех inbound этого пользователя.\nТокен и grants остаются в TOML, но новые запросы будут отклоняться после отдельного auth-only Apply. Текущие туннели не отзываются принудительно.\n\ny: подтвердить и сохранить  n/Esc: отменить",
+                "Пользователь: {id}\nВыбранный inbound: {}\n\nВНИМАНИЕ: отключение действует для всех подключений пользователя.\nКлюч и права останутся в файле. Новые сеансы будут запрещены после отдельного применения прав.\nТекущие сеансы продолжатся.\n\ny: подтвердить и сохранить  n/Esc: отменить",
                 editor.map_or("", |e| e.selected_record_id())
             ),
         ),
@@ -3714,7 +3724,7 @@ fn draw_import(
         ImportFlow::Failed => (
             "Импорт НЕ подтверждён",
             format!(
-                "Проверьте состояние TOML перед повторной попыткой. При отказе до commit новый секрет удалён.\nНикакого connect/OS proxy.\n\n{}\n\nEnter/Esc: закрыть",
+                "Перед повторной попыткой проверьте файл настроек. При отказе до завершения записи новый ключ удалён.\nПодключение не запущено; системный прокси не изменён.\n\n{}\n\nEnter/Esc: закрыть",
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
         ),
@@ -3752,8 +3762,10 @@ fn page_layout(area: Rect, role: Role, page: usize) -> Option<[Rect; 2]> {
     if area.width >= 76 && page != 1 && !(role == Role::Server && matches!(page, 2 | 3)) {
         let controls_width = (area.width / 2).clamp(36, 43);
         let parts = Layout::horizontal([Constraint::Min(36), Constraint::Length(controls_width)]).split(area);
+        let height = area.height.min(action_height.max(15));
+        let content = Rect::new(parts[0].x, parts[0].y, parts[0].width, height);
         let controls = Rect::new(parts[1].x, parts[1].y, parts[1].width, parts[1].height.min(action_height));
-        return Some([parts[0], controls]);
+        return Some([content, controls]);
     }
     if area.height < 14 { return None; }
     let minimum = if page == 1 { 10 } else { 6 };
@@ -3811,11 +3823,11 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
             Line::raw(format!("Конфигурация: {status}")),Line::raw(format!("Процесс: {local}")),
             Line::raw(""),Line::styled("Следующий шаг",Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),Line::raw(help),
             Line::styled(next_label,Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
-            Line::raw("Tab — к действиям, Enter — открыть. Сохранение не запускает процесс.")];
+            Line::raw("Enter — открыть действие. Сохранение не запускает процесс.")];
         frame.render_widget(Paragraph::new(lines).block(tui_widgets::section(title,true)).wrap(Wrap{trim:true}),content);
         }
     } else if page == 1 {
-        draw_editor(frame, content, editor);
+        draw_editor(frame, content, editor, focus == WorkspaceFocus::Fields);
     } else if role == Role::Server && matches!(page, 2 | 3) {
         let users = editor.workspace_users();
         let selected = ui.map_or(0, |u| u.workspace_user).min(users.len().saturating_sub(1));
@@ -3843,10 +3855,7 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         panel(frame, content, pages(role)[page], description, true);
     }
     if controls.height > 0 {
-        Actions { items: &items, selected }.render(frame, controls);
-        if focus != WorkspaceFocus::Actions {
-            frame.render_widget(Paragraph::new(" Действия · F6 фокус ").style(Style::default().fg(MUTED).bg(SURFACE)), Rect::new(controls.x+1,controls.y,controls.width.saturating_sub(2),1));
-        }
+        Actions { items: &items, selected }.render_with_focus(frame, controls, focus == WorkspaceFocus::Actions);
     } else if focus == WorkspaceFocus::Actions && !items.is_empty() {
         Actions { items: &items, selected }.render(frame, area);
     }
@@ -3865,10 +3874,18 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
         return;
     };
     let page = ui.map_or(0, |u| u.workspace_page);
-    let categories = pages(role).iter().enumerate().map(|(i,label)| ListItem::new(format!("{} {label}", if i == page { "›" } else { " " })).style(if i == page { Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD) } else { Style::default().fg(TEXT) }));
+    let nav_focused = ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Navigation);
+    let categories = pages(role).iter().enumerate().map(|(i,label)| {
+        let current = i == page;
+        let marker = if current && nav_focused { "›" } else if current { "•" } else { " " };
+        let style = if current && nav_focused { Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD) }
+            else if current { Style::default().fg(ACCENT).add_modifier(Modifier::BOLD) }
+            else { Style::default().fg(TEXT) };
+        ListItem::new(format!("{marker} {label}")).style(style)
+    });
     frame.render_widget(
         List::new(categories.collect::<Vec<_>>()).block(
-            tui_widgets::section(" Разделы · F6 ", ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Navigation)),
+            tui_widgets::section(if nav_focused { " Разделы · ↑↓ Enter " } else { " Разделы " }, nav_focused),
         ),
         nav,
     );
@@ -3885,7 +3902,6 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
                 let style = if index == editor.workspace_selected() {
                     Style::default()
                         .fg(ACCENT)
-                        .bg(FOCUS)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -3893,7 +3909,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
                 ListItem::new(format!(
                     "{} {} {}{}",
                     if index == editor.workspace_selected() {
-                        "›"
+                        "•"
                     } else {
                         " "
                     },
@@ -3907,11 +3923,11 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
         let title = if role == Role::Server {
             " Подключения · j/k "
         } else {
-            " Профили · ↑↓ "
+            " Профили "
         };
         frame.render_widget(
             List::new(items).block(
-                tui_widgets::section(title, true),
+                tui_widgets::section(title, false),
             ),
             records,
         );
@@ -3943,14 +3959,14 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
 
 fn welcome_form(role: Role, selected: usize) -> Form {
     let (reality, description, lead) = match role {
-        Role::Server => ("Создать SmartTheia REALITY", "Для нового сервера без собственного TLS-сертификата", "Настраиваете сервер впервые? Выберите создание REALITY. Если Theia уже настроена, откройте существующий файл."),
-        Role::Client => ("Импорт SmartTheia REALITY", "У меня есть приглашение от администратора", "Настраиваете клиент впервые? Получите приглашение у администратора. Если профили уже сохранены, откройте их файл."),
+        Role::Server => ("Настроить новый сервер (REALITY)", "Рекомендуется: не нужен собственный TLS-сертификат", "Настраиваете сервер впервые? Выберите создание REALITY. Если Theia уже настроена, откройте существующий файл."),
+        Role::Client => ("Подключиться по приглашению", "Для SmartTheia REALITY: ссылка и файл допуска", "Настраиваете клиент впервые? Получите приглашение у администратора. Если профили уже сохранены, откройте их файл."),
     };
     Form {
         fields: vec![
-            Field { id: 0, label: "Открыть конфигурацию", value: "Выбрать существующий TOML".into(), hint: "Enter — выбрать путь. F3 — открыть файл." },
+            Field { id: 0, label: "Открыть сохранённые настройки", value: "У меня уже есть файл настроек (.toml)".into(), hint: "Enter — выбрать путь. F3 — открыть файл." },
             Field { id: 1, label: reality, value: description.into(), hint: "Enter — выбрать новый путь, затем открыть мастер." },
-            Field { id: 2, label: "Создать Own-TLS", value: "Расширенный вариант: свой сертификат".into(), hint: "Выбирайте только если администратор выдал необходимые TLS-данные." },
+            Field { id: 2, label: "Настроить вручную (Own-TLS)", value: "Расширенная настройка с сертификатом".into(), hint: "Выбирайте только если администратор выдал необходимые TLS-данные." },
         ],
         selected,
         lead: lead.into(),
@@ -4005,7 +4021,7 @@ fn editor_field_hit(area: Rect, editor: &Editor, x: u16, y: u16) -> Option<usize
     (offset < rows && start + offset < editor.workspace_fields().len()).then_some(start + offset)
 }
 
-fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
+fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool) {
     let dirty = if editor.write_uncertain() { "Не сохранено: запись не подтверждена" }
         else if editor.dirty() { "Не сохранено" } else { "Сохранено" };
     let state_color = if editor.write_uncertain() { ERROR } else if editor.dirty() { WARNING } else { MUTED };
@@ -4071,18 +4087,19 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     let label_width = (table_area.width / 2).clamp(12, 24);
     let value_width = table_area.width.saturating_sub(label_width + 5);
     let table_rows = fields.iter().enumerate().skip(start).take(rows).map(|(index, (_, value, selected))| {
-        let marker = if *selected { "› " } else { "  " };
-        let style = if *selected { Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD) }
+        let marker = if *selected && focused { "› " } else if *selected { "· " } else { "  " };
+        let style = if *selected && focused { Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD) }
+            else if *selected { Style::default().fg(TEXT).add_modifier(Modifier::BOLD) }
             else { Style::default().fg(TEXT) };
         let shown = tui_widgets::fit_value(value, value_width.saturating_sub(2), *selected && editor.editing);
         Row::new(vec![
             ratatui::widgets::Cell::from(format!("{marker}{}", labels[index])),
             ratatui::widgets::Cell::from(format!(" {shown}{}", if *selected && editor.editing { " ▏" } else { "" }))
-                .style(Style::default().bg(if reality { SURFACE } else if *selected { FOCUS } else { INPUT })),
+                .style(Style::default().bg(if reality { SURFACE } else if *selected && focused { FOCUS } else { INPUT })),
         ]).style(style)
     });
     let mut table = Table::new(table_rows, [Constraint::Length(label_width), Constraint::Min(1)])
-        .column_spacing(1).block(tui_widgets::section(title, true));
+        .column_spacing(1).block(tui_widgets::section(title, focused));
     if header { table = table.header(Row::new(["Настройка", "Значение"]).style(Style::default().fg(MUTED))); }
     frame.render_widget(table, table_area);
     if fields.is_empty() && table_area.height >= 3 {
@@ -5529,7 +5546,7 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(matches!(ui.issuance, Some(IssueFlow::Confirm(_))));
         let review = rendered_interaction(120, 40, &model, &ui);
-        assert!(review.contains("всех inbound"));
+        assert!(review.contains("всех подключений"));
         assert!(review.contains("CAS Apply"));
         assert!(!review.contains("theia://v1/"));
         let Config::Server(before) = config::read_file(&path).unwrap() else {
@@ -5625,7 +5642,7 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(matches!(ui.revocation, Some(DisableFlow::Confirm(_))));
         let before = rendered_interaction(120, 40, &model, &ui);
-        assert!(before.contains("всех inbound"));
+        assert!(before.contains("всех подключений"));
         assert!(!before.contains("theia://v1/"));
         let Config::Server(before_doc) = config::read_file(&path).unwrap() else {
             panic!("server");

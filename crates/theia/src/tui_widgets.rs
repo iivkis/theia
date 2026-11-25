@@ -328,21 +328,30 @@ impl Actions<'_> {
         (i < self.items.len()).then_some(i)
     }
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        self.render_with_focus(frame, area, true);
+    }
+
+    pub(crate) fn render_with_focus(&self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
         use ratatui::widgets::{List, ListItem};
         let selected = self.selected.min(self.items.len().saturating_sub(1));
         let rows = usize::from(area.height.saturating_sub(2));
         let items = self.items.iter().enumerate().skip(self.start(area)).take(rows).map(|(i, item)| {
-            let style = if i == selected {
+            let active = focused && i == selected;
+            let style = if active {
                 Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD)
+            } else if i == selected {
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
             } else { Style::default().fg(TEXT) };
+            let shortcut = if item.key == '4' { "F4".to_owned() } else { item.key.to_string() };
+            let label = fit_value(item.label, area.width.saturating_sub(9), false);
             ListItem::new(Line::from(vec![
-                Span::raw(if i == selected { " › " } else { "   " }),
-                Span::styled(format!(" {} ", item.key), Style::default().fg(if i == selected { BG } else { TEXT }).bg(if i == selected { ACCENT } else { INPUT })),
-                Span::raw(format!("  {}", item.label)),
+                Span::raw(if active { " › " } else if i == selected { " · " } else { "   " }),
+                Span::raw(label),
+                Span::styled(format!("  {shortcut}"), Style::default().fg(if active { ACCENT } else { MUTED })),
             ])).style(style)
         }).collect::<Vec<_>>();
         frame.render_widget(List::new(items).block(
-            section(" Действия · ↑↓ Enter ", true)
+            section(if focused { " Действия · ↑↓ Enter " } else { " Действия · Tab " }, focused)
         ), area);
     }
 }
