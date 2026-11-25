@@ -419,7 +419,8 @@ impl Menu {
         }
     }
 
-    pub(crate) fn body(&self, rows: usize) -> String {
+    #[cfg(test)]
+    fn body(&self, rows: usize) -> String {
         let groups = self.groups();
         let count = self.count();
         let selected = self.selected();
@@ -496,7 +497,10 @@ impl ConfigDialog {
         }
     }
     pub(crate) fn prefer_reality(&mut self) {
-        self.choice = 1;
+        self.prefer_mode(1);
+    }
+    pub(crate) fn prefer_mode(&mut self, choice: usize) {
+        self.choice = choice.min(2);
     }
     pub(crate) fn paste(&mut self, text: &str) {
         if let Some(panel) = self.enrollment.as_mut() {
