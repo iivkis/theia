@@ -23,8 +23,8 @@ use crate::{
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, EnableBracketedPaste, DisableMouseCapture, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -33,7 +33,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::{
@@ -85,7 +86,8 @@ impl TerminalGuard {
             io::stdout(),
             EnterAlternateScreen,
             Hide,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            EnableMouseCapture
         )?;
         Ok(guard)
     }
@@ -95,6 +97,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = execute!(
             io::stdout(),
+            DisableMouseCapture,
             DisableBracketedPaste,
             Show,
             LeaveAlternateScreen
@@ -304,7 +307,7 @@ impl RecordFlow {
                     };
                     body.push_str(&format!("{marker} {label}: {shown}\n"));
                 }
-                body.push_str("\nTab/Shift+Tab: поле; Ctrl+U: очистить; Enter: preview; Esc: отменить.\nВ скрытые поля вводите только ссылки, не секреты.");
+                body.push_str("\n↑↓ / Tab: поле; Ctrl+U: очистить; Enter: предпросмотр; Esc: отменить.\nВ скрытые поля вводите только ссылки, не секреты.");
                 body
             }
         }
@@ -630,6 +633,65 @@ impl Interaction {
         }
     }
 
+    /// Mouse interaction is confined to harmless selection and navigation.
+    /// No click is translated into a save, Apply, start, reveal or confirmation.
+    fn workspace_visible(&self) -> bool {
+        let clear = self.menu.is_none() && self.config_dialog.is_none()
+            && !self.show_server_process && self.traffic_monitor.is_none()
+            && self.issuance.is_none() && self.revocation.is_none()
+            && self.importing.is_none() && self.qr_scan.is_none()
+            && self.records.is_none() && self.discovery.is_none()
+            && self.candidates.is_none() && self.candidate_batch.is_none()
+            && self.domain.is_none() && self.probe.is_none()
+            && self.reality_provision.is_none() && self.reality_enrollment.is_none()
+            && self.reality_registration.is_none() && self.reality_status.is_none()
+            && self.runtime.is_none() && self.pending.is_none()
+            && self.saving.is_none() && self.exporting.is_none() && self.sharing.is_none()
+            && self.clipboard.is_none()
+            && !self.editor.as_ref().is_some_and(|e| e.editing);
+        #[cfg(windows)]
+        let clear = clear && self.system_proxy.is_none();
+        clear
+    }
+
+    fn mouse(&mut self, model: &mut Model, event: MouseEvent, area: Rect) {
+        if area.width < 32 || area.height < 10
+            || event.kind != MouseEventKind::Down(MouseButton::Left) { return; }
+        let body = shell_layout(area)[1];
+        if let Some(menu) = self.menu.as_mut() {
+            menu.click(body, event.column, event.row);
+            return;
+        }
+        if !self.workspace_visible() { return; }
+        let inside = |r: Rect| event.column >= r.x && event.column < r.right()
+            && event.row >= r.y && event.row < r.bottom();
+        if model.screen == Screen::Home {
+            let cards = home_layout(body);
+            if inside(cards[0]) { model.selected = Role::Server; }
+            if inside(cards[1]) { model.selected = Role::Client; }
+            return;
+        }
+        let Some(role) = Self::panel_role(model) else { return; };
+        let Some(columns) = workspace_columns(body) else { return; };
+        let nav = columns[0];
+        if inside(nav) && event.row > nav.y && event.row < nav.bottom().saturating_sub(1) {
+            let index = usize::from(event.row - nav.y - 1);
+            if index < Menu::categories(role).len() {
+                let mut menu = Menu::new(role, self.editor_for(role).is_some());
+                menu.select_category(index);
+                self.menu = Some(menu);
+            }
+            return;
+        }
+        let records = columns[1];
+        if inside(records) && event.row > records.y && event.row < records.bottom().saturating_sub(1) {
+            if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
+                let start = record_start(editor, records);
+                editor.workspace_select(start + usize::from(event.row - records.y - 1));
+            }
+        }
+    }
+
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press
             || self.saving.is_some()
@@ -892,7 +954,7 @@ impl Interaction {
                     self.open_config(role);
                     return false;
                 }
-                if key.code == KeyCode::F(10) {
+                if matches!(key.code, KeyCode::F(10) | KeyCode::F(2)) {
                     self.menu = Some(Menu::new(role, configured));
                     return false;
                 }
@@ -991,8 +1053,8 @@ impl Interaction {
                             }
                             Err(message) => editor.error = Some(message.into()),
                         },
-                        KeyCode::Tab => focus = (focus + 1) % fields.len(),
-                        KeyCode::BackTab => focus = (focus + fields.len() - 1) % fields.len(),
+                        KeyCode::Tab | KeyCode::Down => focus = (focus + 1) % fields.len(),
+                        KeyCode::BackTab | KeyCode::Up => focus = (focus + fields.len() - 1) % fields.len(),
                         KeyCode::Backspace => {
                             fields[focus].pop();
                         }
@@ -1504,6 +1566,7 @@ impl Interaction {
                     editor.accept();
                 }
                 KeyCode::Backspace => editor.backspace(),
+                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => editor.input.clear(),
                 KeyCode::Char(ch)
                     if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
                 {
@@ -1777,11 +1840,11 @@ impl Interaction {
                     editor.select_record(false);
                     return false;
                 }
-                KeyCode::Tab => {
+                KeyCode::Tab | KeyCode::Right => {
                     editor.select_field(true);
                     return false;
                 }
-                KeyCode::BackTab => {
+                KeyCode::BackTab | KeyCode::Left => {
                     editor.select_field(false);
                     return false;
                 }
@@ -1809,24 +1872,48 @@ impl Interaction {
     }
 }
 
+fn shell_layout(area: Rect) -> [Rect; 3] {
+    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(3)]).split(area);
+    [parts[0], parts[1], parts[2]]
+}
+
+fn home_layout(area: Rect) -> [Rect; 2] {
+    let parts = Layout::default().direction(if area.width >= 80 { Direction::Horizontal } else { Direction::Vertical })
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
+    [parts[0], parts[1]]
+}
+
+fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
+    if area.width < 100 || area.height < 12 { return None; }
+    let cols = Layout::horizontal([Constraint::Length(28), Constraint::Length(25), Constraint::Min(1)]).split(area);
+    Some([cols[0], cols[1], cols[2]])
+}
+
+fn record_start(editor: &Editor, rect: Rect) -> usize {
+    let rows = usize::from(rect.height.saturating_sub(2)).max(1);
+    editor.workspace_selected().saturating_sub(rows - 1)
+        .min(editor.record_count().saturating_sub(rows))
+}
+
 fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bool) {
-    let style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
+    frame.render_widget(Clear, area);
+    let style = Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray });
+    let rows: Vec<Line<'_>> = body.lines().map(|line| {
+        if line.starts_with("> ") || line.starts_with("› ") {
+            Line::styled(line, Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+        } else {
+            Line::raw(line)
+        }
+    }).collect();
+    // Keep the selected typed field visible in a short terminal. Unfocused
+    // text (including confirmation messages) always starts at the top.
+    let focus = body.lines().position(|line| line.starts_with("> ") || line.starts_with("› "));
+    let scroll = focus.map(|i| i.saturating_sub(usize::from(area.height.saturating_sub(5))))
+        .unwrap_or(0).min(usize::from(u16::MAX)) as u16;
     frame.render_widget(
-        Paragraph::new(body)
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(style),
-            )
-            .wrap(Wrap { trim: true }),
-        area,
+        Paragraph::new(rows)
+            .block(Block::default().title(title).borders(Borders::ALL).border_style(style))
+            .wrap(Wrap { trim: false }).scroll((scroll, 0)), area,
     );
 }
 
@@ -1840,14 +1927,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
         return;
     }
-    let parts = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(3),
-        ])
-        .split(area);
+    let parts = shell_layout(area);
     let header = match model.screen {
         Screen::Server => format!("THEIA  •  Сервер  |  {}", interaction.map(|ui| ui.server_process.status()).unwrap_or("Состояние неизвестно")),
         Screen::Client => {
@@ -1858,60 +1938,31 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         _ => "THEIA  •  Локальное управление".into(),
     };
     frame.render_widget(
-        Paragraph::new(header).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(Line::styled(header, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))),
         parts[0],
     );
     match model.screen {
         Screen::Home => {
-            let direction = if area.width >= 80 {
-                Direction::Horizontal
-            } else {
-                Direction::Vertical
-            };
-            let cards = Layout::default()
-                .direction(direction)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(parts[1]);
+            let cards = home_layout(parts[1]);
             panel(
                 frame,
                 cards[0],
                 "[1] Для сервера",
-                "Inbound и порты\nПользователи и права\nTLS и политика\nСтатус: не запрашивался",
+                "Управление входящими подключениями\nПользователи и приглашения\nЗапуск сервера, TLS и диагностика\n\nEnter: открыть выбранную панель",
                 model.selected == Role::Server,
             );
             panel(
                 frame,
                 cards[1],
                 "[2] Для клиента",
-                "Профили и подключения\nЛокальный HTTP/SOCKS5\nСистемный прокси Windows\nСтатус: не запрашивался",
+                "Импорт приглашений и профили\nПодключение и мониторинг трафика\nЛокальный HTTP/SOCKS5 и системный прокси\n\nEnter: открыть выбранную панель",
                 model.selected == Role::Client,
             );
         }
-        Screen::Server => {
-            if let Some(editor) = interaction.and_then(|ui| ui.editor_for(Role::Server)) {
-                draw_editor(frame, parts[1], editor);
-            } else {
-                panel(
-                    frame,
-                    parts[1],
-                    "Для сервера",
-                    "Конфигурация: не загружена\nInbound: данные не загружены\nRuntime: v запрашивает настоящий статус через native IPC; R проверяет готовность restart без применения\n\nEnter/F3: открыть серверный TOML\nF10: меню действий • F5: запуск/остановка\nБез файла изменения недоступны.",
-                    true,
-                );
-            }
-        }
-        Screen::Client => {
-            if let Some(editor) = interaction.and_then(|ui| ui.editor_for(Role::Client)) {
-                draw_editor(frame, parts[1], editor);
-            } else {
-                panel(
-                    frame,
-                    parts[1],
-                    "Для клиента",
-                    "Профиль: не выбран\nЛокальный прокси: состояние неизвестно\nТранспорт: не проверялся\nСистемный прокси Windows: не изменён\n\nEnter/F3: открыть клиентский TOML\nF10: меню действий\nПодключение и системный прокси не запускаются автоматически.",
-                    true,
-                );
-            }
+        Screen::Server | Screen::Client => {
+            let role = if model.screen == Screen::Server { Role::Server } else { Role::Client };
+            draw_workspace(frame, parts[1], role, interaction.and_then(|ui| ui.editor_for(role)));
         }
         Screen::Help => panel(
             frame,
@@ -1930,7 +1981,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(frame, parts[1], "Открыть конфигурацию", &dialog.body(), true);
     } else if let Some(menu) = interaction.and_then(|ui| ui.menu.as_ref()) {
         frame.render_widget(Clear, parts[1]);
-        panel(frame, parts[1], menu.title(), &menu.body(usize::from(parts[1].height)), true);
+        menu.render(frame, parts[1]);
     } else if let Some(ui) = interaction.filter(|ui| ui.show_server_process) {
         frame.render_widget(Clear, parts[1]);
         panel(frame, parts[1], "Сервер • запуск и остановка", &ui.server_process.body(), true);
@@ -1941,7 +1992,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(
             frame,
             parts[1],
-            "F-18: состояние REALITY",
+            "Подключение и состояние REALITY",
             &status.body(),
             true,
         );
@@ -1949,7 +2000,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(
             frame,
             parts[1],
-            "F-18: сохранить в общую конфигурацию",
+            "Регистрация материалов",
             &registration.body(),
             true,
         );
@@ -1957,7 +2008,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(
             frame,
             parts[1],
-            "F-18: импорт REALITY",
+            "Импорт REALITY",
             &enrollment.body(),
             true,
         );
@@ -1965,7 +2016,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(
             frame,
             parts[1],
-            "F-18: подготовка REALITY",
+            "Мастер REALITY",
             &provision.body(),
             true,
         );
@@ -1991,7 +2042,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 }
             }
         }
-        panel(frame, parts[1], "Управление записями TOML", &body, true);
+        panel(frame, parts[1], "Настройка записи", &body, true);
     } else if let Some(flow) = interaction.and_then(|ui| ui.issuance.as_ref()) {
         draw_issuance(
             frame,
@@ -2026,7 +2077,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(
             frame,
             parts[1],
-            "F-18: каталог HTTPS доменов, согласие DNS и pinned H2+H3",
+            "Каталог TLS-референсов",
             &domain.body(),
             true,
         );
@@ -2034,7 +2085,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(
             frame,
             parts[1],
-            "F-18: ручной список до 8 точных IP для TCP/H2 + UDP/H3",
+            "Проверка выбранных IP",
             &batch.body(),
             true,
         );
@@ -2042,7 +2093,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(
             frame,
             parts[1],
-            "F-18: группы кандидатов и ручная область CIDR (офлайн)",
+            "Области поиска референсов (офлайн)",
             &review.body(),
             true,
         );
@@ -2068,19 +2119,22 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         panel(
             frame,
             parts[1],
-            "F-07: системный прокси Windows",
+            "Системный прокси Windows",
             &proxy.body(),
             true,
         );
     }
-    let footer = match model.screen {
+    let footer = if interaction.is_some_and(|ui| !ui.workspace_visible()) {
+        "Активная операция  •  Используйте подсказки в панели; обычная навигация заблокирована"
+    } else { match model.screen {
         Screen::Home => "↑↓ / Tab: роль • Enter: открыть • F1: помощь • q: выход",
         Screen::Help => "Esc: назад",
-        Screen::Server => "F10: действия • F3: открыть TOML • F4: трафик • F5: сервер • Ctrl+S: сохранить",
-        Screen::Client => "F10: действия • F3: открыть TOML • F4: трафик • Ctrl+S: сохранить • Esc: назад",
-    };
+        Screen::Server => "F2/F10 Действия  ·  F3 Файл  ·  F4 Трафик  ·  F5 Сервер  ·  Ctrl+S Сохранить",
+        Screen::Client => "F2/F10 Действия  ·  F3 Файл  ·  F4 Трафик  ·  Ctrl+S Сохранить  ·  Esc Назад",
+    }};
     frame.render_widget(
-        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(footer).wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))),
         parts[2],
     );
 }
@@ -2329,33 +2383,81 @@ fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Opt
     panel(frame, area, title, &body, true);
 }
 
+fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<&Editor>) {
+    let Some([nav, records, details]) = workspace_columns(area) else {
+        if let Some(editor) = editor { draw_editor(frame, area, editor); }
+        else { draw_welcome(frame, area, role); }
+        return;
+    };
+    let categories = Menu::categories(role).into_iter().map(|label| ListItem::new(format!("  {label}")));
+    frame.render_widget(List::new(categories.collect::<Vec<_>>())
+        .block(Block::default().title(" Разделы · F2 ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))), nav);
+    if let Some(editor) = editor {
+        let start = record_start(editor, records);
+        let visible = usize::from(records.height.saturating_sub(2));
+        let items: Vec<_> = editor.workspace_records().into_iter().enumerate()
+            .skip(start).take(visible).map(|(index, (id, active, reality))| {
+                let style = if index == editor.workspace_selected() {
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else { Style::default() };
+                ListItem::new(format!("{} {} {}{}", if index == editor.workspace_selected() {"›"} else {" "},
+                    if reality {"R"} else {"T"}, id, if active {" *"} else {""})).style(style)
+            }).collect();
+        let title = if role == Role::Server {" Inbound · ↑↓ "} else {" Профили · ↑↓ "};
+        frame.render_widget(List::new(items).block(Block::default().title(title).borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))), records);
+        if editor.record_count() == 0 {
+            let inner = Rect::new(records.x + 1, records.y + 1, records.width.saturating_sub(2), records.height.saturating_sub(2));
+            frame.render_widget(Paragraph::new("Нет записей. Создайте через раздел действий.").wrap(Wrap {trim:true}),inner);
+        }
+        draw_editor(frame, details, editor);
+    } else {
+        panel(frame, records, " Записи ", "Конфигурация ещё не открыта.", false);
+        draw_welcome(frame, details, role);
+    }
+}
+
+fn draw_welcome(frame: &mut Frame<'_>, area: Rect, role: Role) {
+    let (title, body) = match role {
+        Role::Server => ("Для сервера", "Начало работы\n\n1. Откройте серверную конфигурацию (Enter или F3).\n2. Выберите inbound, пользователей и права.\n3. Проверьте сохранённые изменения перед Apply.\n\nF2: действия   F5: управление сервером\nRuntime не запускается автоматически."),
+        Role::Client => ("Для клиента", "Начало работы\n\n1. Откройте клиентскую конфигурацию (Enter или F3).\n2. Импортируйте приглашение или выберите профиль.\n3. Откройте управление подключением.\n\nF2: действия   F4: монитор трафика\nСистемный прокси не меняется автоматически."),
+    };
+    panel(frame, area, title, body, true);
+}
+
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
-    let dirty = if editor.dirty() {
-        "* Не сохранено"
+    let dirty = if editor.write_uncertain() {
+        "Не сохранено: запись не подтверждена"
+    } else if editor.dirty() {
+        "Не сохранено"
     } else {
         "Сохранено"
     };
+    let help = if editor.editing {
+        "Ввод · Ctrl+U очистить · Enter проверить · Esc отменить"
+    } else {
+        "↑↓ запись · ←→ / Tab поле · Enter изменить"
+    };
+    let mode = if editor.selected_reality() { "REALITY" } else { "Own-TLS" };
     let message = format!(
-        "{}  |  {}\n\n{}\nВыбранное поле: {}\n{}\n{}\n{}\n\nF10: меню всех действий. Сохранение не меняет runtime.",
-        editor.selection_summary(),
-        dirty,
-        editor.fields_overview(),
-        editor.field_name(),
-        if editor.editing {
-            "Ввод: символы/Backspace | Enter: проверить | Esc: отменить"
-        } else {
-            "↑/↓ или j/k: запись | Tab/Shift+Tab: поле | Enter/e: изменить | Ctrl+S: сохранить"
-        },
-        editor.notice,
-        editor.error.as_deref().unwrap_or(""),
+        "{}  |  {}\n{}\n\n{}Выбранное поле: {}\n{}\n{}\n{}",
+        editor.selection_summary(), dirty, mode, editor.fields_overview(), editor.field_name(),
+        help, editor.notice, editor.error.as_deref().unwrap_or(""),
     );
-    panel(
-        frame,
-        area,
-        if editor.role() == Role::Server { "Сервер • Редактор TOML" } else { "Клиент • Редактор TOML" },
-        &message,
-        true,
-    );
+    let title = if editor.editing { " Изменение поля " } else { " Параметры · Enter " };
+    panel(frame, area, title, &message, true);
+    if area.height >= 16 {
+        let y = area.bottom().saturating_sub(2);
+        let status = if editor.error.is_some() || editor.write_uncertain() {
+            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+        } else if editor.dirty() { Style::default().fg(Color::Yellow) }
+        else { Style::default().fg(Color::Green) };
+        let line = if editor.error.is_some() { "Есть ошибка · проверьте сообщение" } else if editor.dirty() {
+            "Черновик · Ctrl+S сохранить"
+        } else { "Файл сохранён · не означает Apply" };
+        frame.render_widget(Paragraph::new(line).style(status), Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1));
+    }
 }
 
 /// Edit only when both role and a config path are explicitly supplied.
@@ -2448,9 +2550,18 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
                         return Ok(());
                     }
                 }
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    interaction.mouse(&mut model, mouse, Rect::new(0, 0, size.width, size.height));
+                }
                 Event::Paste(text) => {
                     interaction.paste_record_field(&text);
                     interaction.paste_import_source(&text);
+                    if let Some(editor) = interaction.editor.as_mut().filter(|e| e.editing) {
+                        if !text.chars().any(char::is_control) {
+                            for ch in text.chars() { editor.insert(ch); }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -2586,6 +2697,32 @@ mod tests {
         assert!(!app.update(press(KeyCode::Esc)));
         assert_eq!(app.screen, Screen::Home);
         assert!(app.update(press(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn workspace_mouse_selects_role_without_entering_or_starting() {
+        let mut model = Model::new(None);
+        let mut ui = Interaction::new(None);
+        ui.mouse(&mut model, MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
+            column: 90, row: 5, modifiers: KeyModifiers::NONE }, Rect::new(0, 0, 120, 40));
+        assert_eq!(model.screen, Screen::Home);
+        assert_eq!(model.selected, Role::Client);
+        assert!(!ui.server_process.running());
+        assert!(ui.config_dialog.is_none());
+    }
+
+    #[test]
+    fn workspace_action_browser_is_discoverable_and_escape_returns() {
+        let mut model = Model::new(Some(Role::Server));
+        let mut ui = Interaction::new(None);
+        ui.update(&mut model, press(KeyCode::F(2)));
+        assert!(ui.menu.is_some());
+        let snapshot = rendered_interaction(120, 40, &model, &ui);
+        assert!(snapshot.contains("Разделы"));
+        assert!(snapshot.contains("Запуск / остановка"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.menu.is_none());
+        assert!(!ui.server_process.running());
     }
 
     #[test]
