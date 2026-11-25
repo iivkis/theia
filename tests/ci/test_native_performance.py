@@ -77,6 +77,24 @@ class NativeEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             checker.summarize(doc)
 
+    def test_diagnostic_policy_rejects_smoke_and_reports_regression(self):
+        policy = checker.load(Path(__file__).resolve().parents[1] / "benchmark" / "native-diagnostic-policy.json")
+        with self.assertRaises(ValueError):
+            checker.compare(checker.summarize(fixture()), policy)
+        doc = fixture()
+        doc["mode"] = "comparison"
+        doc["revisions"]["baseline"] = policy["baseline_revision"]
+        doc["binaries_sha256"]["baseline"] = "c" * 64
+        doc["repetitions"] = 3
+        extra = [dict(row, trial=2) for row in doc["rows"] if row["trial"] == 1]
+        doc["rows"].extend(extra)
+        result = checker.summarize(doc)
+        self.assertEqual(checker.compare(result, policy)["status"], "within_diagnostic_guardrails")
+        for row in result["summary"]:
+            if row["variant"] == "candidate":
+                row["throughput_bps"] *= .1
+        self.assertEqual(checker.compare(result, policy)["status"], "regression_observed")
+
     def test_json_duplicate_keys(self):
         with self.assertRaises(ValueError):
             checker.unique_object([("rows", []), ("rows", [])])

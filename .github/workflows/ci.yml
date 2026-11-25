@@ -471,6 +471,23 @@ jobs:
       - name: Provision Chromium on Windows
         if: runner.os == 'Windows'
         run: python -m playwright install chromium
+      - name: Checkout immutable stage-3 benchmark reference
+        uses: actions/checkout@v4
+        with:
+          ref: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d
+          path: .perf-baseline
+          persist-credentials: false
+      - name: Build exact native baseline before candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git -C .perf-baseline rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne 'abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d') { throw 'Wrong benchmark reference SHA' }
+          cargo build --manifest-path .perf-baseline/Cargo.toml --locked --bin theia --target-dir target
+          if ($LASTEXITCODE -ne 0) { throw 'Native baseline build failed' }
+          $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
+          Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "perf-baseline-$name")
+          "THEIA_PERF_BASELINE_BIN=$(Join-Path $env:RUNNER_TEMP "perf-baseline-$name")" >> $env:GITHUB_ENV
       - name: Verify Chromium navigation through the built Theia client
         run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5 -- --ignored --exact --nocapture
       - name: Verify Chromium navigation over the explicit Theia H3 transport
@@ -496,6 +513,20 @@ jobs:
         with:
           name: native-performance-${{ matrix.os }}
           path: native-performance.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Measure paired baseline and candidate H2/H3 native binaries
+        env:
+          THEIA_PERF_TESTED_SHA: ${{ needs.specification.outputs.tested_sha }}
+          THEIA_PERF_BASELINE_SHA: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d
+          THEIA_PERF_OUTPUT: ${{ github.workspace }}/native-comparison.json
+        run: cargo test --workspace --locked --test performance_evidence native_binary_performance_comparison -- --ignored --exact --nocapture
+      - name: Evaluate paired measurements against predeclared diagnostic policy
+        run: python tests/benchmark/check_native_performance.py native-comparison.json --expected-revision "${{ needs.specification.outputs.tested_sha }}" --expected-platform "${{ runner.os }}" --require-comparison --policy tests/benchmark/native-diagnostic-policy.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-comparison-${{ matrix.os }}
+          path: native-comparison.json
           if-no-files-found: error
           retention-days: 7
       - name: Build genuine Linux server for Windows cross-OS F-14 E2E

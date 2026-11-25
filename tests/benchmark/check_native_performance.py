@@ -155,16 +155,78 @@ def summarize(document, expected_revision=None, expected_platform=None):
                 binaries_sha256=binaries, acceptance="not_evaluated", summary=summary)
 
 
+def compare(summary, policy):
+    """Predeclared exploratory guardrails. This is not release approval."""
+    exact_keys(policy, {"schema", "scope", "baseline_revision", "min_pairs", "conditions",
+                        "min_throughput_ratio", "max_latency_p99_delta_ms",
+                        "max_open_p99_delta_ms", "max_cpu_delta_s", "max_rss_delta_bytes",
+                        "max_carrier_overhead_delta", "max_fairness_drop"})
+    require(type(policy["schema"]) is int and policy["schema"] == 1
+            and policy["scope"] == "diagnostic-only", "policy is not a diagnostic policy")
+    require(summary["mode"] == "comparison"
+            and summary["revisions"]["baseline"] == policy["baseline_revision"],
+            "wrong comparison reference")
+    minimum = integer(policy["min_pairs"], 3, 30)
+    require(set(policy["conditions"]) == CONDITIONS and len(policy["conditions"]) == 3,
+            "full impairment matrix required")
+    min_rate = number(policy["min_throughput_ratio"], True)
+    require(min_rate <= 1, "invalid throughput guardrail")
+    limits = {
+        "latency_ms_p99": number(policy["max_latency_p99_delta_ms"]),
+        "open_ms_p99": number(policy["max_open_p99_delta_ms"]),
+        "cpu_s": number(policy["max_cpu_delta_s"]),
+        "sampled_peak_rss_bytes": number(policy["max_rss_delta_bytes"]),
+        "carrier_overhead": number(policy["max_carrier_overhead_delta"]),
+    }
+    fairness_drop = number(policy["max_fairness_drop"])
+    require(fairness_drop <= 1, "invalid fairness guardrail")
+    expected = {(t,c,w) for t in ("h2","h3") for c in CONDITIONS
+                if not (t == "h2" and c == "udp-loss") for w in WORKLOADS}
+    rows = {}
+    for row in summary["summary"]:
+        key = (row["transport"], row["condition"], row["workload"])
+        require(key in expected and row["trials"] >= minimum, "insufficient comparison trials")
+        variants = rows.setdefault(key, {})
+        require(row["variant"] not in variants, "duplicate summary variant")
+        variants[row["variant"]] = row
+    require(set(rows) == expected and all(set(v) == VARIANTS for v in rows.values()),
+            "incomplete diagnostic comparison")
+    comparison = []
+    for key, pair in sorted(rows.items()):
+        a, b = pair["baseline"], pair["candidate"]
+        delta = {metric: b[metric] - a[metric] for metric in limits}
+        rate = b["throughput_bps"] / a["throughput_bps"]
+        fairness = a["fairness"] - b["fairness"]
+        violations = [metric for metric, limit in limits.items() if delta[metric] > limit]
+        if rate < min_rate:
+            violations.append("throughput_bps")
+        if fairness > fairness_drop:
+            violations.append("fairness")
+        comparison.append(dict(transport=key[0], condition=key[1], workload=key[2],
+                               throughput_ratio=rate, fairness_drop=fairness,
+                               deltas=delta, violations=violations))
+    return dict(status="regression_observed" if any(r["violations"] for r in comparison)
+                else "within_diagnostic_guardrails", comparisons=comparison,
+                acceptance="not_evaluated")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("evidence", type=Path)
     parser.add_argument("--expected-revision")
     parser.add_argument("--expected-platform")
-    parser.add_argument("--require-smoke", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--require-smoke", action="store_true")
+    modes.add_argument("--require-comparison", action="store_true")
+    parser.add_argument("--policy", type=Path)
     args = parser.parse_args()
     result = summarize(load(args.evidence), args.expected_revision, args.expected_platform)
     if args.require_smoke:
         require(result["mode"] == "smoke", "expected native same-binary smoke")
+    if args.require_comparison:
+        require(result["mode"] == "comparison", "expected separately built binaries")
+    if args.policy is not None:
+        result["diagnostic"] = compare(result, load(args.policy))
     print(json.dumps(result, allow_nan=False, indent=2))
 
 

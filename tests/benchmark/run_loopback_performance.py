@@ -358,6 +358,7 @@ def trial(binary, cert, key, transport, workload, condition):
     children = []
     sampler = None
     sampling_stop = threading.Event()
+    scratch = None
     try:
         origin = TCPFixture(Echo)
         http, socks = free_ports(), free_ports()
@@ -369,8 +370,9 @@ def trial(binary, cert, key, transport, workload, condition):
             if name.startswith("THEIA_"):
                 del env[name]
         env["THEIA_BENCH_TOKEN"] = base64.urlsafe_b64encode(token).decode().rstrip("=")
-        with tempfile.TemporaryDirectory(prefix="theia-perf-") as raw:
-            directory = Path(raw)
+        scratch = tempfile.TemporaryDirectory(prefix="theia-perf-")
+        if scratch:
+            directory = Path(scratch.name)
             config_files(directory, cert, key, target, witness.port, http, socks, transport, token)
             for role, port in (("server", target), ("client", http)):
                 child = subprocess.Popen([str(binary), role, "run", "--config",
@@ -430,6 +432,8 @@ def trial(binary, cert, key, transport, workload, condition):
         witness.close()
         if origin:
             origin.close()
+        if scratch:
+            scratch.cleanup()
 
 
 def sha256(path):
