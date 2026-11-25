@@ -80,6 +80,7 @@ def main():
                         "state_fixture":name.startswith("state-")})
     required = {"home-role-selection","help","server-page-overview","server-page-connections","server-page-users",
                 "client-page-overview","client-page-profiles","client-action-invitation-import","server-action-reality-wizard"}
+    required.update({"client-first-key-input", "client-first-key-trust", "client-first-key-save-review", "client-first-key-saved", "client-first-key-connect"})
     assert required <= {e["scenario"] for e in entries}
     hashes = {e["scenario"]: e["sha256"] for e in entries}
     assert hashes["server-action-server-process"] != hashes["server-page-connections"], "server process screenshot duplicates connections"

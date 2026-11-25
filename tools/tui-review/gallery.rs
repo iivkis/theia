@@ -26,6 +26,8 @@ fn visual_review_gallery() {
     let client = root.join("client.toml");
     std::fs::write(&server, server_issuance_fixture()).unwrap();
     std::fs::write(&client, include_str!("../../../examples/client.toml")).unwrap();
+    // Real first-run import through the production state machine, using a synthetic invitation.
+    first_key_import_fixture(&root.join("first-own-tls"), review_capture);
     let model = Model::new(None);
     let ui = Interaction::new(None);
     review_capture("home-role-selection", &model, &ui);
@@ -47,7 +49,7 @@ fn visual_review_gallery() {
         ui.update(&mut model, press(KeyCode::Down));
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(ui.config_dialog.is_some());
-        review_capture(&format!("{prefix}-first-run-reality"), &model, &ui);
+        review_capture(&format!("{prefix}-first-run-{}", if role == Role::Server { "reality" } else { "key-import" }), &model, &ui);
         assert!(!new_path.exists());
 
         let labels = if role == Role::Server {
