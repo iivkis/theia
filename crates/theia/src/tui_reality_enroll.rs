@@ -132,7 +132,13 @@ fn create_first_client(path: &Path, input: &Input, review: Review, now: u64) -> 
         identity_sha256: input.identity,
         id: crate::tui_editor::generated_id("profile").map_err(|_| Error::Storage)?,
     };
-    let candidate = reality_config::first_client_candidate(&request, now)?;
+    let candidate = match reality_config::first_client_candidate(&request, now) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            owned.cleanup()?;
+            return Err(error);
+        }
+    };
     match config::guarded_create(path, &candidate) {
         Ok(()) => owned.preserve(),
         Err(config::WriteFailure::BeforeReplace(_)) => {
@@ -627,6 +633,27 @@ mod tests {
         let profile = bootstrap::Profile::read(&input.profile).unwrap();
         assert!(profile.admission().is_ok());
         assert!(profile.load(1000).is_ok());
+
+        // Fresh configuration uses the same independent verification and
+        // does not require an existing or placeholder Own-TLS profile.
+        let cfg = dir.join("client.toml");
+        let root = dir.join("first-material");
+        input.profile = root.join("profile.toml");
+        input.trust = root.join("trust.toml");
+        let review = inspect(&input, 1000).unwrap();
+        assert!(!cfg.exists() && !root.exists());
+        let editor = create_first_client(&cfg, &input, review, 1000).unwrap();
+        assert!(editor.selected_reality());
+        let bytes = std::fs::read(&cfg).unwrap();
+        let crate::config::Config::Client(doc) = crate::config::parse(std::str::from_utf8(&bytes).unwrap()).unwrap() else {
+            panic!("client expected");
+        };
+        assert_eq!(doc.client.profiles.len(), 1);
+        assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
+        assert_eq!(doc.client.proxy.system_proxy, crate::config::SystemProxy::Off);
+        assert!(!String::from_utf8_lossy(&bytes).contains(uri.as_str()));
+        assert!(crate::tui_staged_material::StagedMaterial::create_for_new_config(&dir.join("second-material"), &cfg).is_err());
+        assert_eq!(std::fs::read(&cfg).unwrap(), bytes);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
