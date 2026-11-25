@@ -37,7 +37,7 @@ impl Form {
             area.x.saturating_add(1), area.y.saturating_add(1),
             area.width.saturating_sub(2), area.height.saturating_sub(2),
         );
-        let lead = if inner.height >= 10 && !self.lead.is_empty() { 2 } else { 0 };
+        let lead = if self.lead.is_empty() { 0 } else if inner.height >= 10 { 2 } else if inner.height >= 4 { 1 } else { 0 };
         let help = if inner.height >= 7 { 3 } else if inner.height >= 3 { 1 } else { 0 };
         let parts = Layout::vertical([
             Constraint::Length(lead), Constraint::Min(0), Constraint::Length(help),
@@ -110,6 +110,75 @@ impl Form {
             (self.error.as_str(), Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))
         };
         frame.render_widget(Paragraph::new(message).style(style).wrap(Wrap { trim: true }), g.help);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ActionItem {
+    pub key: char,
+    pub label: &'static str,
+}
+
+/// The selected action is only a navigation choice. Owners must dispatch
+/// through their existing key handlers, including all confirmation gates.
+pub(crate) struct Actions<'a> {
+    pub items: &'a [ActionItem],
+    pub selected: usize,
+}
+impl Actions<'_> {
+    fn start(&self, area: Rect) -> usize {
+        let rows = usize::from(area.height.saturating_sub(2)).max(1);
+        self.selected.min(self.items.len().saturating_sub(1))
+            .saturating_sub(rows.saturating_sub(1))
+            .min(self.items.len().saturating_sub(rows))
+    }
+    pub(crate) fn hit(&self, area: Rect, x: u16, y: u16) -> Option<usize> {
+        if x <= area.x || x >= area.right().saturating_sub(1)
+            || y <= area.y || y >= area.bottom().saturating_sub(1) {
+            return None;
+        }
+        let i = self.start(area) + usize::from(y - area.y - 1);
+        (i < self.items.len()).then_some(i)
+    }
+    pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        use ratatui::widgets::{List, ListItem};
+        let selected = self.selected.min(self.items.len().saturating_sub(1));
+        let rows = usize::from(area.height.saturating_sub(2));
+        let items = self.items.iter().enumerate().skip(self.start(area)).take(rows).map(|(i, item)| {
+            let style = if i == selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else { Style::default() };
+            ListItem::new(format!("{} {}: {}", if i == selected { "›" } else { " " }, item.key, item.label)).style(style)
+        }).collect::<Vec<_>>();
+        frame.render_widget(List::new(items).block(
+            Block::default().title(" Действия · ↑↓ Enter ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))
+        ), area);
+    }
+}
+
+pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
+    if count == 0 || area.height < 8 { return None; }
+    if area.width >= 104 {
+        let parts = Layout::horizontal([Constraint::Min(44), Constraint::Length(42)]).split(area);
+        Some([parts[0], parts[1]])
+    } else {
+        let height = (count as u16).saturating_add(2).min(area.height / 2).max(3);
+        let parts = Layout::vertical([Constraint::Min(4), Constraint::Length(height)]).split(area);
+        Some([parts[0], parts[1]])
+    }
+}
+
+pub(crate) fn action_key(items: &[ActionItem], focus: &mut usize, code: crossterm::event::KeyCode) -> Option<crossterm::event::KeyCode> {
+    use crossterm::event::KeyCode;
+    if items.is_empty() { return Some(code); }
+    *focus = (*focus).min(items.len() - 1);
+    match code {
+        KeyCode::Up | KeyCode::BackTab => { *focus = (*focus + items.len() - 1) % items.len(); None }
+        KeyCode::Down | KeyCode::Tab => { *focus = (*focus + 1) % items.len(); None }
+        KeyCode::Home => { *focus = 0; None }
+        KeyCode::End => { *focus = items.len() - 1; None }
+        KeyCode::Enter => Some(KeyCode::Char(items[*focus].key)),
+        other => Some(other),
     }
 }
 
