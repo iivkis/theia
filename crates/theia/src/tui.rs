@@ -18,7 +18,7 @@ use crate::{
     tui_reality_status::StatusPanel,
     tui_runtime::RuntimePanel,
     tui_server_process::ProcessPanel,
-    tui_widgets::{self, action_layout, Actions, Field, Form, ReferenceReview, ACCENT, BG, ERROR, FOCUS, MUTED, SURFACE, TEXT, WARNING},
+    tui_widgets::{self, action_layout, Actions, Field, Form, ReferenceReview, ACCENT, BG, ERROR, FOCUS, INPUT, MUTED, SURFACE, TEXT, WARNING},
     Role,
 };
 use crossterm::{
@@ -2198,7 +2198,7 @@ fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
     if area.width < 90 || area.height < 18 {
         return None;
     }
-    let cols = Layout::horizontal([Constraint::Length(28), Constraint::Length(2), Constraint::Min(1)]).split(area);
+    let cols = Layout::horizontal([Constraint::Length((area.width / 5).clamp(28, 40)), Constraint::Length(2), Constraint::Min(1)]).split(area);
     let left = Layout::vertical([Constraint::Length(8), Constraint::Min(1)]).split(cols[0]);
     Some([left[0], left[1], cols[2]])
 }
@@ -2314,7 +2314,7 @@ fn panel_at(
     viewport: Option<&Viewport>,
 ) {
     tui_widgets::canvas(frame, area);
-    let area = if viewport.is_some() { centered_column(area, 108) } else { area };
+    let area = if viewport.is_some() { centered_column(area, 132) } else { area };
     let page = usize::from(area.height.saturating_sub(2)).max(1);
     let (rows, focus) = visual_rows(body, usize::from(area.width.saturating_sub(2)));
     let count = rows.len();
@@ -2333,6 +2333,7 @@ fn panel_at(
         title.to_owned()
     };
     let visible: Vec<_> = rows.into_iter().skip(offset).take(page).collect();
+    let area = if viewport.is_some() { Rect::new(area.x, area.y, area.width, area.height.min((visible.len() as u16).saturating_add(2))) } else { area };
     frame.render_widget(
         Paragraph::new(visible).block(
             tui_widgets::section(&caption, focused),
@@ -2359,7 +2360,7 @@ fn guided_layout(area: Rect, count: Option<usize>, review_rows: usize) -> [Rect;
     if area.height < 10 {
         return [Rect::new(area.x, area.y, area.width, 0), area, Rect::new(area.x, area.bottom(), area.width, 0)];
     }
-    let footer = if area.width < 72 { 3 } else { 2 };
+    let footer = if area.width < 90 { 4 } else { 3 };
     let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(footer)]).split(area);
     [parts[0], parts[1], parts[2]]
 }
@@ -2408,7 +2409,7 @@ fn draw_guided(
         else { form.render(frame, parts[1], title); }
     } else if let Some(lines) = review_lines {
         // Same width as stepper and key bar: never re-center a nested report.
-        let body_area = Rect::new(parts[1].x + 2, parts[1].y, width, parts[1].height);
+        let body_area = Rect::new(parts[1].x.saturating_add(2), parts[1].y, parts[1].width.saturating_sub(4), parts[1].height);
         let page = usize::from(body_area.height.saturating_sub(1)).max(1);
         let count = lines.len();
         let offset = viewport.map_or(0, |v| v.position(&caption, count, page, None));
@@ -2689,7 +2690,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         "Shift+PgUp/PgDn прокрутка · Esc назад (если доступно)"
     } else {
         match model.screen {
-            Screen::Home => "↑↓ / Tab: роль • Enter: открыть • F1: помощь • q: выход",
+            Screen::Home => "↑↓ / Tab выбрать роль · Enter открыть · F1 помощь · q выход",
             Screen::Help => "Shift+PgUp/PgDn или колесо: прокрутка  ·  Esc назад",
             Screen::Server | Screen::Client if interaction.is_some_and(|ui| Interaction::panel_role(model).is_some_and(|role| ui.editor_for(role).is_none())) => {
                 "↑↓ выбрать · Enter продолжить · F2 все действия · Esc назад"
@@ -3058,7 +3059,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
         Role::Server => &["Сервер", "Подключения", "Пользователи", "REALITY", "Конфигурация"],
         Role::Client => &["Подключение", "Профили", "REALITY", "Конфигурация"],
     };
-    let categories = labels.iter().map(|label| ListItem::new(format!("  {label}")));
+    let categories = labels.iter().map(|label| ListItem::new(format!("  {label}  ›")));
     frame.render_widget(
         List::new(categories.collect::<Vec<_>>()).block(
             tui_widgets::section(" Разделы · F2 ", false),
@@ -3091,7 +3092,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
                         " "
                     },
                     if reality { "REALITY" } else { "TLS" },
-                    id,
+                    tui_widgets::fit_value(&id, records.width.saturating_sub(13), false),
                     if active { " *" } else { "" }
                 ))
                 .style(style)
@@ -3116,7 +3117,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
                 records.height.saturating_sub(2),
             );
             frame.render_widget(
-                Paragraph::new("Нет записей. Создайте через раздел действий.")
+                Paragraph::new("Пока ничего нет. N — создать, F2 — все действия.")
                     .wrap(Wrap { trim: true }),
                 inner,
             );
@@ -3136,8 +3137,8 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
 
 fn welcome_form(role: Role, selected: usize) -> Form {
     let (reality, description, lead) = match role {
-        Role::Server => ("Создать SmartTheia REALITY", "Мастер референсов, без своего сертификата", "Сервер не запущен этой панелью. IPC — отдельно."),
-        Role::Client => ("Импорт SmartTheia REALITY", "Создать профиль из приглашения", "Транспорт не проверялся. Системный прокси не изменён."),
+        Role::Server => ("Создать SmartTheia REALITY", "Мастер референсов, без своего сертификата", "Начните с создания подключения или откройте файл. Сервер не запущен этой панелью. IPC — отдельно."),
+        Role::Client => ("Импорт SmartTheia REALITY", "Создать профиль из приглашения", "Начните с приглашения или откройте файл. Транспорт не проверялся. Системный прокси не изменён."),
     };
     Form {
         fields: vec![
@@ -3162,22 +3163,26 @@ fn centered_column(area: Rect, max_width: u16) -> Rect {
     Rect::new(area.x + (area.width - width) / 2, area.y, width, area.height)
 }
 
-fn editor_layout(mut area: Rect) -> Option<[Rect; 4]> {
-    area.height = area.height.min(28);
-    area.width = area.width.min(116);
+fn editor_layout(area: Rect) -> Option<[Rect; 4]> {
     if area.height < 10 || area.width < 38 { return None; }
-    if area.height >= 26 && area.width >= 48 {
-        let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(7), Constraint::Length(8)]).split(area);
-        let form = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(parts[1]);
-        return Some([parts[0], form[0], form[1], parts[2]]);
+    // Four records at most: do not stretch a short form into an empty grid.
+    // On wide terminals, contextual guidance sits beside the parameters.
+    if area.width >= 92 && area.height >= 18 {
+        let parts = Layout::vertical([Constraint::Length(5), Constraint::Length(9), Constraint::Min(4)]).split(area);
+        let middle = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(parts[1]);
+        return Some([parts[0], middle[0], middle[1], parts[2]]);
     }
-    let parts = Layout::vertical([Constraint::Length(2), Constraint::Min(4), Constraint::Length(2), Constraint::Length(1)]).split(area);
+    if area.height >= 25 {
+        let parts = Layout::vertical([Constraint::Length(5), Constraint::Length(9), Constraint::Length(5), Constraint::Min(6)]).split(area);
+        return Some([parts[0], parts[1], parts[2], parts[3]]);
+    }
+    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(2), Constraint::Length(2)]).split(area);
     Some([parts[0], parts[1], parts[2], parts[3]])
 }
 
 fn editor_table_window(area: Rect, editor: &Editor) -> (usize, usize, bool) {
     let header = area.height >= 7;
-    let count = editor.field_count();
+    let count = editor.workspace_fields().len();
     let rows = usize::from(area.height.saturating_sub(if header { 3 } else { 2 }));
     let start = editor.workspace_field_index().saturating_sub(rows.saturating_sub(1)).min(count.saturating_sub(rows));
     (start, rows, header)
@@ -3191,116 +3196,126 @@ fn editor_field_hit(area: Rect, editor: &Editor, x: u16, y: u16) -> Option<usize
         return None;
     }
     let offset = usize::from(y - y0);
-    (offset < rows && start + offset < editor.field_count()).then_some(start + offset)
+    (offset < rows && start + offset < editor.workspace_fields().len()).then_some(start + offset)
 }
 
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
-    let dirty = if editor.write_uncertain() {
-        "Не сохранено: запись не подтверждена"
-    } else if editor.dirty() {
-        "Не сохранено"
-    } else {
-        "Сохранено"
-    };
-    let help = if editor.editing && !editor.choice_options().is_empty() {
-        "Ввод · ←→ / Пробел выбрать · Enter проверить · Esc отменить"
-    } else if editor.editing {
-        "Ввод · Ctrl+U очистить · Enter проверить · Esc отменить"
-    } else {
-        "↑↓ запись · ←→ / Tab поле · Enter изменить"
-    };
-    let mode = if editor.selected_reality() {
-        "REALITY"
-    } else {
-        "Own-TLS"
-    };
-    let users = if editor.role() == Role::Server {
+    let dirty = if editor.write_uncertain() { "Не сохранено: запись не подтверждена" }
+        else if editor.dirty() { "Не сохранено" } else { "Сохранено" };
+    let state_color = if editor.write_uncertain() { ERROR } else if editor.dirty() { WARNING } else { ACCENT };
+    let reality = editor.selected_reality();
+    let mode = if reality { "SmartTheia REALITY" } else { "Own-TLS" };
+    let server = editor.role() == Role::Server;
+    let users = if server {
         let users = editor.workspace_users();
         let granted = users.iter().filter(|(_, _, grant)| *grant).count();
-        let disabled = users
-            .iter()
-            .filter(|(_, disabled, grant)| *disabled && *grant)
-            .count();
-        format!("Пользователи: {granted} с доступом, {disabled} отключены\n")
-    } else {
-        String::new()
-    };
-    let actions = match editor.role() {
-        Role::Server => "N Новое подключение   W Мастер REALITY   F5 Сервер",
-        Role::Client => "N Новый профиль   i Импорт   V Подключение",
-    };
-    let message = format!(
-        "{}  ·  {}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        editor.selection_summary(),
-        dirty,
-        mode,
-        users.trim_end(),
-        editor.fields_overview().trim_end(),
-        editor.field_name(),
-        help,
-        editor.error.as_deref().unwrap_or(""),
-        editor.notice,
-        actions,
-    );
-    let title = if editor.error.is_some() {
-        " Ошибка · проверьте сообщение "
+        let disabled = users.iter().filter(|(_, disabled, grant)| *disabled && *grant).count();
+        format!("Пользователи: {} с действующим доступом · {} отключены", granted.saturating_sub(disabled), disabled)
+    } else { "Работа профиля проверяется отдельно от сохранения.".into() };
+    let help = if editor.editing && !editor.choice_options().is_empty() {
+        "←→ / Пробел выбрать · Enter проверить · Esc отменить"
     } else if editor.editing {
-        " Изменение поля "
-    } else {
-        " Параметры · Enter "
+        "Ctrl+U очистить · Enter проверить · Esc отменить"
+    } else if reality {
+        "←→ / Tab параметры · F2 управление REALITY"
+    } else { "←→ / Tab поле · Enter изменить" };
+    let actions = if server {
+        "W Мастер REALITY · N Новое подключение · F5 Сервер"
+    } else { "i Импорт приглашения · N Новый профиль · V Подключение" };
+    let secondary = if server {
+        "u Добавить пользователя · F2 Все действия · Ctrl+S Сохранить"
+    } else { "F2 Все действия · F4 Трафик · Ctrl+S Сохранить" };
+    let next = if editor.record_count() == 0 {
+        if server { "Создайте первое подключение (W или N)." } else { "Импортируйте приглашение (i) или создайте профиль (N)." }
+    } else if editor.write_uncertain() { "Откройте конфигурацию заново, прежде чем продолжать." }
+    else if editor.dirty() { "Сохраните изменения (Ctrl+S). Это не изменяет работающий процесс." }
+    else if server { "F5 — запустить или проверить сервер. u — выдать доступ пользователю." }
+    else { "V — открыть подключение и проверить его состояние." };
+    let title = if editor.editing { "Изменение параметра" }
+        else if reality { "Параметры · защищены" } else { "Параметры · Enter изменить" };
+    let fields = editor.workspace_fields();
+    let selected = fields.iter().find(|(_, _, selected)| *selected);
+    let friendly = match (server, editor.workspace_field_index()) {
+        (true, 0) => "Домен, используемый при проверке TLS.",
+        (true, 1) => "На каком адресе и порту сервер принимает TCP (HTTP/2).",
+        (true, _) => "На каком адресе и порту сервер принимает UDP (HTTP/3).",
+        (false, 0) => "Адрес и порт удалённого сервера.",
+        (false, 1) => "Имя сервера, используемое при проверке TLS.",
+        (false, 2) => "Автоматический выбор HTTP/2 или HTTP/3 либо ручной режим.",
+        (false, _) => "Режим передачи данных XHTTP. Обычно оставляют auto.",
     };
     let Some([overview, table_area, detail, bottom]) = editor_layout(area) else {
+        let message = format!("{dirty} · {mode}\n{}\n{}\n{}\n{}\n{}\n{}", editor.selection_summary(),
+            editor.fields_overview(), editor.error.as_deref().unwrap_or(""), editor.notice, next, actions);
         panel(frame, area, title, &message, true);
         return;
     };
-    let wide = area.height >= 26 && area.width >= 48;
-    let state_color = if editor.write_uncertain() { ERROR } else if editor.dirty() { WARNING } else { ACCENT };
+    let heading = if server { "Подключение сервера" } else { "Профиль клиента" };
     let status = vec![
-        Line::from(vec![Span::styled(dirty, Style::default().fg(state_color).add_modifier(Modifier::BOLD)), Span::raw(format!(" · {mode}"))]),
+        Line::from(vec![Span::styled(format!(" {dirty} "), Style::default().fg(BG).bg(state_color).add_modifier(Modifier::BOLD)), Span::raw(format!("  {mode}"))]),
         Line::raw(editor.selection_summary()),
-        Line::raw(users.trim_end().to_owned()),
+        Line::styled(users, Style::default().fg(MUTED)),
     ];
-    let widget = Paragraph::new(status);
-    if wide {
-        frame.render_widget(widget.block(tui_widgets::section("Обзор", false)), overview);
-    } else {
-        frame.render_widget(widget, overview);
-    }
-    let (start, rows, header) = editor_table_window(table_area, editor);
-    let table_rows = editor.workspace_fields().into_iter().skip(start).take(rows).map(|(label, value, selected)| {
-        let marker = if selected { "› " } else { "  " };
-        let style = if selected {
-            Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD)
-        } else { Style::default() };
-        Row::new(vec![format!("{marker}{label}"), value]).style(style)
-    });
-    let mut table = Table::new(table_rows, [Constraint::Length(17), Constraint::Min(1)])
-        .column_spacing(2)
-        .block(tui_widgets::section(title, true));
-    if header {
-        table = table.header(Row::new(["Параметр", "Значение"]).style(Style::default().fg(TEXT)));
-    }
-    frame.render_widget(table, table_area);
-    let error = editor.error.as_deref();
-    if wide {
-        let field_detail = if editor.editing && !editor.choice_options().is_empty() {
-            let choices = editor.choice_options().iter().map(|value| {
-                if *value == editor.input.as_str() { format!("[● {value}]") } else { format!("[○ {value}]") }
-            }).collect::<Vec<_>>().join("  ");
-            format!("{choices}\n{help}")
-        } else {
-            format!("{}\n{help}", editor.field_name())
-        };
-        panel(frame, detail, "Поле", &field_detail, false);
-        let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(bottom);
-        panel(frame, parts[0], "Состояние", &format!("{}\n{}", error.unwrap_or(""), editor.notice), false);
-        panel(frame, parts[1], "Действия", actions, false);
-    } else {
-        let hint = error.unwrap_or(help);
-        frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: true }).style(Style::default().fg(if error.is_some() { ERROR } else { TEXT })), detail);
-        frame.render_widget(Paragraph::new(actions).style(Style::default().fg(ACCENT)), bottom);
-    }
+    frame.render_widget(Paragraph::new(status).block(tui_widgets::section(heading, false)), overview);
 
+    let (start, rows, header) = editor_table_window(table_area, editor);
+    let labels = if server { ["Домен TLS", "Адрес TCP (H2)", "Адрес UDP (H3)", ""] }
+        else { ["Адрес (Endpoint)", "Домен (TLS SNI)", "Транспорт", "Режим XHTTP"] };
+    let label_width = (table_area.width / 2).clamp(12, 24);
+    let value_width = table_area.width.saturating_sub(label_width + 5);
+    let table_rows = fields.iter().enumerate().skip(start).take(rows).map(|(index, (_, value, selected))| {
+        let marker = if *selected { "› " } else { "  " };
+        let style = if *selected { Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD) }
+            else { Style::default().fg(TEXT) };
+        let shown = tui_widgets::fit_value(value, value_width.saturating_sub(2), *selected && editor.editing);
+        Row::new(vec![
+            ratatui::widgets::Cell::from(format!("{marker}{}", labels[index])),
+            ratatui::widgets::Cell::from(format!(" {shown}{}", if *selected && editor.editing { " ▏" } else { "" }))
+                .style(Style::default().bg(if *selected { FOCUS } else { INPUT })),
+        ]).style(style)
+    });
+    let mut table = Table::new(table_rows, [Constraint::Length(label_width), Constraint::Min(1)])
+        .column_spacing(1).block(tui_widgets::section(title, true));
+    if header { table = table.header(Row::new(["Настройка", "Значение"]).style(Style::default().fg(MUTED))); }
+    frame.render_widget(table, table_area);
+    if fields.is_empty() && table_area.height >= 3 {
+        frame.render_widget(Paragraph::new("Нет записей.").style(Style::default().fg(MUTED)),
+            Rect::new(table_area.x + 1, table_area.y + 1, table_area.width.saturating_sub(2), 1));
+    }
+    let choices = if editor.editing && !editor.choice_options().is_empty() {
+        editor.choice_options().iter().map(|value| if *value == editor.input.as_str() { format!("[● {value}]") } else { format!("[○ {value}]") }).collect::<Vec<_>>().join("  ")
+    } else { String::new() };
+    let context = if reality { "Параметры закреплены при регистрации. Изменения доверия выполняются отдельно." }
+        else { friendly };
+    let error = editor.error.as_deref();
+    if detail.height >= 5 {
+        let detail_lines = vec![
+            Line::styled(selected.map_or("Параметр", |(label, _, _)| *label), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            Line::styled(context, Style::default().fg(MUTED)),
+            Line::styled(choices, Style::default().fg(ACCENT)),
+            Line::styled(help, Style::default().fg(TEXT)),
+        ];
+        frame.render_widget(Paragraph::new(detail_lines).block(tui_widgets::section("Что это значит", false)).wrap(Wrap { trim: true }), detail);
+    } else {
+        frame.render_widget(Paragraph::new(error.unwrap_or(help)).style(Style::default().fg(if error.is_some() { ERROR } else { TEXT })).wrap(Wrap { trim: true }), detail);
+    }
+    let mut lines = Vec::new();
+    if let Some(error) = error {
+        lines.push(Line::styled(format!("Ошибка: {error}"), Style::default().fg(ERROR).add_modifier(Modifier::BOLD)));
+    }
+    if !editor.notice.is_empty() {
+        lines.push(Line::styled(editor.notice.as_str(), Style::default().fg(MUTED)));
+    }
+    lines.push(Line::styled(next, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)));
+    lines.push(tui_widgets::key_line(actions));
+    lines.push(tui_widgets::key_line(secondary));
+    if bottom.height >= 5 {
+        let height = bottom.height.min(10);
+        frame.render_widget(Paragraph::new(lines).block(tui_widgets::section("Что дальше", false)).wrap(Wrap { trim: true }),
+            Rect::new(bottom.x, bottom.y, bottom.width, height));
+    } else {
+        frame.render_widget(Paragraph::new(vec![tui_widgets::key_line(actions), tui_widgets::key_line(secondary)]).wrap(Wrap { trim: true }), bottom);
+    }
 }
 
 /// Edit only when both role and a config path are explicitly supplied.
@@ -3554,6 +3569,25 @@ mod tests {
         let (rows, _) = visual_rows("one two three four", 5);
         assert!(rows.len() >= 4);
         assert!(rows.iter().all(|row| row.width() <= 5));
+    }
+
+    #[test]
+    fn workspace_geometry_keeps_short_forms_compact_and_uses_wide_terminal() {
+        let area = Rect::new(0, 0, 240, 70);
+        let [_, _, workspace] = workspace_columns(area).unwrap();
+        let [overview, fields, context, actions] = editor_layout(workspace).unwrap();
+        assert_eq!(overview.width, workspace.width);
+        assert_eq!(fields.height, 9);
+        assert_eq!(fields.right(), context.x);
+        assert_eq!(fields.width + context.width, workspace.width);
+        assert_eq!(actions.y, fields.bottom());
+        assert!(actions.bottom() <= workspace.bottom());
+        for (width, height) in [(60, 20), (80, 24), (120, 40)] {
+            let area = Rect::new(0, 0, width, height);
+            for rect in editor_layout(area).unwrap() {
+                assert!(rect.right() <= area.right() && rect.bottom() <= area.bottom());
+            }
+        }
     }
 
     #[test]
@@ -3844,7 +3878,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(picture.contains("Не сохранено"));
-        assert!(picture.contains("client.profiles[0].server"));
+        assert!(picture.contains("Адрес (Endpoint)"));
         assert!(!picture.contains("THEIA_AUTH_TOKEN"));
         fs::remove_file(path).unwrap();
     }

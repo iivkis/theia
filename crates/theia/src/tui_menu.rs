@@ -63,7 +63,7 @@ const SERVER: &[Group] = &[
                 "Запуск / остановка локального сервера",
                 Action::ServerProcess,
             ),
-            always("Статус работающего сервера / Apply / Rollback", key('v')),
+            always("Проверить сервер / применить / откатить", key('v')),
             always("Монитор трафика этого процесса", Action::Traffic),
             always("Проверить готовность к перезапуску", key('R')),
         ],
@@ -71,16 +71,16 @@ const SERVER: &[Group] = &[
     Group {
         title: "Входящие подключения",
         entries: &[
-            entry("Создать подключение Own-TLS / REALITY", key('N')),
+            entry("Создать подключение (выбор защиты)", key('N')),
             always("Мастер REALITY (новое подключение)", key('W')),
             entry(
-                "Изменить выбранное поле inbound",
+                "Изменить выбранный параметр",
                 Action::Shortcut(KeyCode::Enter, KeyModifiers::NONE),
             ),
             entry("Изменить сертификат / ключ Own-TLS", key('E')),
-            entry("Назначить пользователей и права", key('G')),
+            entry("Выбрать пользователей с доступом", key('G')),
             entry("Настроить лимиты соединений", key('Q')),
-            entry("Удалить выбранный inbound", key('D')),
+            entry("Удалить выбранное подключение", key('D')),
             entry("Сохранить изменения", ctrl('s')),
         ],
     },
@@ -92,7 +92,7 @@ const SERVER: &[Group] = &[
             entry("Обновить токен пользователя", key('t')),
             entry("Отключить пользователя", key('x')),
             entry("Восстановить доступ с новым токеном", key('b')),
-            entry("Удалить пользователя без назначенных прав", key('U')),
+            entry("Удалить пользователя без доступа", key('U')),
         ],
     },
     Group {
@@ -320,7 +320,7 @@ impl Menu {
                 } else { (self.groups()[i].title, true) };
                 let style = if i == selected { Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD) }
                     else if !enabled { Style::default().fg(MUTED) } else { Style::default() };
-                ListItem::new(format!("{} {label}{}", if i == selected { "›" } else { " " }, if enabled { "" } else { " [TOML]" })).style(style)
+                ListItem::new(format!("{} {label}{}", if i == selected { "›" } else { " " }, if enabled { "" } else { " [нужен файл]" })).style(style)
             }).collect::<Vec<_>>();
             let title = if self.item.is_some() { self.groups()[self.group].title } else { self.title() };
             frame.render_widget(List::new(items).block(tui_widgets::section(&format!("{title} · {}/{}", selected + 1, count), true)), parts[0]);
@@ -361,7 +361,7 @@ impl Menu {
                     ListItem::new(Line::from(vec![
                         Span::raw(if i == selected { " › " } else { "   " }),
                         Span::raw(label),
-                        Span::raw(if enabled { "" } else { " [TOML]" }),
+                        Span::raw(if enabled { "" } else { " [нужен файл]" }),
                     ]))
                     .style(style)
                 })

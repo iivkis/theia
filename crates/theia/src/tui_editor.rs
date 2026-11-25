@@ -59,20 +59,20 @@ impl RecordAction {
     pub(crate) fn fields(self) -> &'static [(&'static str, bool)] {
         match self {
             Self::NewInbound => &[
-                ("ID", false),
-                ("TCP/UDP bind", false),
-                ("TLS SNI", false),
-                ("cert (file:)", true),
-                ("key (file:)", true),
-                ("Grants (ID через запятую)", false),
+                ("Название / ID", false),
+                ("Адрес прослушивания TCP/UDP", false),
+                ("Домен TLS (SNI)", false),
+                ("Файл сертификата (file:)", true),
+                ("Файл закрытого ключа (file:)", true),
+                ("Доступ: ID пользователей через запятую", false),
             ],
             Self::NewProfile => &[
-                ("ID", false),
-                ("Endpoint", false),
-                ("TLS SNI", false),
-                ("CA (file:)", true),
-                ("Credential (env:/file:)", true),
-                ("XHTTP path prefix", false),
+                ("Название / ID", false),
+                ("Адрес сервера", false),
+                ("Домен TLS (SNI)", false),
+                ("Файл доверенного CA (file:)", true),
+                ("Ссылка на токен (env:/file:)", true),
+                ("Путь XHTTP", false),
             ],
             Self::SetGrants => &[("Grants (ID через запятую)", false)],
             Self::SetQuota => &[("На пользователя", false), ("Всего", false)],
@@ -1349,7 +1349,7 @@ impl Editor {
 
     pub fn begin(&mut self) {
         if self.selected_reality() {
-            self.error = Some("REALITY: endpoint, bind и policy закреплены при регистрации; требуется отдельное подтверждение доверия, не обычная правка TLS.".into());
+            self.error = Some("Параметры REALITY защищены от обычной правки. Откройте F2 → REALITY: обслуживание для изменения с подтверждением доверия.".into());
             return;
         }
         if self.write_uncertain {

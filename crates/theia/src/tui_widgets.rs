@@ -10,10 +10,10 @@ use ratatui::{
 
 // One restrained, terminal-independent dark palette. Colour is supplementary:
 // focus, warning, selected and disabled states also have textual markers.
-pub(crate) const BG: Color = Color::Rgb(19, 23, 31);
-pub(crate) const SURFACE: Color = Color::Rgb(30, 37, 48);
-pub(crate) const INPUT: Color = Color::Rgb(40, 49, 63);
-pub(crate) const FOCUS: Color = Color::Rgb(46, 65, 70);
+pub(crate) const BG: Color = Color::Rgb(17, 22, 30);
+pub(crate) const SURFACE: Color = Color::Rgb(27, 34, 46);
+pub(crate) const INPUT: Color = Color::Rgb(42, 53, 70);
+pub(crate) const FOCUS: Color = Color::Rgb(39, 76, 82);
 pub(crate) const TEXT: Color = Color::Rgb(224, 231, 239);
 pub(crate) const MUTED: Color = Color::Rgb(158, 173, 190);
 pub(crate) const ACCENT: Color = Color::Rgb(121, 219, 184);
@@ -39,9 +39,12 @@ pub(crate) fn key_line(keys: &str) -> Line<'_> {
     let mut spans = Vec::new();
     for (i, part) in keys.split(" · ").enumerate() {
         if i > 0 { spans.push(Span::raw("  ")); }
+        let part = part.trim();
+        if part.is_empty() { continue; }
         let (key, label) = part.split_once(' ').unwrap_or((part, ""));
+        let key = key.trim_end_matches(':');
         let primary = matches!(key, "Enter" | "Y" | "y");
-        spans.push(Span::styled(format!(" {key} "), Style::default().fg(BG).bg(if primary { ACCENT } else { MUTED }).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!(" {key} "), Style::default().fg(if primary { BG } else { TEXT }).bg(if primary { ACCENT } else { INPUT }).add_modifier(Modifier::BOLD)));
         if !label.is_empty() { spans.push(Span::styled(format!(" {label}"), Style::default().fg(TEXT))); }
     }
     Line::from(spans)
@@ -91,7 +94,7 @@ impl Form {
         let end = (start + capacity).min(count);
         let title = Rect::new(inner.x, inner.y, inner.width, title_h);
         let lead = Rect::new(inner.x, title.bottom(), inner.width, lead_h);
-        let rows_width = if side { inner.width.saturating_sub(34) } else { inner.width };
+        let rows_width = if side { inner.width.saturating_sub(34).min(80) } else { inner.width };
         let rows = Rect::new(inner.x, lead.bottom(), rows_width, (end - start) as u16 * stride);
         let help = if side {
             Rect::new(rows.right().saturating_add(3), rows.y, 31, room.min(12))
@@ -133,13 +136,13 @@ impl Form {
             let selected = field.id == self.selected;
             let rect = Rect::new(g.rows.x, g.rows.y + (offset as u16) * g.stride, g.rows.width, g.stride);
             let marker = if selected { "▎ " } else { "  " };
-            let label = format!("{marker}{}", field.label);
+            let label = if picker { format!("{marker}{}  {}", if selected { "●" } else { "○" }, field.label) } else { format!("{marker}{}", field.label) };
             let value = if field.value.is_empty() { "Введите значение" } else { field.value.as_str() };
             let label_style = Style::default().fg(if selected { ACCENT } else { TEXT }).add_modifier(Modifier::BOLD);
             let value_style = Style::default().fg(if field.value.is_empty() || picker { MUTED } else { TEXT })
                 .bg(if selected { FOCUS } else if picker { BG } else { INPUT });
             if picker && g.stride >= 2 {
-                let style = label_style.bg(if selected { FOCUS } else { BG });
+                let style = label_style.bg(if selected { FOCUS } else { SURFACE });
                 frame.render_widget(Paragraph::new(label).style(style), Rect::new(rect.x, rect.y, rect.width, 1));
                 frame.render_widget(Paragraph::new(format!("  {}", fit_value(value, rect.width.saturating_sub(2), false))).style(value_style),
                     Rect::new(rect.x, rect.y + 1, rect.width, 1));
@@ -170,9 +173,9 @@ impl Form {
                     Line::styled(field.map_or("", |f| f.label), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
                     Line::styled(message, Style::default().fg(color)),
                 ];
-                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), g.help);
+                frame.render_widget(Paragraph::new(lines).style(Style::default().bg(SURFACE)).wrap(Wrap { trim: true }), g.help);
             } else {
-                frame.render_widget(Paragraph::new(message).style(Style::default().fg(color)).wrap(Wrap { trim: true }), g.help);
+                frame.render_widget(Paragraph::new(message).style(Style::default().fg(color).bg(SURFACE)).wrap(Wrap { trim: true }), g.help);
             }
         }
     }
@@ -300,7 +303,11 @@ impl Actions<'_> {
             let style = if i == selected {
                 Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD)
             } else { Style::default().fg(TEXT) };
-            ListItem::new(format!("{} {}: {}", if i == selected { "›" } else { " " }, item.key, item.label)).style(style)
+            ListItem::new(Line::from(vec![
+                Span::raw(if i == selected { " › " } else { "   " }),
+                Span::styled(format!(" {} ", item.key), Style::default().fg(if i == selected { BG } else { TEXT }).bg(if i == selected { ACCENT } else { INPUT })),
+                Span::raw(format!("  {}", item.label)),
+            ])).style(style)
         }).collect::<Vec<_>>();
         frame.render_widget(List::new(items).block(
             section(" Действия · ↑↓ Enter ", true)
@@ -311,7 +318,7 @@ impl Actions<'_> {
 pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
     if count == 0 || area.height < 8 { return None; }
     if area.width >= 104 {
-        let parts = Layout::horizontal([Constraint::Min(44), Constraint::Length(42)]).split(area);
+        let parts = Layout::horizontal([Constraint::Min(44), Constraint::Length((area.width / 3).clamp(42, 64))]).split(area);
         Some([parts[0], parts[1]])
     } else {
         let height = (count as u16).saturating_add(2).min(area.height / 2).max(3);
@@ -335,7 +342,7 @@ pub(crate) fn action_key(items: &[ActionItem], focus: &mut usize, code: crosster
 }
 
 /// Keep the typed end visible for long inputs without splitting Unicode.
-fn fit_value(value: &str, width: u16, tail: bool) -> String {
+pub(crate) fn fit_value(value: &str, width: u16, tail: bool) -> String {
     let clean: String = value.chars().map(|c| if c.is_control() { '�' } else { c }).collect();
     let width = usize::from(width);
     if Span::raw(clean.as_str()).width() <= width { return clean; }
