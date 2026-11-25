@@ -492,6 +492,7 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
         ],
         (Role::Client, 0) => &[
             ('P', "Режим подключения"),
+            ('L', "Выбрать другой профиль"),
             ('i', "Импорт ключа Theia"),
             ('V', "Локальный прокси"),
             ('N', "Новый профиль"),
@@ -514,11 +515,13 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
         (Role::Client, 3) if cfg!(windows) => &[
             ('p', "Включить / выключить системный прокси"),
             ('V', "Запустить / остановить локальный прокси"),
+            ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
             ('i', "Добавить ключ"),
         ],
         (Role::Client, 3) => &[
             ('V', "Запустить / остановить локальный прокси"),
+            ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
             ('i', "Добавить ключ"),
         ],
@@ -563,6 +566,7 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
                 (_, 'E') => has_record && !reality,
                 (Role::Server, 'D') => editor.record_count() > 1,
                 (Role::Client, 'D' | 'A') => has_record && !active,
+                (Role::Client, 'L') => editor.record_count() > 1,
                 (Role::Server, 'b') => can_recover,
                 (Role::Server, 'x' | 't') => can_rotate,
                 _ => true,
@@ -583,7 +587,7 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
             // and the everyday entry points; the dedicated sections retain the
             // rest of the operations.
             let overview = page != 0
-                || matches!((role, key), (Role::Server, 's' | 'N' | 'u') | (Role::Client, 'P' | 'i'))
+                || matches!((role, key), (Role::Server, 's' | 'N' | 'u') | (Role::Client, 'P' | 'i' | 'L'))
                 || key == recommended_step(editor, false).0
                 || key == recommended_step(editor, true).0;
             (available && overview).then_some(ActionItem { key, label })
@@ -1117,7 +1121,11 @@ impl Interaction {
                     self.workspace_focus = WorkspaceFocus::Records;
                 }
             }
-            (WorkspaceFocus::Navigation, KeyCode::Right) => self.workspace_focus = detail,
+            (WorkspaceFocus::Navigation, KeyCode::Right) => {
+                self.workspace_focus = if self.workspace_page == 1 && count > 0 {
+                    WorkspaceFocus::Records
+                } else { detail };
+            }
             (WorkspaceFocus::Records, KeyCode::Up) if record == 0 => {
                 self.workspace_focus = WorkspaceFocus::Navigation;
             }
@@ -1678,9 +1686,10 @@ impl Interaction {
             if self.workspace_focus == WorkspaceFocus::Records {
                 if inside(body) && event.row > body.y && event.row < body.bottom().saturating_sub(1) {
                     if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
-                        let start = record_start(editor, body);
-                        editor.workspace_select(start + usize::from(event.row - body.y - 1));
-                        self.workspace_user = 0;
+                        if let Some((index, _)) = record_rows(editor, body).get(usize::from(event.row - body.y - 1)) {
+                            editor.workspace_select(*index);
+                            self.workspace_user = 0;
+                        }
                     }
                     self.workspace_action = if self.workspace_page == 0 { self.recommended_action(role) } else { 0 };
                 }
@@ -1756,9 +1765,10 @@ impl Interaction {
             && event.row < records.bottom().saturating_sub(1)
         {
             if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
-                let start = record_start(editor, records);
-                editor.workspace_select(start + usize::from(event.row - records.y - 1));
-                self.workspace_user = 0;
+                if let Some((index, _)) = record_rows(editor, records).get(usize::from(event.row - records.y - 1)) {
+                    editor.workspace_select(*index);
+                    self.workspace_user = 0;
+                }
             }
             self.workspace_action = if self.workspace_page == 0 {
                 self.recommended_action(role)
@@ -2255,6 +2265,14 @@ impl Interaction {
                         };
                         return false;
                     }
+                    if key.code == KeyCode::F(7) && self.workspace_focus == WorkspaceFocus::Records {
+                        if let Some(editor) = self.editor_for(role) {
+                            let id = editor.selected_record_id();
+                            self.preview_text = Some(editor.client_profile_label(id).unwrap_or_else(|| id.to_owned()));
+                            self.value_preview = true;
+                        }
+                        return false;
+                    }
                     if key.code == KeyCode::F(7) && self.workspace_page == 1 {
                         self.value_preview = true;
                         return false;
@@ -2320,7 +2338,9 @@ impl Interaction {
                                 {
                                     WorkspaceFocus::Users
                                 } else if self.workspace_page == 1 {
-                                    WorkspaceFocus::Fields
+                                    if self.editor_for(role).is_some_and(|e| e.record_count() > 0) {
+                                        WorkspaceFocus::Records
+                                    } else { WorkspaceFocus::Fields }
                                 } else {
                                     WorkspaceFocus::Actions
                                 };
@@ -2416,6 +2436,10 @@ impl Interaction {
                                 } else {
                                     None
                                 };
+                                if ch == 'L' && role == Role::Client {
+                                    self.workspace_focus = WorkspaceFocus::Records;
+                                    return false;
+                                }
                                 self.workspace_focus = WorkspaceFocus::Fields;
                                 let command = match ch {
                                     'a' if role == Role::Server => {
@@ -3816,7 +3840,7 @@ fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
         return None;
     }
     let cols = Layout::horizontal([
-        Constraint::Length((area.width / 5).clamp(28, 40)),
+        Constraint::Length((area.width / 3).clamp(34, 46)),
         Constraint::Length(2),
         Constraint::Min(1),
     ])
@@ -3825,12 +3849,37 @@ fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
     Some([left[0], left[1], cols[2]])
 }
 
-fn record_start(editor: &Editor, rect: Rect) -> usize {
-    let rows = usize::from(rect.height.saturating_sub(2)).max(1);
-    editor
-        .workspace_selected()
-        .saturating_sub(rows - 1)
-        .min(editor.record_count().saturating_sub(rows))
+/// Wrapped rows share the same record-index map for draw and mouse.
+fn record_rows(editor: &Editor, area: Rect) -> Vec<(usize, String)> {
+    let width = usize::from(area.width.saturating_sub(5)).max(1);
+    let capacity = usize::from(area.height.saturating_sub(2));
+    let selected = editor.workspace_selected();
+    let mut rows = Vec::new();
+    for (index, (id, active, reality)) in editor.workspace_records().into_iter().enumerate() {
+        let label = if editor.role() == Role::Client {
+            format!("№{} {}{}", index + 1, editor.client_profile_address(&id).unwrap_or(&id), if active { " *" } else { "" })
+        } else {
+            format!("{} · {}", id, if reality { "REALITY" } else { "TLS" })
+        };
+        let mut line = String::new();
+        let mut used = 0;
+        for ch in label.chars() {
+            let mut encoded = [0; 4];
+            let encoded: &str = ch.encode_utf8(&mut encoded);
+            let cw = Span::raw(encoded).width();
+            if used + cw > width && !line.is_empty() {
+                rows.push((index, std::mem::take(&mut line)));
+                used = 0;
+            }
+            line.push(ch);
+            used += cw;
+        }
+        rows.push((index, line));
+    }
+    let first = rows.iter().position(|(i, _)| *i == selected).unwrap_or(0);
+    let end = rows.iter().rposition(|(i, _)| *i == selected).map_or(first, |i| i + 1);
+    let start = end.saturating_sub(capacity).min(first).min(rows.len().saturating_sub(capacity));
+    rows.into_iter().skip(start).take(capacity).collect()
 }
 
 /// Scrolling state belongs to presentation only. The signature contains
@@ -4085,8 +4134,7 @@ fn draw_guided(
             Span::styled(
                 format!(" {step}/{total} "),
                 Style::default()
-                    .fg(BG)
-                    .bg(ACCENT)
+                    .fg(ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
@@ -4225,9 +4273,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             format!(
                 "THEIA  •  Клиент  |  {}",
                 if local {
-                    "Локальный процесс запущен/запускается"
+                    "Локальный прокси запущен/запускается"
                 } else {
-                    "Локальный процесс не запущен этой панелью"
+                    "Локальный прокси не запущен этой панелью"
                 }
             )
         }
@@ -4721,7 +4769,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             Screen::Server | Screen::Client => {
                 match interaction.map(|ui| ui.workspace_focus) {
                     Some(WorkspaceFocus::Navigation) => "↑ ↓ разделы / записи · → открыть область · Esc назад · F1 помощь",
-                    Some(WorkspaceFocus::Records) => "↑ ↓ записи · ← разделы · → открыть область · Esc назад",
+                    Some(WorkspaceFocus::Records) => "↑ ↓ записи · ← разделы · → открыть · F7 полный адрес · Esc назад",
                     Some(WorkspaceFocus::Fields | WorkspaceFocus::Users) => "↑ ↓ строки / действия · ← список записей · Enter открыть · Esc назад",
                     _ => "↑ ↓ действия · ← назад к списку · Enter открыть · Esc назад · F1 помощь",
                 }
@@ -5388,46 +5436,14 @@ fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool)
 
 fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> Option<[Rect; 2]> {
     let count = page_actions(role, page, editor).len();
-    if count == 0 || area.height < 10 || (page == 1 && area.height < 25) {
-        return None;
-    }
-    let action_height = (count as u16).saturating_add(2);
-    // Actions stay near the information they operate on.
-    if area.width >= 76
-        && page != 1
-        && !(role == Role::Server && matches!(page, 2 | 3))
-        && !(role == Role::Client && page == 3)
-    {
-        let controls_width = (area.width / 2).clamp(36, 43);
-        let parts = Layout::horizontal([Constraint::Min(36), Constraint::Length(controls_width)])
-            .split(area);
-        let height = area.height.min(action_height.max(15));
-        let content = Rect::new(parts[0].x, parts[0].y, parts[0].width, height);
-        let controls = Rect::new(
-            parts[1].x,
-            parts[1].y,
-            parts[1].width,
-            parts[1].height.min(action_height),
-        );
-        return Some([content, controls]);
-    }
-    if area.height < 14 {
-        return None;
-    }
     let minimum = if page == 1 { 10 } else { 6 };
-    let height = action_height
-        .min(area.height.saturating_sub(minimum))
-        .max(3);
-    let preferred = if page == 1 {
-        20
-    } else if role == Role::Client && page == 3 {
-        23
-    } else if role == Role::Server && matches!(page, 2 | 3) {
-        12
-    } else {
-        10
-    };
-    let content_height = preferred.min(area.height.saturating_sub(height));
+    if count == 0 || area.height < minimum + 3 { return None; }
+    let height = (count as u16).saturating_add(2).min(area.height - minimum).max(3);
+    let preferred = if page == 1 { 20 }
+        else if role == Role::Client && page == 3 { 19 }
+        else if role == Role::Server && matches!(page, 2 | 3) { 12 }
+        else { 10 };
+    let content_height = preferred.min(area.height - height);
     let content = Rect::new(area.x, area.y, area.width, content_height);
     let controls = Rect::new(area.x, content.bottom(), area.width, height);
     Some([content, controls])
@@ -5469,10 +5485,6 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
                 "Own-TLS"
             }
         )),
-        Line::styled(
-            "← к списку профилей · Enter открывает действие.",
-            Style::default().fg(MUTED),
-        ),
         Line::raw(""),
         Line::styled(
             "Системный прокси",
@@ -5509,16 +5521,12 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
-        Line::styled(
-            "Выберите доступное действие справа или ниже. Enter открывает управление.",
-            Style::default().fg(ACCENT),
-        ),
     ];
     if !editor.selected_record_is_active() {
         lines.insert(
-            4,
+            3,
             Line::styled(
-                "Перед запуском подтвердите выбор профиля (A).",
+                "Перед запуском подтвердите выбор профиля.",
                 Style::default().fg(WARNING),
             ),
         );
@@ -5553,7 +5561,7 @@ fn draw_page(
         });
         frame.render_widget(
             List::new(rows.collect::<Vec<_>>())
-                .block(tui_widgets::section("Разделы · ↑↓ Enter", true)),
+                .block(tui_widgets::section("Разделы", true)),
             area,
         );
         return;
@@ -5856,7 +5864,7 @@ fn draw_workspace(
     frame.render_widget(
         List::new(categories.collect::<Vec<_>>()).block(tui_widgets::section(
             if nav_focused {
-                " Разделы · ↑↓ Enter "
+                " Разделы "
             } else {
                 " Разделы "
             },
@@ -5881,63 +5889,24 @@ fn draw_workspace(
 }
 
 fn draw_workspace_records(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, focused: bool) {
-        let start = record_start(editor, area);
-        let visible = usize::from(area.height.saturating_sub(2));
-        let items: Vec<_> = editor
-            .workspace_records()
-            .into_iter()
-            .enumerate()
-            .skip(start)
-            .take(visible)
-            .map(|(index, (id, active, reality))| {
-                let style = if index == editor.workspace_selected() {
-                    Style::default().fg(ACCENT).bg(if focused { FOCUS } else { SURFACE }).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(format!(
-                    "{} {} {}{}",
-                    if index == editor.workspace_selected() {
-                        if focused { "›" } else { "•" }
-                    } else {
-                        " "
-                    },
-                    if reality { "REALITY" } else { "TLS" },
-                    tui_widgets::fit_value(
-                        &if role == Role::Client {
-                            format!("{} {}", index + 1, editor.client_profile_address(&id).unwrap_or(&id))
-                        } else {
-                            id.clone()
-                        },
-                        area.width.saturating_sub(13), false),
-                    if active { " *" } else { "" }
-                ))
-                .style(style)
-            })
-            .collect();
-        let title = if role == Role::Server {
-            " Подключения "
-        } else {
-            " Профили "
-        };
-        frame.render_widget(
-            List::new(items).block(tui_widgets::section(title, focused)),
-            area,
-        );
-        if editor.record_count() == 0 {
-            let inner = Rect::new(
-                area.x + 1,
-                area.y + 1,
-                area.width.saturating_sub(2),
-                area.height.saturating_sub(2),
-            );
-            frame.render_widget(
-                Paragraph::new("Пока ничего нет. Создайте запись в разделе действий.")
-                    .wrap(Wrap { trim: true }),
-                inner,
-            );
-        }
-
+    let selected = editor.workspace_selected();
+    let mut previous = None;
+    let items = record_rows(editor, area).into_iter().map(|(index, label)| {
+        let current = index == selected;
+        let first = previous != Some(index);
+        previous = Some(index);
+        let marker = if first && current { if focused { "› " } else { "• " } } else { "  " };
+        let style = if current {
+            Style::default().fg(ACCENT).bg(if focused { FOCUS } else { BG }).add_modifier(Modifier::BOLD)
+        } else { Style::default().fg(TEXT) };
+        ListItem::new(format!("{marker}{label}")).style(style)
+    }).collect::<Vec<_>>();
+    let title = if role == Role::Server { "Подключения" } else { "Профили" };
+    frame.render_widget(List::new(items).block(tui_widgets::section(title, focused)), area);
+    if editor.record_count() == 0 && area.height > 2 {
+        frame.render_widget(Paragraph::new("Пока нет записей.").style(Style::default().fg(MUTED)),
+            Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1));
+    }
 }
 
 fn welcome_form(role: Role, selected: usize) -> Form {
@@ -6548,6 +6517,10 @@ mod tests {
                     let navigation = rendered_interaction(area.width, area.height, &model, &ui);
                     assert!(navigation.contains(pages(role)[page]));
                     ui.update(&mut model, press(KeyCode::Enter));
+                    if page == 1 {
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
+                        ui.update(&mut model, press(KeyCode::Right));
+                    }
                     let expected_focus = if page == 1 {
                         WorkspaceFocus::Fields
                     } else if role == Role::Server && matches!(page, 2 | 3) {
@@ -7255,6 +7228,9 @@ mod tests {
         for role in [Role::Server, Role::Client] {
             for page in [0, 2, 4, 5, 6] {
                 let [content, controls] = page_layout(workspace, role, page, None).unwrap();
+                assert_eq!(controls.x, content.x);
+                assert_eq!(controls.width, content.width);
+                assert_eq!(controls.y, content.bottom());
                 assert!(controls.y <= content.y + 12);
                 assert!(controls.bottom() <= workspace.bottom());
             }
