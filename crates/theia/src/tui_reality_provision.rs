@@ -533,6 +533,11 @@ enum WizardStage {
     SavingInitial(Receiver<Result<Editor, Error>>, PathBuf),
     Done(String),
 }
+struct GrantPicker {
+    selected: Vec<bool>,
+    focus: usize,
+}
+
 struct Wizard {
     config: PathBuf,
     source: Option<[u8; 32]>,
@@ -541,6 +546,7 @@ struct Wizard {
     advanced: bool,
     users: String,
     available_users: Vec<String>,
+    grant_picker: Option<GrantPicker>,
     stage: WizardStage,
     error: String,
     registration: Option<RegistrationPanel>,
@@ -572,6 +578,7 @@ impl Wizard {
                 .record_user_catalog(crate::tui_editor::RecordAction::NewInbound)
                 .unwrap_or_default(),
             available_users: editor.workspace_users().into_iter().filter_map(|(id, disabled, _)| (!disabled).then_some(id)).collect(),
+            grant_picker: None,
             stage: WizardStage::Input,
             error: String::new(),
             registration: None,
@@ -600,6 +607,7 @@ impl Wizard {
             advanced: false,
             users: "Введите ID первого пользователя. Он будет отключён до явного выпуска токена.".into(),
             available_users: Vec::new(),
+            grant_picker: None,
             stage: WizardStage::Input,
             error: String::new(),
             registration: None,
@@ -625,7 +633,7 @@ impl Wizard {
             panel.paste(text);
             return;
         }
-        if matches!(self.stage, WizardStage::Input) {
+        if self.grant_picker.is_none() && matches!(self.stage, WizardStage::Input) {
             let field = &mut self.fields[self.focus];
             let value = text.trim_end_matches(['\r', '\n']);
             if !value.chars().any(char::is_control)
@@ -639,6 +647,25 @@ impl Wizard {
         if let Some(panel) = self.registration.as_mut() {
             return panel.key(key);
         }
+        if let Some(mut picker) = self.grant_picker.take() {
+            let count = picker.selected.len();
+            match key.code {
+                KeyCode::Esc => return false,
+                KeyCode::Enter => {
+                    self.fields[5] = self.available_users.iter().zip(&picker.selected)
+                        .filter_map(|(id, chosen)| chosen.then_some(id.as_str())).collect::<Vec<_>>().join(",");
+                    return false;
+                }
+                KeyCode::Up | KeyCode::BackTab => picker.focus = (picker.focus + count - 1) % count,
+                KeyCode::Down | KeyCode::Tab => picker.focus = (picker.focus + 1) % count,
+                KeyCode::Home => picker.focus = 0,
+                KeyCode::End => picker.focus = count - 1,
+                KeyCode::Char(' ') => picker.selected[picker.focus] = !picker.selected[picker.focus],
+                _ => {}
+            }
+            self.grant_picker = Some(picker);
+            return false;
+        }
         let old = std::mem::replace(&mut self.stage, WizardStage::Input);
         self.stage = match old {
             WizardStage::Input => {
@@ -651,9 +678,10 @@ impl Wizard {
                         }
                     }
                     KeyCode::F(6) if self.focus == 5 && !self.available_users.is_empty() => {
-                        let next = self.available_users.iter().position(|id| id == &self.fields[5])
-                            .map_or(0, |i| (i + 1) % self.available_users.len());
-                        self.fields[5] = self.available_users[next].clone();
+                        self.grant_picker = Some(GrantPicker {
+                            selected: self.available_users.iter().map(|id| self.fields[5].split(',').any(|s| s.trim() == id)).collect(),
+                            focus: 0,
+                        });
                     }
                     KeyCode::Tab | KeyCode::Down => self.move_focus(true),
                     KeyCode::BackTab | KeyCode::Up => self.move_focus(false),
@@ -890,7 +918,7 @@ impl Wizard {
                 out.push_str(if self.advanced { "auto: подобрать по оценкам; manual: сохранить порядок.\nF2: скрыть расширенные.\n" } else { "ID создаётся автоматически; референсы подбираются из каталога.\nУкажите все собственные IP, включая публичный/NAT: это обязательная защита от self-reference.\nF2: расширенные (ID, домены/IP, manual).\n" });
                 out.push_str(&self.users);
                 if !self.available_users.is_empty() {
-                    out.push_str("\nF6 на поле доступа: выбрать пользователя из списка.");
+                    out.push_str("\nF6 на поле доступа: выбрать пользователей из списка.");
                 }
                 out.push_str("\nEnter: проверить и подобрать; ↑↓ / Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
                 out.push_str(&self.error); out
@@ -1114,6 +1142,18 @@ impl ProvisionPanel {
         if wizard.registration.is_some() || !matches!(wizard.stage, WizardStage::Input) {
             return None;
         }
+        if let Some(picker) = &wizard.grant_picker {
+            let count = picker.selected.iter().filter(|chosen| **chosen).count();
+            return Some(Form {
+                fields: wizard.available_users.iter().enumerate().map(|(id, name)| Field {
+                    id, label: if picker.selected[id] { "[x] Доступ выбран" } else { "[ ] Нет доступа" },
+                    value: name.clone(), hint: "Пробел изменить выбор · Enter перенести в черновик · Esc отменить",
+                }).collect(),
+                selected: picker.focus,
+                lead: format!("Выбрано: {count} из {} · только активные пользователи", picker.selected.len()),
+                error: String::new(),
+            });
+        }
         let first = wizard.source.is_none();
         let labels = [
             ("ID подключения", "Уникальное имя подключения, создаётся автоматически."),
@@ -1122,7 +1162,7 @@ impl ProvisionPanel {
             ("Собственные IP сервера", "Все адреса сервера, включая публичный/NAT, через запятую."),
             ("Домены референсов", "До трёх доменов или домен=IP, через запятую."),
             (if first { "ID первого пользователя" } else { "Пользователи с доступом" },
-             if first { "Пользователь отключён до явного выпуска токена." } else { "ID через запятую; F6 выбирает одного из активных пользователей." }),
+             if first { "Пользователь отключён до явного выпуска токена." } else { "ID через запятую; F6 открывает список с флажками доступа." }),
             ("Режим подбора", "auto — по результатам проверок; manual — в заданном порядке."),
         ];
         Some(Form {
@@ -1137,6 +1177,10 @@ impl ProvisionPanel {
 
     pub(crate) fn select_field(&mut self, id: usize) {
         if let Some(wizard) = self.wizard.as_mut() {
+            if let Some(picker) = wizard.grant_picker.as_mut() {
+                if id < picker.selected.len() { picker.focus = id; }
+                return;
+            }
             if wizard.registration.is_none() && matches!(wizard.stage, WizardStage::Input)
                 && wizard.visible_fields().contains(&id) {
                 wizard.focus = id;
@@ -1149,6 +1193,7 @@ impl ProvisionPanel {
         if wizard.registration.is_some() {
             return Some((5, 5, "Сохранение TOML", "Enter предпросмотр · Y подтвердить · Esc назад"));
         }
+        if wizard.grant_picker.is_some() { return Some((1, 5, "Выбор пользователей", "↑↓ пользователь · Пробел отметить · Enter готово · Esc отменить")); }
         Some(match &wizard.stage {
             WizardStage::Input => (1, 5, "Настройка сервера", "↑↓ поле · F2 расширенные · Enter проверить · Esc назад"),
             WizardStage::DnsConfirm(_) => (2, 5, "Разрешение DNS", "Y разрешить DNS · N / Esc назад"),
@@ -1185,6 +1230,31 @@ impl ProvisionPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grant_picker_is_explicit_and_cancel_restores_previous_draft() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("grant-picker").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let mut wizard = Wizard::first(dir.join("server.toml")).unwrap();
+        wizard.available_users = vec!["alice".into(), "bob".into()];
+        wizard.focus = 5;
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        wizard.key(press(KeyCode::F(6)));
+        wizard.key(press(KeyCode::Char(' ')));
+        wizard.key(press(KeyCode::Down));
+        wizard.key(press(KeyCode::Char(' ')));
+        assert!(wizard.fields[5].is_empty());
+        wizard.key(press(KeyCode::Esc));
+        assert!(wizard.fields[5].is_empty());
+        wizard.key(press(KeyCode::F(6)));
+        wizard.key(press(KeyCode::Char(' ')));
+        wizard.key(press(KeyCode::Down));
+        wizard.key(press(KeyCode::Char(' ')));
+        wizard.key(press(KeyCode::Enter));
+        assert_eq!(wizard.fields[5], "alice,bob");
+        assert!(!wizard.config.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn first_server_wizard_publishes_only_after_review_and_never_overwrites() {
