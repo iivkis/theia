@@ -38,6 +38,7 @@ pub(crate) struct StatusPanel {
     digest: [u8; 32],
     id: String,
     server: bool,
+    server_endpoint: Option<PathBuf>,
     reality: bool,
     pending: Option<Receiver<Result<Update, Error>>>,
     review: Option<RotationReview>,
@@ -58,11 +59,16 @@ pub(crate) struct StatusPanel {
 }
 impl StatusPanel {
     pub(crate) fn open(editor: &Editor) -> Self {
+        Self::open_with_endpoint(editor, None)
+    }
+
+    pub(crate) fn open_with_endpoint(editor: &Editor, server_endpoint: Option<PathBuf>) -> Self {
         let mut panel = Self {
             path: editor.saved_path().to_owned(),
             digest: editor.saved_sha256(),
             id: editor.selected_record_id().to_owned(),
             server: editor.role() == Role::Server,
+            server_endpoint,
             reality: editor.selected_reality(),
             pending: None,
             review: None,
@@ -92,6 +98,7 @@ impl StatusPanel {
         let digest = self.digest;
         let id = self.id.clone();
         let server = self.server;
+        let server_endpoint = self.server_endpoint.clone();
         let reality = self.reality;
         let selected_active = self.client_active;
         let (tx, rx) = mpsc::channel();
@@ -132,8 +139,10 @@ impl StatusPanel {
                         .build()
                         .ok()
                         .and_then(|rt| {
-                            rt.block_on(crate::management::query_environment(command))
-                                .ok()
+                            match server_endpoint.as_deref() {
+                                Some(endpoint) => rt.block_on(crate::tui_runtime::query_endpoint(endpoint, command)),
+                                None => rt.block_on(crate::management::query_environment(command)),
+                            }.ok()
                         });
                     let live=match response{
                         Some(StatusReply::RealityRunning{generation,revision,health_revision,active_reference,overlap})=>
@@ -771,6 +780,7 @@ mod tests {
             digest: [1; 32],
             id: "test".into(),
             server: false,
+            server_endpoint: None,
             reality: true,
             pending: None,
             review: None,
