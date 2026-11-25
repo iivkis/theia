@@ -28,6 +28,67 @@ fn visual_review_gallery() {
     std::fs::write(&client, include_str!("../../../examples/client.toml")).unwrap();
     // Real first-run import through the production state machine, using a synthetic invitation.
     first_key_import_fixture(&root.join("first-own-tls"), review_capture);
+    // Exercise a self-contained REALITY key through the actual first-run UI.
+    {
+        use sha2::{Digest, Sha256};
+        use crate::reference_health::{Evidence, Plan, State, Target};
+        let now = crate::reference_health::unix_now().unwrap();
+        let scope = crate::descriptor::Scope {
+            inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
+        };
+        let state = State::new(Plan {
+            schema_version: 1, inbound: scope.inbound.clone(), endpoint: scope.endpoint.clone(),
+            own_ips: vec!["93.184.216.1".parse().unwrap()],
+            references: vec![Target { server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap() }],
+        }, vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+        let identity = crate::identity_tls::Identity::generate(scope).unwrap();
+        let signed = crate::reality_bootstrap::initial_descriptor(&state, &identity, now).unwrap();
+        let bearer = [42u8; 32];
+        let server_source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &format!("{:x}", Sha256::digest(bearer)))
+            .replace("id = \"public\"", "id = \"edge\"");
+        let config::Config::Server(server_doc) = config::parse(&server_source).unwrap() else { panic!("server fixture") };
+        let admission = crate::reality_admission::Secret::generate().unwrap();
+        let uri = crate::reality_bootstrap::Invitation::issued(&identity, &signed, &server_doc, "device-a", &bearer, &admission, now).unwrap().encode().unwrap();
+        let path = root.join("first-reality.toml");
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(None);
+        let mut dialog = ConfigDialog::new(Role::Client, Some(&path));
+        dialog.begin_client_import();
+        ui.config_dialog = Some(dialog);
+        ui.paste_record_field(&uri);
+        review_capture("client-reality-key-masked", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Enter));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ui.config_dialog.as_ref().is_some_and(|d| d.title() == "Импорт REALITY" && d.guide().is_some_and(|g| g.0 == 3)) {
+            ui.poll_navigation(&mut model);
+            assert!(std::time::Instant::now() < deadline, "REALITY key review did not appear");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!path.exists());
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(!screen.contains(uri.as_str()));
+        assert!(!screen.contains("Файл допуска (admission)"));
+        review_capture("client-reality-key-trust-review", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Char('y')));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ui.config_dialog.is_some() {
+            ui.poll_navigation(&mut model);
+            assert!(std::time::Instant::now() < deadline, "REALITY profile was not saved");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(ui.importing, Some(ImportFlow::Done)));
+        let config::Config::Client(doc) = config::read_file(&path).unwrap() else { panic!("client fixture") };
+        assert_eq!(doc.client.profiles.len(), 1);
+        assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
+        assert_eq!(doc.client.proxy.system_proxy, config::SystemProxy::Off);
+        assert!(!ui.owned_running(Role::Client));
+        review_capture("client-reality-key-saved", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.workspace_page, 3);
+        assert!(!ui.owned_running(Role::Client));
+        review_capture("client-reality-key-connect", &model, &ui);
+    }
     let mut modes = Interaction::new(Some(Editor::load(Role::Client, &client).unwrap()));
     let mut client_model = Model::new(Some(Role::Client));
     modes.update(&mut client_model, press(KeyCode::Char('P')));

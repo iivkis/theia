@@ -26,7 +26,8 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: dev
+          # Exact source snapshot for this review, not a moving branch.
+          ref: 29cd9e4ee70f71a1f1b9ea9e1d12bce4c4408970
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -64,11 +65,13 @@ jobs:
           cd source
           source_sha="$(git rev-parse HEAD)"
           cargo test --locked -p theia first_key_import_creates_active_profile_and_opens_connection_panel -- --nocapture --test-threads=1
-          cargo test --locked -p theia common_import_dispatches_reality_uri_to_masked_independent_enrollment -- --nocapture --test-threads=1
+          cargo test --locked -p theia common_import_dispatches_reality_key_to_masked_review_and_cancels_without_writes -- --nocapture --test-threads=1
           cargo test --locked -p theia client_import_modal_masks_pasted_link_and_requires_explicit_confirmation -- --nocapture --test-threads=1
           cargo test --locked -p theia preview_binds_independent_identity_and_admission_without_exposing_secret -- --nocapture --test-threads=1
           cargo test --locked -p theia client_connection_modes_are_visible_and_do_not_start_or_write_on_selection -- --nocapture --test-threads=1
           cargo test --locked -p theia client_proxy_shortcut_refuses_dirty_or_unconfigured_editor -- --nocapture --test-threads=1
+          cargo test --locked -p theia managed_key_import_has_no_extra_input_fields -- --nocapture --test-threads=1
+          cargo test --locked -p theia compact_reality_with_three_maximum_dns_references_fits_access_key_limit -- --nocapture --test-threads=1
           cargo test --locked -p theia visual_review_gallery -- --nocapture --test-threads=1
           /usr/bin/python3 ../review/tools/tui-review/render.py "$THEIA_REVIEW_CELLS" "$RUNNER_TEMP/tui-gallery" --source-sha "$source_sha"
       - uses: actions/upload-artifact@v4
@@ -106,7 +109,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert re.fullmatch(r"[0-9a-f]{40}", manifest["source_sha"])
+          assert manifest["source_sha"] == "29cd9e4ee70f71a1f1b9ea9e1d12bce4c4408970"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
