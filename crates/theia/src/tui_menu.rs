@@ -2,14 +2,15 @@
 use crate::{
     config::{self, Config},
     security_profile::SecurityMode,
+    tui_widgets::{self, ACCENT, FOCUS, MUTED, SURFACE, TEXT},
     Role,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{List, ListItem, Paragraph, Wrap},
     Frame,
 };
 use sha2::{Digest, Sha256};
@@ -305,7 +306,7 @@ impl Menu {
     }
 
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        frame.render_widget(Clear, area);
+        tui_widgets::canvas(frame, area);
         if area.width < 76 || area.height < 8 {
             let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
             let count = self.count();
@@ -317,12 +318,12 @@ impl Menu {
                     let entry = self.groups()[self.group].entries[i];
                     (entry.label, self.configured || !entry.requires_config)
                 } else { (self.groups()[i].title, true) };
-                let style = if i == selected { Style::default().fg(Color::Black).bg(Color::Cyan) }
-                    else if !enabled { Style::default().fg(Color::DarkGray) } else { Style::default() };
+                let style = if i == selected { Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD) }
+                    else if !enabled { Style::default().fg(MUTED) } else { Style::default() };
                 ListItem::new(format!("{} {label}{}", if i == selected { "›" } else { " " }, if enabled { "" } else { " [TOML]" })).style(style)
             }).collect::<Vec<_>>();
             let title = if self.item.is_some() { self.groups()[self.group].title } else { self.title() };
-            frame.render_widget(List::new(items).block(Block::default().title(format!("{title} · {}/{}", selected + 1, count)).borders(Borders::ALL)), parts[0]);
+            frame.render_widget(List::new(items).block(tui_widgets::section(&format!("{title} · {}/{}", selected + 1, count), true)), parts[0]);
             frame.render_widget(Paragraph::new(self.notice.unwrap_or("↑↓ выбрать · Enter открыть · Esc назад")), parts[1]);
             return;
         }
@@ -346,16 +347,16 @@ impl Menu {
                     let style = if i == selected {
                         Style::default()
                             .fg(if enabled {
-                                Color::Black
+                                ACCENT
                             } else {
-                                Color::DarkGray
+                                MUTED
                             })
-                            .bg(if focused { Color::Cyan } else { Color::Gray })
+                            .bg(if focused { FOCUS } else { SURFACE })
                             .add_modifier(Modifier::BOLD)
                     } else if enabled {
                         Style::default()
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(MUTED)
                     };
                     ListItem::new(Line::from(vec![
                         Span::raw(if i == selected { " › " } else { "   " }),
@@ -367,14 +368,7 @@ impl Menu {
                 .collect();
             frame.render_widget(
                 List::new(rows).block(
-                    Block::default()
-                        .title(title)
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(if focused {
-                            Color::Cyan
-                        } else {
-                            Color::DarkGray
-                        })),
+                    tui_widgets::section(title, focused),
                 ),
                 rect,
             );
@@ -405,9 +399,9 @@ impl Menu {
             "↑↓ действие  ·  Enter открыть  ·  ←/Esc разделы  ·  F10 редактор"
         });
         frame.render_widget(
-            Paragraph::new(hint)
+            Paragraph::new(tui_widgets::key_line(hint))
                 .wrap(Wrap { trim: true })
-                .block(Block::default().title(" Навигация ").borders(Borders::ALL)),
+                .style(Style::default().bg(SURFACE).fg(TEXT)),
             content[1],
         );
     }

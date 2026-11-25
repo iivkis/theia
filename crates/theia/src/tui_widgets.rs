@@ -4,9 +4,47 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+
+// One restrained, terminal-independent dark palette. Colour is supplementary:
+// focus, warning, selected and disabled states also have textual markers.
+pub(crate) const BG: Color = Color::Rgb(19, 23, 31);
+pub(crate) const SURFACE: Color = Color::Rgb(30, 37, 48);
+pub(crate) const INPUT: Color = Color::Rgb(40, 49, 63);
+pub(crate) const FOCUS: Color = Color::Rgb(46, 65, 70);
+pub(crate) const TEXT: Color = Color::Rgb(224, 231, 239);
+pub(crate) const MUTED: Color = Color::Rgb(158, 173, 190);
+pub(crate) const ACCENT: Color = Color::Rgb(121, 219, 184);
+pub(crate) const WARNING: Color = Color::Rgb(244, 194, 118);
+pub(crate) const ERROR: Color = Color::Rgb(255, 146, 152);
+
+pub(crate) fn canvas(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(Style::default().fg(TEXT).bg(BG)), area);
+}
+
+/// A flat section with an inset header, preserving the traditional one-cell
+/// inner geometry used by lists and tables. No visible rectangular outline.
+pub(crate) fn section(title: &str, active: bool) -> Block<'_> {
+    Block::default()
+        .title(Span::styled(title, Style::default().fg(if active { ACCENT } else { MUTED }).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(SURFACE).bg(SURFACE))
+        .style(Style::default().fg(TEXT).bg(SURFACE))
+}
+
+pub(crate) fn key_line(keys: &str) -> Line<'_> {
+    let mut spans = Vec::new();
+    for (i, part) in keys.split(" · ").enumerate() {
+        if i > 0 { spans.push(Span::raw("  ")); }
+        let (key, label) = part.split_once(' ').unwrap_or((part, ""));
+        spans.push(Span::styled(format!(" {key} "), Style::default().fg(BG).bg(MUTED).add_modifier(Modifier::BOLD)));
+        if !label.is_empty() { spans.push(Span::styled(format!(" {label}"), Style::default().fg(TEXT))); }
+    }
+    Line::from(spans)
+}
 
 pub(crate) struct Field {
     pub id: usize,
@@ -23,6 +61,7 @@ pub(crate) struct Form {
 }
 
 struct Geometry {
+    title: Rect,
     lead: Rect,
     rows: Rect,
     help: Rect,
@@ -33,27 +72,32 @@ struct Geometry {
 
 impl Form {
     fn geometry(&self, area: Rect) -> Geometry {
-        let inner = Rect::new(
-            area.x.saturating_add(1), area.y.saturating_add(1),
-            area.width.saturating_sub(2), area.height.saturating_sub(2),
-        );
-        let lead = if self.lead.is_empty() { 0 } else if inner.height >= 10 { 2 } else if inner.height >= 4 { 1 } else { 0 };
-        let help = if inner.height >= 7 { 3 } else if inner.height >= 3 { 1 } else { 0 };
-        let parts = Layout::vertical([
-            Constraint::Length(lead), Constraint::Min(0), Constraint::Length(help),
-        ]).split(inner);
         let count = self.fields.len();
-        let stride = if usize::from(parts[1].height) >= count.saturating_mul(3) && parts[1].width >= 42 {
-            3
-        } else if usize::from(parts[1].height) >= count.saturating_mul(2) {
-            2
-        } else {
-            1
-        };
-        let capacity = usize::from(parts[1].height / stride);
+        let margin = u16::from(area.width >= 36);
+        let inner = Rect::new(area.x.saturating_add(margin), area.y,
+            area.width.saturating_sub(2 * margin), area.height);
+        let title_h = u16::from(inner.height >= 3);
+        let lead_h = if self.lead.is_empty() || inner.height < 5 { 0 }
+            else if inner.height >= 9 { 2 } else { 1 };
+        let side = inner.width >= 96 && inner.height >= 12;
+        let help_h = if side || inner.height < 6 { 0 } else if inner.height >= 10 { 3 } else { 1 };
+        let room = inner.height.saturating_sub(title_h + lead_h + help_h);
+        let stride = if usize::from(room) >= count.saturating_mul(3) && inner.width >= 42 { 3 }
+            else if usize::from(room) >= count.saturating_mul(2) { 2 } else { 1 };
+        let capacity = usize::from(room / stride);
         let selected = self.fields.iter().position(|f| f.id == self.selected).unwrap_or(0);
         let start = selected.saturating_sub(capacity.saturating_sub(1)).min(count.saturating_sub(capacity));
-        Geometry { lead: parts[0], rows: parts[1], help: parts[2], stride, start, end: (start + capacity).min(count) }
+        let end = (start + capacity).min(count);
+        let title = Rect::new(inner.x, inner.y, inner.width, title_h);
+        let lead = Rect::new(inner.x, title.bottom(), inner.width, lead_h);
+        let rows_width = if side { inner.width.saturating_sub(34) } else { inner.width };
+        let rows = Rect::new(inner.x, lead.bottom(), rows_width, (end - start) as u16 * stride);
+        let help = if side {
+            Rect::new(rows.right().saturating_add(3), rows.y, 31, room.min(12))
+        } else {
+            Rect::new(inner.x, rows.bottom(), inner.width, help_h)
+        };
+        Geometry { title, lead, rows, help, stride, start, end }
     }
 
     pub(crate) fn hit(&self, area: Rect, x: u16, y: u16) -> Option<usize> {
@@ -67,49 +111,69 @@ impl Form {
     }
 
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect, title: &str) {
+        self.render_as(frame, area, title, false);
+    }
+
+    pub(crate) fn render_picker(&self, frame: &mut Frame<'_>, area: Rect, title: &str) {
+        self.render_as(frame, area, title, true);
+    }
+
+    fn render_as(&self, frame: &mut Frame<'_>, area: Rect, title: &str, picker: bool) {
+        canvas(frame, area);
         let g = self.geometry(area);
         let title = if g.end - g.start < self.fields.len() {
-            format!("{title} · {}/{}", g.end, self.fields.len())
+            format!("{title}  ·  {}–{}/{}", g.start + 1, g.end, self.fields.len())
         } else { title.to_owned() };
-        frame.render_widget(Block::default().title(title).borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)), area);
+        frame.render_widget(Paragraph::new(title).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)), g.title);
         if g.lead.height > 0 {
-            frame.render_widget(Paragraph::new(self.lead.as_str()).wrap(Wrap { trim: true }), g.lead);
+            frame.render_widget(Paragraph::new(self.lead.as_str()).style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), g.lead);
         }
         for (offset, field) in self.fields[g.start..g.end].iter().enumerate() {
             let selected = field.id == self.selected;
             let rect = Rect::new(g.rows.x, g.rows.y + (offset as u16) * g.stride, g.rows.width, g.stride);
-            let accent = if selected { Color::Cyan } else { Color::DarkGray };
-            let marker = if selected { "› " } else { "  " };
+            let marker = if selected { "▎ " } else { "  " };
             let label = format!("{marker}{}", field.label);
-            let value = if field.value.is_empty() { "Не заполнено" } else { field.value.as_str() };
-            let style = if selected { Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD) }
-                else if field.value.is_empty() { Style::default().fg(Color::DarkGray) } else { Style::default() };
-            if g.stride == 3 {
-                let shown = fit_value(value, rect.width.saturating_sub(2), selected);
-                frame.render_widget(Paragraph::new(shown).style(style).block(
-                    Block::default().title(label).borders(Borders::ALL).border_style(Style::default().fg(accent))
-                ), rect);
-            } else if g.stride == 2 {
-                let shown = fit_value(value, rect.width.saturating_sub(2), selected);
-                frame.render_widget(Paragraph::new(vec![
-                    Line::styled(label, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-                    Line::styled(format!("  {shown}"), style),
-                ]), rect);
+            let value = if field.value.is_empty() { "Введите значение" } else { field.value.as_str() };
+            let label_style = Style::default().fg(if selected { ACCENT } else { TEXT }).add_modifier(Modifier::BOLD);
+            let value_style = Style::default().fg(if field.value.is_empty() || picker { MUTED } else { TEXT })
+                .bg(if selected { FOCUS } else if picker { BG } else { INPUT });
+            if picker && g.stride >= 2 {
+                let style = label_style.bg(if selected { FOCUS } else { BG });
+                frame.render_widget(Paragraph::new(label).style(style), Rect::new(rect.x, rect.y, rect.width, 1));
+                frame.render_widget(Paragraph::new(format!("  {}", fit_value(value, rect.width.saturating_sub(2), false))).style(value_style),
+                    Rect::new(rect.x, rect.y + 1, rect.width, 1));
+                continue;
+            }
+            if g.stride >= 2 {
+                frame.render_widget(Paragraph::new(label).style(label_style), Rect::new(rect.x, rect.y, rect.width, 1));
+                let input = Rect::new(rect.x.saturating_add(2), rect.y + 1, rect.width.saturating_sub(4), 1);
+                let shown = fit_value(value, input.width.saturating_sub(3), selected);
+                let content = if selected && !picker { format!(" {shown} ▏") } else { format!(" {shown}") };
+                frame.render_widget(Paragraph::new(content).style(value_style), input);
             } else {
                 let label_width = rect.width / 2;
                 let columns = Layout::horizontal([Constraint::Length(label_width), Constraint::Min(0)]).split(rect);
-                frame.render_widget(Paragraph::new(label).style(Style::default().fg(accent)), columns[0]);
-                frame.render_widget(Paragraph::new(fit_value(value, columns[1].width, selected)).style(style), columns[1]);
+                frame.render_widget(Paragraph::new(label).style(label_style), columns[0]);
+                frame.render_widget(Paragraph::new(fit_value(value, columns[1].width, selected)).style(value_style), columns[1]);
             }
         }
-        let hint = self.fields.iter().find(|f| f.id == self.selected).map_or("", |f| f.hint);
-        let (message, style) = if self.error.is_empty() {
-            (hint, Style::default().fg(Color::Gray))
-        } else {
-            (self.error.as_str(), Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))
-        };
-        frame.render_widget(Paragraph::new(message).style(style).wrap(Wrap { trim: true }), g.help);
+        let field = self.fields.iter().find(|f| f.id == self.selected);
+        let hint = field.map_or("", |f| f.hint);
+        let (message, color) = if self.error.is_empty() { (hint, MUTED) } else { (self.error.as_str(), ERROR) };
+        if g.help.height > 0 {
+            if g.help.x >= g.rows.right() {
+                let label = if self.error.is_empty() { "ПОДСКАЗКА" } else { "ПРОВЕРЬТЕ ПОЛЕ" };
+                let lines = vec![
+                    Line::styled(label, Style::default().fg(if self.error.is_empty() { ACCENT } else { ERROR }).add_modifier(Modifier::BOLD)),
+                    Line::raw(""),
+                    Line::styled(field.map_or("", |f| f.label), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+                    Line::styled(message, Style::default().fg(color)),
+                ];
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), g.help);
+            } else {
+                frame.render_widget(Paragraph::new(message).style(Style::default().fg(color)).wrap(Wrap { trim: true }), g.help);
+            }
+        }
     }
 }
 
@@ -146,12 +210,12 @@ impl Actions<'_> {
         let rows = usize::from(area.height.saturating_sub(2));
         let items = self.items.iter().enumerate().skip(self.start(area)).take(rows).map(|(i, item)| {
             let style = if i == selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else { Style::default() };
+                Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD)
+            } else { Style::default().fg(TEXT) };
             ListItem::new(format!("{} {}: {}", if i == selected { "›" } else { " " }, item.key, item.label)).style(style)
         }).collect::<Vec<_>>();
         frame.render_widget(List::new(items).block(
-            Block::default().title(" Действия · ↑↓ Enter ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))
+            section(" Действия · ↑↓ Enter ", true)
         ), area);
     }
 }
@@ -234,6 +298,35 @@ mod tests {
             term.draw(|frame| actions.render(frame, controls)).unwrap();
             let screen = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
             assert!(screen.contains("Остановка"));
+        }
+    }
+
+    #[test]
+    fn large_terminal_forms_keep_help_near_fields_and_labels_visible() {
+        let form = Form {
+            fields: vec![
+                Field { id: 1, label: "Порт TCP/UDP", value: "443".into(), hint: "Порт сервера." },
+                Field { id: 2, label: "Адрес", value: String::new(), hint: "Введите домен." },
+                Field { id: 3, label: "Пользователь", value: String::new(), hint: "ID пользователя." },
+            ],
+            selected: 1, lead: "Настройка сервера".into(), error: String::new(),
+        };
+        for (w, h) in [(80, 60), (132, 65), (240, 90)] {
+            let area = Rect::new(0, 0, w, h);
+            let geometry = form.geometry(area);
+            assert!(geometry.rows.height <= 9);
+            assert!(geometry.help.y <= geometry.rows.bottom());
+            assert_eq!(form.hit(area, geometry.rows.x, geometry.rows.y), Some(1));
+            assert_eq!(form.hit(area, geometry.rows.x, geometry.rows.bottom()), None);
+            let mut term = Terminal::new(TestBackend::new(w,h)).unwrap();
+            term.draw(|frame| form.render(frame, area, "Параметры")).unwrap();
+            let buffer = term.backend().buffer();
+            let screen = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            assert!(screen.contains("Порт TCP/UDP"));
+            assert!(screen.contains("443"));
+            assert!(screen.contains("Порт сервера."));
+            assert!(!screen.contains("┌") && !screen.contains("┐"));
+            assert!(buffer.content().iter().all(|c| c.bg != Color::Cyan));
         }
     }
 

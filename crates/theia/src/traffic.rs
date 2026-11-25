@@ -1,11 +1,11 @@
 //! Privacy-preserving, process-local application DATA accounting.
 //! Counts complete relay writes/accepted frames, not IP/wire bytes or peer ACKs.
 //! No per-destination state, payload, credentials, unbounded history or I/O.
-use crate::Role;
+use crate::{tui_widgets::{self, ACCENT, MUTED, SURFACE, TEXT}, Role};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, Paragraph, Sparkline, Wrap},
+    widgets::{Block, Borders, Paragraph, Sparkline, Wrap},
     Frame,
 };
 use std::collections::VecDeque;
@@ -146,17 +146,13 @@ impl Monitor {
     /// Render only measured process-local aggregates. Each transport uses
     /// the same chart scale; the history is bounded to 60 sampled intervals.
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        frame.render_widget(Clear, area);
-        let border = Style::default().fg(Color::DarkGray);
+        tui_widgets::canvas(frame, area);
         if area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
             frame.render_widget(
                 Paragraph::new(self.body())
                     .wrap(Wrap { trim: false })
                     .block(
-                        Block::default()
-                            .title(" Монитор трафика ")
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Cyan)),
+                        tui_widgets::section(" Монитор трафика ", true),
                     ),
                 area,
             );
@@ -181,10 +177,7 @@ impl Monitor {
         let scope = format!("Активные relay: {active}   •   Всего открыто: {opened}\nТолько DATA текущего процесса, не сетевые байты и не подтверждение доставки.");
         frame.render_widget(
             Paragraph::new(scope).wrap(Wrap { trim: true }).block(
-                Block::default()
-                    .title(" Обзор ")
-                    .borders(Borders::ALL)
-                    .border_style(border),
+                tui_widgets::section(" Обзор ", false),
             ),
             layout[0],
         );
@@ -204,19 +197,16 @@ impl Monitor {
             .max(1);
         for (i, panel) in panels.iter().copied().enumerate() {
             let color = if i == 0 {
-                Color::Cyan
+                ACCENT
             } else {
-                Color::LightBlue
+                Color::Rgb(170, 180, 250)
             };
             let title = if i == 0 {
                 " H2 · TCP "
             } else {
                 " H3 · QUIC "
             };
-            let block = Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(color));
+            let block = tui_widgets::section(title, i == 0);
             let inner = block.inner(panel);
             frame.render_widget(block, panel);
             let regions =
@@ -247,7 +237,7 @@ impl Monitor {
                 .block(
                     Block::default()
                         .title(" ↑+↓ DATA/с · 60 отсчётов ")
-                        .borders(Borders::TOP),
+                        .borders(Borders::TOP).border_style(Style::default().fg(MUTED)),
                 );
             frame.render_widget(chart, regions[1]);
         }
@@ -258,7 +248,7 @@ impl Monitor {
         frame.render_widget(
             Paragraph::new(note)
                 .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).border_style(border)),
+                .style(Style::default().bg(SURFACE).fg(TEXT)),
             layout[2],
         );
     }
