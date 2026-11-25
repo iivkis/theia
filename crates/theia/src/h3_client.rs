@@ -30,6 +30,7 @@ pub struct H3Client {
     roots: RootCertStore,
     identity_quic: Option<quinn::ClientConfig>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
+    padding: crate::descriptor::Padding,
     own_routes: Option<crate::split_http::IdentityRoutes>,
     connect_timeout: Duration,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
@@ -68,6 +69,7 @@ impl H3Client {
             roots,
             identity_quic: None,
             identity_routes: None,
+            padding: crate::descriptor::Padding::default(),
             own_routes: Some(crate::split_http::IdentityRoutes::new(crate::split_http::EXAMPLE_PREFIX)?),
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
@@ -161,6 +163,7 @@ impl H3Client {
             roots: RootCertStore::empty(),
             identity_quic: Some(quic),
             identity_routes: Some(routes),
+            padding: d.padding.clone(),
             own_routes: None,
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
@@ -213,7 +216,7 @@ impl H3Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let mut stream = sender
-                .send_request(request)
+                .send_request(self.padding.request(request)?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             stream.finish().await.map_err(|_| ClientError::Http3)?;
@@ -507,13 +510,13 @@ impl H3Client {
             let mut download = sender
                 .send_request(crate::channel_binding::attach(
                     binding,
-                    split_http::request_for(
+                    self.padding.request(split_http::request_for(
                         self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                         &self.uri,
                         Leg::Download,
                         &self.authorization,
                         pair_id,
-                    )?,
+                    )?)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
@@ -521,13 +524,13 @@ impl H3Client {
             let mut upload = sender
                 .send_request(crate::channel_binding::attach(
                     binding,
-                    split_http::request_for(
+                    self.padding.request(split_http::request_for(
                         self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                         &self.uri,
                         Leg::Upload,
                         &self.authorization,
                         pair_id,
-                    )?,
+                    )?)?,
                 )?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
@@ -563,7 +566,7 @@ impl H3Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let mut stream = sender
-                .send_request(crate::channel_binding::attach(binding, request)?)
+                .send_request(crate::channel_binding::attach(binding, self.padding.request(request)?)?)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             let response = stream
@@ -621,10 +624,14 @@ impl H3Client {
             "hello_ack_received",
             "op" = Value::Count(operation)
         );
-        if !matches!(ack, Frame::HelloAck { .. }) {
+        let Frame::HelloAck { accepted_capabilities, .. } = ack else {
             return Err(ClientError::Protocol);
-        }
+        };
         *stage = crate::split_http::HelloOutcome::Acked;
+        if let Some(padding) = self.padding.frame(accepted_capabilities)? {
+            state.apply(Direction::Send, &padding).map_err(|_| ClientError::Protocol)?;
+            send(&mut tx, &padding).await?;
+        }
         state
             .apply(Direction::Send, open)
             .map_err(|_| ClientError::Protocol)?;

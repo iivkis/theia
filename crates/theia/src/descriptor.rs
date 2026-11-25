@@ -136,7 +136,7 @@ pub struct Reference {
     pub h3: bool,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Padding {
     pub header_min: u16,
@@ -196,10 +196,7 @@ impl Descriptor {
             || usize::from(self.active_reference) >= self.references.len()
             || !(self.stream_one || self.stream_up)
             || !crate::split_http::valid_prefix(&self.path_prefix)
-            || self.padding.header_min > self.padding.header_max
-            || self.padding.header_max > 8192
-            || self.padding.frame_min > self.padding.frame_max
-            || self.padding.frame_max > crate::protocol::MAX_PAYLOAD as u32
+            || !self.padding.valid()
             || self.rotation.lifetime_min_s == 0
             || self.rotation.lifetime_min_s > self.rotation.lifetime_max_s
             || self.rotation.volume_min_bytes == 0

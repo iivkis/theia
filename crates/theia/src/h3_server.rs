@@ -239,7 +239,7 @@ async fn handle_descriptor(
     if !matches!(
         timeout(CLOSE_TIMEOUT, async {
             stream
-                .send_response(response)
+                .send_response(context.pad_response(response)?)
                 .await
                 .map_err(|_| ServerError::Io)?;
             stream
@@ -298,7 +298,7 @@ async fn handle_request(
         "session" = Value::Count(session_id)
     );
     if !matches!(
-        timeout(CLOSE_TIMEOUT, respond(&mut stream, StatusCode::OK)).await,
+        timeout(CLOSE_TIMEOUT, respond_admitted(&mut stream, context)).await,
         Ok(Ok(()))
     ) {
         stream.stop_stream(Code::H3_REQUEST_CANCELLED);
@@ -369,9 +369,9 @@ async fn handle_split_request(
     }
     if !matches!(
         timeout(CLOSE_TIMEOUT, async {
-            respond(&mut up, StatusCode::OK).await?;
+            respond_admitted(&mut up, context).await?;
             up.finish().await.map_err(|_| ServerError::Io)?;
-            respond(&mut down, StatusCode::OK).await
+            respond_admitted(&mut down, context).await
         })
         .await,
         Ok(Ok(()))
@@ -421,6 +421,11 @@ async fn relay_request(
         tx.stop_stream(Code::H3_REQUEST_CANCELLED);
         rx.stop_sending(Code::H3_REQUEST_CANCELLED);
     }
+}
+
+async fn respond_admitted(stream: &mut Stream, context: &ServerContext) -> Result<(), ServerError> {
+    let response = Response::builder().status(StatusCode::OK).body(()).map_err(|_| ServerError::Protocol)?;
+    stream.send_response(context.pad_response(response)?).await.map_err(|_| ServerError::Io)
 }
 
 async fn respond(stream: &mut Stream, status: StatusCode) -> Result<(), ServerError> {
@@ -512,6 +517,10 @@ async fn handle_frames(
             .apply(Direction::Send, &ack)
             .map_err(|_| ServerError::Protocol)?;
         send(tx, &ack).await?;
+        if let Some(padding) = context.padding_frame(capabilities & protocol::CAP_PADDING)? {
+            state.apply(Direction::Send, &padding).map_err(|_| ServerError::Protocol)?;
+            send(tx, &padding).await?;
+        }
         let open = loop {
             let frame = incoming.next(rx).await?.ok_or(ServerError::Protocol)?;
             state

@@ -123,6 +123,7 @@ pub struct H2Client {
     wire_shape: H2WireShape,
     certificate_pin: Option<crate::security_profile::CertificatePin>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
+    padding: crate::descriptor::Padding,
     own_routes: Option<crate::split_http::IdentityRoutes>,
     stream_up: bool,
     auto_mode: Option<crate::split_http::AutoMode>,
@@ -253,6 +254,7 @@ impl H2Client {
             .build()
             .map_err(|_| ClientError::Configuration)?;
         client.identity_routes = Some(routes);
+        client.padding = d.padding.clone();
         client.own_routes = None;
         client.pool = crate::connection_pool::Pool::with_rotation(&value.descriptor().rotation);
         let modes = value.effective_modes();
@@ -302,7 +304,7 @@ impl H2Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let (response, _) = sender
-                .send_request(request, true)
+                .send_request(self.padding.request(request)?, true)
                 .map_err(|_| ClientError::Http2)?;
             let response = response.await.map_err(|_| ClientError::Http2)?;
             crate::split_http::check_status(response.status())?;
@@ -408,6 +410,7 @@ impl H2Client {
             wire_shape,
             certificate_pin: None,
             identity_routes: None,
+            padding: crate::descriptor::Padding::default(),
             own_routes: Some(crate::split_http::IdentityRoutes::new(crate::split_http::EXAMPLE_PREFIX)?),
             stream_up: false,
             auto_mode: None,
@@ -683,13 +686,13 @@ impl H2Client {
                 .send_request(
                     crate::channel_binding::attach(
                         binding,
-                        split_http::request_for(
+                        self.padding.request(split_http::request_for(
                             self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                             &self.uri,
                             Leg::Download,
                             &self.authorization,
                             pair_id,
-                        )?,
+                        )?)?,
                     )?,
                     true,
                 )
@@ -699,13 +702,13 @@ impl H2Client {
                 .send_request(
                     crate::channel_binding::attach(
                         binding,
-                        split_http::request_for(
+                        self.padding.request(split_http::request_for(
                             self.identity_routes.as_ref().or(self.own_routes.as_ref()),
                             &self.uri,
                             Leg::Upload,
                             &self.authorization,
                             pair_id,
-                        )?,
+                        )?)?,
                     )?,
                     false,
                 )
@@ -730,7 +733,7 @@ impl H2Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let (response, tx) = sender
-                .send_request(crate::channel_binding::attach(binding, request)?, false)
+                .send_request(crate::channel_binding::attach(binding, self.padding.request(request)?)?, false)
                 .map_err(|_| ClientError::Http2)?;
             (response.await.map_err(|_| ClientError::Http2)?, tx)
         };
@@ -787,10 +790,14 @@ impl H2Client {
             "hello_ack_received",
             "op" = Value::Count(operation)
         );
-        if !matches!(ack, Frame::HelloAck { .. }) {
+        let Frame::HelloAck { accepted_capabilities, .. } = ack else {
             return Err(ClientError::Protocol);
-        }
+        };
         *stage = crate::split_http::HelloOutcome::Acked;
+        if let Some(padding) = self.padding.frame(accepted_capabilities)? {
+            state.apply(Direction::Send, &padding).map_err(|_| ClientError::Protocol)?;
+            send_frame(&mut outgoing, &padding, false).await?;
+        }
         state
             .apply(Direction::Send, open)
             .map_err(|_| ClientError::Protocol)?;

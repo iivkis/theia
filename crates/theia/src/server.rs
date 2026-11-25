@@ -137,6 +137,7 @@ pub struct ServerContext {
     security_mode: crate::security_profile::SecurityMode,
     identity_routes: Option<RwLock<IdentityRoutePolicy>>,
     own_routes: Option<crate::split_http::IdentityRoutes>,
+    padding: crate::descriptor::Padding,
     identity_gate: Option<Arc<RwLock<bool>>>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
@@ -215,6 +216,7 @@ impl ServerContext {
             inbound_id: inbound.id.clone(),
             security_mode: inbound.security_mode,
             identity_routes: None,
+            padding: crate::descriptor::Padding::default(),
             own_routes: inbound.path_prefix.as_deref().and_then(|prefix| crate::split_http::IdentityRoutes::new(prefix).ok()),
             identity_gate: None,
             authorization,
@@ -271,6 +273,7 @@ impl ServerContext {
         }
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
+        self.padding = d.padding.clone();
         self.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
             paths,
             stream_one: d.stream_one,
@@ -307,6 +310,7 @@ impl ServerContext {
             inbound_id: self.inbound_id.clone(),
             security_mode: self.security_mode,
             own_routes: None,
+            padding: d.padding.clone(),
             identity_routes: Some(RwLock::new(IdentityRoutePolicy {
                 paths,
                 stream_one: d.stream_one,
@@ -381,6 +385,15 @@ impl ServerContext {
         routes.digest = value.payload_sha256();
         routes.signed = Arc::from(signed);
         Ok(next.revision)
+    }
+
+    pub(crate) fn pad_response<T>(&self, mut response: Response<T>) -> Result<Response<T>, ServerError> {
+        self.padding.add_header(response.headers_mut()).map_err(|_| ServerError::Config)?;
+        Ok(response)
+    }
+
+    pub(crate) fn padding_frame(&self, accepted: u32) -> Result<Option<Frame>, ServerError> {
+        self.padding.frame(accepted).map_err(|_| ServerError::Config)
     }
 
     pub(crate) fn split_leg<T>(&self, request: &Request<T>) -> Option<crate::split_http::Leg> {
@@ -1107,7 +1120,7 @@ async fn handle_descriptor(
         .body(())
         .map_err(|_| ServerError::Http2)?;
     let mut output = respond
-        .send_response(response, false)
+        .send_response(context.pad_response(response)?, false)
         .map_err(|_| ServerError::Http2)?;
     timeout(CLOSE_TIMEOUT, async {
         output.reserve_capacity(signed.len());
@@ -1181,7 +1194,7 @@ async fn handle_request(
         .map_err(|_| ServerError::Http2)?;
     // HTTP 200 acknowledges transport/auth headers, NOT remote TCP OPEN.
     let outgoing = respond
-        .send_response(response, false)
+        .send_response(context.pad_response(response)?, false)
         .map_err(|_| ServerError::Http2)?;
     let result = relay_request(inbound, outgoing, &context, session_id).await;
     drop(permit);
@@ -1242,9 +1255,10 @@ async fn handle_split_request(
         .map_err(|_| ServerError::Http2)?;
     // POST response contains only an empty acknowledgement. All downstream
     // SmartTheia frames travel on the independent GET response.
-    reject(&mut up, StatusCode::OK).await?;
+    let upload_ack = Response::builder().status(StatusCode::OK).body(()).map_err(|_| ServerError::Http2)?;
+    up.send_response(context.pad_response(upload_ack)?, true).map_err(|_| ServerError::Http2)?;
     let outgoing = down
-        .send_response(response, false)
+        .send_response(context.pad_response(response)?, false)
         .map_err(|_| ServerError::Http2)?;
     let result = relay_request(
         upload.into_body(),
@@ -1391,6 +1405,10 @@ async fn handle_frames(
             .apply(Direction::Send, &ack)
             .map_err(|_| ServerError::Protocol)?;
         send_frame(outgoing, &ack).await?;
+        if let Some(padding) = context.padding_frame(capabilities & protocol::CAP_PADDING)? {
+            state.apply(Direction::Send, &padding).map_err(|_| ServerError::Protocol)?;
+            send_frame(outgoing, &padding).await?;
+        }
         let open = loop {
             let frame = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
             state
