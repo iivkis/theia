@@ -88,7 +88,36 @@ fn visual_review_gallery() {
         ui.update(&mut model, press(KeyCode::Enter));
         assert_eq!(ui.workspace_page, 3);
         assert!(!ui.owned_running(Role::Client));
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Активный профиль: №1 · edge.example.org:443"));
+        assert!(!screen.contains(&doc.client.profiles[0].id));
         review_capture("client-reality-key-connect", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Char('V')));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let status = ui.reality_status.as_mut().unwrap();
+            status.poll();
+            if status.actions().iter().any(|a| a.key == 's') { break; }
+            assert!(std::time::Instant::now() < deadline, "REALITY status did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Сервер: edge.example.org:443"));
+        assert!(screen.contains("Описание сервера: версия"));
+        assert!(screen.contains("Фоновый клиент:"));
+        for term in ["Endpoint=", "Headless runtime", "IPC", "credential", "identity_sha256"] {
+            assert!(!screen.contains(term), "{term}");
+        }
+        review_capture("client-reality-local-proxy-before-start", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Char('s')));
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Запуск локального прокси"));
+        assert!(screen.contains("ШАГ 1/1"));
+        assert!(screen.contains("Следующее действие"));
+        assert!(!ui.owned_running(Role::Client));
+        review_capture("client-reality-local-proxy-start-confirm", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Char('n')));
+        assert!(!ui.owned_running(Role::Client));
     }
     let mut modes = Interaction::new(Some(Editor::load(Role::Client, &client).unwrap()));
     let mut client_model = Model::new(Some(Role::Client));
@@ -110,6 +139,9 @@ fn visual_review_gallery() {
     review_capture("client-local-proxy-before-start", &client_model, &modes);
     modes.update(&mut client_model, press(KeyCode::Char('s')));
     assert!(!modes.owned_running(Role::Client));
+    let screen = rendered_interaction(120, 40, &client_model, &modes);
+    assert!(screen.contains("ШАГ 1/1"));
+    assert!(screen.contains("Следующее действие"));
     review_capture("client-local-proxy-start-confirm", &client_model, &modes);
     modes.update(&mut client_model, press(KeyCode::Char('n')));
     assert!(!modes.owned_running(Role::Client));

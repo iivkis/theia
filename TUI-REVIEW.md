@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (3fcef3e13d352c069241d991092c239c53e910ee) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (95d4b5a7ad69cf8ff5ac1114dbff7611546c4059) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -17,3 +17,5 @@ The gallery now captures first-run self-contained REALITY import (masked key, tr
 Check the source SHA before using screenshots. Review visual hierarchy, truncation, contrast, layout density, current focus, clear next action, understandable field descriptions, confirmations, and separate saved/runtime status. Report by screenshot filename and concrete visual defect. Do not equate a rendered preview with verified runtime operation.
 
 The local proxy gallery waits for the actual status result and captures the explicit start confirmation without launching a listener.
+
+Both REALITY and Own-TLS local proxy status and start confirmation are captured after the read-only check, with assertions for clear Russian labels, no internal profile ID in the connection view and the common confirmation layout.
