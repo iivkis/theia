@@ -2051,6 +2051,48 @@ mod tests {
         assert_eq!(menu.key(KeyCode::Enter), Some(key('Q')));
     }
 
+
+    #[test]
+    fn compact_menu_preserves_selection_and_configuration_guards() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let area = Rect::new(0, 0, 68, 22);
+        for role in [Role::Server, Role::Client] {
+            for configured in [false, true] {
+                let mut menu = Menu::new(role, configured);
+                assert_eq!(Menu::categories(role).len(), menu.groups().len());
+                let group_count = menu.groups().len();
+                for group in 0..group_count {
+                    menu.click(area, 2, 1 + group as u16);
+                    assert_eq!(menu.group, group);
+                    assert!(menu.item.is_none());
+                    let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+                    terminal.draw(|frame| menu.render(frame, area)).unwrap();
+                    let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+                    assert!(rendered.contains(menu.groups()[group].title));
+                    assert_eq!(menu.key(KeyCode::Enter), None);
+                    assert_eq!(menu.item, Some(0));
+                    let entries = menu.groups()[group].entries;
+                    for (index, entry) in entries.iter().enumerate() {
+                        menu.click(area, 2, 1 + index as u16);
+                        assert_eq!(menu.item, Some(index));
+                        terminal.draw(|frame| menu.render(frame, area)).unwrap();
+                        let allowed = configured || !entry.requires_config;
+                        assert_eq!(menu.key(KeyCode::Enter), allowed.then_some(entry.action));
+                        assert_eq!(menu.notice.is_some(), !allowed);
+                        if !allowed {
+                            terminal.draw(|frame| menu.render(frame, area)).unwrap();
+                            let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+                            assert!(rendered.contains("Сначала откройте конфигурацию"));
+                        }
+                    }
+                    assert_eq!(menu.key(KeyCode::Esc), None);
+                    assert!(menu.item.is_none());
+                }
+                assert_eq!(menu.key(KeyCode::F(10)), Some(Action::Close));
+            }
+        }
+    }
+
     #[test]
     fn unconfigured_actions_do_not_mutate_and_selection_is_visible() {
         let mut m = Menu::new(Role::Client, false);
