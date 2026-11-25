@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
@@ -21,6 +21,7 @@ pub(crate) const WARNING: Color = Color::Rgb(244, 194, 118);
 pub(crate) const ERROR: Color = Color::Rgb(255, 146, 152);
 
 pub(crate) fn canvas(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(Style::default().fg(TEXT).bg(BG)), area);
 }
 
@@ -110,6 +111,14 @@ impl Form {
     }
 
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect, title: &str) {
+        self.render_as(frame, area, title, false);
+    }
+
+    pub(crate) fn render_picker(&self, frame: &mut Frame<'_>, area: Rect, title: &str) {
+        self.render_as(frame, area, title, true);
+    }
+
+    fn render_as(&self, frame: &mut Frame<'_>, area: Rect, title: &str, picker: bool) {
         canvas(frame, area);
         let g = self.geometry(area);
         let title = if g.end - g.start < self.fields.len() {
@@ -126,13 +135,20 @@ impl Form {
             let label = format!("{marker}{}", field.label);
             let value = if field.value.is_empty() { "Введите значение" } else { field.value.as_str() };
             let label_style = Style::default().fg(if selected { ACCENT } else { TEXT }).add_modifier(Modifier::BOLD);
-            let value_style = Style::default().fg(if field.value.is_empty() { MUTED } else { TEXT })
-                .bg(if selected { FOCUS } else { INPUT });
+            let value_style = Style::default().fg(if field.value.is_empty() || picker { MUTED } else { TEXT })
+                .bg(if selected { FOCUS } else if picker { BG } else { INPUT });
+            if picker && g.stride >= 2 {
+                let style = label_style.bg(if selected { FOCUS } else { BG });
+                frame.render_widget(Paragraph::new(label).style(style), Rect::new(rect.x, rect.y, rect.width, 1));
+                frame.render_widget(Paragraph::new(format!("  {}", fit_value(value, rect.width.saturating_sub(2), false))).style(value_style),
+                    Rect::new(rect.x, rect.y + 1, rect.width, 1));
+                continue;
+            }
             if g.stride >= 2 {
                 frame.render_widget(Paragraph::new(label).style(label_style), Rect::new(rect.x, rect.y, rect.width, 1));
                 let input = Rect::new(rect.x.saturating_add(2), rect.y + 1, rect.width.saturating_sub(4), 1);
                 let shown = fit_value(value, input.width.saturating_sub(3), selected);
-                let content = if selected { format!(" {shown} ▏") } else { format!(" {shown}") };
+                let content = if selected && !picker { format!(" {shown} ▏") } else { format!(" {shown}") };
                 frame.render_widget(Paragraph::new(content).style(value_style), input);
             } else {
                 let label_width = rect.width / 2;
@@ -282,6 +298,35 @@ mod tests {
             term.draw(|frame| actions.render(frame, controls)).unwrap();
             let screen = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
             assert!(screen.contains("Остановка"));
+        }
+    }
+
+    #[test]
+    fn large_terminal_forms_keep_help_near_fields_and_labels_visible() {
+        let form = Form {
+            fields: vec![
+                Field { id: 1, label: "Порт TCP/UDP", value: "443".into(), hint: "Порт сервера." },
+                Field { id: 2, label: "Адрес", value: String::new(), hint: "Введите домен." },
+                Field { id: 3, label: "Пользователь", value: String::new(), hint: "ID пользователя." },
+            ],
+            selected: 1, lead: "Настройка сервера".into(), error: String::new(),
+        };
+        for (w, h) in [(80, 60), (132, 65), (240, 90)] {
+            let area = Rect::new(0, 0, w, h);
+            let geometry = form.geometry(area);
+            assert!(geometry.rows.height <= 9);
+            assert!(geometry.help.y <= geometry.rows.bottom());
+            assert_eq!(form.hit(area, geometry.rows.x, geometry.rows.y), Some(1));
+            assert_eq!(form.hit(area, geometry.rows.x, geometry.rows.bottom()), None);
+            let mut term = Terminal::new(TestBackend::new(w,h)).unwrap();
+            term.draw(|frame| form.render(frame, area, "Параметры")).unwrap();
+            let buffer = term.backend().buffer();
+            let screen = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            assert!(screen.contains("Порт TCP/UDP"));
+            assert!(screen.contains("443"));
+            assert!(screen.contains("Порт сервера."));
+            assert!(!screen.contains("┌") && !screen.contains("┐"));
+            assert!(buffer.content().iter().all(|c| c.bg != Color::Cyan));
         }
     }
 
