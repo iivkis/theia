@@ -6248,6 +6248,7 @@ mod tests {
 
     #[test]
     fn workspace_navigation_mouse_and_keyboard_never_commit_or_start() {
+        use crate::config::{self, Config};
         let root =
             std::env::temp_dir().join(crate::tui_editor::generated_id("workspace-nav").unwrap());
         std::fs::create_dir(&root).unwrap();
