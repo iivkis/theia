@@ -10,9 +10,10 @@ use std::{fmt, net::SocketAddr};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-const PREFIX: &str = "theia://v1/";
-const MAX_DATA: usize = 3072;
-const MAX_URI: usize = 4096;
+pub(crate) const PREFIX: &str = "theia://v1/";
+const MAX_DATA: usize = 24 * 1024;
+// One envelope must accommodate the full signed REALITY descriptor.
+pub const MAX_URI: usize = 32 * 1024;
 
 /// This type may contain a live 32-byte bearer secret. No derived Debug.
 pub struct Invitation {
@@ -61,26 +62,33 @@ impl Drop for Invitation {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum WireSecurity {
+pub(crate) enum WireSecurity {
     OwnTls,
+    SmartReality,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Wire {
-    version: u32,
-    path_prefix: String,
-    id: String,
-    endpoint: String,
-    server_name: String,
-    carrier: String,
-    security_mode: WireSecurity,
-    xhttp_mode: XhttpMode,
-    transport: Transport,
+pub(crate) struct Wire {
+    pub(crate) version: u32,
+    pub(crate) path_prefix: String,
+    pub(crate) id: String,
+    pub(crate) endpoint: String,
+    pub(crate) server_name: String,
+    pub(crate) carrier: String,
+    pub(crate) security_mode: WireSecurity,
+    pub(crate) xhttp_mode: XhttpMode,
+    pub(crate) transport: Transport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
+    pub(crate) public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) minimum_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) descriptor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token: Option<String>,
 }
 
 impl Drop for Wire {
@@ -89,6 +97,55 @@ impl Drop for Wire {
             token.zeroize();
         }
     }
+}
+
+fn check_wire(wire: &Wire) -> Result<(), InviteError> {
+    if wire.version != 1 || wire.carrier != "smarttheia-xhttp"
+        || !crate::config::valid_id(&wire.id)
+        || !crate::config::valid_remote(&wire.endpoint)
+        || !crate::split_http::valid_prefix(&wire.path_prefix)
+    {
+        return Err(InviteError::Invalid);
+    }
+    let valid = match wire.security_mode {
+        WireSecurity::OwnTls => wire.public_key.is_none()
+            && wire.minimum_revision.is_none() && wire.descriptor.is_none(),
+        WireSecurity::SmartReality => wire.public_key.is_some()
+            && wire.minimum_revision.is_some_and(|revision| revision > 0)
+            && wire.descriptor.as_ref().is_some_and(|value| !value.is_empty()
+                && value.len() <= crate::descriptor::MAX_DOCUMENT),
+    };
+    if !valid { return Err(InviteError::Invalid); }
+    Ok(())
+}
+
+pub(crate) fn encode_wire(wire: &Wire) -> Result<Zeroizing<String>, InviteError> {
+    check_wire(wire)?;
+    let text = Zeroizing::new(toml::to_string(wire).map_err(|_| InviteError::Invalid)?);
+    if text.len() > MAX_DATA { return Err(InviteError::Invalid); }
+    let mut uri = Zeroizing::new(PREFIX.to_owned());
+    URL_SAFE_NO_PAD.encode_string(text.as_bytes(), &mut uri);
+    if uri.len() > MAX_URI { return Err(InviteError::Invalid); }
+    Ok(uri)
+}
+
+pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
+    if uri.len() > MAX_URI { return Err(InviteError::Invalid); }
+    let encoded = uri.strip_prefix(PREFIX).ok_or(InviteError::Invalid)?;
+    if encoded.is_empty() || encoded.bytes().any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_') {
+        return Err(InviteError::Invalid);
+    }
+    let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded).map_err(|_| InviteError::Invalid)?);
+    let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice()));
+    if bytes.len() > MAX_DATA || canonical.as_str() != encoded { return Err(InviteError::Invalid); }
+    let text = std::str::from_utf8(&bytes).map_err(|_| InviteError::Invalid)?;
+    let wire: Wire = toml::from_str(text).map_err(|_| InviteError::Invalid)?;
+    check_wire(&wire)?;
+    // Preserve the authenticated REALITY bootstrap's canonical TOML contract.
+    if wire.security_mode == WireSecurity::SmartReality
+        && Zeroizing::new(toml::to_string(&wire).map_err(|_| InviteError::Invalid)?).as_str() != text
+    { return Err(InviteError::Invalid); }
+    Ok(wire)
 }
 
 impl Invitation {
@@ -211,49 +268,22 @@ impl Invitation {
             security_mode: WireSecurity::OwnTls,
             xhttp_mode: self.xhttp_mode,
             transport: self.transport,
+            public_key: None,
+            minimum_revision: None,
+            descriptor: None,
             token: self.token.as_ref().map(|v| URL_SAFE_NO_PAD.encode(v)),
         };
-        let text = Zeroizing::new(toml::to_string(&wire).map_err(|_| InviteError::Invalid)?);
-        if text.len() > MAX_DATA {
-            return Err(InviteError::Invalid);
-        }
-        let mut uri = Zeroizing::new(PREFIX.to_owned());
-        URL_SAFE_NO_PAD.encode_string(text.as_bytes(), &mut uri);
-        if uri.len() > MAX_URI {
-            return Err(InviteError::Invalid);
-        }
+        let mut uri = encode_wire(&wire)?;
         Ok(std::mem::take(&mut *uri))
     }
 
     /// Reject non-canonical base64url, unknown fields/versions, invalid
     /// credential lengths, and invalid core profile fields.
     pub fn decode(uri: &str) -> Result<Self, InviteError> {
-        if uri.len() > MAX_URI {
+        let mut wire = decode_wire(uri)?;
+        if wire.security_mode != WireSecurity::OwnTls {
             return Err(InviteError::Invalid);
         }
-        let encoded = uri.strip_prefix(PREFIX).ok_or(InviteError::Invalid)?;
-        if encoded.is_empty()
-            || encoded
-                .bytes()
-                .any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_')
-        {
-            return Err(InviteError::Invalid);
-        }
-        let bytes = Zeroizing::new(
-            URL_SAFE_NO_PAD
-                .decode(encoded)
-                .map_err(|_| InviteError::Invalid)?,
-        );
-        let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice()));
-        if bytes.len() > MAX_DATA || canonical.as_str() != encoded {
-            return Err(InviteError::Invalid);
-        }
-        let text = std::str::from_utf8(&bytes).map_err(|_| InviteError::Invalid)?;
-        let mut wire: Wire = toml::from_str(text).map_err(|_| InviteError::Invalid)?;
-        if wire.version != 1 || wire.carrier != "smarttheia-xhttp" {
-            return Err(InviteError::Invalid);
-        }
-        let WireSecurity::OwnTls = wire.security_mode;
         let tls_profile = "default".into();
         let token = match wire.token.as_ref() {
             Some(raw) => {

@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fmt, path::Path};
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
+use crate::invite::{self, Wire, WireSecurity};
 
-const PREFIX: &str = "theia://v1/";
-pub const MAX_URI: usize = 32 * 1024;
-const MAX_DATA: usize = 24 * 1024;
+#[cfg(test)]
+use crate::invite::PREFIX;
+pub use crate::invite::MAX_URI;
 const MAX_PROFILE: usize = 64 * 1024;
 pub(crate) const VALIDITY: u64 = 7 * 24 * 60 * 60;
 
@@ -220,28 +221,6 @@ pub fn refresh_descriptor(
         .map_err(|_| Error::Descriptor)
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Wire {
-    version: u16,
-    carrier: String,
-    security_mode: String,
-    inbound: String,
-    endpoint: String,
-    public_key: String,
-    minimum_revision: u64,
-    descriptor: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
-}
-impl Drop for Wire {
-    fn drop(&mut self) {
-        if let Some(token) = &mut self.token {
-            token.zeroize();
-        }
-    }
-}
-
 /// Incoming invitations are UNTRUSTED until explicitly matched with an
 /// independently obtained public-key fingerprint. A valid self-signature
 /// is not proof that the operator intended to trust the signer.
@@ -250,6 +229,8 @@ pub struct Invitation {
     public: [u8; 32],
     revision: u64,
     signed: String,
+    reference_name: String,
+    path_prefix: String,
     bearer: Option<Zeroizing<[u8; 32]>>,
 }
 
@@ -268,6 +249,8 @@ impl Invitation {
             public: identity.public_key(),
             revision: value.descriptor().revision,
             signed: signed.to_owned(),
+            reference_name: value.descriptor().references[usize::from(value.descriptor().active_reference)].server_name.clone(),
+            path_prefix: value.descriptor().path_prefix.clone(),
             bearer: None,
         })
     }
@@ -323,12 +306,16 @@ impl Invitation {
         Wire {
             version: 1,
             carrier: "smarttheia-xhttp".into(),
-            security_mode: "smart-reality".into(),
-            inbound: self.scope.inbound.clone(),
+            security_mode: WireSecurity::SmartReality,
+            id: self.scope.inbound.clone(),
             endpoint: self.scope.endpoint.clone(),
-            public_key: URL_SAFE_NO_PAD.encode(self.public),
-            minimum_revision: self.revision,
-            descriptor: self.signed.clone(),
+            server_name: self.reference_name.clone(),
+            path_prefix: self.path_prefix.clone(),
+            transport: Transport::Auto,
+            xhttp_mode: XhttpMode::Auto,
+            public_key: Some(URL_SAFE_NO_PAD.encode(self.public)),
+            minimum_revision: Some(self.revision),
+            descriptor: Some(self.signed.clone()),
             token: self
                 .bearer
                 .as_ref()
@@ -337,51 +324,23 @@ impl Invitation {
     }
 
     pub fn encode(&self) -> Result<Zeroizing<String>, Error> {
-        let raw = Zeroizing::new(toml::to_string(&self.wire()).map_err(|_| Error::Format)?);
-        if raw.len() > MAX_DATA {
-            return Err(Error::Format);
-        }
-        let mut uri = Zeroizing::new(PREFIX.to_owned());
-        URL_SAFE_NO_PAD.encode_string(raw.as_bytes(), &mut uri);
-        if uri.len() > MAX_URI {
-            return Err(Error::Format);
-        }
-        Ok(uri)
+        invite::encode_wire(&self.wire()).map_err(|_| Error::Format)
     }
 
     pub fn decode(uri: &str, now: u64) -> Result<Self, Error> {
-        if uri.len() > MAX_URI {
+        let wire = invite::decode_wire(uri).map_err(|_| Error::Format)?;
+        if wire.security_mode != WireSecurity::SmartReality
+            || wire.transport != Transport::Auto || wire.xhttp_mode != XhttpMode::Auto {
             return Err(Error::Format);
         }
-        let encoded = uri.strip_prefix(PREFIX).ok_or(Error::Format)?;
-        let raw = Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded).map_err(|_| Error::Format)?);
-        let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(raw.as_slice()));
-        if raw.len() > MAX_DATA || canonical.as_str() != encoded {
-            return Err(Error::Format);
-        }
-        let text = std::str::from_utf8(&raw).map_err(|_| Error::Format)?;
-        let wire: Wire = toml::from_str(text).map_err(|_| Error::Format)?;
-        if wire.version != 1
-            || wire.carrier != "smarttheia-xhttp"
-            || wire.security_mode != "smart-reality"
-            || Zeroizing::new(toml::to_string(&wire).map_err(|_| Error::Format)?).as_str() != text
-        {
-            return Err(Error::Format);
-        }
-        let public = key(&wire.public_key)?;
-        let scope = Scope {
-            inbound: wire.inbound.clone(),
-            endpoint: wire.endpoint.clone(),
-        };
-        let value = verify(
-            &wire.descriptor,
-            &scope,
-            public,
-            wire.minimum_revision,
-            auto_policy(),
-            now,
-        )?;
-        if value.descriptor().revision != wire.minimum_revision {
+        let public = key(wire.public_key.as_deref().ok_or(Error::Format)?)?;
+        let scope = Scope { inbound: wire.id.clone(), endpoint: wire.endpoint.clone() };
+        let revision = wire.minimum_revision.ok_or(Error::Format)?;
+        let signed = wire.descriptor.as_deref().ok_or(Error::Format)?;
+        let value = verify(signed, &scope, public, revision, auto_policy(), now)?;
+        let d = value.descriptor();
+        if d.revision != revision || d.path_prefix != wire.path_prefix
+            || d.references[usize::from(d.active_reference)].server_name != wire.server_name {
             return Err(Error::Descriptor);
         }
         let bearer = wire
@@ -393,8 +352,10 @@ impl Invitation {
         Ok(Self {
             scope,
             public,
-            revision: wire.minimum_revision,
-            signed: wire.descriptor.clone(),
+            revision,
+            signed: signed.to_owned(),
+            reference_name: wire.server_name.clone(),
+            path_prefix: wire.path_prefix.clone(),
             bearer,
         })
     }
@@ -1026,6 +987,14 @@ mod tests {
             .is_err());
         assert!(Invitation::decode(&format!("{}=", uri.as_str()), NOW).is_err());
         assert!(Invitation::decode(&uri, NOW + VALIDITY).is_err());
+        assert!(crate::invite::Invitation::decode(&uri).is_err());
+        let mut wire = received.wire();
+        wire.path_prefix = "/v1/substituted".into();
+        let wrong = invite::encode_wire(&wire).unwrap();
+        assert!(Invitation::decode(&wrong, NOW).is_err());
+        wire = received.wire();
+        wire.security_mode = WireSecurity::OwnTls;
+        assert!(invite::encode_wire(&wire).is_err());
         let wire = received.wire();
         let mut value = toml::to_string(&wire).unwrap();
         value.push_str("unknown = 1\n");

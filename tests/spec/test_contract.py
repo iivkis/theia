@@ -534,14 +534,14 @@ class SpecContractTests(unittest.TestCase):
         self.assertFalse((ROOT / "crates/theia/src/reality_identity.rs").exists())
         self.assertNotIn("SmartRealityV1", read("crates/theia/src/security_profile.rs"))
         # Registered external REALITY is not the retired local-TLS invitation.
-        # The ordinary invitation codec must still reject both registered REALITY
-        # profiles and server inbounds instead of exporting a generic TLS pin.
+        # Shared v1 envelope supports both modes; the own-TLS adapter must
+        # still reject REALITY instead of exporting a generic TLS pin.
         invite = read("crates/theia/src/invite.rs")
         wire_security = re.search(r"enum WireSecurity\s*\{([^}]+)\}", invite)
         self.assertIsNotNone(wire_security)
         self.assertEqual(
             [item.strip() for item in wire_security.group(1).split(",") if item.strip()],
-            ["OwnTls"],
+            ["OwnTls", "SmartReality"],
         )
         self.assertRegex(
             invite,
