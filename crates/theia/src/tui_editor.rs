@@ -1190,6 +1190,17 @@ impl Editor {
         self.error = None;
     }
 
+    pub(crate) fn workspace_select_field(&mut self, index: usize) {
+        if !self.editing && self.issued.is_none() && index < self.field_count() {
+            self.selected_field = index;
+            self.error = None;
+        }
+    }
+
+    pub(crate) fn workspace_field_index(&self) -> usize {
+        self.selected_field
+    }
+
     pub fn select_field(&mut self, forward: bool) {
         if self.editing || self.issued.is_some() {
             return;
