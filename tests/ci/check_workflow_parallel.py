@@ -348,4 +348,10 @@ require("$bins = @($testEvents | Where-Object" in browser
         and "$_.profile.test -eq $false" in browser
         and "$_.target.kind -contains 'bin'" in browser,
         "F-14 must reuse a genuine same-build Windows client, with explicit build fallback")
+require("test_native_performance.py" in spec
+        and "native_binary_performance_evidence_smoke" in browser
+        and "check_native_performance.py native-performance.json" in browser
+        and "--require-smoke" in browser
+        and "native-performance-" in browser,
+        "native paired performance smoke and evidence must remain mandatory")
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")
