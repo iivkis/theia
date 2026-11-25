@@ -293,7 +293,7 @@ enum RecordFlow {
 impl RecordFlow {
     fn body(&self) -> String {
         match self {
-            Self::ChooseMode(role) => format!("Создать {}\n1: собственный TLS (cert/key или CA)\n2: SmartTheia REALITY (мастер / импорт)\nEsc: отменить. Runtime не меняется.", if *role == Role::Server {"inbound"} else {"профиль"}),
+            Self::ChooseMode(role) => format!("ВЫБЕРИТЕ РЕЖИМ\n\n  1   Own-TLS\n      {}\n\n  2   SmartTheia REALITY\n      {}\n\nEsc: назад. Сохранение не запускает runtime.", if *role == Role::Server {"Свой сертификат и ключ"} else {"Ручные параметры TLS"}, if *role == Role::Server {"Мастер проверки референсов, без своего сертификата"} else {"Импорт с независимым подтверждением доверия"}),
             Self::Confirm(review) => review.body().to_owned(),
             Self::Input {
                 action,
@@ -1911,8 +1911,13 @@ impl Interaction {
                     editor.error =
                         Some("Сохраните или отмените черновик перед подготовкой REALITY.".into());
                 } else {
-                    editor.error = None;
-                    self.reality_provision = Some(ProvisionPanel::new());
+                    match ProvisionPanel::bound(editor) {
+                        Ok(panel) => {
+                            editor.error = None;
+                            self.reality_provision = Some(panel);
+                        }
+                        Err(message) => editor.error = Some(message.into()),
+                    }
                 }
                 return false;
             }
