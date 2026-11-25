@@ -1,0 +1,120 @@
+name: Release binaries (build)
+
+on:
+  push:
+    branches: [build, build/releases]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-build-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release / ${{ matrix.target }}
+    if: github.ref == 'refs/heads/build' || github.ref == 'refs/heads/build/releases'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            executable: theia
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: theia.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      RELEASE_TARGET: ${{ matrix.target }}
+      RELEASE_EXE: ${{ matrix.executable }}
+      RELEASE_ARCHIVE: ${{ matrix.archive }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify immutable build revision
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:GITHUB_SHA) {
+            throw 'Checkout differs from requested build SHA'
+          }
+          if ($env:GITHUB_REF -notin @('refs/heads/build', 'refs/heads/build/releases')) {
+            throw 'Release build is restricted to build branch'
+          }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-build-v1-${{ matrix.target }}
+          cache-workspace-crates: false
+          cache-bin: false
+      - name: Compile optimized native binary
+        run: |
+          cargo build --locked --release --bin theia --target $env:RELEASE_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Release compilation failed' }
+      - name: Verify executable and package archive
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path "target/$env:RELEASE_TARGET/release" $env:RELEASE_EXE
+          if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Binary missing' }
+          $version = & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Release executable cannot report its version' }
+          $rust = rustc -Vv
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiler' }
+          $cargo = cargo -V
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify Cargo' }
+          $stem = "theia-$env:RELEASE_TARGET-$($env:GITHUB_SHA.Substring(0,12))"
+          $stage = Join-Path $env:RUNNER_TEMP $stem
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item -LiteralPath $exe -Destination (Join-Path $stage $env:RELEASE_EXE)
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $stage $env:RELEASE_EXE)).Hash.ToLowerInvariant()
+          "$digest  $env:RELEASE_EXE" | Set-Content -Encoding utf8 (Join-Path $stage 'SHA256SUMS')
+          [ordered]@{
+            source_sha = $env:GITHUB_SHA
+            branch = $env:GITHUB_REF_NAME
+            target = $env:RELEASE_TARGET
+            profile = 'release'
+            version = ($version -join "`n")
+            rustc = ($rust -join "`n")
+            cargo = ($cargo -join "`n")
+            binary_sha256 = $digest
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            release_acceptance = 'not_evaluated'
+          } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $stage 'build-info.json')
+          New-Item -ItemType Directory -Path dist | Out-Null
+          $archive = Join-Path dist "$stem.$env:RELEASE_ARCHIVE"
+          if ($IsLinux) {
+            chmod 755 (Join-Path $stage $env:RELEASE_EXE)
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot preserve executable mode' }
+            tar -czf $archive -C $stage .
+            if ($LASTEXITCODE -ne 0) { throw 'tar packaging failed' }
+          } else {
+            Compress-Archive -Path "$stage/*" -DestinationPath $archive
+          }
+          if (!(Test-Path -LiteralPath $archive -PathType Leaf)) { throw 'Archive missing' }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          "$hash  $([IO.Path]::GetFileName($archive))" | Set-Content -Encoding utf8 "$archive.sha256"
+          "### ${{ matrix.target }} release-profile build" >> $env:GITHUB_STEP_SUMMARY
+          "Source: $env:GITHUB_SHA" >> $env:GITHUB_STEP_SUMMARY
+          "Archive: $([IO.Path]::GetFileName($archive))" >> $env:GITHUB_STEP_SUMMARY
+          "Binary SHA-256: $digest" >> $env:GITHUB_STEP_SUMMARY
+          "Build only; acceptance and stable release publication are not performed here." >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: theia-${{ matrix.target }}-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
