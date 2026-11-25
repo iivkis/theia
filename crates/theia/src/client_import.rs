@@ -10,7 +10,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-const MAX_URI: u64 = 4096;
+const MAX_URI: u64 = crate::invite::MAX_URI as u64;
 const MAX_CA: u64 = 1024 * 1024;
 const RANDOM_BYTES: usize = 16;
 
@@ -167,6 +167,14 @@ pub(crate) fn export_invitation_file(
         return Err(ImportError::InvalidSource);
     }
     let encoded = Zeroizing::new(invite.encode().map_err(|_| ImportError::InvalidSource)?);
+    export_encoded_invitation(config_path, &encoded)
+}
+
+/// Both invitation modes use the same protected, create-only export.
+pub(crate) fn export_encoded_invitation(
+    config_path: &Path,
+    encoded: &str,
+) -> Result<PathBuf, ImportError> {
     let mut output = PrivateBearer::create_payload(
         config_path,
         "export",

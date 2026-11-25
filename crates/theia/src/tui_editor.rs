@@ -108,13 +108,56 @@ fn parse_grants(raw: &str) -> Vec<String> {
     raw.split(',').map(str::trim).map(str::to_owned).collect()
 }
 
+/// One-time, saved credential offer for either product security mode.
+pub enum IssuedInvitation {
+    OwnTls(Invitation),
+    Reality {
+        invitation: crate::reality_bootstrap::Invitation,
+        user: String,
+    },
+}
+impl IssuedInvitation {
+    pub fn encode(&self) -> Result<String, &'static str> {
+        match self {
+            Self::OwnTls(value) => value.encode().map_err(|_| "Invalid invitation"),
+            Self::Reality { invitation, .. } => invitation.encode().map(|uri| uri.to_string()).map_err(|_| "Invalid REALITY invitation"),
+        }
+    }
+    pub fn token_bytes(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::OwnTls(value) => value.token_bytes(),
+            Self::Reality { invitation, .. } => invitation.token_bytes(),
+        }
+    }
+}
+
+fn server_invitation(
+    config: &Config, id: &str, credential: Option<(&str, &[u8; 32])>,
+) -> Result<IssuedInvitation, &'static str> {
+    let Config::Server(document) = config else { return Err("Server configuration required"); };
+    let inbound = document.server.inbounds.iter().find(|entry| entry.id == id).ok_or("Inbound missing")?;
+    if inbound.security_mode == SecurityMode::SmartReality {
+        let now = crate::reference_health::unix_now().map_err(|_| "Invalid clock")?;
+        let invitation = crate::reality_config::registered_invitation(document, id, credential, now)
+            .map_err(|_| "Registered REALITY publication not eligible")?;
+        return Ok(IssuedInvitation::Reality {
+            invitation, user: credential.map_or_else(String::new, |(user, _)| user.to_owned()),
+        });
+    }
+    let invitation = match credential {
+        Some((user, bearer)) => Invitation::issued_from_server(config, id, user, bearer),
+        None => Invitation::public_from_server(config, id),
+    }.map_err(|_| "Selected inbound cannot issue invitations")?;
+    Ok(IssuedInvitation::OwnTls(invitation))
+}
+
 pub struct Editor {
     role: Role,
     path: PathBuf,
     source: Vec<u8>,
     original: Config,
     draft: Config,
-    issued: Option<Invitation>,
+    issued: Option<IssuedInvitation>,
     issued_ready: bool,
     write_uncertain: bool,
     selected_record: usize,
@@ -381,7 +424,7 @@ impl Editor {
         let inbound_id = self.selected_record_id().to_owned();
         // Reject unusable auto invitations before consuming random input or
         // changing the draft (e.g., different H2/H3 public port numbers).
-        Invitation::public_from_server(&self.draft, &inbound_id)
+        server_invitation(&self.draft, &inbound_id, None)
             .map_err(|_| "Selected inbound cannot issue auto invitations")?;
 
         let mut token = Zeroizing::new([0u8; 32]);
@@ -406,7 +449,7 @@ impl Editor {
         candidate
             .validate()
             .map_err(|_| "New user or grants did not pass validation")?;
-        let invitation = Invitation::issued_from_server(&candidate, &inbound_id, user_id, &token)
+        let invitation = server_invitation(&candidate, &inbound_id, Some((user_id, &token)))
             .map_err(|_| "Cannot issue invitation for selected inbound")?;
         // Commit draft only when all validations and permission checks succeed.
         self.draft = candidate;
@@ -464,7 +507,7 @@ impl Editor {
         }
         let previous_digest = user.token_sha256.clone();
         let inbound_id = inbound.id.clone();
-        Invitation::public_from_server(&self.draft, &inbound_id)
+        server_invitation(&self.draft, &inbound_id, None)
             .map_err(|_| "Selected inbound cannot issue auto invitations")?;
 
         let mut token = Zeroizing::new([0u8; 32]);
@@ -493,7 +536,7 @@ impl Editor {
         candidate
             .validate()
             .map_err(|_| "Rotated user did not pass configuration validation")?;
-        let invitation = Invitation::issued_from_server(&candidate, &inbound_id, user_id, &token)
+        let invitation = server_invitation(&candidate, &inbound_id, Some((user_id, &token)))
             .map_err(|_| "Cannot issue replacement invitation for selected inbound")?;
         self.draft = candidate;
         self.issued = Some(invitation);
@@ -565,7 +608,7 @@ impl Editor {
     }
 
     /// Exactly one successful retrieval, only after a durable store.
-    pub fn take_issued(&mut self) -> Option<Invitation> {
+    pub fn take_issued(&mut self) -> Option<IssuedInvitation> {
         if !self.issued_ready() {
             return None;
         }
@@ -574,6 +617,21 @@ impl Editor {
         if !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source) {
             self.error = Some("Saved configuration changed; issuance refused".into());
             return None;
+        }
+        if let IssuedInvitation::Reality { invitation, user } = &invite {
+            // Publication/health may have advanced during TOML save. Never
+            // reveal an outdated or no-longer-authorized confidential offer.
+            let token = Zeroizing::new(invitation.token_bytes()?);
+            let current = server_invitation(&self.original, self.selected_record_id(), Some((user, &token))).ok();
+            let unchanged = current.as_ref().is_some_and(|value| {
+                let left = invite.encode().ok().map(Zeroizing::new);
+                let right = value.encode().ok().map(Zeroizing::new);
+                left.is_some() && left == right
+            });
+            if !unchanged {
+                self.error = Some("REALITY publication changed; issue a new credential.".into());
+                return None;
+            }
         }
         Some(invite)
     }
@@ -589,7 +647,7 @@ impl Editor {
         }
         let invite = match &self.original {
             Config::Server(_) => {
-                Invitation::public_from_server(&self.original, self.selected_record_id())
+                return server_invitation(&self.original, self.selected_record_id(), None)?.encode();
             }
             Config::Client(doc) => {
                 let profile = doc
@@ -612,8 +670,14 @@ impl Editor {
             return Err("Server issuance required");
         }
         let invite = self.take_issued().ok_or("No saved invitation available")?;
-        client_import::export_invitation_file(&self.path, &invite)
-            .map_err(|_| "Protected export failed; issue or rotate again")
+        let result = match &invite {
+            IssuedInvitation::OwnTls(value) => client_import::export_invitation_file(&self.path, value),
+            IssuedInvitation::Reality { .. } => {
+                let encoded = Zeroizing::new(invite.encode()?);
+                client_import::export_encoded_invitation(&self.path, &encoded)
+            }
+        };
+        result.map_err(|_| "Protected export failed; issue or rotate again")
     }
 
     pub fn clear_issued(&mut self) {
@@ -1697,6 +1761,71 @@ mod tests {
         assert!(!discarded.exists());
         assert!(!discarded.parent().unwrap().exists());
         assert_eq!(fs::read_to_string(&temp.0).unwrap(), initial);
+    }
+
+    #[test]
+    fn registered_reality_issuance_rotation_and_recovery_use_same_saved_guard() {
+        use crate::reference_health::{Evidence, Plan, State, Store, Target};
+        let temp = Temp::write(&server_source());
+        let directory = temp.0.with_extension("reality");
+        fs::create_dir(&directory).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let now = crate::reference_health::unix_now().unwrap();
+        let state = State::new(Plan {
+            schema_version: 1,
+            inbound: "reality".into(),
+            endpoint: "127.0.0.1:9443".into(),
+            own_ips: vec!["127.0.0.1".parse().unwrap()],
+            references: vec![Target {
+                server_name: "reference.example.org".into(),
+                address: "93.184.216.2:443".parse().unwrap(),
+            }],
+        }, vec![Evidence { h2_status: Some(200), h3_status: Some(200) }], now).unwrap();
+        let health = directory.join("health.toml");
+        Store::new(&health).unwrap().enroll(&state).unwrap();
+        let bundle = directory.join("bundle");
+        let digest = state.snapshot_sha256().unwrap();
+        let record = crate::reality_provision::create(&state, digest, &bundle, now).unwrap();
+        let request = crate::reality_config::Request::Server(crate::reality_config::ServerRequest {
+            health, bundle, health_sha256: digest, identity_sha256: record.identity_sha256,
+            listen: "127.0.0.1:9443".parse().unwrap(), grants: vec!["device-a".into()],
+        });
+        let review = crate::reality_config::prepare(&temp.0, &request, now).unwrap();
+        crate::reality_config::apply(&temp.0, &request, review.approval_sha256(), now).unwrap();
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.select_record(true);
+        assert!(editor.selected_reality());
+        let public = editor.public_share().unwrap();
+        let parsed = crate::reality_bootstrap::Invitation::decode(&public, now).unwrap();
+        assert!(!parsed.has_token());
+        assert_eq!(parsed.fingerprint(), record.identity_sha256);
+        editor.issue_user("new-reality").unwrap();
+        assert!(editor.take_issued().is_none());
+        assert!(editor.save());
+        let invite = editor.take_issued().unwrap();
+        let first = Zeroizing::new(invite.token_bytes().unwrap());
+        let raw = Zeroizing::new(invite.encode().unwrap());
+        assert!(crate::reality_bootstrap::Invitation::decode(&raw, now).unwrap().has_token());
+        assert!(editor.take_issued().is_none());
+        editor.rotate_user("new-reality").unwrap();
+        assert!(editor.save());
+        let path = editor.export_issued_file().unwrap();
+        let encoded = crate::reality_bootstrap::read_text(&path, crate::invite::MAX_URI, true).unwrap();
+        let rotated = crate::reality_bootstrap::Invitation::decode(&encoded, now).unwrap();
+        assert_ne!(rotated.token_bytes(), Some(*first));
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+        editor.disable_user("new-reality").unwrap();
+        assert!(editor.save());
+        assert!(editor.rotate_user("new-reality").is_err());
+        editor.reenable_user("new-reality").unwrap();
+        assert!(editor.save());
+        assert!(editor.take_issued().unwrap().token_bytes().is_some());
+        assert!(editor.take_issued().is_none());
     }
 
     #[test]
