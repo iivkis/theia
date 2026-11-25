@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "26f1e21496ca4f5d98c4bb15338c48611ab34738",
+  "source_sha": "878887492d59bca030d1cb832dcf76921e8e5261",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -12,379 +12,421 @@
     {
       "scenario": "client-action-active-profile",
       "file": "client-action-active-profile.png",
-      "sha256": "dac517fd988b8d10cd557174174fde8cb4bb66c96fe3317f02d0140c89097c01",
+      "sha256": "6f16ee9d319a12067b71071691225b5572ce8aebdd36fdf9e260623407f37f56",
       "state_fixture": false
     },
     {
       "scenario": "client-action-connection-status",
       "file": "client-action-connection-status.png",
-      "sha256": "73fdeb30b3924dd2808ac052010856514932cd6594b1b62b86b6f58c4a78811f",
+      "sha256": "c64d6ab4a5795c70e3d2e20375a638ea3f36d0db1c065e96e2c99bae1f253d74",
       "state_fixture": false
     },
     {
       "scenario": "client-action-delete-profile",
       "file": "client-action-delete-profile.png",
-      "sha256": "3ca75d4d615bb927811fb4efa05a5dc82f8376c42cf9e8ce0d8f573fba02e033",
+      "sha256": "94f07c53c8dab05ea81b3cfe05b549028b058574355f3205548b17cb97049169",
       "state_fixture": false
     },
     {
       "scenario": "client-action-invitation-import",
       "file": "client-action-invitation-import.png",
-      "sha256": "3060330e1cc26f6849e7a39d6dae372b526bcc0e19ea8139e584e9a691e04a4e",
+      "sha256": "ae714b94f92bea1dc1ef64e265dc6947f2cca07fca6c9fad92cb653a32033ef6",
       "state_fixture": false
     },
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "236eb1ab083ba9e9447b380cf12a416cd661133054287c5036fbf9874481fd66",
+      "sha256": "8785ba55ebcc3bf53cd0be4b378bdc23c29522010f6892ce8bd639b240fbbc12",
       "state_fixture": false
     },
     {
       "scenario": "client-action-reality-import",
       "file": "client-action-reality-import.png",
-      "sha256": "733b3bb250aa7cf6b5633df2f56c5d5f7e5216f3508a2589446fa2341507ecfb",
+      "sha256": "c9d333db56f00ea12ccd7dc8fca99864e7491bd5dccca6ef27ca6150bc7c5b46",
       "state_fixture": false
     },
     {
       "scenario": "client-action-trust-material",
       "file": "client-action-trust-material.png",
-      "sha256": "eed7417cf9e3c4ce22aa87f129d571f6cdc2d63cc34df91b5e92de5d45eef292",
+      "sha256": "f358acf4b04dea8e2f63e773cc46e0f2d2dfebbeb81fcc38809f60b942c52530",
       "state_fixture": false
     },
     {
       "scenario": "client-command-menu",
       "file": "client-command-menu.png",
-      "sha256": "516010cfe56c8cb60ef5e6b68ba521c1648594af2aee140cdb78e4e1ad0b38bd",
+      "sha256": "f500ab7906cfcec59a962038421a5188d36df61f4496cf6c31e292d68cf36d1a",
       "state_fixture": false
     },
     {
       "scenario": "client-file-picker",
       "file": "client-file-picker.png",
-      "sha256": "2d7b15145638abd0f63b3f48c9d065f3c7254292176212948e07359b380cf238",
+      "sha256": "a4c4c2d09cd72920d363a5ea40216305b28946df437deb811a20591a48bfd2c9",
       "state_fixture": false
     },
     {
       "scenario": "client-first-run-reality",
       "file": "client-first-run-reality.png",
-      "sha256": "02601cee8dd49500e9d1ecb51d9530c2f38dfc317b4eea8150fe7dcd807f9380",
+      "sha256": "d41f2c0502a508448395320d0c2f6318324641072d79966a505b4ecb4ac22223",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-focus-actions",
+      "file": "client-focus-actions.png",
+      "sha256": "7c04cfb3eb94af3d201645d9d01b32d2cbd8a2e523cc956dc84fefcad08fbaf7",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-focus-navigation",
+      "file": "client-focus-navigation.png",
+      "sha256": "a0e0b0b7a12014099a35f36a31bdda624287962e87a776759b8de363503fc583",
       "state_fixture": false
     },
     {
       "scenario": "client-page-diagnostics",
       "file": "client-page-diagnostics.png",
-      "sha256": "f40c288f887212489d2e04f249e1b3c996d0c0b96a14911077bea92a3853e9c2",
+      "sha256": "c02002f0bb20fb3e50f3fef66f6794b54a39cb91b4960590bbfa46cf37f1b768",
       "state_fixture": false
     },
     {
       "scenario": "client-page-import",
       "file": "client-page-import.png",
-      "sha256": "9de9454e6ca6ae982c05347e01f273dcee9b765bfdff20e9e2510803b400cc3b",
+      "sha256": "53db8ce1ea2bc14d6412dea755420d1f7e8ca1c62f71db793ea8928918137709",
       "state_fixture": false
     },
     {
       "scenario": "client-page-overview",
       "file": "client-page-overview.png",
-      "sha256": "788de17c72ab6f2452cf0050d3df8bf252728a19c40e7c9642d275fb6480722c",
+      "sha256": "6796d8a90cb0412727834a21d1179d97e6d4eb9910e301495a7bdfef0620d115",
       "state_fixture": false
     },
     {
       "scenario": "client-page-profiles",
       "file": "client-page-profiles.png",
-      "sha256": "3df430ae953c6b43b2196b9bade3e555ef8f76f1a2698e47be07414bd6328e0c",
+      "sha256": "63468c3dd685d0b8f9b3474b2de13553daa5212bf4802909b60da81d375b5689",
       "state_fixture": false
     },
     {
       "scenario": "client-page-proxy",
       "file": "client-page-proxy.png",
-      "sha256": "37ba7e11672efc287a57d8e52bf9bbfd1557895faa42cd47e3602c5ff1c8d3a5",
+      "sha256": "71d8102862bdf55b0d878b8a59c5fcbc47a1debb06c255e5ee850654a9656f84",
       "state_fixture": false
     },
     {
       "scenario": "client-page-settings",
       "file": "client-page-settings.png",
-      "sha256": "bf6a3dcd9cb6bc48d414be96d2420c2d7dcf229f4af617d9e8476374ea95e451",
+      "sha256": "3a315c9a72667c06236874882f40a6499b80a065a128eb622e726a6279facc6b",
       "state_fixture": false
     },
     {
       "scenario": "client-page-traffic",
       "file": "client-page-traffic.png",
-      "sha256": "186c514e2d9c6168c3e6f7aec7c43a19dede82e5064f5084fbc6da9f8191911b",
+      "sha256": "cc267cc4f2a376359a70243d2ac4350982d530518990e34c0a89fca0326eeb64",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-traffic-monitor-idle",
+      "file": "client-traffic-monitor-idle.png",
+      "sha256": "debe791771fa4c95f86514841e6c89f463a40e3277d67f72af4239f11a230af6",
       "state_fixture": false
     },
     {
       "scenario": "client-validation-error",
       "file": "client-validation-error.png",
-      "sha256": "7e4323c4ba1f2e36b0e2cd08e4e838470171300a61b1d3843c8b8729fda7f1e0",
+      "sha256": "b629766d12cd1370449010b58d0067f7df1cc09ef51a411dc60afb76276eefe3",
       "state_fixture": false
     },
     {
       "scenario": "client-welcome",
       "file": "client-welcome.png",
-      "sha256": "02cfa0191582d6ec6cadb2a3f4c29b97fac9bae3fe4dc529b8719900e9afdc94",
+      "sha256": "631d2f5a04e7506fd4e63f0f503fc542c933fc06c984807a6460a8f447049ffe",
       "state_fixture": false
     },
     {
       "scenario": "help",
       "file": "help.png",
-      "sha256": "9752c4c061253439a56d50f9942c18880edb2d4f9e40ed060e03cb794c75516a",
+      "sha256": "8417e3bdde44806124a63c3aa7a573f535c3fcb35cf31d6e1c00919df44a02d6",
       "state_fixture": false
     },
     {
       "scenario": "home-role-selection",
       "file": "home-role-selection.png",
-      "sha256": "f7af2180d0fc6d74dae2cf76279de6af454c7ff261e5cc411aa477b68d76bf93",
+      "sha256": "b35feda61200f7e81bc04f308e4b805bc7aea23325da2ca1b3b4f042b816ed89",
       "state_fixture": false
     },
     {
       "scenario": "server-action-certificate",
       "file": "server-action-certificate.png",
-      "sha256": "ac07b02890dd25523111718a7a18263601e43a390c3d5235dfae79dfea10ad29",
+      "sha256": "23363c60e0c26c217a2fc3a02feb10145fc382946dae27ca33e4c28275fa30d1",
       "state_fixture": false
     },
     {
       "scenario": "server-action-delete-connection",
       "file": "server-action-delete-connection.png",
-      "sha256": "06a69eb9b5e9690398a5966e77cbbb5ea81ee229724b924ea923b42795f5e546",
+      "sha256": "d4d142b1669bb35fd287698df279345f131f01e353b7f1f68095bedf6af7ff67",
       "state_fixture": false
     },
     {
       "scenario": "server-action-delete-user",
       "file": "server-action-delete-user.png",
-      "sha256": "a506b7b97e25e847e798c01a75029ef02e59f5bf8c125e0fca61f94f631ebac6",
+      "sha256": "d2ccd9cadb6c0c026ec5f465d8b153e535dd9480c904318747a57e9b370fb395",
       "state_fixture": false
     },
     {
       "scenario": "server-action-disable-user",
       "file": "server-action-disable-user.png",
-      "sha256": "479159d55d79b7b54fa3052dbb77d6eb67312d42940989a7764a0e1ad168a800",
+      "sha256": "bddc464218ad690e3efc0c34d1cbca1ed5de2101d884da225a833daa09aab7f9",
       "state_fixture": false
     },
     {
       "scenario": "server-action-grant-picker",
       "file": "server-action-grant-picker.png",
-      "sha256": "6d6461c8ead526969039925f106808a0eb368132a0290efbf54f2f5fa5ed6eb4",
+      "sha256": "df66fc53786066c1904289ac460622dbe21f714b1558c9bf161072c0e261374a",
       "state_fixture": false
     },
     {
       "scenario": "server-action-limits",
       "file": "server-action-limits.png",
-      "sha256": "07c2f6bd00c0df0991d70bdeef599a69905bbae54b982de0477b6edee553af26",
+      "sha256": "5f77cecc20288e119d4fb903f20ac497578beca3fdbe39e546dc09b55801da05",
       "state_fixture": false
     },
     {
       "scenario": "server-action-network-diagnostics",
       "file": "server-action-network-diagnostics.png",
-      "sha256": "aac152adb24988753bcea4df1d04fbda390a7c7cfc3495e4ac6c6b4a57f8cccd",
+      "sha256": "874baf0c4ff7068bcb9c6aac23707011ae790fb1f58aa98be609e1b44a6e6c78",
       "state_fixture": false
     },
     {
       "scenario": "server-action-new-connection",
       "file": "server-action-new-connection.png",
-      "sha256": "13486d521b480e5cdcb4f88df02a6258c43cfdeac019e2d806b36e7b4e224d4d",
+      "sha256": "55bb7b228527e7047369aa835d44613f630f8876b6a5d0ec10d2ed84bbcdb58f",
       "state_fixture": false
     },
     {
       "scenario": "server-action-new-user",
       "file": "server-action-new-user.png",
-      "sha256": "3c933b47a0daee7333acaa30a5408150968012827306dee0671c3d2039842809",
+      "sha256": "308091debaeec5bd2e93505bab8eb3dae0171904554af18079d2686f08fc0133",
       "state_fixture": false
     },
     {
       "scenario": "server-action-reality-status",
       "file": "server-action-reality-status.png",
-      "sha256": "02d6ebf5c336218be672351edcaa2632258cf9ddb36da207a4e344d26e860ccc",
+      "sha256": "a47e34917c4f0cecaf80b8a5b54ca10a27c91992619a7c6aa84e9782cf06d41e",
       "state_fixture": false
     },
     {
       "scenario": "server-action-reality-wizard",
       "file": "server-action-reality-wizard.png",
-      "sha256": "046b2e8a0608a13c5803b34e674a9ba05d82d17760362282835fe71216d99473",
+      "sha256": "54110f61444cfe09453969be0a5aee9893e17d0c5d3dd90d93b420abb64f7433",
       "state_fixture": false
     },
     {
       "scenario": "server-action-recover-user",
       "file": "server-action-recover-user.png",
-      "sha256": "432bdd64d3df1408412005844df9556bba2567893c138a99aff0f8bd6a8e168f",
+      "sha256": "cd1e8225741cd156fc6c9583d959d27796a74918123677caee657fadaa8096df",
       "state_fixture": false
     },
     {
       "scenario": "server-action-rotate-token",
       "file": "server-action-rotate-token.png",
-      "sha256": "e416f85c6f543b974d00749eb1ce59a7f79e724f1db4325ae959fc4b6c3043eb",
+      "sha256": "5aa528d04d4817bc65ffd3bebd1ff2fce955f342b019ea3c850a6e50769097d5",
       "state_fixture": false
     },
     {
       "scenario": "server-action-runtime-status",
       "file": "server-action-runtime-status.png",
-      "sha256": "8c769e74d1cdb2a31244378036507bd1657c7a7934b5e54952856b2689b471ef",
+      "sha256": "20b7a9c212ab3a146dfcd588d8d6f92551b80086e90d9c915d39b891fda66940",
       "state_fixture": false
     },
     {
       "scenario": "server-action-server-process",
       "file": "server-action-server-process.png",
-      "sha256": "21355f0947ea2e8cdae365a80414977ea466e4d04493456e0f5a5550a4ef863a",
+      "sha256": "d9e615b41ac5862595392a02124f518db957156851b25b66fe9f55c05bb8820a",
       "state_fixture": false
     },
     {
       "scenario": "server-command-menu",
       "file": "server-command-menu.png",
-      "sha256": "85e77340dd4459eb23010e0f9f196dcc1abe8b49d799fb047367dc6fe773922f",
+      "sha256": "8b1e772bc34a5e1ff325749671e4817cb4fbea195bd366e5d5725a9ee1509bfa",
       "state_fixture": false
     },
     {
       "scenario": "server-discovery-consent",
       "file": "server-discovery-consent.png",
-      "sha256": "05f7cb30a80fc7f815c5376588c66611afddec5c83fcc1a88feb70915cf9cf5b",
+      "sha256": "76eb203cab01a3dd530381c6a19173539f214533f93b86d28daa9b83326dad3a",
       "state_fixture": false
     },
     {
       "scenario": "server-file-picker",
       "file": "server-file-picker.png",
-      "sha256": "af9eb1f5e544cf7834dd6c6cbd59ac74d8f85bfa1b6edd6bbceca77c83531060",
+      "sha256": "c313c887aea6e0b383d02d0c2626a6f32f62475c4e59ba90ba4f883ad3992bf7",
       "state_fixture": false
     },
     {
       "scenario": "server-first-run-reality",
       "file": "server-first-run-reality.png",
-      "sha256": "584a29c188b8645f665d0b172902d67b644183bf1cc7aa8481c4a2425690c60a",
+      "sha256": "5b09925bac6603af0404be3e02ff45321dbcaa7ef953c57fe40c61170e0cf36a",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-focus-actions",
+      "file": "server-focus-actions.png",
+      "sha256": "b666003d609445d2691c1be219eef8c5612425682b197f96f740bf398c64a34e",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-focus-navigation",
+      "file": "server-focus-navigation.png",
+      "sha256": "668a32fb3ae73303974358e93d58701c4f0e5efce3339c6aa0e2d3997dc8c7e4",
       "state_fixture": false
     },
     {
       "scenario": "server-page-connections",
       "file": "server-page-connections.png",
-      "sha256": "61ae82b5c666ec4477dbc1234c3e4232f1e91d5d83728e0bc2675f82a66e882c",
+      "sha256": "3e539bf6072e4d028a42d79dcc1311713149648e9d296066f25a2ff68b9fd06a",
       "state_fixture": false
     },
     {
       "scenario": "server-page-diagnostics",
       "file": "server-page-diagnostics.png",
-      "sha256": "0d87ba85030f38724295d19c3359e201ff95f2a5d54a1467124c72de6bd406b2",
+      "sha256": "223603d8bf5adedee8204a6ed9be5c854d35a138bed8ad7ee51c6d3f5b2429e0",
       "state_fixture": false
     },
     {
       "scenario": "server-page-invitations",
       "file": "server-page-invitations.png",
-      "sha256": "64bfb6b16604815662bdc98e6a21c91f2f863bf82a885774a527260fefb44742",
+      "sha256": "f20588b7e0dba2f77ba1c2471c3f3f09e33a2471e2047c97a25412f59611f979",
       "state_fixture": false
     },
     {
       "scenario": "server-page-overview",
       "file": "server-page-overview.png",
-      "sha256": "068ec50a1c882b1b2e16abf84643789dbccb5cd8e55b35c7e5202bd87e203073",
+      "sha256": "594985735ddc1e556cf96e8a241fe2e8bd0edbe42aea350d1509b800a29766bf",
       "state_fixture": false
     },
     {
       "scenario": "server-page-settings",
       "file": "server-page-settings.png",
-      "sha256": "557cf9ddbdc6bc23f767678e7505a132b8b7ec63acf4b4988c060f6b107d289c",
+      "sha256": "ded90248b2026b1618a461f8bed1fa9766cd4bdae6f2e4eacd6cc630deed2670",
       "state_fixture": false
     },
     {
       "scenario": "server-page-traffic",
       "file": "server-page-traffic.png",
-      "sha256": "09b56064b75b9f217eea2a3e031c907c789e075e14450044830b10f87b0ea66b",
+      "sha256": "54b8713147e6107ca45ef9355d901f0c063bc18cad8c25c355e68b1b0f8e4ec7",
       "state_fixture": false
     },
     {
       "scenario": "server-page-users",
       "file": "server-page-users.png",
-      "sha256": "176d54e3ca39ca2e79096744b8caa23bd7a0bd6c1820ecda7e9cd099e0f9e2d0",
+      "sha256": "0feeb246be07769347807209998b8daa0c091130e83bfc6677e793136006bb84",
       "state_fixture": false
     },
     {
       "scenario": "server-reference-candidate-groups",
       "file": "server-reference-candidate-groups.png",
-      "sha256": "686163b9682de2ba0d2644c0b13ff4efe4bc204a8dca6816c93917f888ee66c7",
+      "sha256": "d8acb853387e9978b23f0fd634ccd2a7eb77fa99e3281e51920969b255d97829",
       "state_fixture": false
     },
     {
       "scenario": "server-reference-cidr-input",
       "file": "server-reference-cidr-input.png",
-      "sha256": "ec624ba6bb3f4aaa7c09f54d3265d5e4b86132fd59ccb5f663309802c521dba3",
+      "sha256": "4bba473c26f8dd00587d458226829c6485431e8f3bac4f322cdd8538ac8476bc",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-start-confirmation",
+      "file": "server-start-confirmation.png",
+      "sha256": "e726faa5ca9b31dd99789d88bab54555ad5034a2ca5aba7d67c0f1ab8955de99",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-traffic-monitor-idle",
+      "file": "server-traffic-monitor-idle.png",
+      "sha256": "aaf6e7e61ebec986719dbe266a7b53130a0cfd1d358ce4aab6544631b526262e",
       "state_fixture": false
     },
     {
       "scenario": "server-validation-error",
       "file": "server-validation-error.png",
-      "sha256": "2c40109e61eaac1eda21c33c00ab023bece80415eef0d6f25c8f487a876f979c",
+      "sha256": "a6737f021b38e66a904abca32d3c5ccce9352864e26965ea9e2ba50079754056",
       "state_fixture": false
     },
     {
       "scenario": "server-welcome",
       "file": "server-welcome.png",
-      "sha256": "3908f83d6b5a1cf92b7036e36a56bc41435e9e0c48f367e2bc2714fda9895bc0",
+      "sha256": "777e703a6e7bcebf5505cd3f303d9ee1375095d7ae516b8c3727b49269ac38fa",
       "state_fixture": false
     },
     {
       "scenario": "state-disable-confirm",
       "file": "state-disable-confirm.png",
-      "sha256": "87c0e2867bc61b77b9f6dcd062190abd9c626139ddf9d81e619410c9ff84297d",
+      "sha256": "6839a801b8670ba70e9cea2c2de920c582a8275ac21b021bf8968079d3f7afe1",
       "state_fixture": true
     },
     {
       "scenario": "state-disable-failed",
       "file": "state-disable-failed.png",
-      "sha256": "2b566d1dbffd715e1769f3532eb5e3894d6018e1aaa2a61c552da0c619ea7391",
+      "sha256": "7cdb27a86c57c25d403304449ce5505432345bbb20e8b5e486c120fec1e45492",
       "state_fixture": true
     },
     {
       "scenario": "state-import-failed",
       "file": "state-import-failed.png",
-      "sha256": "5fda166b3b314fa30887d1505c417868a5771210ea81cb06f21bd31d84d3f2bb",
+      "sha256": "592b384c182cc3fce4fce46d72f323dea29678046788d007de22a084b370a33b",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-new-confirm",
       "file": "state-issuance-new-confirm.png",
-      "sha256": "929d8d86b709a3914d977e88dc422ac88adc0da2ecd81b086539ef44b632509e",
+      "sha256": "45394cf37aa8c22bd433b0bd028b94998af8ca028aaf9af5ef2e1a5f0e3a0945",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-new-failed",
       "file": "state-issuance-new-failed.png",
-      "sha256": "781b6bc74464100b7c7a9937d705dcedbbbfca638682f30c7e1d36068c9461e0",
+      "sha256": "7639cc30ddac17f54db2bfea2d09be7da1cb6d8afbbc139615c27b7f0cfb2c43",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-new-input",
       "file": "state-issuance-new-input.png",
-      "sha256": "4de224ed3e03b262d235fa71669bb249dc9071622d19374f8651dc815e88b328",
+      "sha256": "436185f4232ce4002c6e3378454ed405db4da0dd0076c825f72c8f0825284ac9",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-recover-confirm",
       "file": "state-issuance-recover-confirm.png",
-      "sha256": "f83f2a7eb267f5f154c238e3f21d748ffe614b2ccc58498920957ef79c1a750f",
+      "sha256": "ed8d10c11982a40dbc1c59b17aafde5906bcd1aad71a155eab8125406e1eed5a",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-recover-failed",
       "file": "state-issuance-recover-failed.png",
-      "sha256": "29858b804b81d74c2f574454544495b9d3442962858b6cc7c4b91f4cec837778",
+      "sha256": "0049ef306b63ef1734e091248752fb92732c118bb6ea23eb68c53e5978788a39",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-recover-input",
       "file": "state-issuance-recover-input.png",
-      "sha256": "974f4b04ccac8791fd7eff0ed1b85d4e3a7a3e5a87f33993e93c748ecec63040",
+      "sha256": "b4b7dd70ebd25b26b354958622ea308680255cd4d66f05ab22902d79371d3a58",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-rotate-confirm",
       "file": "state-issuance-rotate-confirm.png",
-      "sha256": "63b234d29655136de6b6447ca44fa3ecb347d307b6429a8b6dde3eeaae0f450b",
+      "sha256": "1794e5607a71bb575c230620d6487dd85c2c913681eecc95d8e2c7cd82f6136a",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-rotate-failed",
       "file": "state-issuance-rotate-failed.png",
-      "sha256": "31858e7fa04e7c2dbdf812342908840f4541b556f8d60cecea0db17bd610355b",
+      "sha256": "dc9a5f2defad880b9780d39876bc48f447be3bc37074a2dace7f09984545bab7",
       "state_fixture": true
     },
     {
       "scenario": "state-issuance-rotate-input",
       "file": "state-issuance-rotate-input.png",
-      "sha256": "fd985ba7af2bfd9edde5677a5b4bc5bd41213c83e1be638f87be7e1a9d7013c7",
+      "sha256": "5aa528d04d4817bc65ffd3bebd1ff2fce955f342b019ea3c850a6e50769097d5",
       "state_fixture": true
     }
   ]

@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 26f1e21496ca4f5d98c4bb15338c48611ab34738
+Source: 878887492d59bca030d1cb832dcf76921e8e5261
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -46,6 +46,14 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-first-run-reality](client-first-run-reality.png)
 
+## client-focus-actions
+
+![client-focus-actions](client-focus-actions.png)
+
+## client-focus-navigation
+
+![client-focus-navigation](client-focus-navigation.png)
+
 ## client-page-diagnostics
 
 ![client-page-diagnostics](client-page-diagnostics.png)
@@ -73,6 +81,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## client-page-traffic
 
 ![client-page-traffic](client-page-traffic.png)
+
+## client-traffic-monitor-idle
+
+![client-traffic-monitor-idle](client-traffic-monitor-idle.png)
 
 ## client-validation-error
 
@@ -166,6 +178,14 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-first-run-reality](server-first-run-reality.png)
 
+## server-focus-actions
+
+![server-focus-actions](server-focus-actions.png)
+
+## server-focus-navigation
+
+![server-focus-navigation](server-focus-navigation.png)
+
 ## server-page-connections
 
 ![server-page-connections](server-page-connections.png)
@@ -201,6 +221,14 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-reference-cidr-input
 
 ![server-reference-cidr-input](server-reference-cidr-input.png)
+
+## server-start-confirmation
+
+![server-start-confirmation](server-start-confirmation.png)
+
+## server-traffic-monitor-idle
+
+![server-traffic-monitor-idle](server-traffic-monitor-idle.png)
 
 ## server-validation-error
 
