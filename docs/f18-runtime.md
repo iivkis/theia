@@ -18,10 +18,10 @@ This is development code, not a release acceptance claim. REALITY
 server startup now supports live immutable generations, dual-signer overlap,
 rooted compatible renewal and automatic approved-reference failover; see
 f18-live-runtime.md for the precise recovery contract. It fails closed for
-new handshakes when no valid generation exists. Status-only IPC remains for
-any configuration containing REALITY; mixed inbounds do not support the
-existing own-TLS live mutation operations. Structural restart/rollback,
-overlap failover and independent audit remain open. No deployment should
+new handshakes when no valid generation exists. Protected IPC now supports bound authorization and quota changes, runtime
+REALITY status, fresh-port structural cutover and bounded rollback for
+mixed configurations. See f18-management.md for restrictions. Independent
+audit remains open. No deployment should
 be declared accepted before main CI and independent review.
 
 External QUIC path lifecycle retains independent budgets and original

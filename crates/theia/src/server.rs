@@ -2486,7 +2486,17 @@ async fn run_supervised_file(
                 // No key or health rollback: previous own-TLS PEM digest
                 // must still match, REALITY reopens its CURRENT rooted
                 // publication and floor when the operator confirms.
-                if structural{
+                // An independent root replacement on the same logical endpoint
+                // is not a reversible listener operation. Never offer its old root
+                // as a structural rollback target.
+                let replaced_root=request.previous.document.server.inbounds.iter().any(|old|
+                    old.reality.as_ref().is_some_and(|root|
+                        request.candidate.server.inbounds.iter().any(|new|
+                            new.id==old.id && new.server_name==old.server_name &&
+                            new.h2_listen.parse::<std::net::SocketAddr>().ok().map(|v|v.port())==
+                                old.h2_listen.parse::<std::net::SocketAddr>().ok().map(|v|v.port()) &&
+                            new.reality.as_ref().map(|v|v.identity_sha256)!=Some(root.identity_sha256))));
+                if structural || replaced_root{
                     structural_rollback=None;
                     runtime.set_restart_rollback(None);
                 }else{

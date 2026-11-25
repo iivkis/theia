@@ -32,10 +32,11 @@ and the bounded suspect follow-up; automatically publishes compatible
 same-signer failover when the fresh two-cycle evidence and existing
 cooldown select a reserve. Renewal preserves the signed policy. Startup
 can perform the same bounded recovery of a persisted degraded reference.
-There is no automatic failover while a dual-signer publication is pending:
-the existing signed transition contract does not permit changing its
-operational parameters; suspend new admissions and preserve existing
-tunnels. No eligible reserve, stale trust, or unrooted materials fail
+During a valid dual-signer overlap, failover atomically publishes a fresh
+pair of signed descriptors, skipping the already issued successor revision
+and preserving the original validity intervals and overlap deadline. Both
+old and promoted clients can refresh their own signer. After overlap expiry
+but before explicit promotion, automatic failover remains suspended. No eligible reserve, stale trust, or unrooted materials fail
 closed. If startup cannot recover a valid generation it refuses to bind.
 
 Recovery decision: allow a valid admission for any reference SNI in the
@@ -57,6 +58,7 @@ recovery fixture checks fresh approved reserve selection and rejects stale
 health rollback. Reference evidence is synthetic.
 The production anti-replay startup window is preserved; only the explicit
 unit-test ready path uses a test guard start time in the past. No build,
-test, or coverage result is claimed. Live structural management/rollback,
-overlap failover, independent public reference and offline/restart E2E
-acceptance, and final main CI remain open.
+test, or coverage result is claimed. Structural management and rollback are implemented as described in
+f18-management.md. The overlap publication test exercises both signer
+states, but independent public reference and offline/restart E2E acceptance,
+and final main CI remain open.

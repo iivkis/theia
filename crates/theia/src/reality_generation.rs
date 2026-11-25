@@ -392,6 +392,11 @@ mod tests {
         let preview = reality_config::prepare(&cfg, &request, now).unwrap();
         reality_config::apply(&cfg, &request, preview.approval_sha256(), now).unwrap();
         let doc = config::read_file(&cfg).unwrap();
+        let Config::Server(server)=&doc else{panic!("server fixture")};
+        let inbound=server.server.inbounds.iter().find(|i|i.id=="edge").unwrap();
+        let captured=Candidate::capture(inbound,now).unwrap();
+        let (_,lease)=captured.activate(inbound,now).unwrap();
+        assert_eq!(lease.status().revision,1);
         let manager = Manager::new(&doc, "edge", now).unwrap();
         let old = manager.refresh(now).unwrap();
         let path = bundle.join("publication.toml");
@@ -399,6 +404,7 @@ mod tests {
         let publication = crate::identity_publication::Publication::new(&path).unwrap();
         let status = publication.inspect(now).unwrap();
         publication.refresh(&state, status.snapshot_sha256, now + 1).unwrap();
+        assert!(captured.activate(inbound,now+1).is_err());
         let new = manager.refresh(now + 1).unwrap();
         assert_eq!(old.status().revision, 1);
         assert_eq!(new.status().revision, 2);
