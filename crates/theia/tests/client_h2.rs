@@ -420,7 +420,7 @@ async fn launch_client_with_profile(
     pem: String,
     label: &str,
     transport: theia::config::Transport,
-    tls_profile: &str,
+    security_mode: &str,
 ) -> (
     TestDirectory,
     ChildProcess,
@@ -449,7 +449,7 @@ async fn launch_client_with_profile(
     profile.server = endpoint;
     profile.server_name = "localhost".into();
     profile.transport = transport;
-    profile.tls_profile = tls_profile.to_owned();
+    profile.security_mode = security_mode.to_owned();
     profile.tls_ca = Some(format!("file:{}", ca_path.display()));
     profile.auth_token = "env:THEIA_CI_TEST_TOKEN".into();
     doc.client.proxy.http_listen = http.to_string();
@@ -487,7 +487,7 @@ async fn launch_client(
     std::net::SocketAddr,
     std::net::SocketAddr,
 ) {
-    launch_client_with_profile(endpoint, pem, label, transport, "default").await
+    launch_client_with_profile(endpoint, pem, label, transport, "own-tls").await
 }
 
 /// Black-box curl tests run on both native CI runners. No external service,
@@ -630,10 +630,10 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_binary_curl_connect_and_socks5h() {
-    check_native_binary_connect_and_socks5("default", "curl").await;
+    check_native_binary_connect_and_socks5("own-tls", "curl").await;
 }
 
-async fn check_native_binary_connect_and_socks5(tls_profile: &str, label: &str) {
+async fn check_native_binary_connect_and_socks5(security_mode: &str, label: &str) {
     timeout(Duration::from_secs(40), async {
         let (endpoint, _roots, pem, server) = listener_with_pem(true).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -662,7 +662,7 @@ async fn check_native_binary_connect_and_socks5(tls_profile: &str, label: &str) 
             pem,
             label,
             theia::config::Transport::H2,
-            tls_profile,
+            security_mode,
         )
         .await;
 
@@ -1274,8 +1274,8 @@ fn retired_product_security_profiles_are_rejected_before_network() {
         format!("pinned-cert-stream-up-v1:{}", "42".repeat(32)),
     ] {
         let invalid = source.replace(
-            "tls_profile = \"default\"",
-            &format!("tls_profile = \"{mode}\""),
+            "security_mode = \"own-tls\"",
+            &format!("security_mode = \"{mode}\""),
         );
         assert!(theia::config::parse(&invalid).is_err());
     }

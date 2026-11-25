@@ -82,10 +82,7 @@ pub struct Inbound {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "crate::security_profile::SecurityMode::is_plain"
-    )]
+    #[serde(default)]
     pub security_mode: crate::security_profile::SecurityMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality: Option<RealityBinding>,
@@ -153,7 +150,7 @@ pub struct Profile {
     pub server: String,
     pub server_name: String,
     pub auth_token: String,
-    pub tls_profile: String,
+    pub security_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality_profile: Option<RealityClientBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -596,7 +593,7 @@ impl ClientDocument {
                 "expected absolute file: reference to PEM CA bundle",
             )?;
             ensure(
-                if profile.tls_profile == "smart-reality" {
+                if profile.security_mode == "smart-reality" {
                     profile.path_prefix.is_none()
                 } else {
                     profile
@@ -607,7 +604,7 @@ impl ClientDocument {
                 format!("{field}.path_prefix"),
                 "own TLS requires an explicit /v1/<prefix>; REALITY uses the signed descriptor",
             )?;
-            if profile.tls_profile == "smart-reality" {
+            if profile.security_mode == "smart-reality" {
                 ensure(
                     profile
                         .reality_profile
@@ -641,9 +638,9 @@ impl ClientDocument {
                     "invalid TLS server name",
                 )?;
                 ensure(
-                    profile.tls_profile == "default",
-                    format!("{field}.tls_profile"),
-                    "only own TLS (default) and smart-reality are supported",
+                    profile.security_mode == "own-tls",
+                    format!("{field}.security_mode"),
+                    "only own-tls and smart-reality are supported",
                 )?;
             }
             ensure(
@@ -934,6 +931,25 @@ mod tests {
         }
     }
     #[test]
+    fn canonical_product_security_names_and_retired_aliases() {
+        for source in [server(), client()] {
+            let parsed = parse(&source).unwrap();
+            let canonical = parsed.to_toml().unwrap();
+            assert!(canonical.contains("security_mode = \"own-tls\""));
+            assert_eq!(parse(&canonical).unwrap(), parsed);
+            for retired in ["plain", "default", "pinned-cert-v1", "browser-h2-btls-v1"] {
+                let invalid = canonical.replace("security_mode = \"own-tls\"",
+                    &format!("security_mode = \"{retired}\""));
+                assert_ne!(invalid, canonical);
+                assert!(parse(&invalid).is_err());
+            }
+            let old_field = canonical.replace("security_mode = \"own-tls\"",
+                "tls_profile = \"default\"");
+            assert!(parse(&old_field).is_err());
+        }
+    }
+
+    #[test]
     fn own_tls_requires_explicit_valid_prefix() {
         for source in [server(), client()] {
             for bad in ["", "/v1/", "/v1/a/b", "/v1/../x", "/v1/a?b", "/v1/a%2fb"] {
@@ -1003,8 +1019,8 @@ mod tests {
             ("stream-up", XhttpMode::StreamUp),
         ] {
             let explicit = original.replacen(
-                "tls_profile = \"default\"",
-                &format!("tls_profile = \"default\"\nxhttp_mode = \"{raw}\""),
+                "security_mode = \"own-tls\"",
+                &format!("security_mode = \"own-tls\"\nxhttp_mode = \"{raw}\""),
                 1,
             );
             let accepted = parse(&explicit).unwrap();
@@ -1014,14 +1030,14 @@ mod tests {
             assert_eq!(doc.client.profiles[0].xhttp_mode, Some(mode));
             assert_eq!(parse(&accepted.to_toml().unwrap()).unwrap(), accepted);
             let pinned = explicit.replace(
-                "tls_profile = \"default\"",
-                &format!("tls_profile = \"pinned-cert-v1:{}\"", "42".repeat(32)),
+                "security_mode = \"own-tls\"",
+                &format!("security_mode = \"pinned-cert-v1:{}\"", "42".repeat(32)),
             );
-            assert!(parse(&pinned).unwrap_err().field.contains("tls_profile"));
+            assert!(parse(&pinned).unwrap_err().field.contains("security_mode"));
         }
         let invalid = original.replacen(
-            "tls_profile = \"default\"",
-            "tls_profile = \"default\"\nxhttp_mode = \"guess\"",
+            "security_mode = \"own-tls\"",
+            "security_mode = \"own-tls\"\nxhttp_mode = \"guess\"",
             1,
         );
         assert!(parse(&invalid).is_err());
@@ -1047,9 +1063,9 @@ mod tests {
                 "client.proxy",
             ),
             (
-                "tls_profile = \"default\"",
-                "tls_profile = \"chrome133\"",
-                "tls_profile",
+                "security_mode = \"own-tls\"",
+                "security_mode = \"chrome133\"",
+                "security_mode",
             ),
             (
                 "auth_token = \"env:THEIA_AUTH_TOKEN\"",
@@ -1085,8 +1101,8 @@ mod tests {
             for transport in ["h2", "h3", "auto"] {
                 let bad = source
                     .replace(
-                        "tls_profile = \"default\"",
-                        &format!("tls_profile = \"{mode}\""),
+                        "security_mode = \"own-tls\"",
+                        &format!("security_mode = \"{mode}\""),
                     )
                     .replace(
                         "transport = \"auto\"",
@@ -1097,8 +1113,8 @@ mod tests {
         }
         for mode in ["pinned-cert-v1", "pinned-cert-stream-up-v1"] {
             let bad = server().replace(
-                "[[server.inbounds]]",
-                &format!("[[server.inbounds]]\nsecurity_mode = \"{mode}\""),
+                "security_mode = \"own-tls\"",
+                &format!("security_mode = \"{mode}\""),
             );
             assert!(parse(&bad).is_err());
         }

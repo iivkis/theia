@@ -357,6 +357,14 @@ impl Live {
     }
     pub(crate) fn retire(&self) {
         self.retired.store(true, Ordering::Release);
+        // Close the existing TLS contexts' admission gate as well as the
+        // initial-handshake table. Already-issued SessionPermits do not
+        // borrow this gate and remain valid until their tunnels finish.
+        if let Ok(gate) = self.gate.read() {
+            if let Ok(mut open) = gate.write() {
+                *open = false;
+            }
+        }
         self.suspend();
     }
     pub(crate) fn suspend(&self) {

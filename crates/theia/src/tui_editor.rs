@@ -296,7 +296,7 @@ impl Editor {
         if profile.server != invite.endpoint
             || profile.server_name != invite.server_name
             || profile.path_prefix.as_deref() != Some(invite.path_prefix.as_str())
-            || profile.tls_profile != invite.tls_profile()
+            || profile.security_mode != invite.security_mode()
             || (invite.xhttp_mode() != XhttpMode::Auto
                 && profile.effective_xhttp_mode() != invite.xhttp_mode())
             || (invite.transport != Transport::Auto && profile.transport != invite.transport)
@@ -728,7 +728,7 @@ impl Editor {
                     .profiles
                     .get(self.selected_record)
                     .ok_or("Profile missing")?;
-                if profile.tls_profile != "default" {
+                if profile.security_mode != "own-tls" {
                     return Err("Для REALITY требуется отдельная процедура управления доверием.");
                 }
                 Ok(vec![String::new(), String::new()])
@@ -789,7 +789,7 @@ impl Editor {
                     server: fields[1].clone(),
                     server_name: fields[2].clone(),
                     auth_token: fields[4].clone(),
-                    tls_profile: "default".into(),
+                    security_mode: "own-tls".into(),
                     reality_profile: None,
                     xhttp_mode: Some(XhttpMode::Auto),
                     tls_ca: Some(fields[3].clone()),
@@ -891,7 +891,7 @@ impl Editor {
                     .profiles
                     .get_mut(self.selected_record)
                     .ok_or("Profile missing")?;
-                if profile.tls_profile != "default" || fields[0].is_empty() {
+                if profile.security_mode != "own-tls" || fields[0].is_empty() {
                     return Err("Требуется own-TLS и явная доверенная CA.");
                 }
                 profile.tls_ca = Some(fields[0].clone());
@@ -1147,7 +1147,7 @@ impl Editor {
                 .client
                 .profiles
                 .get(self.selected_record)
-                .is_some_and(|p| p.tls_profile == "smart-reality"),
+                .is_some_and(|p| p.security_mode == "smart-reality"),
         }
     }
 
@@ -1571,8 +1571,8 @@ mod tests {
     fn retired_pinned_modes_cannot_be_loaded_into_editor() {
         for mode in ["pinned-cert-v1", "pinned-cert-stream-up-v1"] {
             let source = server_source().replace(
-                "[[server.inbounds]]",
-                &format!("[[server.inbounds]]\nsecurity_mode = \"{mode}\""),
+                "security_mode = \"own-tls\"",
+                &format!("security_mode = \"{mode}\""),
             );
             let file = Temp::write(&source);
             assert!(Editor::load(Role::Server, &file.0).is_err());
@@ -1821,8 +1821,8 @@ mod tests {
     #[test]
     fn editor_refuses_retired_browser_security_profile() {
         let source = include_str!("../../../examples/client.toml").replace(
-            "tls_profile = \"default\"",
-            "tls_profile = \"browser-h2-btls-v1\"",
+            "security_mode = \"own-tls\"",
+            "security_mode = \"browser-h2-btls-v1\"",
         );
         let temp = Temp::write(&source);
         assert!(Editor::load(Role::Client, &temp.0).is_err());

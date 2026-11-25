@@ -22,7 +22,7 @@ pub struct Invitation {
     pub endpoint: String,
     pub server_name: String,
     pub transport: Transport,
-    tls_profile: String,
+    security_mode: String,
     xhttp_mode: XhttpMode,
     token: Option<[u8; 32]>,
 }
@@ -46,7 +46,7 @@ impl fmt::Debug for Invitation {
             .field("endpoint", &self.endpoint)
             .field("server_name", &self.server_name)
             .field("transport", &self.transport)
-            .field("tls_profile", &self.tls_profile)
+            .field("security_mode", &self.security_mode)
             .field("xhttp_mode", &self.xhttp_mode)
             .field("contains_token", &self.has_token())
             .finish()
@@ -152,8 +152,8 @@ impl Invitation {
     /// Safe token-free export of an exact supported profile.
     pub fn public_from_profile(profile: &Profile) -> Result<Self, InviteError> {
         if profile.reality_profile.is_some()
-            || profile.tls_profile == "smart-reality"
-            || profile.tls_profile != "default"
+            || profile.security_mode == "smart-reality"
+            || profile.security_mode != "own-tls"
         {
             return Err(InviteError::Invalid);
         }
@@ -163,7 +163,7 @@ impl Invitation {
             endpoint: profile.server.clone(),
             server_name: profile.server_name.clone(),
             transport: profile.transport,
-            tls_profile: profile.tls_profile.clone(),
+            security_mode: profile.security_mode.clone(),
             xhttp_mode: profile.effective_xhttp_mode(),
             token: None,
         };
@@ -212,7 +212,7 @@ impl Invitation {
             endpoint: format!("{}:{}", inbound.server_name, h2.port()),
             server_name: inbound.server_name.clone(),
             transport: Transport::Auto,
-            tls_profile: "default".into(),
+            security_mode: "own-tls".into(),
             xhttp_mode: XhttpMode::Auto,
             token: None,
         };
@@ -284,7 +284,7 @@ impl Invitation {
         if wire.security_mode != WireSecurity::OwnTls {
             return Err(InviteError::Invalid);
         }
-        let tls_profile = "default".into();
+        let security_mode = "own-tls".into();
         let token = match wire.token.as_ref() {
             Some(raw) => {
                 let value = Zeroizing::new(
@@ -311,7 +311,7 @@ impl Invitation {
             endpoint: std::mem::take(&mut wire.endpoint),
             server_name: std::mem::take(&mut wire.server_name),
             transport: wire.transport,
-            tls_profile,
+            security_mode,
             xhttp_mode: wire.xhttp_mode,
             token,
         };
@@ -320,8 +320,8 @@ impl Invitation {
     }
 
     /// Non-secret, exact security/carrier selection for safe preview.
-    pub fn tls_profile(&self) -> &str {
-        &self.tls_profile
+    pub fn security_mode(&self) -> &str {
+        &self.security_mode
     }
 
     pub fn xhttp_mode(&self) -> XhttpMode {
@@ -351,9 +351,9 @@ impl Invitation {
             server: self.endpoint.clone(),
             server_name: self.server_name.clone(),
             auth_token: secret_ref.into(),
-            tls_profile: self.tls_profile.clone(),
+            security_mode: self.security_mode.clone(),
             reality_profile: None,
-            xhttp_mode: (self.tls_profile == "default").then_some(self.xhttp_mode),
+            xhttp_mode: (self.security_mode == "own-tls").then_some(self.xhttp_mode),
             tls_ca,
             transport: self.transport,
             quic_connect_timeout_ms: 1600,
@@ -362,7 +362,7 @@ impl Invitation {
     }
 
     fn check(&self) -> Result<(), InviteError> {
-        if self.tls_profile != "default" {
+        if self.security_mode != "own-tls" {
             return Err(InviteError::Invalid);
         }
         let profile = self.to_profile_unchecked("env:THEIA_INVITE_TOKEN".into(), None)?;
@@ -383,9 +383,9 @@ impl Invitation {
             server: self.endpoint.clone(),
             server_name: self.server_name.clone(),
             auth_token,
-            tls_profile: self.tls_profile.clone(),
+            security_mode: self.security_mode.clone(),
             reality_profile: None,
-            xhttp_mode: (self.tls_profile == "default").then_some(self.xhttp_mode),
+            xhttp_mode: (self.security_mode == "own-tls").then_some(self.xhttp_mode),
             tls_ca,
             transport: self.transport,
             quic_connect_timeout_ms: 1600,
@@ -514,11 +514,11 @@ mod tests {
             let decoded = Invitation::decode(&encoded).unwrap();
             assert!(!decoded.has_token());
             let restored = decoded.to_profile("env:TOKEN", None).unwrap();
-            assert_eq!(restored.tls_profile, "default");
+            assert_eq!(restored.security_mode, "own-tls");
             assert_eq!(restored.transport, transport);
         }
         for name in ["browser-h2-btls-v1", "smart-reality-v1", "unknown", ""] {
-            profile.tls_profile = name.into();
+            profile.security_mode = name.into();
             for transport in [Transport::Auto, Transport::H2, Transport::H3] {
                 profile.transport = transport;
                 assert_eq!(
@@ -623,7 +623,7 @@ mod tests {
             format!("pinned-cert-v1:{}", "42".repeat(32)),
             format!("pinned-cert-stream-up-v1:{}", "42".repeat(32)),
         ] {
-            profile.tls_profile = mode;
+            profile.security_mode = mode;
             assert!(Invitation::public_from_profile(&profile).is_err());
         }
     }
@@ -656,7 +656,7 @@ mod tests {
         assert!(
             Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(retired))).is_err()
         );
-        profile.tls_profile = format!("smart-reality-v1:{key}");
+        profile.security_mode = format!("smart-reality-v1:{key}");
         for transport in [Transport::H2, Transport::H3, Transport::Auto] {
             profile.transport = transport;
             assert!(Invitation::public_from_profile(&profile).is_err());

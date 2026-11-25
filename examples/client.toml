@@ -11,7 +11,7 @@ server = "edge.example.org:443"
 server_name = "edge.example.org"
 # THEIA_AUTH_TOKEN must contain base64url(no-padding) of 32 random bytes.
 auth_token = "env:THEIA_AUTH_TOKEN"
-tls_profile = "default"
+security_mode = "own-tls"
 # Explicit CA bundle for explicit H2/H3 runtime (optional for structural validation).
 # tls_ca = "file:/absolute/path/to/ca-bundle.pem"
 # Auto tries QUIC first; two silent UDP handshakes permit H2 fallback.

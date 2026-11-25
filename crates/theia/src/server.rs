@@ -2005,6 +2005,22 @@ async fn prepare_selected_listeners(
     live: Arc<LiveAuthorization>,
     only: Option<&std::collections::HashSet<String>>,
 ) -> Result<PreparedGeneration, ServerError> {
+    prepare_selected_listeners_inner(
+        document, limits, captured, live, only,
+        #[cfg(test)]
+        None,
+    ).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn prepare_selected_listeners_inner(
+    document: &ServerDocument,
+    limits: &GenerationLimits,
+    captured: Option<&CapturedTls>,
+    live: Arc<LiveAuthorization>,
+    only: Option<&std::collections::HashSet<String>>,
+    #[cfg(test)] guard_start: Option<u64>,
+) -> Result<PreparedGeneration, ServerError> {
     let mut listeners = Vec::with_capacity(document.server.inbounds.len());
     let mut identities = Vec::with_capacity(document.server.inbounds.len());
     let mut reality = HashMap::new();
@@ -2046,6 +2062,13 @@ async fn prepare_selected_listeners(
                 limits.peer_budget.clone(),
             );
             context.live_quota = Some(limits.ledger.clone());
+            #[cfg(test)]
+            let carrier = if let Some(start) = guard_start {
+                crate::reality_live::Live::with_guard_start(Arc::new(lease), Arc::new(context), now, start)?
+            } else {
+                crate::reality_live::Live::new(Arc::new(lease), Arc::new(context), now)?
+            };
+            #[cfg(not(test))]
             let carrier = crate::reality_live::Live::new(Arc::new(lease), Arc::new(context), now)?;
             let listener = crate::tcp_bbr::bind(tcp_addr).map_err(|e| match e {
                 crate::tcp_bbr::Error::Network => ServerError::Io,
@@ -2371,12 +2394,8 @@ impl RunningGeneration {
         }
     }
     fn remove_inbounds(&mut self, removed: &std::collections::HashSet<String>) {
-        for id in removed {
-            if let Some(phase) = self.phases.get(id) {
-                self.draining.insert(id.clone());
-                phase.send_replace(GenerationPhase::Drain);
-            }
-        }
+        // Revoke admissions on all removed REALITY contexts before signalling
+        // GOAWAY. Existing tunnel permits and retained inbounds are unaffected.
         self.reality.retain(|hot| {
             if removed.contains(&hot.id) {
                 hot.carrier.retire();
@@ -2385,6 +2404,12 @@ impl RunningGeneration {
                 true
             }
         });
+        for id in removed {
+            if let Some(phase) = self.phases.get(id) {
+                self.draining.insert(id.clone());
+                phase.send_replace(GenerationPhase::Drain);
+            }
+        }
         let old = std::mem::take(&mut self.identities);
         let configs = std::mem::take(&mut self.active_h3);
         for (hot, cfg) in old.into_iter().zip(configs) {
@@ -2419,6 +2444,45 @@ impl RunningGeneration {
         self.phases.remove(id);
         true
     }
+}
+
+/// Exercise the real supervisor preparation, launch and partial removal
+/// path. The replay clock override is compiled only into the test harness.
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+pub(crate) async fn registered_reality_drain_fixture(
+    document: ServerDocument,
+    ready: tokio::sync::oneshot::Sender<()>,
+    drain: tokio::sync::oneshot::Receiver<()>,
+    draining: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), ServerError> {
+    let limits = GenerationLimits::new(&document);
+    let authorization = Arc::new(LiveAuthorization::new(document.clone())
+        .map_err(|_| ServerError::Config)?);
+    let start = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?
+        .saturating_sub(121);
+    let prepared = prepare_selected_listeners_inner(
+        &document, &limits, None, authorization, None, Some(start),
+    ).await?;
+    let mut running = RunningGeneration::launch(prepared.listeners, GenerationPhase::Active);
+    ready.send(()).map_err(|_| ServerError::Io)?;
+    tokio::select! {
+        signal = drain => signal.map_err(|_| ServerError::Io)?,
+        _ = running.tasks.join_next() => return Err(ServerError::Io),
+    }
+    let removed = document.server.inbounds.iter().map(|inbound| inbound.id.clone()).collect();
+    running.remove_inbounds(&removed);
+    draining.send(()).map_err(|_| ServerError::Io)?;
+    while let Some(result) = running.tasks.join_next().await {
+        let (id, result) = result.map_err(|_| ServerError::Io)?;
+        result?;
+        if !running.finish_draining(&id) {
+            return Err(ServerError::Io);
+        }
+    }
+    if running.has_draining() {
+        return Err(ServerError::Io);
+    }
+    Ok(())
 }
 
 /// Reaper is capped at one at a time. After a bounded 20-second drain, all

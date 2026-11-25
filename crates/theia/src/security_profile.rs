@@ -12,6 +12,7 @@ const SPLIT_PROFILE_PREFIX: &str = "pinned-cert-stream-up-v1:";
 #[serde(rename_all = "kebab-case")]
 pub enum SecurityMode {
     #[default]
+    #[serde(rename = "own-tls")]
     Plain,
     // Laboratory-only typed fixtures. Neither mode is a product setting.
     #[serde(skip)]

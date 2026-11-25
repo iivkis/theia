@@ -234,7 +234,7 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
                 server: profile.endpoint().to_owned(),
                 server_name: host.to_owned(),
                 auth_token: profile.credential_reference().to_owned(),
-                tls_profile: "smart-reality".into(),
+                security_mode: "smart-reality".into(),
                 reality_profile: Some(RealityClientBinding {
                     enrollment: path_string(&r.enrollment)?,
                     enrollment_sha256,
@@ -343,7 +343,7 @@ pub fn apply(path: &Path, request: &Request, expected: [u8; 32], now: u64) -> Re
 /// interpreting mutable trust history. A copied/replaced profile, changed
 /// bearer ref or independently edited mode must not silently take effect.
 pub(crate) fn pinned_client(profile: &Profile) -> Result<bootstrap::Profile, Error> {
-    if profile.tls_profile != "smart-reality" || profile.tls_ca.is_some() {
+    if profile.security_mode != "smart-reality" || profile.tls_ca.is_some() {
         return Err(Error::Format);
     }
     let binding = profile.reality_profile.as_ref().ok_or(Error::Format)?;
@@ -569,7 +569,7 @@ fn exact_client_record(path: &Path, expected: [u8; 32], id: &str) -> Result<Prof
     doc.client
         .profiles
         .into_iter()
-        .find(|p| p.id == id && p.tls_profile == "smart-reality")
+        .find(|p| p.id == id && p.security_mode == "smart-reality")
         .ok_or(Error::Scope)
 }
 
