@@ -185,6 +185,8 @@ impl ProcessPanel {
         }
     }
 
+    pub(crate) fn confirmation(&self) -> Option<bool> { self.confirm }
+
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
         if self.confirm.is_some() { return Vec::new(); }
@@ -254,7 +256,7 @@ impl ProcessPanel {
 
     pub(crate) fn summary(&self) -> String {
         let report = match &self.worker {
-            Some(w) if w.stop.is_none() => "Остановка: admission закрывается, ожидается завершение задач.".into(),
+            Some(w) if w.stop.is_none() => "Остановка: новые подключения не принимаются, ожидается завершение задач.".into(),
             Some(w) if w.inbounds.is_some() => format!("Сервер запущен. Inbound: {}.\nСостояние относится только к этому экземпляру.", w.inbounds.unwrap_or(0)),
             _ => self.notice.clone(),
         };
@@ -264,7 +266,7 @@ impl ProcessPanel {
     pub(crate) fn body(&self) -> String {
         if let Some(start) = self.confirm {
             return if start {
-                "Запустить сервер по сохранённому TOML? Открываются указанные сетевые порты и закрытый локальный канал управления. Права ОС не повышаются.\ny: запустить • n/Esc: отменить".into()
+                "Запустить сервер по сохранённым настройкам?\nОткрываются указанные сетевые порты и закрытый локальный канал управления. Права ОС не повышаются.\ny: запустить • n/Esc: отменить".into()
             } else {
                 "Остановить запущенный этой панелью сервер? Новые подключения будут отклонены; действующие получат ограниченное время на завершение.\ny: остановить • n/Esc: отменить".into()
             };

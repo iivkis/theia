@@ -404,15 +404,15 @@ fn pages(role: Role) -> &'static [&'static str] {
 
 fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
     let entries: &[(char, &str)] = match (role, page) {
-        (Role::Server, 0) => &[('N',"Создать подключение"),('u',"Добавить пользователя"),('b',"Выдать доступ"),('G',"Выбрать пользователей"),('s',"Запуск / остановка"),('S',"Сохранить файл"),('a',"Применить права доступа"),('v',"Состояние / другие изменения"),('o',"Открыть другой файл")],
-        (Role::Server, 1) => &[('N',"Создать подключение"),('G',"Кому разрешён доступ"),('V',"Состояние REALITY"),('E',"Сертификат Own-TLS"),('D',"Удалить подключение")],
+        (Role::Server, 0) => &[('N',"Создать подключение"),('u',"Добавить пользователя"),('b',"Восстановить доступ"),('G',"Выбрать пользователей"),('s',"Запуск / остановка"),('S',"Сохранить файл"),('a',"Применить права доступа"),('v',"Состояние / другие изменения"),('o',"Открыть другой файл")],
+        (Role::Server, 1) => &[('N',"Создать подключение"),('G',"Кому разрешён доступ"),('V',"Состояние (только REALITY)"),('E',"Сертификат (только Own-TLS)"),('D',"Удалить подключение")],
         (Role::Server, 2) => &[('u',"Добавить пользователя"),('G',"Выбрать права доступа"),('b',"Восстановить доступ"),('x',"Отключить пользователя"),('t',"Заменить приглашение"),('U',"Удалить пользователя")],
         (Role::Server, 3) => &[('u',"Новый пользователь и ссылка"),('b',"Восстановить доступ"),('t',"Заменить приглашение"),('l',"Ссылка без секрета")],
         (_, 4) => &[('4',"Открыть монитор трафика")],
         (Role::Server, 5) => &[('S',"Сохранить файл"),('a',"Применить права доступа"),('v',"Состояние / другие изменения"),('Q',"Лимиты подключений"),('o',"Открыть файл"),('R',"Проверить перезапуск"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
-        (Role::Server, 6) => &[('p',"Сетевая диагностика"),('V',"Состояние REALITY")],
+        (Role::Server, 6) => &[('p',"Сетевая диагностика"),('V',"Состояние (только REALITY)")],
         (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
-        (Role::Client, 1) => &[('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт"),('E',"Доверие Own-TLS"),('D',"Удалить профиль")],
+        (Role::Client, 1) => &[('V',"Подключить / отключить"),('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт приглашения"),('E',"Сертификат Own-TLS"),('D',"Удалить профиль")],
         (Role::Client, 2) => &[('i',"Импорт ссылки или QR"),('I',"Импорт REALITY")],
         (Role::Client, 3) if cfg!(windows) => &[('p',"Управление системным прокси")],
         (Role::Client, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('V',"Состояние и применение"),('K',"Подтвердить доверие"),('M',"Регистрация материалов")],
@@ -1869,6 +1869,10 @@ impl Interaction {
             let Some(code) = code else { self.issuance = Some(flow); return false; };
             let key = KeyEvent { code, ..key };
             match flow {
+                IssueFlow::Input(id) if self.issue_kind != IssueKind::NewUser
+                    && eligible_users(editor, self.issue_kind == IssueKind::Reenable).is_empty() => {
+                    if key.code != KeyCode::Esc { self.issuance = Some(IssueFlow::Input(id)); }
+                }
                 IssueFlow::Input(mut id) => match key.code {
                     KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab if self.issue_kind != IssueKind::NewUser => {
                         id = cycle_user(
@@ -2047,6 +2051,9 @@ impl Interaction {
 
         if let Some(flow) = self.revocation.take() {
             match flow {
+                DisableFlow::Input(id) if eligible_users(editor, false).is_empty() => {
+                    if key.code != KeyCode::Esc { self.revocation = Some(DisableFlow::Input(id)); }
+                }
                 DisableFlow::Input(mut id) => match key.code {
                     KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
                         id = cycle_user(editor, &id, false, matches!(key.code,KeyCode::Down|KeyCode::Tab));
@@ -2441,7 +2448,7 @@ impl Interaction {
             {
                 if editor.role() == Role::Server && !editor.selected_reality() {
                     editor.error =
-                        Some("Выберите зарегистрированный REALITY inbound/профиль.".into());
+                        Some("Это подключение использует собственный TLS. Для состояния сервера откройте F5 или выберите подключение REALITY.".into());
                 } else {
                     match editor.require_clean_records() {
                         Ok(()) => {
@@ -2998,7 +3005,7 @@ fn draw_guided(
         for number in 1..=total {
             segments.push(Span::styled(if number <= step { "━━━ " } else { "─── " }, Style::default().fg(if number <= step { ACCENT } else { MUTED })));
         }
-        segments.push(Span::styled(heading, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)));
+        segments.push(Span::styled(heading, Style::default().fg(if heading == "Подтверждение" { WARNING } else { TEXT }).add_modifier(Modifier::BOLD)));
         frame.render_widget(Paragraph::new(vec![
             Line::styled(caption.as_str(), Style::default().fg(MUTED)),
             Line::from(segments),
@@ -3162,6 +3169,12 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         if let Some([report, controls]) = action_layout(parts[1], items.len()) {
             modal_panel!(frame, report, "Состояние сервера", &ui.server_process.summary(), false);
             Actions { items: &items, selected: ui.server_process.action_focus() }.render(frame, controls);
+        } else if let Some(start) = ui.server_process.confirmation() {
+            let body = ui.server_process.body();
+            let message = body.rsplit_once('\n').map_or(body.as_str(), |(message, _)| message);
+            draw_guided(frame, parts[1], if start { "Запуск сервера" } else { "Остановка сервера" }, message,
+                (1, 1, "Подтверждение", if start { "y запустить · n/Esc отменить" } else { "y остановить · n/Esc отменить" }),
+                viewport, (None, None));
         } else {
             modal_panel!(frame, parts[1], "Сервер • запуск и остановка", &ui.server_process.body(), true);
         }
@@ -3179,10 +3192,10 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         tui_widgets::canvas(frame, parts[1]);
         let items = status.actions();
         if let Some([report, controls]) = action_layout(parts[1], items.len()) {
-            modal_panel!(frame, report, "Подключение и состояние REALITY", &status.summary(), false);
+            modal_panel!(frame, report, status.title(), &status.summary(), false);
             Actions { items: &items, selected: status.action_focus() }.render(frame, controls);
         } else {
-            modal_panel!(frame, parts[1], "Подключение и состояние REALITY", &status.body(), true);
+            modal_panel!(frame, parts[1], status.title(), &status.body(), true);
         }
     } else if let Some(registration) = interaction.and_then(|ui| ui.reality_registration.as_ref()) {
         if let Some(form)=registration.form() {
@@ -3432,6 +3445,12 @@ fn draw_issuance(
             draw_guided(frame, area, "Новый пользователь", "", (1, 2, "Доступ", "Enter продолжить · Ctrl+U очистить · Esc отменить"), viewport, (Some(form), None));
             return;
         }
+        if editor.is_some_and(|e| eligible_users(e, recovering).is_empty()) {
+            let title = if recovering { "Восстановление доступа" } else { "Заменить личный ключ" };
+            let message = if recovering { "В этом подключении нет отключённых пользователей с правом доступа.\nЕсли нужен новый ключ для включённого пользователя, выберите «Заменить приглашение»." } else { "В этом подключении нет включённых пользователей с правом доступа.\nДобавьте пользователя или восстановите его доступ." };
+            panel_at(frame, area, title, &format!("{message}\n\nEsc: вернуться"), true, viewport);
+            return;
+        }
         if let Some(form) = user_picker(editor, id, recovering) {
             let title = if recovering { "Восстановление отключённого пользователя" } else { "Заменить личный ключ" };
             draw_guided(frame, area, title, "", (1, 2, "Выбор пользователя", "↑↓ выбрать · Enter проверить · Esc отменить"), viewport, (Some(form), None));
@@ -3496,7 +3515,7 @@ fn draw_issuance(
                 if recovering {
                     "Восстановление НЕ сохранено. Новый токен не показывался."
                 } else if rotating {
-                    "Новый ключ НЕ сохранён. Старый ключ остаётся в файле; работающий сервер не изменён."
+                    "Новый ключ НЕ сохранён. Сохранённые данные старого ключа и работающий сервер не изменены."
                 } else {
                     "Новый пользователь НЕ записан. Токен не показывался."
                 },
@@ -3571,6 +3590,11 @@ fn draw_issuance(
     } else {
         body
     };
+    if matches!(flow, IssueFlow::Confirm(_)) {
+        let message = body.rsplit_once("\n\n").map_or(body.as_str(), |(message, _)| message);
+        draw_guided(frame, area, title, message, (2, 2, "Подтверждение", "y подтвердить и сохранить · n/Esc отменить"), viewport, (None, None));
+        return;
+    }
     let items = invitation_actions(flow);
     if let Some([report, controls]) = action_layout(area, items.len()) {
         panel_at(frame, report, title, &body, false, viewport);
@@ -3588,6 +3612,10 @@ fn draw_revocation(
     viewport: Option<&Viewport>,
 ) {
     if let DisableFlow::Input(id) = flow {
+        if editor.is_some_and(|e| eligible_users(e, false).is_empty()) {
+            panel_at(frame, area, "Отключить пользователя", "В этом подключении нет включённых пользователей с правом доступа.\n\nEsc: вернуться", true, viewport);
+            return;
+        }
         if let Some(form) = user_picker(editor, id, false) {
             draw_guided(frame, area, "Отключить существующего пользователя", "", (1, 2, "Выбор пользователя", "↑↓ выбрать · Enter проверить · Esc отменить"), viewport, (Some(form), None));
             return;
@@ -3620,7 +3648,7 @@ fn draw_revocation(
         DisableFlow::SaveFailed => (
             "Отзыв доступа: ошибка сохранения",
             format!(
-                "TOML НЕ сохранён. Runtime не изменён.\n\n{}\n\nr: повторить сохранение  d: отменить черновик",
+                "Изменения НЕ сохранены. Работающий сервер не изменён.\n\n{}\n\nr: повторить сохранение  d: отменить черновик",
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
         ),
@@ -3634,7 +3662,12 @@ fn draw_revocation(
     } else {
         body
     };
-    panel_at(frame, area, title, &body, true, viewport);
+    if matches!(flow, DisableFlow::Confirm(_)) {
+        let message = body.rsplit_once("\n\n").map_or(body.as_str(), |(message, _)| message);
+        draw_guided(frame, area, title, message, (2, 2, "Подтверждение", "y подтвердить и сохранить · n/Esc отменить"), viewport, (None, None));
+    } else {
+        panel_at(frame, area, title, &body, true, viewport);
+    }
 }
 
 fn draw_import(
@@ -3864,7 +3897,8 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         panel(frame, content, pages(role)[page], description, true);
     }
     if controls.height > 0 {
-        Actions { items: &items, selected }.render_with_focus(frame, controls, focus == WorkspaceFocus::Actions);
+        Actions { items: &items, selected }.render_with_focus(frame, controls,
+            focus == WorkspaceFocus::Actions || (focus == WorkspaceFocus::Fields && page != 1 && !(role == Role::Server && matches!(page, 2 | 3))));
     } else if focus == WorkspaceFocus::Actions && !items.is_empty() {
         Actions { items: &items, selected }.render(frame, area);
     }
@@ -4062,8 +4096,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
     let title = if editor.editing { "Изменение параметра" }
         else if reality { "Защищённое подключение · только просмотр" } else { "Параметры · Enter изменить" };
     let fields = editor.workspace_fields();
-    let selected = fields.iter().find(|(_, _, selected)| *selected);
-    let friendly = match (server, editor.workspace_field_index()) {
+     let friendly = match (server, editor.workspace_field_index()) {
         (true, 0) => "Домен, используемый при проверке TLS.",
         (true, 1) => "На каком адресе и порту сервер принимает TCP (HTTP/2).",
         (true, _) => "На каком адресе и порту сервер принимает UDP (HTTP/3).",
@@ -4123,7 +4156,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
     let error = editor.error.as_deref();
     if detail.height >= 5 {
         let detail_lines = vec![
-            Line::styled(selected.map_or("Параметр", |(label, _, _)| *label), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            Line::styled(fields.iter().position(|(_, _, selected)| *selected).and_then(|index| labels.get(index)).copied().unwrap_or("Параметр"), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
             Line::styled(context, Style::default().fg(MUTED)),
             Line::styled(choices, Style::default().fg(ACCENT)),
             Line::styled(help, Style::default().fg(TEXT)),
@@ -6038,7 +6071,7 @@ mod tests {
                 )
             });
             assert!(confirm.contains("Подтверждение"));
-            assert!(confirm.contains("y: подтвердить"));
+            assert!(confirm.contains("подтвердить и сохранить"));
             let failed =
                 render(|f, a| draw_issuance(f, a, &IssueFlow::SaveFailed, None, kind, None, 0));
             assert!(failed.contains("ссылка заблокирована"));
@@ -6084,7 +6117,7 @@ mod tests {
                 "отдельного применения прав",
             ),
             (DisableFlow::Saving, "Runtime не изменяется"),
-            (DisableFlow::SaveFailed, "TOML НЕ сохранён"),
+            (DisableFlow::SaveFailed, "Изменения НЕ сохранены"),
             (DisableFlow::Done, "подтвердить auth-only Apply"),
         ] {
             let screen = render(|f, a| draw_revocation(f, a, &flow, None, None));

@@ -447,6 +447,12 @@ impl StatusPanel {
     pub(crate) fn select_action(&mut self, index: usize) {
         if index < self.actions().len() { self.action_focus = index; }
     }
+    pub(crate) fn title(&self) -> &'static str {
+        if self.server { "Состояние REALITY на сервере" }
+        else if self.reality { "Подключение REALITY" }
+        else { "Подключение клиента · собственный TLS" }
+    }
+
     pub(crate) fn summary(&self) -> String {
         if let Some(run) = &self.client_run {
             let status = run.report.lock().map(|s| s.clone()).unwrap_or_else(|_| "Статус недоступен".into());
@@ -736,7 +742,7 @@ impl StatusPanel {
             return "Подтверждённая запись публикации выполняется. Не закрывайте экран.".into();
         }
         if self.pending.is_some() {
-            return "Проверка сохранённых материалов/локального IPC. Ничего не применяется.\nEsc: закрыть.".into();
+            return "Проверяем сохранённые настройки и состояние локального процесса. Изменения не применяются.\nEsc: закрыть.".into();
         }
         if let Some(review) = &self.expiry_review {
             return format!("{}\n\ny: подтвердить | n/Esc: отменить", review.report());
