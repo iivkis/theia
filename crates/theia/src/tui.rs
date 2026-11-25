@@ -7035,7 +7035,10 @@ mod tests {
 
     #[test]
     fn confirmation_choices_default_to_cancel_and_never_execute_on_focus() {
-        let mut ui = Interaction::new(None);
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("confirm-choice").unwrap());
+        let original = server_issuance_fixture();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
         let mut model = Model::new(Some(Role::Server));
         ui.update(&mut model, press(KeyCode::F(5)));
         ui.update(&mut model, press(KeyCode::Enter));
@@ -7055,6 +7058,40 @@ mod tests {
         assert!(ui.server_process.confirmation().is_none());
         assert!(!ui.server_process.running());
         assert!(!ui.confirm_selected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn direct_profile_selection_wraps_long_addresses_without_activating() {
+        use crate::config::{self, Config};
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("profile-selection").unwrap());
+        let Config::Client(mut doc) = config::parse(include_str!("../../../examples/client.toml")).unwrap() else { panic!("client") };
+        let mut backup = doc.client.profiles[0].clone();
+        backup.id = "backup".into();
+        backup.server = "long-label-for-testing-profile-address.example.org:443".into();
+        doc.client.profiles.push(backup);
+        let original = Config::Client(doc).to_toml().unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.update(&mut model, press(KeyCode::Char('P')));
+        let items = page_actions(Role::Client, 3, ui.editor.as_ref());
+        ui.workspace_action = items.iter().position(|a| a.key == 'L').unwrap();
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
+        ui.update(&mut model, press(KeyCode::Down));
+        let editor = ui.editor.as_ref().unwrap();
+        assert_eq!(editor.selected_record_id(), "backup");
+        assert!(!editor.selected_record_is_active());
+        let rows = record_rows(editor, Rect::new(0, 0, 30, 20));
+        let label = rows.iter().filter(|(id, _)| *id == 1).map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("");
+        assert_eq!(label, "№2 long-label-for-testing-profile-address.example.org:443");
+        ui.update(&mut model, press(KeyCode::F(7)));
+        assert!(ui.preview_text.as_deref().unwrap().contains("long-label-for-testing-profile-address.example.org:443"));
+        assert!(!ui.owned_running(Role::Client));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

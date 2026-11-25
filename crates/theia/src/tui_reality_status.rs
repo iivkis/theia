@@ -14,6 +14,7 @@ use std::{
 
 enum Update {
     Report(String),
+    Observation { brief: String, details: Option<String> },
     Review(RotationReview),
     Trust(TrustReview),
     Expiry(ExpiryReview),
@@ -44,6 +45,8 @@ pub(crate) struct StatusPanel {
     review: Option<RotationReview>,
     committing: bool,
     report: String,
+    details: Option<String>,
+    show_details: bool,
     client_active: bool,
     client_confirm: Option<bool>,
     client_run: Option<ClientRun>,
@@ -74,6 +77,8 @@ impl StatusPanel {
             review: None,
             committing: false,
             report: String::new(),
+            details: None,
+            show_details: false,
             client_active: editor.selected_record_is_active(),
             client_confirm: None,
             client_run: None,
@@ -111,9 +116,12 @@ impl StatusPanel {
                     return RotationReview::prepare(&path, digest, &id, retire, now)
                         .map(Update::Review);
                 }
+                let mut details = None;
                 let mut report = if reality {
                     if server {
-                        reality_config::status_expected(&path, digest, &id, now)?
+                        let (brief, technical) = reality_config::status_expected(&path, digest, &id, now)?;
+                        details = Some(technical);
+                        brief
                     } else {
                         reality_config::client_status_expected(&path, digest, &id, now)?
                     }
@@ -156,14 +164,16 @@ impl StatusPanel {
                             }
                             .ok()
                         });
-                    let live=match response{
-                        Some(StatusReply::RealityRunning{generation,revision,health_revision,active_reference,overlap})=>
-                            format!("Runtime: принимает подключения\ngeneration={generation} revision={revision} health_revision={health_revision}\nreference_index={active_reference} overlap={overlap}"),
-                        Some(StatusReply::RealitySuspended)=>"Runtime: новые подключения приостановлены; действующие туннели не отозваны.".into(),
-                        _=>"Runtime: нет подтверждённого IPC статуса этого bundle.".into(),
+                    let (live, technical) = match response {
+                        Some(StatusReply::RealityRunning{generation,revision,health_revision,active_reference,overlap}) => (
+                            format!("Сервер: принимает подключения (версия {revision})."),
+                            format!("generation={generation} revision={revision} health_revision={health_revision}\nreference_index={active_reference} overlap={overlap}")),
+                        Some(StatusReply::RealitySuspended) => ("Сервер: новые подключения приостановлены; действующие туннели не отозваны.".into(), "Runtime: suspended".into()),
+                        _ => ("Состояние работающего сервера не подтверждено. Это не означает, что он остановлен.".into(), "Runtime: нет подтверждённого IPC статуса этого bundle.".into()),
                     };
                     report.push_str("\n\n");
                     report.push_str(&live);
+                    if let Some(detail) = details.as_mut() { detail.push_str("\n\n"); detail.push_str(&technical); }
                 } else {
                     use crate::management::{StatusCommand, StatusReply};
                     let response = tokio::runtime::Builder::new_current_thread()
@@ -186,7 +196,7 @@ impl StatusPanel {
                     report.push_str("\n\n");
                     report.push_str(&live);
                 }
-                Ok(Update::Report(report))
+                Ok(Update::Observation { brief: report, details })
             })();
             let _ = tx.send(result);
         });
@@ -452,6 +462,9 @@ impl StatusPanel {
         {
             return Vec::new();
         }
+        if self.show_details && self.details.is_some() {
+            return vec![ActionItem { key: 'd', label: "К краткому состоянию" }];
+        }
         if let Some(run) = &self.client_run {
             return if run.stop.is_some() {
                 vec![ActionItem {
@@ -508,6 +521,9 @@ impl StatusPanel {
                 },
             ]);
         }
+        if self.details.is_some() {
+            items.push(ActionItem { key: 'd', label: "Технические подробности" });
+        }
         items
     }
     pub(crate) fn action_focus(&self) -> usize {
@@ -529,6 +545,9 @@ impl StatusPanel {
     }
 
     pub(crate) fn summary(&self) -> String {
+        if self.show_details {
+            if let Some(details) = &self.details { return details.clone(); }
+        }
         if let Some(run) = &self.client_run {
             let status = run
                 .report
@@ -552,6 +571,18 @@ impl StatusPanel {
             return false;
         };
         key.code = code;
+        if self.show_details {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('d')) {
+                self.show_details = false;
+                self.action_focus = 0;
+            }
+            return false;
+        }
+        if key.code == KeyCode::Char('d') && items.iter().any(|item| item.key == 'd') {
+            self.show_details = true;
+            self.action_focus = 0;
+            return false;
+        }
         if self.reopen_required {
             return key.code == KeyCode::Esc;
         }
@@ -760,8 +791,14 @@ impl StatusPanel {
         };
         self.pending = None;
         self.committing = false;
+        self.details = None;
+        self.show_details = false;
         match result{
             Ok(Update::Report(report))=>self.report=report,
+            Ok(Update::Observation { brief, details })=>{
+                self.report=brief;
+                self.details=details;
+            },
             Ok(Update::Review(review))=>self.review=Some(review),
             Ok(Update::Trust(review))=>self.trust_review=Some(review),
             Ok(Update::Expiry(review))=>self.expiry_review=Some(review),
@@ -795,6 +832,9 @@ impl StatusPanel {
         }
     }
     pub(crate) fn body(&self) -> String {
+        if self.show_details {
+            if let Some(details) = &self.details { return format!("{details}\n\nEsc: к краткому состоянию"); }
+        }
         if self.reopen_required {
             return format!("{}\nEsc: закрыть", self.report);
         }
@@ -888,6 +928,8 @@ mod tests {
             review: None,
             committing: false,
             report: String::new(),
+            details: None,
+            show_details: false,
             client_active: active,
             client_confirm: None,
             client_run: None,
@@ -902,6 +944,21 @@ mod tests {
             action_focus: 0,
         }
     }
+    #[test]
+    fn technical_status_is_opt_in_and_never_starts_a_worker() {
+        let mut p = panel(true);
+        p.server = true;
+        p.report = "Краткое состояние".into();
+        p.details = Some("identity_sha256=public-fingerprint".into());
+        assert!(!p.summary().contains("identity_sha256"));
+        assert!(p.actions().iter().any(|a| a.key == 'd'));
+        assert!(!p.key(key(KeyCode::Char('d'))));
+        assert!(p.summary().contains("identity_sha256"));
+        assert!(!p.key(key(KeyCode::Esc)));
+        assert!(!p.summary().contains("identity_sha256"));
+        assert!(p.pending.is_none());
+    }
+
     #[test]
     fn own_tls_status_only_offers_common_runtime_controls() {
         let mut p = panel(true);
