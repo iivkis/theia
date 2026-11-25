@@ -785,7 +785,7 @@ impl PreparedQuic {
                 _=tasks.join_next(),if !tasks.is_empty()=>{},
                 incoming=self.endpoint.accept()=>{
                     let Some(incoming)=incoming else{return Err(ServerError::Io);};
-                    let key=(incoming.remote_address(),incoming.orig_dst_cid().as_ref().to_vec());
+                    let key=(incoming.remote_address(),incoming.orig_dst_cid().to_vec());
                     let ticket=self.tickets.lock().map_err(|_|ServerError::Io)?.remove(&key);
                     let Some(ticket)=ticket else{incoming.ignore();continue;};
                     let Ok(now)=crate::reference_health::unix_now() else{incoming.ignore();continue;};

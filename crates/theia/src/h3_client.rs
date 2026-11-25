@@ -9,7 +9,7 @@ use bytes::{Buf, Bytes};
 use h3::{client::RequestStream, quic};
 use http::{header, HeaderValue, Request, StatusCode, Uri};
 use rustls::{pki_types::ServerName, RootCertStore};
-use std::{collections::VecDeque, net::SocketAddr, time::Duration};
+use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     task::JoinHandle,
