@@ -426,7 +426,7 @@ class SpecContractTests(unittest.TestCase):
         proxy = read("crates/theia/src/local_proxy.rs")
         self.assertIn("enum Carrier", proxy)
         self.assertIn("(None, Some(h3)) => Ok(Self::H3(h3))", proxy)
-        self.assertIn("Self::H3(client) => client.open(address, port)", proxy)
+        self.assertRegex(proxy, r"Self::H3\(client\)\s*=>\s*client\s*\.open\(address,\s*port\)")
         self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
         server = read("crates/theia/src/server.rs")
         self.assertIn("crate::h3_server::serve(endpoint, context)", server)
