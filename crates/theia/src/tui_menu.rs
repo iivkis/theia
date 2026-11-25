@@ -126,6 +126,7 @@ const CLIENT: &[Group] = &[
         title: "Профили и приглашения",
         entries: &[
             entry("Импорт ссылки, URI-файла или изображения QR", key('i')),
+            always("Импорт первого REALITY-профиля", key('I')),
             entry("Создать профиль", key('N')),
             entry("Выбрать активный профиль", key('A')),
             entry(
@@ -447,6 +448,7 @@ pub(crate) struct ConfigDialog {
     loading: Option<std::sync::mpsc::Receiver<Result<crate::tui_editor::Editor, &'static str>>>,
     setup: Option<FirstSetup>,
     reality: Option<crate::tui_reality_provision::ProvisionPanel>,
+    enrollment: Option<crate::tui_reality_enroll::EnrollmentPanel>,
     creating: bool,
 }
 impl ConfigDialog {
@@ -470,10 +472,15 @@ impl ConfigDialog {
             loading: None,
             setup: None,
             reality: None,
+            enrollment: None,
             creating: false,
         }
     }
     pub(crate) fn paste(&mut self, text: &str) {
+        if let Some(panel) = self.enrollment.as_mut() {
+            panel.paste(text);
+            return;
+        }
         if let Some(panel) = self.reality.as_mut() {
             panel.paste(text);
             return;
@@ -491,6 +498,12 @@ impl ConfigDialog {
     }
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.loading.is_some() {
+            return false;
+        }
+        if let Some(panel) = self.enrollment.as_mut() {
+            if panel.key(key) {
+                self.enrollment = None;
+            }
             return false;
         }
         if let Some(panel) = self.reality.as_mut() {
@@ -538,9 +551,14 @@ impl ConfigDialog {
                     self.error = None;
                 }
             }
-            KeyCode::F(4) if self.role == Role::Server => {
+            KeyCode::F(4) => {
                 if self.input.is_empty() {
                     self.error = Some("Укажите путь нового TOML.");
+                } else if self.role == Role::Client {
+                    match crate::tui_reality_enroll::EnrollmentPanel::first(std::path::PathBuf::from(&self.input)) {
+                        Ok(panel) => { self.enrollment = Some(panel); self.error = None; }
+                        Err(error) => self.error = Some(error),
+                    }
                 } else {
                     match crate::tui_reality_provision::ProvisionPanel::first(
                         std::path::PathBuf::from(&self.input),
@@ -592,6 +610,9 @@ impl ConfigDialog {
         false
     }
     pub(crate) fn poll(&mut self) -> Option<crate::tui_editor::Editor> {
+        if let Some(panel) = self.enrollment.as_mut() {
+            return panel.poll();
+        }
         if let Some(panel) = self.reality.as_mut() {
             return panel.poll();
         }
@@ -613,8 +634,25 @@ impl ConfigDialog {
             }
         }
     }
+    pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
+        if let Some(panel) = &self.reality {
+            return panel.guide();
+        }
+        if let Some(panel) = &self.enrollment {
+            return Some(panel.guide());
+        }
+        self.setup.as_ref().map(|setup| {
+            if setup.review.is_some() {
+                (2, 2, "Подтверждение", "Y создать · N / Esc назад")
+            } else {
+                (1, 2, "Параметры Own-TLS", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад")
+            }
+        })
+    }
     pub(crate) fn title(&self) -> &'static str {
-        if self.reality.is_some() {
+        if self.enrollment.is_some() {
+            "Импорт REALITY"
+        } else if self.reality.is_some() {
             "Мастер REALITY"
         } else if self.setup.is_some() {
             "Мастер Own-TLS"
@@ -631,6 +669,9 @@ impl ConfigDialog {
                 "Проверяется существующий TOML; ничего не записывается.".into()
             };
         }
+        if let Some(panel) = &self.enrollment {
+            return panel.body();
+        }
         if let Some(panel) = &self.reality {
             return panel.body();
         }
@@ -645,7 +686,7 @@ impl ConfigDialog {
         let reality = if self.role == Role::Server {
             "\n  F4    SmartTheia REALITY  ·  мастер подбора, без своего сертификата"
         } else {
-            ""
+            "\n  F4    Импорт REALITY  ·  создать TOML из приглашения"
         };
         format!("{role} • открытие или создание конфигурации\n\nПуть к TOML\n> {}\n\nВЫБЕРИТЕ ДЕЙСТВИЕ\n  Enter Открыть существующий TOML\n  F2    Own-TLS  ·  собственный сертификат{reality}\n\n{}\nCtrl+U очистить путь · Esc назад", self.input, self.error.unwrap_or(""))
 
@@ -1101,8 +1142,8 @@ mod tests {
         menu.click(area, 2, 2);
         assert_eq!(menu.group, 1);
         assert_eq!(menu.item, Some(0));
-        menu.click(area, 32, 5);
-        assert_eq!(menu.item, Some(4));
+        menu.click(area, 32, 6);
+        assert_eq!(menu.item, Some(5));
         assert_eq!(menu.key(KeyCode::Enter), Some(key('Q')));
     }
 
