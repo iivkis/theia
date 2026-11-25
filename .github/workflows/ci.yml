@@ -445,6 +445,7 @@ jobs:
     timeout-minutes: 35
     env:
       THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      THEIA_F13_EVIDENCE_DIR: ${{ github.workspace }}/f13-observations
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
@@ -492,10 +493,24 @@ jobs:
         run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5 -- --ignored --exact --nocapture
       - name: Verify Chromium navigation over the explicit Theia H3 transport
         run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5_over_h3 -- --ignored --exact --nocapture
+      - name: Create fresh F-13 measurement directory
+        run: python -c "from pathlib import Path; Path('f13-observations').mkdir()"
+      - name: Measure actual native H2 TLS and HTTP first-flight
+        run: cargo test --workspace --locked --test h2_wire_fingerprint real_default_h2_settings_and_pseudo_headers_are_measured -- --exact --nocapture
+      - name: Measure actual native H3 client Initial
+        run: cargo test --workspace --locked --test f18_h3_first_flight actual_native_h3_client_initial_reference -- --exact --nocapture
       - name: Capture actual Chromium H2 SETTINGS and HPACK pseudo names on loopback
         run: cargo test --workspace --locked --test chromium_h2_reference actual_chromium_h2_settings_and_pseudo_order_reference -- --ignored --exact --nocapture
       - name: Capture independent actual Chromium H3 Initial on loopback
         run: cargo test --workspace --locked --test f18_h3_first_flight actual_chromium_h3_initial_reference -- --ignored --exact --nocapture
+      - name: Report observed native and browser differences without claiming parity
+        run: python tests/benchmark/check_f13_observations.py f13-observations
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f13-observations-${{ matrix.os }}
+          path: f13-observations/*.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Install pinned independent REALITY reference implementations
         run: python -m pip install h2==4.2.0 aioquic==1.2.0
       - name: Independent external TLS and QUIC through registered REALITY dispatchers
