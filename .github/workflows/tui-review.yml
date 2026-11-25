@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: d2f3cc6b8037fb13670c7e310735eec0299e1d48
+          ref: 1e9433c2d80bee719077e9af5d2fda19724767ee
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -64,15 +64,30 @@ jobs:
           PY
           cd source
           source_sha="$(git rev-parse HEAD)"
-          cargo test --locked -p theia first_key_import_creates_active_profile_and_opens_connection_panel -- --nocapture --test-threads=1
-          cargo test --locked -p theia common_import_dispatches_reality_key_to_masked_review_and_cancels_without_writes -- --nocapture --test-threads=1
-          cargo test --locked -p theia client_import_modal_masks_pasted_link_and_requires_explicit_confirmation -- --nocapture --test-threads=1
-          cargo test --locked -p theia preview_binds_independent_identity_and_admission_without_exposing_secret -- --nocapture --test-threads=1
-          cargo test --locked -p theia client_connection_modes_are_visible_and_do_not_start_or_write_on_selection -- --nocapture --test-threads=1
-          cargo test --locked -p theia client_proxy_shortcut_refuses_dirty_or_unconfigured_editor -- --nocapture --test-threads=1
-          cargo test --locked -p theia managed_key_import_has_no_extra_input_fields -- --nocapture --test-threads=1
-          cargo test --locked -p theia compact_reality_with_three_maximum_dns_references_fits_access_key_limit -- --nocapture --test-threads=1
-          cargo test --locked -p theia visual_review_gallery -- --nocapture --test-threads=1
+          # Report every independent regression in one CI run; never publish on failure.
+          failed=0
+          for test in \
+            first_key_import_creates_active_profile_and_opens_connection_panel \
+            common_import_dispatches_reality_key_to_masked_review_and_cancels_without_writes \
+            client_import_modal_masks_pasted_link_and_requires_explicit_confirmation \
+            preview_binds_independent_identity_and_admission_without_exposing_secret \
+            client_connection_modes_are_visible_and_do_not_start_or_write_on_selection \
+            client_proxy_shortcut_refuses_dirty_or_unconfigured_editor \
+            managed_key_import_has_no_extra_input_fields \
+            compact_reality_with_three_maximum_dns_references_fits_access_key_limit \
+            visual_review_gallery
+          do
+            echo "::group::$test"
+            log="$RUNNER_TEMP/theia-review-$test.log"
+            if ! cargo test --locked -p theia --lib "$test" -- --nocapture --test-threads=1 2>&1 | tee "$log"; then
+              failed=1
+            elif ! grep -Eq 'test result: ok\. 1 passed; 0 failed' "$log"; then
+              echo "::error::Expected exactly one passing test: $test"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          test "$failed" -eq 0
           /usr/bin/python3 ../review/tools/tui-review/render.py "$THEIA_REVIEW_CELLS" "$RUNNER_TEMP/tui-gallery" --source-sha "$source_sha"
       - uses: actions/upload-artifact@v4
         with:
@@ -109,7 +124,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "d2f3cc6b8037fb13670c7e310735eec0299e1d48"
+          assert manifest["source_sha"] == "1e9433c2d80bee719077e9af5d2fda19724767ee"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
