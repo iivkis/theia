@@ -4,6 +4,30 @@
 //! No TLS secrets, authorization values, HPACK block or raw frames are logged.
 #[path = "support/h2_wire.rs"]
 mod h2_wire;
+#[path = "../../../spikes/m0_1/src/client_hello.rs"]
+mod client_hello;
+#[path = "support/f13_evidence.rs"]
+mod f13_evidence;
+
+fn emit_tls(name: &str, capture: &Arc<Mutex<Capture>>) {
+    let summary = {
+        let mut state = capture.lock().unwrap();
+        state.frozen = true;
+        let mut raw = std::mem::take(&mut state.raw);
+        let result = client_hello::parse_tls_records(&raw);
+        raw.fill(0);
+        result.expect("bounded actual TLS ClientHello")
+    };
+    let json = format!(
+        "{{\"legacy_version\":{},\"cipher_count\":{},\"extension_count\":{},\"group_count\":{},\"grease\":{},\"alps\":{},\"sni_present\":{},\"tls13\":{},\"alpn_h2\":{}}}",
+        summary.legacy_version, summary.cipher_suites.len(), summary.extensions_in_wire_order.len(),
+        summary.supported_groups.len(), summary.has_grease_extension(), summary.has_alps(),
+        summary.sni_present, summary.supported_versions.contains(&0x0304),
+        summary.alpn.iter().any(|alpn| alpn.as_slice() == b"h2")
+    );
+    f13_evidence::emit(name, &json);
+}
+
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use h2_wire::{inspect, Observation, MAX_CAPTURE_BYTES};
@@ -148,7 +172,17 @@ async fn measure(backend: Backend) -> Observation {
         let endpoint = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let tls = acceptor.accept(socket).await.expect("strict TLS 1.3");
+            let hello = Arc::new(Mutex::new(Capture::default()));
+            let tapped_socket = Tap { inner: socket, capture: hello.clone() };
+            let tls = acceptor.accept(tapped_socket).await.expect("strict TLS 1.3");
+            if matches!(backend, Backend::Rustls) {
+                emit_tls("native-h2-tls.json", &hello);
+            } else {
+                let mut capture = hello.lock().unwrap();
+                capture.frozen = true;
+                capture.raw.fill(0);
+                capture.raw.clear();
+            }
             assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
             let capture = Arc::new(Mutex::new(Capture::default()));
             let tapped = Tap {
@@ -282,6 +316,7 @@ async fn named_browser_h2_profile_has_measured_distinct_bounded_first_flight() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_default_h2_settings_and_pseudo_headers_are_measured() {
     let observed = measure(Backend::Rustls).await;
+    f13_evidence::emit("native-h2-http.json", &observed.sanitized_json());
     // New fail-closed baseline: reject unsolicited H2 server PUSH_PROMISE
     // without relaxing Theia's 8 KiB response-header decoding budget.
     // This is NOT a Chrome-like H2/TLS browser profile.

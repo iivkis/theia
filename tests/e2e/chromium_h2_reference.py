@@ -17,7 +17,7 @@ async def scenario(endpoint: str) -> None:
     assert sep and host == "127.0.0.1" and port.isdigit()
     assert ipaddress.ip_address(host).is_loopback
     assert 1 <= int(port) <= 65535
-    url = f"https://127.0.0.1:{port}/ci-chromium-h2-reference"
+    url = f"https://localhost:{port}/ci-chromium-h2-reference"
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -27,7 +27,8 @@ async def scenario(endpoint: str) -> None:
                 "--disable-component-update",
                 "--disable-quic",
                 "--no-first-run",
-                "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+                "--no-proxy-server",
+                "--host-resolver-rules=MAP localhost 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
             ],
             timeout=20000,
         )

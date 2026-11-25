@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "scope": "diagnostic-only",
+  "baseline_revision": "abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d",
+  "min_pairs": 3,
+  "conditions": [
+    "clean",
+    "relay-delay",
+    "udp-loss"
+  ],
+  "min_throughput_ratio": 0.8,
+  "max_latency_p99_delta_ms": 10,
+  "max_open_p99_delta_ms": 50,
+  "max_cpu_delta_s": 0.1,
+  "max_rss_delta_bytes": 16777216,
+  "max_carrier_overhead_delta": 0.1,
+  "max_fairness_drop": 0.05
+}

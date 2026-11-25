@@ -4,6 +4,30 @@
 //! production Theia (default rustls/optional BoringSSL) still verifies PKI.
 #[path = "support/h2_wire.rs"]
 mod h2_wire;
+#[path = "../../../spikes/m0_1/src/client_hello.rs"]
+mod client_hello;
+#[path = "support/f13_evidence.rs"]
+mod f13_evidence;
+
+fn emit_tls(name: &str, capture: &Arc<Mutex<Capture>>) {
+    let summary = {
+        let mut state = capture.lock().unwrap();
+        state.frozen = true;
+        let mut raw = std::mem::take(&mut state.raw);
+        let result = client_hello::parse_tls_records(&raw);
+        raw.fill(0);
+        result.expect("bounded actual TLS ClientHello")
+    };
+    let json = format!(
+        "{{\"legacy_version\":{},\"cipher_count\":{},\"extension_count\":{},\"group_count\":{},\"grease\":{},\"alps\":{},\"sni_present\":{},\"tls13\":{},\"alpn_h2\":{}}}",
+        summary.legacy_version, summary.cipher_suites.len(), summary.extensions_in_wire_order.len(),
+        summary.supported_groups.len(), summary.has_grease_extension(), summary.has_alps(),
+        summary.sni_present, summary.supported_versions.contains(&0x0304),
+        summary.alpn.iter().any(|alpn| alpn.as_slice() == b"h2")
+    );
+    f13_evidence::emit(name, &json);
+}
+
 
 use bytes::Bytes;
 use h2_wire::{inspect, Observation, MAX_CAPTURE_BYTES};
@@ -115,12 +139,15 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
             let mut verified = None;
             for _ in 0..8 {
                 let (socket, _) = listener.accept().await.expect("loopback browser TCP");
+                let hello = Arc::new(Mutex::new(Capture::default()));
+                let tapped_socket = Tap { inner: socket, state: hello.clone() };
                 if let Ok(Ok(tls)) = timeout(
                     Duration::from_secs(5),
-                    tls_acceptor.accept(socket),
+                    tls_acceptor.accept(tapped_socket),
                 )
                 .await
                 {
+                    emit_tls("browser-h2-tls.json", &hello);
                     verified = Some(tls);
                     break;
                 }
@@ -194,6 +221,7 @@ async fn actual_chromium_h2_settings_and_pseudo_order_reference() {
             String::from_utf8_lossy(&process.stderr)
         );
         let observation: Observation = server.await.expect("Chromium TLS H2 server task");
+        f13_evidence::emit("browser-h2-http.json", &observation.sanitized_json());
         // Pin stable first-flight semantics of the *actual* Chromium
         // 159.0.8154.6 bundled by Playwright 1.65.2, observed identically
         // on native Linux/Windows. An upgrade must be reviewed deliberately.

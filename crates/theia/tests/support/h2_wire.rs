@@ -24,6 +24,18 @@ pub struct Observation {
     pub request_end_stream: bool,
 }
 
+impl Observation {
+    #[allow(dead_code)]
+    pub fn sanitized_json(&self) -> String {
+        let settings: Vec<[u32; 2]> = self.settings.iter().map(|&(id, value)| [u32::from(id), value]).collect();
+        format!(
+            "{{\"settings\":{:?},\"frames_before_headers\":{:?},\"connection_window_updates\":{:?},\"pseudo_headers\":{:?},\"ordinary_fields\":{},\"request_end_stream\":{}}}",
+            settings, self.frames_before_headers, self.connection_window_updates, self.pseudo_headers,
+            self.ordinary_fields, self.request_end_stream
+        )
+    }
+}
+
 fn read_int(data: &[u8], cursor: &mut usize, prefix: u8) -> Result<usize, &'static str> {
     let first = *data.get(*cursor).ok_or("truncated HPACK integer")?;
     *cursor += 1;

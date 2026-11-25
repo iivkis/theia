@@ -129,7 +129,9 @@ require("always() && " + dev_merge in gate,
         "final gate must share the exact dev merge guard")
 require(workflow.count("ref: ${{ github.event.pull_request.merge_commit_sha }}") == 1
         and workflow.count("actions/checkout@v4") ==
-        1 + workflow.count("ref: ${{ needs.specification.outputs.tested_sha }}"),
+        2 + workflow.count("ref: ${{ needs.specification.outputs.tested_sha }}")
+        and "ref: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d" in job("browser-e2e")
+        and "path: .perf-baseline" in job("browser-e2e"),
         "only specification checks out merge; all native jobs pin the exact published SHA")
 require(workflow.count('--sha "${{ needs.specification.outputs.tested_sha }}"') == 2,
         "both coverage producers and gate must use the tested SHA")
@@ -348,4 +350,21 @@ require("$bins = @($testEvents | Where-Object" in browser
         and "$_.profile.test -eq $false" in browser
         and "$_.target.kind -contains 'bin'" in browser,
         "F-14 must reuse a genuine same-build Windows client, with explicit build fallback")
+require("test_native_performance.py" in spec
+        and "native_binary_performance_evidence_smoke" in browser
+        and "check_native_performance.py native-performance.json" in browser
+        and "--require-smoke" in browser
+        and "native-performance-" in browser,
+        "native paired performance smoke and evidence must remain mandatory")
+require("test_classifier_evidence.py" in spec, "independent score evidence regressions remain mandatory")
+require("native_binary_performance_comparison" in browser
+        and "native-comparison.json" in browser
+        and "--require-comparison --policy tests/benchmark/native-diagnostic-policy.json" in browser
+        and "Build exact native baseline before candidate" in browser,
+        "native baseline and candidate comparison remains mandatory")
+require("actual_native_h3_client_initial_reference" in browser
+        and "real_default_h2_settings_and_pseudo_headers_are_measured" in browser
+        and "check_f13_observations.py f13-observations" in browser
+        and "test_f13_observations.py" in spec,
+        "real native and browser first-flight observation matrix must remain mandatory")
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")
