@@ -69,6 +69,8 @@ jobs:
         run: python3 -m unittest discover -s tests/ci -p 'test_ci_timing.py' -v
       - name: Test coverage evidence parser and threshold
         run: python3 -m unittest discover -s tests/ci -p 'test_ci_coverage.py' -v
+      - name: Validate performance evidence checker
+        run: python3 -m unittest discover -s tests/ci -p 'test_performance_evidence.py' -v
       - name: Require full native CI for every merge
         id: scope
         shell: bash

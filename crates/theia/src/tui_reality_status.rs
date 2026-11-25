@@ -19,7 +19,7 @@ enum Update {
     Expiry(ExpiryReview),
     HeadlessReview(u64),
     CredentialReview(PathBuf, [u8; 32], u64),
-    CredentialSaved(Editor),
+    CredentialSaved(Box<Editor>),
 }
 struct ClientRun {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -201,7 +201,7 @@ impl StatusPanel {
                     if editor.selected_record_id() != id {
                         return Err(Error::Indeterminate);
                     }
-                    Ok(Update::CredentialSaved(editor))
+                    Ok(Update::CredentialSaved(Box::new(editor)))
                 } else {
                     let (approval, revision) = reality_config::preview_credential_refresh_for_editor(
                         &path, digest, &id, &source, now)?;
@@ -569,7 +569,7 @@ impl StatusPanel {
             Ok(Update::CredentialSaved(editor))=>{
                 self.digest=editor.saved_sha256();
                 self.client_active=editor.selected_record_is_active();
-                self.refreshed_editor=Some(editor);
+                self.refreshed_editor=Some(*editor);
                 self.report="Credential сохранён, trust не изменён. Для новых соединений требуется отдельный Apply или запуск.".into();
             }
             Err(Error::Indeterminate)=>{
