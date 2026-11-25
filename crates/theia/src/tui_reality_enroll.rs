@@ -243,6 +243,7 @@ impl EnrollmentPanel {
         let mut panel = Self::first(path)?;
         panel.fields[0] = source;
         panel.focus = 0;
+        panel.begin_review();
         Ok(panel)
     }
 
@@ -285,6 +286,7 @@ impl EnrollmentPanel {
         let mut panel = Self::bound(editor)?;
         panel.fields[0] = source;
         panel.focus = 0;
+        panel.begin_review();
         Ok(panel)
     }
 
@@ -343,6 +345,23 @@ impl EnrollmentPanel {
         if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= limit
         {
             field.push_str(value);
+        }
+    }
+
+    fn begin_review(&mut self) {
+        match self.input() {
+            Ok(input) => {
+                let (tx, rx) = mpsc::channel();
+                self.error = None;
+                self.stage = Stage::Loading(rx);
+                let _worker = std::thread::spawn(move || {
+                    let result = reference_health::unix_now()
+                        .map_err(|_| Error::Clock)
+                        .and_then(|now| inspect(&input, now));
+                    let _ = tx.send(result);
+                });
+            }
+            Err(error) => self.error = Some(error.to_string()),
         }
     }
 
@@ -513,20 +532,7 @@ impl EnrollmentPanel {
                 self.focus = 4;
                 self.error=Some("Отпечаток должен состоять из 64 шестнадцатеричных символов. Сверьте его с администратором отдельно от приглашения.".into());
             }
-            KeyCode::Enter => match self.input() {
-                Ok(input) => {
-                    let (tx, rx) = mpsc::channel();
-                    self.error = None;
-                    self.stage = Stage::Loading(rx);
-                    let _worker = std::thread::spawn(move || {
-                        let result = reference_health::unix_now()
-                            .map_err(|_| Error::Clock)
-                            .and_then(|now| inspect(&input, now));
-                        let _ = tx.send(result);
-                    });
-                }
-                Err(error) => self.error = Some(error.to_string()),
-            },
+            KeyCode::Enter => self.begin_review(),
             KeyCode::Char(ch)
                 if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                     && !ch.is_control()
@@ -633,7 +639,7 @@ impl EnrollmentPanel {
                 })
                 .map(|(id, label)| Field {
                     id,
-                    label,
+                    label: if self.managed_paths() && id == 0 { "Ключ подключения" } else { label },
                     hint: hints[id],
                     value: if self.fields[id].is_empty() {
                         String::new()
@@ -902,6 +908,26 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(&cfg).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_key_import_has_no_extra_input_fields() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("key-import-ui").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("client.toml");
+        let mut panel = EnrollmentPanel::first(path.clone()).unwrap();
+        let fields = panel.form().unwrap().fields;
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].id, 0);
+        for code in [KeyCode::Tab, KeyCode::Down, KeyCode::F(8)] {
+            panel.key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert_eq!(panel.focus, 0);
+        }
+        assert!(!panel.body().contains("Файл допуска"));
+        assert!(!panel.body().contains("Отпечаток сервера"));
+        assert!(panel.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!path.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

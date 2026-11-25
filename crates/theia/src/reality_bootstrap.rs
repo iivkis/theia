@@ -392,7 +392,12 @@ impl Invitation {
         )?;
         let d = value.descriptor();
         Ok(format!(
-            "UNTRUSTED invitation; verify fingerprint independently; runtime UNCHANGED\ninbound={}\nendpoint={}\nidentity_sha256={:x}\nrevision={}\nreference={}\nh3={}\ncontains_token={}",
+            "{}\ninbound={}\nendpoint={}\nidentity_sha256={:x}\nrevision={}\nreference={}\nh3={}\ncontains_token={}",
+            if self.is_access_key() {
+                "Подтвердите доверие к ключу, полученному от администратора; runtime UNCHANGED"
+            } else {
+                "UNTRUSTED invitation; verify fingerprint independently; runtime UNCHANGED"
+            },
             self.scope.inbound,
             self.scope.endpoint,
             Sha256::digest(self.public),

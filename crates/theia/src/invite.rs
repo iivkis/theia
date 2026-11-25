@@ -903,6 +903,42 @@ mod tests {
     }
 
     #[test]
+    fn compact_reality_with_three_maximum_dns_references_fits_access_key_limit() {
+        use crate::descriptor::{Descriptor, Padding, Reference, Rotation, Scope};
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let key = Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
+        let dns = |c: char| [63, 63, 63, 61].into_iter().map(|n| c.to_string().repeat(n)).collect::<Vec<_>>().join(".");
+        let d = Descriptor {
+            schema_version: 1, wire_version: 1,
+            security_mode: crate::descriptor::SecurityMode::SmartReality,
+            revision: 1, not_before: 1, not_after: 100,
+            active_reference: 0, h3: true, stream_one: true, stream_up: true,
+            path_prefix: format!("/v1/{}", "p".repeat(64)),
+            next_identity: Some(URL_SAFE_NO_PAD.encode([8; 32])),
+            scope: Scope { inbound: "i".repeat(64), endpoint: format!("{}:65535", dns('d')) },
+            padding: Padding::default(),
+            rotation: Rotation { lifetime_min_s: 1, lifetime_max_s: 2, volume_min_bytes: 1, volume_max_bytes: 2 },
+            references: ['a', 'b', 'c'].into_iter().map(|c| Reference { server_name: dns(c), port: 443, h3: true }).collect(),
+        };
+        let signed = crate::descriptor::sign(&d, &key).unwrap();
+        let wire = Wire {
+            version: 1, carrier: "smarttheia-xhttp".into(), security_mode: WireSecurity::SmartReality,
+            transport: Transport::Auto, xhttp_mode: XhttpMode::Auto,
+            id: d.scope.inbound.clone(), endpoint: d.scope.endpoint.clone(),
+            server_name: d.references[0].server_name.clone(), path_prefix: d.path_prefix.clone(),
+            public_key: Some(URL_SAFE_NO_PAD.encode(key.public_key().as_ref())),
+            minimum_revision: Some(d.revision), descriptor: Some(signed.clone()),
+            token: Some(URL_SAFE_NO_PAD.encode([7; 32])), admission: Some(URL_SAFE_NO_PAD.encode([6; 32])),
+        };
+        let uri = encode_wire(&wire).unwrap();
+        assert!(uri.len() <= 2048);
+        let decoded = decode_wire(&uri).unwrap();
+        assert_eq!(decoded.descriptor.as_deref(), Some(signed.as_str()));
+        assert_eq!(encode_wire(&decoded).unwrap().as_str(), uri.as_str());
+        assert!(decode_wire(&format!("{PREFIX}{}", "A".repeat(2049 - PREFIX.len()))).is_err());
+    }
+
+    #[test]
     fn malformed_links_unknown_fields_versions_and_token_bytes_fail_closed() {
         let inv = Invitation::issued_from_server(
             &server_with_token(&[0x42; 32]),

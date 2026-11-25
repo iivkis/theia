@@ -559,8 +559,6 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             tty.send("i")
             tty.wait("Импорт подключения")
             tty.send(str(reality_link) + "\r")
-            tty.wait("REALITY · ключ подключения")
-            tty.send("\r")
             tty.wait("ПРЕДПРОСМОТР: самодостаточный ключ REALITY")
             tty.send("y")
             # Successful managed enrollment opens registration automatically.
