@@ -357,12 +357,13 @@ require("test_native_performance.py" in spec
         and "native-performance-" in browser,
         "native paired performance smoke and evidence must remain mandatory")
 require("test_classifier_evidence.py" in spec, "independent score evidence regressions remain mandatory")
+require("test_f19_bundle.py" in spec, "exact-revision independent evidence join regressions remain mandatory")
 require("native_binary_performance_comparison" in browser
         and "native-comparison.json" in browser
         and "--require-comparison --policy tests/benchmark/native-diagnostic-policy.json" in browser
         and "Build exact native baseline before candidate" in browser,
         "native baseline and candidate comparison remains mandatory")
-f13_runner = Path("tests/benchmark/run_f13_observations.py").read_text(encoding="utf-8")
+f13_runner = (ROOT / "tests/benchmark/run_f13_observations.py").read_text(encoding="utf-8")
 require(all(case in f13_runner for case in (
             "actual_native_h3_client_initial_reference",
             "real_default_h2_settings_and_pseudo_headers_are_measured",

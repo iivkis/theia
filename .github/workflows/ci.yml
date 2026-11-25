@@ -77,6 +77,8 @@ jobs:
         run: python3 -m unittest discover -s tests/ci -p 'test_native_performance.py' -v
       - name: Validate independent classifier evidence schema and holdout isolation
         run: python3 -m unittest discover -s tests/ci -p 'test_classifier_evidence.py' -v
+      - name: Validate joined independent classifier and exact revision overhead evidence
+        run: python3 -m unittest discover -s tests/ci -p 'test_f19_bundle.py' -v
       - name: Validate F-13 observation evidence reader
         run: python3 -m unittest discover -s tests/ci -p 'test_f13_observations.py' -v
       - name: Require full native CI for every merge
