@@ -2189,4 +2189,68 @@ mod strict_wire_matrix_tests {
             handle.await.unwrap().unwrap();
         }
     }
+
+    #[tokio::test]
+    async fn invalid_cas_and_scope_are_rejected_before_any_wire_write() {
+        use StatusCommand as C;
+        for command in [
+            C::ClientPreview { expected_revision: 0, candidate_sha256: [1; 32] },
+            C::ClientApply { expected_revision: 0, candidate_sha256: [1; 32] },
+            C::CheckRestartBound { expected_revision: 0, candidate_sha256: [1; 32] },
+            C::ApplyRestartRollback { expected_revision: 0 },
+            C::ApplyAuthRollback { expected_revision: 0 },
+            C::ApplyTlsRollback { expected_revision: 0 },
+            C::ApplyQuotaBound { expected_revision: 0, candidate_sha256: [1; 32] },
+            C::ApplyRestartBound { expected_revision: 0, candidate_sha256: [1; 32], tls_sha256: [2; 32] },
+            C::ApplyReload { expected_revision: 0 },
+            C::ApplyReloadBound { expected_revision: 0, candidate_sha256: [1; 32] },
+            C::RealityStatus { id: [b'a'; 64], len: 65, manifest: [1; 32] },
+            C::RealityStatus { id: [255; 64], len: 1, manifest: [1; 32] },
+            C::RealityStatus { id: [b'/'; 64], len: 1, manifest: [1; 32] },
+        ] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            assert_eq!(exchange(client, command).await, Err(ManagementError::InvalidReply));
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).await.unwrap();
+            assert!(bytes.is_empty(), "invalid command must not reach peer: {command:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_receipts_reject_wrong_revision_overflow_and_corrupt_wire() {
+        use StatusCommand as C;
+        use StatusReply as R;
+        let digest = "ab".repeat(32);
+        let tls = "cd".repeat(32);
+        for (command, request, prefix, success) in [
+            (C::ApplyQuotaBound { expected_revision: 7, candidate_sha256: [0xab; 32] },
+                format!("quota-apply rev=7 sha256={digest}\n"), "theia-quota-v1", R::QuotaApplied { revision: 8 }),
+            (C::ApplyRestartBound { expected_revision: 7, candidate_sha256: [0xab; 32], tls_sha256: [0xcd; 32] },
+                format!("restart-apply rev=7 sha256={digest} tls-sha256={tls}\n"), "theia-restart-v1", R::RestartApplied { revision: 8 }),
+            (C::ApplyReload { expected_revision: 7 }, "apply-reload rev=7\n".into(), "theia-apply-v1", R::Applied { revision: 8 }),
+        ] {
+            assert_eq!(peer(command, &request, format!("{prefix} applied revision=8\n").as_bytes()).await, Ok(success));
+            assert_eq!(peer(command, &request, format!("{prefix} rejected\n").as_bytes()).await, Err(ManagementError::CandidateRejected));
+            assert_eq!(peer(command, &request, b"ERR unsupported\n").await, Err(ManagementError::Unsupported));
+            for suffix in ["applied revision=7\n", "applied revision=9\n", "applied revision=08\n", "applied revision=8", "applied revision=8 extra\n"] {
+                assert_eq!(peer(command, &request, format!("{prefix} {suffix}").as_bytes()).await, Err(ManagementError::InvalidReply));
+            }
+            assert_eq!(peer(command, &request, &[255]).await, Err(ManagementError::InvalidReply));
+        }
+        let max = u64::MAX;
+        assert_eq!(peer(C::ApplyReload { expected_revision: max }, &format!("apply-reload rev={max}\n"), b"theia-apply-v1 applied revision=1\n").await, Err(ManagementError::InvalidReply));
+        for (reply, expected) in [
+            (b"theia-quota-v1 ready\n".as_slice(), Ok(R::QuotaReady)),
+            (b"theia-quota-v1 rejected\n".as_slice(), Err(ManagementError::CandidateRejected)),
+            (b"ERR unsupported\n".as_slice(), Err(ManagementError::Unsupported)),
+            (b"theia-quota-v1 ready extra\n".as_slice(), Err(ManagementError::InvalidReply)),
+        ] {
+            assert_eq!(peer(C::CheckQuota, "check-quota\n", reply).await, expected);
+        }
+        assert_eq!(peer(C::Health, "health\n", &[b'x'; 257]).await, Err(ManagementError::InvalidReply));
+        let (client, server) = tokio::io::duplex(1024);
+        drop(server);
+        assert_eq!(exchange(client, C::Health).await, Err(ManagementError::Io));
+    }
+
 }
