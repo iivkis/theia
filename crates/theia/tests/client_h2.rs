@@ -474,7 +474,10 @@ async fn launch_client_with_profile(
     let control = {
         use std::os::unix::fs::DirBuilderExt;
         let path = dir.0.join("ctl");
-        std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
         command.env("THEIA_CLIENT_CONTROL_DIR", &path);
         path
     };
@@ -493,19 +496,31 @@ async fn launch_client_with_profile(
         let expected: [u8; 32] = Sha256::digest(std::fs::read(&config).unwrap()).into();
         timeout(Duration::from_secs(10), async {
             loop {
-                assert!(child.0.try_wait().unwrap().is_none(), "client exited before readiness");
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "client exited before readiness"
+                );
                 #[cfg(target_os = "linux")]
-                let status = theia::management::query_in(&control, StatusCommand::ClientStatus).await;
+                let status =
+                    theia::management::query_in(&control, StatusCommand::ClientStatus).await;
                 #[cfg(target_os = "windows")]
-                let status = theia::windows_control::query_pipe(&control, StatusCommand::ClientStatus).await;
-                if let Ok(StatusReply::ClientRunning { revision, config_sha256, .. }) = status {
+                let status =
+                    theia::windows_control::query_pipe(&control, StatusCommand::ClientStatus).await;
+                if let Ok(StatusReply::ClientRunning {
+                    revision,
+                    config_sha256,
+                    ..
+                }) = status
+                {
                     assert_eq!(revision, 1);
                     assert_eq!(config_sha256, expected);
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-        }).await.expect("exact client readiness deadline");
+        })
+        .await
+        .expect("exact client readiness deadline");
     }
     wait_for_proxy(http, &mut child).await;
     wait_for_proxy(socks, &mut child).await;
