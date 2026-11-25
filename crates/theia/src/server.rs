@@ -3793,14 +3793,15 @@ mod hardening_tests {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = target.local_addr().unwrap().port();
         let (owner, phase) = watch::channel(GenerationPhase::Active);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let remote = listener.local_addr().unwrap();
-        let server = if h3 {
-            let endpoint =
-                crate::quic_transport::server_endpoint(remote, vec![cert], key.into()).unwrap();
-            drop(listener);
-            tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase))
+        let (remote, server) = if h3 {
+            let endpoint = crate::quic_transport::server_endpoint(
+                "127.0.0.1:0".parse().unwrap(), vec![cert], key.into(),
+            ).unwrap();
+            let remote = endpoint.local_addr().unwrap();
+            (remote, tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase)))
         } else {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let remote = listener.local_addr().unwrap();
             let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
@@ -3810,12 +3811,12 @@ mod hardening_tests {
             .with_single_cert(vec![cert], key.into())
             .unwrap();
             tls.alpn_protocols = vec![b"h2".to_vec()];
-            tokio::spawn(serve_generation(
+            (remote, tokio::spawn(serve_generation(
                 listener,
                 TlsAcceptor::from(Arc::new(tls)),
                 context,
                 phase,
-            ))
+            )))
         };
         let token = URL_SAFE_NO_PAD.encode([7u8; 32]);
         let address = Address::V4([127, 0, 0, 1]);
@@ -4229,12 +4230,8 @@ mod hardening_tests {
         )));
         fs::create_dir(&directory.0).unwrap();
         tokio::time::timeout(Duration::from_secs(45), async {
-            let address = (0..16).find_map(|_| {
-                let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-                let address = tcp.local_addr().ok()?;
-                let _udp = std::net::UdpSocket::bind(address).ok()?;
-                Some(address)
-            }).expect("fixture TCP/UDP address");
+            let reservations = crate::shared_port::reserve_shared_port();
+            let address = reservations.0.local_addr().unwrap();
             let now = crate::reference_health::unix_now().unwrap();
             let approved: SocketAddr = "93.184.216.2:443".parse().unwrap();
             let state = State::new(Plan {
@@ -4265,6 +4262,7 @@ mod hardening_tests {
             document.server.inbounds.retain(|i| i.id == "independent-reference");
             let limits = GenerationLimits::new(&document);
             let auth = Arc::new(LiveAuthorization::new(document.clone()).unwrap());
+            drop(reservations);
             let prepared = prepare_selected_listeners_inner(&document, &limits, None, auth, None, None)
                 .await.unwrap();
             let cert = rcgen::generate_simple_self_signed(vec!["reference.example.org".into()]).unwrap();
@@ -4581,12 +4579,7 @@ mod hardening_tests {
         let mut mixed = initial.clone();
         let reservations = addresses(&mut mixed);
         drop(reservations);
-        let (tcp, udp) = loop {
-            let tcp = StdTcp::bind("127.0.0.1:0").unwrap();
-            if let Ok(udp) = StdUdp::bind(tcp.local_addr().unwrap()) {
-                break (tcp, udp);
-            }
-        };
+        let (tcp, udp) = crate::shared_port::reserve_shared_port();
         let addr = tcp.local_addr().unwrap();
         let edge = &mut mixed.server.inbounds[1];
         edge.h2_listen = addr.to_string();

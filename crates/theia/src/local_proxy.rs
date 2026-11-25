@@ -1817,19 +1817,8 @@ mod selector_tests {
         )));
         std::fs::create_dir(&dir.0).unwrap();
         timeout(Duration::from_secs(59), async {
-            let remote = {
-                let mut selected = None;
-                for _ in 0..16 {
-                    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let addr = tcp.local_addr().unwrap();
-                    if let Ok(udp) = std::net::UdpSocket::bind(addr) {
-                        selected = Some(addr);
-                        drop(udp);
-                        break;
-                    }
-                }
-                selected.unwrap()
-            };
+            let reservations = crate::shared_port::reserve_shared_port();
+            let remote = reservations.0.local_addr().unwrap();
             let now = reference_health::unix_now()
                 .unwrap()
                 .saturating_sub(if drain_only { 0 } else { 3700 });
@@ -1955,6 +1944,9 @@ mod selector_tests {
             }
             // A single signed snapshot is the source of both native carriers.
             drop(lease);
+            // Production listener preparation binds both protocols itself.
+            // Keep the fixture reservation through all preceding file work.
+            drop(reservations);
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             if drain_only {
                 let (started, ready) = tokio::sync::oneshot::channel();
