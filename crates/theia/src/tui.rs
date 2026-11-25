@@ -815,9 +815,14 @@ impl Interaction {
             return;
         };
         if self.editor_for(role).is_none() {
-        return;
-    }
-    let Some(columns) = workspace_columns(body) else {
+            return;
+        }
+        let Some(columns) = workspace_columns(body) else {
+            if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
+                if let Some(id) = editor_field_hit(body, editor, event.column, event.row) {
+                    editor.workspace_select_field(id);
+                }
+            }
             return;
         };
         let nav = columns[0];
@@ -838,6 +843,12 @@ impl Interaction {
             if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
                 let start = record_start(editor, records);
                 editor.workspace_select(start + usize::from(event.row - records.y - 1));
+            }
+            return;
+        }
+        if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
+            if let Some(id) = editor_field_hit(columns[2], editor, event.column, event.row) {
+                editor.workspace_select_field(id);
             }
         }
     }
@@ -3095,6 +3106,36 @@ fn centered_column(area: Rect, max_width: u16) -> Rect {
     Rect::new(area.x + (area.width - width) / 2, area.y, width, area.height)
 }
 
+fn editor_layout(area: Rect) -> Option<[Rect; 4]> {
+    if area.height < 10 || area.width < 38 { return None; }
+    if area.height >= 26 && area.width >= 48 {
+        let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(7), Constraint::Length(8)]).split(area);
+        let form = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(parts[1]);
+        return Some([parts[0], form[0], form[1], parts[2]]);
+    }
+    let parts = Layout::vertical([Constraint::Length(2), Constraint::Min(4), Constraint::Length(2), Constraint::Length(1)]).split(area);
+    Some([parts[0], parts[1], parts[2], parts[3]])
+}
+
+fn editor_table_window(area: Rect, editor: &Editor) -> (usize, usize, bool) {
+    let header = area.height >= 7;
+    let count = editor.field_count();
+    let rows = usize::from(area.height.saturating_sub(if header { 3 } else { 2 }));
+    let start = editor.workspace_field_index().saturating_sub(rows.saturating_sub(1)).min(count.saturating_sub(rows));
+    (start, rows, header)
+}
+
+fn editor_field_hit(area: Rect, editor: &Editor, x: u16, y: u16) -> Option<usize> {
+    let rect = editor_layout(area)?[1];
+    let (start, rows, header) = editor_table_window(rect, editor);
+    let y0 = rect.y + if header { 2 } else { 1 };
+    if x <= rect.x || x >= rect.right().saturating_sub(1) || y < y0 || y >= rect.bottom().saturating_sub(1) {
+        return None;
+    }
+    let offset = usize::from(y - y0);
+    (offset < rows && start + offset < editor.field_count()).then_some(start + offset)
+}
+
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     let dirty = if editor.write_uncertain() {
         "Не сохранено: запись не подтверждена"
@@ -3148,36 +3189,50 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     } else {
         " Параметры · Enter "
     };
-    // Keep navigation and status distinct from the form at normal terminal sizes.
-    // Compact terminals retain the complete keyboard-first editor.
-    if area.height < 26 || area.width < 48 {
+    let Some([overview, table_area, detail, bottom]) = editor_layout(area) else {
         panel(frame, area, title, &message, true);
         return;
+    };
+    let wide = area.height >= 26 && area.width >= 48;
+    let state_color = if editor.write_uncertain() { Color::LightRed } else if editor.dirty() { Color::Yellow } else { Color::Green };
+    let status = vec![
+        Line::from(vec![Span::styled(dirty, Style::default().fg(state_color).add_modifier(Modifier::BOLD)), Span::raw(format!(" · {mode}"))]),
+        Line::raw(editor.selection_summary()),
+        Line::raw(users.trim_end().to_owned()),
+    ];
+    let widget = Paragraph::new(status);
+    if wide {
+        frame.render_widget(widget.block(Block::default().title("Обзор").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))), overview);
+    } else {
+        frame.render_widget(widget, overview);
     }
-    let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(7), Constraint::Length(5), Constraint::Length(3)]).split(area);
-    let status = format!("{}\n{} · {}\n{}", editor.selection_summary(), mode, dirty, users.trim_end());
-    panel(frame, parts[0], "Обзор", &status, false);
-    let form = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(parts[1]);
-    let rows = editor.workspace_fields().into_iter().map(|(label, value, selected)| {
+    let (start, rows, header) = editor_table_window(table_area, editor);
+    let table_rows = editor.workspace_fields().into_iter().skip(start).take(rows).map(|(label, value, selected)| {
         let marker = if selected { "› " } else { "  " };
         let style = if selected {
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
+        } else { Style::default() };
         Row::new(vec![format!("{marker}{label}"), value]).style(style)
     });
-    frame.render_widget(
-        Table::new(rows, [Constraint::Length(17), Constraint::Min(1)])
-            .header(Row::new(["Параметр", "Значение"]).style(Style::default().fg(Color::DarkGray)))
-            .column_spacing(2)
-            .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))),
-        form[0],
-    );
-    panel(frame, form[1], "Поле", &format!("{}\n{help}", editor.field_name()), false);
-    let notice = format!("{}\n{}", editor.error.as_deref().unwrap_or(""), editor.notice);
-    panel(frame, parts[2], "Состояние", &notice, false);
-    panel(frame, parts[3], "Действия", actions, false);
+    let mut table = Table::new(table_rows, [Constraint::Length(17), Constraint::Min(1)])
+        .column_spacing(2)
+        .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+    if header {
+        table = table.header(Row::new(["Параметр", "Значение"]).style(Style::default().fg(Color::Gray)));
+    }
+    frame.render_widget(table, table_area);
+    let error = editor.error.as_deref();
+    if wide {
+        panel(frame, detail, "Поле", &format!("{}\n{help}", editor.field_name()), false);
+        let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(bottom);
+        panel(frame, parts[0], "Состояние", &format!("{}\n{}", error.unwrap_or(""), editor.notice), false);
+        panel(frame, parts[1], "Действия", actions, false);
+    } else {
+        let hint = error.unwrap_or(help);
+        frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: true }).style(Style::default().fg(if error.is_some() { Color::LightRed } else { Color::Gray })), detail);
+        frame.render_widget(Paragraph::new(actions).style(Style::default().fg(Color::Cyan)), bottom);
+    }
+
 }
 
 /// Edit only when both role and a config path are explicitly supplied.
