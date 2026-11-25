@@ -328,7 +328,16 @@ impl RecordFlow {
         let Self::Input { action, fields, focus } = self else { return None; };
         Some(Form {
             fields: action.fields().iter().zip(fields).enumerate().map(|(id, ((label, hidden), value))| Field {
-                id, label, hint: if *hidden { "Только ссылка на материал, не секрет." } else { "Введите значение; Enter — предпросмотр." },
+                id, label, hint: match (*action, id) {
+                    (RecordAction::EditTls, 0) => "Путь к PEM-файлу сертификата, например file:/etc/theia/fullchain.pem.",
+                    (RecordAction::EditTls, 1) => "Путь к PEM-файлу закрытого ключа. Не вставляйте содержимое ключа.",
+                    (RecordAction::EditTrust, 0) => "Путь к доверенному сертификату CA, полученному от администратора.",
+                    (RecordAction::EditTrust, 1) => "Ссылка на файл токена (file:абсолютный путь) или переменную (env:ИМЯ). Не вставляйте сам токен.",
+                    (RecordAction::SetQuota, 0) => "Максимум одновременных подключений одного пользователя.",
+                    (RecordAction::SetQuota, 1) => "Общий максимум одновременных подключений всех пользователей.",
+                    _ if *hidden => "Введите путь или ссылку на материал, а не его секретное содержимое.",
+                    _ => "Введите значение; Enter — предпросмотр.",
+                },
                 value: if *hidden && !value.is_empty() { "[скрыто] · ссылка введена".into() } else { value.clone() },
             }).collect(),
             selected: *focus,
@@ -3213,7 +3222,12 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             } else {
                 (1, 2, "Параметры", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад")
             };
-            draw_guided(frame, parts[1], "Настройка подключения", &body, guide, viewport, (form, None));
+            let title = match flow {
+                RecordFlow::Input { action, .. } => action.title(),
+                RecordFlow::GrantPicker { .. } => "Права доступа",
+                _ => "Настройка подключения",
+            };
+            draw_guided(frame, parts[1], title, &body, guide, viewport, (form, None));
         } else {
             modal_panel!(frame, parts[1], "Настройка записи", &body, true);
         }
@@ -3732,7 +3746,7 @@ fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool)
 
 fn page_layout(area: Rect, role: Role, page: usize) -> Option<[Rect; 2]> {
     let count = page_actions(role, page).len();
-    if count == 0 || area.height < 10 { return None; }
+    if count == 0 || area.height < 10 || (page == 1 && area.height < 25) { return None; }
     let action_height = (count as u16).saturating_add(2);
     // Actions stay near the information they operate on.
     if area.width >= 76 && page != 1 && !(role == Role::Server && matches!(page, 2 | 3)) {
@@ -4814,7 +4828,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(picture.contains("Не сохранено"));
-        assert!(picture.contains("Адрес (Endpoint)"));
+        assert!(picture.contains("Адрес сервера"));
         assert!(!picture.contains("THEIA_AUTH_TOKEN"));
         fs::remove_file(path).unwrap();
     }
@@ -4910,8 +4924,8 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(screen.contains("backup"), "{width}x{height}");
-            assert!(screen.contains("Endpoint"), "{width}x{height}");
-            assert!(screen.contains("TLS SNI"), "{width}x{height}");
+            assert!(screen.contains("Адрес сервера"), "{width}x{height}");
+            assert!(screen.contains("Имя сервера (TLS)"), "{width}x{height}");
             assert!(!screen.contains("THEIA_AUTH_TOKEN"), "{width}x{height}");
             assert!(!screen.contains("token_sha256"), "{width}x{height}");
         }
