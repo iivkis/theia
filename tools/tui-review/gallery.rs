@@ -68,6 +68,31 @@ fn visual_review_gallery() {
         assert!(ui.menu.is_some());
         review_capture(&format!("{prefix}-command-menu"), &model, &ui);
 
+        // Capture the actual monitor, not merely the navigation page.
+        let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
+        ui.update(&mut model, press(KeyCode::F(4)));
+        assert!(ui.traffic_monitor.is_some());
+        review_capture(&format!("{prefix}-traffic-monitor-idle"), &model, &ui);
+        ui.update(&mut model, press(KeyCode::Esc));
+        if role == Role::Server {
+            let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
+            ui.update(&mut model, press(KeyCode::F(5)));
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(ui.show_server_process);
+            assert!(!ui.server_process.running());
+            assert!(ui.server_process.actions().is_empty());
+            review_capture("server-start-confirmation", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(!ui.server_process.running());
+        }
+        // Capture both focus states without confirming an action.
+        let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
+        ui.select_workspace_page(role, 0);
+        review_capture(&format!("{prefix}-focus-navigation"), &model, &ui);
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+        review_capture(&format!("{prefix}-focus-actions"), &model, &ui);
+
         // Only passive/input paths; no live operation confirmation.
         let keys: &[(char, &str)] = if role == Role::Server {
             &[('N',"new-connection"),('G',"grant-picker"),('u',"new-user"),('b',"recover-user"),
