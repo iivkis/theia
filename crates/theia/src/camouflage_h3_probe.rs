@@ -44,7 +44,7 @@ pub struct H3ProbeReport {
 fn map_error(error: QuicError) -> H3ProbeError {
     match error {
         QuicError::Bind => H3ProbeError::BindFailed,
-        QuicError::Unreachable => H3ProbeError::UdpUnavailable,
+        QuicError::Unreachable | QuicError::EndpointNetworkRefused => H3ProbeError::UdpUnavailable,
         QuicError::Timeout => H3ProbeError::TimedOut,
         QuicError::Configuration
         | QuicError::Handshake
@@ -123,4 +123,17 @@ pub async fn probe_quic_h3(
     })
     .await
     .map_err(|_| H3ProbeError::TimedOut)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_refusal_is_unavailable_without_handshake_evidence() {
+        assert_eq!(map_error(QuicError::EndpointNetworkRefused), H3ProbeError::UdpUnavailable);
+        assert_eq!(map_error(QuicError::Unreachable), H3ProbeError::UdpUnavailable);
+        assert_eq!(map_error(QuicError::Timeout), H3ProbeError::TimedOut);
+        assert_eq!(map_error(QuicError::Handshake), H3ProbeError::HandshakeRejected);
+    }
 }
