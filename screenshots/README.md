@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 1e9433c2d80bee719077e9af5d2fda19724767ee
+Source: 3fcef3e13d352c069241d991092c239c53e910ee
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -81,6 +81,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## client-local-proxy-before-start
 
 ![client-local-proxy-before-start](client-local-proxy-before-start.png)
+
+## client-local-proxy-start-confirm
+
+![client-local-proxy-start-confirm](client-local-proxy-start-confirm.png)
 
 ## client-page-diagnostics
 

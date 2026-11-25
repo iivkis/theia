@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "1e9433c2d80bee719077e9af5d2fda19724767ee",
+  "source_sha": "3fcef3e13d352c069241d991092c239c53e910ee",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -12,7 +12,7 @@
     {
       "scenario": "client-action-active-profile",
       "file": "client-action-active-profile.png",
-      "sha256": "b3a4bcef48f49b81777518a77d76559f536050115085c464b3535928c0210fbd",
+      "sha256": "969ed104677a031e2cc1dbe19f18facc0aab85563e01405603bf44c92aa8c6db",
       "state_fixture": false
     },
     {
@@ -24,7 +24,7 @@
     {
       "scenario": "client-action-delete-profile",
       "file": "client-action-delete-profile.png",
-      "sha256": "cf31fc5fdc5c757271428a4fcfc12af94bff04a882bd0b4ec5e9a850663a15b0",
+      "sha256": "6cb485ad973540be87baf8800043d1ca698302929d13ae1dfd096471e89cf0b4",
       "state_fixture": false
     },
     {
@@ -60,7 +60,7 @@
     {
       "scenario": "client-connection-modes",
       "file": "client-connection-modes.png",
-      "sha256": "79c80eed692d9d4406ff034a27f0215a0cd34a0b75f908651de5cfe473b3b227",
+      "sha256": "eed3f13488b7a82a524f2b0c0a9ae5e79cb02ff785c873ec7f27f01ef616ee9c",
       "state_fixture": false
     },
     {
@@ -72,7 +72,7 @@
     {
       "scenario": "client-first-key-connect",
       "file": "client-first-key-connect.png",
-      "sha256": "1dbc9f2ccc8d9596dbb131abe71c6284fb37608dd6347238a1ac42a030590ee3",
+      "sha256": "9ce79ab0c509d9b8836a204c5fe2d023fbfd202e9a53f7844b83a049c376ce0e",
       "state_fixture": false
     },
     {
@@ -84,13 +84,13 @@
     {
       "scenario": "client-first-key-save-review",
       "file": "client-first-key-save-review.png",
-      "sha256": "37e330b9028170c7dae10bacf611b6807bdd24f7637d016be4ca5e193c79ef12",
+      "sha256": "78f9c73f6f24c236683e5e2860d44096934857639f42e5694ed93f9ff1fb2fb3",
       "state_fixture": false
     },
     {
       "scenario": "client-first-key-saved",
       "file": "client-first-key-saved.png",
-      "sha256": "667f1c58cb1076d12cc40ce10be066d752a0765954d39f1273b542daa680f37e",
+      "sha256": "a5c3e3bbf48cf7ebda623e0a0773d9a6a0d157077d1dd07312f1fda2ecc28fc0",
       "state_fixture": false
     },
     {
@@ -108,67 +108,73 @@
     {
       "scenario": "client-focus-actions",
       "file": "client-focus-actions.png",
-      "sha256": "4a1cdbaa57577a80bd940a95755540f001c184666693340dcac22f47a5e265f0",
+      "sha256": "307158f9816806453114f0f324cbf02af08ef9576702d08b90b80f1bd7040cd4",
       "state_fixture": false
     },
     {
       "scenario": "client-focus-navigation",
       "file": "client-focus-navigation.png",
-      "sha256": "7f94bd5561525e0330dfa1008bd1476b99501ef0b276391f9433162ff55805af",
+      "sha256": "3253571e26ceb95b2886f6229a409c7a4580a4f6ec3524926d7265f72c32c0ed",
       "state_fixture": false
     },
     {
       "scenario": "client-local-proxy-before-start",
       "file": "client-local-proxy-before-start.png",
-      "sha256": "053bb3ffe6f408ba552a489fcb312ef4eb44e0b97eb0a6d5b3dc9754ddfe972b",
+      "sha256": "98334e588c77e6071b76451b34186519cc14e155e6deee718f6e7e2e63a62e54",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-local-proxy-start-confirm",
+      "file": "client-local-proxy-start-confirm.png",
+      "sha256": "a1af1c97b4fa792417f95d94087bd631cb7080be72f8b73ec2f971316292445e",
       "state_fixture": false
     },
     {
       "scenario": "client-page-diagnostics",
       "file": "client-page-diagnostics.png",
-      "sha256": "15863590b636450b33cda87abaa0dc4e798a8fd8101c554cd1ca44d742fbd743",
+      "sha256": "9477389f318fbf4750fa94ac099a5ba1456b88e7fec3c3cd316287d1792be7c5",
       "state_fixture": false
     },
     {
       "scenario": "client-page-import",
       "file": "client-page-import.png",
-      "sha256": "23d723ea00830ce93bdc0ee6b7b17e336772549b5014be6df2828375a3e240f1",
+      "sha256": "65dfbbab430b039689aff7e508892f1d5342c667279b248bae33eee1d7789d3c",
       "state_fixture": false
     },
     {
       "scenario": "client-page-overview",
       "file": "client-page-overview.png",
-      "sha256": "1479e05e7b3beaa788ce705871ab277c566e022b1161eae4281ca186c9fcfaea",
+      "sha256": "e413da4cc15862eb3bb0b01130639f4d943bd0a5bcbc053576559d944d1e4801",
       "state_fixture": false
     },
     {
       "scenario": "client-page-profiles",
       "file": "client-page-profiles.png",
-      "sha256": "e5e0cad66d3325803eb4b33470d1e10306c3bb2daa03154aabbbb564bf406206",
+      "sha256": "d3b06dabb1771f00e98fc84ee801efafa499ad453c0291c01ae3b7ee59283a44",
       "state_fixture": false
     },
     {
       "scenario": "client-page-proxy",
       "file": "client-page-proxy.png",
-      "sha256": "79c80eed692d9d4406ff034a27f0215a0cd34a0b75f908651de5cfe473b3b227",
+      "sha256": "eed3f13488b7a82a524f2b0c0a9ae5e79cb02ff785c873ec7f27f01ef616ee9c",
       "state_fixture": false
     },
     {
       "scenario": "client-page-settings",
       "file": "client-page-settings.png",
-      "sha256": "58018a4a25f9aa32fefc06ba3d8e4cf66947fb2d9087c731b73c673e55d311aa",
+      "sha256": "58d39523fd2f1514ef88209a2dc76786b53af66a150308d36d9b585431d48818",
       "state_fixture": false
     },
     {
       "scenario": "client-page-traffic",
       "file": "client-page-traffic.png",
-      "sha256": "321cef21748a4ba68cf9e09092b0c382201a21b10377ef13ca7096c119cf97c3",
+      "sha256": "80aac881e33860f35defe7b4b52695d4f7fbe056ab753c72379860e29b0e19f5",
       "state_fixture": false
     },
     {
       "scenario": "client-reality-key-connect",
       "file": "client-reality-key-connect.png",
-      "sha256": "209700df1039b50924e263f93f439715dc4bf637dd0af11c65fce4f712dbfa80",
+      "sha256": "232b2730b299aa9e89d26e378b746a73f63cffc0ac2b36c58c8dccacdedd93aa",
       "state_fixture": false
     },
     {
@@ -180,13 +186,13 @@
     {
       "scenario": "client-reality-key-saved",
       "file": "client-reality-key-saved.png",
-      "sha256": "862033aedd7ad0902d9a0162fc15a5704b9300a65137f750775ec5e558a5cf2e",
+      "sha256": "a5c3e3bbf48cf7ebda623e0a0773d9a6a0d157077d1dd07312f1fda2ecc28fc0",
       "state_fixture": false
     },
     {
       "scenario": "client-reality-key-trust-review",
       "file": "client-reality-key-trust-review.png",
-      "sha256": "9bad0e56e20ba6bf3dab78e3001b42b1e5533907b65faee79784db0bd9138ff2",
+      "sha256": "5755ee06552e6d87919ba9827f00620d4d8b5ecc9a44c2c6dd31aa8c0c0109ab",
       "state_fixture": false
     },
     {
@@ -198,7 +204,7 @@
     {
       "scenario": "client-validation-error",
       "file": "client-validation-error.png",
-      "sha256": "7d9db740d4222c6233bc3345dd57bfbcc1ff38e2f83881e31790e36e7690eae4",
+      "sha256": "17bb980b9b00a0fb9fe3df6bc279f0f7baacf8b8f21ead2883ba5d3a049d71cf",
       "state_fixture": false
     },
     {
@@ -444,7 +450,7 @@
     {
       "scenario": "state-import-done",
       "file": "state-import-done.png",
-      "sha256": "2324726c60568f65f081a6020418235b07e2d197873104a135a5e41f8e5511ca",
+      "sha256": "a5c3e3bbf48cf7ebda623e0a0773d9a6a0d157077d1dd07312f1fda2ecc28fc0",
       "state_fixture": true
     },
     {
@@ -480,7 +486,7 @@
     {
       "scenario": "state-issuance-recover-confirm",
       "file": "state-issuance-recover-confirm.png",
-      "sha256": "37670979d7a1d09c31d951eedcc9263badbe5dbcc5c721f019c8b7b43f95098d",
+      "sha256": "7941c59da9444c9a6964454fe3f5ee0867dc9e8f9ffbba1232592347b12fdbae",
       "state_fixture": true
     },
     {
@@ -504,7 +510,7 @@
     {
       "scenario": "state-issuance-rotate-confirm",
       "file": "state-issuance-rotate-confirm.png",
-      "sha256": "ddd764888330475d06145dfa93bce497c893c9481f83166eaf65155dc49f5da2",
+      "sha256": "ea306b1a31be59b3f31f8aeddbec4c74f048c631061743b81720283c16fb493f",
       "state_fixture": true
     },
     {
