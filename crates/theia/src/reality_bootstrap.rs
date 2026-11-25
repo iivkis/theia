@@ -232,6 +232,7 @@ pub struct Invitation {
     reference_name: String,
     path_prefix: String,
     bearer: Option<Zeroizing<[u8; 32]>>,
+    admission: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl Invitation {
@@ -255,6 +256,7 @@ impl Invitation {
             .clone(),
             path_prefix: value.descriptor().path_prefix.clone(),
             bearer: None,
+            admission: None,
         })
     }
 
@@ -266,6 +268,7 @@ impl Invitation {
         document: &config::ServerDocument,
         user_id: &str,
         bearer: &[u8; 32],
+        admission: &crate::reality_admission::Secret,
         now: u64,
     ) -> Result<Self, Error> {
         config::Config::Server(document.clone())
@@ -302,6 +305,7 @@ impl Invitation {
             return Err(Error::Credential);
         }
         invitation.bearer = Some(Zeroizing::new(*bearer));
+        invitation.admission = Some(admission.invitation_key());
         Ok(invitation)
     }
 
@@ -323,6 +327,7 @@ impl Invitation {
                 .bearer
                 .as_ref()
                 .map(|value| URL_SAFE_NO_PAD.encode(&value[..])),
+            admission: self.admission.as_ref().map(|value| URL_SAFE_NO_PAD.encode(&value[..])),
         }
     }
 
@@ -359,6 +364,7 @@ impl Invitation {
             .map(token)
             .transpose()?
             .map(Zeroizing::new);
+        let admission = wire.admission.as_deref().map(key).transpose()?.map(Zeroizing::new);
         Ok(Self {
             scope,
             public,
@@ -367,6 +373,7 @@ impl Invitation {
             reference_name: wire.server_name.clone(),
             path_prefix: wire.path_prefix.clone(),
             bearer,
+            admission,
         })
     }
 
@@ -498,14 +505,15 @@ impl Profile {
         uri: &str,
         now: u64,
     ) -> Result<CredentialMaterial, Error> {
-        self.admission()?;
+        let current_admission = self.admission()?;
         let (snapshot, current) = self
             .store()?
             .inspect_bound(now)
             .map_err(|_| Error::Descriptor)?;
         current.check_time(now).map_err(|_| Error::Descriptor)?;
         let invite = Invitation::decode(uri, now)?;
-        if invite.scope != current.descriptor().scope
+        if !bool::from(invite.embedded_admission()?.commitment().ct_eq(&current_admission.commitment()))
+            || invite.scope != current.descriptor().scope
             || invite.public != current.signer()
             || invite.revision != current.descriptor().revision
         {
@@ -778,7 +786,19 @@ impl Invitation {
         self.bearer.as_ref().map(|value| **value)
     }
 
+    pub(crate) fn is_access_key(&self) -> bool {
+        self.bearer.is_some() && self.admission.is_some()
+    }
+
+    fn embedded_admission(&self) -> Result<crate::reality_admission::Secret, Error> {
+        let value = self.admission.as_ref().ok_or(Error::Credential)?;
+        crate::reality_admission::Secret::new(**value).map_err(|_| Error::Credential)
+    }
+
     pub(crate) fn admission_preview(&self, path: &Path) -> Result<[u8; 32], Error> {
+        if self.is_access_key() {
+            return Ok(self.embedded_admission()?.commitment());
+        }
         crate::reality_admission::Secret::load(&self.scope, path)
             .map(|secret| secret.commitment())
             .map_err(|_| Error::Credential)
@@ -812,9 +832,12 @@ pub fn import(
     }
     let invitation = Invitation::decode(uri, now)?;
     let anchor = invitation.confirmed(approval.identity_sha256, policy, now)?;
-    let admission =
+    let admission = if invitation.is_access_key() {
+        invitation.embedded_admission()?
+    } else {
         crate::reality_admission::Secret::load(&invitation.scope, material.admission_path)
-            .map_err(|_| Error::Credential)?;
+            .map_err(|_| Error::Credential)?
+    };
     let admission_commitment = admission.commitment();
     if material
         .expected_admission
@@ -1390,8 +1413,9 @@ mod tests {
         let config::Config::Server(mut server) = config::parse(&source).unwrap() else {
             panic!()
         };
+        let admission = crate::reality_admission::Secret::generate().unwrap();
         let invite =
-            Invitation::issued(&identity, &raw, &server, "device-a", &credential, NOW).unwrap();
+            Invitation::issued(&identity, &raw, &server, "device-a", &credential, &admission, NOW).unwrap();
         assert!(!invite
             .preview(NOW)
             .unwrap()
@@ -1408,12 +1432,13 @@ mod tests {
             },
             &profile,
             &trust,
-            material(&admission_file(&scratch, &identity), None),
+            material(Path::new(""), None),
             auto_policy(),
             NOW,
         )
         .unwrap();
         let loaded = Profile::read(&profile).unwrap();
+        assert_eq!(loaded.admission().unwrap().commitment(), admission.commitment());
         let path = loaded.credential_reference().strip_prefix("file:").unwrap();
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
@@ -1424,7 +1449,7 @@ mod tests {
             .contains(&URL_SAFE_NO_PAD.encode(credential)));
         server.server.users[0].disabled = true;
         assert!(
-            Invitation::issued(&identity, &raw, &server, "device-a", &credential, NOW).is_err()
+            Invitation::issued(&identity, &raw, &server, "device-a", &credential, &admission, NOW).is_err()
         );
     }
 }

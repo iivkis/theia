@@ -89,12 +89,17 @@ pub(crate) struct Wire {
     pub(crate) descriptor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admission: Option<String>,
 }
 
 impl Drop for Wire {
     fn drop(&mut self) {
         if let Some(token) = self.token.as_mut() {
             token.zeroize();
+        }
+        if let Some(admission) = self.admission.as_mut() {
+            admission.zeroize();
         }
     }
 }
@@ -113,6 +118,7 @@ fn check_wire(wire: &Wire) -> Result<(), InviteError> {
             wire.public_key.is_none()
                 && wire.minimum_revision.is_none()
                 && wire.descriptor.is_none()
+                && wire.admission.is_none()
         }
         WireSecurity::SmartReality => {
             wire.public_key.is_some()
@@ -120,6 +126,7 @@ fn check_wire(wire: &Wire) -> Result<(), InviteError> {
                 && wire.descriptor.as_ref().is_some_and(|value| {
                     !value.is_empty() && value.len() <= crate::descriptor::MAX_DOCUMENT
                 })
+                && wire.token.is_some() == wire.admission.is_some()
         }
     };
     if !valid {
@@ -275,9 +282,12 @@ pub(crate) fn encode_wire(wire: &Wire) -> Result<Zeroizing<String>, InviteError>
     bytes.push(match wire.security_mode { WireSecurity::OwnTls => 0, WireSecurity::SmartReality => 1 });
     bytes.push(match wire.transport { Transport::Auto => 0, Transport::H2 => 1, Transport::H3 => 2 });
     bytes.push(match wire.xhttp_mode { XhttpMode::Auto => 0, XhttpMode::StreamOne => 1, XhttpMode::StreamUp => 2 });
-    bytes.push(u8::from(wire.token.is_some()));
+    bytes.push(u8::from(wire.token.is_some()) | (u8::from(wire.admission.is_some()) << 1));
     if let Some(token) = &wire.token {
         bytes.extend_from_slice(&raw_key::<32>(token)?[..]);
+    }
+    if let Some(admission) = &wire.admission {
+        bytes.extend_from_slice(&raw_key::<32>(admission)?[..]);
     }
     match wire.security_mode {
         WireSecurity::OwnTls => {
@@ -340,11 +350,22 @@ pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
     let mut wire = Wire {
         version: 1, carrier: "smarttheia-xhttp".into(), security_mode, transport, xhttp_mode,
         id: String::new(), endpoint: String::new(), server_name: String::new(), path_prefix: String::new(),
-        token: None, public_key: None, minimum_revision: None, descriptor: None,
+        token: None, admission: None, public_key: None, minimum_revision: None, descriptor: None,
     };
-    if r.flag()? {
+    let flags = r.byte()?;
+    if flags & !3 != 0 {
+        return Err(InviteError::Invalid);
+    }
+    if flags & 1 != 0 {
         let token = Zeroizing::new(r.array::<32>()?);
         wire.token = Some(URL_SAFE_NO_PAD.encode(&token[..]));
+    }
+    if flags & 2 != 0 {
+        let admission = Zeroizing::new(r.array::<32>()?);
+        if *admission == [0; 32] {
+            return Err(InviteError::Invalid);
+        }
+        wire.admission = Some(URL_SAFE_NO_PAD.encode(&admission[..]));
     }
     match security_mode {
         WireSecurity::OwnTls => {
@@ -490,6 +511,7 @@ impl Invitation {
             minimum_revision: None,
             descriptor: None,
             token: self.token.as_ref().map(|v| URL_SAFE_NO_PAD.encode(v)),
+            admission: None,
         };
         let mut uri = encode_wire(&wire)?;
         Ok(std::mem::take(&mut *uri))

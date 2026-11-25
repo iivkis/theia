@@ -30,6 +30,7 @@ struct Input {
     trust: PathBuf,
     identity: [u8; 32],
     token: Option<Zeroizing<String>>,
+    access_key_only: bool,
 }
 
 struct Review {
@@ -52,7 +53,7 @@ fn source_uri(input: &Input) -> Result<Zeroizing<String>, Error> {
 }
 
 fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
-    for path in [&input.admission, &input.profile, &input.trust] {
+    for path in [&input.profile, &input.trust] {
         if !crate::bounded_input::explicit_file_path(path) {
             return Err(Error::Storage);
         }
@@ -68,7 +69,11 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
     }
     let uri = source_uri(input)?;
     let invitation = Invitation::decode(&uri, now)?;
-    if invitation.fingerprint() != input.identity {
+    if input.access_key_only {
+        if !invitation.is_access_key() {
+            return Err(Error::Credential);
+        }
+    } else if invitation.fingerprint() != input.identity {
         return Err(Error::Approval);
     }
     if invitation.has_token() == input.token.is_some() {
@@ -82,10 +87,13 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
     let admission = invitation.admission_preview(&input.admission)?;
     let approval = ImportApproval {
         document_sha256: bootstrap::digest(&uri),
-        identity_sha256: input.identity,
+        identity_sha256: invitation.fingerprint(),
     };
-    let body = format!("ПРЕДПРОСМОТР: fingerprint совпал с введённым значением.\n{}\nAdmission-файл проверен; секрет будет скопирован в защищённое хранилище.\nTransport/XHTTP: auto. CA не требуется.\nСохранение отдельного профиля не меняет active profile, proxy или runtime.\ny: сохранить; n/Esc: отменить.",
-        invitation.preview(now)?);
+    let body = if input.access_key_only {
+        format!("ПРЕДПРОСМОТР: самодостаточный ключ REALITY.\n{}\nПолучили ключ от доверенного администратора? Подтвердите доверие.\nСекреты сохраняются защищённо. Подключение и системный прокси не запускаются.\ny: сохранить; n/Esc: отменить.", invitation.preview(now)?)
+    } else {
+        format!("ПРЕДПРОСМОТР: fingerprint совпал с введённым значением.\n{}\nAdmission-файл проверен; секрет будет скопирован в защищённое хранилище.\nTransport/XHTTP: auto. CA не требуется.\nСохранение отдельного профиля не меняет active profile, proxy или runtime.\ny: сохранить; n/Esc: отменить.", invitation.preview(now)?)
+    };
     Ok(Review {
         approval,
         admission,
@@ -122,6 +130,7 @@ fn create_first_client(
         input.profile.parent().ok_or(Error::Storage)?,
         path,
     )?;
+    let identity_sha256 = review.approval.identity_sha256;
     match apply(input, review, now) {
         Ok(_) => {}
         Err(Error::Indeterminate) => {
@@ -135,7 +144,7 @@ fn create_first_client(
     }
     let request = reality_config::ClientRequest {
         enrollment: input.profile.clone(),
-        identity_sha256: input.identity,
+        identity_sha256,
         id: crate::tui_editor::generated_id("profile").map_err(|_| Error::Storage)?,
     };
     let candidate = match reality_config::first_client_candidate(&request, now) {
@@ -233,7 +242,7 @@ impl EnrollmentPanel {
         }
         let mut panel = Self::first(path)?;
         panel.fields[0] = source;
-        panel.focus = 1;
+        panel.focus = 0;
         Ok(panel)
     }
 
@@ -275,7 +284,7 @@ impl EnrollmentPanel {
         }
         let mut panel = Self::bound(editor)?;
         panel.fields[0] = source;
-        panel.focus = 1;
+        panel.focus = 0;
         Ok(panel)
     }
 
@@ -289,8 +298,13 @@ impl EnrollmentPanel {
 
     fn input(&self) -> Result<Input, Error> {
         let path = |i: usize| PathBuf::from(self.fields[i].as_str());
-        let identity = crate::parse_restart_digest(&self.fields[4]).ok_or(Error::Approval)?;
-        let token = (!self.fields[5].is_empty()).then(|| self.fields[5].clone());
+        let access_key_only = self.managed_paths();
+        let identity = if access_key_only {
+            crate::parse_restart_digest(&self.fields[4]).unwrap_or([0; 32])
+        } else {
+            crate::parse_restart_digest(&self.fields[4]).ok_or(Error::Approval)?
+        };
+        let token = (!access_key_only && !self.fields[5].is_empty()).then(|| self.fields[5].clone());
         Ok(Input {
             source: if self.fields[0].starts_with("theia://") {
                 PathBuf::new()
@@ -305,6 +319,7 @@ impl EnrollmentPanel {
             trust: path(3),
             identity,
             token,
+            access_key_only,
         })
     }
 
@@ -465,20 +480,14 @@ impl EnrollmentPanel {
                     self.fields[self.focus].as_str(),
                 ));
             }
-            KeyCode::F(8) => {
+            KeyCode::F(8) if !self.managed_paths() => {
                 self.focus = if self.focus < 4 { 4 } else { 0 };
             }
-            KeyCode::Tab | KeyCode::Down => {
+            KeyCode::Tab | KeyCode::Down if !self.managed_paths() => {
                 self.focus = (self.focus + 1) % LABELS.len();
-                if self.managed_paths() && self.focus == 2 {
-                    self.focus = 4;
-                }
             }
-            KeyCode::BackTab | KeyCode::Up => {
+            KeyCode::BackTab | KeyCode::Up if !self.managed_paths() => {
                 self.focus = (self.focus + LABELS.len() - 1) % LABELS.len();
-                if self.managed_paths() && self.focus == 3 {
-                    self.focus = 1;
-                }
             }
             KeyCode::Backspace => {
                 self.fields[self.focus].pop();
@@ -488,29 +497,19 @@ impl EnrollmentPanel {
                 self.fields[self.focus] = Zeroizing::new(String::new());
                 self.error = None;
             }
-            KeyCode::Enter
-                if self.managed_paths()
-                    && self.focus < 4
-                    && !self.fields[0].is_empty()
-                    && !self.fields[1].is_empty()
-                    && self.fields[4].is_empty() =>
-            {
-                self.focus = 4;
-                self.error = None;
-            }
             KeyCode::Enter if self.fields[0].is_empty() => {
                 self.focus = 0;
                 self.error = Some(
                     "Нет приглашения. Вставьте ссылку или выберите присланный файл (F6).".into(),
                 );
             }
-            KeyCode::Enter if self.fields[1].is_empty() => {
+            KeyCode::Enter if !self.managed_paths() && self.fields[1].is_empty() => {
                 self.focus = 1;
                 self.error = Some(
                     "Нет файла допуска. Попросите его у администратора и выберите через F6.".into(),
                 );
             }
-            KeyCode::Enter if crate::parse_restart_digest(&self.fields[4]).is_none() => {
+            KeyCode::Enter if !self.managed_paths() && crate::parse_restart_digest(&self.fields[4]).is_none() => {
                 self.focus = 4;
                 self.error=Some("Отпечаток должен состоять из 64 шестнадцатеричных символов. Сверьте его с администратором отдельно от приглашения.".into());
             }
@@ -568,6 +567,11 @@ impl EnrollmentPanel {
         };
         match result {
             Ok(stage) => {
+                if self.managed_paths() {
+                    if let Stage::Confirm(review) = &stage {
+                        self.fields[4] = Zeroizing::new(review.approval.identity_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    }
+                }
                 self.stage = stage;
                 if matches!(&self.stage, Stage::Done(_)) && self.owned.is_some() {
                     if let (Some((path, digest)), Ok(input)) = (&self.config, self.input()) {
@@ -625,7 +629,7 @@ impl EnrollmentPanel {
                 .iter()
                 .enumerate()
                 .filter(|(id, _)| {
-                    !self.managed_paths() || (if self.focus < 4 { *id < 2 } else { *id >= 4 })
+                    !self.managed_paths() || *id == 0
                 })
                 .map(|(id, label)| Field {
                     id,
@@ -639,8 +643,8 @@ impl EnrollmentPanel {
                 })
                 .collect(),
             selected: self.focus,
-            lead: if self.managed_paths() && self.focus < 4 {
-                "1. Получите приглашение и отдельный файл допуска у администратора. Далее — проверка отпечатка (F8 или Tab).".into()
+            lead: if self.managed_paths() {
+                "Вставьте единственный ключ от администратора. Все параметры доступа уже внутри. Enter — проверить ключ.".into()
             } else {
                 "Отпечаток сверяется независимо от приглашения. Ссылка на токен нужна только при его отсутствии в приглашении. Значения скрыты.".into()
             },
@@ -659,7 +663,7 @@ impl EnrollmentPanel {
         }
         if matches!(self.stage, Stage::Input)
             && id < LABELS.len()
-            && (!self.managed_paths() || !matches!(id, 2 | 3))
+            && (!self.managed_paths() || id == 0)
         {
             self.focus = id;
         }
@@ -684,17 +688,11 @@ impl EnrollmentPanel {
             );
         }
         match &self.stage {
-            Stage::Input if self.managed_paths() && self.focus < 4 => (
+            Stage::Input if self.managed_paths() => (
                 2,
                 5,
-                "REALITY · приглашение и файл допуска",
-                "↑↓ поле · F6 файл · F8 далее · Enter продолжить · Esc назад",
-            ),
-            Stage::Input if self.managed_paths() => (
-                3,
-                5,
-                "Проверка доверия и ключа",
-                "↑↓ поле · F8 назад · Enter проверить · Ctrl+U очистить · Esc отменить",
+                "REALITY · ключ подключения",
+                "F6 файл · Enter проверить · Ctrl+U очистить · Esc назад",
             ),
             Stage::Input => (
                 1,
@@ -737,7 +735,7 @@ impl EnrollmentPanel {
             Stage::Input => {
                 let mut out = String::from("ШАГ 1 · Приглашение и доверие\n\nЛокальные абсолютные пути; значения скрыты.\n");
                 for (i, label) in LABELS.iter().enumerate() {
-                    if self.managed_paths() && matches!(i, 2 | 3) {
+                    if self.managed_paths() && i != 0 {
                         continue;
                     }
                     out.push_str(&format!(
@@ -751,7 +749,11 @@ impl EnrollmentPanel {
                         self.fields[i].len()
                     ));
                 }
-                out.push_str("\nFingerprint введите из отдельного доверенного канала. Bearer: только env:/file: ссылка, не значение.\nEnter: предпросмотр; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
+                if self.managed_paths() {
+                    out.push_str("\nВставьте ключ от администратора. Enter: проверить; Esc: отменить.\n");
+                } else {
+                    out.push_str("\nFingerprint введите из отдельного доверенного канала. Bearer: только env:/file: ссылка, не значение.\nEnter: предпросмотр; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
+                }
                 out.push_str(self.error.as_deref().unwrap_or(""));
                 out
             }
@@ -833,6 +835,7 @@ mod tests {
             trust: dir.join("trust"),
             identity: [0; 32],
             token: Some(Zeroizing::new("env:TEST_BEARER".into())),
+            access_key_only: false,
         };
         bootstrap::create_text(&input.source, &uri).unwrap();
         Secret::generate()

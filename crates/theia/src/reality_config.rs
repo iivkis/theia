@@ -795,7 +795,7 @@ pub(crate) fn registered_invitation(
     let state = reference_health::Store::new(Path::new(&binding.health_store))
         .and_then(|s| s.inspect())
         .map_err(|_| Error::Health)?;
-    let (publication, _admission) = crate::reality_provision::capture_registered(
+    let (publication, admission) = crate::reality_provision::capture_registered(
         Path::new(&binding.bundle),
         binding,
         &state,
@@ -818,6 +818,7 @@ pub(crate) fn registered_invitation(
             document,
             user,
             bearer,
+            &admission,
             now,
         ),
         None => bootstrap::Invitation::public(material.identity(), material.signed(), now),
@@ -1477,7 +1478,8 @@ mod tests {
         server.server.users[0].disabled = false;
         server.server.inbounds[0].allowed_user_ids = vec![user.clone()];
         let issued =
-            bootstrap::Invitation::issued(&identity, &signed, &server, &user, &token, 1000)
+            bootstrap::Invitation::issued(&identity, &signed, &server, &user, &token,
+                &Secret::load(&scope, &admission).unwrap(), 1000)
                 .unwrap();
         std::fs::write(&invite_path, issued.encode().unwrap().as_bytes()).unwrap();
         let (approval, revision) =
