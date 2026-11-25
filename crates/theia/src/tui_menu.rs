@@ -1,6 +1,7 @@
 //! Discoverable, role-specific menu. Actions reuse the existing guarded forms.
 use crate::Role;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{Frame, layout::{Constraint, Layout, Rect}, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -134,8 +135,8 @@ impl Menu {
                 if self.item.take().is_none() || key == KeyCode::F(10) { return Some(Action::Close); }
                 return None;
             }
-            KeyCode::Up | KeyCode::Char('k') => (selected + count - 1) % count,
-            KeyCode::Down | KeyCode::Char('j') => (selected + 1) % count,
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => (selected + count - 1) % count,
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => (selected + 1) % count,
             KeyCode::Home => 0,
             KeyCode::End => count - 1,
             KeyCode::PageUp => selected.saturating_sub(5),
@@ -156,6 +157,93 @@ impl Menu {
         };
         if self.item.is_some() { self.item = Some(next); } else { self.group = next; }
         None
+    }
+
+
+    /// The menu is a workspace, not a list of undocumented hotkeys.
+    /// Only the existing action dispatcher can execute an operation.
+    pub(crate) fn categories(role: Role) -> Vec<&'static str> {
+        let groups = match role { Role::Server => SERVER, Role::Client => CLIENT };
+        groups.iter().map(|g| g.title).collect()
+    }
+
+    pub(crate) fn select_category(&mut self, index: usize) {
+        if index < self.groups().len() {
+            self.group = index;
+            self.item = Some(0);
+            self.notice = None;
+        }
+    }
+
+    fn columns(area: Rect) -> [Rect; 2] {
+        let parts = Layout::horizontal([Constraint::Length(29), Constraint::Min(1)]).split(area);
+        [parts[0], parts[1]]
+    }
+
+    fn visible_start(selected: usize, count: usize, height: usize) -> usize {
+        selected.saturating_sub(height.saturating_sub(1)).min(count.saturating_sub(height))
+    }
+
+    pub(crate) fn click(&mut self, area: Rect, x: u16, y: u16) {
+        if area.width < 76 { return; }
+        let content = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
+        let [left, right] = Self::columns(content[0]);
+        let index = |rect: Rect, selected: usize, count: usize| -> Option<usize> {
+            if x <= rect.x || x >= rect.right().saturating_sub(1)
+                || y <= rect.y || y >= rect.bottom().saturating_sub(1) { return None; }
+            let height = usize::from(rect.height.saturating_sub(2));
+            let i = Self::visible_start(selected, count, height) + usize::from(y - rect.y - 1);
+            (i < count).then_some(i)
+        };
+        if let Some(i) = index(left, self.group, self.groups().len()) {
+            self.select_category(i);
+        } else if let Some(i) = index(right, self.item.unwrap_or(0), self.groups()[self.group].entries.len()) {
+            self.item = Some(i);
+            self.notice = None;
+        }
+        // A click selects only. Enter still goes through all guards.
+    }
+
+    pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(Clear, area);
+        if area.width < 76 || area.height < 8 {
+            frame.render_widget(Paragraph::new(self.body(usize::from(area.height)))
+                .block(Block::default().title(self.title()).borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)))
+                .wrap(Wrap { trim: false }), area);
+            return;
+        }
+        let content = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
+        let [left, right] = Self::columns(content[0]);
+        let groups = self.groups();
+        let render_list = |frame: &mut Frame<'_>, rect: Rect, title: &str,
+                           items: Vec<(&str, bool)>, selected: usize, focused: bool| {
+            let height = usize::from(rect.height.saturating_sub(2));
+            let start = Self::visible_start(selected, items.len(), height);
+            let rows: Vec<ListItem<'_>> = items.into_iter().enumerate().skip(start).take(height)
+                .map(|(i, (label, enabled))| {
+                    let style = if i == selected {
+                        Style::default().fg(if enabled { Color::Black } else { Color::DarkGray })
+                            .bg(if focused { Color::Cyan } else { Color::Gray }).add_modifier(Modifier::BOLD)
+                    } else if enabled { Style::default() } else { Style::default().fg(Color::DarkGray) };
+                    ListItem::new(Line::from(vec![Span::raw(if i == selected { " › " } else { "   " }),
+                        Span::raw(label), Span::raw(if enabled { "" } else { " [TOML]" })])).style(style)
+                }).collect();
+            frame.render_widget(List::new(rows).block(Block::default().title(title)
+                .borders(Borders::ALL).border_style(Style::default()
+                    .fg(if focused { Color::Cyan } else { Color::DarkGray }))), rect);
+        };
+        render_list(frame, left, " Разделы ", groups.iter().map(|g| (g.title, true)).collect(),
+            self.group, self.item.is_none());
+        let entries = groups[self.group].entries;
+        render_list(frame, right, groups[self.group].title,
+            entries.iter().map(|e| (e.label, !e.requires_config || self.configured)).collect(),
+            self.item.unwrap_or(0), self.item.is_some());
+        let hint = self.notice.unwrap_or(if self.item.is_none() {
+            "↑↓ раздел  ·  Enter/→ действия  ·  Esc редактор"
+        } else { "↑↓ действие  ·  Enter открыть  ·  ←/Esc разделы  ·  F10 редактор" });
+        frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: true })
+            .block(Block::default().title(" Навигация ").borders(Borders::ALL)), content[1]);
     }
 
     pub(crate) fn title(&self) -> &'static str {
@@ -287,6 +375,18 @@ mod tests {
         assert_eq!(m.key(KeyCode::Esc), None);
         assert_eq!(m.key(KeyCode::Esc), Some(Action::Close));
     }
+    #[test]
+    fn click_selects_but_never_executes_an_action() {
+        let mut menu = Menu::new(Role::Server, true);
+        let area = Rect::new(0, 0, 100, 24);
+        menu.click(area, 2, 2);
+        assert_eq!(menu.group, 1);
+        assert_eq!(menu.item, Some(0));
+        menu.click(area, 32, 5);
+        assert_eq!(menu.item, Some(4));
+        assert_eq!(menu.key(KeyCode::Enter), Some(key('Q')));
+    }
+
     #[test]
     fn unconfigured_actions_do_not_mutate_and_selection_is_visible() {
         let mut m = Menu::new(Role::Client, false);
