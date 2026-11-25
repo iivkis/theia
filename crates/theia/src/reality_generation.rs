@@ -292,6 +292,29 @@ impl Manager {
         self.refresh(reference_health::unix_now().map_err(|_|Error::Clock)?)
     }
 
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    pub(crate) fn root_fingerprint(&self)->[u8;32]{
+        self.inbound.reality.as_ref().expect("registered manager").identity_sha256
+    }
+
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    pub(crate) fn check_replacement(&self,next:&Lease,root:[u8;32])->Result<(),Error>{
+        let slot=self.slot.lock().map_err(|_|Error::Storage)?;
+        let old=&slot.last;
+        let p=next.publication();
+        let value=p.active().verified();
+        if p.generation()!=1||p.next().is_some()||value.descriptor().revision!=1
+            || value.descriptor().scope!=self.scope
+            || crate::reality_bootstrap::fingerprint(value.signer())!=root
+            || root==self.root_fingerprint()
+            || old.admission.commitment()==next.admission().commitment()
+            || old.publication.active().verified().signer()==value.signer()
+            || old.publication.next().is_some_and(|m|m.verified().signer()==value.signer()){
+            return Err(Error::Approval);
+        }
+        Ok(())
+    }
+
     /// Serialize candidate changes, revalidate private materials on each
     /// refresh, and refuse stale, equivocated or unhealthy generations.
     /// Never hand out the prior candidate on failure. The lock is intended

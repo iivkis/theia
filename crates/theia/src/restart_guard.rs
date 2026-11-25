@@ -109,6 +109,11 @@ pub(crate) fn probe_captured(
     if assess_reload(active, candidate).is_ok() && identities_unchanged {
         return Ok(RestartVerdict::AuthorizationOnly);
     }
+    if let Some(index)=same_port_reality_only(active,candidate){
+        if loaded_identities.len()==candidate_identities.len() && loaded_identities.iter().zip(&candidate_identities).enumerate().all(|(i,(a,b))|i==index||a==b){
+            return Ok(RestartVerdict::SamePortTlsReady);
+        }
+    }
     if same_port_tls_only(active, candidate) && !identities_unchanged {
         return Ok(RestartVerdict::SamePortTlsReady);
     }
@@ -180,6 +185,23 @@ pub(crate) fn probe_captured(
 /// SNI/hostname expectations, routes users differently or touches quota.
 /// Compare *every* typed field and blank only the two PEM references.
 /// A PEM file changed in place also qualifies when identity digests drift.
+/// A single independently enrolled REALITY replacement, with every other
+/// typed field and inbound identical. Runtime additionally checks the
+/// actual native H3 capability, admission key and unused root.
+pub(crate) fn same_port_reality_only(active:&ServerDocument,candidate:&ServerDocument)->Option<usize>{
+    if active.server.inbounds.len()!=candidate.server.inbounds.len(){return None;}
+    let mut normalized=candidate.clone();
+    let mut changed=None;
+    for (i,(old,new)) in active.server.inbounds.iter().zip(&mut normalized.server.inbounds).enumerate(){
+        if old.reality==new.reality{continue;}
+        let (Some(a),Some(b))=(&old.reality,&new.reality)else{return None;};
+        if changed.is_some()||a.identity_sha256==b.identity_sha256||a.bundle==b.bundle||a.manifest_sha256==b.manifest_sha256{return None;}
+        changed=Some(i);
+        new.reality=old.reality.clone();
+    }
+    if &normalized==active{changed}else{None}
+}
+
 pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocument) -> bool {
     if active.server.inbounds.len()!=candidate.server.inbounds.len()
         || active.server.inbounds.iter().chain(&candidate.server.inbounds).any(|i|i.reality.is_some()){

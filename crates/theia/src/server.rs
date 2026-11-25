@@ -136,6 +136,7 @@ pub struct ServerContext {
     pub inbound_id: String,
     security_mode: crate::security_profile::SecurityMode,
     identity_routes: Option<RwLock<IdentityRoutePolicy>>,
+    identity_gate:Option<Arc<RwLock<bool>>>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
     global_streams: Arc<Semaphore>,
@@ -213,6 +214,7 @@ impl ServerContext {
             inbound_id: inbound.id.clone(),
             security_mode: inbound.security_mode,
             identity_routes: None,
+            identity_gate:None,
             authorization,
             policy: policy.clone(),
             global_streams,
@@ -276,7 +278,7 @@ impl ServerContext {
     }
 
     pub(crate) fn fork_identity(&self, value: &crate::descriptor::Verified,
-        signed: Arc<str>, successor: Option<Arc<str>>) -> Result<Self,ServerError> {
+        signed: Arc<str>, successor: Option<Arc<str>>,gate:Arc<RwLock<bool>>) -> Result<Self,ServerError> {
         let d=value.descriptor();
         if d.scope.inbound!=self.inbound_id || value.check_time(crate::reference_health::unix_now()
             .map_err(|_|ServerError::Config)?).is_err() { return Err(ServerError::Config); }
@@ -287,6 +289,7 @@ impl ServerContext {
                 paths,stream_one:d.stream_one,stream_up:d.stream_up,not_before:d.not_before,
                 not_after:d.not_after,signed,successor,signer:value.signer(),descriptor:d.clone(),digest:value.payload_sha256(),
             })),
+            identity_gate:Some(gate),
             authorization:self.authorization.clone(),policy:self.policy.clone(),
             global_streams:self.global_streams.clone(),user_streams:self.user_streams.clone(),
             connection_slots:self.connection_slots.clone(),live_quota:self.live_quota.clone(),peer_budget:self.peer_budget.clone(),
@@ -533,6 +536,13 @@ impl ServerContext {
     /// Check all configured hashes using constant-time comparison and never
     /// reflect token bytes, hashes or even the candidate string in errors.
     pub fn authorize(&self, authorization: Option<&str>) -> Result<SessionPermit, AuthFailure> {
+        // Held through permit acquisition: a structural root replacement
+        // linearizes against new logical streams on the old TLS context.
+        let _identity=if let Some(gate)=&self.identity_gate{
+            let held=gate.read().map_err(|_|AuthFailure::Forbidden)?;
+            if !*held{return Err(AuthFailure::Forbidden);}
+            Some(held)
+        }else{None};
         let header = authorization.ok_or(AuthFailure::Unauthorized)?;
         let bearer = header
             .strip_prefix("Bearer ")
@@ -1801,7 +1811,7 @@ async fn prepare_generation(
         if let Some(binding)=&inbound.reality{
             let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
             let (manager,lease)=if let Some(snapshot)=captured{
-                snapshot.reality(index)?.activate(inbound,now).map_err(|_|ServerError::Config)?
+                snapshot.reality(index).map_err(|_|())?.activate(inbound,now).map_err(|_|ServerError::Config)?
             }else{
                 let manager=crate::reality_generation::Manager::new_live(&config,&inbound.id,now).await.map_err(|_|ServerError::Config)?;
                 let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
@@ -1927,6 +1937,14 @@ struct RollbackSlot {
 const TLS_ROLLBACK_WINDOW: Duration = Duration::from_secs(300);
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+struct HotReality{
+    id:String,
+    carrier:Arc<crate::reality_live::Live>,
+    manager:Arc<tokio::sync::Mutex<Arc<crate::reality_generation::Manager>>>,
+    used_roots:std::collections::HashSet<[u8;32]>,
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 struct RunningGeneration {
     tasks: JoinSet<Result<(), ServerError>>,
     phase: watch::Sender<GenerationPhase>,
@@ -1934,7 +1952,7 @@ struct RunningGeneration {
     // Exact QUIC configs installed on the endpoints. Saved previous configs
     // support a one-shot TLS undo without reading external PEM files again.
     active_h3: Vec<quinn::ServerConfig>,
-    reality:Vec<Arc<crate::reality_live::Live>>,
+    reality:Vec<HotReality>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1949,7 +1967,10 @@ impl RunningGeneration {
             let (tcp,acceptor,udp,context,h3_config)=match listener{
                 ReadyListener::Plain(tcp,acceptor,udp,context,h3_config)=>(tcp,acceptor,udp,context,h3_config),
                 ReadyListener::Reality(tcp,quic,silent,manager,carrier)=>{
-                    reality.push(carrier.clone());
+                    let id=carrier.inbound_id().to_owned();
+                    let root=manager.root_fingerprint();
+                    let manager=Arc::new(tokio::sync::Mutex::new(Arc::new(manager)));
+                    reality.push(HotReality{id,carrier:carrier.clone(),manager:manager.clone(),used_roots:std::collections::HashSet::from([root])});
                     let mut phase=receiver.clone();
                     tasks.spawn(async move{
                         if !await_generation_activation(&mut phase).await{return Ok(());}
@@ -1982,6 +2003,7 @@ impl RunningGeneration {
                                     if changed.is_err()||*phase.borrow()==GenerationPhase::Drain{return Ok(());}
                                 }
                                 _=tokio::time::sleep(Duration::from_secs(5))=>{
+                                    let manager=manager.lock().await;
                                     let result=tokio::select!{
                                         result=manager.maintain(&carrier)=>result,
                                         _=phase.changed()=>return Ok(()),
@@ -2040,7 +2062,7 @@ impl RunningGeneration {
     }
 
     fn drain(&self) {
-        for carrier in &self.reality{carrier.retire();}
+        for hot in &self.reality{hot.carrier.retire();}
         self.phase.send_replace(GenerationPhase::Drain);
     }
 }
@@ -2111,6 +2133,51 @@ async fn stage_fresh_generation(
 /// finish before acquiring the short CAS lock or swapping any live handles.
 /// The old listener socket and both active tunnel populations remain intact.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn commit_same_port_reality(
+    runtime:&crate::runtime_generation::State,running:&mut RunningGeneration,
+    request:&crate::runtime_generation::RestartRequest,
+    loaded:&[crate::reload_preflight::IdentityHash],path:&Path,
+)->Result<(Vec<crate::reload_preflight::IdentityHash>,u64),()>{
+    use crate::restart_guard::{self,RestartVerdict};
+    let previous=request.previous.document.as_ref();
+    let candidate=&request.candidate;
+    let index=restart_guard::same_port_reality_only(previous,candidate).ok_or(())?;
+    let snapshot=request.material.as_ref().ok_or(())?;
+    if restart_guard::probe_captured(previous,loaded,candidate,snapshot)!=Ok(RestartVerdict::SamePortTlsReady){
+        return Err(());
+    }
+    let inbound=&candidate.server.inbounds[index];
+    let binding=inbound.reality.as_ref().ok_or(())?;
+    let old=previous.server.inbounds[index].reality.as_ref().ok_or(())?;
+    let hot=running.reality.iter_mut().find(|v|v.id==inbound.id).ok_or(())?;
+    if hot.used_roots.contains(&binding.identity_sha256){return Err(());}
+    // One supervisor owns the maintenance mutex. If DNS/health work is
+    // in progress, refuse rather than race a stale manager publication.
+    let mut manager=hot.manager.try_lock().map_err(|_|())?;
+    let now=crate::reference_health::unix_now().map_err(|_|())?;
+    let (next_manager,lease)=snapshot.reality(index)?.activate(inbound,now).map_err(|_|())?;
+    manager.check_replacement(&lease,binding.identity_sha256).map_err(|_|())?;
+    let prepared=hot.carrier.prepare_replacement(Arc::new(lease),now).map_err(|_|())?;
+    let (live,auth)=request.previous.live.prepare_tls_rebase(candidate,request.expected_revision).map_err(|_|())?;
+    let identities=snapshot.identities();
+    let next=crate::runtime_generation::View{
+        document:Arc::new(candidate.clone()),inbounds:candidate.server.inbounds.len(),
+        preflight:Arc::new(crate::reload_preflight::ReloadPreflight::new(path.to_owned(),candidate.clone(),identities.clone())),
+        live:Arc::new(live),
+    };
+    if request.complete.is_closed(){return Err(());}
+    let revision=hot.carrier.commit_replacement(prepared,|publish|{
+        runtime.commit_reality_replacement(&request.previous,request.expected_revision,next,auth,
+            &inbound.id,old.manifest_sha256,binding.manifest_sha256,||{
+                publish();
+                *manager=Arc::new(next_manager);
+            }).map_err(|_|())
+    })?;
+    hot.used_roots.insert(binding.identity_sha256);
+    Ok((identities,revision))
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 fn commit_same_port_tls(
     runtime: &crate::runtime_generation::State,
     running: &mut RunningGeneration,
@@ -2429,6 +2496,22 @@ async fn run_supervised_file(
                 if request.kind == crate::runtime_generation::ChangeKind::Quota {
                     let result = commit_live_quota(&runtime, &request, &limits.ledger);
                     let _ = request.complete.send(result);
+                    continue;
+                }
+                if crate::restart_guard::same_port_reality_only(request.previous.document.as_ref(),&request.candidate).is_some(){
+                    let result=commit_same_port_reality(&runtime,&mut running,&request,&identities,config_path);
+                    match result{
+                        Ok((next,revision))=>{
+                            identities=next;
+                            // Independent enrollment is not reversible TLS
+                            // rotation; never resurrect the replaced root.
+                            rollback=None;structural_rollback=None;
+                            runtime.set_rollback_until(None);
+                            runtime.set_restart_rollback(None);
+                            let _=request.complete.send(Ok(revision));
+                        }
+                        Err(())=>{let _=request.complete.send(Err(()));}
+                    }
                     continue;
                 }
                 if crate::restart_guard::same_port_tls_only(

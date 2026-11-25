@@ -234,6 +234,28 @@ impl State {
         Ok(actual)
     }
 
+    /// Same listener set, different independently enrolled REALITY root.
+    /// The supervisor holds the route and previous admission gate locks.
+    /// Only one changed manifest is installed; no old root rollback slot.
+    pub(crate) fn commit_reality_replacement(&self,previous:&Arc<View>,expected:u64,
+        next:View,authorization:StagedAuthorization,id:&str,old_manifest:[u8;32],new_manifest:[u8;32],
+        swap:impl FnOnce())->Result<u64,LiveAuthError>{
+        let mut guard=self.current.write().map_err(|_|LiveAuthError::Unavailable)?;
+        if !Arc::ptr_eq(&guard,previous)||previous.live.revision()?!=expected{
+            return Err(LiveAuthError::StaleRevision);
+        }
+        let mut reality=self.reality.write().map_err(|_|LiveAuthError::Unavailable)?;
+        let entry=reality.get_mut(id).ok_or(LiveAuthError::Unavailable)?;
+        if entry.0!=old_manifest||old_manifest==new_manifest{return Err(LiveAuthError::StaleRevision);}
+        let mut rollback=self.auth_rollback.write().map_err(|_|LiveAuthError::Unavailable)?;
+        let revision=previous.live.publish(authorization)?;
+        swap();
+        entry.0=new_manifest;
+        *rollback=None;
+        *guard=Arc::new(next);
+        Ok(revision)
+    }
+
     /// M4.2j: one guarded quota limit/revision publication. The shared
     /// ledger counts ALL held H2+H3 permits, including those created before
     /// cutover. A cap smaller than occupancy creates admission debt; no

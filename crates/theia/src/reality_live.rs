@@ -50,7 +50,7 @@ pub(crate) struct Generation {
     routes: Vec<Arc<Route>>,
 }
 impl Generation {
-    fn prepare(lease: Arc<Lease>, base: &ServerContext, handshake: &Arc<ReplayGuard>, now: u64)
+    fn prepare(lease: Arc<Lease>, base: &ServerContext, handshake: &Arc<ReplayGuard>, now: u64,gate:Arc<RwLock<bool>>)
         -> Result<Self, ServerError> {
         let publication = lease.publication();
         let mut routes = Vec::new();
@@ -63,7 +63,7 @@ impl Generation {
             let next = if successor { None } else {
                 publication.next().map(|m| Arc::<str>::from(m.signed()))
             };
-            let context = Arc::new(base.fork_identity(value,Arc::from(material.signed()),next)?);
+            let context = Arc::new(base.fork_identity(value,Arc::from(material.signed()),next,gate.clone())?);
             // Active reference first. Other signed, operator-approved SNI
             // values allow authenticated clients with a previously signed
             // descriptor to reconnect. An invalid marker still uses only
@@ -111,9 +111,13 @@ pub(crate) fn relay_value(lease:&Lease,now:u64)->Option<&Verified> {
         v.check_time(now).is_ok() && lease.health().validate_active(v.descriptor(),now).is_ok())
 }
 
+#[cfg(any(target_os="linux",target_os="windows"))]
+pub(crate) struct PreparedReplacement{generation:Arc<Generation>,gate:Arc<RwLock<bool>>}
+
 pub(crate) struct Live {
     base: Arc<ServerContext>,
     slot: RwLock<Option<Arc<Generation>>>,
+    gate:RwLock<Arc<RwLock<bool>>>,
     // A routing replay window is shared by every generation. The QUIC TLS
     // boundary has a separate equally long-lived replay window.
     pub(crate) guard: Arc<ReplayGuard>,
@@ -128,9 +132,10 @@ impl Live {
     pub(crate) fn with_guard_start(lease:Arc<Lease>,base:Arc<ServerContext>,now:u64,guard_start:u64)->Result<Arc<Self>,ServerError>{
         let guard=Arc::new(ReplayGuard::new(65536,guard_start).map_err(|_|ServerError::Config)?);
         let handshake=Arc::new(ReplayGuard::new(65536,guard_start).map_err(|_|ServerError::Config)?);
-        let initial=Arc::new(Generation::prepare(lease,&base,&handshake,now)?);
+        let gate=Arc::new(RwLock::new(true));
+        let initial=Arc::new(Generation::prepare(lease,&base,&handshake,now,gate.clone())?);
         let h3=initial.default_quic().is_some();
-        Ok(Arc::new(Self{base,slot:RwLock::new(Some(initial)),guard,handshake,h3,retired:AtomicBool::new(false)}))
+        Ok(Arc::new(Self{base,slot:RwLock::new(Some(initial)),gate:RwLock::new(gate),guard,handshake,h3,retired:AtomicBool::new(false)}))
     }
     pub(crate) fn current(&self)->Option<Arc<Generation>>{
         if self.retired.load(Ordering::Acquire){return None;}
@@ -158,7 +163,8 @@ impl Live {
             a.generation==b.generation && a.health_revision==b.health_revision &&
                 a.active_usable==b.active_usable && a.successor_usable==b.successor_usable
         }) { return Ok(()); }
-        let candidate=Arc::new(Generation::prepare(lease,&self.base,&self.handshake,now)?);
+        let gate=self.gate.read().map_err(|_|ServerError::Config)?;
+        let candidate=Arc::new(Generation::prepare(lease,&self.base,&self.handshake,now,gate.clone())?);
         // A transport policy change requires structural Apply, not an
         // implicit rebind. The publication rotation/failover contract retains modes.
         if candidate.default_quic().is_some()!=self.h3 { return Err(ServerError::Config); }
@@ -166,6 +172,31 @@ impl Live {
         if self.retired.load(Ordering::Acquire){return Err(ServerError::Config);}
         *slot=Some(candidate);
         Ok(())
+    }
+    pub(crate) fn inbound_id(&self)->&str{&self.base.inbound_id}
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    pub(crate) fn prepare_replacement(&self,lease:Arc<Lease>,now:u64)->Result<PreparedReplacement,ServerError>{
+        let gate=Arc::new(RwLock::new(true));
+        let generation=Arc::new(Generation::prepare(lease,&self.base,&self.handshake,now,gate.clone())?);
+        if generation.default_quic().is_some()!=self.h3{return Err(ServerError::Config);}
+        Ok(PreparedReplacement{generation,gate})
+    }
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    pub(crate) fn commit_replacement<T>(&self,candidate:PreparedReplacement,
+        commit:impl FnOnce(&mut dyn FnMut())->Result<T,()>)->Result<T,()>{
+        let mut gate=self.gate.write().map_err(|_|())?;
+        let previous_gate=gate.clone();
+        let mut slot=self.slot.write().map_err(|_|())?;
+        let mut previous=previous_gate.write().map_err(|_|())?;
+        if self.retired.load(Ordering::Acquire){return Err(());}
+        let mut candidate=Some(candidate);
+        let mut publish=||{
+            let next=candidate.take().expect("single supervisor commit");
+            *previous=false;
+            *gate=next.gate;
+            *slot=Some(next.generation);
+        };
+        commit(&mut publish)
     }
     pub(crate) fn retire(&self){
         self.retired.store(true,Ordering::Release);

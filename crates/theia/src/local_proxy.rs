@@ -858,6 +858,8 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     let Config::Client(document)=config::parse(std::str::from_utf8(&raw).map_err(|_|ClientError::Configuration)?)
         .map_err(|_|ClientError::Configuration)? else{return Err(ClientError::Configuration);};
     let (http,socks,client)=prepare_proxy(&document).await?;
+    #[cfg(windows)]
+    let http_bound=http.local_addr().map_err(|_|ClientError::Io)?;
     #[cfg(any(target_os="linux",target_os="windows"))]
     let managed={
         use sha2::{Digest,Sha256};
@@ -889,8 +891,7 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
         if document.client.proxy.system_proxy != config::SystemProxy::Manual {
             return Err(ClientError::SystemProxy);
         }
-        let bound = http.local_addr().map_err(|_| ClientError::Io)?;
-        let mut lease = crate::windows_system_proxy::OwnedProxy::apply(bound)
+        let mut lease = crate::windows_system_proxy::OwnedProxy::apply(http_bound)
             .map_err(|_| ClientError::SystemProxy)?;
         // Ctrl+C is the normal scoped exit. A killed process cannot execute
         // destructors; persistent registry journal permits explicit recovery
