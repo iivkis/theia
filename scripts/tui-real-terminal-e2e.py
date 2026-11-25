@@ -190,6 +190,24 @@ def drive(binary, config, scenario, expected):
             revision(binary, expected)
         else:
             tty.wait("Редактор TOML")
+            if scenario == "apply":
+                # Both actual terminal creation paths must be reachable and
+                # cancel without touching the exact TOML or server revision.
+                with open(config, "rb") as file:
+                    original = file.read()
+                for choice, label in [("1", "Создать inbound (собственный TLS)"),
+                                      ("2", "Новый REALITY inbound")]:
+                    since = tty.snapshot()
+                    tty.send("N")
+                    tty.wait("SmartTheia REALITY", since=since)
+                    since = tty.snapshot()
+                    tty.send(choice)
+                    tty.wait(label, since=since)
+                    tty.send("\x1b")
+                    time.sleep(0.15)
+                    with open(config, "rb") as file:
+                        assert file.read() == original
+                    revision(binary, expected)
             if scenario == "dirty":
                 since = tty.snapshot()
                 tty.send("\r")

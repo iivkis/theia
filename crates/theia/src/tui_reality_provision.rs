@@ -237,6 +237,18 @@ impl WizardInput {
             || self.grants.is_empty()
             || self.grants.iter().any(|id| !doc.server.users.iter().any(|u| u.id == *id && !u.disabled))
         { return Err(Error::Grant); }
+        // Reject collisions with saved listeners before any consented work
+        // or material creation. Wildcards may overlap both address families.
+        for inbound in &doc.server.inbounds {
+            for address in [&inbound.h2_listen, &inbound.quic_listen] {
+                let existing: SocketAddr = address.parse().map_err(|_| Error::Scope)?;
+                if existing.port() == self.listen.port()
+                    && (existing.ip() == self.listen.ip() || existing.ip().is_unspecified() || self.listen.ip().is_unspecified())
+                {
+                    return Err(Error::Scope);
+                }
+            }
+        }
         validate_paths(&self.health, &self.bundle)?;
         new_health_path(&self.health)?;
         Ok(())
@@ -700,7 +712,20 @@ mod tests {
         ]).unwrap();
         let evidence = vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }, reference_health::Evidence { h2_status: Some(200), h3_status: Some(200) }];
         let now = reference_health::unix_now().unwrap();
-        let (state, report) = rank_checked(&input, plan, evidence, now).unwrap();
+        let (state, report) = rank_checked(&input, plan.clone(), evidence.clone(), now).unwrap();
+        let mut manual = input.clone();
+        manual.automatic = false;
+        let (ordered, _) = rank_checked(&manual, plan.clone(), evidence.clone(), now).unwrap();
+        assert_eq!(ordered.plan().references[0].server_name, "first.example.org");
+        let mut failed = evidence.clone();
+        failed[0] = Evidence { h2_status: None, h3_status: None };
+        assert!(rank_checked(&manual, plan.clone(), failed.clone(), now).is_err());
+        let (filtered, _) = rank_checked(&input, plan.clone(), failed, now).unwrap();
+        assert_eq!(filtered.plan().references.len(), 1);
+        assert!(rank_checked(&input, plan.clone(), Vec::new(), now).is_err());
+        let resolved = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(input.resolve()).unwrap();
+        assert_eq!(resolved.digest().unwrap(), plan.digest().unwrap());
         assert_eq!(state.plan().references[0].server_name, "second.example.org");
         assert!(report.contains("100") && report.contains("80"));
         assert!(!input.bundle.exists() && !input.health.exists());
@@ -709,6 +734,32 @@ mod tests {
         wizard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(wizard.stage, WizardStage::Input));
         assert!(!input.bundle.exists() && !input.health.exists());
+        let original = std::fs::read(&path).unwrap();
+        wizard.stage = WizardStage::CreateConfirm(Box::new((input.clone(), state, report)));
+        assert!(!wizard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while wizard.registration.is_none() {
+            let _ = wizard.poll();
+            assert!(std::time::Instant::now() < deadline, "{}", wizard.body());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(input.bundle.exists() && input.health.exists());
+        wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        while !wizard.body().contains("Сохранить только TOML?") {
+            let _ = wizard.poll();
+            assert!(std::time::Instant::now() < deadline, "{}", wizard.body());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        wizard.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let registered = loop {
+            if let Some(editor) = wizard.poll() { break editor; }
+            assert!(std::time::Instant::now() < deadline, "{}", wizard.body());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(registered.selected_reality());
+        assert_eq!(registered.selected_record_id(), input.id);
         std::fs::write(&path, "stale").unwrap();
         assert_eq!(input.check_source(), Err(Error::Approval));
         std::fs::remove_dir_all(dir).unwrap();

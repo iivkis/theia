@@ -1792,6 +1792,25 @@ mod tests {
     }
 
     #[test]
+    fn quota_edit_requires_valid_bounds_and_durable_save() {
+        let temp = Temp::write(&server_source());
+        let original = fs::read(&temp.0).unwrap();
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        assert_eq!(editor.record_fields(RecordAction::SetQuota).unwrap().len(), 2);
+        for values in [["0", "4"], ["5", "4"], ["x", "4"], ["4", "0"]] {
+            assert!(editor.review_record(RecordAction::SetQuota, &values.map(str::to_owned)).is_err());
+        }
+        let review = editor.review_record(RecordAction::SetQuota, &["3".into(), "7".into()]).unwrap();
+        assert_eq!(fs::read(&temp.0).unwrap(), original);
+        editor.stage_record(review).unwrap();
+        assert_eq!(fs::read(&temp.0).unwrap(), original);
+        assert!(editor.save());
+        let Config::Server(doc) = config::read_file(&temp.0).unwrap() else { panic!("server"); };
+        assert_eq!(doc.server.policy.max_connections_per_user, 3);
+        assert_eq!(doc.server.policy.max_connections_total, 7);
+    }
+
+    #[test]
     fn registered_reality_issuance_rotation_and_recovery_use_same_saved_guard() {
         use crate::reference_health::{Evidence, Plan, State, Store, Target};
         let temp = Temp::write(&server_source());

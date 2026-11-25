@@ -42,6 +42,7 @@ const MAX_FIELD: usize = 1024;
 
 struct Review {
     request: Request,
+    selected_id: String,
     approval: [u8; 32],
     body: String,
 }
@@ -140,7 +141,14 @@ fn preview(path: &Path, original: [u8; 32], request: Request, now: u64) -> Resul
     } else {
         "y: сохранить; n/Esc: отменить."
     };
-    Ok(Review { request, approval: prepared.approval_sha256(),
+    let selected_id = match (&request, prepared.candidate()) {
+        (Request::Server(_), config::Config::Server(doc)) => doc.server.inbounds.last()
+            .ok_or(Error::Scope)?.id.clone(),
+        (Request::ReplaceServer(request), _) => request.id.clone(),
+        (Request::Client(request) | Request::Reenroll(request), _) => request.id.clone(),
+        _ => return Err(Error::Scope),
+    };
+    Ok(Review { request, selected_id, approval: prepared.approval_sha256(),
         body: format!("{}\n\nСохранить только TOML? {consent}\nРаботающие listener/системный proxy не меняются.", prepared.report()) })
 }
 
@@ -310,12 +318,7 @@ impl RegistrationPanel {
                 .map_err(SaveError::Refused)
                 .and_then(|()| {
                     let mut editor = Editor::load(role, &path).map_err(|_| SaveError::SavedReloadFailed)?;
-                    let selected = match &review.request {
-                        Request::Server(_) => None,
-                        Request::Client(request) | Request::Reenroll(request) => Some(request.id.as_str()),
-                        Request::ReplaceServer(request) => Some(request.id.as_str()),
-                    };
-                    if let Some(id) = selected { editor.select_id(id); }
+                    editor.select_id(&review.selected_id);
                     Ok(editor)
                 });
             let _ = tx.send(result);
