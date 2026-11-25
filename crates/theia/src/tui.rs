@@ -656,11 +656,10 @@ impl Interaction {
             background.poll();
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
-            let role = dialog.role;
             if let Some(editor) = dialog.poll() {
                 self.editor = Some(editor);
                 self.config_dialog = None;
-                self.menu = Some(Menu::new(role, true));
+                self.menu = None;
             }
         }
     }
@@ -750,7 +749,10 @@ impl Interaction {
         let Some(role) = Self::panel_role(model) else {
             return;
         };
-        let Some(columns) = workspace_columns(body) else {
+        if self.editor_for(role).is_none() {
+        return;
+    }
+    let Some(columns) = workspace_columns(body) else {
             return;
         };
         let nav = columns[0];
@@ -1089,6 +1091,7 @@ impl Interaction {
             if let Some(role) = role {
                 let configured = self.editor_for(role).is_some();
                 if key.code == KeyCode::F(3)
+                    || (!configured && key.code == KeyCode::Char('N'))
                     || (!configured
                         && (key.code == KeyCode::Enter
                             || (role == Role::Client && key.code == KeyCode::Char('V'))))
@@ -1120,7 +1123,7 @@ impl Interaction {
                 return false;
             }
             if model.screen == Screen::Server && key.code == KeyCode::Char('W') {
-                self.reality_provision = Some(ProvisionPanel::new());
+                self.open_config(Role::Server);
                 return false;
             }
             if model.screen == Screen::Server && key.code == KeyCode::Char('R') {
@@ -2066,16 +2069,12 @@ fn home_layout(area: Rect) -> [Rect; 2] {
 }
 
 fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
-    if area.width < 100 || area.height < 12 {
+    if area.width < 90 || area.height < 18 {
         return None;
     }
-    let cols = Layout::horizontal([
-        Constraint::Length(28),
-        Constraint::Length(25),
-        Constraint::Min(1),
-    ])
-    .split(area);
-    Some([cols[0], cols[1], cols[2]])
+    let cols = Layout::horizontal([Constraint::Length(30), Constraint::Min(1)]).split(area);
+    let left = Layout::vertical([Constraint::Length(8), Constraint::Min(1)]).split(cols[0]);
+    Some([left[0], left[1], cols[1]])
 }
 
 fn record_start(editor: &Editor, rect: Rect) -> usize {
@@ -2144,6 +2143,10 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
+        } else if line.starts_with("Ошибка:") || line.starts_with("ОТКАЗ:") {
+            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+        } else if line.starts_with("ШАГ ") || line.starts_with("ВЫБЕРИТЕ ") || line.starts_with("НАЧАЛО РАБОТЫ") || line.starts_with("SMARTTHEIA REALITY") || line == "OWN-TLS" || line == "ПРОФИЛИ" {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("КОНФИДЕНЦИАЛЬНО")
         {
             Style::default()
@@ -2185,6 +2188,7 @@ fn panel_at(
     viewport: Option<&Viewport>,
 ) {
     frame.render_widget(Clear, area);
+    let area = if viewport.is_some() { centered_column(area, 108) } else { area };
     let style = Style::default().fg(if focused {
         Color::Cyan
     } else {
@@ -2332,7 +2336,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         modal_panel!(
             frame,
             parts[1],
-            "Открыть конфигурацию",
+            dialog.title(),
             &dialog.body(),
             true
         );
@@ -2823,6 +2827,10 @@ fn draw_import(
 }
 
 fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<&Editor>) {
+    if editor.is_none() {
+        draw_welcome(frame, area, role);
+        return;
+    }
     let Some([nav, records, details]) = workspace_columns(area) else {
         if let Some(editor) = editor {
             draw_editor(frame, area, editor);
@@ -2831,9 +2839,11 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
         }
         return;
     };
-    let categories = Menu::categories(role)
-        .into_iter()
-        .map(|label| ListItem::new(format!("  {label}")));
+    let labels: &[&str] = match role {
+        Role::Server => &["Сервер", "Подключения", "Пользователи", "REALITY", "Конфигурация"],
+        Role::Client => &["Подключение", "Профили", "REALITY", "Конфигурация"],
+    };
+    let categories = labels.iter().map(|label| ListItem::new(format!("  {label}")));
     frame.render_widget(
         List::new(categories.collect::<Vec<_>>()).block(
             Block::default()
@@ -2916,11 +2926,20 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
 }
 
 fn draw_welcome(frame: &mut Frame<'_>, area: Rect, role: Role) {
-    let (title, body) = match role {
-        Role::Server => ("Для сервера", "Начало работы\n\n1. Откройте серверную конфигурацию (Enter или F3).\n2. Выберите inbound, пользователей и права.\n3. Проверьте сохранённые изменения перед Apply.\n\nF2: действия   F5: управление сервером\nRuntime не запускается автоматически. Статус: защищённый IPC."),
-        Role::Client => ("Для клиента", "Начало работы\n\n1. Откройте клиентскую конфигурацию (Enter или F3).\n2. Импортируйте приглашение или выберите профиль.\n3. Откройте управление подключением.\n\nF2: действия   F4: монитор трафика\nТранспорт не проверялся. Системный прокси не меняется автоматически."),
+    let title = if role == Role::Server { "Для сервера" } else { "Для клиента" };
+    let body = match role {
+        Role::Server => "НАЧАЛО РАБОТЫ\n\n> Enter / F3   Создать или открыть TOML\n\nSMARTTHEIA REALITY\n  Новый сервер без собственного TLS-сертификата.\n  Введите путь к TOML, затем F4 — мастер REALITY.\n\nOWN-TLS\n  Собственный сертификат и ключ.\n  Введите путь к TOML, затем F2 — мастер Own-TLS.\n\nF2: все действия   F5: сервер\nСервер не запущен этой панелью. IPC — отдельно.",
+        Role::Client => "НАЧАЛО РАБОТЫ\n\n> Enter / F3   Создать или открыть TOML\n\nПРОФИЛИ\n  F2 в выборе файла — новый Own-TLS.\n  Откройте TOML для импорта приглашения.\n\nF2: все действия   F4: трафик\nТранспорт не проверялся. Системный прокси не изменён.",
     };
-    panel(frame, area, title, body, true);
+    // A welcome screen has one reading column, not empty sidebars.
+    frame.render_widget(Clear, area);
+    let content = centered_column(area, 88);
+    panel(frame, content, title, body, true);
+}
+
+fn centered_column(area: Rect, max_width: u16) -> Rect {
+    let width = area.width.min(max_width);
+    Rect::new(area.x + (area.width - width) / 2, area.y, width, area.height)
 }
 
 fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
@@ -2952,17 +2971,22 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     } else {
         String::new()
     };
+    let actions = match editor.role() {
+        Role::Server => "N Новое подключение   W Мастер REALITY   F5 Сервер",
+        Role::Client => "N Новый профиль   i Импорт   V Подключение",
+    };
     let message = format!(
-        "{}  |  {}\n{}\n{}\n{}Выбранное поле: {}\n{}\n{}\n{}",
+        "{}  ·  {}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         editor.selection_summary(),
         dirty,
         mode,
-        users,
-        editor.fields_overview(),
+        users.trim_end(),
+        editor.fields_overview().trim_end(),
         editor.field_name(),
         help,
         editor.error.as_deref().unwrap_or(""),
         editor.notice,
+        actions,
     );
     let title = if editor.error.is_some() {
         " Ошибка · проверьте сообщение "
@@ -2971,7 +2995,20 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     } else {
         " Параметры · Enter "
     };
-    panel(frame, area, title, &message, true);
+    // Keep navigation and status distinct from the form at normal terminal sizes.
+    // Compact terminals retain the complete keyboard-first editor.
+    if area.height < 20 || area.width < 48 {
+        panel(frame, area, title, &message, true);
+        return;
+    }
+    let parts = Layout::vertical([Constraint::Length(4), Constraint::Min(7), Constraint::Length(5), Constraint::Length(3)]).split(area);
+    let status = format!("{}\n{} · {}\n{}", editor.selection_summary(), mode, dirty, users.trim_end());
+    panel(frame, parts[0], "Обзор", &status, false);
+    let fields = format!("{}\n{}\n{}", editor.fields_overview(), editor.field_name(), help);
+    panel(frame, parts[1], title, &fields, true);
+    let notice = format!("{}\n{}", editor.error.as_deref().unwrap_or(""), editor.notice);
+    panel(frame, parts[2], "Состояние", &notice, false);
+    panel(frame, parts[3], "Действия", actions, false);
 }
 
 /// Edit only when both role and a config path are explicitly supplied.
@@ -4262,10 +4299,10 @@ mod tests {
         assert!(ui.reality_provision.is_none());
         model.update(press(KeyCode::Char('1')));
         ui.update(&mut model, press(KeyCode::Char('W')));
-        assert!(ui.reality_provision.is_some());
-        assert!(rendered_interaction(120, 40, &model, &ui).contains("Мастер REALITY"));
+        assert!(ui.config_dialog.is_some());
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("SmartTheia REALITY"));
         ui.update(&mut model, press(KeyCode::Esc));
-        assert!(ui.reality_provision.is_none());
+        assert!(ui.config_dialog.is_none());
         assert_eq!(model.screen, Screen::Server);
     }
 
