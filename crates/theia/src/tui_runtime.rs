@@ -866,4 +866,83 @@ mod tests {
         panel.complete(Ok(StatusReply::Applied { revision: 3 }));
         assert_eq!(panel.phase, Phase::Applied { revision: 3 });
     }
+
+    #[test]
+    fn quota_and_auth_rollback_receipts_require_the_correct_operation() {
+        for (checking, reply, confirmed, applying, ack, applied) in [
+            (Phase::QuotaChecking { revision: 7 }, StatusReply::QuotaReady,
+                Phase::QuotaConfirming { revision: 7 }, Phase::QuotaApplying,
+                StatusReply::QuotaApplied { revision: 8 }, Phase::QuotaApplied { revision: 8 }),
+            (Phase::RollbackChecking, StatusReply::AuthRollbackReady { revision: 7, remaining_seconds: 123 },
+                Phase::RollbackConfirming { revision: 7, remaining_seconds: 123 }, Phase::RollbackApplying,
+                StatusReply::AuthRollbackApplied { revision: 8 }, Phase::RollbackApplied { revision: 8 }),
+        ] {
+            let mut panel = fake(Some([3; 32]), false);
+            panel.phase = checking;
+            assert!(panel.key(key(KeyCode::Esc)));
+            assert!(!panel.key(key(KeyCode::Char('y'))));
+            panel.complete(Ok(reply));
+            assert_eq!(panel.phase, confirmed);
+            assert!(panel.body().contains("revision=7"));
+            assert!(panel.key(key(KeyCode::Char('n'))));
+            assert!(panel.receiver.is_none());
+            panel.phase = applying;
+            assert!(!panel.key(key(KeyCode::Esc)));
+            assert!(!panel.body().is_empty());
+            let (tx, rx) = mpsc::channel();
+            panel.receiver = Some(rx);
+            panel.poll();
+            assert_eq!(panel.phase, applying);
+            tx.send(Ok(ack)).unwrap();
+            panel.poll();
+            assert_eq!(panel.phase, applied);
+            assert!(panel.body().contains("revision=8"));
+            assert!(panel.receiver.is_none());
+            panel.phase = applying;
+            let (tx, rx) = mpsc::channel();
+            panel.receiver = Some(rx);
+            drop(tx);
+            panel.poll();
+            assert_eq!(panel.phase, Phase::Indeterminate);
+            assert!(panel.body().contains("МОГЛО"));
+            panel.phase = checking;
+            panel.complete(Err(ManagementError::CandidateRejected));
+            assert!(matches!(panel.phase, Phase::QuotaRejected | Phase::RollbackUnavailable));
+        }
+    }
+
+    #[test]
+    fn rejected_and_ambiguous_operation_results_are_not_success_receipts() {
+        for (phase, rejected) in [
+            (Phase::CutoverApplying, Phase::CutoverRejected),
+            (Phase::RestartRollbackApplying, Phase::RestartRollbackUnavailable),
+            (Phase::QuotaApplying, Phase::QuotaRejected),
+            (Phase::RollbackApplying, Phase::Rejected),
+            (Phase::Applying, Phase::Rejected),
+        ] {
+            let mut panel = fake(Some([3; 32]), false);
+            panel.phase = phase;
+            panel.complete(Err(ManagementError::CandidateRejected));
+            assert_eq!(panel.phase, rejected);
+            assert!(!panel.body().contains("revision=8"));
+            panel.phase = phase;
+            panel.complete(Ok(StatusReply::Running { inbounds: 2 }));
+            assert_eq!(panel.phase, Phase::Indeterminate);
+        }
+        let mut panel = fake(Some([3; 32]), false);
+        panel.phase = Phase::CutoverChecking { revision: 7 };
+        panel.complete(Ok(StatusReply::RestartPreview { same_port: true, material_sha256: [5; 32] }));
+        assert!(panel.body().contains("Смена TLS на текущих портах"));
+        panel.phase = Phase::CutoverApplying;
+        panel.complete(Ok(StatusReply::RestartApplied { revision: 8 }));
+        assert_eq!(panel.phase, Phase::CutoverApplied { revision: 8 });
+        assert!(panel.body().contains("revision=8"));
+        panel.phase = Phase::RestartRollbackChecking;
+        panel.complete(Err(ManagementError::TimedOut));
+        assert_eq!(panel.phase, Phase::RestartRollbackUnavailable);
+        panel.phase = Phase::CutoverChecking { revision: 8 };
+        panel.complete(Err(ManagementError::CandidateRejected));
+        assert_eq!(panel.phase, Phase::CutoverRejected);
+    }
+
 }

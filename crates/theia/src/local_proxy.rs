@@ -1852,6 +1852,10 @@ mod selector_tests {
                     panic!("wrong security mode")
                 };
                 let current = managed.generation().await.unwrap();
+                let report = managed.runtime_report().await;
+                assert!(report.contains("Saved trust: совпадает"));
+                assert!(report.contains("last_open=ещё нет подтверждённого OPEN"));
+                assert!(report.contains(if socks_mode { "policy=h3" } else { "policy=h2" }));
                 managed_clients.push(managed.clone());
                 if let RealityCarrier::H3(h3) = &current.carrier {
                     // Use the production dispatcher and a real OPEN_OK
@@ -1937,6 +1941,8 @@ mod selector_tests {
                 let mut bytes = [0; 4];
                 stream.read_exact(&mut bytes).await.unwrap();
                 assert_eq!(&bytes, b"ping");
+                let report = managed_clients.last().unwrap().runtime_report().await;
+                assert!(report.contains(if socks_mode { "last_open=H3" } else { "last_open=H2" }));
                 established.push(stream);
                 proxies.push(proxy);
             }

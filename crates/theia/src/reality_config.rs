@@ -1222,4 +1222,55 @@ mod tests {
             Err(Error::Approval)
         ));
     }
+
+    #[test]
+    fn registered_rotation_preview_apply_and_stale_digest_are_guarded() {
+        let dir = Scratch::new();
+        let state = health();
+        let health_path = dir.0.join("health");
+        let bundle = dir.0.join("bundle");
+        Store::new(&health_path).unwrap().enroll(&state).unwrap();
+        let digest = state.snapshot_sha256().unwrap();
+        let record = crate::reality_provision::create(&state, digest, &bundle, 1000).unwrap();
+        let path = dir.0.join("server.toml");
+        std::fs::write(&path, include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))).unwrap();
+        let req = Request::Server(ServerRequest {
+            health: health_path.clone(), bundle: bundle.clone(), health_sha256: digest,
+            identity_sha256: record.identity_sha256, listen: "127.0.0.1:9443".parse().unwrap(),
+            grants: vec!["device-a".into()],
+        });
+        let prepared = prepare(&path, &req, 1000).unwrap();
+        let original: [u8;32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
+        assert_eq!(prepared.source_sha256(), original);
+        assert!(matches!(prepared.candidate(), Config::Server(_)));
+        apply(&path, &req, prepared.approval_sha256(), 1000).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let saved: [u8;32] = Sha256::digest(&bytes).into();
+        let id = "reality-edge";
+        assert!(runtime_status_command(&path, saved, id).is_ok());
+        assert!(runtime_status_command(&path, [0;32], id).is_err());
+        assert!(runtime_status_command(&path, saved, "missing").is_err());
+        assert!(RotationReview::prepare(&path, saved, id, true, 1001).is_err());
+        assert!(ExpiryReview::prepare(&path, saved, id, 1001).is_err());
+        let preview = RotationReview::prepare(&path, saved, id, false, 1001).unwrap();
+        assert!(preview.report().contains("fingerprint"));
+        let publication = crate::identity_publication::Publication::new(&bundle.join("publication.toml")).unwrap();
+        let before = publication.inspect(1001).unwrap();
+        assert!(before.next_fingerprint.is_none());
+        assert!(preview.apply(&path, [0;32], id, 1001).is_err());
+        assert_eq!(publication.inspect(1001).unwrap().snapshot_sha256, before.snapshot_sha256);
+        let preview = RotationReview::prepare(&path, saved, id, false, 1001).unwrap();
+        let stale = RotationReview::prepare(&path, saved, id, false, 1001).unwrap();
+        assert!(preview.apply(&path, saved, id, 1001).unwrap().contains("Ротация опубликована"));
+        assert!(stale.apply(&path, saved, id, 1001).is_err());
+        let after = publication.inspect(1001).unwrap();
+        assert_eq!(after.revision, 2);
+        assert!(after.next_fingerprint.is_some());
+        assert!(RotationReview::prepare(&path, saved, id, false, 1001).is_err());
+        assert!(RotationReview::prepare(&path, saved, id, true, 1001).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+
 }

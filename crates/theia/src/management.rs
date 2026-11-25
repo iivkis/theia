@@ -1835,3 +1835,153 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod strict_wire_matrix_tests {
+    use super::*;
+
+    // Independent peer verifies the actual request bytes before sending
+    // deliberately valid or invalid wire replies. No native endpoint or
+    // filesystem side effects are needed for parser boundary tests.
+    async fn peer(command: StatusCommand, request: &str, reply: &[u8]) -> Result<StatusReply, ManagementError> {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let send = async {
+            let mut received = vec![0; request.len()];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, request.as_bytes());
+            server.write_all(reply).await.unwrap();
+            server.shutdown().await.unwrap();
+        };
+        let (actual, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(exchange(client, command), send)
+        }).await.unwrap();
+        actual
+    }
+
+    #[tokio::test]
+    async fn client_status_requires_canonical_fields_and_exact_revision_cas() {
+        let hex = "ab".repeat(32);
+        let status = StatusCommand::ClientStatus;
+        for (d, t, f) in [(0, 0, false), (3, 2, true), (4, 3, false)] {
+            let response = format!("theia-client-v1 r=7 sha256={hex} d={d} t={t} f={}\n", u8::from(f));
+            assert_eq!(peer(status, "client-status\n", response.as_bytes()).await,
+                Ok(StatusReply::ClientRunning { revision: 7, config_sha256: [0xab; 32], descriptor_revision: d, transport: t, fallback: f }));
+        }
+        for response in [
+            format!("theia-client-v1 r=07 sha256={hex} d=0 t=0 f=0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=3 f=0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 f=1\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=1 t=1 f=0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=1 t=2 f=2\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=1 t=2 f=0 extra\n"),
+            format!("theia-client-v1 r=7 sha256={} d=1 t=2 f=0\n", hex.to_uppercase()),
+        ] {
+            assert_eq!(peer(status, "client-status\n", response.as_bytes()).await, Err(ManagementError::InvalidReply));
+        }
+        for (command, action, good, expected) in [
+            (StatusCommand::ClientPreview { expected_revision: 7, candidate_sha256: [0xab; 32] }, "preview", "ready r=7", StatusReply::ClientReady { revision: 7 }),
+            (StatusCommand::ClientApply { expected_revision: 7, candidate_sha256: [0xab; 32] }, "apply", "applied r=8", StatusReply::ClientApplied { revision: 8 }),
+        ] {
+            let request = format!("client-{action} rev=7 sha256={hex}\n");
+            let reply = format!("theia-client-v1 {good}\n");
+            assert_eq!(peer(command, &request, reply.as_bytes()).await, Ok(expected));
+            for (reply, error) in [
+                ("theia-client-v1 rejected\n", ManagementError::CandidateRejected),
+                ("ERR unsupported\n", ManagementError::Unsupported),
+                ("theia-client-v1 ready r=9\n", ManagementError::InvalidReply),
+                ("theia-client-v1 applied r=9\n", ManagementError::InvalidReply),
+                ("theia-client-v1 applied r=8 extra\n", ManagementError::InvalidReply),
+            ] {
+                assert_eq!(peer(command, &request, reply.as_bytes()).await, Err(error));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reality_status_is_bound_to_manifest_and_strictly_parsed() {
+        assert!(StatusCommand::reality_status("invalid id", [1; 32]).is_err());
+        assert!(StatusCommand::reality_status("edge", [0; 32]).is_err());
+        let command = StatusCommand::reality_status("edge", [0xab; 32]).unwrap();
+        let request = format!("reality-status id=edge manifest={}\n", "ab".repeat(32));
+        for (a, o) in [(0, false), (1, true), (2, false)] {
+            let reply = format!("theia-reality-v1 g=4 r=7 h=9 a={a} o={}\n", u8::from(o));
+            assert_eq!(peer(command, &request, reply.as_bytes()).await,
+                Ok(StatusReply::RealityRunning { generation: 4, revision: 7, health_revision: 9, active_reference: a, overlap: o }));
+        }
+        assert_eq!(peer(command, &request, b"theia-reality-v1 suspended\n").await, Ok(StatusReply::RealitySuspended));
+        assert_eq!(peer(command, &request, b"ERR unsupported\n").await, Err(ManagementError::Unsupported));
+        for reply in ["theia-reality-v1 g=0 r=7 h=9 a=0 o=0\n", "theia-reality-v1 g=4 r=7 h=9 a=3 o=0\n", "theia-reality-v1 g=4 r=7 h=9 a=0 o=2\n", "theia-reality-v1 g=4 r=7 h=9 a=0 o=0 extra\n"] {
+            assert_eq!(peer(command, &request, reply.as_bytes()).await, Err(ManagementError::InvalidReply));
+        }
+        assert_eq!(parse_reality_status(request.trim_end().as_bytes()), Some(("edge", [0xab; 32])));
+        for invalid in ["reality-status id=bad/id manifest=", "reality-status id=edge manifest="] {
+            assert!(parse_reality_status(invalid.as_bytes()).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_and_preview_receipts_cannot_claim_an_unapproved_revision() {
+        for (check, apply, verb, check_reply, apply_reply) in [
+            (StatusCommand::CheckRestartRollback, StatusCommand::ApplyRestartRollback { expected_revision: 7 }, "restart", StatusReply::RestartRollbackReady { revision: 7, remaining_seconds: 300 }, StatusReply::RestartRollbackApplied { revision: 8 }),
+            (StatusCommand::CheckAuthRollback, StatusCommand::ApplyAuthRollback { expected_revision: 7 }, "auth", StatusReply::AuthRollbackReady { revision: 7, remaining_seconds: 300 }, StatusReply::AuthRollbackApplied { revision: 8 }),
+            (StatusCommand::CheckTlsRollback, StatusCommand::ApplyTlsRollback { expected_revision: 7 }, "tls", StatusReply::TlsRollbackReady { revision: 7, remaining_seconds: 300 }, StatusReply::TlsRollbackApplied { revision: 8 }),
+        ] {
+            let check_request = format!("{verb}-rollback-check\n");
+            let apply_request = format!("{verb}-rollback-apply rev=7\n");
+            let prefix = format!("theia-{verb}-rollback-v1");
+            for (suffix, result) in [
+                ("ready revision=7 seconds=300", Ok(check_reply)),
+                ("ready revision=7 seconds=301", Err(ManagementError::InvalidReply)),
+                ("ready revision=07 seconds=1", Err(ManagementError::InvalidReply)),
+                ("unavailable", Err(ManagementError::CandidateRejected)),
+            ] {
+                assert_eq!(peer(check, &check_request, format!("{prefix} {suffix}\n").as_bytes()).await, result);
+            }
+            for (suffix, result) in [
+                ("applied revision=8", Ok(apply_reply)),
+                ("applied revision=7", Err(ManagementError::InvalidReply)),
+                ("applied revision=9", Err(ManagementError::InvalidReply)),
+                ("rejected", Err(ManagementError::CandidateRejected)),
+            ] {
+                assert_eq!(peer(apply, &apply_request, format!("{prefix} {suffix}\n").as_bytes()).await, result);
+            }
+            assert_eq!(peer(check, &check_request, b"ERR unsupported\n").await, Err(ManagementError::Unsupported));
+            assert_eq!(peer(apply, &apply_request, b"ERR unsupported\n").await, Err(ManagementError::Unsupported));
+        }
+        let command = StatusCommand::CheckRestartBound { expected_revision: 7, candidate_sha256: [0xab; 32] };
+        let request = format!("restart-preview rev=7 sha256={}\n", "ab".repeat(32));
+        for (mode, same_port) in [("fresh", false), ("same-port", true)] {
+            let reply = format!("theia-restart-preview-v1 {mode} sha256={}\n", "cd".repeat(32));
+            assert_eq!(peer(command, &request, reply.as_bytes()).await, Ok(StatusReply::RestartPreview { same_port, material_sha256: [0xcd; 32] }));
+        }
+        for (reply, error) in [
+            ("theia-restart-preview-v1 rejected\n", ManagementError::CandidateRejected),
+            ("ERR unsupported\n", ManagementError::Unsupported),
+            ("theia-restart-preview-v1 invalid sha256=00\n", ManagementError::InvalidReply),
+            ("theia-restart-preview-v1 fresh sha256=00\n", ManagementError::InvalidReply),
+        ] {
+            assert_eq!(peer(command, &request, reply.as_bytes()).await, Err(error));
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_server_refuses_mutation_and_unknown_reality_scope() {
+        for (command, expected) in [
+            (StatusCommand::CheckAuthRollback, Err(ManagementError::Unsupported)),
+            (StatusCommand::ApplyAuthRollback { expected_revision: 1 }, Err(ManagementError::Unsupported)),
+            (StatusCommand::CheckRestartRollback, Err(ManagementError::CandidateRejected)),
+            (StatusCommand::ApplyRestartRollback { expected_revision: 1 }, Err(ManagementError::Unsupported)),
+            (StatusCommand::CheckRestartBound { expected_revision: 1, candidate_sha256: [1; 32] }, Err(ManagementError::Unsupported)),
+            (StatusCommand::reality_status("edge", [1; 32]).unwrap(), Err(ManagementError::Unsupported)),
+            (StatusCommand::CheckQuota, Err(ManagementError::Unsupported)),
+            (StatusCommand::ApplyQuotaBound { expected_revision: 1, candidate_sha256: [1; 32] }, Err(ManagementError::Unsupported)),
+            (StatusCommand::ApplyRestartBound { expected_revision: 1, candidate_sha256: [1; 32], tls_sha256: [2; 32] }, Err(ManagementError::Unsupported)),
+            (StatusCommand::ApplyReloadBound { expected_revision: 1, candidate_sha256: [1; 32] }, Err(ManagementError::Unsupported)),
+        ] {
+            let (client, server) = tokio::io::duplex(1024);
+            let handle = tokio::spawn(handle_internal(server, 1, None, None, None, None));
+            assert_eq!(exchange(client, command).await, expected);
+            handle.await.unwrap().unwrap();
+        }
+    }
+}

@@ -586,4 +586,120 @@ mod tests {
         inactive.key(key(KeyCode::Char('s')));
         assert!(inactive.client_confirm.is_none() && inactive.client_run.is_none());
     }
+
+    fn finish(p: &mut StatusPanel) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while p.pending.is_some() {
+            p.poll();
+            assert!(std::time::Instant::now() < deadline, "local status worker deadline");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn offline_status_workers_fail_closed_and_never_publish_on_missing_config() {
+        let mut p = panel(true);
+        let nonexistent = std::env::temp_dir().join(format!("theia-missing-status-{}", std::process::id()));
+        assert!(!nonexistent.exists());
+        p.path = nonexistent.clone();
+        p.key(key(KeyCode::Char('r')));
+        assert!(p.pending.is_some());
+        assert!(p.body().contains("Ничего не применяется"));
+        p.start(None);
+        assert!(!p.key(key(KeyCode::Char('s'))));
+        assert!(p.client_confirm.is_none());
+        finish(&mut p);
+        assert!(p.body().contains("Операция не подтверждена"));
+        p.key(key(KeyCode::Char('h')));
+        finish(&mut p);
+        assert!(p.body().contains("Операция не подтверждена"));
+        for action in ['o', 'k'] {
+            p.key(key(KeyCode::Char(action)));
+            assert!(p.trust_input.is_some());
+            p.paste("private");
+            p.key(key(KeyCode::Backspace));
+            p.key(key(KeyCode::Char('x')));
+            p.paste("\x01");
+            p.paste(&"a".repeat(1025));
+            assert_eq!(p.trust_input.as_ref().unwrap().1, "privatx");
+            assert!(!p.body().contains("privatx"));
+            p.key(key(KeyCode::Enter));
+            finish(&mut p);
+            assert!(p.body().contains("Операция не подтверждена"));
+        }
+        p.server = true;
+        for action in ['t', 'p', 'e', 'r'] {
+            p.key(key(KeyCode::Char(action)));
+            finish(&mut p);
+            assert!(p.body().contains("Операция не подтверждена"));
+        }
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn runtime_stop_confirmation_and_disconnected_worker_are_observable() {
+        let mut p = panel(true);
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let (tx, done) = mpsc::channel();
+        p.client_run = Some(ClientRun {
+            stop: Some(stop), done,
+            report: std::sync::Arc::new(std::sync::Mutex::new("active-local".into())),
+        });
+        assert!(p.body().contains("active-local"));
+        assert!(!p.key(key(KeyCode::Esc)));
+        p.key(key(KeyCode::Char('x')));
+        assert!(p.body().contains("Открытые туннели"));
+        p.key(key(KeyCode::Char('n')));
+        assert!(matches!(stopped.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        p.key(key(KeyCode::Char('x')));
+        p.key(key(KeyCode::Char('y')));
+        assert_eq!(stopped.try_recv(), Ok(()));
+        assert!(p.body().contains("Остановка"));
+        tx.send(Ok(())).unwrap();
+        p.poll();
+        assert!(p.client_run.is_none());
+        assert!(p.body().contains("runtime остановлен"));
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let (tx, done) = mpsc::channel();
+        p.client_run = Some(ClientRun { stop: Some(stop), done, report: Default::default() });
+        drop(tx);
+        p.poll();
+        assert_eq!(stopped.try_recv(), Ok(()));
+        assert!(p.body().contains("ошибкой"));
+        let (tx, rx) = mpsc::channel();
+        p.pending = Some(rx);
+        p.committing = true;
+        assert!(p.body().contains("Подтверждённая запись"));
+        assert!(!p.key(key(KeyCode::Esc)));
+        p.poll();
+        assert!(p.committing);
+        drop(tx);
+        p.poll();
+        assert!(!p.committing);
+        assert!(p.body().contains("Операция не подтверждена"));
+        p.headless_review = Some(7);
+        assert!(p.body().contains("revision=7"));
+        p.key(key(KeyCode::Esc));
+        assert!(p.headless_review.is_none());
+    }
+
+    #[test]
+    fn client_start_with_missing_saved_profile_reports_failure_without_runtime() {
+        let mut p = panel(true);
+        p.path = std::env::temp_dir().join(format!("theia-missing-start-{}", std::process::id()));
+        assert!(!p.path.exists());
+        p.key(key(KeyCode::Char('s')));
+        assert!(p.body().contains("OS proxy не изменяется"));
+        p.key(key(KeyCode::Char('y')));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while p.client_run.is_some() {
+            p.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(p.body().contains("ошибкой"));
+        assert!(!p.path.exists());
+    }
+
+
 }
