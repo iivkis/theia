@@ -7,6 +7,7 @@ use crate::{
     client_import::{self, PrivateBearer},
     config::{self, Config, Transport, User, XhttpMode},
     invite::Invitation,
+    security_profile::SecurityMode,
     Role,
 };
 use sha2::{Digest, Sha256};
@@ -728,7 +729,7 @@ impl Editor {
                     .profiles
                     .get(self.selected_record)
                     .ok_or("Profile missing")?;
-                if profile.security_mode != "own-tls" {
+                if !profile.security_mode.is_plain() {
                     return Err("Для REALITY требуется отдельная процедура управления доверием.");
                 }
                 Ok(vec![String::new(), String::new()])
@@ -789,7 +790,7 @@ impl Editor {
                     server: fields[1].clone(),
                     server_name: fields[2].clone(),
                     auth_token: fields[4].clone(),
-                    security_mode: "own-tls".into(),
+                    security_mode: SecurityMode::Plain,
                     reality_profile: None,
                     xhttp_mode: Some(XhttpMode::Auto),
                     tls_ca: Some(fields[3].clone()),
@@ -891,7 +892,7 @@ impl Editor {
                     .profiles
                     .get_mut(self.selected_record)
                     .ok_or("Profile missing")?;
-                if profile.security_mode != "own-tls" || fields[0].is_empty() {
+                if !profile.security_mode.is_plain() || fields[0].is_empty() {
                     return Err("Требуется own-TLS и явная доверенная CA.");
                 }
                 profile.tls_ca = Some(fields[0].clone());
@@ -1147,7 +1148,7 @@ impl Editor {
                 .client
                 .profiles
                 .get(self.selected_record)
-                .is_some_and(|p| p.security_mode == "smart-reality"),
+                .is_some_and(|p| p.security_mode == SecurityMode::SmartReality),
         }
     }
 

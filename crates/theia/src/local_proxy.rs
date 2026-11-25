@@ -6,6 +6,7 @@ use crate::{
     diagnostics::{self, Value},
     h3_client::{H3Client, H3Tunnel},
     protocol::{self, Address, ErrorCode, Frame},
+    security_profile::SecurityMode,
 };
 use rustls::RootCertStore;
 use std::{
@@ -76,14 +77,15 @@ async fn load_client_with_budget(
     profile: &Profile,
     budget: Arc<Semaphore>,
 ) -> Result<ProxyClient, ClientError> {
-    if profile.security_mode != "own-tls" && profile.security_mode != "smart-reality" {
-        return Err(ClientError::Configuration);
-    }
-    if profile.security_mode == "smart-reality" || profile.reality_profile.is_some() {
-        return RealityClient::prepare_with_budget(profile, budget)
-            .await
-            .map(Arc::new)
-            .map(ProxyClient::Reality);
+    match profile.security_mode {
+        SecurityMode::SmartReality if profile.reality_profile.is_some() && profile.tls_ca.is_none() => {
+            return RealityClient::prepare_with_budget(profile, budget)
+                .await
+                .map(Arc::new)
+                .map(ProxyClient::Reality);
+        }
+        SecurityMode::Plain if profile.reality_profile.is_none() => {}
+        _ => return Err(ClientError::Configuration),
     }
     let prefix = profile
         .path_prefix
@@ -1250,7 +1252,7 @@ impl PreparedLocalProxy {
                 .client
                 .profiles
                 .iter()
-                .any(|p| p.id == id && p.security_mode == "smart-reality")
+                .any(|p| p.id == id && p.security_mode == SecurityMode::SmartReality)
         {
             return Err(ClientError::Configuration);
         }
@@ -2665,10 +2667,10 @@ mod selector_tests {
         invalid.auth_token = "file:relative".into();
         assert!(load_client(&invalid).await.is_err());
         invalid = profile.clone();
-        invalid.security_mode = "unknown".into();
+        invalid.security_mode = SecurityMode::SmartReality;
         assert!(load_client(&invalid).await.is_err());
         invalid = profile.clone();
-        invalid.security_mode = "browser-h2-btls-v1".into();
+        invalid.security_mode = SecurityMode::PinnedCertV1;
         assert!(load_client(&invalid).await.is_err());
         invalid.xhttp_mode = None;
         invalid.transport = Transport::H3;
@@ -2677,8 +2679,7 @@ mod selector_tests {
         assert!(load_client(&invalid).await.is_err());
         let mut pinned = profile.clone();
         pinned.xhttp_mode = None;
-        pinned.security_mode =
-            crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
+        pinned.security_mode = SecurityMode::PinnedCertStreamUpV1;
         assert!(load_client(&pinned).await.is_err());
         let mut automatic_mode = profile.clone();
         automatic_mode.xhttp_mode = Some(XhttpMode::Auto);

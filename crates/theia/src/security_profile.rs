@@ -23,6 +23,24 @@ pub enum SecurityMode {
 }
 
 impl SecurityMode {
+    /// Only these two names are part of the product configuration contract.
+    pub fn from_product_name(name: &str) -> Option<Self> {
+        match name {
+            "own-tls" => Some(Self::Plain),
+            "smart-reality" => Some(Self::SmartReality),
+            _ => None,
+        }
+    }
+
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Plain => "own-tls",
+            Self::SmartReality => "smart-reality",
+            Self::PinnedCertV1 => "pinned-cert-v1 (laboratory)",
+            Self::PinnedCertStreamUpV1 => "pinned-cert-stream-up-v1 (laboratory)",
+        }
+    }
+
     pub fn is_plain(&self) -> bool {
         *self == Self::Plain
     }
