@@ -73,11 +73,12 @@ struct Session {
     paths_opened: usize,
     closed_paths: HashSet<SocketAddr>,
     generation: Option<Arc<Lease>>,
+    reference_signer: Option<[u8;32]>,
 }
 impl Session {
     fn new(peer: SocketAddr, original: Cid, client: Cid, now: Instant) -> Self {
         Self { original, client, server: HashSet::new(), retry: None, retry_echoed: false, server_initial: false, first_peer: peer,
-            paths: HashMap::new(), deadline: now + LIFETIME, last: now, remaining: BYTES, paths_opened: 0, closed_paths: HashSet::new(), generation: None }
+            paths: HashMap::new(), deadline: now + LIFETIME, last: now, remaining: BYTES, paths_opened: 0, closed_paths: HashSet::new(), generation: None, reference_signer:None }
     }
     fn expired(&self, now: Instant) -> bool {
         now >= self.deadline || now.saturating_duration_since(self.last) >= IDLE || self.remaining == 0
@@ -100,6 +101,7 @@ impl Session {
     }
     fn allows_client(&self, peer: SocketAddr, datagram: &[u8]) -> bool {
         if let Some(h) = wire::long(datagram) {
+            if !wire::coherent_datagram(datagram){return false;}
             if peer != self.first_peer && !self.paths.contains_key(&peer) { return false; }
             if h.kind == Kind::Initial {
                 if datagram.len() < wire::MIN_INITIAL || h.scid != self.client { return false; }
@@ -123,6 +125,7 @@ impl Session {
     // relay cannot learn them from 1-RTT packets. Never guess a new CID length.
     fn observe_reference(&mut self, peer: SocketAddr, packet: &[u8]) -> bool {
         if let Some(h) = wire::long(packet) {
+            if !wire::coherent_datagram(packet){return false;}
             if h.dcid != self.client { return false; }
             if h.kind == Kind::VersionNegotiation {
                 return self.retry.is_none() && h.scid == self.original;
@@ -203,10 +206,10 @@ impl Retired {
     fn blocks(&self, peer: SocketAddr, bytes: &[u8], now: Instant) -> bool {
         if now >= self.until { return false; }
         if let Some(h) = wire::long(bytes) {
-            return self.peers.contains(&peer) && (h.dcid == self.original && h.scid == self.client
-                || self.server.contains(h.dcid));
+            return (self.peers.contains(&peer) && h.dcid == self.original && h.scid == self.client)
+                || self.server.contains(h.dcid);
         }
-        self.peers.contains(&peer) && self.server.iter().any(|cid| wire::short_matches(bytes,cid))
+        self.server.iter().any(|cid| wire::short_matches(bytes,cid))
     }
 }
 
@@ -240,12 +243,16 @@ fn wildcard(ip: IpAddr) -> SocketAddr {
 /// seen from a second address does not redirect or validate the old path.
 /// Responses return only to the physical peer owning this socket.
 async fn reference_path(
-    generation: Arc<Lease>, id: SessionId, peer: SocketAddr, deadline: Instant,
+    generation: Arc<Lease>, signer:[u8;32], id: SessionId, peer: SocketAddr, deadline: Instant,
     incoming: mpsc::Receiver<Vec<u8>>, replies: mpsc::Sender<Reply>,
 ) {
     let publication = generation.publication();
     let Ok(now)=crate::reference_health::unix_now() else { return; };
-    let Some(value)=crate::reality_live::relay_value(&generation,now) else { return; };
+    // A session pins the signer/reference selected at its creation. When
+    // overlap expires, a new path cannot silently switch to the successor's
+    // reference; if this exact descriptor is no longer valid, close the path.
+    let Ok(material)=publication.select(signer,now) else{return;};
+    let value=material.verified();
     let Ok(Ok(lease)) = timeout(DNS_DEADLINE,
         generation.health().relay_lease(value, publication.plan_sha256())).await else { return; };
     let Ok(address) = lease.address() else { return; };
@@ -500,12 +507,12 @@ impl PreparedQuic {
         let (tx, rx) = mpsc::channel(QUEUE);
         session.paths.insert(peer, Path { queue: tx, budget: Budget::default(), last: Instant::now() });
         session.paths_opened += 1;
-        let Some(generation) = session.generation.clone() else { session.paths.remove(&peer); return false; };
+        let (Some(generation),Some(signer))=(session.generation.clone(),session.reference_signer) else { session.paths.remove(&peer); return false; };
         let deadline = session.deadline;
         let replies = replies.clone();
         workers.spawn(async move {
             let _slot = slot;
-            reference_path(generation, id, peer, deadline, rx, replies).await;
+            reference_path(generation, signer, id, peer, deadline, rx, replies).await;
         });
         true
     }
@@ -600,7 +607,7 @@ impl PreparedQuic {
                     if h.kind != Kind::Initial || n < wire::MIN_INITIAL || h.dcid.len() < 8 { continue; }
                     // A known but ambiguous long-header CID must not
                     // silently allocate a second reference session.
-                    if sessions.values().any(|s| s.known(data) && s.paths.contains_key(&peer)) { continue; }
+                    if sessions.values().any(|s| s.known(data)) { continue; }
                     let key = (peer, h.dcid.to_vec());
                     if !pending.contains_key(&key) {
                         if pending.len() + sessions.len() >= SESSIONS { continue; }
@@ -630,12 +637,14 @@ impl PreparedQuic {
                         admitted.insert(key,(p.client,now+LIFETIME));
                         for packet in p.datagrams{let _=self.local.try_send((peer,packet));}
                     }else{
-                        if generation.relay_value(wall).is_none(){continue;}
+                        let Some(value)=generation.relay_value(wall) else{continue;};
+                        let signer=value.signer();
                         if sessions.len() + retired.len() >= RETIRED_LIMIT { continue; }
                         let Some(next) = sequence.checked_add(1) else { return Err(ServerError::Io); };
                         sequence = next;
                         let mut s = Session::new(peer, h.dcid.to_vec(), p.client, now);
                         s.generation=Some(generation.lease.clone());
+                        s.reference_signer=Some(signer);
                         if !self.open_path(&mut workers, &reply_tx, sequence, &mut s, peer) { continue; }
                         for packet in p.datagrams { s.enqueue(peer, packet, now); }
                         sessions.insert(sequence, s);
@@ -776,6 +785,24 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_packets_cannot_cross_connection_boundaries(){
+        fn packet(dcid:u8)->Vec<u8>{
+            let mut p=vec![0xe0,0,0,0,1,8];p.extend_from_slice(&[dcid;8]);
+            p.push(8);p.extend_from_slice(&[2;8]);p.push(17);p.extend_from_slice(&[0;17]);p
+        }
+        let mut bytes=packet(3);
+        bytes.extend(packet(3));
+        assert!(wire::coherent_datagram(&bytes));
+        bytes.extend(packet(4));
+        assert!(!wire::coherent_datagram(&bytes));
+        let mut bytes=packet(3);
+        bytes.extend([0x40]);bytes.extend([3;8]);bytes.extend([0;17]);
+        assert!(wire::coherent_datagram(&bytes));
+        let last=packet(3).len()+1;bytes[last]=4;
+        assert!(!wire::coherent_datagram(&bytes));
+    }
+
+    #[test]
     fn retirement_is_bounded_and_dead_path_cannot_reset_credit() {
         let p = peer(10);
         let mut s = session(p, &[3;8]);
@@ -786,7 +813,7 @@ mod tests {
         let retired = Retired::from_session(s,now);
         let known = [0x40,3,3,3,3,3,3,3,3,0];
         assert!(retired.blocks(p,&known,now));
-        assert!(!retired.blocks(peer(20),&known,now));
+        assert!(retired.blocks(peer(20),&known,now));
         assert!(!retired.blocks(p,&known,now+RETIRED_TTL));
     }
 

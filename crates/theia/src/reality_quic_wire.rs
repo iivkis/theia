@@ -76,6 +76,29 @@ pub(crate) fn long(bytes: &[u8]) -> Option<Long<'_>> {
     Some(Long { kind, dcid, scid, token, pn: pos, end })
 }
 
+/// Every packet in a coalesced datagram must have the same destination
+/// CID. A trailing short header consumes the rest. No encrypted packet is
+/// interpreted as an authenticated control frame. Retry/VN are standalone.
+pub(crate) fn coherent_datagram(bytes:&[u8])->bool{
+    let Some(first)=long(bytes) else{return false;};
+    if matches!(first.kind,Kind::Retry|Kind::VersionNegotiation){return true;}
+    let mut offset=first.end;
+    let mut packets=1;
+    while offset<bytes.len(){
+        packets+=1;
+        if packets>64{return false;}
+        let tail=&bytes[offset..];
+        if tail[0]&0x80==0{
+            return tail.len()>=1+first.dcid.len()+17 &&
+                tail.get(1..1+first.dcid.len())==Some(first.dcid);
+        }
+        let Some(next)=long(tail)else{return false;};
+        if next.dcid!=first.dcid||matches!(next.kind,Kind::Retry|Kind::VersionNegotiation){return false;}
+        offset+=next.end;
+    }
+    true
+}
+
 pub(crate) fn short_matches(bytes: &[u8], cid: &[u8]) -> bool {
     !cid.is_empty() && bytes.first().is_some_and(|b| b & 0x80 == 0)
         && bytes.get(1..1 + cid.len()) == Some(cid)
@@ -185,7 +208,7 @@ impl Flight {
             scid: header.scid.to_vec(), largest: None, crypto: vec![None; MAX_CRYPTO], contiguous: 0 })
     }
     pub fn inspect(&mut self, datagram: &[u8]) -> Inspection {
-        if datagram.len() < MIN_INITIAL { return Inspection::Invalid; }
+        if datagram.len() < MIN_INITIAL || !coherent_datagram(datagram) { return Inspection::Invalid; }
         let mut offset = 0;
         let mut seen = false;
         while offset < datagram.len() {
