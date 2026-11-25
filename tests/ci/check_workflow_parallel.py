@@ -378,4 +378,10 @@ require("test_benchmark_ports.py" in spec and "test_benchmark_ports.py" in brows
         "native benchmark transport-specific port reservation regressions remain mandatory")
 require("native_clients_require_pki_and_exact_alpn -- --ignored --exact" in browser,
         "independent native-client TLS trust and ALPN matrix must remain mandatory")
+require("ref: 917417b09f209334939c38551112081c480eb958" in browser
+        and "path: .f19-baseline" in browser
+        and "THEIA_F19_BASELINE_BIN" in browser
+        and "f19-comparison.json" in browser
+        and "--require-comparison --policy tests/benchmark/f19-diagnostic-policy.json" in browser,
+        "isolated exact pre-batch overhead comparison remains mandatory")
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")

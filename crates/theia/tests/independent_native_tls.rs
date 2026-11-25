@@ -1,5 +1,8 @@
 //! Independent peer matrix: real production client constructors, strict trust,
 //! exact ALPN and no HTTP body before admission. Controlled loopback only.
+#[path = "support/private_pem.rs"]
+mod private_pem;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rustls::RootCertStore;
 use std::{
@@ -42,7 +45,7 @@ async fn native_clients_require_pki_and_exact_alpn() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let unrelated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         fs::write(scratch.0.join("cert.pem"), cert.cert.pem()).unwrap();
-        fs::write(scratch.0.join("key.pem"), cert.key_pair.serialize_pem()).unwrap();
+        private_pem::write_new_key(&scratch.0.join("key.pem"), cert.key_pair.serialize_pem());
         let mut trusted = RootCertStore::empty();
         trusted.add(cert.cert.der().clone()).unwrap();
         let mut wrong = RootCertStore::empty();

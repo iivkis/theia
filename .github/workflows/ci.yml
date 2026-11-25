@@ -494,6 +494,23 @@ jobs:
           $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
           Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "perf-baseline-$name")
           "THEIA_PERF_BASELINE_BIN=$(Join-Path $env:RUNNER_TEMP "perf-baseline-$name")" >> $env:GITHUB_ENV
+      - name: Checkout exact pre-batch F-19 comparison reference
+        uses: actions/checkout@v4
+        with:
+          ref: 917417b09f209334939c38551112081c480eb958
+          path: .f19-baseline
+          persist-credentials: false
+      - name: Build exact pre-batch native reference
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git -C .f19-baseline rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne '917417b09f209334939c38551112081c480eb958') { throw 'Wrong F-19 reference SHA' }
+          cargo build --manifest-path .f19-baseline/Cargo.toml --locked --bin theia --target-dir target
+          if ($LASTEXITCODE -ne 0) { throw 'F-19 baseline build failed' }
+          $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
+          Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "f19-baseline-$name")
+          "THEIA_F19_BASELINE_BIN=$(Join-Path $env:RUNNER_TEMP "f19-baseline-$name")" >> $env:GITHUB_ENV
       - name: Verify Chromium navigation through the built Theia client
         run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5 -- --ignored --exact --nocapture
       - name: Verify Chromium navigation over the explicit Theia H3 transport
@@ -543,6 +560,24 @@ jobs:
         with:
           name: native-comparison-${{ matrix.os }}
           path: native-comparison.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Measure isolated pre-batch vs candidate native overhead
+        env:
+          THEIA_PERF_TESTED_SHA: ${{ needs.specification.outputs.tested_sha }}
+          THEIA_PERF_BASELINE_SHA: 917417b09f209334939c38551112081c480eb958
+          THEIA_PERF_OUTPUT: ${{ github.workspace }}/f19-comparison.json
+        shell: pwsh
+        run: |
+          $env:THEIA_PERF_BASELINE_BIN = $env:THEIA_F19_BASELINE_BIN
+          cargo test --workspace --locked --test performance_evidence native_binary_performance_comparison -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'F-19 controlled measurement failed' }
+      - name: Evaluate isolated overhead without claiming classification or release acceptance
+        run: python tests/benchmark/check_native_performance.py f19-comparison.json --expected-revision "${{ needs.specification.outputs.tested_sha }}" --expected-platform "${{ runner.os }}" --require-comparison --policy tests/benchmark/f19-diagnostic-policy.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f19-comparison-${{ matrix.os }}
+          path: f19-comparison.json
           if-no-files-found: error
           retention-days: 7
       - name: Build genuine Linux server for Windows cross-OS F-14 E2E
