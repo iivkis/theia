@@ -54,6 +54,7 @@ pub(crate) struct StatusPanel {
     credential_review: Option<(PathBuf, [u8; 32], u64)>,
     refreshed_editor: Option<Editor>,
     reopen_required: bool,
+    action_focus: usize,
 }
 impl StatusPanel {
     pub(crate) fn open(editor: &Editor) -> Self {
@@ -78,6 +79,7 @@ impl StatusPanel {
             credential_review: None,
             refreshed_editor: None,
             reopen_required: false,
+            action_focus: 0,
         };
         panel.start(None);
         panel
@@ -397,7 +399,62 @@ impl StatusPanel {
         self.client_run.is_some() && self.client_confirm.is_none()
     }
 
-    pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
+    pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if self.reopen_required || self.pending.is_some() || self.committing
+            || self.review.is_some() || self.expiry_review.is_some()
+            || self.client_confirm.is_some() || self.credential_input.is_some()
+            || self.credential_review.is_some() || self.headless_review.is_some()
+            || self.trust_input.is_some() || self.trust_review.is_some() {
+            return Vec::new();
+        }
+        if let Some(run) = &self.client_run {
+            return if run.stop.is_some() {
+                vec![ActionItem { key: 'x', label: "Остановить подключение" }]
+            } else { Vec::new() };
+        }
+        let mut items = Vec::new();
+        if !self.server && self.client_active {
+            items.push(ActionItem { key: 's', label: "запустить локальный runtime" });
+            items.push(ActionItem { key: 'h', label: "headless Apply" });
+        }
+        items.push(ActionItem { key: 'r', label: "Обновить состояние" });
+        if self.server {
+            items.extend([
+                ActionItem { key: 't', label: "Начать ротацию identity" },
+                ActionItem { key: 'p', label: "Отозвать старый ключ" },
+                ActionItem { key: 'e', label: "Восстановить descriptor" },
+            ]);
+        } else if self.reality {
+            items.extend([
+                ActionItem { key: 'o', label: "Восстановить доверие" },
+                ActionItem { key: 'k', label: "Плановый переход identity" },
+                ActionItem { key: 'c', label: "Обновить credential" },
+            ]);
+        }
+        items
+    }
+    pub(crate) fn action_focus(&self) -> usize { self.action_focus }
+    pub(crate) fn select_action(&mut self, index: usize) {
+        if index < self.actions().len() { self.action_focus = index; }
+    }
+    pub(crate) fn summary(&self) -> String {
+        if let Some(run) = &self.client_run {
+            let status = run.report.lock().map(|s| s.clone()).unwrap_or_else(|_| "Статус недоступен".into());
+            return format!("{status}\n\nEsc: свернуть, подключение продолжит работу.");
+        }
+        let mut summary = self.report.clone();
+        if !self.server && !self.client_active {
+            summary.push_str("\n\nДля запуска сначала выберите активный профиль.");
+        }
+        summary.push_str("\n\nEsc: назад.");
+        summary
+    }
+
+    pub(crate) fn key(&mut self, mut key: KeyEvent) -> bool {
+        let items = self.actions();
+        let Some(code) = crate::tui_widgets::action_key(&items, &mut self.action_focus, key.code) else { return false; };
+        key.code = code;
         if self.reopen_required {
             return key.code == KeyCode::Esc;
         }
@@ -730,6 +787,7 @@ mod tests {
             credential_review: None,
             refreshed_editor: None,
             reopen_required: false,
+            action_focus: 0,
         }
     }
     #[test]
