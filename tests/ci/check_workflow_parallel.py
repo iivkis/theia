@@ -129,7 +129,7 @@ require("always() && " + dev_merge in gate,
         "final gate must share the exact dev merge guard")
 require(workflow.count("ref: ${{ github.event.pull_request.merge_commit_sha }}") == 1
         and workflow.count("actions/checkout@v4") ==
-        2 + workflow.count("ref: ${{ needs.specification.outputs.tested_sha }}")
+        3 + workflow.count("ref: ${{ needs.specification.outputs.tested_sha }}")
         and "ref: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d" in job("browser-e2e")
         and "path: .perf-baseline" in job("browser-e2e"),
         "only specification checks out merge; all native jobs pin the exact published SHA")
