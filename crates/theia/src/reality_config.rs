@@ -176,6 +176,58 @@ pub(crate) fn first_server_candidate(r: &ServerRequest, now: u64) -> Result<Conf
     Ok(candidate)
 }
 
+fn approved_client_profile(r: &ClientRequest, now: u64) -> Result<(Profile, crate::descriptor::Verified), Error> {
+    if !config::valid_id(&r.id) {
+        return Err(Error::Scope);
+    }
+    let (profile, enrollment_sha256) = bootstrap::Profile::read_snapshot(&r.enrollment)?;
+    if !bool::from(profile.enrollment_identity()?.ct_eq(&r.identity_sha256)) {
+        return Err(Error::Approval);
+    }
+    let value = profile.load(now)?;
+    let policy = profile.policy();
+    let host = profile.endpoint().rsplit_once(':').ok_or(Error::Scope)?.0;
+    let entry = Profile {
+        id: r.id.clone(),
+        path_prefix: None,
+        server: profile.endpoint().to_owned(),
+        server_name: host.to_owned(),
+        auth_token: profile.credential_reference().to_owned(),
+        security_mode: SecurityMode::SmartReality,
+        reality_profile: Some(RealityClientBinding {
+            enrollment: path_string(&r.enrollment)?,
+            enrollment_sha256,
+            identity_sha256: r.identity_sha256,
+        }),
+        xhttp_mode: Some(policy.xhttp_mode),
+        tls_ca: None,
+        transport: policy.transport,
+        quic_connect_timeout_ms: 1600,
+        quic_negative_cache_ttl_s: 900,
+    };
+    Ok((entry, value))
+}
+
+pub(crate) fn first_client_candidate(r: &ClientRequest, now: u64) -> Result<Config, Error> {
+    let (profile, _) = approved_client_profile(r, now)?;
+    let candidate = Config::Client(config::ClientDocument {
+        schema_version: 1,
+        management: config::Management { ipc: "auto".into(), log_level: "info".into() },
+        ui: config::Ui { language: "ru".into() },
+        client: config::ClientSettings {
+            active_profile: r.id.clone(),
+            profiles: vec![profile],
+            proxy: config::LocalProxy {
+                http_listen: "127.0.0.1:7890".into(),
+                socks5_listen: "127.0.0.1:7891".into(),
+                system_proxy: config::SystemProxy::Off,
+            },
+        },
+    });
+    candidate.validate().map_err(|_| Error::Format)?;
+    Ok(candidate)
+}
+
 /// Read and validate exactly one config snapshot plus the corresponding
 /// independent enrollment or complete initial server receipt. The returned
 /// config is immutable; no listener, proxy, grant runtime or file is changed.
@@ -259,34 +311,12 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
             if !config::valid_id(&r.id) || document.client.profiles.iter().any(|p| p.id == r.id) {
                 return Err(Error::Scope);
             }
-            let (profile, enrollment_sha256) = bootstrap::Profile::read_snapshot(&r.enrollment)?;
-            if !bool::from(profile.enrollment_identity()?.ct_eq(&r.identity_sha256)) {
-                return Err(Error::Approval);
-            }
-            let value = profile.load(now)?;
-            let policy = profile.policy();
-            let host = profile.endpoint().rsplit_once(':').ok_or(Error::Scope)?.0;
-            document.client.profiles.push(Profile {
-                id: r.id.clone(),
-                path_prefix: None,
-                server: profile.endpoint().to_owned(),
-                server_name: host.to_owned(),
-                auth_token: profile.credential_reference().to_owned(),
-                security_mode: SecurityMode::SmartReality,
-                reality_profile: Some(RealityClientBinding {
-                    enrollment: path_string(&r.enrollment)?,
-                    enrollment_sha256,
-                    identity_sha256: r.identity_sha256,
-                }),
-                xhttp_mode: Some(policy.xhttp_mode),
-                tls_ca: None,
-                transport: policy.transport,
-                quic_connect_timeout_ms: 1600,
-                quic_negative_cache_ttl_s: 900,
-            });
+            let (profile, value) = approved_client_profile(r, now)?;
+            let endpoint = profile.server.clone();
+            document.client.profiles.push(profile);
             let modes = value.effective_modes();
             let report = format!("Register REALITY profile (saved configuration only)\nprofile={}\nendpoint={}\nidentity_sha256={}\nrevision={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nActive profile and proxy remain unchanged. Selected profile can be started after preflight; the current process is unchanged.",
-                r.id, profile.endpoint(), hex(bootstrap::fingerprint(value.signer())), value.descriptor().revision,
+                r.id, endpoint, hex(bootstrap::fingerprint(value.signer())), value.descriptor().revision,
                 modes.h2, modes.h3, modes.stream_one, modes.stream_up);
             (report, value.payload_sha256())
         }
