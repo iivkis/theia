@@ -1,8 +1,11 @@
 //! The TUI owns only servers it explicitly starts. External service status
 //! and guarded Apply remain in tui_runtime; never kill an arbitrary PID.
-use crate::{Role, server::ServerError, tui_editor::Editor};
-use std::{sync::mpsc::{self, Receiver, TryRecvError}, thread::JoinHandle};
+use crate::{server::ServerError, tui_editor::Editor, Role};
 use crossterm::event::KeyCode;
+use std::{
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread::JoinHandle,
+};
 
 struct Worker {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -13,7 +16,9 @@ struct Worker {
 }
 impl Worker {
     fn request_stop(&mut self) {
-        if let Some(stop) = self.stop.take() { let _ = stop.send(()); }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
     }
 }
 impl Drop for Worker {
@@ -21,7 +26,9 @@ impl Drop for Worker {
         self.request_stop();
         // Dropping the TUI after an I/O failure still requests bounded drain.
         // No detached thread or claim that an unconfirmed stop has succeeded.
-        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -32,10 +39,16 @@ pub(crate) struct ProcessPanel {
 }
 impl ProcessPanel {
     pub(crate) fn new() -> Self {
-        Self { worker: None, confirm: None, notice: "Сервер этой панели не запущен.".into() }
+        Self {
+            worker: None,
+            confirm: None,
+            notice: "Сервер этой панели не запущен.".into(),
+        }
     }
 
-    pub(crate) fn running(&self) -> bool { self.worker.is_some() }
+    pub(crate) fn running(&self) -> bool {
+        self.worker.is_some()
+    }
 
     fn start(&mut self, editor: &Editor) {
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -45,7 +58,10 @@ impl ProcessPanel {
         }
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
-            if self.worker.is_some() || editor.role() != Role::Server || editor.require_clean_records().is_err() {
+            if self.worker.is_some()
+                || editor.role() != Role::Server
+                || editor.require_clean_records().is_err()
+            {
                 self.notice = "Сначала откройте и сохраните серверную конфигурацию.".into();
                 return;
             }
@@ -54,15 +70,29 @@ impl ProcessPanel {
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let (ready_tx, ready) = tokio::sync::oneshot::channel();
             let (tx, done) = mpsc::channel();
-            let thread = std::thread::Builder::new().name("theia-tui-server".into()).spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread().enable_all().build()
-                    .map_err(|_| ServerError::Io)
-                    .and_then(|runtime| runtime.block_on(crate::server::run_tui_file(&path, digest, ready_tx, stopped)));
-                let _ = tx.send(result);
-            });
+            let thread = std::thread::Builder::new()
+                .name("theia-tui-server".into())
+                .spawn(move || {
+                    let result = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| ServerError::Io)
+                        .and_then(|runtime| {
+                            runtime.block_on(crate::server::run_tui_file(
+                                &path, digest, ready_tx, stopped,
+                            ))
+                        });
+                    let _ = tx.send(result);
+                });
             match thread {
                 Ok(thread) => {
-                    self.worker = Some(Worker { stop: Some(stop), ready, done, thread: Some(thread), inbounds: None });
+                    self.worker = Some(Worker {
+                        stop: Some(stop),
+                        ready,
+                        done,
+                        thread: Some(thread),
+                        inbounds: None,
+                    });
                     self.notice = "Проверяются TOML, TLS, права и слушатели...".into();
                 }
                 Err(_) => self.notice = "Не удалось запустить рабочий поток сервера.".into(),
@@ -71,9 +101,13 @@ impl ProcessPanel {
     }
 
     pub(crate) fn poll(&mut self) {
-        let Some(worker) = self.worker.as_mut() else { return; };
+        let Some(worker) = self.worker.as_mut() else {
+            return;
+        };
         if worker.inbounds.is_none() {
-            if let Ok(count) = worker.ready.try_recv() { worker.inbounds = Some(count); }
+            if let Ok(count) = worker.ready.try_recv() {
+                worker.inbounds = Some(count);
+            }
         }
         let result = match worker.done.try_recv() {
             Ok(value) => Some(value),
@@ -97,8 +131,11 @@ impl ProcessPanel {
                 KeyCode::Char('y') => {
                     self.confirm = None;
                     if start {
-                        if let Some(editor) = editor { self.start(editor); }
-                        else { self.notice = "Сначала откройте серверный TOML (F3).".into(); }
+                        if let Some(editor) = editor {
+                            self.start(editor);
+                        } else {
+                            self.notice = "Сначала откройте серверный TOML (F3).".into();
+                        }
                     } else if let Some(worker) = self.worker.as_mut() {
                         worker.request_stop();
                     }
@@ -111,10 +148,13 @@ impl ProcessPanel {
         match key {
             KeyCode::Esc => true,
             KeyCode::Char('s') if self.worker.is_none() => {
-                if editor.is_some_and(|e| e.role() == Role::Server && e.require_clean_records().is_ok()) {
+                if editor
+                    .is_some_and(|e| e.role() == Role::Server && e.require_clean_records().is_ok())
+                {
                     self.confirm = Some(true);
                 } else {
-                    self.notice = "Нужен сохранённый серверный TOML; F3 открыть, Ctrl+S сохранить.".into();
+                    self.notice =
+                        "Нужен сохранённый серверный TOML; F3 открыть, Ctrl+S сохранить.".into();
                 }
                 false
             }
@@ -144,11 +184,20 @@ impl ProcessPanel {
             };
         }
         let report = match &self.worker {
-            Some(w) if w.stop.is_none() => "Остановка: admission закрывается, ожидается завершение задач.".into(),
-            Some(w) if w.inbounds.is_some() => format!("Сервер запущен. Inbound: {}.\nСостояние относится только к этому экземпляру.", w.inbounds.unwrap_or(0)),
+            Some(w) if w.stop.is_none() => {
+                "Остановка: admission закрывается, ожидается завершение задач.".into()
+            }
+            Some(w) if w.inbounds.is_some() => format!(
+                "Сервер запущен. Inbound: {}.\nСостояние относится только к этому экземпляру.",
+                w.inbounds.unwrap_or(0)
+            ),
             _ => self.notice.clone(),
         };
-        let actions = if self.running() { "x: остановить (подтверждение)" } else { "s: запустить (подтверждение)" };
+        let actions = if self.running() {
+            "x: остановить (подтверждение)"
+        } else {
+            "s: запустить (подтверждение)"
+        };
         format!("{report}\n\n{actions} • Esc: назад (не останавливает сервер)\nДля внешнего headless сервиса: статус v / локальный IPC.\nВыход из TUI требует предварительной остановки принадлежащего ему сервера.")
     }
 }

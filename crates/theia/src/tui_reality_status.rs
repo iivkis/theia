@@ -390,8 +390,12 @@ impl StatusPanel {
             let _ = tx.send(result);
         });
     }
-    pub(crate) fn local_running(&self) -> bool { self.client_run.is_some() }
-    pub(crate) fn can_minimize(&self) -> bool { self.client_run.is_some() && self.client_confirm.is_none() }
+    pub(crate) fn local_running(&self) -> bool {
+        self.client_run.is_some()
+    }
+    pub(crate) fn can_minimize(&self) -> bool {
+        self.client_run.is_some() && self.client_confirm.is_none()
+    }
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.reopen_required {

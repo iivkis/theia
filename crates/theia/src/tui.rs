@@ -11,20 +11,21 @@ use crate::{
     tui_domain::DomainPanel,
     tui_editor::{Editor, RecordAction, RecordReview},
     tui_menu::{Action as MenuAction, ConfigDialog, Menu},
-    tui_server_process::ProcessPanel,
     tui_probe::ProbePanel,
     tui_reality_enroll::EnrollmentPanel,
     tui_reality_provision::ProvisionPanel,
     tui_reality_register::RegistrationPanel,
     tui_reality_status::StatusPanel,
     tui_runtime::RuntimePanel,
+    tui_server_process::ProcessPanel,
     Role,
 };
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, DisableMouseCapture, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -173,8 +174,14 @@ impl Model {
                 self.screen = Screen::Client;
                 false
             }
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down if self.screen == Screen::Home => {
-                self.selected = if self.selected == Role::Server { Role::Client } else { Role::Server };
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
+                if self.screen == Screen::Home =>
+            {
+                self.selected = if self.selected == Role::Server {
+                    Role::Client
+                } else {
+                    Role::Server
+                };
                 false
             }
             KeyCode::Tab | KeyCode::BackTab if self.screen != Screen::Help => {
@@ -574,7 +581,6 @@ impl Interaction {
         self.editor.as_ref().filter(|edit| edit.role() == role)
     }
 
-
     fn panel_role(model: &Model) -> Option<Role> {
         match model.screen {
             Screen::Server => Some(Role::Server),
@@ -583,14 +589,25 @@ impl Interaction {
         }
     }
     fn open_config(&mut self, role: Role) {
-        if self.editor.as_ref().is_some_and(|e| e.dirty() || e.write_uncertain()) {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.dirty() || e.write_uncertain())
+        {
             if let Some(editor) = self.editor.as_mut() {
-                editor.error = Some("Сначала сохраните черновик; при неопределённой записи проверьте файл.".into());
+                editor.error = Some(
+                    "Сначала сохраните черновик; при неопределённой записи проверьте файл.".into(),
+                );
             }
             return;
         }
         if (role == Role::Server && self.server_process.running())
-            || (role == Role::Client && self.client_background.as_ref().is_some_and(StatusPanel::local_running)) {
+            || (role == Role::Client
+                && self
+                    .client_background
+                    .as_ref()
+                    .is_some_and(StatusPanel::local_running))
+        {
             if role == Role::Server {
                 self.show_server_process = true;
             } else {
@@ -598,8 +615,13 @@ impl Interaction {
             }
             return;
         }
-        if role == Role::Client { self.client_background = None; }
-        self.config_dialog = Some(ConfigDialog::new(role, self.editor_for(role).map(Editor::saved_path)));
+        if role == Role::Client {
+            self.client_background = None;
+        }
+        self.config_dialog = Some(ConfigDialog::new(
+            role,
+            self.editor_for(role).map(Editor::saved_path),
+        ));
     }
 
     fn poll_navigation(&mut self, model: &mut Model) {
@@ -617,7 +639,9 @@ impl Interaction {
                             self.update(model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                         }
                         Err(message) => {
-                            if let Some(editor) = self.editor.as_mut() { editor.error = Some(message.into()); }
+                            if let Some(editor) = self.editor.as_mut() {
+                                editor.error = Some(message.into());
+                            }
                             self.importing = Some(ImportFlow::Input(scan.source));
                         }
                     }
@@ -625,8 +649,12 @@ impl Interaction {
             }
         }
         self.server_process.poll();
-        if let Some(monitor) = self.traffic_monitor.as_mut() { monitor.poll(); }
-        if let Some(background) = self.client_background.as_mut() { background.poll(); }
+        if let Some(monitor) = self.traffic_monitor.as_mut() {
+            monitor.poll();
+        }
+        if let Some(background) = self.client_background.as_mut() {
+            background.poll();
+        }
         if let Some(dialog) = self.config_dialog.as_mut() {
             let role = dialog.role;
             if let Some(editor) = dialog.poll() {
@@ -640,17 +668,29 @@ impl Interaction {
     /// Mouse interaction is confined to harmless selection and navigation.
     /// No click is translated into a save, Apply, start, reveal or confirmation.
     fn workspace_visible(&self) -> bool {
-        let clear = self.menu.is_none() && self.config_dialog.is_none()
-            && !self.show_server_process && self.traffic_monitor.is_none()
-            && self.issuance.is_none() && self.revocation.is_none()
-            && self.importing.is_none() && self.qr_scan.is_none()
-            && self.records.is_none() && self.discovery.is_none()
-            && self.candidates.is_none() && self.candidate_batch.is_none()
-            && self.domain.is_none() && self.probe.is_none()
-            && self.reality_provision.is_none() && self.reality_enrollment.is_none()
-            && self.reality_registration.is_none() && self.reality_status.is_none()
-            && self.runtime.is_none() && self.pending.is_none()
-            && self.saving.is_none() && self.exporting.is_none() && self.sharing.is_none()
+        let clear = self.menu.is_none()
+            && self.config_dialog.is_none()
+            && !self.show_server_process
+            && self.traffic_monitor.is_none()
+            && self.issuance.is_none()
+            && self.revocation.is_none()
+            && self.importing.is_none()
+            && self.qr_scan.is_none()
+            && self.records.is_none()
+            && self.discovery.is_none()
+            && self.candidates.is_none()
+            && self.candidate_batch.is_none()
+            && self.domain.is_none()
+            && self.probe.is_none()
+            && self.reality_provision.is_none()
+            && self.reality_enrollment.is_none()
+            && self.reality_registration.is_none()
+            && self.reality_status.is_none()
+            && self.runtime.is_none()
+            && self.pending.is_none()
+            && self.saving.is_none()
+            && self.exporting.is_none()
+            && self.sharing.is_none()
             && self.clipboard.is_none()
             && !self.editor.as_ref().is_some_and(|e| e.editing);
         #[cfg(windows)]
@@ -659,31 +699,60 @@ impl Interaction {
     }
 
     fn mouse(&mut self, model: &mut Model, event: MouseEvent, area: Rect) {
-        if area.width < 32 || area.height < 10 { return; }
-        let body = shell_layout(area)[1];
-        if matches!(event.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
-            && event.column >= body.x && event.column < body.right()
-            && event.row >= body.y && event.row < body.bottom()
-            && self.menu.is_none() && (!self.workspace_visible() || model.screen == Screen::Help) {
-            self.viewport.move_by(if event.kind == MouseEventKind::ScrollUp { -3 } else { 3 });
+        if area.width < 32 || area.height < 10 {
             return;
         }
-        if event.kind != MouseEventKind::Down(MouseButton::Left) { return; }
+        let body = shell_layout(area)[1];
+        if matches!(
+            event.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && event.column >= body.x
+            && event.column < body.right()
+            && event.row >= body.y
+            && event.row < body.bottom()
+            && self.menu.is_none()
+            && (!self.workspace_visible() || model.screen == Screen::Help)
+        {
+            self.viewport
+                .move_by(if event.kind == MouseEventKind::ScrollUp {
+                    -3
+                } else {
+                    3
+                });
+            return;
+        }
+        if event.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
         if let Some(menu) = self.menu.as_mut() {
             menu.click(body, event.column, event.row);
             return;
         }
-        if !self.workspace_visible() { return; }
-        let inside = |r: Rect| event.column >= r.x && event.column < r.right()
-            && event.row >= r.y && event.row < r.bottom();
-        if model.screen == Screen::Home {
-            let cards = home_layout(body);
-            if inside(cards[0]) { model.selected = Role::Server; }
-            if inside(cards[1]) { model.selected = Role::Client; }
+        if !self.workspace_visible() {
             return;
         }
-        let Some(role) = Self::panel_role(model) else { return; };
-        let Some(columns) = workspace_columns(body) else { return; };
+        let inside = |r: Rect| {
+            event.column >= r.x
+                && event.column < r.right()
+                && event.row >= r.y
+                && event.row < r.bottom()
+        };
+        if model.screen == Screen::Home {
+            let cards = home_layout(body);
+            if inside(cards[0]) {
+                model.selected = Role::Server;
+            }
+            if inside(cards[1]) {
+                model.selected = Role::Client;
+            }
+            return;
+        }
+        let Some(role) = Self::panel_role(model) else {
+            return;
+        };
+        let Some(columns) = workspace_columns(body) else {
+            return;
+        };
         let nav = columns[0];
         if inside(nav) && event.row > nav.y && event.row < nav.bottom().saturating_sub(1) {
             let index = usize::from(event.row - nav.y - 1);
@@ -695,7 +764,10 @@ impl Interaction {
             return;
         }
         let records = columns[1];
-        if inside(records) && event.row > records.y && event.row < records.bottom().saturating_sub(1) {
+        if inside(records)
+            && event.row > records.y
+            && event.row < records.bottom().saturating_sub(1)
+        {
             if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
                 let start = record_start(editor, records);
                 editor.workspace_select(start + usize::from(event.row - records.y - 1));
@@ -704,14 +776,23 @@ impl Interaction {
     }
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
-        if key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::SHIFT
+        if key.kind == KeyEventKind::Press
+            && key.modifiers == KeyModifiers::SHIFT
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
-            && self.menu.is_none() && (!self.workspace_visible() || model.screen == Screen::Help) {
+            && self.menu.is_none()
+            && (!self.workspace_visible() || model.screen == Screen::Help)
+        {
             let page = self.viewport.page.get().max(1).min(isize::MAX as usize) as isize;
-            self.viewport.move_by(if key.code == KeyCode::PageUp { -page } else { page });
+            self.viewport.move_by(if key.code == KeyCode::PageUp {
+                -page
+            } else {
+                page
+            });
             return false;
         }
-        if key.kind == KeyEventKind::Press { self.viewport.reset(); }
+        if key.kind == KeyEventKind::Press {
+            self.viewport.reset();
+        }
         if key.kind != KeyEventKind::Press
             || self.saving.is_some()
             || self.exporting.is_some()
@@ -721,28 +802,40 @@ impl Interaction {
             return false;
         }
         if let Some(scan) = self.qr_scan.as_mut() {
-            if key.code == KeyCode::Esc { scan.cancelled = true; }
+            if key.code == KeyCode::Esc {
+                scan.cancelled = true;
+            }
             return false;
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
-            if dialog.key(key) { self.config_dialog = None; }
+            if dialog.key(key) {
+                self.config_dialog = None;
+            }
             return false;
         }
         if self.show_server_process {
-            if self.server_process.key(key.code, self.editor.as_ref()) { self.show_server_process = false; }
+            if self.server_process.key(key.code, self.editor.as_ref()) {
+                self.show_server_process = false;
+            }
             return false;
         }
         if self.traffic_monitor.is_some() {
-            if matches!(key.code, KeyCode::Esc | KeyCode::F(10)) { self.traffic_monitor = None; }
+            if matches!(key.code, KeyCode::Esc | KeyCode::F(10)) {
+                self.traffic_monitor = None;
+            }
             return false;
         }
         if let Some(menu) = self.menu.as_mut() {
-            let Some(action) = menu.key(key.code) else { return false; };
+            let Some(action) = menu.key(key.code) else {
+                return false;
+            };
             self.menu = None;
             match action {
                 MenuAction::Close => {}
                 MenuAction::Config => {
-                    if let Some(role) = Self::panel_role(model) { self.open_config(role); }
+                    if let Some(role) = Self::panel_role(model) {
+                        self.open_config(role);
+                    }
                 }
                 MenuAction::ServerProcess => self.show_server_process = true,
                 MenuAction::Traffic => {
@@ -750,7 +843,9 @@ impl Interaction {
                         self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
                     }
                 }
-                MenuAction::Shortcut(code, modifiers) => return self.update(model, KeyEvent::new(code, modifiers)),
+                MenuAction::Shortcut(code, modifiers) => {
+                    return self.update(model, KeyEvent::new(code, modifiers))
+                }
             }
             return false;
         }
@@ -761,11 +856,18 @@ impl Interaction {
             }
             return false;
         }
-        if self.reality_status.as_ref().is_some_and(StatusPanel::can_minimize)
-            && matches!(key.code, KeyCode::Esc | KeyCode::F(10)) {
+        if self
+            .reality_status
+            .as_ref()
+            .is_some_and(StatusPanel::can_minimize)
+            && matches!(key.code, KeyCode::Esc | KeyCode::F(10))
+        {
             self.client_background = self.reality_status.take();
             if key.code == KeyCode::F(10) {
-                self.menu = Some(Menu::new(Role::Client, self.editor_for(Role::Client).is_some()));
+                self.menu = Some(Menu::new(
+                    Role::Client,
+                    self.editor_for(Role::Client).is_some(),
+                ));
             }
             return false;
         }
@@ -943,33 +1045,54 @@ impl Interaction {
             }
             return false;
         }
-        let base = self.records.is_none() && self.issuance.is_none() && self.revocation.is_none()
-            && self.importing.is_none() && self.pending.is_none()
+        let base = self.records.is_none()
+            && self.issuance.is_none()
+            && self.revocation.is_none()
+            && self.importing.is_none()
+            && self.pending.is_none()
             && !self.editor.as_ref().is_some_and(|e| e.editing);
         if base {
             let role = Self::panel_role(model);
             let exiting = key.code == KeyCode::Char('q')
-                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL));
             if exiting && self.server_process.running() {
                 self.show_server_process = true;
                 return false;
             }
-            if exiting && self.client_background.as_ref().is_some_and(StatusPanel::local_running) {
+            if exiting
+                && self
+                    .client_background
+                    .as_ref()
+                    .is_some_and(StatusPanel::local_running)
+            {
                 self.reality_status = self.client_background.take();
                 return false;
             }
-            if role == Some(Role::Client) && key.code == KeyCode::Char('V') && self.client_background.is_some() {
+            if role == Some(Role::Client)
+                && key.code == KeyCode::Char('V')
+                && self.client_background.is_some()
+            {
                 self.reality_status = self.client_background.take();
                 return false;
             }
-            if role == Some(Role::Client) && key.code == KeyCode::Char('p')
-                && self.client_background.as_ref().is_some_and(StatusPanel::local_running) {
+            if role == Some(Role::Client)
+                && key.code == KeyCode::Char('p')
+                && self
+                    .client_background
+                    .as_ref()
+                    .is_some_and(StatusPanel::local_running)
+            {
                 self.reality_status = self.client_background.take();
                 return false;
             }
             if let Some(role) = role {
                 let configured = self.editor_for(role).is_some();
-                if key.code == KeyCode::F(3) || (!configured && (key.code == KeyCode::Enter || (role == Role::Client && key.code == KeyCode::Char('V')))) {
+                if key.code == KeyCode::F(3)
+                    || (!configured
+                        && (key.code == KeyCode::Enter
+                            || (role == Role::Client && key.code == KeyCode::Char('V'))))
+                {
                     self.open_config(role);
                     return false;
                 }
@@ -989,7 +1112,8 @@ impl Interaction {
         }
         // Keep the editor for the other role intact; read-only actions are
         // routed without silently borrowing its saved path or credentials.
-        let inactive_editor = base && Self::panel_role(model).is_some_and(|role| self.editor_for(role).is_none());
+        let inactive_editor =
+            base && Self::panel_role(model).is_some_and(|role| self.editor_for(role).is_none());
         if self.editor.is_none() || inactive_editor {
             if model.screen == Screen::Client && key.code == KeyCode::Char('I') {
                 self.reality_enrollment = Some(EnrollmentPanel::new());
@@ -1013,7 +1137,9 @@ impl Interaction {
             }
             return model.update(key);
         }
-        let Some(editor) = self.editor.as_mut() else { return false; };
+        let Some(editor) = self.editor.as_mut() else {
+            return false;
+        };
         if let Some(flow) = self.records.take() {
             match flow {
                 RecordFlow::ChooseMode(role) => match key.code {
@@ -1073,7 +1199,9 @@ impl Interaction {
                             Err(message) => editor.error = Some(message.into()),
                         },
                         KeyCode::Tab | KeyCode::Down => focus = (focus + 1) % fields.len(),
-                        KeyCode::BackTab | KeyCode::Up => focus = (focus + fields.len() - 1) % fields.len(),
+                        KeyCode::BackTab | KeyCode::Up => {
+                            focus = (focus + fields.len() - 1) % fields.len()
+                        }
                         KeyCode::Backspace => {
                             fields[focus].pop();
                         }
@@ -1103,7 +1231,12 @@ impl Interaction {
             match flow {
                 IssueFlow::Input(mut id) => match key.code {
                     KeyCode::Up | KeyCode::Down if self.issue_kind != IssueKind::NewUser => {
-                        id = cycle_user(editor, &id, self.issue_kind == IssueKind::Reenable, key.code == KeyCode::Down);
+                        id = cycle_user(
+                            editor,
+                            &id,
+                            self.issue_kind == IssueKind::Reenable,
+                            key.code == KeyCode::Down,
+                        );
                         self.issuance = Some(IssueFlow::Input(id));
                     }
                     KeyCode::Esc => {}
@@ -1331,12 +1464,21 @@ impl Interaction {
                         if crate::qr_import::image_path(source.trim()) {
                             let path = Zeroizing::new(source.trim().to_owned());
                             let (tx, rx) = mpsc::channel();
-                            match std::thread::Builder::new().name("theia-qr-import".into()).spawn(move || {
-                                let _ = tx.send(crate::qr_import::scan_file(&path));
-                            }) {
-                                Ok(_) => self.qr_scan = Some(QrScan { source, done: rx, cancelled: false }),
+                            match std::thread::Builder::new()
+                                .name("theia-qr-import".into())
+                                .spawn(move || {
+                                    let _ = tx.send(crate::qr_import::scan_file(&path));
+                                }) {
+                                Ok(_) => {
+                                    self.qr_scan = Some(QrScan {
+                                        source,
+                                        done: rx,
+                                        cancelled: false,
+                                    })
+                                }
                                 Err(_) => {
-                                    editor.error = Some("Не удалось запустить сканирование QR.".into());
+                                    editor.error =
+                                        Some("Не удалось запустить сканирование QR.".into());
                                     self.importing = Some(ImportFlow::Input(source));
                                 }
                             }
@@ -1593,7 +1735,9 @@ impl Interaction {
                     editor.accept();
                 }
                 KeyCode::Backspace => editor.backspace(),
-                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => editor.input.clear(),
+                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                    editor.input.clear()
+                }
                 KeyCode::Char(ch)
                     if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
                 {
@@ -1900,25 +2044,45 @@ impl Interaction {
 }
 
 fn shell_layout(area: Rect) -> [Rect; 3] {
-    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(3)]).split(area);
+    let parts = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(4),
+        Constraint::Length(3),
+    ])
+    .split(area);
     [parts[0], parts[1], parts[2]]
 }
 
 fn home_layout(area: Rect) -> [Rect; 2] {
-    let parts = Layout::default().direction(if area.width >= 80 { Direction::Horizontal } else { Direction::Vertical })
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
+    let parts = Layout::default()
+        .direction(if area.width >= 80 {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
     [parts[0], parts[1]]
 }
 
 fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
-    if area.width < 100 || area.height < 12 { return None; }
-    let cols = Layout::horizontal([Constraint::Length(28), Constraint::Length(25), Constraint::Min(1)]).split(area);
+    if area.width < 100 || area.height < 12 {
+        return None;
+    }
+    let cols = Layout::horizontal([
+        Constraint::Length(28),
+        Constraint::Length(25),
+        Constraint::Min(1),
+    ])
+    .split(area);
     Some([cols[0], cols[1], cols[2]])
 }
 
 fn record_start(editor: &Editor, rect: Rect) -> usize {
     let rows = usize::from(rect.height.saturating_sub(2)).max(1);
-    editor.workspace_selected().saturating_sub(rows - 1)
+    editor
+        .workspace_selected()
+        .saturating_sub(rows - 1)
         .min(editor.record_count().saturating_sub(rows))
 }
 
@@ -1932,9 +2096,17 @@ struct Viewport {
     signature: Cell<u64>,
 }
 impl Viewport {
-    fn reset(&self) { self.offset.set(0); self.signature.set(0); }
+    fn reset(&self) {
+        self.offset.set(0);
+        self.signature.set(0);
+    }
     fn move_by(&self, delta: isize) {
-        self.offset.set(self.offset.get().saturating_add_signed(delta).min(self.max.get()));
+        self.offset.set(
+            self.offset
+                .get()
+                .saturating_add_signed(delta)
+                .min(self.max.get()),
+        );
     }
     fn position(&self, title: &str, count: usize, page: usize, focus: Option<usize>) -> usize {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -1944,7 +2116,11 @@ impl Viewport {
         let signature = hash.finish();
         let max = count.saturating_sub(page);
         if self.signature.replace(signature) != signature {
-            self.offset.set(focus.map_or(0, |i| i.saturating_sub(page.saturating_sub(3))).min(max));
+            self.offset.set(
+                focus
+                    .map_or(0, |i| i.saturating_sub(page.saturating_sub(3)))
+                    .min(max),
+            );
         }
         self.max.set(max);
         self.page.set(page);
@@ -1964,10 +2140,18 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
         let selected = line.starts_with("> ") || line.starts_with("› ");
         let style = if selected {
             focus.get_or_insert(rows.len());
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("КОНФИДЕНЦИАЛЬНО") {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else { Style::default() };
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if line.starts_with("ВНИМАНИЕ") || line.starts_with("КОНФИДЕНЦИАЛЬНО")
+        {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
         let mut start = 0;
         let mut used = 0;
         let mut break_at = None;
@@ -1983,29 +2167,57 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
                 break_at = None;
             }
             used += cw;
-            if ch == ' ' { break_at = Some(i + ch.len_utf8()); }
+            if ch == ' ' {
+                break_at = Some(i + ch.len_utf8());
+            }
         }
         rows.push(Line::styled(&line[start..], style));
     }
     (rows, focus)
 }
 
-fn panel_at(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bool, viewport: Option<&Viewport>) {
+fn panel_at(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    body: &str,
+    focused: bool,
+    viewport: Option<&Viewport>,
+) {
     frame.render_widget(Clear, area);
-    let style = Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray });
+    let style = Style::default().fg(if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    });
     let page = usize::from(area.height.saturating_sub(2)).max(1);
     let (rows, focus) = visual_rows(body, usize::from(area.width.saturating_sub(2)));
     let count = rows.len();
     // Auto-reveal focus in typed forms only. Confirmation/review screens
     // start at their first line, including warnings, not at the confirm key.
-    let focus = focus.filter(|_| body.contains("Tab: поле") || body.contains("Tab/Shift+Tab: поле"));
+    let focus =
+        focus.filter(|_| body.contains("Tab: поле") || body.contains("Tab/Shift+Tab: поле"));
     let offset = viewport.map_or(0, |v| v.position(title, count, page, focus));
     let caption = if viewport.is_some() && count > page {
-        format!("{title}  ·  {}–{}/{}", offset + 1, (offset + page).min(count), count)
-    } else { title.to_owned() };
+        format!(
+            "{title}  ·  {}–{}/{}",
+            offset + 1,
+            (offset + page).min(count),
+            count
+        )
+    } else {
+        title.to_owned()
+    };
     let visible: Vec<_> = rows.into_iter().skip(offset).take(page).collect();
-    frame.render_widget(Paragraph::new(visible)
-        .block(Block::default().title(caption).borders(Borders::ALL).border_style(style)), area);
+    frame.render_widget(
+        Paragraph::new(visible).block(
+            Block::default()
+                .title(caption)
+                .borders(Borders::ALL)
+                .border_style(style),
+        ),
+        area,
+    );
 }
 
 fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bool) {
@@ -2028,17 +2240,45 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         ($($arg:expr),+ $(,)?) => { panel_at($($arg),+, viewport) }
     }
     let header = match model.screen {
-        Screen::Server => format!("THEIA  •  Сервер  |  {}", interaction.map(|ui| ui.server_process.status()).unwrap_or("Состояние неизвестно")),
+        Screen::Server => format!(
+            "THEIA  •  Сервер  |  {}",
+            interaction
+                .map(|ui| ui.server_process.status())
+                .unwrap_or("Состояние неизвестно")
+        ),
         Screen::Client => {
-            let local = interaction.is_some_and(|ui| ui.reality_status.as_ref().is_some_and(StatusPanel::local_running)
-                || ui.client_background.as_ref().is_some_and(StatusPanel::local_running));
-            format!("THEIA  •  Клиент  |  {}", if local { "Локальный runtime активен/запускается" } else { "Локальный runtime не запущен этой панелью" })
+            let local = interaction.is_some_and(|ui| {
+                ui.reality_status
+                    .as_ref()
+                    .is_some_and(StatusPanel::local_running)
+                    || ui
+                        .client_background
+                        .as_ref()
+                        .is_some_and(StatusPanel::local_running)
+            });
+            format!(
+                "THEIA  •  Клиент  |  {}",
+                if local {
+                    "Локальный runtime активен/запускается"
+                } else {
+                    "Локальный runtime не запущен этой панелью"
+                }
+            )
         }
         _ => "THEIA  •  Локальное управление".into(),
     };
     frame.render_widget(
-        Paragraph::new(Line::styled(header, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))),
+        Paragraph::new(Line::styled(
+            header,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
         parts[0],
     );
     match model.screen {
@@ -2073,22 +2313,51 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     if interaction.is_some_and(|ui| ui.qr_scan.is_some()) {
         frame.render_widget(Clear, parts[1]);
-        let cancelled = interaction.and_then(|ui| ui.qr_scan.as_ref()).is_some_and(|scan| scan.cancelled);
-        modal_panel!(frame, parts[1], "Чтение QR", if cancelled { "Импорт отменён. Результат декодирования будет отброшен." } else { "Локальное декодирование изображения. Никакой сети или записи. Esc: отменить." }, true);
+        let cancelled = interaction
+            .and_then(|ui| ui.qr_scan.as_ref())
+            .is_some_and(|scan| scan.cancelled);
+        modal_panel!(
+            frame,
+            parts[1],
+            "Чтение QR",
+            if cancelled {
+                "Импорт отменён. Результат декодирования будет отброшен."
+            } else {
+                "Локальное декодирование изображения. Никакой сети или записи. Esc: отменить."
+            },
+            true
+        );
     } else if let Some(dialog) = interaction.and_then(|ui| ui.config_dialog.as_ref()) {
         frame.render_widget(Clear, parts[1]);
-        modal_panel!(frame, parts[1], "Открыть конфигурацию", &dialog.body(), true);
+        modal_panel!(
+            frame,
+            parts[1],
+            "Открыть конфигурацию",
+            &dialog.body(),
+            true
+        );
     } else if let Some(menu) = interaction.and_then(|ui| ui.menu.as_ref()) {
         frame.render_widget(Clear, parts[1]);
         menu.render(frame, parts[1]);
     } else if let Some(ui) = interaction.filter(|ui| ui.show_server_process) {
         frame.render_widget(Clear, parts[1]);
-        modal_panel!(frame, parts[1], "Сервер • запуск и остановка", &ui.server_process.body(), true);
+        modal_panel!(
+            frame,
+            parts[1],
+            "Сервер • запуск и остановка",
+            &ui.server_process.body(),
+            true
+        );
     } else if let Some(monitor) = interaction.and_then(|ui| ui.traffic_monitor.as_ref()) {
         frame.render_widget(Clear, parts[1]);
-        if parts[1].width < 46 || parts[1].height < 17 || (parts[1].width < 86 && parts[1].height < 27) {
+        if parts[1].width < 46
+            || parts[1].height < 17
+            || (parts[1].width < 86 && parts[1].height < 27)
+        {
             modal_panel!(frame, parts[1], "Монитор трафика", &monitor.body(), true);
-        } else { monitor.render(frame, parts[1]); }
+        } else {
+            monitor.render(frame, parts[1]);
+        }
     } else if let Some(status) = interaction.and_then(|ui| ui.reality_status.as_ref()) {
         modal_panel!(
             frame,
@@ -2106,21 +2375,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         );
     } else if let Some(enrollment) = interaction.and_then(|ui| ui.reality_enrollment.as_ref()) {
-        modal_panel!(
-            frame,
-            parts[1],
-            "Импорт REALITY",
-            &enrollment.body(),
-            true,
-        );
+        modal_panel!(frame, parts[1], "Импорт REALITY", &enrollment.body(), true,);
     } else if let Some(provision) = interaction.and_then(|ui| ui.reality_provision.as_ref()) {
-        modal_panel!(
-            frame,
-            parts[1],
-            "Мастер REALITY",
-            &provision.body(),
-            true,
-        );
+        modal_panel!(frame, parts[1], "Мастер REALITY", &provision.body(), true,);
     } else if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
         modal_panel!(frame, parts[1], runtime.title(), &runtime.body(), true);
     } else if interaction.is_some_and(|ui| ui.saving.is_some()) {
@@ -2230,27 +2487,42 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     let footer = if interaction.is_some_and(|ui| !ui.workspace_visible()) {
         "Активная операция · Shift+PgUp/PgDn или колесо: прокрутка · действия указаны в панели"
-    } else { match model.screen {
-        Screen::Home => "↑↓ / Tab: роль • Enter: открыть • F1: помощь • q: выход",
-        Screen::Help => "Shift+PgUp/PgDn или колесо: прокрутка  ·  Esc назад",
-        Screen::Server => "F2/F10 Действия  ·  F3 Файл  ·  F4 Трафик  ·  F5 Сервер  ·  Ctrl+S Сохранить",
-        Screen::Client => "F2/F10 Действия  ·  F3 Файл  ·  F4 Трафик  ·  Ctrl+S Сохранить  ·  Esc Назад",
-    }};
+    } else {
+        match model.screen {
+            Screen::Home => "↑↓ / Tab: роль • Enter: открыть • F1: помощь • q: выход",
+            Screen::Help => "Shift+PgUp/PgDn или колесо: прокрутка  ·  Esc назад",
+            Screen::Server => {
+                "F2/F10 Действия  ·  F3 Файл  ·  F4 Трафик  ·  F5 Сервер  ·  Ctrl+S Сохранить"
+            }
+            Screen::Client => {
+                "F2/F10 Действия  ·  F3 Файл  ·  F4 Трафик  ·  Ctrl+S Сохранить  ·  Esc Назад"
+            }
+        }
+    };
     frame.render_widget(
-        Paragraph::new(footer).wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))),
+        Paragraph::new(footer).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
         parts[2],
     );
 }
 
 fn eligible_users(editor: &Editor, disabled: bool) -> Vec<String> {
-    editor.workspace_users().into_iter().filter(|(_, is_disabled, granted)| *granted && *is_disabled == disabled)
-        .map(|(id, _, _)| id).collect()
+    editor
+        .workspace_users()
+        .into_iter()
+        .filter(|(_, is_disabled, granted)| *granted && *is_disabled == disabled)
+        .map(|(id, _, _)| id)
+        .collect()
 }
 
 fn cycle_user(editor: &Editor, current: &str, disabled: bool, forward: bool) -> String {
     let users = eligible_users(editor, disabled);
-    if users.is_empty() { return current.to_owned(); }
+    if users.is_empty() {
+        return current.to_owned();
+    }
     let selected = users.iter().position(|id| id == current);
     let next = match selected {
         Some(i) if forward => (i + 1) % users.len(),
@@ -2262,11 +2534,23 @@ fn cycle_user(editor: &Editor, current: &str, disabled: bool, forward: bool) -> 
 }
 
 fn user_choices(editor: Option<&Editor>, current: &str, disabled: bool) -> String {
-    let users = editor.map(|e| eligible_users(e, disabled)).unwrap_or_default();
-    if users.is_empty() { return "Нет подходящих пользователей в выбранном inbound.".into(); }
+    let users = editor
+        .map(|e| eligible_users(e, disabled))
+        .unwrap_or_default();
+    if users.is_empty() {
+        return "Нет подходящих пользователей в выбранном inbound.".into();
+    }
     let selected = users.iter().position(|id| id == current).unwrap_or(0);
-    let start = selected.saturating_sub(4).min(users.len().saturating_sub(5));
-    let rows = users.iter().skip(start).take(5).map(|id| format!("{} {id}", if id == current { "›" } else { " " })).collect::<Vec<_>>().join("\n");
+    let start = selected
+        .saturating_sub(4)
+        .min(users.len().saturating_sub(5));
+    let rows = users
+        .iter()
+        .skip(start)
+        .take(5)
+        .map(|id| format!("{} {id}", if id == current { "›" } else { " " }))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!("Пользователи выбранного inbound · ↑↓ выбрать, Enter проверить\n{rows}\nПоказано {}–{} из {}", start + 1, (start + 5).min(users.len()), users.len())
 }
 
@@ -2405,7 +2689,9 @@ fn draw_issuance(
     let body = if let IssueFlow::Input(id) = flow {
         if rotating || recovering {
             format!("{body}\n\n{}", user_choices(editor, id, recovering))
-        } else { body }
+        } else {
+            body
+        }
     } else if matches!(flow, IssueFlow::Offer | IssueFlow::Public(_)) {
         format!("{body}\nQ: защищённый QR | c: буфер обмена (отдельное подтверждение)")
     } else {
@@ -2414,7 +2700,13 @@ fn draw_issuance(
     panel_at(frame, area, title, &body, true, viewport);
 }
 
-fn draw_revocation(frame: &mut Frame<'_>, area: Rect, flow: &DisableFlow, editor: Option<&Editor>, viewport: Option<&Viewport>) {
+fn draw_revocation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    flow: &DisableFlow,
+    editor: Option<&Editor>,
+    viewport: Option<&Viewport>,
+) {
     let (title, body) = match flow {
         DisableFlow::Input(id) => (
             "Отключить существующего пользователя",
@@ -2453,11 +2745,19 @@ fn draw_revocation(frame: &mut Frame<'_>, area: Rect, flow: &DisableFlow, editor
     };
     let body = if let DisableFlow::Input(id) = flow {
         format!("{body}\n\n{}", user_choices(editor, id, false))
-    } else { body };
+    } else {
+        body
+    };
     panel_at(frame, area, title, &body, true, viewport);
 }
 
-fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Option<&Editor>, viewport: Option<&Viewport>) {
+fn draw_import(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    flow: &ImportFlow,
+    editor: Option<&Editor>,
+    viewport: Option<&Viewport>,
+) {
     let (title, body) = match flow {
         ImportFlow::Input(source) => (
             "F-14: импорт подключения",
@@ -2524,35 +2824,93 @@ fn draw_import(frame: &mut Frame<'_>, area: Rect, flow: &ImportFlow, editor: Opt
 
 fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<&Editor>) {
     let Some([nav, records, details]) = workspace_columns(area) else {
-        if let Some(editor) = editor { draw_editor(frame, area, editor); }
-        else { draw_welcome(frame, area, role); }
+        if let Some(editor) = editor {
+            draw_editor(frame, area, editor);
+        } else {
+            draw_welcome(frame, area, role);
+        }
         return;
     };
-    let categories = Menu::categories(role).into_iter().map(|label| ListItem::new(format!("  {label}")));
-    frame.render_widget(List::new(categories.collect::<Vec<_>>())
-        .block(Block::default().title(" Разделы · F2 ").borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))), nav);
+    let categories = Menu::categories(role)
+        .into_iter()
+        .map(|label| ListItem::new(format!("  {label}")));
+    frame.render_widget(
+        List::new(categories.collect::<Vec<_>>()).block(
+            Block::default()
+                .title(" Разделы · F2 ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        nav,
+    );
     if let Some(editor) = editor {
         let start = record_start(editor, records);
         let visible = usize::from(records.height.saturating_sub(2));
-        let items: Vec<_> = editor.workspace_records().into_iter().enumerate()
-            .skip(start).take(visible).map(|(index, (id, active, reality))| {
+        let items: Vec<_> = editor
+            .workspace_records()
+            .into_iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, (id, active, reality))| {
                 let style = if index == editor.workspace_selected() {
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else { Style::default() };
-                ListItem::new(format!("{} {} {}{}", if index == editor.workspace_selected() {"›"} else {" "},
-                    if reality {"R"} else {"T"}, id, if active {" *"} else {""})).style(style)
-            }).collect();
-        let title = if role == Role::Server {" Inbound · ↑↓ "} else {" Профили · ↑↓ "};
-        frame.render_widget(List::new(items).block(Block::default().title(title).borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))), records);
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(format!(
+                    "{} {} {}{}",
+                    if index == editor.workspace_selected() {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    if reality { "R" } else { "T" },
+                    id,
+                    if active { " *" } else { "" }
+                ))
+                .style(style)
+            })
+            .collect();
+        let title = if role == Role::Server {
+            " Inbound · ↑↓ "
+        } else {
+            " Профили · ↑↓ "
+        };
+        frame.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            records,
+        );
         if editor.record_count() == 0 {
-            let inner = Rect::new(records.x + 1, records.y + 1, records.width.saturating_sub(2), records.height.saturating_sub(2));
-            frame.render_widget(Paragraph::new("Нет записей. Создайте через раздел действий.").wrap(Wrap {trim:true}),inner);
+            let inner = Rect::new(
+                records.x + 1,
+                records.y + 1,
+                records.width.saturating_sub(2),
+                records.height.saturating_sub(2),
+            );
+            frame.render_widget(
+                Paragraph::new("Нет записей. Создайте через раздел действий.")
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
         }
         draw_editor(frame, details, editor);
     } else {
-        panel(frame, records, " Записи ", "Конфигурация ещё не открыта.", false);
+        panel(
+            frame,
+            records,
+            " Записи ",
+            "Конфигурация ещё не открыта.",
+            false,
+        );
         draw_welcome(frame, details, role);
     }
 }
@@ -2578,21 +2936,42 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     } else {
         "↑↓ запись · ←→ / Tab поле · Enter изменить"
     };
-    let mode = if editor.selected_reality() { "REALITY" } else { "Own-TLS" };
+    let mode = if editor.selected_reality() {
+        "REALITY"
+    } else {
+        "Own-TLS"
+    };
     let users = if editor.role() == Role::Server {
         let users = editor.workspace_users();
         let granted = users.iter().filter(|(_, _, grant)| *grant).count();
-        let disabled = users.iter().filter(|(_, disabled, grant)| *disabled && *grant).count();
+        let disabled = users
+            .iter()
+            .filter(|(_, disabled, grant)| *disabled && *grant)
+            .count();
         format!("Пользователи: {granted} с доступом, {disabled} отключены\n")
-    } else { String::new() };
+    } else {
+        String::new()
+    };
     let message = format!(
         "{}  |  {}\n{}\n{}\n{}Выбранное поле: {}\n{}\n{}\n{}",
-        editor.selection_summary(), dirty, mode, users, editor.fields_overview(), editor.field_name(),
-        help, editor.error.as_deref().unwrap_or(""), editor.notice,
+        editor.selection_summary(),
+        dirty,
+        mode,
+        users,
+        editor.fields_overview(),
+        editor.field_name(),
+        help,
+        editor.error.as_deref().unwrap_or(""),
+        editor.notice,
     );
-    let title = if editor.error.is_some() { " Ошибка · проверьте сообщение " } else if editor.editing { " Изменение поля " } else { " Параметры · Enter " };
+    let title = if editor.error.is_some() {
+        " Ошибка · проверьте сообщение "
+    } else if editor.editing {
+        " Изменение поля "
+    } else {
+        " Параметры · Enter "
+    };
     panel(frame, area, title, &message, true);
-
 }
 
 /// Edit only when both role and a config path are explicitly supplied.
@@ -2694,7 +3073,9 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
                     interaction.paste_import_source(&text);
                     if let Some(editor) = interaction.editor.as_mut().filter(|e| e.editing) {
                         if !text.chars().any(char::is_control) {
-                            for ch in text.chars() { editor.insert(ch); }
+                            for ch in text.chars() {
+                                editor.insert(ch);
+                            }
                         }
                     }
                 }
@@ -2850,8 +3231,16 @@ mod tests {
     fn workspace_mouse_selects_role_without_entering_or_starting() {
         let mut model = Model::new(None);
         let mut ui = Interaction::new(None);
-        ui.mouse(&mut model, MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
-            column: 90, row: 5, modifiers: KeyModifiers::NONE }, Rect::new(0, 0, 120, 40));
+        ui.mouse(
+            &mut model,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 90,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 40),
+        );
         assert_eq!(model.screen, Screen::Home);
         assert_eq!(model.selected, Role::Client);
         assert!(!ui.server_process.running());
@@ -4154,11 +4543,19 @@ mod tests {
             });
             assert!(input.contains(label));
             let confirm = render(|f, a| {
-                draw_issuance(f, a, &IssueFlow::Confirm("device-a".into()), None, kind, None)
+                draw_issuance(
+                    f,
+                    a,
+                    &IssueFlow::Confirm("device-a".into()),
+                    None,
+                    kind,
+                    None,
+                )
             });
             assert!(confirm.contains("Подтверждение"));
             assert!(confirm.contains("y: подтвердить"));
-            let failed = render(|f, a| draw_issuance(f, a, &IssueFlow::SaveFailed, None, kind, None));
+            let failed =
+                render(|f, a| draw_issuance(f, a, &IssueFlow::SaveFailed, None, kind, None));
             assert!(failed.contains("ссылка заблокирована"));
             let offer = render(|f, a| draw_issuance(f, a, &IssueFlow::Offer, None, kind, None));
             assert!(offer.contains("Одноразовая"));

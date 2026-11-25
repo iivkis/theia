@@ -2947,7 +2947,6 @@ impl<T> Drop for SupervisorTask<T> {
     }
 }
 
-
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct TuiServerControl {
     expected: [u8; 32],
@@ -2956,9 +2955,13 @@ struct TuiServerControl {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn saved_server_bytes(path: &Path, expected: [u8; 32]) -> Result<zeroize::Zeroizing<Vec<u8>>, ServerError> {
+fn saved_server_bytes(
+    path: &Path,
+    expected: [u8; 32],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, ServerError> {
     use sha2::{Digest, Sha256};
-    let bytes = zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ServerError::Config)?);
+    let bytes =
+        zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ServerError::Config)?);
     let digest: [u8; 32] = Sha256::digest(bytes.as_slice()).into();
     if digest != expected {
         return Err(ServerError::Config);
@@ -2984,7 +2987,16 @@ pub(crate) async fn run_tui_file(
     if !document.server.enabled {
         return Err(ServerError::Config);
     }
-    run_supervised_file(document, path, Some(TuiServerControl { expected, ready: Some(ready), stop })).await
+    run_supervised_file(
+        document,
+        path,
+        Some(TuiServerControl {
+            expected,
+            ready: Some(ready),
+            stop,
+        }),
+    )
+    .await
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -3762,9 +3774,12 @@ mod hardening_tests {
         use std::fs;
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
-            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
         }
-        let directory = std::env::temp_dir().join(crate::tui_editor::generated_id("tui-server").unwrap());
+        let directory =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("tui-server").unwrap());
         fs::create_dir(&directory).unwrap();
         let _cleanup = Cleanup(directory.clone());
         let path = directory.join("server.toml");
@@ -3797,23 +3812,36 @@ mod hardening_tests {
         let expected: [u8; 32] = Sha256::digest(contents.as_bytes()).into();
         let (bad_ready, _) = tokio::sync::oneshot::channel();
         let (_bad_stop, bad_rx) = tokio::sync::oneshot::channel();
-        assert!(matches!(run_tui_file(&path, [0; 32], bad_ready, bad_rx).await, Err(ServerError::Config)));
+        assert!(matches!(
+            run_tui_file(&path, [0; 32], bad_ready, bad_rx).await,
+            Err(ServerError::Config)
+        ));
         drop(tcp);
         drop(udp);
         let (ready, ready_rx) = tokio::sync::oneshot::channel();
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
         let run_path = path.clone();
-        let task = tokio::spawn(async move { run_tui_file(&run_path, expected, ready, stop_rx).await });
-        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx).await.unwrap().unwrap(), 1);
+        let task =
+            tokio::spawn(async move { run_tui_file(&run_path, expected, ready, stop_rx).await });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
         assert!(std::net::TcpListener::bind(tcp_addr).is_err());
         assert!(std::net::UdpSocket::bind(udp_addr).is_err());
         stop.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), task).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(std::net::TcpListener::bind(tcp_addr).is_ok());
         assert!(std::net::UdpSocket::bind(udp_addr).is_ok());
         assert_eq!(fs::read(&path).unwrap(), contents.as_bytes());
     }
-
 
     #[test]
     fn pem_reader_refuses_oversized_and_relative_inputs() {
