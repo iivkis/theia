@@ -595,7 +595,7 @@ pub fn checked_quic_server(identity: &Identity, value: &descriptor::Verified,
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|_| Error::Tls)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(crate::quic_transport::transport_config());
-    config.migration(false);
+    config.migration(true);
     Ok(config)
 }
 

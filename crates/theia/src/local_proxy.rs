@@ -1524,6 +1524,27 @@ mod selector_tests {
                 let ProxyClient::Reality(managed) = &client else { panic!("wrong security mode") };
                 let current = managed.generation().await.unwrap();
                 managed_clients.push(managed.clone());
+                if let RealityCarrier::H3(h3)=&current.carrier{
+                    // Use the production dispatcher and a real OPEN_OK
+                    // tunnel. Rebind the same Quinn endpoint, not a new
+                    // connection or a new admission handshake.
+                    let tunnel=h3.open(crate::protocol::Address::V4([127,0,0,1]),target.port()).await.unwrap();
+                    let (mut local,remote)=tokio::io::duplex(4096);
+                    let rebind=std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                    rebind.set_nonblocking(true).unwrap();
+                    tunnel.rebind_for_test(rebind).unwrap();
+                    let task=tokio::spawn(tunnel.relay(remote));
+                    local.write_all(b"move").await.unwrap();
+                    let mut bytes=[0;4];
+                    timeout(Duration::from_secs(10),local.read_exact(&mut bytes)).await.unwrap().unwrap();
+                    assert_eq!(&bytes,b"move");
+                    local.write_all(b"stay").await.unwrap();
+                    timeout(Duration::from_secs(10),local.read_exact(&mut bytes)).await.unwrap().unwrap();
+                    assert_eq!(&bytes,b"stay");
+                    drop(local);
+                    task.abort();
+                    let _=task.await;
+                }
                 assert!(match (&current.carrier,socks_mode) {
                     (RealityCarrier::H2(_),false)|(RealityCarrier::H3(_),true)=>true,
                     _=>false,

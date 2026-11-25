@@ -664,6 +664,11 @@ pub struct H3Tunnel {
 }
 
 impl H3Tunnel {
+    #[cfg(test)]
+    pub(crate) fn rebind_for_test(&self, socket:std::net::UdpSocket)->Result<(),ClientError>{
+        self._lease.connection()._endpoint.endpoint.rebind(socket).map_err(|_|ClientError::Io)
+    }
+
     /// True when both tunnels share one verified transport connection.
     /// Does not reveal peer addresses, credentials or connection identifiers.
     pub fn shares_transport_with(&self, other: &Self) -> bool {

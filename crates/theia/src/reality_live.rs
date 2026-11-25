@@ -85,7 +85,10 @@ impl Generation {
                         .map_err(|_| ServerError::Tls)?;
                     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
                     cfg.transport_config(crate::quic_transport::transport_config());
-                    cfg.migration(false);
+                    // The native endpoint authenticates packets and validates
+                    // new physical paths itself; the passive relay never
+                    // grants equivalent validation or amplification credit.
+                    cfg.migration(true);
                     Some(Arc::new(cfg))
                 } else { None };
                 routes.push(Arc::new(Route { lease:lease.clone(),successor,reference:index,context:context.clone(),tcp,quic }));
