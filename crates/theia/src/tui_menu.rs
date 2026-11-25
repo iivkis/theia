@@ -98,7 +98,7 @@ const SERVER: &[Group] = &[
         title: "REALITY: обслуживание",
         entries: &[
             entry("Состояние, ротация и восстановление", key('V')),
-            entry("Мастер нового REALITY", key('W')),
+            always("Комплект по готовому плану (расширенные)", key('w')),
             entry("Зарегистрировать существующий комплект", key('M')),
             entry("Независимая замена доверия", key('K')),
             always("Диагностика сети (без автоматических запросов)", key('p')),
@@ -477,6 +477,9 @@ impl ConfigDialog {
             enrollment: None,
             creating: false,
         }
+    }
+    pub(crate) fn prefer_reality(&mut self) {
+        self.choice = 1;
     }
     pub(crate) fn paste(&mut self, text: &str) {
         if let Some(panel) = self.enrollment.as_mut() {
