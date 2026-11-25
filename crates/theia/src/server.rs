@@ -1899,10 +1899,12 @@ fn prepare_same_port_tls(
 ) -> Result<PreparedSamePortTls, ServerError> {
     let mut h2 = Vec::with_capacity(document.server.inbounds.len());
     let mut h3 = Vec::with_capacity(document.server.inbounds.len());
-    let mut identities = Vec::with_capacity(document.server.inbounds.len());
+    // Keep identities in document order, but compile PEM acceptors in
+    // ordinary-listener order, exactly as RunningGeneration::launch does.
+    let identities=captured.identities();
     for (index, inbound) in document.server.inbounds.iter().enumerate() {
+        if inbound.reality.is_some(){continue;}
         let material = captured.material(inbound, index)?;
-        identities.push(material.identity);
         let h2_acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
         let h3_config = crate::quic_transport::server_config(material.certs, material.key)
             .map_err(|_| ServerError::Tls)?;
@@ -2197,11 +2199,14 @@ fn commit_same_port_tls(
     let snapshot = request.material.as_ref().ok_or(())?;
     if crate::restart_guard::probe_captured(original, loaded_identities, candidate, snapshot)
         != Ok(crate::restart_guard::RestartVerdict::SamePortTlsReady)
-        || running.identities.len() != candidate.server.inbounds.len()
+        || !crate::restart_guard::same_port_tls_only(original,candidate)
+        || running.identities.len()!=candidate.server.inbounds.iter().filter(|i|i.reality.is_none()).count()
+        || running.active_h3.len()!=running.identities.len()
     {
         return Err(());
     }
     let prepared = prepare_same_port_tls(candidate, snapshot).map_err(|_| ())?;
+    if prepared.h2.len()!=running.identities.len()||prepared.h3.len()!=running.identities.len(){return Err(());}
     let (rebased_live, staged_auth) = request
         .previous
         .live
@@ -2277,13 +2282,17 @@ fn commit_tls_rollback(
     if Instant::now() >= slot.expires
         || slot.h2.len() != running.identities.len()
         || slot.h3.len() != running.identities.len()
-        || slot.refs.len() != running.identities.len()
-        || slot.identities.len() != running.identities.len()
+        || running.active_h3.len()!=running.identities.len()
     {
         return Err(());
     }
     let previous = runtime.snapshot().map_err(|_| ())?;
-    if previous.live.revision() != Ok(expected_revision) {
+    if slot.refs.len()!=previous.document.server.inbounds.len()
+        || slot.identities.len()!=previous.document.server.inbounds.len()
+        || running.identities.len()!=previous.document.server.inbounds.iter().filter(|i|i.reality.is_none()).count()
+        || previous.document.server.inbounds.iter().zip(&slot.identities).any(|(i,identity)|
+            i.reality.as_ref().is_some_and(|b|crate::reload_preflight::IdentityHash::reality(b)!=*identity))
+        || previous.live.revision() != Ok(expected_revision) {
         return Err(());
     }
     let mut target = previous.document.as_ref().clone();

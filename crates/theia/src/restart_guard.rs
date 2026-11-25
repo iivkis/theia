@@ -114,7 +114,10 @@ pub(crate) fn probe_captured(
             return Ok(RestartVerdict::SamePortTlsReady);
         }
     }
-    if same_port_tls_only(active, candidate) && !identities_unchanged {
+    if same_port_tls_only(active, candidate) && !identities_unchanged
+        && loaded_identities.len()==candidate_identities.len()
+        && active.server.inbounds.iter().zip(loaded_identities).zip(&candidate_identities)
+            .all(|((inbound,old),new)|inbound.reality.is_none()||old==new) {
         return Ok(RestartVerdict::SamePortTlsReady);
     }
 
@@ -204,7 +207,7 @@ pub(crate) fn same_port_reality_only(active:&ServerDocument,candidate:&ServerDoc
 
 pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocument) -> bool {
     if active.server.inbounds.len()!=candidate.server.inbounds.len()
-        || active.server.inbounds.iter().chain(&candidate.server.inbounds).any(|i|i.reality.is_some()){
+        || !active.server.inbounds.iter().any(|i|i.reality.is_none()){
         return false;
     }
     let mut normalized = candidate.clone();
@@ -214,8 +217,12 @@ pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocu
         .iter()
         .zip(&mut normalized.server.inbounds)
     {
-        normalized_inbound.tls_cert.clone_from(&original.tls_cert);
-        normalized_inbound.tls_key.clone_from(&original.tls_key);
+        // A mixed deployment may rotate its ordinary TLS listeners only.
+        // Never normalize away a REALITY binding or a security-mode change.
+        if original.reality.is_none() && normalized_inbound.reality.is_none(){
+            normalized_inbound.tls_cert.clone_from(&original.tls_cert);
+            normalized_inbound.tls_key.clone_from(&original.tls_key);
+        }
     }
     &normalized == active
 }
