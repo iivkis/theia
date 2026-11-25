@@ -466,6 +466,8 @@ pub struct Profile {
     admission_commitment: [u8; 32],
 }
 
+type CredentialMaterial = ([u8; 32], Zeroizing<[u8; 32]>, u64);
+
 impl Profile {
     fn anchor(&self) -> Result<Anchor, Error> {
         if self.schema_version != 1
@@ -524,7 +526,7 @@ impl Profile {
         &self,
         uri: &str,
         now: u64,
-    ) -> Result<([u8; 32], Zeroizing<[u8; 32]>, u64), Error> {
+    ) -> Result<CredentialMaterial, Error> {
         self.admission()?;
         let (snapshot, current) = self
             .store()?
