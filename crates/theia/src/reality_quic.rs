@@ -700,6 +700,23 @@ mod tests {
         assert_eq!(route(&table, old, &known, false), None);
     }
     #[test]
+    fn opaque_cid_new_address_is_not_connection_or_validation_evidence(){
+        let mut table=HashMap::new();
+        table.insert(1,session(peer(1),&[1;8]));
+        table.insert(2,session(peer(2),&[2;8]));
+        // Either reference-side connection could have received this
+        // newly issued, encrypted CID. The observer sees identical bytes.
+        let mut opaque=vec![0x40];opaque.extend_from_slice(&[9;8]);opaque.extend_from_slice(&[0;24]);
+        assert_eq!(route(&table,peer(3),&opaque,false),None);
+        for s in table.values(){
+            assert!(!s.can_reply(peer(3),1));
+            assert!(!s.allows_client(peer(3),&opaque));
+        }
+        assert_eq!(route(&table,peer(1),&opaque,true),None);
+        assert_eq!(table.len(),2);
+    }
+
+    #[test]
     fn quotas_expiry_and_queue_failure_do_not_create_credit() {
         let p = peer(1);
         let mut s = session(p, &[3;8]);

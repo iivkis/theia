@@ -3547,7 +3547,7 @@ mod hardening_tests {
             .await
             .is_err());
         drop(fresh_reservations);
-        let (successor,next,next_ids,next_reality,revision)=
+        let (mut successor,next,next_ids,next_reality,revision)=
             stage_fresh_generation(&fresh, &restored, &limits, &path)
                 .await
                 .unwrap();
@@ -3567,6 +3567,53 @@ mod hardening_tests {
         tokio::time::timeout(Duration::from_secs(5), reap_previous(running))
             .await
             .unwrap();
+        // Partial cutover: bind only a new inbound, keep existing TCP/UDP
+        // ownership and the exact shared authorization cell.
+        let retained=runtime.snapshot().unwrap();
+        let mut added=retained.document.as_ref().clone();
+        let mut inbound=added.server.inbounds[0].clone();
+        inbound.id="edge-c".into();
+        let reserve_tcp=StdTcp::bind("127.0.0.1:0").unwrap();
+        let reserve_udp=StdUdp::bind("127.0.0.1:0").unwrap();
+        inbound.h2_listen=reserve_tcp.local_addr().unwrap().to_string();
+        inbound.quic_listen=reserve_udp.local_addr().unwrap().to_string();
+        added.server.inbounds.push(inbound.clone());
+        let captured=CapturedTls::capture(&added).unwrap();
+        let add_ids=captured.identities();
+        let plan=crate::restart_guard::partial_layout(&retained.document,&next_ids,&added,&add_ids).unwrap();
+        assert!(plan.added.contains("edge-c")&&plan.removed.is_empty());
+        let add=request(added.clone(),ChangeKind::Restart,Some(captured));
+        assert!(stage_partial_generation(&add,&next_ids,&limits,&path,&plan).await.is_err());
+        assert_eq!(runtime.snapshot().unwrap().live.revision(),Ok(5));
+        drop((reserve_tcp,reserve_udp));
+        let (prepared,view,auth)=stage_partial_generation(&add,&next_ids,&limits,&path,&plan).await.unwrap();
+        assert_eq!(prepared.listeners.len(),1);
+        assert_eq!(runtime.commit_partial_layout(&add.previous,5,view,auth,&plan.removed,prepared.reality),Ok(6));
+        successor.append(prepared.listeners,GenerationPhase::Active);
+        successor.order_plain(&added);
+        let current=runtime.snapshot().unwrap();
+        assert!(Arc::ptr_eq(&current.live.shared(),&retained.live.shared()));
+        assert!(StdTcp::bind(&added.server.inbounds[0].h2_listen).is_err());
+        assert!(StdUdp::bind(&added.server.inbounds[0].quic_listen).is_err());
+        assert!(StdTcp::bind(&inbound.h2_listen).is_err());
+        let mut removed=added.clone();
+        removed.server.inbounds.retain(|i|i.id!="edge-c");
+        let captured=CapturedTls::capture(&removed).unwrap();
+        let remove_ids=captured.identities();
+        let plan=crate::restart_guard::partial_layout(&added,&add_ids,&removed,&remove_ids).unwrap();
+        assert!(plan.added.is_empty()&&plan.removed.contains("edge-c"));
+        let remove=request(removed,ChangeKind::Restart,Some(captured));
+        let (prepared,view,auth)=stage_partial_generation(&remove,&add_ids,&limits,&path,&plan).await.unwrap();
+        assert!(prepared.listeners.is_empty());
+        assert_eq!(runtime.commit_partial_layout(&remove.previous,6,view,auth,&plan.removed,prepared.reality),Ok(7));
+        successor.remove_inbounds(&plan.removed);
+        assert!(successor.has_draining());
+        let (id,result)=tokio::time::timeout(Duration::from_secs(5),successor.tasks.join_next()).await.unwrap().unwrap().unwrap();
+        assert!(result.is_ok()&&successor.finish_draining(&id));
+        assert!(!successor.has_draining());
+        assert!(StdTcp::bind(&inbound.h2_listen).is_ok());
+        assert!(StdUdp::bind(&inbound.quic_listen).is_ok());
+        assert!(StdTcp::bind(&added.server.inbounds[0].h2_listen).is_err());
         tokio::time::timeout(Duration::from_secs(5), reap_previous(successor))
             .await
             .unwrap();

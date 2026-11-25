@@ -430,6 +430,39 @@ mod tests {
     }
 
     #[test]
+    fn managed_roster_apply_rejects_stale_and_keeps_deleted_id_occupancy(){
+        let source=include_str!("../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX",&"a".repeat(64));
+        let crate::config::Config::Server(mut doc)=crate::config::parse(&source).unwrap() else{panic!()};
+        doc.server.policy.max_connections_per_user=1;
+        let user=doc.server.users[0].clone();
+        let mut other=user.clone();other.id="new-device".into();other.token_sha256="b".repeat(64);
+        doc.server.users.push(other.clone());
+        doc.server.inbounds[0].allowed_user_ids.push(other.id.clone());
+        let ledger=crate::quota::Ledger::new(&doc.server.policy,&doc.server.users);
+        let live=Arc::new(LiveAuthorization::new(doc.clone()).unwrap());
+        let state=State::new(View{document:Arc::new(doc.clone()),inbounds:doc.server.inbounds.len(),
+            preflight:Arc::new(ReloadPreflight::new(std::env::temp_dir().join("unused.toml"),doc.clone(),Vec::new())),live})
+            .with_reality_ledger(ledger.clone());
+        let held=ledger.acquire_session(&user.id).unwrap();
+        let original=state.snapshot().unwrap();
+        let mut removed=doc.clone();
+        removed.server.users.retain(|u|u.id!=user.id);
+        for inbound in &mut removed.server.inbounds{inbound.allowed_user_ids.retain(|id|id!=&user.id);}
+        assert_eq!(state.apply_auth(&original,&removed,1),Ok(2));
+        assert!(ledger.acquire_session(&user.id).is_none());
+        assert!(state.apply_auth(&original,&doc,1).is_err());
+        let current=state.snapshot().unwrap();
+        assert_eq!(state.apply_auth(&current,&doc,2),Ok(3));
+        assert!(ledger.acquire_session(&user.id).is_none());
+        drop(held);
+        assert!(ledger.acquire_session(&user.id).is_some());
+        let mut invalid=doc.clone();invalid.server.inbounds[0].tls_cert="file:replacement.pem".into();
+        let current=state.snapshot().unwrap();
+        assert!(state.apply_auth(&current,&invalid,3).is_err());
+        assert_eq!(state.snapshot().unwrap().live.revision(),Ok(3));
+    }
+
+    #[test]
     fn rollback_readiness_is_bounded_and_never_exposes_secret_material() {
         let source = include_str!("../../../examples/server.toml")
             .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));

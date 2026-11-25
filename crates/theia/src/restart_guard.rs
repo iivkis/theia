@@ -339,6 +339,28 @@ mod tests {
     }
 
     #[test]
+    fn mixed_tls_rotation_never_normalizes_reality_binding(){
+        let source=include_str!("../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX",&"a".repeat(64));
+        let crate::config::Config::Server(mut active)=crate::config::parse(&source).unwrap()else{panic!()};
+        let mut reality=active.server.inbounds[0].clone();
+        reality.id="other-reality".into();reality.h2_listen="127.0.0.1:9443".into();reality.quic_listen=reality.h2_listen.clone();
+        reality.security_mode=crate::security_profile::SecurityMode::SmartReality;
+        reality.tls_cert.clear();reality.tls_key.clear();
+        let base=std::env::temp_dir();
+        reality.reality=Some(crate::config::RealityBinding{health_store:base.join("health").to_string_lossy().into_owned(),
+            bundle:base.join("bundle").to_string_lossy().into_owned(),initial_health_sha256:[1;32],identity_sha256:[2;32],manifest_sha256:[3;32]});
+        active.server.inbounds.insert(0,reality);
+        let mut next=active.clone();next.server.inbounds[1].tls_cert="file:new.pem".into();
+        assert!(same_port_tls_only(&active,&next));
+        next.server.inbounds[0].reality.as_mut().unwrap().manifest_sha256=[4;32];
+        assert!(!same_port_tls_only(&active,&next));
+        assert!(same_port_reality_only(&active,&next).is_none());
+        next.server.inbounds[0]=active.server.inbounds[0].clone();
+        next.server.inbounds[0].tls_key="file:unexpected.pem".into();
+        assert!(!same_port_tls_only(&active,&next));
+    }
+
+    #[test]
     fn wildcard_and_dual_stack_bind_aliases_force_maintenance_instead_of_blind_rebind() {
         let local: SocketAddr = "127.0.0.1:9443".parse().unwrap();
         let v4_wildcard: SocketAddr = "0.0.0.0:9443".parse().unwrap();

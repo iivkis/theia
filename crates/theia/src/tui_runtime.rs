@@ -422,7 +422,7 @@ impl RuntimePanel {
             Phase::CutoverChecking{..}=>"Проверка точного сохранённого TOML и отпечатка материалов; runtime не меняется.".into(),
             Phase::CutoverConfirming{revision,same_port,material_sha256}=>{
                 let digest=material_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
-                let mode=if same_port {"Смена TLS на текущих портах; открытые туннели сохраняются."}else{"Новые порты: старые соединения получают до 20 с на завершение, после чего могут быть закрыты."};
+                let mode=if same_port {"Смена TLS на текущих портах; открытые туннели сохраняются."}else{"Новые порты готовятся до Apply; неизменённые inbound при частичном cutover сохраняются. Удаляемые/заменяемые соединения получают до 20 с на завершение, затем могут быть закрыты."};
                 format!("Структурный Apply, revision={revision}.\n{mode}\nОтпечаток материалов SHA-256: {digest}\nСервер повторно проверит TOML, материалы и CAS.\ny: применить | n/Esc: отменить")
             }
             Phase::CutoverApplying=>"Структурный Apply отправлен; при потере ACK сначала запросите фактический статус.".into(),
