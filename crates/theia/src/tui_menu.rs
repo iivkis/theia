@@ -708,11 +708,19 @@ impl FirstInvite {
         }
         let value = value.trim_end_matches(['\r', '\n']);
         if value.chars().any(char::is_control) {
+            if self.own.is_none() {
+                self.source = Zeroizing::new(String::new());
+            }
+            self.error = Some("Ввод содержит недопустимые символы. Вставьте значение целиком.");
             return;
         }
         if self.own.is_none() {
             if self.source.len().saturating_add(value.len()) <= crate::invite::MAX_URI {
                 self.source.push_str(value);
+                self.error = None;
+            } else {
+                self.source = Zeroizing::new(String::new());
+                self.error = Some("Ключ слишком длинный. Вставьте его целиком или запросите новый.");
             }
         } else {
             let field = if self.focus == 0 {

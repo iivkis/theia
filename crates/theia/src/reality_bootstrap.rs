@@ -420,6 +420,15 @@ impl Invitation {
         ))
     }
 
+    /// Human-facing summary for the managed key wizard. The CLI preview
+    /// retains its diagnostic fields; the ordinary user need not read them.
+    pub(crate) fn access_key_summary(&self) -> String {
+        format!(
+            "Сервер: {}\nПодключение: защищённое (REALITY)\nЛичный ключ доступа: получен\nПараметры соединения будут выбраны автоматически.",
+            self.scope.endpoint
+        )
+    }
+
     fn confirmed(
         &self,
         expected: [u8; 32],

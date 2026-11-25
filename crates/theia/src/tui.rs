@@ -5015,7 +5015,7 @@ fn draw_import(
             "Credential сохранён",
             "Старый файл сохранён. Проверьте доступ отдельно; соединение и системный прокси не менялись. Enter/Esc: закрыть.".into(),
         ),
-        ImportFlow::Saving => ("Сохранение профиля", "Создание нового приватного bearer и guarded TOML commit. Секрет не отображается.\nНикакого подключения или системного прокси.".into()),
+        ImportFlow::Saving => ("Сохранение профиля", "Сохраняем профиль и ключ в защищённом хранилище.\nПодключение не запускается, системный прокси не меняется.".into()),
         ImportFlow::Done => ("Профиль сохранён", format!("Профиль: {}\n{}\nИмпорт не запустил новое соединение и не изменил системный прокси.\n\nEnter: выбрать режим подключения\nEsc: закончить без запуска\n\n{}",
             editor.map_or("Новый профиль", Editor::selected_record_id),
             if editor.is_some_and(Editor::selected_record_is_active) { "Профиль активен в настройках." } else { "Активный профиль не изменён. Перед подключением подтвердите выбор нового профиля." },
@@ -5206,9 +5206,9 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
     let mut lines = vec![
         Line::styled(
             if running {
-                "● Локальный процесс запущен / запускается"
+                "● Локальный прокси запущен или запускается (не проверка связи с сервером)"
             } else {
-                "○ Локальный процесс не запущен"
+                "○ Локальный прокси не запущен"
             },
             Style::default()
                 .fg(if running { ACCENT } else { MUTED })
@@ -5237,19 +5237,19 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
         ),
         Line::raw(if cfg!(windows) {
             if editor.system_proxy_allowed() {
-                "Windows · включение и выключение в одном экране."
+                "Для программ, использующих настройки прокси Windows. Не VPN."
             } else {
-                "Windows · при первом запуске потребуется разрешение."
+                "Для программ с системным прокси Windows. Сначала потребуется разрешение."
             }
         } else {
-            "Недоступен на Linux · системная интеграция не реализована."
+            "На Linux пока недоступен. Настройте прокси в нужных приложениях."
         }),
         Line::styled(
             "TUN / VPN",
             Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
         ),
         Line::styled(
-            "Недоступен · backend не реализован.",
+            "Пока недоступен. Весь трафик устройства через Theia не направляется.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
@@ -5260,7 +5260,7 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
         Line::raw(format!("HTTP {http}")),
         Line::raw(format!("SOCKS5 {socks}")),
         Line::styled(
-            "Для приложений с ручной настройкой прокси.",
+            "Запустите локальный прокси и укажите адрес в нужном приложении. Остальной трафик не защищается этим режимом.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
@@ -7604,6 +7604,7 @@ mod tests {
 
     #[test]
     fn common_import_dispatches_reality_key_to_masked_review_and_cancels_without_writes() {
+        use crate::config::{self, Config};
         use sha2::{Digest, Sha256};
         use crate::reference_health::{Evidence, Plan, State, Target};
         let now = crate::reference_health::unix_now().unwrap();

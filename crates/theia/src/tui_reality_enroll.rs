@@ -90,7 +90,7 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
         identity_sha256: invitation.fingerprint(),
     };
     let body = if input.access_key_only {
-        format!("ПРЕДПРОСМОТР: самодостаточный ключ REALITY.\n{}\nПолучили ключ от доверенного администратора? Подтвердите доверие.\nСекреты сохраняются защищённо. Подключение и системный прокси не запускаются.\ny: сохранить; n/Esc: отменить.", invitation.preview(now)?)
+        format!("ПРЕДПРОСМОТР: самодостаточный ключ REALITY.\n{}\n\nКлюч проверен на этом устройстве. Связь с сервером ещё не проверена.\nСохраняйте его только если получили от администратора, которому доверяете.\nПодключение не запускается, системный прокси не меняется.\ny: доверять и продолжить; n/Esc: назад.", invitation.access_key_summary())
     } else {
         format!("ПРЕДПРОСМОТР: fingerprint совпал с введённым значением.\n{}\nAdmission-файл проверен; секрет будет скопирован в защищённое хранилище.\nTransport/XHTTP: auto. CA не требуется.\nСохранение отдельного профиля не меняет active profile, proxy или runtime.\ny: сохранить; n/Esc: отменить.", invitation.preview(now)?)
     };
@@ -604,9 +604,13 @@ impl EnrollmentPanel {
                 }
             }
             Err(error) => {
-                self.error = Some(format!(
-                    "ОТКАЗ: {error}. При неопределённой записи проверьте файлы перед повтором."
-                ));
+                self.error = Some(format!("ОТКАЗ: {}", match error {
+                    Error::Format | Error::Credential | Error::Scope => "Ключ неполный или неверный. Вставьте его целиком или попросите новый ключ у администратора.",
+                    Error::Descriptor | Error::Identity | Error::Approval | Error::Health | Error::Grant => "Не удалось подтвердить безопасность ключа. Попросите администратора проверить доступ и выдать новый ключ.",
+                    Error::Storage => "Не удалось прочитать или сохранить настройки. Проверьте путь и права доступа к файлам.",
+                    Error::Indeterminate => "Результат сохранения неизвестен. Проверьте файлы перед повтором.",
+                    Error::Clock => "Проверьте дату и время устройства и повторите импорт.",
+                }));
                 self.stage = if error == Error::Indeterminate {
                     Stage::Done(format!("ОТКАЗ: неопределённая запись. Проверьте подготовленный профиль {:?}; повтор заблокирован.", Path::new(self.fields[2].as_str())))
                 } else {
@@ -716,7 +720,7 @@ impl EnrollmentPanel {
                 if self.managed_paths() { 3 } else { total - 1 },
                 total,
                 "Проверка приглашения",
-                "Идёт локальная проверка",
+                "Идёт проверка · Esc отменить",
             ),
             Stage::Confirm(_) => (
                 if self.managed_paths() { 3 } else { total - 1 },
@@ -770,17 +774,17 @@ impl EnrollmentPanel {
                 out
             }
             Stage::Loading(_) => {
-                "Проверка локального приглашения и admission; без сети и записи.".into()
+                "Проверяем ключ без сети и записи. Esc — отменить.".into()
             }
             Stage::Confirm(review) => {
                 if let Some(path) = &self.new_config {
-                    format!("{}\n\nПервый TOML: {}\nНовый профиль станет активным в TOML. Системный прокси выключен.\ny: создать TOML и enrollment; n/Esc: назад.", review.body, path.display())
+                    format!("{}\n\nФайл настроек: {}\nПервый профиль будет выбран для подключения. Системный прокси останется выключенным.\ny: сохранить профиль; n/Esc: назад.", review.body, path.display())
                 } else {
                     review.body.clone()
                 }
             }
             Stage::Applying(_) | Stage::Creating(_) => {
-                "Сохранение защищённого профиля; runtime не меняется.".into()
+                "Сохраняем защищённый профиль. Подключение не меняется.".into()
             }
             Stage::Done(body) => {
                 if self.config.is_some() && self.owned.is_some() {
@@ -1000,7 +1004,7 @@ mod tests {
         p.key(key(KeyCode::Enter));
         assert!(matches!(p.stage, Stage::Loading(_)));
         assert!(p.body().contains("без сети и записи"));
-        assert!(!p.key(key(KeyCode::Esc)));
+        assert!(p.key(key(KeyCode::Esc)));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while matches!(p.stage, Stage::Loading(_)) {
             p.poll();
@@ -1010,7 +1014,7 @@ mod tests {
         assert!(p.body().contains("ОТКАЗ"));
         let (tx, rx) = mpsc::channel();
         p.stage = Stage::Applying(rx);
-        assert!(p.body().contains("runtime не меняется"));
+        assert!(p.body().contains("Подключение не меняется"));
         drop(tx);
         assert!(p.poll().is_none());
         assert!(p.body().contains("ОТКАЗ"));
