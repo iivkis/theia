@@ -96,7 +96,7 @@ jobs:
           '~~~text' >> $env:GITHUB_STEP_SUMMARY
           $rust >> $env:GITHUB_STEP_SUMMARY
           '~~~' >> $env:GITHUB_STEP_SUMMARY
-          "Build only; acceptance and stable release publication are not performed here." >> $env:GITHUB_STEP_SUMMARY
+          "Experimental build only; acceptance and stable release publication are not performed here." >> $env:GITHUB_STEP_SUMMARY
       - name: Upload raw executable
         uses: actions/upload-artifact@v7
         with:
@@ -105,3 +105,75 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 90
+
+
+  publish:
+    name: Publish experimental GitHub pre-release
+    needs: release
+    if: success() && (github.ref == 'refs/heads/build' || github.ref == 'refs/heads/build/releases')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download Linux executable from this run
+        uses: actions/download-artifact@v8
+        with:
+          name: theia-linux-x64
+          path: ${{ runner.temp }}/release-assets
+          digest-mismatch: error
+      - name: Download Windows executable from this run
+        uses: actions/download-artifact@v8
+        with:
+          name: theia-windows-x64.exe
+          path: ${{ runner.temp }}/release-assets
+          digest-mismatch: error
+      - name: Verify and publish both binaries together
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ASSET_DIR: ${{ runner.temp }}/release-assets
+        run: |
+          set -euo pipefail
+          cd "$ASSET_DIR"
+          test -s theia-linux-x64
+          test -s theia-windows-x64.exe
+          python3 - <<'PY'
+          from pathlib import Path
+          for name, magic in (("theia-linux-x64", b"\x7fELF"),
+                              ("theia-windows-x64.exe", b"MZ")):
+              path = Path(name)
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"Not a standalone file: {name}")
+              with path.open("rb") as f:
+                  if f.read(len(magic)) != magic:
+                      raise SystemExit(f"Unexpected executable format: {name}")
+          PY
+          sha256sum theia-linux-x64 theia-windows-x64.exe > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          tag="dev-${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          notes="$(mktemp)"
+          trap 'rm -f "$notes"' EXIT
+          printf '%s\n' \
+            'Experimental development build. Not a stable release or a release acceptance result.' \
+            '' \
+            "Source commit: $GITHUB_SHA" \
+            "Source branch: $GITHUB_REF_NAME" \
+            "Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '' \
+            'Assets: native Linux x64 and Windows x64 executables, plus SHA256SUMS.' \
+            'On Linux, run chmod +x theia-linux-x64 after downloading if needed.' \
+            'Dev configuration and key formats may change without backward compatibility.' \
+            > "$notes"
+          # gh creates a draft, uploads all assets, then publishes it.
+          # Unique per-run/attempt tag: never overwrite a prior release.
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "Theia dev ${GITHUB_SHA:0:12} (build $GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT)" \
+            --notes-file "$notes" \
+            --prerelease --latest=false \
+            theia-linux-x64 theia-windows-x64.exe SHA256SUMS
+          printf 'Published experimental pre-release: %s/%s/releases/tag/%s\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$tag" >> "$GITHUB_STEP_SUMMARY"
