@@ -468,7 +468,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Параметры · Enter")
         own_link = issue(tty, "own-user")
         tty.send("j")
-        tty.wait("• REALITY reality")
+        tty.wait("SmartTheia REALITY · только просмотр")
         reality_link = issue(tty, "reality-user")
         saved = read_config(server)["server"]
         assert "own-user" in saved["inbounds"][0]["allowed_user_ids"]
@@ -529,7 +529,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Режим подключения")
+        tty.wait("Активный профиль: public")
         assert read_config(client)["client"]["active_profile"] == "public"
         assert client_revision(1)
         tty.send("V")
