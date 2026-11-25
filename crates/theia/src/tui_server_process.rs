@@ -3,11 +3,60 @@
 use crate::{server::ServerError, tui_editor::Editor, Role};
 use crossterm::event::KeyCode;
 use std::{
+    path::PathBuf,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread::JoinHandle,
 };
 
+/// The endpoint exists only for the server owned by this TUI. On Linux a
+/// newly created private directory is removed only if its identity is still
+/// the one we created, and only when empty. Windows uses the existing SID DACL.
+struct OwnedEndpoint {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    identity: (u64, u64),
+}
+
+impl OwnedEndpoint {
+    #[cfg(target_os = "linux")]
+    fn create() -> Result<Self, &'static str> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let id = crate::tui_editor::generated_id("theia-ipc")?;
+        let path = std::path::absolute(std::env::temp_dir().join(id))
+            .map_err(|_| "Не удалось определить локальный каталог управления.")?;
+        std::fs::DirBuilder::new().mode(0o700).create(&path)
+            .map_err(|_| "Не удалось создать закрытый каталог управления.")?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| "Не удалось проверить каталог управления.")?;
+        let endpoint = Self { path, identity: (metadata.dev(), metadata.ino()) };
+        if !metadata.file_type().is_dir() || metadata.mode() & 0o777 != 0o700 {
+            return Err("Каталог управления должен иметь права 0700.");
+        }
+        Ok(endpoint)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn create() -> Result<Self, &'static str> {
+        Ok(Self { path: PathBuf::from(crate::tui_editor::generated_id("theia-ipc")?) })
+    }
+}
+
+impl Drop for OwnedEndpoint {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if std::fs::symlink_metadata(&self.path).is_ok_and(|m| {
+                m.file_type().is_dir() && (m.dev(), m.ino()) == self.identity
+            }) {
+                let _ = std::fs::remove_dir(&self.path);
+            }
+        }
+    }
+}
+
 struct Worker {
+    endpoint: Option<OwnedEndpoint>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     ready: tokio::sync::oneshot::Receiver<usize>,
     done: Receiver<Result<(), ServerError>>,
@@ -52,6 +101,10 @@ impl ProcessPanel {
         self.worker.is_some()
     }
 
+    pub(crate) fn management_endpoint(&self) -> Option<PathBuf> {
+        self.worker.as_ref().and_then(|w| w.endpoint.as_ref()).map(|e| e.path.clone())
+    }
+
     fn start(&mut self, editor: &Editor) {
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
@@ -67,6 +120,11 @@ impl ProcessPanel {
                 self.notice = "Сначала откройте и сохраните серверную конфигурацию.".into();
                 return;
             }
+            let endpoint = match OwnedEndpoint::create() {
+                Ok(endpoint) => endpoint,
+                Err(message) => { self.notice = message.into(); return; }
+            };
+            let management_path = endpoint.path.clone();
             let path = editor.saved_path().to_owned();
             let digest = editor.saved_sha256();
             let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -81,7 +139,7 @@ impl ProcessPanel {
                         .map_err(|_| ServerError::Io)
                         .and_then(|runtime| {
                             runtime.block_on(crate::server::run_tui_file(
-                                &path, digest, ready_tx, stopped,
+                                &path, digest, ready_tx, stopped, Some(management_path),
                             ))
                         });
                     let _ = tx.send(result);
@@ -89,6 +147,7 @@ impl ProcessPanel {
             match thread {
                 Ok(thread) => {
                     self.worker = Some(Worker {
+                        endpoint: Some(endpoint),
                         stop: Some(stop),
                         ready,
                         done,
@@ -205,7 +264,7 @@ impl ProcessPanel {
     pub(crate) fn body(&self) -> String {
         if let Some(start) = self.confirm {
             return if start {
-                "Запустить сервер по сохранённому TOML? Открываются указанные сетевые порты. Права ОС не повышаются.\ny: запустить • n/Esc: отменить".into()
+                "Запустить сервер по сохранённому TOML? Открываются указанные сетевые порты и закрытый локальный канал управления. Права ОС не повышаются.\ny: запустить • n/Esc: отменить".into()
             } else {
                 "Остановить запущенный этой панелью сервер? Новые подключения будут отклонены; действующие получат ограниченное время на завершение.\ny: остановить • n/Esc: отменить".into()
             };
@@ -239,6 +298,7 @@ mod tests {
         let (done_tx, done) = mpsc::channel();
         let mut panel = ProcessPanel::new();
         panel.worker = Some(Worker {
+            endpoint: None,
             stop: Some(stop),
             ready,
             done,
@@ -285,6 +345,7 @@ mod tests {
         panel.key(KeyCode::Char('y'), None);
         assert!(panel.body().contains("Сначала откройте серверный TOML"));
         panel.worker = Some(Worker {
+            endpoint: None,
             stop: Some(stop),
             ready,
             done,
@@ -296,6 +357,26 @@ mod tests {
         assert!(!panel.running());
         stopped.try_recv().unwrap();
         assert!(panel.body().contains("Сервер не работает"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_endpoint_is_private_unique_and_only_removed_when_empty() {
+        use std::os::unix::fs::MetadataExt;
+        let first = OwnedEndpoint::create().unwrap();
+        let second = OwnedEndpoint::create().unwrap();
+        assert_ne!(first.path, second.path);
+        let path = first.path.clone();
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().mode() & 0o777, 0o700);
+        drop(first);
+        assert!(!path.exists());
+        let path = second.path.clone();
+        let retained = path.join("retain");
+        std::fs::write(&retained, b"data").unwrap();
+        drop(second);
+        assert!(retained.exists());
+        std::fs::remove_file(retained).unwrap();
+        std::fs::remove_dir(path).unwrap();
     }
 
     #[test]
