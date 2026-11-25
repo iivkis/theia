@@ -104,11 +104,20 @@ class ReferenceH3(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self.http = H3Connection(self._quic)
         self.seen = seen
+        self.requests = set()
 
     def quic_event_received(self, event):
         for item in self.http.handle_event(event):
             if isinstance(item, HeadersReceived):
-                assert dict(item.headers) == dict(HEADERS) and item.stream_ended
+                assert dict(item.headers) == dict(HEADERS)
+                self.requests.add(item.stream_id)
+            elif isinstance(item, DataReceived):
+                assert not item.data
+            else:
+                continue
+            if item.stream_ended:
+                assert item.stream_id in self.requests
+                self.requests.remove(item.stream_id)
                 self.seen.append("h3")
                 self.http.send_headers(item.stream_id, RESPONSE)
                 self.http.send_data(item.stream_id, BODY, end_stream=True)

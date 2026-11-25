@@ -3285,7 +3285,7 @@ fn has_reality(document: &ServerDocument) -> bool {
 /// captured once for both transports, and every inbound shares accounting.
 /// The current REALITY generation is immutable; ordinary own-TLS hot
 /// replacement cannot mutate it. Management is status-only in this mode.
-#[cfg(test)]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "windows"))))]
 pub(crate) async fn run_reality_document_with_ready(
     document: ServerDocument,
     started: Option<tokio::sync::oneshot::Sender<()>>,

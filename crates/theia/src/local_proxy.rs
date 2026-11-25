@@ -1985,8 +1985,17 @@ mod selector_tests {
                 }
                 let (started, ready) = tokio::sync::oneshot::channel();
                 let mut server = JoinSet::new();
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                let (drain, stop) = tokio::sync::oneshot::channel();
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                let (draining, acknowledged) = tokio::sync::oneshot::channel();
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                server.spawn(crate::server::registered_reality_drain_fixture(
+                    server_doc.clone(), started, stop, draining,
+                ));
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 server.spawn(crate::server::run_reality_document_with_ready(
-                    server_doc.clone(),
+                    server_doc,
                     Some(started),
                 ));
                 ready.await.unwrap();
@@ -2306,9 +2315,13 @@ mod selector_tests {
                     proxy.shutdown().await;
                 }
                 drop(managed_clients);
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 server.shutdown().await;
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 {
+                    drain.send(()).unwrap();
+                    acknowledged.await.unwrap();
+                    server.join_next().await.unwrap().unwrap().unwrap();
                     // A fresh supervisor must reject a previously valid but
                     // superseded publication, even after the old process exits.
                     let path = bundle.join("publication.toml");
