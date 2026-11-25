@@ -233,6 +233,7 @@ enum IssueFlow {
     Saving,
     SaveFailed,
     Offer,
+    ConfirmReveal,
     ConfirmExport,
     Exporting,
     Exported(PathBuf),
@@ -600,7 +601,7 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
     if editor.write_uncertain() {
         return (
             'o',
-            "Запись не подтверждена. Проверьте файл и откройте его заново (F3).",
+            "Запись не подтверждена. Проверьте файл и откройте его заново.",
         );
     }
     if editor.dirty() {
@@ -672,12 +673,29 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
     }
 }
 
+fn save_failure_actions(editor: Option<&Editor>) -> Vec<ActionItem> {
+    let mut items = Vec::new();
+    if !editor.is_some_and(Editor::write_uncertain) {
+        items.push(ActionItem { key: 'r', label: "Повторить сохранение" });
+    }
+    items.push(ActionItem { key: 'd', label: "Отменить черновик" });
+    items
+}
+
+fn issuance_actions(flow: &IssueFlow, editor: Option<&Editor>) -> Vec<ActionItem> {
+    if matches!(flow, IssueFlow::SaveFailed) { save_failure_actions(editor) } else { invitation_actions(flow) }
+}
+
 fn invitation_actions(flow: &IssueFlow) -> Vec<ActionItem> {
     match flow {
         IssueFlow::Offer => vec![
             ActionItem {
                 key: 'f',
                 label: "Сохранить приглашение в файл",
+            },
+            ActionItem {
+                key: 'v',
+                label: "Показать ссылку один раз",
             },
             ActionItem {
                 key: 'Q',
@@ -1337,6 +1355,7 @@ impl Interaction {
         if let Some(flow) = &self.issuance {
             return match flow {
                 IssueFlow::Confirm(_) => Some(('y', "Сохранить")),
+                IssueFlow::ConfirmReveal => Some(('y', "Показать ссылку")),
                 IssueFlow::ConfirmExport => Some(('y', "Экспортировать")),
                 IssueFlow::ShareConfirm { .. } => Some(('y', "Подтвердить передачу")),
                 _ => None,
@@ -1620,8 +1639,8 @@ impl Interaction {
             return;
         }
         if let Some(flow) = self.issuance.as_ref() {
-            let items = invitation_actions(flow);
-            if let Some([_, controls]) = action_layout(body, items.len()) {
+            let items = issuance_actions(flow, self.editor.as_ref());
+            if let Some(controls) = self.viewport.action_rect.get().filter(|r| r.bottom() <= body.bottom()) {
                 if let Some(index) = (Actions {
                     items: &items,
                     selected: self.modal_action,
@@ -1632,6 +1651,15 @@ impl Interaction {
                 }
                 return;
             }
+        }
+        if matches!(self.revocation, Some(DisableFlow::SaveFailed)) {
+            let items = save_failure_actions(self.editor.as_ref());
+            if let Some(controls) = self.viewport.action_rect.get() {
+                if let Some(index) = (Actions { items: &items, selected: self.modal_action }).hit(controls, event.column, event.row) {
+                    self.modal_action = index;
+                }
+            }
+            return;
         }
         if let Some(IssueFlow::Input(id)) = self.issuance.as_mut() {
             if self.issue_kind != IssueKind::NewUser {
@@ -2769,7 +2797,7 @@ impl Interaction {
             return false;
         }
         if let Some(flow) = self.issuance.take() {
-            let items = invitation_actions(&flow);
+            let items = issuance_actions(&flow, Some(editor));
             let code = if key.modifiers.is_empty() {
                 tui_widgets::action_key(&items, &mut self.modal_action, key.code)
             } else {
@@ -2780,6 +2808,7 @@ impl Interaction {
                 return false;
             };
             let key = KeyEvent { code, ..key };
+            if !items.is_empty() { self.modal_action = 0; }
             match flow {
                 IssueFlow::Input(id)
                     if self.issue_kind != IssueKind::NewUser
@@ -2865,7 +2894,12 @@ impl Interaction {
                     KeyCode::Char('f') => {
                         self.issuance = Some(IssueFlow::ConfirmExport);
                     }
-                    KeyCode::Char('y') => {
+                    KeyCode::Char('v' | 'y') => self.issuance = Some(IssueFlow::ConfirmReveal),
+                    KeyCode::Char('n') | KeyCode::Esc => editor.clear_issued(),
+                    _ => self.issuance = Some(IssueFlow::Offer),
+                },
+                IssueFlow::ConfirmReveal => match key.code {
+                    KeyCode::Char('y') if key.modifiers.is_empty() => {
                         if let Some(invite) = editor.take_issued() {
                             match invite.encode() {
                                 Ok(link) => {
@@ -2878,8 +2912,8 @@ impl Interaction {
                             }
                         }
                     }
-                    KeyCode::Char('n') | KeyCode::Esc => editor.clear_issued(),
-                    _ => self.issuance = Some(IssueFlow::Offer),
+                    KeyCode::Char('n') | KeyCode::Esc => self.issuance = Some(IssueFlow::Offer),
+                    _ => self.issuance = Some(IssueFlow::ConfirmReveal),
                 },
                 IssueFlow::ConfirmExport => match key.code {
                     KeyCode::Char('y') => {
@@ -2969,6 +3003,13 @@ impl Interaction {
         }
 
         if let Some(flow) = self.revocation.take() {
+            let items = if matches!(flow, DisableFlow::SaveFailed) { save_failure_actions(Some(editor)) } else { Vec::new() };
+            let Some(code) = (if key.modifiers.is_empty() { tui_widgets::action_key(&items, &mut self.modal_action, key.code) } else { Some(key.code) }) else {
+                self.revocation = Some(flow);
+                return false;
+            };
+            let key = KeyEvent { code, ..key };
+            if !items.is_empty() { self.modal_action = 0; }
             match flow {
                 DisableFlow::Input(id) if eligible_users(editor, false).is_empty() => {
                     if key.code != KeyCode::Esc {
@@ -3920,6 +3961,7 @@ struct Viewport {
     focused_row: Cell<Option<usize>>,
     confirmation: Cell<bool>,
     confirm_rect: Cell<Option<Rect>>,
+    action_rect: Cell<Option<Rect>>,
     guided: Cell<bool>,
 }
 impl Viewport {
@@ -4318,6 +4360,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     if let Some(v) = viewport {
         v.confirmation.set(confirmation.is_some());
         v.confirm_rect.set(None);
+        v.action_rect.set(None);
         v.guided.set(false);
     }
     macro_rules! modal_panel {
@@ -4619,7 +4662,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Сохранение конфигурации",
-            "Проверка изменений и атомарная запись TOML выполняются.\nRuntime не перезагружается.\nДождитесь результата операции.",
+            "Проверка изменений и безопасная запись файла выполняются.\nРаботающий процесс не перезапускается.\nДождитесь результата операции.",
             true,
         );
     } else if let Some(flow) = interaction.and_then(|ui| ui.records.as_ref()) {
@@ -4684,6 +4727,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             flow,
             interaction.and_then(|ui| ui.editor.as_ref()),
             viewport,
+            interaction.map_or(0, |ui| ui.modal_action),
         );
     } else if let Some(browser) = interaction.and_then(|ui| ui.import_browser.as_ref()) {
         let title = if interaction
@@ -5075,9 +5119,9 @@ fn draw_issuance(
                 "Пользователь: {id}\nПодключение: {}\n\n{}\n\ny: подтвердить и сохранить  n/Esc: отменить",
                 editor.map_or("", |e| e.selected_record_id()),
                 if recovering {
-                    "ВНИМАНИЕ: доступ восстановится для всех ранее разрешённых подключений.\nБудет создан новый ключ; старый восстановить нельзя.\nЧтобы изменить работающий сервер, отдельно примените права (Ctrl+R)."
+                    "ВНИМАНИЕ: доступ восстановится для всех ранее разрешённых подключений.\nБудет создан новый ключ; старый восстановить нельзя.\nЧтобы изменить работающий сервер, отдельно примените права."
                 } else if rotating {
-                    "ВНИМАНИЕ: новый ключ заменит старый для всех подключений пользователя.\nСтарый ключ перестанет работать для новых сеансов после отдельного применения прав (Ctrl+R).\nТекущие сеансы продолжатся. Права и состояние пользователя не изменятся."
+                    "ВНИМАНИЕ: новый ключ заменит старый для всех подключений пользователя.\nСтарый ключ перестанет работать для новых сеансов после отдельного применения прав.\nТекущие сеансы продолжатся. Права и состояние пользователя не изменятся."
                 } else {
                     "Создать личный ключ и сохранить пользователя?\nСервер не перезапускается. После записи отдельно примените права доступа."
                 }
@@ -5085,18 +5129,18 @@ fn draw_issuance(
         ),
         IssueFlow::Saving => (
             "Сохранение токена",
-            "Проверка и атомарная запись TOML. Конфиденциальная ссылка скрыта; runtime не меняется."
+            "Проверка и безопасная запись файла. Конфиденциальная ссылка скрыта; runtime не меняется."
                 .into(),
         ),
         IssueFlow::SaveFailed if editor.is_some_and(Editor::write_uncertain) => (
             "Состояние записи неизвестно: ссылка заблокирована",
-            "TOML мог быть заменён. Токен уничтожен; runtime не обновлён. Откройте редактор заново и проверьте состояние. d: закрыть черновик."
+            "Файл мог быть заменён. Ключ уничтожен; работающий сервер не обновлён. Откройте настройки заново и проверьте состояние."
                 .into(),
         ),
         IssueFlow::SaveFailed => (
             "Сохранение НЕ удалось: ссылка заблокирована",
             format!(
-                "{}\n\n{}\n\nr: повторить запись  d: удалить черновик и токен",
+                "{}\n\n{}",
                 if recovering {
                     "Восстановление НЕ сохранено. Новый токен не показывался."
                 } else if rotating {
@@ -5110,14 +5154,18 @@ fn draw_issuance(
         IssueFlow::Offer => (
             "Одноразовая выдача конфиденциальной ссылки",
             if recovering {
-                "Восстановление доступа сохранено в файле. Старый ключ восстановить нельзя.\nРаботающий сервер ещё не изменён. После передачи приглашения отдельно примените права доступа (Ctrl+R).\n\nКОНФИДЕНЦИАЛЬНО: передайте новую ссылку только её владельцу. После закрытия повторного показа не будет.\n\ny: показать ссылку один раз".into()
+                "Восстановление доступа сохранено в файле. Старый ключ восстановить нельзя.\nРаботающий сервер ещё не изменён. После передачи приглашения отдельно примените права доступа.\n\nКОНФИДЕНЦИАЛЬНО: передайте новую ссылку только её владельцу. После закрытия повторного показа не будет.".into()
             } else if rotating {
-                "Данные нового ключа сохранены. Работающий сервер ещё не изменён.\nСтарый ключ может использоваться для новых сеансов до отдельного применения прав (Ctrl+R).\n\nКОНФИДЕНЦИАЛЬНО: новая ссылка предназначена только её владельцу. После закрытия повторного показа не будет.\n\ny: показать ссылку один раз"
+                "Данные нового ключа сохранены. Работающий сервер ещё не изменён.\nСтарый ключ может использоваться для новых сеансов до отдельного применения прав.\n\nКОНФИДЕНЦИАЛЬНО: новая ссылка предназначена только её владельцу. После закрытия повторного показа не будет."
                     .into()
             } else {
-                "Новый пользователь сохранён в файле. Работающий сервер ещё не изменён.\nПосле передачи приглашения отдельно примените права доступа (Ctrl+R).\n\nКОНФИДЕНЦИАЛЬНО: ссылка содержит личный ключ. Не публикуйте её. После закрытия повторного показа не будет.\n\ny: показать ссылку один раз"
+                "Новый пользователь сохранён в файле. Работающий сервер ещё не изменён.\nПосле передачи приглашения отдельно примените права доступа.\n\nКОНФИДЕНЦИАЛЬНО: ссылка содержит личный ключ. Не публикуйте её. После закрытия повторного показа не будет."
                     .into()
             },
+        ),
+        IssueFlow::ConfirmReveal => (
+            "Показ конфиденциальной ссылки",
+            "Ссылка содержит личный ключ доступа. Любой, кто её получит, сможет подключаться с этими правами.\nУбедитесь, что экран, терминал и его история доступны только вам.\nПосле показа повторная выдача невозможна.".into(),
         ),
         IssueFlow::ShareConfirm { action, public } => (
             "Подтвердить передачу приглашения",
@@ -5129,7 +5177,7 @@ fn draw_issuance(
                 if public.is_none() { "КОНФИДЕНЦИАЛЬНО: будет использован одноразовый bearer; не передавайте недоверенному терминалу или получателю." } else { "Публичное приглашение без bearer." })
         ),
         IssueFlow::Sharing => ("Передача приглашения", "Операция выполняется; URI скрыт.".into()),
-        IssueFlow::ShareDone(message) => ("Результат передачи", format!("{message}\nEsc: закрыть. Runtime не изменён.")),
+        IssueFlow::ShareDone(message) => ("Результат передачи", format!("{message}\nEsc: закрыть. Работающий процесс не изменён.")),
         IssueFlow::ConfirmExport => (
             "Подтверждение конфиденциального экспорта",
             "Создать новый защищённый файл рядом с конфигурацией сервера? Ссылка не будет показана. Файл содержит bearer; храните и передавайте его только доверенным способом. Повторная выдача недоступна.\n\ny: сохранить  n/Esc: назад"
@@ -5137,12 +5185,12 @@ fn draw_issuance(
         ),
         IssueFlow::Exporting => (
             "Защищённый экспорт",
-            "Создаётся новый конфиденциальный файл. Runtime не обновляется.".into(),
+            "Создаётся новый конфиденциальный файл. Работающий процесс не обновляется.".into(),
         ),
         IssueFlow::Exported(path) => (
             "Конфиденциальный файл создан",
             format!(
-                "Файл содержит bearer. Не публикуйте его.\n\n{path:?}\n\nПуть показан в кавычках. Esc: закрыть. Runtime не обновлён."
+                "Файл содержит bearer. Не публикуйте его.\n\n{path:?}\n\nПуть показан в кавычках. Esc: закрыть. Работающий сервер не обновлён."
             ),
         ),
         IssueFlow::ExportFailed => (
@@ -5159,7 +5207,7 @@ fn draw_issuance(
         IssueFlow::Showing(link) => (
             "СЕКРЕТ: ссылка подключения (однократный просмотр)",
             format!(
-                "КОНФИДЕНЦИАЛЬНО. Скопируйте ссылку целиком.\nТерминал/SSH и экран должны быть доверенными.\n\n{link}\n\nEsc: скрыть и стереть из памяти.\nRuntime не перезагружен.",
+                "КОНФИДЕНЦИАЛЬНО. Скопируйте ссылку целиком.\nТерминал/SSH и экран должны быть доверенными.\n\n{link}\n\nEsc: скрыть и стереть из памяти.\nРаботающий процесс не перезапущен.",
                 link = link.as_str()
             ),
         ),
@@ -5171,13 +5219,7 @@ fn draw_issuance(
             body
         }
     } else if matches!(flow, IssueFlow::Offer) {
-        // The reveal shortcut remains explicit, never an Enter action.
-        // Keep all keyboard alternatives available when the list cannot fit.
-        if action_layout(area, invitation_actions(flow).len()).is_none() {
-            format!("{body}\nf: сохранить в файл | Q: QR | c: копировать | n/Esc: закрыть")
-        } else {
-            format!("{body}\nEsc: закрыть без выдачи. Файл останется сохранённым.")
-        }
+        format!("{body}\nФайл настроек останется сохранённым даже без передачи ссылки.")
     } else {
         body
     };
@@ -5201,8 +5243,9 @@ fn draw_issuance(
         );
         return;
     }
-    let items = invitation_actions(flow);
-    if let Some([report, controls]) = action_layout(area, items.len()) {
+    let items = issuance_actions(flow, editor);
+    if let Some([report, controls]) = report_action_layout(area, items.len(), &body) {
+        if let Some(v) = viewport { v.action_rect.set(Some(controls)); }
         panel_at(frame, report, title, &body, false, viewport);
         Actions {
             items: &items,
@@ -5220,6 +5263,7 @@ fn draw_revocation(
     flow: &DisableFlow,
     editor: Option<&Editor>,
     viewport: Option<&Viewport>,
+    action_focus: usize,
 ) {
     if let DisableFlow::Input(id) = flow {
         if editor.is_some_and(|e| eligible_users(e, false).is_empty()) {
@@ -5261,23 +5305,23 @@ fn draw_revocation(
         ),
         DisableFlow::Saving => (
             "Отзыв доступа: сохранение",
-            "Проверка и атомарная запись TOML. Runtime не изменяется.".into(),
+            "Проверка и безопасная запись файла. Работающий процесс не изменяется.".into(),
         ),
         DisableFlow::SaveFailed if editor.is_some_and(Editor::write_uncertain) => (
             "Отзыв доступа: состояние записи неизвестно",
-            "TOML мог быть заменён. Runtime не обновлён. Откройте редактор заново; d: закрыть черновик."
+            "Файл мог быть заменён. Работающий сервер не обновлён. Откройте настройки заново и проверьте состояние."
                 .into(),
         ),
         DisableFlow::SaveFailed => (
             "Отзыв доступа: ошибка сохранения",
             format!(
-                "Изменения НЕ сохранены. Работающий сервер не изменён.\n\n{}\n\nr: повторить сохранение  d: отменить черновик",
+                "Изменения НЕ сохранены. Работающий сервер не изменён.\n\n{}",
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
         ),
         DisableFlow::Done => (
             "Отключение сохранено",
-            "Настройки сохранены. Работающий сервер ещё не изменён.\n\nСледующий шаг: закройте это окно и выберите «Применить права доступа» (Ctrl+R). После подтверждения новые подключения пользователя будут запрещены. Уже открытые туннели продолжатся.\n\nEnter/Esc: закрыть.".into(),
+            "Настройки сохранены. Работающий сервер ещё не изменён.\n\nСледующий шаг: закройте это окно и выберите «Применить права доступа». После подтверждения новые подключения пользователя будут запрещены. Уже открытые туннели продолжатся.\n\nEnter/Esc: закрыть.".into(),
         ),
     };
     let body = if let DisableFlow::Input(id) = flow {
@@ -5303,6 +5347,13 @@ fn draw_revocation(
             viewport,
             (None, None),
         );
+    } else if matches!(flow, DisableFlow::SaveFailed) {
+        let items = save_failure_actions(editor);
+        if let Some([report, controls]) = report_action_layout(area, items.len(), &body) {
+            if let Some(v) = viewport { v.action_rect.set(Some(controls)); }
+            panel_at(frame, report, title, &body, false, viewport);
+            Actions { items: &items, selected: action_focus }.render(frame, controls);
+        } else { panel_at(frame, area, title, &body, true, viewport); }
     } else {
         panel_at(frame, area, title, &body, true, viewport);
     }
@@ -5404,13 +5455,13 @@ fn draw_import(
         ImportFlow::RefreshConfirm(invitation) => (
             "Подтверждение замены credential",
             format!(
-                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\n\nТолько новая ссылка на защищённый bearer. CA, TLS, transport и active_profile сохраняются. Старый файл не удаляется. Runtime не меняется.\n\ny: сохранить  n/Esc: отменить",
+                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\n\nТолько новая ссылка на защищённый bearer. CA, TLS, transport и active_profile сохраняются. Старый файл не удаляется. Работающий процесс не меняется.\n\ny: сохранить  n/Esc: отменить",
                 invitation.id, invitation.endpoint, invitation.server_name
             ),
         ),
         ImportFlow::RefreshSaving => (
             "Замена credential",
-            "Создание нового защищённого файла и guarded TOML commit. Runtime не меняется.".into(),
+            "Создание нового защищённого файла и guarded TOML commit. Работающий процесс не меняется.".into(),
         ),
         ImportFlow::RefreshDone => (
             "Credential сохранён",
@@ -6149,7 +6200,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
         "Enter — изменить выбранное поле"
     };
     let actions = if server {
-        "W Мастер REALITY · N Новое подключение · F5 Сервер"
+        "Создайте подключение или запустите сервер"
     } else {
         "i Импорт приглашения · N Новый профиль · V Подключение"
     };
@@ -6164,7 +6215,7 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
     } else if editor.dirty() {
         "Сохраните изменения (Ctrl+S). Это не изменяет работающий процесс."
     } else if server {
-        "F5 — запустить или проверить сервер. u — выдать доступ пользователю."
+        "Запустите сервер или выдайте доступ пользователю."
     } else {
         "V — открыть подключение и проверить его состояние."
     };
@@ -7370,7 +7421,7 @@ mod tests {
             ui.issue_kind = kind;
             ui.issuance = Some(IssueFlow::Offer);
             let screen = rendered_interaction(120, 40, &model, &ui);
-            assert!(screen.contains("показать ссылку один раз"));
+            assert!(screen.contains("Показать ссылку один раз"));
             assert!(screen.contains("Сохранить приглашение в файл"));
             assert!(!screen.contains("Что это значит"));
             assert!(!screen.contains("edge.example.org"));
@@ -8498,7 +8549,17 @@ mod tests {
         assert!(doc.server.inbounds[0]
             .allowed_user_ids
             .contains(&"new-device".to_owned()));
-        assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
+        ui.update(&mut model, press(KeyCode::Down));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(ui.issuance, Some(IssueFlow::ConfirmReveal)));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
+        ui.update(&mut model, press(KeyCode::Enter)); // cancel selected
+        assert!(matches!(ui.issuance, Some(IssueFlow::Offer)));
+        assert!(ui.editor.as_ref().unwrap().issued_ready());
+        ui.update(&mut model, press(KeyCode::Char('v')));
+        ui.update(&mut model, press(KeyCode::Right));
+        assert!(ui.editor.as_ref().unwrap().issued_ready());
+        ui.update(&mut model, press(KeyCode::Enter));
         let IssueFlow::Showing(uri) = ui.issuance.as_ref().unwrap() else {
             panic!("explicit one-time reveal expected");
         };
@@ -8632,7 +8693,10 @@ mod tests {
         assert!(!rendered_interaction(120, 40, &model, &ui).contains("theia://v1/"));
         assert!(!ui.update(&mut model, press(KeyCode::Char('y'))));
         assert!(matches!(ui.issuance, Some(IssueFlow::SaveFailed)));
-        assert!(!ui.update(&mut model, press(KeyCode::Char('d'))));
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("Повторить сохранение"));
+        ui.update(&mut model, press(KeyCode::Down));
+        assert!(ui.saving.is_none());
+        ui.update(&mut model, press(KeyCode::Enter));
         assert!(ui.issuance.is_none());
         assert!(!ui.editor.as_ref().unwrap().dirty());
         assert!(ui.editor.as_mut().unwrap().take_issued().is_none());
@@ -8721,6 +8785,7 @@ mod tests {
             after.server.inbounds[0].allowed_user_ids,
             before.server.inbounds[0].allowed_user_ids
         );
+        ui.update(&mut model, press(KeyCode::Char('y')));
         ui.update(&mut model, press(KeyCode::Char('y')));
         let IssueFlow::Showing(link) = ui.issuance.as_ref().unwrap() else {
             panic!("one-time rotation reveal expected");
@@ -9182,7 +9247,7 @@ mod tests {
         for (flow, label) in [
             (IssueFlow::Saving, "Конфиденциальная ссылка скрыта"),
             (IssueFlow::ConfirmExport, "Ссылка не будет показана"),
-            (IssueFlow::Exporting, "Runtime не обновляется"),
+            (IssueFlow::Exporting, "Работающий процесс не обновляется"),
             (
                 IssueFlow::Exported(PathBuf::from("private.invite")),
                 "Файл содержит bearer",
@@ -9216,11 +9281,11 @@ mod tests {
                 DisableFlow::Confirm("device-a".into()),
                 "отдельного применения прав",
             ),
-            (DisableFlow::Saving, "Runtime не изменяется"),
+            (DisableFlow::Saving, "Работающий процесс не изменяется"),
             (DisableFlow::SaveFailed, "Изменения НЕ сохранены"),
             (DisableFlow::Done, "Применить права доступа"),
         ] {
-            let screen = render(|f, a| draw_revocation(f, a, &flow, None, None));
+            let screen = render(|f, a| draw_revocation(f, a, &flow, None, None, 0));
             assert!(screen.contains(label), "{screen}");
         }
         let input = render(|f, a| {
@@ -9235,7 +9300,7 @@ mod tests {
         assert!(!input.contains(hidden));
         assert!(input.contains("скрыто"));
         for (flow, label) in [
-            (ImportFlow::RefreshSaving, "Runtime не меняется"),
+            (ImportFlow::RefreshSaving, "Работающий процесс не меняется"),
             (
                 ImportFlow::RefreshDone,
                 "соединение и системный прокси не менялись",
