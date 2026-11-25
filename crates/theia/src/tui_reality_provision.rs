@@ -714,6 +714,14 @@ impl Wizard {
                             self.focus = 1;
                         }
                     }
+                    KeyCode::F(3) if self.focus==3 && self.fields[3].is_empty() => {
+                        if let Ok(ip)=self.fields[2].trim_matches(['[',']']).parse::<IpAddr>() {
+                            self.fields[3]=ip.to_string();
+                            self.error.clear();
+                        } else {
+                            self.error="Адрес для клиентов не является IP. Укажите все IP своего сервера вручную.".into();
+                        }
+                    }
                     KeyCode::F(6) if self.focus == 5 && !self.available_users.is_empty() => {
                         self.grant_picker = Some(GrantPicker {
                             selected: self.available_users.iter().map(|id| self.fields[5].split(',').any(|s| s.trim() == id)).collect(),
@@ -724,9 +732,11 @@ impl Wizard {
                     KeyCode::BackTab | KeyCode::Up => self.move_focus(false),
                     KeyCode::Backspace => {
                         self.fields[self.focus].pop();
+                        self.error.clear();
                     }
                     KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-                        self.fields[self.focus].clear()
+                        self.fields[self.focus].clear();
+                        self.error.clear();
                     }
                     KeyCode::Enter => {
                         if let Some((field, message)) = self.basic_error() {
@@ -1203,7 +1213,7 @@ impl ProvisionPanel {
             ("ID подключения", "Уникальное имя подключения, создаётся автоматически."),
             ("Порт TCP/UDP", "Оставьте 443, если не знаете, зачем менять. Порт должен быть доступен на сервере."),
             ("Адрес сервера для клиентов", "Введите IP или домен VPS из панели хостинга, без https:// и порта. Не адрес стороннего сайта."),
-            ("Собственные IP сервера", "IP из панели хостинга. Включите все адреса этого сервера, в том числе публичные/NAT. При нескольких адресах разделите запятыми."),
+            ("Собственные IP сервера", "F3 — вставить IP из предыдущего поля, если там IP. Обязательно добавьте все остальные адреса сервера через запятую."),
             ("Домены референсов", "До трёх доменов или домен=IP, через запятую."),
             (if first { "ID первого пользователя" } else { "Пользователи с доступом" },
              if first { "Придумайте имя, например phone. После создания нажмите «Выдать доступ отключённому» на обзоре сервера." } else { "Нажмите F6 и отметьте нужных пользователей. Никому не выдаётся доступ автоматически." }),

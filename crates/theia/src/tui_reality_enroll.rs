@@ -435,13 +435,27 @@ impl EnrollmentPanel {
             }
             KeyCode::Backspace => {
                 self.fields[self.focus].pop();
+                self.error=None;
             }
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
                 self.fields[self.focus] = Zeroizing::new(String::new());
+                self.error=None;
             }
             KeyCode::Enter if self.managed_paths() && self.focus < 4 && !self.fields[0].is_empty() && !self.fields[1].is_empty() && self.fields[4].is_empty() => {
                 self.focus=4;
                 self.error=None;
+            }
+            KeyCode::Enter if self.fields[0].is_empty() => {
+                self.focus=0;
+                self.error=Some("Нет приглашения. Вставьте ссылку или выберите присланный файл (F6).".into());
+            }
+            KeyCode::Enter if self.fields[1].is_empty() => {
+                self.focus=1;
+                self.error=Some("Нет файла допуска. Попросите его у администратора и выберите через F6.".into());
+            }
+            KeyCode::Enter if crate::parse_restart_digest(&self.fields[4]).is_none() => {
+                self.focus=4;
+                self.error=Some("Отпечаток должен состоять из 64 шестнадцатеричных символов. Сверьте его с администратором отдельно от приглашения.".into());
             }
             KeyCode::Enter => match self.input() {
                 Ok(input) => {

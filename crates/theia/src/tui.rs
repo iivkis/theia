@@ -1541,6 +1541,11 @@ impl Interaction {
                             if let Some(KeyCode::Char(ch)) = tui_widgets::action_key(&items, &mut self.workspace_action, key.code) {
                                 let selected = if role == Role::Server && self.workspace_page == 2 {
                                     self.editor_for(role).and_then(|e| e.workspace_users().get(self.workspace_user).map(|u| u.0.clone()))
+                                } else if role == Role::Server && key.code==KeyCode::Enter && matches!(ch,'b'|'x'|'t') {
+                                    self.editor_for(role).and_then(|e| {
+                                        let users=eligible_users(e,ch=='b');
+                                        (users.len()==1).then(||users[0].clone())
+                                    })
                                 } else { None };
                                 self.workspace_focus = WorkspaceFocus::Fields;
                                 let command = match ch {
@@ -1571,6 +1576,7 @@ impl Interaction {
                         }
                     }
                     if self.workspace_page != 1 && matches!(key.code, KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab) {
+                        if self.workspace_page==0 && self.workspace_focus==WorkspaceFocus::Fields {self.workspace_action=self.recommended_action(role);}
                         self.workspace_focus = if key.code == KeyCode::BackTab { WorkspaceFocus::Navigation } else { WorkspaceFocus::Actions };
                         return false;
                     }
@@ -1749,6 +1755,10 @@ impl Interaction {
                     KeyCode::Backspace => {
                         id.pop();
                         self.issuance = Some(IssueFlow::Input(id));
+                    }
+                    KeyCode::Char('u') if key.modifiers==KeyModifiers::CONTROL => {
+                        editor.error=None;
+                        self.issuance=Some(IssueFlow::Input(String::new()));
                     }
                     KeyCode::Char(ch)
                         if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
@@ -1962,10 +1972,17 @@ impl Interaction {
         if let Some(browser)=self.import_browser.as_mut() {
             if key.code==KeyCode::Esc {self.import_browser=None;return false;}
             if let Some(path)=browser.key(key.code,"") {
-                if let (Some(path),Some(ImportFlow::Input(source)))=(path.to_str(),self.importing.as_mut()) {
-                    if path.len()<=crate::invite::MAX_URI && !path.chars().any(char::is_control) {
-                        *source=Zeroizing::new(path.to_owned());
-                        editor.error=None;
+                if let Some(path)=path.to_str().filter(|s|!s.chars().any(char::is_control)) {
+                    match self.importing.as_mut() {
+                        Some(ImportFlow::Input(source)) if path.len()<=crate::invite::MAX_URI => {
+                            *source=Zeroizing::new(path.to_owned());
+                            editor.error=None;
+                        }
+                        Some(ImportFlow::Trust{ca,..}) if path.len()<=1019 => {
+                            *ca=format!("file:{path}");
+                            editor.error=None;
+                        }
+                        _=>editor.error=Some("Путь слишком длинный. Выберите другой файл.".into()),
                     }
                 }
                 self.import_browser=None;
@@ -2102,6 +2119,15 @@ impl Interaction {
                     mut ca,
                     public_ref,
                 } => match key.code {
+                    KeyCode::F(6) => {
+                        self.import_browser=Some(FileBrowser::files(ca.strip_prefix("file:").unwrap_or(&ca)));
+                        self.importing=Some(ImportFlow::Trust{invitation,ca,public_ref});
+                    }
+                    KeyCode::Char('u') if key.modifiers==KeyModifiers::CONTROL => {
+                        ca.clear();
+                        editor.error=None;
+                        self.importing=Some(ImportFlow::Trust{invitation,ca,public_ref});
+                    }
                     KeyCode::Esc => {
                         self.importing = Some(ImportFlow::Preview {
                             invitation,
@@ -2126,7 +2152,7 @@ impl Interaction {
                             }
                             Err(_) => {
                                 editor.error = Some(
-                                    "CA-файл должен быть доверенным PEM по абсолютному file: пути."
+                                    "Не удалось проверить сертификат. Выберите через F6 доверенный PEM-файл, полученный отдельно от администратора."
                                         .into(),
                                 );
                                 self.importing = Some(ImportFlow::Trust {
@@ -2503,8 +2529,7 @@ impl Interaction {
                 } else {
                     editor.error = None;
                     self.issue_kind = IssueKind::Reenable;
-                    let users=eligible_users(editor,true);
-                    self.issuance = Some(IssueFlow::Input(if users.len()==1 {users[0].clone()}else{String::new()}));
+                    self.issuance = Some(IssueFlow::Input(String::new()));
                 }
                 return false;
             }
@@ -2834,7 +2859,7 @@ fn draw_guided(
     }
     if let Some(form) = form {
         let title = if parts[0].height == 0 { caption.as_str() } else { "Параметры" };
-        if matches!(heading, "Выбор пользователей" | "Выбор пользователя" | "Выбор защиты" | "Выбор адреса") { form.render_picker(frame, parts[1], title); }
+        if matches!(heading, "Выбор пользователей" | "Выбор пользователя" | "Выбор защиты" | "Выбор адреса" | "Выбор файла" | "Выбор локального файла") { form.render_picker(frame, parts[1], title); }
         else { form.render(frame, parts[1], title); }
     } else if let Some(lines) = review_lines {
         // Same width as stepper and key bar: never re-center a nested report.
@@ -3074,7 +3099,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             viewport,
         );
     } else if let Some(browser)=interaction.and_then(|ui|ui.import_browser.as_ref()) {
-        draw_guided(frame,parts[1],"Выбрать файл приглашения или QR","",(1,2,"Выбор файла","↑↓ выбрать · Enter выбрать путь · Esc назад"),viewport,(Some(browser.form()),None));
+        let title=if interaction.is_some_and(|ui|matches!(ui.importing.as_ref(),Some(ImportFlow::Trust{..}))) {"Выбрать доверенный сертификат"}else{"Выбрать файл приглашения или QR"};
+        draw_guided(frame,parts[1],title,"",(1,2,"Выбор файла","↑↓ выбрать · Enter выбрать путь · Esc назад"),viewport,(Some(browser.form()),None));
     } else if let Some(flow) = interaction.and_then(|ui| ui.importing.as_ref()) {
         draw_import(
             frame,
@@ -3242,7 +3268,7 @@ fn draw_issuance(
                 lead: "Создаётся новый токен и доступ только к выбранному подключению. Сервер не перезапускается.".into(),
                 error: editor.and_then(|e| e.error.clone()).unwrap_or_default(),
             };
-            draw_guided(frame, area, "Новый пользователь", "", (1, 2, "Доступ", "Enter продолжить · Backspace удалить · Esc отменить"), viewport, (Some(form), None));
+            draw_guided(frame, area, "Новый пользователь", "", (1, 2, "Доступ", "Enter продолжить · Ctrl+U очистить · Esc отменить"), viewport, (Some(form), None));
             return;
         }
         if let Some(form) = user_picker(editor, id, recovering) {
@@ -3471,6 +3497,16 @@ fn draw_import(
         draw_guided(frame, area, "Импорт подключения", "", (1, 2, "Источник приглашения", "Enter проверить · F6 выбрать файл · Ctrl+U очистить · Esc отменить"), viewport, (Some(form), None));
         return;
     }
+    if let ImportFlow::Trust{ca,..}=flow {
+        let form=Form {
+            fields:vec![Field {id:0,label:"Доверенный сертификат (CA)",value:if ca.is_empty(){String::new()}else{format!("Путь указан · {} символов",ca.len())},hint:"Нажмите F6 и выберите PEM-файл, полученный от администратора по доверенному каналу."}],
+            selected:0,
+            lead:"Сертификат подтверждает, что вы подключаетесь к нужному серверу. Получите его отдельно от приглашения. Пустое поле оставит профиль неготовым.".into(),
+            error:editor.and_then(|e|e.error.clone()).unwrap_or_default(),
+        };
+        draw_guided(frame,area,"F-14: отдельный TLS trust","",(2,3,"Проверка сертификата","F6 выбрать файл · Enter проверить · Ctrl+U очистить · Esc назад"),viewport,(Some(form),None));
+        return;
+    }
     let (title, body) = match flow {
         ImportFlow::Input(source) => (
             "F-14: импорт подключения",
@@ -3483,7 +3519,7 @@ fn draw_import(
         ImportFlow::Preview { invitation, ca, public_ref } => (
             "F-14: безопасный предпросмотр подключения",
             format!(
-                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nSecurity mode: {}\nTransport: {:?}\nXHTTP: {:?}\nBearer: {}\nCA trust: {}\nДоверенный CA проверяется отдельно от приглашения.\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: выбрать CA PEM file: путь\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
+                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nSecurity mode: {}\nTransport: {:?}\nXHTTP: {:?}\nBearer: {}\nCA trust: {}\nДоверенный CA проверяется отдельно от приглашения.\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: указать доверенный сертификат (выбор файла)\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
                 invitation.id, invitation.endpoint, invitation.server_name,
                 invitation.security_mode().canonical_name(), invitation.transport, invitation.xhttp_mode(),
                 if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },
@@ -4007,9 +4043,15 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
+                    let old_screen=model.screen;
                     if interaction.update(&mut model, key) {
                         crate::diag!(Info, "tui", "closed_by_user");
                         return Ok(());
+                    }
+                    if old_screen!=model.screen {
+                        if let Some(role)=Interaction::panel_role(&model) {
+                            if interaction.editor_for(role).is_none() {interaction.welcome_choice=ConfigDialog::suggested_mode(role);}
+                        }
                     }
                 }
                 Event::Mouse(mouse) => {
