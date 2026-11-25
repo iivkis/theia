@@ -248,6 +248,11 @@ impl StatusServer {
         self
     }
 
+    pub(crate) fn with_runtime(mut self,state:Arc<crate::runtime_generation::State>)->Self{
+        self.runtime=Some(state);
+        self
+    }
+
     pub(crate) fn with_supervisor(
         mut self,
         state: Arc<crate::runtime_generation::State>,
@@ -586,7 +591,9 @@ where
                 }
             }
             candidate if parse_apply_revision(candidate).is_some() => {
-                if let (Some(preflight), Some(live)) = (preflight, live) {
+                if observed.as_ref().is_some_and(|view|view.document.server.inbounds.iter().any(|i|i.reality.is_some())) {
+                    "theia-apply-v1 rejected\n".to_owned()
+                } else if let (Some(preflight), Some(live)) = (preflight, live) {
                     let expected = parse_apply_revision(candidate).expect("already parsed");
                     // The blocking worker can finish after a timeout, but it
                     // NEVER commits. Only this still-live task may stage/CAS

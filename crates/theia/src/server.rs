@@ -1702,7 +1702,7 @@ pub async fn run_file(config_path: &Path) -> Result<(), ServerError> {
         "inbounds" = Value::Count(document.server.inbounds.len() as u64)
     );
     if has_reality(&document) {
-        return run_reality_document(document).await;
+        return run_reality_document_inner(document,None,Some(config_path)).await;
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
@@ -2401,13 +2401,18 @@ fn has_reality(document: &ServerDocument) -> bool {
 /// The current REALITY generation is immutable; ordinary own-TLS hot
 /// replacement cannot mutate it. Management is status-only in this mode.
 async fn run_reality_document(document: ServerDocument) -> Result<(), ServerError> {
-    run_reality_document_with_ready(document, None).await
+    run_reality_document_inner(document,None,None).await
 }
 
 pub(crate) async fn run_reality_document_with_ready(
     document: ServerDocument,
     started: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ServerError> {
+    run_reality_document_inner(document,started,None).await
+}
+
+async fn run_reality_document_inner(document:ServerDocument,
+    started:Option<tokio::sync::oneshot::Sender<()>>,config_path:Option<&Path>)->Result<(),ServerError>{
     let config = Config::Server(document.clone());
     config.validate().map_err(|_| ServerError::Config)?;
     if !document.server.enabled { return Err(ServerError::Config); }
@@ -2425,6 +2430,8 @@ pub(crate) async fn run_reality_document_with_ready(
             Option<tokio::net::UdpSocket>,crate::reality_generation::Manager,Arc<crate::reality_live::Live>),
     }
     let mut ready = Vec::with_capacity(document.server.inbounds.len());
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let mut loaded_identities=Vec::new();
     for inbound in &document.server.inbounds {
         let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
         let udp_addr: SocketAddr = inbound.quic_listen.parse().map_err(|_| ServerError::Config)?;
@@ -2435,6 +2442,8 @@ pub(crate) async fn run_reality_document_with_ready(
         let context = ServerContext::with_limits(inbound, policy, live.shared(), global.clone(),
             users.clone(), connections.clone(), peers.clone());
         if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            loaded_identities.push(crate::reload_preflight::IdentityHash::reality(inbound.reality.as_ref().ok_or(ServerError::Config)?));
             let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
             let manager = crate::reality_generation::Manager::new_live(&config,&inbound.id,now).await
                 .map_err(|_|ServerError::Config)?;
@@ -2459,18 +2468,27 @@ pub(crate) async fn run_reality_document_with_ready(
             ready.push(Ready::Reality(tcp,quic,silent,manager,live_generation));
         } else {
             let material = tls_material(inbound)?;
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            loaded_identities.push(material.identity.clone());
             let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
             let endpoint = crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
                 .map_err(|_| ServerError::Tls)?;
             ready.push(Ready::Plain(listener, acceptor, endpoint, Arc::new(context)));
         }
     }
-    // Status-only IPC. No reload/rollback request can pass through an
-    // own-TLS preflight and accidentally replace a REALITY generation.
+    // Same protected native CAS interface, but only auth-only mutations
+    // until a structural REALITY cutover can be fully staged.
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let runtime=config_path.map(|path|Arc::new(crate::runtime_generation::State::new(
+        crate::runtime_generation::View{document:Arc::new(document.clone()),inbounds:ready.len(),
+            preflight:Arc::new(crate::reload_preflight::ReloadPreflight::new(path.to_owned(),document.clone(),loaded_identities)),
+            live:live.clone()})));
     #[cfg(target_os = "linux")]
-    let management = crate::management::StatusServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?;
+    let management = crate::management::StatusServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?
+        .map(|server|if let Some(runtime)=runtime{server.with_runtime(runtime)}else{server});
     #[cfg(target_os = "windows")]
-    let management = crate::windows_control::WindowsServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?;
+    let management = crate::windows_control::WindowsServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?
+        .map(|server|if let Some(runtime)=runtime{server.with_runtime(runtime)}else{server});
     let mut tasks = JoinSet::new();
     let mut silent_sockets = Vec::new();
     for item in ready {
@@ -2524,7 +2542,7 @@ async fn run_document_with_config(
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = config_path;
     if has_reality(&document) {
-        return run_reality_document(document).await;
+        return run_reality_document_inner(document,None,config_path).await;
     }
     if !document.server.enabled {
         return Err(ServerError::Config);

@@ -552,7 +552,7 @@ impl Publication {
         now: u64,
     ) -> Result<u8, Error> {
         record.check_clock(now)?;
-        if record.pending.is_some()
+        if checked.current.check_time(now).is_err()
             || state.plan().digest().map_err(|_| Error::Health)? != record.plan_sha256
         {
             return Err(Error::Approval);
@@ -583,7 +583,7 @@ impl Publication {
                 .current
                 .descriptor()
                 .revision
-                .checked_add(1)
+                .checked_add(if record.pending.is_some(){2}else{1})
                 .ok_or(Error::Descriptor)?,
         })
     }
@@ -610,18 +610,33 @@ impl Publication {
         }
         let mut next = checked.current.descriptor().clone();
         next.active_reference = selected;
-        next.revision = next.revision.checked_add(1).ok_or(Error::Descriptor)?;
-        next.not_before = now;
-        next.not_after = now.checked_add(VALIDITY).ok_or(Error::Clock)?;
-        state
-            .validate_active(&next, now)
-            .map_err(|_| Error::Health)?;
-        record.active_document = checked
-            .active
-            .sign_descriptor(&next)
-            .map_err(|_| Error::Descriptor)?;
-        record.advance(now)?;
-        self.write(&record, Some(&old))
+        if let Some(pending)=record.pending.as_mut(){
+            // Preserve the original overlap and both validity intervals.
+            // Skip the already issued successor revision; neither signer
+            // may ever publish different content at an existing revision.
+            let (successor_key,previous)=checked.next.ok_or(Error::Identity)?;
+            next.revision=previous.descriptor().revision.checked_add(1).ok_or(Error::Descriptor)?;
+            let mut successor=previous.descriptor().clone();
+            successor.active_reference=selected;
+            successor.revision=next.revision.checked_add(1).ok_or(Error::Descriptor)?;
+            state.validate_active(&next,now).map_err(|_|Error::Health)?;
+            state.validate_active(&successor,now).map_err(|_|Error::Health)?;
+            let announcement=checked.active.sign_descriptor(&next).map_err(|_|Error::Descriptor)?;
+            let signed=successor_key.sign_descriptor(&successor).map_err(|_|Error::Descriptor)?;
+            pending.announcement=announcement.clone();
+            pending.successor=signed;
+            record.active_document=announcement;
+            record.advance(now)?;
+            record.advance(now)?;
+        }else{
+            next.revision=next.revision.checked_add(1).ok_or(Error::Descriptor)?;
+            next.not_before=now;
+            next.not_after=now.checked_add(VALIDITY).ok_or(Error::Clock)?;
+            state.validate_active(&next,now).map_err(|_|Error::Health)?;
+            record.active_document=checked.active.sign_descriptor(&next).map_err(|_|Error::Descriptor)?;
+            record.advance(now)?;
+        }
+        self.write(&record,Some(&old))
     }
 
     /// Stage a previously generated independent successor key. Both
@@ -773,6 +788,64 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+
+    #[test]
+    fn failover_during_overlap_advances_both_signers_and_preserves_deadline(){
+        let dir=Scratch::new();
+        let now=1000;
+        let scope=Scope{inbound:"edge".into(),endpoint:"edge.example.org:443".into()};
+        let good=reference_health::Evidence{h2_status:Some(200),h3_status:Some(200)};
+        let state=reference_health::State::new(reference_health::Plan{
+            schema_version:1,inbound:scope.inbound.clone(),endpoint:scope.endpoint.clone(),
+            own_ips:vec!["93.184.216.1".parse().unwrap()],
+            references:vec![reference_health::Target{server_name:"ref.example.org".into(),address:"93.184.216.2:443".parse().unwrap()},
+                reference_health::Target{server_name:"reserve.example.org".into(),address:"93.184.216.3:443".parse().unwrap()}],
+        },vec![good,good],now).unwrap();
+        let old=Identity::generate(scope.clone()).unwrap();
+        let next=Identity::generate(scope.clone()).unwrap();
+        let old_path=dir.0.join("old.key");let next_path=dir.0.join("next.key");
+        old.save_new(&old_path).unwrap();next.save_new(&next_path).unwrap();
+        let publication=Publication::new(&dir.0.join("publication.toml")).unwrap();
+        publication.initialize(&state,&old_path,now).unwrap();
+        let initial=publication.documents(now).unwrap().0;
+        let status=publication.inspect(now).unwrap();
+        let start=now+1;
+        publication.begin_rotation(&next_path,status.snapshot_sha256,bootstrap::fingerprint(next.public_key()),start).unwrap();
+        let overlap=publication.inspect(start).unwrap();
+        let (announcement,successor)=publication.documents(start).unwrap();
+        let successor=successor.unwrap();
+        let anchor=Anchor::new(scope.clone(),old.public_key(),1,bootstrap::auto_policy()).unwrap();
+        let a=descriptor::Store::new(&dir.0.join("a"),anchor.clone()).unwrap();
+        let b=descriptor::Store::new(&dir.0.join("b"),anchor).unwrap();
+        for store in [&a,&b]{store.initialize(&initial,now).unwrap();store.update_at(&announcement,1,start).unwrap();}
+        b.promote(&successor,2,next.public_key(),start).unwrap();
+        let time=start+FAILOVER_COOLDOWN+1;
+        let failed=vec![reference_health::Evidence::default(),good];
+        let state=state.record(failed.clone(),time-300).unwrap().record(failed,time).unwrap();
+        let preview=publication.preview_failover(&state,time).unwrap();
+        assert_eq!(preview.next_revision,4);
+        let approval=FailoverApproval{publication_sha256:preview.publication_sha256,health_sha256:preview.health_sha256,selected_reference:1};
+        publication.apply_failover(&state,approval,time).unwrap();
+        assert!(publication.apply_failover(&state,approval,time).is_err());
+        let status=publication.inspect(time).unwrap();
+        assert_eq!(status.overlap_ends_at,overlap.overlap_ends_at);
+        assert_eq!(status.revision,4);
+        let (announcement,successor)=publication.documents(time).unwrap();
+        let successor=successor.unwrap();
+        a.update_at(&announcement,2,time).unwrap();
+        a.promote(&successor,4,next.public_key(),time).unwrap();
+        b.update_at(&successor,3,time).unwrap();
+        for store in [&a,&b]{
+            let value=store.load(time).unwrap();
+            assert_eq!(value.signer(),next.public_key());
+            assert_eq!(value.descriptor().revision,5);
+            assert_eq!(value.descriptor().active_reference,1);
+        }
+        let ends=status.overlap_ends_at.unwrap();
+        publication.promote(status.snapshot_sha256,bootstrap::fingerprint(next.public_key()),ends).unwrap();
+        assert_eq!(publication.inspect(ends).unwrap().revision,5);
     }
 
     #[test]

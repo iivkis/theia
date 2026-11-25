@@ -224,6 +224,11 @@ impl WindowsServer {
         self
     }
 
+    pub(crate) fn with_runtime(mut self,state:Arc<crate::runtime_generation::State>)->Self{
+        self.runtime=Some(state);
+        self
+    }
+
     pub(crate) fn with_supervisor(
         mut self,
         state: Arc<crate::runtime_generation::State>,

@@ -66,7 +66,6 @@ pub fn assess_reload(
             || before.tls_key != after.tls_key
             || before.security_mode != after.security_mode
             || before.reality != after.reality
-            || after.reality.is_some()
         {
             return Err(ReloadCheckError::RequiresRestart);
         }
@@ -94,6 +93,10 @@ pub(crate) struct IdentityHash {
 
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 impl IdentityHash {
+    pub(crate) fn reality(binding:&crate::config::RealityBinding)->Self {
+        Self{cert:binding.manifest_sha256,key:binding.identity_sha256}
+    }
+
     pub(crate) fn from_pem(cert: &[u8], key: &[u8]) -> Self {
         Self {
             cert: Sha256::digest(cert).into(),
@@ -211,6 +214,17 @@ impl ReloadPreflight {
             return Err(ReloadCheckError::IdentityDrift);
         }
         for (inbound, identity) in candidate.server.inbounds.iter().zip(&self.identities) {
+            if let Some(binding)=&inbound.reality {
+                if *identity!=IdentityHash::reality(binding){return Err(ReloadCheckError::IdentityDrift);}
+                let addr:std::net::SocketAddr=inbound.h2_listen.parse().map_err(|_|ReloadCheckError::IdentityDrift)?;
+                let scope=crate::descriptor::Scope{inbound:inbound.id.clone(),endpoint:format!("{}:{}",inbound.server_name,addr.port())};
+                let state=crate::reference_health::Store::new(std::path::Path::new(&binding.health_store))
+                    .and_then(|store|store.inspect()).map_err(|_|ReloadCheckError::IdentityDrift)?;
+                let now=crate::reference_health::unix_now().map_err(|_|ReloadCheckError::IdentityDrift)?;
+                crate::reality_provision::inspect_registered(std::path::Path::new(&binding.bundle),binding,&state,&scope,now)
+                    .map_err(|_|ReloadCheckError::IdentityDrift)?;
+                continue;
+            }
             let cert = crate::server::pem_data(&inbound.tls_cert, false)
                 .map_err(|_| ReloadCheckError::IdentityDrift)?;
             let key = crate::server::pem_data(&inbound.tls_key, true)

@@ -165,7 +165,7 @@ impl Manager {
         }
         let status=publication.inspect(time)?;
         if status.snapshot_sha256!=stamp.publication || status.plan_sha256!=approved{return Err(Error::Approval);}
-        if status.valid_now && status.next_fingerprint.is_none()
+        if status.valid_now
             && health.active_status(value.descriptor(),time).map_err(|_|Error::Health)?.0==crate::reference_health::PrimaryStatus::Degraded{
             let preview=publication.preview_failover(&health,time)?;
             if preview.publication_sha256!=stamp.publication || preview.health_sha256!=stamp.health
@@ -223,8 +223,7 @@ impl Manager {
         let status=publication.inspect(now)?;
         if status.snapshot_sha256!=stamp.publication || status.plan_sha256!=approved{return Err(Error::Approval);}
         let fresh=now.saturating_sub(health.last_checked_at())<=60;
-        if active==PrimaryStatus::Degraded && reserve.is_some() && fresh && status.valid_now
-            && status.next_fingerprint.is_none(){
+        if active==PrimaryStatus::Degraded && reserve.is_some() && fresh && status.valid_now{
             // Existing clients can bootstrap using any signed reference
             // alias at the same pinned endpoint, but only after admission
             // and independent identity verification. No relay alias.
