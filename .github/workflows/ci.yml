@@ -478,7 +478,7 @@ jobs:
       - name: Install pinned independent REALITY reference implementations
         run: python -m pip install h2==4.2.0 aioquic==1.2.0
       - name: Independent external TLS and QUIC through registered REALITY dispatchers
-        run: cargo test --workspace --locked --lib server::tests::independent_external_reference_through_registered_reality_dispatchers -- --ignored --exact --nocapture
+        run: cargo test --workspace --locked --lib server::hardening_tests::independent_external_reference_through_registered_reality_dispatchers -- --ignored --exact --nocapture
       - name: Build genuine Linux server for Windows cross-OS F-14 E2E
         if: runner.os == 'Linux'
         run: cargo build --workspace --locked --bin theia

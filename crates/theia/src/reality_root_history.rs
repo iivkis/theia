@@ -88,12 +88,16 @@ pub(crate) struct RootHistory {
     retiring: bool,
 }
 impl RootHistory {
-    pub(crate) fn open(config_path: &Path, document: &ServerDocument) -> Result<Self, ()> {
+    fn path_for(config_path: &Path) -> Result<PathBuf, ()> {
         let path = fs::canonicalize(config_path).map_err(|_| ())?;
         let mut name = path.as_os_str().to_os_string();
         name.push(".reality-roots.toml");
+        Ok(PathBuf::from(name))
+    }
+
+    pub(crate) fn open(config_path: &Path, document: &ServerDocument) -> Result<Self, ()> {
         let mut history = Self {
-            path: PathBuf::from(name),
+            path: Self::path_for(config_path)?,
             owner: None,
             current: History::default(),
             raw: None,
@@ -110,7 +114,11 @@ impl RootHistory {
     }
 
     fn exists(&self) -> Result<bool, ()> {
-        match fs::symlink_metadata(&self.path) {
+        Self::exists_at(&self.path)
+    }
+
+    fn exists_at(path: &Path) -> Result<bool, ()> {
+        match fs::symlink_metadata(path) {
             Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(true),
             Ok(_) => Err(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
@@ -127,15 +135,43 @@ impl RootHistory {
         Ok(())
     }
 
+    fn read(path: &Path) -> Result<(String, History), ()> {
+        let raw = crate::reality_bootstrap::read_text(path, MAX_BYTES, true).map_err(|_| ())?;
+        let current: History = toml::from_str(&raw).map_err(|_| ())?;
+        current.validate()?;
+        Ok((raw.to_string(), current))
+    }
+
     fn load(&mut self) -> Result<(), ()> {
         if self.exists()? {
-            let raw = crate::reality_bootstrap::read_text(&self.path, MAX_BYTES, true).map_err(|_| ())?;
-            let current: History = toml::from_str(&raw).map_err(|_| ())?;
-            current.validate()?;
+            let (raw, current) = Self::read(&self.path)?;
             self.current = current;
-            self.raw = Some(raw.to_string());
+            self.raw = Some(raw);
         }
         Ok(())
+    }
+
+    /// Read-only planning. Do not take the supervisor's lifetime lock or
+    /// create a sidecar from a preview. A running REALITY root must already
+    /// be recorded exactly; concurrent publication is rejected by the
+    /// caller's revision CAS and the supervisor's exact-byte disk CAS.
+    pub(crate) fn preview(
+        config_path: &Path, active: &ServerDocument, candidate: &ServerDocument,
+    ) -> Result<(), ()> {
+        let path = Self::path_for(config_path)?;
+        let history = if Self::exists_at(&path)? {
+            Self::read(&path)?.1
+        } else {
+            History::default()
+        };
+        if active.server.inbounds.iter().any(|inbound| {
+            inbound.reality.as_ref().is_some_and(|binding|
+                history.last.get(&inbound.id) != Some(&binding.identity_sha256)
+            )
+        }) {
+            return Err(());
+        }
+        history.next(candidate).map(|_| ())
     }
 
     pub(crate) fn check(&self, document: &ServerDocument) -> Result<(), ()> {
@@ -223,6 +259,9 @@ mod tests {
         recovered.advance(&b).unwrap();
         assert!(!recovered.pending());
         assert!(recovered.check(&a).is_err());
+        assert!(RootHistory::preview(&path, &b, &a).is_err());
+        assert!(RootHistory::preview(&path, &b, &b).is_ok());
+        assert!(RootHistory::preview(&path, &a, &b).is_err());
         let plain = document(None);
         recovered.advance(&plain).unwrap();
         recovered.committed();

@@ -2938,6 +2938,17 @@ fn commit_live_quota(
         .map_err(|_| ())
 }
 
+/// Supervisor-owned workers must never outlive a failed supervisor or
+/// report a stale management view after a fatal persistence error.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct SupervisorTask<T>(tokio::task::JoinHandle<T>);
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl<T> Drop for SupervisorTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn run_supervised_file(
     document: ServerDocument,
@@ -2995,12 +3006,12 @@ async fn run_supervised_file(
     .map(|service| service.with_supervisor(runtime.clone(), requests.clone()));
 
     let mut management_task = management.map(|service| {
-        tokio::spawn(async move { service.serve().await.map_err(|_| ServerError::Io) })
+        SupervisorTask(tokio::spawn(async move { service.serve().await.map_err(|_| ServerError::Io) }))
     });
     let mut running = RunningGeneration::launch(initial.listeners, GenerationPhase::Active);
     crate::diag!(Info, "server.supervisor", "generation_active");
     let mut identities = current_identities;
-    let mut retiring: Option<tokio::task::JoinHandle<()>> = None;
+    let mut retiring: Option<SupervisorTask<()>> = None;
     let mut rollback: Option<RollbackSlot> = None;
     let mut structural_rollback: Option<StructuralRollbackSlot> = None;
     // Root history is retained for the entire supervisor and persisted before
@@ -3013,12 +3024,12 @@ async fn run_supervised_file(
                 };
                 // No unbounded retired-generation backlog and no double
                 // admission during simultaneous restart attempts.
-                if running.has_draining()||retiring.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                if running.has_draining()||retiring.as_ref().is_some_and(|worker| !worker.0.is_finished()) {
                     let _ = request.complete.send(Err(()));
                     continue;
                 }
-                if let Some(worker) = retiring.take() {
-                    let _ = worker.await;
+                if let Some(mut worker) = retiring.take() {
+                    let _ = (&mut worker.0).await;
                 }
                 if !runtime.still_current(&request.previous, request.expected_revision) {
                     let _ = request.complete.send(Err(()));
@@ -3218,7 +3229,7 @@ async fn run_supervised_file(
                 identities=next_identities;
                 rollback=None;
                 runtime.set_rollback_until(None);
-                retiring = Some(tokio::spawn(reap_previous(previous)));
+                retiring = Some(SupervisorTask(tokio::spawn(reap_previous(previous))));
                 // This ACK is AFTER commit. Lost ACK is indeterminate:
                 // operator must query status; never retry blindly.
                 let _ = request.complete.send(Ok(revision));
@@ -3252,7 +3263,7 @@ async fn run_supervised_file(
             }
             result = async {
                 match &mut management_task {
-                    Some(task) => Some(task.await),
+                    Some(task) => Some((&mut task.0).await),
                     None => std::future::pending().await,
                 }
             } => {
