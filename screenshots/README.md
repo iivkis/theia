@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 878887492d59bca030d1cb832dcf76921e8e5261
+Source: c128a81fa8755f43bc271a04c760a2a03ca68cb1
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -242,9 +242,17 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-disable-confirm](state-disable-confirm.png)
 
+## state-disable-done
+
+![state-disable-done](state-disable-done.png)
+
 ## state-disable-failed
 
 ![state-disable-failed](state-disable-failed.png)
+
+## state-import-done
+
+![state-import-done](state-import-done.png)
 
 ## state-import-failed
 
@@ -262,6 +270,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-issuance-new-input](state-issuance-new-input.png)
 
+## state-issuance-new-offer
+
+![state-issuance-new-offer](state-issuance-new-offer.png)
+
 ## state-issuance-recover-confirm
 
 ![state-issuance-recover-confirm](state-issuance-recover-confirm.png)
@@ -274,6 +286,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-issuance-recover-input](state-issuance-recover-input.png)
 
+## state-issuance-recover-offer
+
+![state-issuance-recover-offer](state-issuance-recover-offer.png)
+
 ## state-issuance-rotate-confirm
 
 ![state-issuance-rotate-confirm](state-issuance-rotate-confirm.png)
@@ -285,3 +301,7 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## state-issuance-rotate-input
 
 ![state-issuance-rotate-input](state-issuance-rotate-input.png)
+
+## state-issuance-rotate-offer
+
+![state-issuance-rotate-offer](state-issuance-rotate-offer.png)
