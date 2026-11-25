@@ -590,6 +590,22 @@ mod tests {
         let snapshot = publication.inspect(1001).unwrap();
         publication.refresh(&state, snapshot.snapshot_sha256, 1001).unwrap();
         assert!(registered_status(&path, "reality-edge", 1001).unwrap().contains("revision=2"));
+        let replacement_health=dir.0.join("replacement-health");
+        let replacement_bundle=dir.0.join("replacement-bundle");
+        Store::new(&replacement_health).unwrap().enroll(&state).unwrap();
+        let replacement=crate::reality_provision::create(&state,digest,&replacement_bundle,1001).unwrap();
+        let req=Request::ReplaceServer(ServerReplacement{id:"reality-edge".into(),
+            health:replacement_health,bundle:replacement_bundle,health_sha256:digest,
+            identity_sha256:replacement.identity_sha256});
+        let preview=prepare(&path,&req,1001).unwrap();
+        assert!(apply(&path,&req,[0;32],1001).is_err());
+        apply(&path,&req,preview.approval_sha256(),1001).unwrap();
+        let Config::Server(after)=config::read_file(&path).unwrap() else{panic!()};
+        #[cfg(any(target_os="linux",target_os="windows"))]
+        assert_eq!(crate::restart_guard::same_port_reality_only(&saved,&after),Some(saved.server.inbounds.len()-1));
+        assert_eq!(after.server.inbounds.last().unwrap().allowed_user_ids,inbound.allowed_user_ids);
+        assert_eq!(after.server.inbounds.last().unwrap().h2_listen,inbound.h2_listen);
+        assert!(prepare(&path,&req,1001).is_err());
         let mut mixed = saved;
         mixed.server.inbounds.last_mut().unwrap().tls_cert = "file:/tmp/foreign.pem".into();
         assert!(Config::Server(mixed).validate().is_err());

@@ -576,7 +576,7 @@ impl PreparedQuic {
                         continue;
                     }
                     let relay = route(&sessions, peer, data, local_peer || local_known);
-                    if (local_known || existing_local) && relay.is_some() { continue; }
+                    if (local_known || existing_local) && (relay.is_some() || sessions.values().any(|s|s.known(data))) { continue; }
                     if local_known || existing_local {
                         // An issued local CID alone is not authorization to
                         // create a fresh connection. Only a previously

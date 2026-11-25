@@ -26,6 +26,10 @@ the native H3 application endpoint, and a byte-exact UDP reference relay.
   the bounded cooldown; ambiguous known Initials cannot create a duplicate
   session. Coalesced datagrams must agree on their destination CID before
   forwarding; malformed or mixed-CID long-header datagrams are dropped.
+  Global CID-prefix collisions are rejected even when a tuple is known;
+  overlap between native and relay candidates also fails closed. Short
+  header candidates require a minimum protected payload and fixed bit
+  (conservative; QUIC-bit greasing interoperability remains unverified).
   Unknown short CID can be forwarded only on a unique existing
   physical tuple, never learned or used to migrate to another tuple.
 * Amplification: independent client payload accounting per physical path,
@@ -51,7 +55,7 @@ Likewise it cannot safely lift the 3x external-path cap, even if the
 reference has validated the proxy's upstream UDP address. A cooperating
 reference or separately reviewed protocol-level routing/validation design
 is required for unrestricted simultaneous CID rotation and migration.
-Do not infer validation from successful UDP send, observed CID, public
+The boundary follows RFC 9000 sections 5.1 and 9.5 (CIDs must not enable an observer to correlate connections across address changes), RFC 9001 section 5 (packet protection), and RFC 9312 (on-path manageability). Two histories can expose the same new tuple and opaque short-header packet while assigning it to different existing connections. Therefore no deterministic or probabilistic routing rule can prove that association from the relay's observations alone. Fan-out, first-match heuristics, trial forwarding to previous references and resetting a session budget for an unknown CID are not valid fixes. A cooperative reference could supply authenticated CID-to-connection and path-validation evidence, but this would change the approved unchanged-third-party contract. The reference's validation of the upstream relay address is not validation of the physical client address. Do not infer validation from successful UDP send, observed CID, public
 Initial integrity or Retry token echo. Zero-length CID migration is not
 supported. Native admitted endpoint uses a generation-specific authenticated
 CID namespace; only classified Initial retransmits may reach its TLS

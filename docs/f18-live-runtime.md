@@ -39,7 +39,7 @@ old and promoted clients can refresh their own signer. After overlap expiry and 
 transition pair is frozen; only the valid successor signs operational
 failover and renewal. Its independent latest document is monotonic and
 rooted in the historical pair; retirement preserves this evidence and
-advances the successor revision. Old admission remains invalid. No eligible reserve, stale trust, or unrooted materials fail
+advances the successor revision. Old admission remains invalid. If the effective signer expires, explicit recovery can publish a fresh descriptor under that same key only, with exact rooted publication and fresh healthy reference evidence (60s), a new monotonic revision and independent fingerprint confirmation. No expired predecessor is restored; clients with expired trust still recover offline. A compromised key requires independent replacement. No eligible reserve, stale trust, or unrooted materials fail
 closed. If startup cannot recover a valid generation it refuses to bind.
 
 Recovery decision: allow a valid admission for any reference SNI in the

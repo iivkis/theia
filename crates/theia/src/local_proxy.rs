@@ -1501,7 +1501,7 @@ mod selector_tests {
             let mut echo_tasks = JoinSet::new();
             echo_tasks.spawn(async move {
                 let mut sessions=JoinSet::new();
-                for _ in 0..4 {
+                loop {
                     let (mut stream,_) = echo.accept().await.unwrap();
                     sessions.spawn(async move {
                         let mut bytes=[0;4];
@@ -1510,12 +1510,13 @@ mod selector_tests {
                         }
                     });
                 }
-                while let Some(result)=sessions.join_next().await{result.unwrap();}
             });
             let Config::Client(mut client_doc) = config::read_file(&client_path).unwrap() else { panic!() };
             let mut established=Vec::new();
             let mut proxies=Vec::new();
             let mut managed_clients=Vec::new();
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            let mut headless=None;
             for (id,socks_mode) in [("native-h2",false),("native-h3",true)] {
                 client_doc.client.active_profile=id.into();
                 let profile = client_doc.client.profiles.iter().find(|p|p.id==id).unwrap();
@@ -1531,6 +1532,18 @@ mod selector_tests {
                 let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let listen = if socks_mode { socks.local_addr().unwrap() } else { http.local_addr().unwrap() };
                 let mut proxy = JoinSet::new();
+                #[cfg(any(target_os="linux",target_os="windows"))]
+                if !socks_mode {
+                    let raw=Config::Client(client_doc.clone()).to_toml().unwrap();
+                    std::fs::write(&client_path,&raw).unwrap();
+                    let digest=Sha256::digest(raw.as_bytes()).into();
+                    let runtime=ClientRuntime::new(client_path.clone(),client_doc.clone(),digest,client);
+                    headless=Some((runtime.clone(),listen));
+                    proxy.spawn(serve_managed_proxy(http,socks,runtime));
+                }else{
+                    proxy.spawn(serve_proxy(http,socks,client));
+                }
+                #[cfg(not(any(target_os="linux",target_os="windows")))]
                 proxy.spawn(serve_proxy(http,socks,client));
                 let mut stream = TcpStream::connect(listen).await.unwrap();
                 if socks_mode {
@@ -1556,6 +1569,41 @@ mod selector_tests {
                 assert_eq!(&bytes,b"ping");
                 established.push(stream);
                 proxies.push(proxy);
+            }
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            {
+                use crate::management::{StatusCommand as C,StatusReply as R};
+                async fn ipc(runtime:Arc<ClientRuntime>,command:C)->Result<R,crate::management::ManagementError>{
+                    let (caller,handler)=tokio::io::duplex(1024);
+                    let task=tokio::spawn(crate::management::handle_client(handler,runtime));
+                    let result=crate::management::exchange(caller,command).await;
+                    task.await.unwrap().unwrap();
+                    result
+                }
+                let (runtime,listen)=headless.unwrap();
+                let raw=Config::Client(client_doc.clone()).to_toml().unwrap();
+                std::fs::write(&client_path,&raw).unwrap();
+                let digest:[u8;32]=Sha256::digest(raw.as_bytes()).into();
+                assert!(ipc(runtime.clone(),C::ClientApply{expected_revision:1,candidate_sha256:[0;32]}).await.is_err());
+                assert_eq!(ipc(runtime.clone(),C::ClientPreview{expected_revision:1,candidate_sha256:digest}).await.unwrap(),R::ClientReady{revision:1});
+                assert_eq!(runtime.status().await.0,1);
+                assert_eq!(ipc(runtime.clone(),C::ClientApply{expected_revision:1,candidate_sha256:digest}).await.unwrap(),R::ClientApplied{revision:2});
+                assert!(ipc(runtime.clone(),C::ClientApply{expected_revision:1,candidate_sha256:digest}).await.is_err());
+                let mut stream=TcpStream::connect(listen).await.unwrap();
+                stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).await.unwrap();
+                let mut response=vec![0;HTTP_OK.len()];
+                stream.read_exact(&mut response).await.unwrap();
+                assert_eq!(response,HTTP_OK);
+                stream.write_all(b"swap").await.unwrap();
+                let mut bytes=[0;4];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes,b"swap");
+                assert!(matches!(ipc(runtime.clone(),C::ClientStatus).await.unwrap(),R::ClientRunning{revision:2,transport:3,..}));
+                for stream in &mut established{
+                    stream.write_all(b"keep").await.unwrap();
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes,b"keep");
+                }
             }
             let publication=crate::identity_publication::Publication::new(&bundle.join("publication.toml")).unwrap();
             let now=reference_health::unix_now().unwrap();

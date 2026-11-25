@@ -22,9 +22,15 @@ REALITY. Management remains owner-protected local IPC, not a network API.
   the current rooted publication and health floor. A replacement of the
   root on the same logical endpoint disables the rollback slot. No rollback
   rewrites saved TOML, trust history, or health floors.
-* Same-port structural REALITY changes require maintenance. The existing
-  own-TLS-only same-port TLS rotation remains a separate path. Mixed
-  same-port PEM mutation is not supported.
+* Same-port REALITY replacement supports exactly one independently
+  provisioned fresh bundle on the existing inbound, same endpoint and H3
+  capability, different root and admission key, unchanged grants, quotas
+  and other configuration. Stage and commit retain listeners, Quinn
+  endpoint and replay guards; old authenticated streams retain permits
+  but old identity contexts cannot authorize new streams. No root rollback
+  slot is created. Reusing roots already seen by the running supervisor
+  is refused. Other same-port structural changes (including enabling H3)
+  still require maintenance. Own-TLS-only TLS rotation is separate.
 * TUI runtime screen: a authorization Apply, b authorization rollback,
   c quota Apply, s structural preview/Apply, z structural rollback;
   y confirms, n/Esc cancels a preview, r reads status. Lost ACK is
@@ -43,8 +49,24 @@ REALITY. Management remains owner-protected local IPC, not a network API.
   Live local report includes descriptor revision, current signed reference,
   transport policy, last successful OPEN transport, route-bound H3 negative
   cache and descriptor-refresh result. This is process-local telemetry,
-  not remote proof or headless-process IPC. Windows WinINet panel exposes
+  not remote proof. Windows WinINet panel exposes
   the same runtime report when it owns a REALITY client.
+* Headless file-run on Linux/Windows exposes a distinct opt-in owner-only
+  client IPC endpoint (THEIA_CLIENT_CONTROL_DIR or THEIA_CLIENT_CONTROL_PIPE;
+  use a separate directory/pipe ID from server IPC). V reads runtime
+  revision, saved digest match, descriptor revision, last OPEN carrier and
+  route-bound H3 negative cache. h previews, y confirms Client Apply.
+  CLI client status and client reload --check/--apply --expected-revision N
+  --sha256 HEX (--confirm for apply) use the same CAS. New accepted sockets
+  receive the new client view; existing tunnels are not cancelled. Listener,
+  management and OS-proxy changes require restart. Changing an existing ID's
+  independently pinned enrollment or switching security mode requires
+  explicit re-enrollment/restart; switching between registered profiles of
+  the same mode is supported. Preview validates local material, not remote
+  handshake success. No automatic retry on lost acknowledgement.
+* Server K previews independent bundle replacement; Y saves only TOML.
+  Structural Apply remains separate. Server V/e previews expired-signer
+  recovery and y confirms it with fresh healthy evidence and current root.
 * Client V: o previews same-signer offline recovery; k previews a signed
   planned successor promotion. Both bind the saved TOML, signed file,
   current trust snapshot and expected revision; y explicitly commits
