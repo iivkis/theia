@@ -1153,9 +1153,7 @@ impl Interaction {
                 editor.workspace_select(start + usize::from(event.row - records.y - 1));
                 self.workspace_user = 0;
             }
-            if self.workspace_page == 0 {
-                self.workspace_action = self.recommended_action(role);
-            }
+            self.workspace_action = if self.workspace_page == 0 { self.recommended_action(role) } else { 0 };
             return;
         }
         let visible_action = self.visible_workspace_action(role);
@@ -1563,9 +1561,7 @@ impl Interaction {
                             editor.select_record(key.code == KeyCode::Char('j'));
                         }
                         self.workspace_user = 0;
-                        if self.workspace_page == 0 {
-                            self.workspace_action = self.recommended_action(role);
-                        }
+                        self.workspace_action = if self.workspace_page == 0 { self.recommended_action(role) } else { 0 };
                         return false;
                     }
                     if key.code == KeyCode::F(7) && self.workspace_page == 1 {
