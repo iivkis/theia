@@ -35,6 +35,7 @@ pub(crate) enum RecordAction {
     DeleteRecord,
     ActivateProfile,
     SetGrants,
+    SetQuota,
     DeleteUser,
     EditTls,
     EditTrust,
@@ -48,6 +49,7 @@ impl RecordAction {
             Self::DeleteRecord => "Удалить выбранную запись",
             Self::ActivateProfile => "Выбрать активный профиль",
             Self::SetGrants => "Заменить список grants",
+            Self::SetQuota => "Изменить лимиты соединений",
             Self::DeleteUser => "Удалить пользователя без grants",
             Self::EditTls => "Изменить ссылки cert/key",
             Self::EditTrust => "Изменить CA и ссылку credential",
@@ -73,6 +75,7 @@ impl RecordAction {
                 ("XHTTP path prefix", false),
             ],
             Self::SetGrants => &[("Grants (ID через запятую)", false)],
+            Self::SetQuota => &[("На пользователя", false), ("Всего", false)],
             Self::DeleteUser => &[("ID пользователя", false)],
             Self::EditTls => &[("cert (file:)", true), ("key (file:)", true)],
             Self::EditTrust => &[("CA (file:)", true), ("Credential (env:/file:)", true)],
@@ -626,7 +629,7 @@ impl Editor {
             let unchanged = current.as_ref().is_some_and(|value| {
                 let left = invite.encode().ok().map(Zeroizing::new);
                 let right = value.encode().ok().map(Zeroizing::new);
-                left.is_some() && left == right
+                matches!((left, right), (Some(a), Some(b)) if a.as_str() == b.as_str())
             });
             if !unchanged {
                 self.error = Some("REALITY publication changed; issue a new credential.".into());
@@ -767,6 +770,10 @@ impl Editor {
             ]),
             (_, RecordAction::DeleteRecord)
             | (Config::Client(_), RecordAction::ActivateProfile) => Ok(vec![]),
+            (Config::Server(doc), RecordAction::SetQuota) => Ok(vec![
+                doc.server.policy.max_connections_per_user.to_string(),
+                doc.server.policy.max_connections_total.to_string(),
+            ]),
             (Config::Server(doc), RecordAction::SetGrants) => {
                 let inbound = doc
                     .server
@@ -901,6 +908,16 @@ impl Editor {
                 format!(
                     "Активный профиль в TOML: {previous} → {selected}. Runtime не переключается."
                 )
+            }
+            (Config::Server(doc), RecordAction::SetQuota) => {
+                let per: u32 = fields[0].parse().map_err(|_| "Неверный лимит пользователя")?;
+                let total: u32 = fields[1].parse().map_err(|_| "Неверный общий лимит")?;
+                if per == 0 || total == 0 || per > total {
+                    return Err("Требуется 0 < per-user <= total");
+                }
+                doc.server.policy.max_connections_per_user = per;
+                doc.server.policy.max_connections_total = total;
+                format!("На пользователя: {per}; всего: {total}\nТолько сохранение TOML. Для runtime: v, затем c (quota-only Apply).")
             }
             (Config::Server(doc), RecordAction::SetGrants) => {
                 let inbound = doc

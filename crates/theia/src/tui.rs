@@ -1223,7 +1223,7 @@ impl Interaction {
             if key.code == KeyCode::Char('V')
                 && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
             {
-                if !editor.selected_reality() {
+                if editor.role() == Role::Server && !editor.selected_reality() {
                     editor.error =
                         Some("Выберите зарегистрированный REALITY inbound/профиль.".into());
                 } else {
@@ -1280,6 +1280,7 @@ impl Interaction {
                     (_, KeyCode::Char('D')) => Some(RecordAction::DeleteRecord),
                     (Role::Client, KeyCode::Char('A')) => Some(RecordAction::ActivateProfile),
                     (Role::Server, KeyCode::Char('G')) => Some(RecordAction::SetGrants),
+                    (Role::Server, KeyCode::Char('Q')) => Some(RecordAction::SetQuota),
                     (Role::Server, KeyCode::Char('U')) => Some(RecordAction::DeleteUser),
                     (Role::Server, KeyCode::Char('E')) => Some(RecordAction::EditTls),
                     (Role::Client, KeyCode::Char('E')) => Some(RecordAction::EditTrust),
@@ -1748,9 +1749,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         );
     }
     let footer = if model.screen == Screen::Client {
-        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  M: регистрация  K: re-enroll  V: REALITY status  Ctrl+S: сохранить"
+        "N/D/A/E: профили  p: Windows proxy  i: импорт  I: REALITY  M: регистрация  K: re-enroll  V: статус/Apply  Ctrl+S: сохранить"
     } else {
-        "N/D/G/U/E: записи  W: REALITY  M: регистрация  K: замена bundle  V: REALITY status  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
+        "N/D/G/U/E/Q: записи  W: REALITY  M: регистрация  K: замена bundle  V: REALITY status  j/k: выбор  u/t/x/b: users  v: статус  Ctrl+R: Apply  Ctrl+S: сохранить"
     };
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),

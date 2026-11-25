@@ -58,6 +58,11 @@ enum Phase {
         revision: u64,
     },
     CutoverRejected,
+    TlsRollbackChecking,
+    TlsRollbackConfirming { revision: u64, remaining_seconds: u64 },
+    TlsRollbackApplying,
+    TlsRollbackApplied { revision: u64 },
+    TlsRollbackUnavailable,
     RestartRollbackChecking,
     RestartRollbackConfirming {
         revision: u64,
@@ -254,6 +259,20 @@ impl RuntimePanel {
                     _ => Phase::Indeterminate,
                 };
             }
+            Phase::TlsRollbackChecking => {
+                self.phase = match result {
+                    Ok(StatusReply::TlsRollbackReady { revision, remaining_seconds }) =>
+                        Phase::TlsRollbackConfirming { revision, remaining_seconds },
+                    _ => Phase::TlsRollbackUnavailable,
+                };
+            }
+            Phase::TlsRollbackApplying => {
+                self.phase = match result {
+                    Ok(StatusReply::TlsRollbackApplied { revision }) => Phase::TlsRollbackApplied { revision },
+                    Err(ManagementError::CandidateRejected | ManagementError::Unsupported) => Phase::TlsRollbackUnavailable,
+                    _ => Phase::Indeterminate,
+                };
+            }
             Phase::RestartRollbackChecking => {
                 self.phase = match result {
                     Ok(StatusReply::RestartRollbackReady {
@@ -373,11 +392,12 @@ impl RuntimePanel {
                 | Phase::RollbackApplying
                 | Phase::QuotaApplying
                 | Phase::CutoverApplying
-                | Phase::RestartRollbackApplying,
+                | Phase::RestartRollbackApplying
+                | Phase::TlsRollbackApplying,
                 _,
             ) => false,
-            (Phase::CutoverChecking { .. } | Phase::RestartRollbackChecking, KeyCode::Esc) => true,
-            (Phase::CutoverChecking { .. } | Phase::RestartRollbackChecking, _) => false,
+            (Phase::CutoverChecking { .. } | Phase::RestartRollbackChecking | Phase::TlsRollbackChecking, KeyCode::Esc) => true,
+            (Phase::CutoverChecking { .. } | Phase::RestartRollbackChecking | Phase::TlsRollbackChecking, _) => false,
             (
                 Phase::Viewing { revision, .. }
                 | Phase::Applied { revision }
@@ -424,6 +444,19 @@ impl RuntimePanel {
                 self.start(StatusCommand::CheckRestartRollback);
                 false
             }
+            (Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. }, KeyCode::Char('t'))
+                if self.saved_sha256.is_some() => {
+                self.phase = Phase::TlsRollbackChecking;
+                self.start(StatusCommand::CheckTlsRollback);
+                false
+            }
+            (Phase::TlsRollbackConfirming { revision, .. }, KeyCode::Char('y')) => {
+                self.phase = Phase::TlsRollbackApplying;
+                self.start(StatusCommand::ApplyTlsRollback { expected_revision: revision });
+                false
+            }
+            (Phase::TlsRollbackConfirming { .. }, KeyCode::Char('n') | KeyCode::Esc) => true,
+            (Phase::TlsRollbackConfirming { .. }, _) => false,
             (Phase::RestartRollbackConfirming { revision, .. }, KeyCode::Char('y')) => {
                 self.phase = Phase::RestartRollbackApplying;
                 self.start(StatusCommand::ApplyRestartRollback {
@@ -538,12 +571,17 @@ impl RuntimePanel {
             Phase::CutoverChecking{..}=>"Проверка точного сохранённого TOML и отпечатка материалов; runtime не меняется.".into(),
             Phase::CutoverConfirming{revision,same_port,material_sha256}=>{
                 let digest=material_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
-                let mode=if same_port {"Смена TLS на текущих портах; открытые туннели сохраняются."}else{"Новые порты готовятся до Apply; неизменённые inbound при частичном cutover сохраняются. Удаляемые/заменяемые соединения получают до 20 с на завершение, затем могут быть закрыты."};
+                let mode=if same_port {"Смена материалов на текущих портах; независимая замена REALITY root необратима. Заменяемые туннели могут завершиться после drain."}else{"Новые порты готовятся до Apply; неизменённые inbound при частичном cutover сохраняются. Удаляемые/заменяемые соединения получают до 20 с на завершение, затем могут быть закрыты."};
                 format!("Структурный Apply, revision={revision}.\n{mode}\nОтпечаток материалов SHA-256: {digest}\nСервер повторно проверит TOML, материалы и CAS.\ny: применить | n/Esc: отменить")
             }
             Phase::CutoverApplying=>"Структурный Apply отправлен; при потере ACK сначала запросите фактический статус.".into(),
-            Phase::CutoverApplied{revision}=>format!("Структурный Apply подтверждён, revision={revision}.\nz: проверить структурный откат после drain | r: статус | Esc: закрыть"),
+            Phase::CutoverApplied{revision}=>format!("Структурный Apply подтверждён, revision={revision}.\nz: структурный откат | t: TLS rollback | r: статус | Esc: закрыть"),
             Phase::CutoverRejected=>"Структурный кандидат отклонён: проверьте порты, материалы, сохранённый TOML и revision.\nr: статус | Esc: закрыть".into(),
+            Phase::TlsRollbackChecking => "Проверка доступности TLS rollback. Только чтение.".into(),
+            Phase::TlsRollbackConfirming { revision, remaining_seconds } => format!("Одноразовый TLS rollback, revision={revision}, осталось {remaining_seconds} с.\nТолько допустимый сервером откат; независимый REALITY root не откатывается. TOML не меняется.\ny: подтвердить | n/Esc: отменить"),
+            Phase::TlsRollbackApplying => "TLS rollback отправлен; при потере ACK не повторяйте автоматически.".into(),
+            Phase::TlsRollbackApplied { revision } => format!("TLS rollback подтверждён, revision={revision}. TOML не изменён.\nr: статус | Esc: закрыть"),
+            Phase::TlsRollbackUnavailable => "TLS rollback недоступен.\nr: статус | Esc: закрыть".into(),
             Phase::RestartRollbackChecking=>"Проверка доступности структурного отката. Только чтение.".into(),
             Phase::RestartRollbackConfirming{revision,remaining_seconds}=>format!("Одноразовый структурный откат, revision={revision}, осталось {remaining_seconds} с.\nСервер заново проверит прежние порты и текущие доверенные материалы. Старые ключи и trust floor не откатываются. TOML не меняется.\ny: подтвердить | n/Esc: отменить"),
             Phase::RestartRollbackApplying=>"Структурный откат отправлен; при потере ACK не повторяйте запрос автоматически.".into(),
@@ -564,7 +602,7 @@ impl RuntimePanel {
             Phase::Viewing { inbounds, revision } => format!(
                 "Сервер работает. Inbounds: {inbounds}. Авторизация: revision={revision}.\n\n{}\nr: обновить статус | Esc: закрыть",
                 if self.saved_sha256.is_some() {
-                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются пользователи, token digest, disabled и grants; занятость удалённых ID сохраняется до завершения их туннелей.\nb: проверить одноразовый откат авторизации REALITY (300 с).\nc: проверить quota-only Apply.\ns: проверить структурный Apply.\nz: проверить структурный откат."
+                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются пользователи, token digest, disabled и grants; занятость удалённых ID сохраняется до завершения их туннелей.\nb: проверить одноразовый откат авторизации REALITY (300 с).\nc: проверить quota-only Apply.\ns: проверить структурный Apply.\nz: проверить структурный откат.\nt: проверить TLS rollback."
                 } else {
                     "Применение недоступно без явного --role server --config FILE."
                 }
@@ -600,6 +638,25 @@ mod tests {
             start_with_review: review,
             receiver: None,
         }
+    }
+
+    #[test]
+    fn tls_rollback_requires_separate_confirmation_and_ack() {
+        let mut p = fake(Some([1; 32]), false);
+        p.phase = Phase::TlsRollbackChecking;
+        p.complete(Ok(StatusReply::TlsRollbackReady { revision: 7, remaining_seconds: 20 }));
+        assert_eq!(p.phase, Phase::TlsRollbackConfirming { revision: 7, remaining_seconds: 20 });
+        assert!(p.body().contains("revision=7"));
+        assert!(p.key(key(KeyCode::Char('n'))));
+        p.phase = Phase::TlsRollbackApplying;
+        p.complete(Ok(StatusReply::TlsRollbackApplied { revision: 8 }));
+        assert_eq!(p.phase, Phase::TlsRollbackApplied { revision: 8 });
+        p.phase = Phase::TlsRollbackApplying;
+        p.complete(Err(ManagementError::Io));
+        assert_eq!(p.phase, Phase::Indeterminate);
+        p.phase = Phase::TlsRollbackChecking;
+        p.complete(Err(ManagementError::Unsupported));
+        assert_eq!(p.phase, Phase::TlsRollbackUnavailable);
     }
 
     #[test]
