@@ -8,7 +8,7 @@ use http::{header, HeaderValue, Request, StatusCode};
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     task::JoinHandle,
     time::timeout,
 };
@@ -1001,12 +1001,8 @@ impl Tunnel {
         let (upload_done, upload_finished) = tokio::sync::oneshot::channel();
         let upload = async {
             let mut buffer = [0; 4096];
-            let mut batch = crate::relay_batch::BatchReader::new();
             loop {
-                let size = batch
-                    .read(&mut read, &mut buffer)
-                    .await
-                    .map_err(|_| ClientError::Io)?;
+                let size = read.read(&mut buffer).await.map_err(|_| ClientError::Io)?;
                 let frame = if size == 0 {
                     Frame::Fin
                 } else {
