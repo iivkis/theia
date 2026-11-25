@@ -134,25 +134,38 @@ fn visual_review_gallery() {
     }
     // State fixtures use synthetic inputs, never actual issued credentials.
     let model = Model::new(Some(Role::Server));
+    let disabled_server = root.join("server-disabled.toml");
+    let disabled_fixture = server_issuance_fixture().replace("disabled = false", "disabled = true");
+    assert_ne!(disabled_fixture, server_issuance_fixture());
+    std::fs::write(&disabled_server, &disabled_fixture).unwrap();
     for (kind, label) in [(IssueKind::NewUser, "new"), (IssueKind::Rotation, "rotate"), (IssueKind::Reenable, "recover")] {
-        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &server).unwrap()));
+        let path = if kind == IssueKind::Reenable { &disabled_server } else { &server };
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, path).unwrap()));
         ui.issue_kind = kind;
-        ui.issuance = Some(IssueFlow::Input("review-device".into()));
+        let user = if kind == IssueKind::NewUser { "review-device" } else { "device-a" };
+        ui.issuance = Some(IssueFlow::Input(user.into()));
         review_capture(&format!("state-issuance-{label}-input"), &model, &ui);
-        ui.issuance = Some(IssueFlow::Confirm("review-device".into()));
+        ui.issuance = Some(IssueFlow::Confirm(user.into()));
         review_capture(&format!("state-issuance-{label}-confirm"), &model, &ui);
         ui.issuance = Some(IssueFlow::SaveFailed);
         review_capture(&format!("state-issuance-{label}-failed"), &model, &ui);
+        ui.issuance = Some(IssueFlow::Offer);
+        review_capture(&format!("state-issuance-{label}-offer"), &model, &ui);
     }
+    assert_eq!(std::fs::read_to_string(&disabled_server).unwrap(), disabled_fixture);
     let mut ui = Interaction::new(Some(Editor::load(Role::Server, &server).unwrap()));
-    ui.revocation = Some(DisableFlow::Confirm("review-device".into()));
+    ui.revocation = Some(DisableFlow::Confirm("device-a".into()));
     review_capture("state-disable-confirm", &model, &ui);
     ui.revocation = Some(DisableFlow::SaveFailed);
     review_capture("state-disable-failed", &model, &ui);
+    ui.revocation = Some(DisableFlow::Done);
+    review_capture("state-disable-done", &model, &ui);
     let model = Model::new(Some(Role::Client));
     let mut ui = Interaction::new(Some(Editor::load(Role::Client, &client).unwrap()));
     ui.importing = Some(ImportFlow::Failed);
     review_capture("state-import-failed", &model, &ui);
+    ui.importing = Some(ImportFlow::Done);
+    review_capture("state-import-done", &model, &ui);
     assert_eq!(std::fs::read_to_string(server).unwrap(), server_issuance_fixture());
     assert_eq!(std::fs::read_to_string(client).unwrap(), include_str!("../../../examples/client.toml"));
 }
