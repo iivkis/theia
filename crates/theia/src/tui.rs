@@ -18,7 +18,7 @@ use crate::{
     tui_reality_status::StatusPanel,
     tui_runtime::RuntimePanel,
     tui_server_process::ProcessPanel,
-    tui_widgets::{Field, Form},
+    tui_widgets::{action_layout, Actions, Field, Form},
     Role,
 };
 use crossterm::{
@@ -297,10 +297,10 @@ impl RecordFlow {
         Some(Form {
             fields: action.fields().iter().zip(fields).enumerate().map(|(id, ((label, hidden), value))| Field {
                 id, label, hint: if *hidden { "Только ссылка на материал, не секрет." } else { "Введите значение; Enter — предпросмотр." },
-                value: if *hidden && !value.is_empty() { "Скрыто · ссылка введена".into() } else { value.clone() },
+                value: if *hidden && !value.is_empty() { "[скрыто] · ссылка введена".into() } else { value.clone() },
             }).collect(),
             selected: *focus,
-            lead: action.title().to_owned(),
+            lead: editor.and_then(|e| e.record_user_catalog(*action)).map_or_else(|| action.title().to_owned(), |catalog| format!("{}\n{catalog}", action.title())),
             error: editor.and_then(|e| e.error.clone()).unwrap_or_default(),
         })
     }
@@ -747,6 +747,26 @@ impl Interaction {
         }
         // Hit-testing follows the same geometry as the renderer and only
         // changes focus. A click never dispatches Enter, y, or a shortcut.
+        if self.show_server_process {
+            let items = self.server_process.actions();
+            if let Some([_, rect]) = action_layout(body, items.len()) {
+                let actions = Actions { items: &items, selected: self.server_process.action_focus() };
+                if let Some(index) = actions.hit(rect, event.column, event.row) {
+                    self.server_process.select_action(index);
+                }
+            }
+            return;
+        }
+        if let Some(panel) = self.reality_status.as_mut() {
+            let items = panel.actions();
+            if let Some([_, rect]) = action_layout(body, items.len()) {
+                let actions = Actions { items: &items, selected: panel.action_focus() };
+                if let Some(index) = actions.hit(rect, event.column, event.row) {
+                    panel.select_action(index);
+                }
+            }
+            return;
+        }
         if let Some(dialog) = self.config_dialog.as_mut() {
             if let Some(form) = dialog.form() {
                 let target = if dialog.guide().is_some() { guided_form_area(body) } else { centered_column(body, 108) };
@@ -2264,8 +2284,7 @@ fn panel_at(
     let count = rows.len();
     // Auto-reveal focus in typed forms only. Confirmation/review screens
     // start at their first line, including warnings, not at the confirm key.
-    let focus =
-        focus.filter(|_| body.contains("Tab: поле") || body.contains("Tab/Shift+Tab: поле"));
+    let focus = focus.filter(|_| body.contains("Tab: поле") || body.contains("Tab/Shift+Tab: поле"));
     let offset = viewport.map_or(0, |v| v.position(title, count, page, focus));
     let caption = if viewport.is_some() && count > page {
         format!(
@@ -2468,13 +2487,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         menu.render(frame, parts[1]);
     } else if let Some(ui) = interaction.filter(|ui| ui.show_server_process) {
         frame.render_widget(Clear, parts[1]);
-        modal_panel!(
-            frame,
-            parts[1],
-            "Сервер • запуск и остановка",
-            &ui.server_process.body(),
-            true
-        );
+        let items = ui.server_process.actions();
+        if let Some([report, controls]) = action_layout(parts[1], items.len()) {
+            modal_panel!(frame, report, "Состояние сервера", &ui.server_process.summary(), false);
+            Actions { items: &items, selected: ui.server_process.action_focus() }.render(frame, controls);
+        } else {
+            modal_panel!(frame, parts[1], "Сервер • запуск и остановка", &ui.server_process.body(), true);
+        }
     } else if let Some(monitor) = interaction.and_then(|ui| ui.traffic_monitor.as_ref()) {
         frame.render_widget(Clear, parts[1]);
         if parts[1].width < 46
@@ -2486,13 +2505,14 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             monitor.render(frame, parts[1]);
         }
     } else if let Some(status) = interaction.and_then(|ui| ui.reality_status.as_ref()) {
-        modal_panel!(
-            frame,
-            parts[1],
-            "Подключение и состояние REALITY",
-            &status.body(),
-            true,
-        );
+        frame.render_widget(Clear, parts[1]);
+        let items = status.actions();
+        if let Some([report, controls]) = action_layout(parts[1], items.len()) {
+            modal_panel!(frame, report, "Подключение и состояние REALITY", &status.summary(), false);
+            Actions { items: &items, selected: status.action_focus() }.render(frame, controls);
+        } else {
+            modal_panel!(frame, parts[1], "Подключение и состояние REALITY", &status.body(), true);
+        }
     } else if let Some(registration) = interaction.and_then(|ui| ui.reality_registration.as_ref()) {
         modal_panel!(
             frame,
