@@ -433,4 +433,44 @@ mod tests {
         assert!(!panel.body().contains("SECRET-NEVER-DISPLAY"));
         assert!(panel.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
     }
+
+    #[test]
+    fn input_validation_and_async_refusal_preserve_unwritten_enrollment() {
+        let mut p = EnrollmentPanel::new();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        p.key(key(KeyCode::Enter));
+        assert!(p.error.is_some());
+        p.key(key(KeyCode::Char('a')));
+        p.key(key(KeyCode::Backspace));
+        p.key(key(KeyCode::Tab));
+        p.key(key(KeyCode::BackTab));
+        p.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(p.fields[0].is_empty());
+        let dir = std::env::temp_dir().join(format!("theia-enrollment-missing-{}", std::process::id()));
+        assert!(!dir.exists());
+        for (i, field) in ["invitation", "admission", "profile", "trust"].into_iter().enumerate() {
+            p.fields[i] = Zeroizing::new(dir.join(field).to_str().unwrap().to_owned());
+        }
+        p.fields[4] = Zeroizing::new("ab".repeat(32));
+        p.key(key(KeyCode::Enter));
+        assert!(matches!(p.stage, Stage::Loading(_)));
+        assert!(p.body().contains("без сети и записи"));
+        assert!(!p.key(key(KeyCode::Esc)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(p.stage, Stage::Loading(_)) {
+            p.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(p.body().contains("ОТКАЗ"));
+        let (tx, rx) = mpsc::channel();
+        p.stage = Stage::Applying(rx);
+        assert!(p.body().contains("runtime не меняется"));
+        drop(tx);
+        assert!(p.poll().is_none());
+        assert!(p.body().contains("ОТКАЗ"));
+        assert!(!dir.exists());
+    }
+
+
 }

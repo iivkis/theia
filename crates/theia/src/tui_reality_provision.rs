@@ -535,4 +535,87 @@ mod tests {
         assert!(matches!(panel.stage, Stage::Input));
         assert!(panel.key(key(KeyCode::Esc)));
     }
+
+    #[test]
+    fn existing_health_panel_requires_confirmation_and_persists_bundle() {
+        let dir = std::env::temp_dir().join(format!("theia-provision-panel-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let health = dir.join("health");
+        let output = dir.join("bundle");
+        let now = reference_health::unix_now().unwrap();
+        let state = State::new(Plan {
+            schema_version: 1, inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
+            own_ips: vec!["93.184.216.1".parse().unwrap()],
+            references: vec![Target { server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap() }],
+        }, vec![Evidence { h2_status: Some(200), h3_status: None }], now).unwrap();
+        Store::new(&health).unwrap().enroll(&state).unwrap();
+        let mut p = ProvisionPanel::new();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        p.paste(health.to_str().unwrap());
+        p.key(key(KeyCode::Tab));
+        p.paste(output.to_str().unwrap());
+        p.key(key(KeyCode::Char('x')));
+        p.key(key(KeyCode::Backspace));
+        p.key(key(KeyCode::BackTab));
+        p.key(key(KeyCode::Tab));
+        assert!(p.body().contains("Plan TOML"));
+        p.key(key(KeyCode::Enter));
+        assert!(matches!(p.stage, Stage::Loading(_)));
+        assert!(!p.key(key(KeyCode::Esc)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(p.stage, Stage::Loading(_)) {
+            p.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(matches!(p.stage, Stage::Confirm(_)));
+        assert!(p.body().contains("не live Apply"));
+        assert!(!output.exists());
+        p.key(key(KeyCode::Char('y')));
+        assert!(matches!(p.stage, Stage::Applying(_)));
+        assert!(p.body().contains("Runtime не изменяется"));
+        while matches!(p.stage, Stage::Applying(_)) {
+            p.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(matches!(p.stage, Stage::Done(_)), "{}", p.body());
+        assert!(output.join("provision.toml").exists());
+        assert!(p.key(key(KeyCode::Esc)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn worker_failures_and_network_cancellation_never_report_saved() {
+        let mut p = ProvisionPanel::new();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        p.key(key(KeyCode::Char('a')));
+        p.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(p.fields[0].is_empty());
+        let (tx, rx) = mpsc::channel();
+        p.stage = Stage::LoadingPlan(rx);
+        assert!(p.body().contains("согласуемого плана"));
+        p.poll();
+        tx.send(Ok(PlanReview { digest: [1;32], body: "consent".into() })).unwrap();
+        p.poll();
+        assert_eq!(p.body(), "consent");
+        p.key(key(KeyCode::Char('n')));
+        assert!(matches!(p.stage, Stage::Input));
+        let (tx, result) = mpsc::channel();
+        let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+        p.stage = Stage::Checking { result, cancel };
+        assert!(p.body().contains("отменить без записи"));
+        p.key(key(KeyCode::Esc));
+        assert_eq!(cancelled.try_recv(), Ok(()));
+        assert!(matches!(p.stage, Stage::Input));
+        drop(tx);
+        let (tx, rx) = mpsc::channel();
+        p.stage = Stage::Applying(rx);
+        drop(tx);
+        p.poll();
+        assert!(p.body().contains("ОТКАЗ"));
+        assert!(matches!(p.stage, Stage::Input));
+    }
+
+
 }

@@ -1120,6 +1120,12 @@ async fn auto_falls_back_only_after_udp_silence_and_uses_negative_cache() {
         let origin = tokio::spawn(async move {
             for _ in 0..2 {
                 let (mut tcp, _) = target.accept().await.unwrap();
+                // Do not race the CONNECT success header with an immediate
+                // upstream FIN. The client closes each test tunnel after
+                // reading the complete header; then the origin may half-close.
+                let mut received = Vec::new();
+                tcp.read_to_end(&mut received).await.unwrap();
+                assert!(received.is_empty());
                 tcp.shutdown().await.unwrap();
             }
         });
