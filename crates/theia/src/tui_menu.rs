@@ -206,13 +206,17 @@ impl Menu {
                 }
                 return None;
             }
-            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => (selected + count - 1) % count,
-            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => (selected + 1) % count,
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => (selected + 1).min(count - 1),
             KeyCode::Home => 0,
             KeyCode::End => count - 1,
             KeyCode::PageUp => selected.saturating_sub(5),
             KeyCode::PageDown => (selected + 5).min(count - 1),
-            KeyCode::Enter | KeyCode::Right => {
+            KeyCode::Right => {
+                if self.item.is_none() { self.item = Some(0); }
+                return None;
+            }
+            KeyCode::Enter => {
                 if let Some(item) = self.item {
                     let e = self.groups()[self.group].entries[item];
                     if e.requires_config && !self.configured {
@@ -439,9 +443,9 @@ impl Menu {
             self.item.is_some(),
         );
         let hint = self.notice.unwrap_or(if self.item.is_none() {
-            "↑↓ раздел  ·  Enter/→ действия  ·  Esc редактор"
+            "↑ ↓ выбор · → действия · Enter открыть · Esc назад"
         } else {
-            "↑↓ действие  ·  Enter открыть  ·  ←/Esc разделы  ·  F10 редактор"
+            "↑ ↓ выбор · ← разделы · Enter открыть · Esc назад"
         });
         frame.render_widget(
             Paragraph::new(tui_widgets::key_line(hint))

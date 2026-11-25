@@ -613,12 +613,9 @@ impl Actions<'_> {
                 } else {
                     Style::default().fg(TEXT)
                 };
-                let shortcut = if item.key == '4' {
-                    "F4".to_owned()
-                } else {
-                    item.key.to_string()
-                };
-                let label = fit_value(item.label, area.width.saturating_sub(9), false);
+                // Named actions are primary. Shortcuts remain available in
+                // F1/F2, not repeated next to every visible action.
+                let label = fit_value(item.label, area.width.saturating_sub(5), false);
                 ListItem::new(Line::from(vec![
                     Span::raw(if active {
                         " › "
@@ -628,10 +625,6 @@ impl Actions<'_> {
                         "   "
                     }),
                     Span::raw(label),
-                    Span::styled(
-                        format!("  {shortcut}"),
-                        Style::default().fg(if active { ACCENT } else { MUTED }),
-                    ),
                 ]))
                 .style(style)
             })
@@ -639,9 +632,9 @@ impl Actions<'_> {
         frame.render_widget(
             List::new(items).block(section(
                 if focused {
-                    " Действия · ↑↓ Enter "
+                    " Действия "
                 } else {
-                    " Действия · Tab "
+                    " Действия "
                 },
                 focused,
             )),
@@ -686,11 +679,11 @@ pub(crate) fn action_key(
     *focus = (*focus).min(items.len() - 1);
     match code {
         KeyCode::Up | KeyCode::BackTab => {
-            *focus = (*focus + items.len() - 1) % items.len();
+            *focus = focus.saturating_sub(1);
             None
         }
         KeyCode::Down | KeyCode::Tab => {
-            *focus = (*focus + 1) % items.len();
+            *focus = (*focus + 1).min(items.len() - 1);
             None
         }
         KeyCode::Home => {
