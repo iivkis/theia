@@ -15,12 +15,13 @@ proxy; auto uses the same H3-first, two silent attempts, route-scoped
 fallback rules as new tunnels. Existing tunnels retain their carrier leases.
 
 This is development code, not a release acceptance claim. REALITY
-server startup supports a single immutable signer/generation, fails closed
-for new handshakes when captured health or descriptor validity expires, with
-status-only IPC for any configuration containing REALITY; mixed inbounds
-do not support the existing own-TLS live mutation operations in this
-candidate. Dual identity, live reference/descriptor generation changes,
-restart/rollback integration and audit remain open. No deployment should
+server startup now supports live immutable generations, dual-signer overlap,
+rooted compatible renewal and automatic approved-reference failover; see
+f18-live-runtime.md for the precise recovery contract. It fails closed for
+new handshakes when no valid generation exists. Status-only IPC remains for
+any configuration containing REALITY; mixed inbounds do not support the
+existing own-TLS live mutation operations. Structural restart/rollback,
+overlap failover and independent audit remain open. No deployment should
 be declared accepted before main CI and independent review.
 
 External QUIC path lifecycle retains independent budgets and original

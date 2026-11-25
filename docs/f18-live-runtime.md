@@ -51,8 +51,10 @@ unadmitted relay always uses the single current pinned reference;
 passive CID/NAT/3x limitations remain.
 
 Native registered loopback test holds H2 CONNECT and H3 SOCKS5 tunnels
-open across planned rotation, authenticates new signer on each branch,
-and exchanges bytes after promotion. Reference evidence is synthetic.
+open across automatic reference failover and planned rotation, authenticates
+new signer on each branch, and exchanges bytes after promotion. Startup
+recovery fixture checks fresh approved reserve selection and rejects stale
+health rollback. Reference evidence is synthetic.
 The production anti-replay startup window is preserved; only the explicit
 unit-test ready path uses a test guard start time in the past. No build,
 test, or coverage result is claimed. Live structural management/rollback,
