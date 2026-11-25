@@ -23,6 +23,15 @@ pub struct ServerRequest {
     pub grants: Vec<String>,
 }
 
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub struct ServerReplacement{
+    pub id:String,
+    pub health:PathBuf,
+    pub bundle:PathBuf,
+    pub health_sha256:[u8;32],
+    pub identity_sha256:[u8;32],
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientRequest {
     pub enrollment: PathBuf,
@@ -33,6 +42,7 @@ pub struct ClientRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Server(ServerRequest),
+    ReplaceServer(ServerReplacement),
     Client(ClientRequest),
     /// Explicit independent re-enrollment, never an automatic trust transition.
     Reenroll(ClientRequest),
@@ -125,6 +135,30 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
                 record.scope.inbound, record.scope.endpoint, r.listen, r.grants.join(","),
                 hex(record.identity_sha256), state.report(now).map_err(|_| Error::Health)?);
             (report, record.publication_sha256)
+        }
+        (Config::Server(document),Request::ReplaceServer(r))=>{
+            let entry=document.server.inbounds.iter_mut().find(|i|i.id==r.id).ok_or(Error::Scope)?;
+            if entry.security_mode!=SecurityMode::SmartReality{return Err(Error::Format);}
+            let old=entry.reality.as_ref().ok_or(Error::Format)?;
+            let state=reference_health::Store::new(&r.health).and_then(|s|s.inspect()).map_err(|_|Error::Health)?;
+            let record=crate::reality_provision::inspect_initial(&state,r.health_sha256,r.identity_sha256,&r.bundle,now)?;
+            let addr:SocketAddr=entry.h2_listen.parse().map_err(|_|Error::Scope)?;
+            if record.scope.inbound!=entry.id || record.scope.endpoint!=format!("{}:{}",entry.server_name,addr.port()){
+                return Err(Error::Scope);
+            }
+            let binding=RealityBinding{
+                health_store:path_string(&r.health)?,bundle:path_string(&r.bundle)?,
+                initial_health_sha256:r.health_sha256,identity_sha256:r.identity_sha256,
+                manifest_sha256:record.manifest_sha256()?,
+            };
+            if old.identity_sha256==binding.identity_sha256||old.bundle==binding.bundle||old.manifest_sha256==binding.manifest_sha256{
+                return Err(Error::Approval);
+            }
+            let report=format!("Independent REALITY server replacement (saved config only)\ninbound={}\nendpoint={}\nold_identity_sha256={}\nnew_identity_sha256={}\nExisting bind, grants and policy retained. Confirm new identity independently; clients require new enrollment. Old bundle is retained but must not be reactivated as rollback.\n{}",
+                entry.id,record.scope.endpoint,hex(old.identity_sha256),hex(binding.identity_sha256),
+                state.report(now).map_err(|_|Error::Health)?);
+            entry.reality=Some(binding);
+            (report,record.publication_sha256)
         }
         (Config::Client(document), Request::Client(r)) => {
             if !config::valid_id(&r.id) || document.client.profiles.iter().any(|p| p.id == r.id) {

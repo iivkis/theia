@@ -1,7 +1,7 @@
 //! Register the already verified local materials in the ordinary typed
 //! editor. Preview and save are separate; a dirty or externally changed
 //! config never gets silently replaced. No live Apply is implied.
-use crate::{config, reality_bootstrap::Error, reality_config::{self, ClientRequest, Request, ServerRequest},
+use crate::{config, reality_bootstrap::Error, reality_config::{self, ClientRequest, Request, ServerRequest,ServerReplacement},
     reference_health, tui_editor::Editor, Role};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{path::{Path, PathBuf}, sync::mpsc::{self, Receiver, TryRecvError}};
@@ -10,6 +10,7 @@ const SERVER_FIELDS: [&str; 6] = ["Health store", "Каталог комплек
     "Identity SHA-256 (независимое подтверждение)", "TCP/UDP bind", "Разрешённые ID через запятую"];
 const CLIENT_FIELDS: [&str; 3] = ["Файл enrollment", "Identity SHA-256 (независимое подтверждение)", "Новый ID профиля"];
 const REENROLL_FIELDS: [&str;2] = ["Новый отдельно импортированный enrollment", "Новый identity SHA-256 из независимого канала"];
+const REPLACE_SERVER_FIELDS:[&str;4]=["Новый health store","Новый bundle","Health SHA-256","Новый fingerprint из независимого канала"];
 const MAX_FIELD: usize = 1024;
 
 struct Review {
@@ -84,7 +85,7 @@ fn build_reenroll(id: &str, fields: &[String]) -> Result<Request, Error> {
 fn preview(path: &Path, original: [u8;32], request: Request, now: u64) -> Result<Review, Error> {
     let prepared = reality_config::prepare(path, &request, now)?;
     if prepared.source_sha256() != original { return Err(Error::Approval); }
-    let consent = if matches!(&request, Request::Reenroll(_)) {
+    let consent = if matches!(&request, Request::Reenroll(_)|Request::ReplaceServer(_)) {
         "Y (Shift+Y): подтвердить независимую замену identity; n/Esc: отменить."
     } else {
         "y: сохранить; n/Esc: отменить."
@@ -112,18 +113,21 @@ impl RegistrationPanel {
     }
 
     pub(crate) fn reenroll(editor: &Editor) -> Result<Self, &'static str> {
-        if editor.role() != Role::Client || !editor.selected_reality() {
+        if !editor.selected_reality() {
             return Err("Выберите зарегистрированный REALITY-профиль.");
         }
         let mut panel = Self::new(editor)?;
         panel.reenroll_id = Some(editor.selected_record_id().to_owned());
-        panel.fields = vec![String::new(); REENROLL_FIELDS.len()];
+        panel.fields=vec![String::new();if editor.role()==Role::Server{REPLACE_SERVER_FIELDS.len()}else{REENROLL_FIELDS.len()}];
         Ok(panel)
     }
 
     fn request(&self) -> Result<Request, Error> {
         if let Some(id) = &self.reenroll_id {
-            build_reenroll(id, &self.fields)
+            if self.role==Role::Server{
+                if self.fields.len()!=REPLACE_SERVER_FIELDS.len(){return Err(Error::Format);}
+                Ok(Request::ReplaceServer(ServerReplacement{id:id.clone(),health:self.fields[0].as_str().into(),bundle:self.fields[1].as_str().into(),health_sha256:hash(&self.fields[2])?,identity_sha256:hash(&self.fields[3])?}))
+            }else{build_reenroll(id,&self.fields)}
         } else {
             build_request(self.role, &self.fields)
         }
@@ -236,7 +240,7 @@ impl RegistrationPanel {
         match &self.stage {
             Stage::Input => {
                 let (mut out, labels) = if let Some(id) = &self.reenroll_id {
-                    (format!("Независимый повторный enrollment выбранного профиля {id}. Не штатная ротация. Сначала импортируйте новое приглашение через I.\n"), REENROLL_FIELDS.as_slice())
+                    if self.role==Role::Server{(format!("Независимая замена bundle выбранного inbound {id}. Сначала подготовьте новый комплект. Не штатная ротация.\n"),REPLACE_SERVER_FIELDS.as_slice())}else{(format!("Независимый повторный enrollment выбранного профиля {id}. Не штатная ротация. Сначала импортируйте новое приглашение через I.\n"),REENROLL_FIELDS.as_slice())}
                 } else {
                     (String::from("Регистрация уже подготовленных материалов. Только сохранение, не запуск.\n"), labels(self.role))
                 };

@@ -1811,7 +1811,7 @@ async fn prepare_generation(
         if let Some(binding)=&inbound.reality{
             let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
             let (manager,lease)=if let Some(snapshot)=captured{
-                snapshot.reality(index).map_err(|_|())?.activate(inbound,now).map_err(|_|ServerError::Config)?
+                snapshot.reality(index)?.activate(inbound,now).map_err(|_|ServerError::Config)?
             }else{
                 let manager=crate::reality_generation::Manager::new_live(&config,&inbound.id,now).await.map_err(|_|ServerError::Config)?;
                 let now=crate::reference_health::unix_now().map_err(|_|ServerError::Config)?;
@@ -2155,7 +2155,7 @@ fn commit_same_port_reality(
     // in progress, refuse rather than race a stale manager publication.
     let mut manager=hot.manager.try_lock().map_err(|_|())?;
     let now=crate::reference_health::unix_now().map_err(|_|())?;
-    let (next_manager,lease)=snapshot.reality(index)?.activate(inbound,now).map_err(|_|())?;
+    let (next_manager,lease)=snapshot.reality(index).map_err(|_|())?.activate(inbound,now).map_err(|_|())?;
     manager.check_replacement(&lease,binding.identity_sha256).map_err(|_|())?;
     let prepared=hot.carrier.prepare_replacement(Arc::new(lease),now).map_err(|_|())?;
     let (live,auth)=request.previous.live.prepare_tls_rebase(candidate,request.expected_revision).map_err(|_|())?;

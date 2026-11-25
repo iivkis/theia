@@ -73,11 +73,19 @@ impl State {
         self.commit_quota(previous,expected,next,stage,ledger)
     }
     pub(crate) fn reality_status(&self,id:&str,manifest:[u8;32])->Option<Option<crate::reality_generation::Status>>{
-        let _current=self.current.read().ok()?;
-        let reality=self.reality.read().ok()?;
-        let (expected,live)=reality.get(id)?;
-        if *expected!=manifest{return None;}
-        Some(live.status())
+        let (view,live)={
+            let view=self.current.read().ok()?.clone();
+            let map=self.reality.read().ok()?;
+            let (expected,live)=map.get(id)?;
+            if *expected!=manifest{return None;}
+            (view,live.clone())
+        };
+        // Never hold the runtime lock while reading the route table:
+        // same-port Apply acquires these locks in the opposite order.
+        let status=live.status();
+        let current=self.current.read().ok()?;
+        if !Arc::ptr_eq(&current,&view){return None;}
+        Some(status)
     }
 
     /// Advisory rollback readiness. Never returns certificates, keys or

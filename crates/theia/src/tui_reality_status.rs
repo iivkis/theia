@@ -3,7 +3,7 @@ use crate::{reality_bootstrap::Error,reality_config::{self,RotationReview,TrustR
 use crossterm::event::{KeyCode,KeyEvent};
 use std::{path::PathBuf,sync::mpsc::{self,Receiver,TryRecvError}};
 
-enum Update { Report(String), Review(RotationReview), Trust(TrustReview), Expiry(ExpiryReview) }
+enum Update { Report(String), Review(RotationReview), Trust(TrustReview), Expiry(ExpiryReview), HeadlessReview(u64) }
 struct ClientRun{
     stop:Option<tokio::sync::oneshot::Sender<()>>,
     done:Receiver<Result<(),crate::client::ClientError>>,
@@ -24,13 +24,14 @@ pub(crate) struct StatusPanel {
     trust_input:Option<(bool,String)>,
     trust_review:Option<TrustReview>,
     expiry_review:Option<ExpiryReview>,
+    headless_review:Option<u64>,
 }
 impl StatusPanel{
     pub(crate) fn open(editor:&Editor)->Self{
         let mut panel=Self{path:editor.saved_path().to_owned(),digest:editor.saved_sha256(),
             id:editor.selected_record_id().to_owned(),server:editor.role()==Role::Server,
             pending:None,review:None,committing:false,report:String::new(),
-            client_active:editor.selected_record_is_active(),client_confirm:None,client_run:None,trust_input:None,trust_review:None,expiry_review:None};
+            client_active:editor.selected_record_is_active(),client_confirm:None,client_run:None,trust_input:None,trust_review:None,expiry_review:None,headless_review:None};
         panel.start(None);
         panel
     }
@@ -54,6 +55,17 @@ impl StatusPanel{
                             format!("Runtime: принимает подключения\ngeneration={generation} revision={revision} health_revision={health_revision}\nreference_index={active_reference} overlap={overlap}"),
                         Some(StatusReply::RealitySuspended)=>"Runtime: новые подключения приостановлены; действующие туннели не отозваны.".into(),
                         _=>"Runtime: нет подтверждённого IPC статуса этого bundle.".into(),
+                    };
+                    report.push_str("\n\n");report.push_str(&live);
+                }else{
+                    use crate::management::{StatusCommand,StatusReply};
+                    let response=tokio::runtime::Builder::new_current_thread().enable_all().build().ok()
+                        .and_then(|rt|rt.block_on(crate::management::query_client_environment(StatusCommand::ClientStatus)).ok());
+                    let live=match response{
+                        Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,fallback})=>
+                            format!("Headless runtime: revision={revision}; saved TOML совпадает={}\ndescriptor_revision={descriptor_revision}; last_open={}; H3 fallback={fallback}",
+                                config_sha256==digest,match transport{2=>"H2",3=>"H3",_=>"не подтверждён"}),
+                        _=>"Headless runtime: защищённый IPC не подтверждён.".into(),
                     };
                     report.push_str("\n\n");report.push_str(&live);
                 }
@@ -118,6 +130,33 @@ impl StatusPanel{
             let _=tx.send(result);
         });
     }
+    fn headless(&mut self,apply:Option<u64>){
+        let digest=self.digest;let path=self.path.clone();
+        let (tx,rx)=mpsc::channel();self.pending=Some(rx);self.committing=apply.is_some();
+        let _worker=std::thread::spawn(move||{
+            use crate::management::{self,StatusCommand,StatusReply};
+            let result=(||{
+                crate::local_proxy::saved_client_bytes(&path,digest).map_err(|_|Error::Approval)?;
+                let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_|Error::Storage)?;
+                rt.block_on(async{
+                    if let Some(expected_revision)=apply{
+                        return Ok(match management::query_client_environment(StatusCommand::ClientApply{expected_revision,candidate_sha256:digest}).await{
+                            Ok(StatusReply::ClientApplied{revision})=>Update::Report(format!("Headless Apply подтверждён: revision={revision}. Прежние туннели сохранены.")),
+                            Err(management::ManagementError::CandidateRejected)=>Update::Report("Headless Apply отклонён. Ничего не подтверждено.".into()),
+                            _=>Update::Report("Headless Apply: результат не подтверждён. Перечитайте IPC status; не повторяйте вслепую.".into()),
+                        });
+                    }
+                    let StatusReply::ClientRunning{revision,config_sha256,..}=management::query_client_environment(StatusCommand::ClientStatus).await.map_err(|_|Error::Storage)? else{return Err(Error::Storage);};
+                    if config_sha256==digest{return Ok(Update::Report("Headless runtime уже использует этот TOML.".into()));}
+                    match management::query_client_environment(StatusCommand::ClientPreview{expected_revision:revision,candidate_sha256:digest}).await{
+                        Ok(StatusReply::ClientReady{revision:ready}) if ready==revision=>Ok(Update::HeadlessReview(revision)),
+                        _=>Err(Error::Approval),
+                    }
+                })
+            })();
+            let _=tx.send(result);
+        });
+    }
     fn start_client(&mut self){
         if !self.client_active||self.client_run.is_some(){return;}
         let path=self.path.clone();let digest=self.digest;let id=self.id.clone();
@@ -142,6 +181,14 @@ impl StatusPanel{
     }
     pub(crate) fn key(&mut self,key:KeyEvent)->bool{
         if !self.server{
+            if let Some(revision)=self.headless_review{
+                match key.code{
+                    KeyCode::Char('y')=>{self.headless_review=None;self.headless(Some(revision));},
+                    KeyCode::Char('n')|KeyCode::Esc=>self.headless_review=None,
+                    _=>{},
+                }
+                return false;
+            }
             if self.trust_review.is_some(){
                 match key.code{
                     KeyCode::Char('y')=>{if let Some(review)=self.trust_review.take(){self.apply_trust(review);}},
@@ -178,6 +225,9 @@ impl StatusPanel{
             }
             if self.pending.is_none()&&!self.committing&&matches!(key.code,KeyCode::Char('o'|'k')){
                 self.trust_input=Some((key.code==KeyCode::Char('k'),String::new()));return false;
+            }
+            if self.pending.is_none()&&self.client_active&&key.code==KeyCode::Char('h'){
+                self.headless(None);return false;
             }
             if self.pending.is_none()&&self.client_active&&key.code==KeyCode::Char('s'){
                 self.client_confirm=Some(true);return false;
@@ -225,10 +275,12 @@ impl StatusPanel{
             Ok(Update::Review(review))=>self.review=Some(review),
             Ok(Update::Trust(review))=>self.trust_review=Some(review),
             Ok(Update::Expiry(review))=>self.expiry_review=Some(review),
+            Ok(Update::HeadlessReview(revision))=>self.headless_review=Some(revision),
             Err(error)=>self.report=format!("Операция не подтверждена: {error}\nПри неопределённой записи сначала перечитайте сохранённый и runtime статус. Не повторяйте вслепую."),
         }
     }
     pub(crate) fn body(&self)->String{
+        if let Some(revision)=self.headless_review{return format!("Headless Apply: revision={revision}; точный сохранённый TOML проверен. Меняются только будущие локальные соединения, OS proxy и listeners сохраняются.\ny: применить | n/Esc: отменить");}
         if let Some((promote,field))=&self.trust_input{return format!("{}\nАбсолютный путь к подписанному descriptor: [скрыто, {} bytes]\nEnter: предпросмотр | Esc: отменить",
             if *promote{"Плановый переход identity"}else{"Offline recovery"},field.len());}
         if let Some(review)=&self.trust_review{return format!("{}\n\ny: подтвердить | n/Esc: отменить",review.report());}
@@ -243,7 +295,7 @@ impl StatusPanel{
         if let Some(review)=&self.expiry_review{return format!("{}\n\ny: подтвердить | n/Esc: отменить",review.report());}
         if let Some(review)=&self.review{return format!("{}\n\ny: подтвердить запись | n/Esc: отменить",review.report());}
         format!("{}\n\nr: перечитать | {}Esc: закрыть",self.report,
-            if self.server{"t: начать ротацию | p: отозвать старый ключ после overlap | e: восстановить истёкший descriptor | "}else if self.client_active{"s: запустить локальный runtime | o: recovery | k: promotion | "}else{"o: recovery | k: promotion | для запуска выберите активный профиль | "})
+            if self.server{"t: начать ротацию | p: отозвать старый ключ после overlap | e: восстановить истёкший descriptor | "}else if self.client_active{"s: запустить локальный runtime | h: headless Apply | o: recovery | k: promotion | "}else{"o: recovery | k: promotion | для запуска выберите активный профиль | "})
     }
 }
 
@@ -255,7 +307,7 @@ mod tests{
     fn panel(active:bool)->StatusPanel{
         StatusPanel{path:PathBuf::new(),digest:[1;32],id:"test".into(),server:false,
             pending:None,review:None,committing:false,report:String::new(),
-            client_active:active,client_confirm:None,client_run:None,trust_input:None,trust_review:None,expiry_review:None}
+            client_active:active,client_confirm:None,client_run:None,trust_input:None,trust_review:None,expiry_review:None,headless_review:None}
     }
     #[test]
     fn runtime_and_trust_inputs_never_implicitly_apply(){
