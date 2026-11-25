@@ -740,6 +740,12 @@ impl Interaction {
         page_actions(role, 0).iter().position(|item| item.key == key).unwrap_or(0)
     }
 
+    fn visible_workspace_action(&self, role: Role) -> usize {
+        if role == Role::Server && self.workspace_page == 0 && self.workspace_focus == WorkspaceFocus::Fields {
+            self.recommended_action(role)
+        } else { self.workspace_action }
+    }
+
     fn select_workspace_page(&mut self, role: Role, page: usize) {
         self.workspace_page = page.min(pages(role).len() - 1);
         self.workspace_action = if self.workspace_page == 0 { self.recommended_action(role) } else { 0 };
@@ -818,7 +824,11 @@ impl Interaction {
                 }
             }
         }
+        let previous_process_status = self.server_process.status();
         self.server_process.poll();
+        if self.server_process.status() != previous_process_status {
+            self.last_apply = None;
+        }
         if let Some(monitor) = self.traffic_monitor.as_mut() {
             monitor.poll();
         }
@@ -1067,8 +1077,11 @@ impl Interaction {
             }
             let items=page_actions(role,self.workspace_page);
             let controls=page_layout(body,role,self.workspace_page).map(|p|p[1]).unwrap_or(if self.workspace_focus==WorkspaceFocus::Actions {body} else {Rect::default()});
-            if let Some(i)=(Actions {items:&items,selected:self.workspace_action}).hit(controls,event.column,event.row) {
+            if let Some(i)=(Actions {items:&items,selected:self.visible_workspace_action(role)}).hit(controls,event.column,event.row) {
                 self.workspace_action=i; self.workspace_focus=WorkspaceFocus::Actions; return;
+            }
+            if self.workspace_focus == WorkspaceFocus::Actions && controls == body {
+                return;
             }
             if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
                 let content=page_layout(body,role,self.workspace_page).map(|p|p[0]).unwrap_or(body);
@@ -1106,10 +1119,11 @@ impl Interaction {
             }
             return;
         }
+        let visible_action = self.visible_workspace_action(role);
         if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
             if let Some([content, controls]) = page_layout(columns[2], role, self.workspace_page).or_else(||(self.workspace_focus==WorkspaceFocus::Actions).then_some([Rect::default(),columns[2]])) {
                 let items = page_actions(role, self.workspace_page);
-                if let Some(i) = (Actions { items: &items, selected: self.workspace_action }).hit(controls, event.column, event.row) {
+                if let Some(i) = (Actions { items: &items, selected: visible_action }).hit(controls, event.column, event.row) {
                     self.workspace_action = i;
                     self.workspace_focus = WorkspaceFocus::Actions;
                     return;
@@ -3745,11 +3759,7 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
     let page = ui.map_or(0, |u| u.workspace_page.min(6));
     let items = page_actions(role, page);
     let focus = ui.map_or(WorkspaceFocus::Fields, |u| u.workspace_focus);
-    let selected = ui.map_or(0, |u| {
-        if role == Role::Server && page == 0 && focus == WorkspaceFocus::Fields {
-            u.recommended_action(role)
-        } else { u.workspace_action }
-    });
+    let selected = ui.map_or(0, |u| u.visible_workspace_action(role));
     if compact && focus==WorkspaceFocus::Navigation {
         let rows=pages(role).iter().enumerate().map(|(i,label)|ListItem::new(format!("{} {label}",if i==page{"›"}else{" "})).style(Style::default().fg(if i==page{ACCENT}else{TEXT}).bg(if i==page{FOCUS}else{SURFACE})));
         frame.render_widget(List::new(rows.collect::<Vec<_>>()).block(tui_widgets::section("Разделы · ↑↓ Enter",true)),area);
