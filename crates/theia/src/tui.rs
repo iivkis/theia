@@ -18,6 +18,7 @@ use crate::{
     tui_reality_status::StatusPanel,
     tui_runtime::RuntimePanel,
     tui_server_process::ProcessPanel,
+    tui_widgets::{Field, Form},
     Role,
 };
 use crossterm::{
@@ -291,6 +292,23 @@ enum RecordFlow {
 }
 
 impl RecordFlow {
+    fn form(&self, editor: Option<&Editor>) -> Option<Form> {
+        let Self::Input { action, fields, focus } = self else { return None; };
+        Some(Form {
+            fields: action.fields().iter().zip(fields).enumerate().map(|(id, ((label, hidden), value))| Field {
+                id, label, hint: if *hidden { "Только ссылка на материал, не секрет." } else { "Введите значение; Enter — предпросмотр." },
+                value: if *hidden && !value.is_empty() { "Скрыто · ссылка введена".into() } else { value.clone() },
+            }).collect(),
+            selected: *focus,
+            lead: action.title().to_owned(),
+            error: editor.and_then(|e| e.error.clone()).unwrap_or_default(),
+        })
+    }
+    fn select_field(&mut self, id: usize) {
+        if let Self::Input { fields, focus, .. } = self {
+            if id < fields.len() { *focus = id; }
+        }
+    }
     fn body(&self) -> String {
         match self {
             Self::ChooseMode(role) => format!("ВЫБЕРИТЕ РЕЖИМ\n\n  1   Own-TLS\n      {}\n\n  2   SmartTheia REALITY\n      {}\n\nEsc: назад. Сохранение не запускает runtime.", if *role == Role::Server {"Свой сертификат и ключ"} else {"Ручные параметры TLS"}, if *role == Role::Server {"Мастер проверки референсов, без своего сертификата"} else {"Импорт с независимым подтверждением доверия"}),
@@ -725,6 +743,33 @@ impl Interaction {
         }
         if let Some(menu) = self.menu.as_mut() {
             menu.click(body, event.column, event.row);
+            return;
+        }
+        // Hit-testing follows the same geometry as the renderer and only
+        // changes focus. A click never dispatches Enter, y, or a shortcut.
+        if let Some(dialog) = self.config_dialog.as_mut() {
+            if let Some(form) = dialog.form() {
+                let target = if dialog.guide().is_some() { guided_form_area(body) } else { centered_column(body, 108) };
+                if let Some(id) = form.hit(target, event.column, event.row) { dialog.select_field(id); }
+            }
+            return;
+        }
+        if let Some(panel) = self.reality_provision.as_mut() {
+            if let Some(form) = panel.form() {
+                if let Some(id) = form.hit(guided_form_area(body), event.column, event.row) { panel.select_field(id); }
+            }
+            return;
+        }
+        if let Some(panel) = self.reality_enrollment.as_mut() {
+            if let Some(form) = panel.form() {
+                if let Some(id) = form.hit(guided_form_area(body), event.column, event.row) { panel.select_field(id); }
+            }
+            return;
+        }
+        if let Some(flow) = self.records.as_mut() {
+            if let Some(form) = flow.form(self.editor.as_ref()) {
+                if let Some(id) = form.hit(guided_form_area(body), event.column, event.row) { flow.select_field(id); }
+            }
             return;
         }
         if !self.workspace_visible() {
@@ -2250,6 +2295,12 @@ fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, focused: bo
 
 /// A persistent step header and action strip separate guidance from the
 /// scrollable form/review. No display-only shortcut may commit a transaction.
+fn guided_form_area(area: Rect) -> Rect {
+    let area = centered_column(area, 108);
+    if area.height < 18 || area.width < 48 { return area; }
+    Layout::vertical([Constraint::Length(3), Constraint::Min(4), Constraint::Length(3)]).split(area)[1]
+}
+
 fn draw_guided(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2257,12 +2308,14 @@ fn draw_guided(
     body: &str,
     guide: (usize, usize, &'static str, &'static str),
     viewport: Option<&Viewport>,
+    form: Option<Form>,
 ) {
     let (step, total, heading, keys) = guide;
     let title = format!("{title} · ШАГ {step}/{total} · {heading}");
     frame.render_widget(Clear, area);
     if area.height < 18 || area.width < 48 {
-        panel_at(frame, area, &title, body, true, viewport);
+        if let Some(form) = form { form.render(frame, guided_form_area(area), &title); }
+        else { panel_at(frame, area, &title, body, true, viewport); }
         return;
     }
     let area = centered_column(area, 108);
@@ -2287,7 +2340,11 @@ fn draw_guided(
         Paragraph::new(Line::from(segments)).block(Block::default().title(title.as_str()).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray))),
         parts[0],
     );
-    panel_at(frame, parts[1], "Параметры / проверка", body, true, viewport);
+    if let Some(form) = form {
+        form.render(frame, parts[1], "Параметры");
+    } else {
+        panel_at(frame, parts[1], "Проверка", body, true, viewport);
+    }
     frame.render_widget(
         Paragraph::new(keys).wrap(Wrap { trim: true }).block(Block::default().title("Следующее действие").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))),
         parts[2],
@@ -2400,7 +2457,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     } else if let Some(dialog) = interaction.and_then(|ui| ui.config_dialog.as_ref()) {
         frame.render_widget(Clear, parts[1]);
         if let Some(guide) = dialog.guide() {
-            draw_guided(frame, parts[1], dialog.title(), &dialog.body(), guide, viewport);
+            draw_guided(frame, parts[1], dialog.title(), &dialog.body(), guide, viewport, dialog.form());
+        } else if let Some(form) = dialog.form() {
+            form.render(frame, centered_column(parts[1], 108), dialog.title());
         } else {
             modal_panel!(frame, parts[1], dialog.title(), &dialog.body(), true);
         }
@@ -2443,10 +2502,10 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         );
     } else if let Some(enrollment) = interaction.and_then(|ui| ui.reality_enrollment.as_ref()) {
-        draw_guided(frame, parts[1], "Импорт REALITY", &enrollment.body(), enrollment.guide(), viewport);
+        draw_guided(frame, parts[1], "Импорт REALITY", &enrollment.body(), enrollment.guide(), viewport, enrollment.form());
     } else if let Some(provision) = interaction.and_then(|ui| ui.reality_provision.as_ref()) {
         if let Some(guide) = provision.guide() {
-            draw_guided(frame, parts[1], "Мастер REALITY", &provision.body(), guide, viewport);
+            draw_guided(frame, parts[1], "Мастер REALITY", &provision.body(), guide, viewport, provision.form());
         } else {
             modal_panel!(frame, parts[1], "Мастер REALITY", &provision.body(), true);
         }
@@ -2472,7 +2531,13 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 }
             }
         }
-        modal_panel!(frame, parts[1], "Настройка записи", &body, true);
+        let form = flow.form(interaction.and_then(|ui| ui.editor.as_ref()));
+        if form.is_some() {
+            draw_guided(frame, parts[1], "Настройка записи", &body,
+                (1, 2, "Параметры", "↑↓ поле · Ctrl+U очистить · Enter проверить · Esc назад"), viewport, form);
+        } else {
+            modal_panel!(frame, parts[1], "Настройка записи", &body, true);
+        }
     } else if let Some(flow) = interaction.and_then(|ui| ui.issuance.as_ref()) {
         draw_issuance(
             frame,
