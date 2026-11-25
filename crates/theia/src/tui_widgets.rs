@@ -643,6 +643,27 @@ impl Actions<'_> {
     }
 }
 
+/// Shared confirmation choices: a pointer or an arrow selects, only Enter
+/// dispatches through the owning workflow. Keep the negative choice first.
+pub(crate) fn confirmation_bar(frame: &mut Frame<'_>, area: Rect, heading: &str, error: bool,
+    confirm: &str, selected: bool) {
+    canvas(frame, area);
+    if area.height == 0 { return; }
+    let heading = fit_value(heading, area.width, false);
+    frame.render_widget(Paragraph::new(heading).style(Style::default().fg(if error { ERROR } else { MUTED })),
+        Rect::new(area.x, area.y, area.width, 1));
+    if area.height < 2 { return; }
+    let half = area.width / 2;
+    for (i, (label, x, width)) in [("Отменить", area.x, half), (confirm, area.x + half, area.width - half)].into_iter().enumerate() {
+        let active = (i == 1) == selected;
+        let shown = fit_value(label, width.saturating_sub(2), false);
+        frame.render_widget(Paragraph::new(format!("{} {shown}", if active { "›" } else { " " }))
+            .style(Style::default().fg(if active { ACCENT } else { TEXT })
+                .bg(if active { FOCUS } else { BG })),
+            Rect::new(x, area.bottom() - 1, width, 1));
+    }
+}
+
 pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
     if count == 0 || area.height < 8 {
         return None;

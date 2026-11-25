@@ -711,6 +711,7 @@ struct Interaction {
     value_preview: bool,
     preview_text: Option<String>,
     modal_action: usize,
+    confirm_selected: bool,
     last_apply: Option<([u8; 32], &'static str, u64)>,
     viewport: Viewport,
     welcome_choice: usize,
@@ -758,6 +759,7 @@ impl Interaction {
             value_preview: false,
             preview_text: None,
             modal_action: 0,
+            confirm_selected: false,
             last_apply: None,
             viewport: Viewport::default(),
             welcome_choice: 0,
@@ -1289,6 +1291,64 @@ impl Interaction {
 
     /// Mouse interaction is confined to harmless selection and navigation.
     /// No click is translated into a save, Apply, start, reveal or confirmation.
+    /// Only explicit workflow states can offer a confirmation.
+    fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        if self.value_preview || self.saving.is_some() || self.exporting.is_some()
+            || self.sharing.is_some() || self.clipboard.is_some() || self.qr_scan.is_some()
+            || self.import_browser.is_some() || self.menu.is_some() { return None; }
+        if let Some(p) = &self.config_dialog { return p.confirmation_choice(); }
+        if self.show_server_process {
+            return self.server_process.confirmation().map(|start| ('y', if start { "Запустить" } else { "Остановить" }));
+        }
+        #[cfg(windows)]
+        if let Some(p) = &self.system_proxy { return p.confirmation_choice(); }
+        if let Some(p) = &self.reality_status { return p.confirmation_choice(); }
+        if let Some(p) = &self.reality_registration { return p.confirmation_choice(); }
+        if let Some(p) = &self.reality_enrollment { return p.confirmation_choice(); }
+        if let Some(p) = &self.reality_provision { return p.confirmation_choice(); }
+        if let Some(p) = &self.runtime { return p.confirmation_choice(); }
+        if let Some(p) = &self.domain {
+            return if p.is_dns_confirming() { Some(('y', "Разрешить DNS")) }
+                else if p.is_probe_confirming() { Some(('y', "Проверить адреса")) } else { None };
+        }
+        if let Some(p) = &self.candidate_batch {
+            return p.is_confirming().then_some(('y', "Начать проверку"));
+        }
+        if let Some(p) = &self.candidates {
+            return p.is_confirming().then_some(('y', "Подтвердить область"));
+        }
+        if let Some(p) = &self.probe {
+            return p.is_consent_pending().then_some(('y', "Начать проверку"));
+        }
+        if let Some(p) = &self.discovery {
+            return p.is_consent_pending().then_some(('y', "Разрешить запрос"));
+        }
+        if let Some(flow) = &self.records {
+            return matches!(flow, RecordFlow::Confirm(_)).then_some(('y', "Сохранить"));
+        }
+        if let Some(flow) = &self.issuance {
+            return match flow {
+                IssueFlow::Confirm(_) => Some(('y', "Сохранить")),
+                IssueFlow::ConfirmExport => Some(('y', "Экспортировать")),
+                IssueFlow::ShareConfirm { .. } => Some(('y', "Подтвердить передачу")),
+                _ => None,
+            };
+        }
+        if let Some(flow) = &self.revocation {
+            return matches!(flow, DisableFlow::Confirm(_)).then_some(('y', "Отключить доступ"));
+        }
+        if let Some(flow) = &self.importing {
+            return match flow {
+                ImportFlow::Preview { invitation, ca: Some(_), public_ref }
+                    if invitation.has_token() || public_ref.is_some() => Some(('y', "Сохранить профиль")),
+                ImportFlow::RefreshConfirm(_) => Some(('y', "Сохранить ключ")),
+                ImportFlow::ActivateConfirm => Some(('y', "Выбрать профиль")),
+                _ => None,
+            };
+        }
+        None
+    }
+
     fn active_form(&self) -> Option<Form> {
         if let Some(browser) = &self.import_browser {
             return Some(browser.form());
@@ -1374,6 +1434,14 @@ impl Interaction {
         }
         if event.kind != MouseEventKind::Down(MouseButton::Left) {
             return;
+        }
+        if self.confirmation_choice().is_some() {
+            let footer = shell_layout(area)[2];
+            if event.row == footer.bottom().saturating_sub(1)
+                && event.column >= footer.x && event.column < footer.right() {
+                self.confirm_selected = event.column >= footer.x + footer.width / 2;
+                return;
+            }
         }
         if let Some(menu) = self.menu.as_mut() {
             menu.click(body, event.column, event.row);
@@ -1750,7 +1818,7 @@ impl Interaction {
         }
     }
 
-    fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
+    fn update(&mut self, model: &mut Model, mut key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Press
             && key.modifiers == KeyModifiers::SHIFT
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
@@ -1776,6 +1844,20 @@ impl Interaction {
         {
             return false;
         }
+        // Cancel is the safe default. Selection never executes an operation.
+        if let Some((confirm, _)) = self.confirmation_choice() {
+            if key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Left | KeyCode::Home => { self.confirm_selected = false; return false; }
+                    KeyCode::Right | KeyCode::End => { self.confirm_selected = true; return false; }
+                    KeyCode::Enter => {
+                        key.code = KeyCode::Char(if self.confirm_selected { confirm } else { 'n' });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.confirm_selected = false;
         if self.value_preview {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::F(7)) {
                 self.value_preview = false;
@@ -3760,6 +3842,8 @@ struct Viewport {
     page: Cell<usize>,
     signature: Cell<u64>,
     focused_row: Cell<Option<usize>>,
+    confirmation: Cell<bool>,
+    guided: Cell<bool>,
 }
 impl Viewport {
     fn reset(&self) {
@@ -3979,6 +4063,7 @@ fn draw_guided(
 ) {
     let (form, review) = content;
     let (step, total, heading, keys) = guide;
+    if let Some(v) = viewport { v.guided.set(true); }
     tui_widgets::canvas(frame, area);
     let width = area.width.min(108).saturating_sub(4);
     let review_lines = if form.is_none() {
@@ -4086,7 +4171,7 @@ fn draw_guided(
             body_area,
         );
     }
-    if parts[2].height > 0 {
+    if parts[2].height > 0 && !viewport.is_some_and(|v| v.confirmation.get()) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::styled("Следующее действие", Style::default().fg(MUTED)),
@@ -4112,6 +4197,11 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     tui_widgets::canvas(frame, area);
     let parts = shell_layout(area);
     let viewport = interaction.map(|ui| &ui.viewport);
+    let confirmation = interaction.and_then(Interaction::confirmation_choice);
+    if let Some(v) = viewport {
+        v.confirmation.set(confirmation.is_some());
+        v.guided.set(false);
+    }
     macro_rules! modal_panel {
         ($($arg:expr),+ $(,)?) => { panel_at($($arg),+, viewport) }
     }
@@ -4617,7 +4707,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             );
         }
     }
-    let footer = if interaction.is_some_and(|ui| !ui.workspace_visible()) {
+    let footer = if viewport.is_some_and(|v| v.guided.get()) {
+        ""
+    } else if interaction.is_some_and(|ui| !ui.workspace_visible()) {
         "Esc назад · Shift+PgUp/PgDn прокрутка · F7 детали"
     } else {
         match model.screen {
@@ -4643,6 +4735,15 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     let editor_error = interaction
         .and_then(|ui| Interaction::panel_role(model).and_then(|role| ui.editor_for(role)))
         .and_then(|e| e.error.as_deref());
+    if let Some((_, label)) = confirmation {
+        let error = active_error.as_deref().or(editor_error);
+        let heading = error.map_or_else(
+            || "Следующее действие · ← → выбор · Enter открыть · Esc назад".to_owned(),
+            |e| format!("Ошибка: {e} · F7 детали"));
+        tui_widgets::confirmation_bar(frame, parts[2], &heading, error.is_some(),
+            label, interaction.is_some_and(|ui| ui.confirm_selected));
+        return;
+    }
     if let Some(error) = active_error.as_deref().or(editor_error) {
         let line = tui_widgets::fit_value(&format!("Ошибка: {error}"), parts[2].width, false);
         frame.render_widget(
@@ -6957,6 +7058,30 @@ mod tests {
         assert!(!ui.update(&mut model, press(KeyCode::Char('p'))));
         #[cfg(windows)]
         assert!(ui.system_proxy.is_none());
+    }
+
+    #[test]
+    fn confirmation_choices_default_to_cancel_and_never_execute_on_focus() {
+        let mut ui = Interaction::new(None);
+        let mut model = Model::new(Some(Role::Server));
+        ui.update(&mut model, press(KeyCode::F(5)));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.server_process.confirmation(), Some(true));
+        let area = Rect::new(0, 0, 120, 40);
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("› Отменить"));
+        assert!(screen.contains("Запустить"));
+        ui.update(&mut model, press(KeyCode::Right));
+        assert!(ui.confirm_selected);
+        assert!(!ui.server_process.running());
+        ui.mouse(&mut model, click_at(90, area.bottom() - 1), area);
+        assert!(ui.confirm_selected);
+        assert!(!ui.server_process.running());
+        ui.update(&mut model, press(KeyCode::Left));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.server_process.confirmation().is_none());
+        assert!(!ui.server_process.running());
+        assert!(!ui.confirm_selected);
     }
 
     #[test]
