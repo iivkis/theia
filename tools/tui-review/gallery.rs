@@ -99,7 +99,20 @@ fn visual_review_gallery() {
     modes.update(&mut client_model, press(KeyCode::Char('V')));
     assert!(modes.reality_status.is_some());
     assert!(!modes.owned_running(Role::Client));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let status = modes.reality_status.as_mut().unwrap();
+        status.poll();
+        if status.actions().iter().any(|a| a.key == 's') { break; }
+        assert!(std::time::Instant::now() < deadline, "local proxy start action did not appear");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     review_capture("client-local-proxy-before-start", &client_model, &modes);
+    modes.update(&mut client_model, press(KeyCode::Char('s')));
+    assert!(!modes.owned_running(Role::Client));
+    review_capture("client-local-proxy-start-confirm", &client_model, &modes);
+    modes.update(&mut client_model, press(KeyCode::Char('n')));
+    assert!(!modes.owned_running(Role::Client));
     let model = Model::new(None);
     let ui = Interaction::new(None);
     review_capture("home-role-selection", &model, &ui);
