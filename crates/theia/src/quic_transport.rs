@@ -25,7 +25,6 @@ use std::{
 use tokio::time::timeout;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const ALPN: &[u8] = b"h3";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuicError {
@@ -61,11 +60,12 @@ pub(crate) fn transport_config() -> Arc<TransportConfig> {
     config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     // Bounded per-connection stream credit. Leave unidirectional credit for
     // HTTP/3 control and QPACK streams. These are not process RSS promises.
-    config.max_concurrent_bidi_streams(VarInt::from_u32(32));
-    config.max_concurrent_uni_streams(VarInt::from_u32(8));
-    config.stream_receive_window(VarInt::from_u32(256 * 1024));
-    config.receive_window(VarInt::from_u32(4 * 1024 * 1024));
-    config.send_window(4 * 1024 * 1024);
+    use crate::transport_policy as policy;
+    config.max_concurrent_bidi_streams(VarInt::from_u32(policy::MAX_BIDI_STREAMS));
+    config.max_concurrent_uni_streams(VarInt::from_u32(policy::MAX_QUIC_UNI_STREAMS));
+    config.stream_receive_window(VarInt::from_u32(policy::QUIC_STREAM_RECEIVE_BYTES));
+    config.receive_window(VarInt::from_u32(policy::QUIC_CONNECTION_RECEIVE_BYTES));
+    config.send_window(policy::QUIC_SEND_WINDOW_BYTES);
     Arc::new(config)
 }
 
@@ -95,16 +95,9 @@ pub(crate) fn server_config(
     certificates: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<quinn::ServerConfig, QuicError> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| QuicError::Configuration)?
-    .with_no_client_auth()
-    .with_single_cert(certificates, key)
-    .map_err(|_| QuicError::Configuration)?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-    tls.max_early_data_size = 0;
+    let tls = crate::transport_policy::Carrier::H3
+        .server_tls(certificates, key)
+        .map_err(|_| QuicError::Configuration)?;
     let crypto = QuicServerConfig::try_from(tls).map_err(|_| QuicError::Configuration)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(transport_config());
@@ -123,15 +116,9 @@ fn client_config(roots: RootCertStore) -> Result<quinn::ClientConfig, QuicError>
     if roots.is_empty() {
         return Err(QuicError::Configuration);
     }
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| QuicError::Configuration)?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-    tls.enable_early_data = false;
+    let tls = crate::transport_policy::Carrier::H3
+        .client_tls(roots)
+        .map_err(|_| QuicError::Configuration)?;
     let crypto = QuicClientConfig::try_from(tls).map_err(|_| QuicError::Configuration)?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(transport_config());
@@ -146,7 +133,7 @@ fn verify(connection: &Connection) -> Result<(), QuicError> {
         .ok_or(QuicError::Handshake)?
         .downcast::<HandshakeData>()
         .map_err(|_| QuicError::Handshake)?;
-    if metadata.protocol.as_deref() != Some(ALPN) {
+    if !crate::transport_policy::Carrier::H3.accepts_alpn(metadata.protocol.as_deref()) {
         return Err(QuicError::Alpn);
     }
     if connection

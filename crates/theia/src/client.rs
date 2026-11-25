@@ -8,7 +8,7 @@ use http::{header, HeaderValue, Request, StatusCode};
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     task::JoinHandle,
     time::timeout,
 };
@@ -141,15 +141,9 @@ impl H2Client {
         if roots.is_empty() {
             return Err(ClientError::Configuration);
         }
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| ClientError::Tls)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        tls.alpn_protocols = vec![b"h2".to_vec()];
-        tls.enable_early_data = false;
+        let tls = crate::transport_policy::Carrier::H2
+            .client_tls(roots)
+            .map_err(|_| ClientError::Tls)?;
         Self::with_connector(
             endpoint,
             name,
@@ -615,7 +609,10 @@ impl H2Client {
                     .connect(self.server_name.clone(), socket)
                     .await
                     .map_err(|_| ClientError::Tls)?;
-                if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+                if !crate::transport_policy::Carrier::H2.accepts_tls(
+                    tls.get_ref().1.protocol_version(),
+                    tls.get_ref().1.alpn_protocol(),
+                ) {
                     return Err(ClientError::Tls);
                 }
                 if let Some(pin) = self.certificate_pin {
@@ -915,14 +912,7 @@ async fn start_h2<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut builder = h2::client::Builder::new();
-    // Theia never accepts server push. Advertise that explicitly instead
-    // of allowing a peer to reserve unsolicited streams. This matches the
-    // safe SETTINGS_ENABLE_PUSH=0 part of the measured Chromium reference,
-    // while retaining Theia's strict 8 KiB response-header limit and
-    // bounded default receive windows. No named browser profile is claimed.
-    builder.enable_push(false);
-    builder.max_header_list_size(8192);
+    let mut builder = crate::transport_policy::Carrier::H2.h2_client();
     if matches!(wire_shape, H2WireShape::BrowserH2V1) {
         // Chromium159 advertises HPACK table 65536, 6MiB per-stream credit,
         // 256KiB max header list and ~15MiB connection receive credit.
@@ -1000,9 +990,10 @@ impl Tunnel {
         let activity = crate::relay_liveness::Activity::new();
         let (upload_done, upload_finished) = tokio::sync::oneshot::channel();
         let upload = async {
-            let mut buffer = [0; 4096];
+            let mut buffer = [0; crate::relay_batch::MAX_BATCH];
+            let mut batch = crate::relay_batch::ReadyBatch::default();
             loop {
-                let size = read.read(&mut buffer).await.map_err(|_| ClientError::Io)?;
+                let size = batch.read(&mut read, &mut buffer).await.map_err(|_| ClientError::Io)?;
                 let frame = if size == 0 {
                     Frame::Fin
                 } else {

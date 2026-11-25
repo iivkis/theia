@@ -11,7 +11,7 @@ use h3::{error::Code, quic, server::RequestStream};
 use http::{Request, Response, StatusCode};
 use std::{collections::VecDeque, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::TcpStream,
     sync::watch,
     task::JoinSet,
@@ -21,8 +21,7 @@ use tokio::{
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_HANDLERS: usize = 32;
-const MAX_HEADERS: u64 = 8192;
+const MAX_HANDLERS: usize = crate::transport_policy::MAX_BIDI_STREAMS as usize;
 
 type Stream = RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
@@ -149,7 +148,7 @@ pub(crate) async fn run_connection(
         None
     };
     let mut builder = h3::server::builder();
-    builder.max_field_section_size(MAX_HEADERS);
+    builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
     let Ok(Ok(mut h3)) = timeout(
         HANDSHAKE_TIMEOUT,
         builder.build::<_, Bytes>(h3_quinn::Connection::new(guard.0.clone())),
@@ -706,9 +705,10 @@ async fn relay(
         Ok::<(), ServerError>(())
     };
     let download = async {
-        let mut buffer = [0; 4096];
+        let mut buffer = [0; crate::relay_batch::MAX_BATCH];
+        let mut batch = crate::relay_batch::ReadyBatch::default();
         loop {
-            let n = read.read(&mut buffer).await.map_err(|_| ServerError::Io)?;
+            let n = batch.read(&mut read, &mut buffer).await.map_err(|_| ServerError::Io)?;
             let frame = if n == 0 {
                 Frame::Fin
             } else {

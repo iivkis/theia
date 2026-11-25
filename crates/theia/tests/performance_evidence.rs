@@ -20,7 +20,7 @@ fn native_binary_performance_evidence_smoke() {
 }
 
 #[test]
-#[ignore = "post-merge native benchmark comparison with separately built stage-3 binary"]
+#[ignore = "post-merge native benchmark comparison with separately built exact reference binary"]
 fn native_binary_performance_comparison() {
     measure(true);
 }

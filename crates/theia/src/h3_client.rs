@@ -11,14 +11,13 @@ use http::{header, HeaderValue, Request, StatusCode, Uri};
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     task::JoinHandle,
     time::timeout,
 };
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_HEADERS: u64 = 8192;
 type Tx = RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 type Rx = RequestStream<h3_quinn::RecvStream, Bytes>;
 
@@ -489,7 +488,7 @@ impl H3Client {
             "op" = Value::Count(operation)
         );
         let mut builder = h3::client::builder();
-        builder.max_field_section_size(MAX_HEADERS);
+        builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
         let (mut driver, sender) = builder
             .build::<_, _, Bytes>(h3_quinn::Connection::new(connection))
             .await
@@ -811,9 +810,10 @@ impl H3Tunnel {
         let activity = crate::relay_liveness::Activity::new();
         let (upload_done, upload_finished) = tokio::sync::oneshot::channel();
         let upload = async {
-            let mut buffer = [0; 4096];
+            let mut buffer = [0; crate::relay_batch::MAX_BATCH];
+            let mut batch = crate::relay_batch::ReadyBatch::default();
             loop {
-                let n = read.read(&mut buffer).await.map_err(|_| ClientError::Io)?;
+                let n = batch.read(&mut read, &mut buffer).await.map_err(|_| ClientError::Io)?;
                 let frame = if n == 0 {
                     Frame::Fin
                 } else {
