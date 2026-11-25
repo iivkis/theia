@@ -102,6 +102,80 @@ fn approval(original: &[u8], next: &str, evidence: [u8; 32]) -> [u8; 32] {
     hash.finalize().into()
 }
 
+/// Same verified binding builder for registration and first-run creation.
+fn approved_server_inbound(
+    r: &ServerRequest,
+    now: u64,
+) -> Result<(Inbound, reference_health::State, crate::reality_provision::Record), Error> {
+    if r.listen.port() == 0 || r.grants.is_empty() || r.grants.len() > 256 {
+        return Err(Error::Grant);
+    }
+    let state = reference_health::Store::new(&r.health)
+        .map_err(|_| Error::Health)?
+        .inspect()
+        .map_err(|_| Error::Health)?;
+    let record = crate::reality_provision::inspect_initial(
+        &state, r.health_sha256, r.identity_sha256, &r.bundle, now,
+    )?;
+    let (host, port) = record.scope.endpoint.rsplit_once(':').ok_or(Error::Scope)?;
+    if port.parse::<u16>().ok() != Some(r.listen.port()) {
+        return Err(Error::Scope);
+    }
+    let inbound = Inbound {
+        id: record.scope.inbound.clone(),
+        path_prefix: None,
+        security_mode: SecurityMode::SmartReality,
+        reality: Some(RealityBinding {
+            health_store: path_string(&r.health)?,
+            bundle: path_string(&r.bundle)?,
+            initial_health_sha256: r.health_sha256,
+            identity_sha256: r.identity_sha256,
+            manifest_sha256: record.manifest_sha256()?,
+        }),
+        allowed_user_ids: r.grants.clone(),
+        h2_listen: r.listen.to_string(),
+        quic_listen: r.listen.to_string(),
+        server_name: host.to_owned(),
+        tls_cert: String::new(),
+        tls_key: String::new(),
+    };
+    Ok((inbound, state, record))
+}
+
+/// First configuration: no placeholder Own-TLS or usable default credential.
+pub(crate) fn first_server_candidate(r: &ServerRequest, now: u64) -> Result<Config, Error> {
+    use zeroize::Zeroizing;
+    if r.grants.len() != 1 || !config::valid_id(&r.grants[0]) {
+        return Err(Error::Grant);
+    }
+    let (inbound, _, _) = approved_server_inbound(r, now)?;
+    let mut random = Zeroizing::new([0u8; 32]);
+    rustls::crypto::ring::default_provider()
+        .secure_random.fill(&mut random[..]).map_err(|_| Error::Storage)?;
+    let candidate = Config::Server(config::ServerDocument {
+        schema_version: 1,
+        management: config::Management { ipc: "auto".into(), log_level: "info".into() },
+        ui: config::Ui { language: "ru".into() },
+        server: config::ServerSettings {
+            enabled: true,
+            inbounds: vec![inbound],
+            users: vec![config::User {
+                id: r.grants[0].clone(),
+                token_sha256: format!("{:x}", Sha256::digest(&random[..])),
+                disabled: true,
+            }],
+            policy: config::ServerPolicy {
+                allow_private_ips: false,
+                max_connections_per_user: 64,
+                max_connections_total: 1024,
+                connect_timeout_ms: 10000,
+            },
+        },
+    });
+    candidate.validate().map_err(|_| Error::Format)?;
+    Ok(candidate)
+}
+
 /// Read and validate exactly one config snapshot plus the corresponding
 /// independent enrollment or complete initial server receipt. The returned
 /// config is immutable; no listener, proxy, grant runtime or file is changed.
@@ -125,47 +199,11 @@ pub fn prepare(path: &Path, request: &Request, now: u64) -> Result<Prepared, Err
             }) {
                 return Err(Error::Grant);
             }
-            let state = reference_health::Store::new(&r.health)
-                .map_err(|_| Error::Health)?
-                .inspect()
-                .map_err(|_| Error::Health)?;
-            let record = crate::reality_provision::inspect_initial(
-                &state,
-                r.health_sha256,
-                r.identity_sha256,
-                &r.bundle,
-                now,
-            )?;
-            let (host, port) = record.scope.endpoint.rsplit_once(':').ok_or(Error::Scope)?;
-            if port.parse::<u16>().ok() != Some(r.listen.port()) {
+            let (inbound, state, record) = approved_server_inbound(r, now)?;
+            if document.server.inbounds.iter().any(|i| i.id == inbound.id) {
                 return Err(Error::Scope);
             }
-            if document
-                .server
-                .inbounds
-                .iter()
-                .any(|i| i.id == record.scope.inbound)
-            {
-                return Err(Error::Scope);
-            }
-            document.server.inbounds.push(Inbound {
-                id: record.scope.inbound.clone(),
-                path_prefix: None,
-                security_mode: SecurityMode::SmartReality,
-                reality: Some(RealityBinding {
-                    health_store: path_string(&r.health)?,
-                    bundle: path_string(&r.bundle)?,
-                    initial_health_sha256: r.health_sha256,
-                    identity_sha256: r.identity_sha256,
-                    manifest_sha256: record.manifest_sha256()?,
-                }),
-                allowed_user_ids: r.grants.clone(),
-                h2_listen: r.listen.to_string(),
-                quic_listen: r.listen.to_string(),
-                server_name: host.to_owned(),
-                tls_cert: String::new(),
-                tls_key: String::new(),
-            });
+            document.server.inbounds.push(inbound);
             let report = format!("Register REALITY inbound (saved configuration only)\ninbound={}\nendpoint={}\nlisten={}\ngrants={}\nidentity_sha256={}\n{}\nExisting runtime remains unchanged. Startup uses the registered generation; live changes require a separate supported activation operation.",
                 record.scope.inbound, record.scope.endpoint, r.listen, r.grants.join(","),
                 hex(record.identity_sha256), state.report(now).map_err(|_| Error::Health)?);
