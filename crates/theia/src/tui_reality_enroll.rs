@@ -30,6 +30,7 @@ struct Input {
     trust: PathBuf,
     identity: [u8; 32],
     token: Option<Zeroizing<String>>,
+    access_key_only: bool,
 }
 
 struct Review {
@@ -52,7 +53,7 @@ fn source_uri(input: &Input) -> Result<Zeroizing<String>, Error> {
 }
 
 fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
-    for path in [&input.admission, &input.profile, &input.trust] {
+    for path in [&input.profile, &input.trust] {
         if !crate::bounded_input::explicit_file_path(path) {
             return Err(Error::Storage);
         }
@@ -68,7 +69,11 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
     }
     let uri = source_uri(input)?;
     let invitation = Invitation::decode(&uri, now)?;
-    if invitation.fingerprint() != input.identity {
+    if input.access_key_only {
+        if !invitation.is_access_key() {
+            return Err(Error::Credential);
+        }
+    } else if invitation.fingerprint() != input.identity {
         return Err(Error::Approval);
     }
     if invitation.has_token() == input.token.is_some() {
@@ -82,10 +87,13 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
     let admission = invitation.admission_preview(&input.admission)?;
     let approval = ImportApproval {
         document_sha256: bootstrap::digest(&uri),
-        identity_sha256: input.identity,
+        identity_sha256: invitation.fingerprint(),
     };
-    let body = format!("ПРЕДПРОСМОТР: fingerprint совпал с введённым значением.\n{}\nAdmission-файл проверен; секрет будет скопирован в защищённое хранилище.\nTransport/XHTTP: auto. CA не требуется.\nСохранение отдельного профиля не меняет active profile, proxy или runtime.\ny: сохранить; n/Esc: отменить.",
-        invitation.preview(now)?);
+    let body = if input.access_key_only {
+        format!("ПРЕДПРОСМОТР: самодостаточный ключ REALITY.\n{}\n\nКлюч проверен на этом устройстве. Связь с сервером ещё не проверена.\nСохраняйте его только если получили от администратора, которому доверяете.\nПодключение не запускается, системный прокси не меняется.", invitation.access_key_summary())
+    } else {
+        format!("ПРЕДПРОСМОТР: fingerprint совпал с введённым значением.\n{}\nAdmission-файл проверен; секрет будет скопирован в защищённое хранилище.\nTransport/XHTTP: auto. CA не требуется.\nСохранение отдельного профиля не меняет active profile, proxy или runtime.\ny: сохранить; n/Esc: отменить.", invitation.preview(now)?)
+    };
     Ok(Review {
         approval,
         admission,
@@ -122,6 +130,7 @@ fn create_first_client(
         input.profile.parent().ok_or(Error::Storage)?,
         path,
     )?;
+    let identity_sha256 = review.approval.identity_sha256;
     match apply(input, review, now) {
         Ok(_) => {}
         Err(Error::Indeterminate) => {
@@ -135,7 +144,7 @@ fn create_first_client(
     }
     let request = reality_config::ClientRequest {
         enrollment: input.profile.clone(),
-        identity_sha256: input.identity,
+        identity_sha256,
         id: crate::tui_editor::generated_id("profile").map_err(|_| Error::Storage)?,
     };
     let candidate = match reality_config::first_client_candidate(&request, now) {
@@ -233,7 +242,8 @@ impl EnrollmentPanel {
         }
         let mut panel = Self::first(path)?;
         panel.fields[0] = source;
-        panel.focus = 1;
+        panel.focus = 0;
+        panel.begin_review();
         Ok(panel)
     }
 
@@ -275,7 +285,8 @@ impl EnrollmentPanel {
         }
         let mut panel = Self::bound(editor)?;
         panel.fields[0] = source;
-        panel.focus = 1;
+        panel.focus = 0;
+        panel.begin_review();
         Ok(panel)
     }
 
@@ -289,8 +300,13 @@ impl EnrollmentPanel {
 
     fn input(&self) -> Result<Input, Error> {
         let path = |i: usize| PathBuf::from(self.fields[i].as_str());
-        let identity = crate::parse_restart_digest(&self.fields[4]).ok_or(Error::Approval)?;
-        let token = (!self.fields[5].is_empty()).then(|| self.fields[5].clone());
+        let access_key_only = self.managed_paths();
+        let identity = if access_key_only {
+            crate::parse_restart_digest(&self.fields[4]).unwrap_or([0; 32])
+        } else {
+            crate::parse_restart_digest(&self.fields[4]).ok_or(Error::Approval)?
+        };
+        let token = (!access_key_only && !self.fields[5].is_empty()).then(|| self.fields[5].clone());
         Ok(Input {
             source: if self.fields[0].starts_with("theia://") {
                 PathBuf::new()
@@ -305,6 +321,7 @@ impl EnrollmentPanel {
             trust: path(3),
             identity,
             token,
+            access_key_only,
         })
     }
 
@@ -325,10 +342,36 @@ impl EnrollmentPanel {
         let value = value.trim_end_matches(['\r', '\n']);
         let limit = self.limit();
         let field = &mut self.fields[self.focus];
-        if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= limit
-        {
-            field.push_str(value);
+        if value.chars().any(char::is_control) || field.len().saturating_add(value.len()) > limit {
+            *field = Zeroizing::new(String::new());
+            self.error = Some("Ввод отклонён: превышен лимит или есть недопустимые символы. Вставьте значение целиком.".into());
+            return;
         }
+        field.push_str(value);
+        self.error = None;
+    }
+
+    fn begin_review(&mut self) {
+        match self.input() {
+            Ok(input) => {
+                let (tx, rx) = mpsc::channel();
+                self.error = None;
+                self.stage = Stage::Loading(rx);
+                let _worker = std::thread::spawn(move || {
+                    let result = reference_health::unix_now()
+                        .map_err(|_| Error::Clock)
+                        .and_then(|now| inspect(&input, now));
+                    let _ = tx.send(result);
+                });
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        if self.browser.is_some() { return None; }
+        if let Some(panel) = &self.registration { return panel.confirmation_choice(); }
+        matches!(self.stage, Stage::Confirm(_)).then_some(('y', "Доверять и сохранить"))
     }
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
@@ -359,7 +402,10 @@ impl EnrollmentPanel {
             return panel.key(key);
         }
         match &self.stage {
-            Stage::Loading(_) | Stage::Applying(_) | Stage::Creating(_) => return false,
+            // The review worker performs reads only. Dropping its receiver
+            // cancels the UI immediately; no late result can authorize a save.
+            Stage::Loading(_) => return key.code == KeyCode::Esc,
+            Stage::Applying(_) | Stage::Creating(_) => return false,
             Stage::Done(_) => {
                 if key.code == KeyCode::Char('g') && (self.config.is_none() || self.owned.is_some())
                 {
@@ -465,20 +511,14 @@ impl EnrollmentPanel {
                     self.fields[self.focus].as_str(),
                 ));
             }
-            KeyCode::F(8) => {
+            KeyCode::F(8) if !self.managed_paths() => {
                 self.focus = if self.focus < 4 { 4 } else { 0 };
             }
-            KeyCode::Tab | KeyCode::Down => {
+            KeyCode::Tab | KeyCode::Down if !self.managed_paths() => {
                 self.focus = (self.focus + 1) % LABELS.len();
-                if self.managed_paths() && self.focus == 2 {
-                    self.focus = 4;
-                }
             }
-            KeyCode::BackTab | KeyCode::Up => {
+            KeyCode::BackTab | KeyCode::Up if !self.managed_paths() => {
                 self.focus = (self.focus + LABELS.len() - 1) % LABELS.len();
-                if self.managed_paths() && self.focus == 3 {
-                    self.focus = 1;
-                }
             }
             KeyCode::Backspace => {
                 self.fields[self.focus].pop();
@@ -488,46 +528,23 @@ impl EnrollmentPanel {
                 self.fields[self.focus] = Zeroizing::new(String::new());
                 self.error = None;
             }
-            KeyCode::Enter
-                if self.managed_paths()
-                    && self.focus < 4
-                    && !self.fields[0].is_empty()
-                    && !self.fields[1].is_empty()
-                    && self.fields[4].is_empty() =>
-            {
-                self.focus = 4;
-                self.error = None;
-            }
             KeyCode::Enter if self.fields[0].is_empty() => {
                 self.focus = 0;
                 self.error = Some(
                     "Нет приглашения. Вставьте ссылку или выберите присланный файл (F6).".into(),
                 );
             }
-            KeyCode::Enter if self.fields[1].is_empty() => {
+            KeyCode::Enter if !self.managed_paths() && self.fields[1].is_empty() => {
                 self.focus = 1;
                 self.error = Some(
                     "Нет файла допуска. Попросите его у администратора и выберите через F6.".into(),
                 );
             }
-            KeyCode::Enter if crate::parse_restart_digest(&self.fields[4]).is_none() => {
+            KeyCode::Enter if !self.managed_paths() && crate::parse_restart_digest(&self.fields[4]).is_none() => {
                 self.focus = 4;
                 self.error=Some("Отпечаток должен состоять из 64 шестнадцатеричных символов. Сверьте его с администратором отдельно от приглашения.".into());
             }
-            KeyCode::Enter => match self.input() {
-                Ok(input) => {
-                    let (tx, rx) = mpsc::channel();
-                    self.error = None;
-                    self.stage = Stage::Loading(rx);
-                    let _worker = std::thread::spawn(move || {
-                        let result = reference_health::unix_now()
-                            .map_err(|_| Error::Clock)
-                            .and_then(|now| inspect(&input, now));
-                        let _ = tx.send(result);
-                    });
-                }
-                Err(error) => self.error = Some(error.to_string()),
-            },
+            KeyCode::Enter => self.begin_review(),
             KeyCode::Char(ch)
                 if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                     && !ch.is_control()
@@ -568,6 +585,11 @@ impl EnrollmentPanel {
         };
         match result {
             Ok(stage) => {
+                if self.managed_paths() {
+                    if let Stage::Confirm(review) = &stage {
+                        self.fields[4] = Zeroizing::new(review.approval.identity_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    }
+                }
                 self.stage = stage;
                 if matches!(&self.stage, Stage::Done(_)) && self.owned.is_some() {
                     if let (Some((path, digest)), Ok(input)) = (&self.config, self.input()) {
@@ -588,9 +610,13 @@ impl EnrollmentPanel {
                 }
             }
             Err(error) => {
-                self.error = Some(format!(
-                    "ОТКАЗ: {error}. При неопределённой записи проверьте файлы перед повтором."
-                ));
+                self.error = Some(format!("ОТКАЗ: {}", match error {
+                    Error::Format | Error::Credential | Error::Scope => "Ключ неполный или неверный. Вставьте его целиком или попросите новый ключ у администратора.",
+                    Error::Descriptor | Error::Identity | Error::Approval | Error::Health | Error::Grant => "Не удалось подтвердить безопасность ключа. Попросите администратора проверить доступ и выдать новый ключ.",
+                    Error::Storage => "Не удалось прочитать или сохранить настройки. Проверьте путь и права доступа к файлам.",
+                    Error::Indeterminate => "Результат сохранения неизвестен. Проверьте файлы перед повтором.",
+                    Error::Clock => "Проверьте дату и время устройства и повторите импорт.",
+                }));
                 self.stage = if error == Error::Indeterminate {
                     Stage::Done(format!("ОТКАЗ: неопределённая запись. Проверьте подготовленный профиль {:?}; повтор заблокирован.", Path::new(self.fields[2].as_str())))
                 } else {
@@ -625,11 +651,11 @@ impl EnrollmentPanel {
                 .iter()
                 .enumerate()
                 .filter(|(id, _)| {
-                    !self.managed_paths() || (if self.focus < 4 { *id < 2 } else { *id >= 4 })
+                    !self.managed_paths() || *id == 0
                 })
                 .map(|(id, label)| Field {
                     id,
-                    label,
+                    label: if self.managed_paths() && id == 0 { "Ключ подключения" } else { label },
                     hint: hints[id],
                     value: if self.fields[id].is_empty() {
                         String::new()
@@ -639,8 +665,8 @@ impl EnrollmentPanel {
                 })
                 .collect(),
             selected: self.focus,
-            lead: if self.managed_paths() && self.focus < 4 {
-                "1. Получите приглашение и отдельный файл допуска у администратора. Далее — проверка отпечатка (F8 или Tab).".into()
+            lead: if self.managed_paths() {
+                "Вставьте единственный ключ от администратора. Все параметры доступа уже внутри. Enter — проверить ключ.".into()
             } else {
                 "Отпечаток сверяется независимо от приглашения. Ссылка на токен нужна только при его отсутствии в приглашении. Значения скрыты.".into()
             },
@@ -659,7 +685,7 @@ impl EnrollmentPanel {
         }
         if matches!(self.stage, Stage::Input)
             && id < LABELS.len()
-            && (!self.managed_paths() || !matches!(id, 2 | 3))
+            && (!self.managed_paths() || id == 0)
         {
             self.focus = id;
         }
@@ -684,17 +710,11 @@ impl EnrollmentPanel {
             );
         }
         match &self.stage {
-            Stage::Input if self.managed_paths() && self.focus < 4 => (
+            Stage::Input if self.managed_paths() => (
                 2,
                 5,
-                "REALITY · приглашение и файл допуска",
-                "↑↓ поле · F6 файл · F8 далее · Enter продолжить · Esc назад",
-            ),
-            Stage::Input if self.managed_paths() => (
-                3,
-                5,
-                "Проверка доверия и ключа",
-                "↑↓ поле · F8 назад · Enter проверить · Ctrl+U очистить · Esc отменить",
+                "REALITY · ключ подключения",
+                "F6 файл · Enter проверить · Ctrl+U очистить · Esc назад",
             ),
             Stage::Input => (
                 1,
@@ -706,13 +726,13 @@ impl EnrollmentPanel {
                 if self.managed_paths() { 3 } else { total - 1 },
                 total,
                 "Проверка приглашения",
-                "Идёт локальная проверка",
+                "Идёт проверка · Esc отменить",
             ),
             Stage::Confirm(_) => (
                 if self.managed_paths() { 3 } else { total - 1 },
                 total,
                 "Подтверждение доверия",
-                "Y сохранить · N / Esc назад",
+                "y доверять и сохранить · n / Esc назад",
             ),
             Stage::Applying(_) | Stage::Creating(_) => (
                 if self.managed_paths() { 4 } else { total },
@@ -737,7 +757,7 @@ impl EnrollmentPanel {
             Stage::Input => {
                 let mut out = String::from("ШАГ 1 · Приглашение и доверие\n\nЛокальные абсолютные пути; значения скрыты.\n");
                 for (i, label) in LABELS.iter().enumerate() {
-                    if self.managed_paths() && matches!(i, 2 | 3) {
+                    if self.managed_paths() && i != 0 {
                         continue;
                     }
                     out.push_str(&format!(
@@ -751,22 +771,26 @@ impl EnrollmentPanel {
                         self.fields[i].len()
                     ));
                 }
-                out.push_str("\nFingerprint введите из отдельного доверенного канала. Bearer: только env:/file: ссылка, не значение.\nEnter: предпросмотр; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
+                if self.managed_paths() {
+                    out.push_str("\nВставьте ключ от администратора. Enter: проверить; Esc: отменить.\n");
+                } else {
+                    out.push_str("\nFingerprint введите из отдельного доверенного канала. Bearer: только env:/file: ссылка, не значение.\nEnter: предпросмотр; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
+                }
                 out.push_str(self.error.as_deref().unwrap_or(""));
                 out
             }
             Stage::Loading(_) => {
-                "Проверка локального приглашения и admission; без сети и записи.".into()
+                "Проверяем ключ без сети и записи. Esc — отменить.".into()
             }
             Stage::Confirm(review) => {
                 if let Some(path) = &self.new_config {
-                    format!("{}\n\nПервый TOML: {}\nНовый профиль станет активным в TOML. Системный прокси выключен.\ny: создать TOML и enrollment; n/Esc: назад.", review.body, path.display())
+                    format!("{}\n\nФайл настроек: {}\nПервый профиль будет выбран для подключения. Системный прокси останется выключенным.", review.body, path.display())
                 } else {
                     review.body.clone()
                 }
             }
             Stage::Applying(_) | Stage::Creating(_) => {
-                "Сохранение защищённого профиля; runtime не меняется.".into()
+                "Сохраняем защищённый профиль. Подключение не меняется.".into()
             }
             Stage::Done(body) => {
                 if self.config.is_some() && self.owned.is_some() {
@@ -833,6 +857,7 @@ mod tests {
             trust: dir.join("trust"),
             identity: [0; 32],
             token: Some(Zeroizing::new("env:TEST_BEARER".into())),
+            access_key_only: false,
         };
         bootstrap::create_text(&input.source, &uri).unwrap();
         Secret::generate()
@@ -903,6 +928,31 @@ mod tests {
     }
 
     #[test]
+    fn managed_key_import_has_no_extra_input_fields() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("key-import-ui").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("client.toml");
+        let mut panel = EnrollmentPanel::first(path.clone()).unwrap();
+        let fields = panel.form().unwrap().fields;
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].id, 0);
+        for code in [KeyCode::Tab, KeyCode::Down, KeyCode::F(8)] {
+            panel.key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert_eq!(panel.focus, 0);
+        }
+        assert!(!panel.body().contains("Файл допуска"));
+        assert!(!panel.body().contains("Отпечаток сервера"));
+        panel.paste("theia://v1/test");
+        panel.paste(&"A".repeat(bootstrap::MAX_URI));
+        assert!(panel.fields[0].is_empty());
+        assert!(panel.error.is_some());
+        assert!(!panel.body().contains("theia://v1/test"));
+        assert!(panel.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn wizard_handoff_keeps_original_config_binding_and_requires_profile_id() {
         let mut panel = EnrollmentPanel::new();
         use sha2::{Digest, Sha256};
@@ -960,7 +1010,7 @@ mod tests {
         p.key(key(KeyCode::Enter));
         assert!(matches!(p.stage, Stage::Loading(_)));
         assert!(p.body().contains("без сети и записи"));
-        assert!(!p.key(key(KeyCode::Esc)));
+        assert!(p.key(key(KeyCode::Esc)));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while matches!(p.stage, Stage::Loading(_)) {
             p.poll();
@@ -970,7 +1020,7 @@ mod tests {
         assert!(p.body().contains("ОТКАЗ"));
         let (tx, rx) = mpsc::channel();
         p.stage = Stage::Applying(rx);
-        assert!(p.body().contains("runtime не меняется"));
+        assert!(p.body().contains("Подключение не меняется"));
         drop(tx);
         assert!(p.poll().is_none());
         assert!(p.body().contains("ОТКАЗ"));

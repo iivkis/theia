@@ -150,6 +150,7 @@ impl DomainPanel {
         self.manual = None;
         self.manual_input.clear();
         self.manual_error = false;
+        self.domain_index = self.domain_index.min(self.domains.len().saturating_sub(1));
         self.state = DomainState::Catalog;
     }
 
@@ -196,8 +197,8 @@ impl DomainPanel {
             return;
         }
         match self.state {
-            DomainState::Catalog if !self.domains.is_empty() => {
-                self.domain_index = (self.domain_index + 1) % self.domains.len();
+            DomainState::Catalog => {
+                self.domain_index = (self.domain_index + 1).min(self.domains.len());
                 self.reset_pins();
             }
             DomainState::Resolved if !self.addresses.is_empty() => {
@@ -213,9 +214,8 @@ impl DomainPanel {
             return;
         }
         match self.state {
-            DomainState::Catalog if !self.domains.is_empty() => {
-                self.domain_index =
-                    (self.domain_index + self.domains.len() - 1) % self.domains.len();
+            DomainState::Catalog => {
+                self.domain_index = self.domain_index.saturating_sub(1);
                 self.reset_pins();
             }
             DomainState::Resolved if !self.addresses.is_empty() => {
@@ -238,6 +238,9 @@ impl DomainPanel {
                 } else {
                     self.manual_error = true;
                 }
+            }
+            DomainState::Catalog if self.domain_index == self.domains.len() => {
+                self.begin_manual();
             }
             DomainState::Catalog if self.domain().is_some() => {
                 self.state = DomainState::DnsConfirm;
@@ -546,8 +549,9 @@ impl DomainPanel {
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
         match self.state {
-            DomainState::Catalog if !self.domains.is_empty() => Some(Form {
-                fields:self.domains.iter().enumerate().map(|(id,name)| Field {id,label:"Домен",value:(*name).to_owned(),hint:"Enter — запросить отдельное согласие на DNS. m — ручное имя."}).collect(),
+            DomainState::Catalog => Some(Form {
+                fields:self.domains.iter().enumerate().map(|(id,name)| Field {id,label:"Домен",value:(*name).to_owned(),hint:"Enter — запросить отдельное согласие на DNS."})
+                    .chain(std::iter::once(Field { id: self.domains.len(), label: "Ввести свой домен", value: "Ручной выбор".into(), hint: "Enter — открыть поле ввода." })).collect(),
                 selected:self.domain_index,lead:"DNS ещё НЕ выполнялся. Каталог не даёт права на активную проверку.".into(),error:String::new(),
             }),
             DomainState::Resolved if !self.addresses.is_empty() => Some(Form {
@@ -559,13 +563,21 @@ impl DomainPanel {
     }
     pub(crate) fn select_field(&mut self, id: usize) {
         match self.state {
-            DomainState::Catalog if id < self.domains.len() => {
+            DomainState::Catalog if id <= self.domains.len() => {
                 self.domain_index = id;
                 self.reset_pins();
             }
             DomainState::Resolved if id < self.addresses.len() => self.address_index = id,
             _ => {}
         }
+    }
+
+    pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if !matches!(self.state, DomainState::Complete(Ok(_))) { return Vec::new(); }
+        vec![ActionItem { key: 'a', label: "Подробности результата" },
+            ActionItem { key: 'k', label: "Предыдущий результат" },
+            ActionItem { key: 'j', label: "Следующий результат" }]
     }
 
     pub(crate) fn body(&self) -> String {
@@ -605,12 +617,12 @@ impl DomainPanel {
                     out.push_str(&format!("{cursor} {name}\n"));
                 }
                 out.push_str(
-                    "\nDNS ещё НЕ выполнялся. Наличие домена в каталоге не означает разрешения на сканирование.\nj/k: выбрать домен  Enter: запросить согласие на один DNS A/AAAA\nm: ручной ввод имени  Esc: назад",
+                    "\nDNS ещё НЕ выполнялся. Наличие домена в каталоге не означает разрешения на сканирование.",
                 );
             }
             DomainState::ManualInput => unreachable!("rendered above"),
             DomainState::DnsConfirm => out.push_str(&format!(
-                "СОГЛАСИЕ: DNS-запрос A/AAAA только для {domain}.\nВаш DNS-resolver увидит это имя. Запрос может уйти сторонним DNS-серверам.\nОдна попытка, до 5с, максимум 64 адреса; приватные/опасные ответы отклоняются целиком.\nОтветы показываются для отдельного выбора, ни один TLS/QUIC не запускается.\nНаличие домена в каталоге НЕ подтверждает право активного сканирования.\n\ny: разрешить DNS-запрос  n: отказаться  Esc: назад",
+                "СОГЛАСИЕ: DNS-запрос A/AAAA только для {domain}.\nВаш DNS-resolver увидит это имя. Запрос может уйти сторонним DNS-серверам.\nОдна попытка, до 5с, максимум 64 адреса; приватные/опасные ответы отклоняются целиком.\nОтветы показываются для отдельного выбора, ни один TLS/QUIC не запускается.\nНаличие домена в каталоге НЕ подтверждает право активного сканирования.",
             )),
             DomainState::DnsRunning { .. } => out.push_str(&format!(
                 "Выполняется разрешённый DNS A/AAAA запрос {domain}.\nНикакого TCP/H2 или UDP/H3 пока нет.\nEsc: отменить запрос и выйти",
@@ -666,7 +678,7 @@ impl DomainPanel {
                     out.push_str(&format!("  {}  SNI: {domain}\n", SocketAddr::new(*ip, 443)));
                 }
                 out.push_str(
-                    "\nTLS1.3+CA+SNI/SAN+h2 по TCP и QUIC/TLS1.3+CA+SNI/SAN+h3 по UDP.\nДо 8 точных IP, 2 параллельно, 5с/цель, 20с/набор.\nОператор подтверждает права на КАЖДЫЙ адрес; DNS не доказывает права.\nНет HTTP-запросов, перенаправлений, DNS-rebinding, retries и fallback.\n\ny: разрешить все перечисленные проверки  n/Esc: вернуться",
+                    "\nTLS1.3+CA+SNI/SAN+h2 по TCP и QUIC/TLS1.3+CA+SNI/SAN+h3 по UDP.\nДо 8 точных IP, 2 параллельно, 5с/цель, 20с/набор.\nОператор подтверждает права на КАЖДЫЙ адрес; DNS не доказывает права.\nНет HTTP-запросов, перенаправлений, DNS-rebinding, retries и fallback.",
                 );
             }
             DomainState::ProbeRunning { .. } => out.push_str(
@@ -737,7 +749,7 @@ impl DomainPanel {
                     }
                 }
                 out.push_str(
-                    "\nREALITY: НЕ готов. Результат подтверждает лишь транспортный TLS/ALPN, НЕ HTTP/3 fingerprint/identity/DPI.\nScore не является вероятностью обхода DPI; нет Apply и автоматического сканирования каталога.\nj/k: выбрать результат; a: шаг 2 (просмотр). Esc: каталог",
+                    "\nREALITY: НЕ готов. Результат подтверждает лишь транспортный TLS/ALPN, НЕ HTTP/3 fingerprint/identity/DPI.\nScore не является вероятностью обхода DPI; нет Apply и автоматического сканирования каталога.",
                 );
             }
         }

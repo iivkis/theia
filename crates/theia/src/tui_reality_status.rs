@@ -14,6 +14,7 @@ use std::{
 
 enum Update {
     Report(String),
+    Observation { brief: String, details: Option<String> },
     Review(RotationReview),
     Trust(TrustReview),
     Expiry(ExpiryReview),
@@ -44,6 +45,8 @@ pub(crate) struct StatusPanel {
     review: Option<RotationReview>,
     committing: bool,
     report: String,
+    details: Option<String>,
+    show_details: bool,
     client_active: bool,
     client_confirm: Option<bool>,
     client_run: Option<ClientRun>,
@@ -74,6 +77,8 @@ impl StatusPanel {
             review: None,
             committing: false,
             report: String::new(),
+            details: None,
+            show_details: false,
             client_active: editor.selected_record_is_active(),
             client_confirm: None,
             client_run: None,
@@ -111,8 +116,15 @@ impl StatusPanel {
                     return RotationReview::prepare(&path, digest, &id, retire, now)
                         .map(Update::Review);
                 }
+                let mut details = None;
                 let mut report = if reality {
-                    reality_config::status_expected(&path, digest, &id, now)?
+                    if server {
+                        let (brief, technical) = reality_config::status_expected(&path, digest, &id, now)?;
+                        details = Some(technical);
+                        brief
+                    } else {
+                        reality_config::client_status_expected(&path, digest, &id, now)?
+                    }
                 } else {
                     let raw = crate::local_proxy::saved_client_bytes(&path, digest)
                         .map_err(|_| Error::Approval)?;
@@ -129,7 +141,12 @@ impl StatusPanel {
                         .iter()
                         .find(|p| p.id == id)
                         .ok_or(Error::Storage)?;
-                    format!("Сохранённый профиль: {} (Own-TLS)\nEndpoint={}\nTransport={:?}; XHTTP={:?}\nАктивный в TOML: {}\nCA/credential: проверяются при запуске", p.id, p.server, p.transport, p.effective_xhttp_mode(), doc.client.active_profile == id)
+                    let transport = format!("{:?}", p.transport);
+                    let mode = format!("{:?}", p.effective_xhttp_mode());
+                    format!("Сервер: {}\nЗащита: собственный TLS\nПрофиль выбран для запуска: {}\nРежим передачи: {}\nРежим XHTTP: {}\nСертификат и ключ доступа проверяются при запуске.\nСвязь с сервером пока не проверена этим экраном.", p.server,
+                        if doc.client.active_profile == id { "да" } else { "нет" },
+                        if transport == "Auto" { "автоматически" } else { transport.as_str() },
+                        if mode == "Auto" { "автоматически" } else { mode.as_str() })
                 };
                 if server {
                     use crate::management::StatusReply;
@@ -147,14 +164,16 @@ impl StatusPanel {
                             }
                             .ok()
                         });
-                    let live=match response{
-                        Some(StatusReply::RealityRunning{generation,revision,health_revision,active_reference,overlap})=>
-                            format!("Runtime: принимает подключения\ngeneration={generation} revision={revision} health_revision={health_revision}\nreference_index={active_reference} overlap={overlap}"),
-                        Some(StatusReply::RealitySuspended)=>"Runtime: новые подключения приостановлены; действующие туннели не отозваны.".into(),
-                        _=>"Runtime: нет подтверждённого IPC статуса этого bundle.".into(),
+                    let (live, technical) = match response {
+                        Some(StatusReply::RealityRunning{generation,revision,health_revision,active_reference,overlap}) => (
+                            format!("Сервер: принимает подключения (версия {revision})."),
+                            format!("generation={generation} revision={revision} health_revision={health_revision}\nreference_index={active_reference} overlap={overlap}")),
+                        Some(StatusReply::RealitySuspended) => ("Сервер: новые подключения приостановлены; действующие туннели не отозваны.".into(), "Runtime: suspended".into()),
+                        _ => ("Состояние работающего сервера не подтверждено. Это не означает, что он остановлен.".into(), "Runtime: нет подтверждённого IPC статуса этого bundle.".into()),
                     };
                     report.push_str("\n\n");
                     report.push_str(&live);
+                    if let Some(detail) = details.as_mut() { detail.push_str("\n\n"); detail.push_str(&technical); }
                 } else {
                     use crate::management::{StatusCommand, StatusReply};
                     let response = tokio::runtime::Builder::new_current_thread()
@@ -169,15 +188,15 @@ impl StatusPanel {
                         });
                     let live=match response{
                         Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback}) if config_sha256 == digest && selected_active =>
-                            format!("Headless runtime: revision={revision}; saved TOML совпадает={}\ndescriptor_revision={descriptor_revision}; last_open={}; XHTTP={}; H3 negative cache={}",
-                                config_sha256==digest,match transport{2=>"H2",3=>"H3",_=>"не подтверждён"}, crate::local_proxy::xhttp_observation(xhttp), if fallback {"активен: временная сетевая недоступность QUIC"} else {"не активен"}),
-                        Some(StatusReply::ClientRunning{revision,..})=>format!("Headless runtime: revision={revision}; выбранный профиль не подтверждён для этого TOML."),
-                        _=>"Headless runtime: защищённый IPC не подтверждён.".into(),
+                            format!("Фоновый клиент: работает с этими настройками (версия {revision}).\nВерсия описания сервера: {descriptor_revision}\nПоследнее подтверждённое соединение: {}; XHTTP: {}\nВременный переход с H3: {}",
+                                match transport{2=>"H2",3=>"H3",_=>"пока нет"}, crate::local_proxy::xhttp_observation(xhttp), if fallback {"да, H3 временно недоступен"} else {"нет"}),
+                        Some(StatusReply::ClientRunning{revision,..})=>format!("Фоновый клиент: работает (версия {revision}), но использование выбранного профиля не подтверждено."),
+                        _=>"Фоновый клиент: состояние не подтверждено. Это не означает, что он остановлен.".into(),
                     };
                     report.push_str("\n\n");
                     report.push_str(&live);
                 }
-                Ok(Update::Report(report))
+                Ok(Update::Observation { brief: report, details })
             })();
             let _ = tx.send(result);
         });
@@ -351,13 +370,13 @@ impl StatusPanel {
                 rt.block_on(async{
                     if let Some(expected_revision)=apply{
                         return Ok(match management::query_client_environment(StatusCommand::ClientApply{expected_revision,candidate_sha256:digest}).await{
-                            Ok(StatusReply::ClientApplied{revision})=>Update::Report(format!("Headless Apply подтверждён: revision={revision}. Прежние туннели сохранены.")),
-                            Err(management::ManagementError::CandidateRejected)=>Update::Report("Headless Apply отклонён. Ничего не подтверждено.".into()),
-                            _=>Update::Report("Headless Apply: результат не подтверждён. Перечитайте IPC status; не повторяйте вслепую.".into()),
+                            Ok(StatusReply::ClientApplied{revision})=>Update::Report(format!("Настройки фонового клиента применены (версия {revision}). Прежние туннели сохранены.")),
+                            Err(management::ManagementError::CandidateRejected)=>Update::Report("Фоновый клиент отклонил настройки. Изменения не подтверждены.".into()),
+                            _=>Update::Report("Применение настроек фонового клиента не подтверждено. Обновите состояние перед повтором.".into()),
                         });
                     }
                     let StatusReply::ClientRunning{revision,config_sha256,..}=management::query_client_environment(StatusCommand::ClientStatus).await.map_err(|_|Error::Storage)? else{return Err(Error::Storage);};
-                    if config_sha256==digest{return Ok(Update::Report("Headless runtime уже использует этот TOML.".into()));}
+                    if config_sha256==digest{return Ok(Update::Report("Фоновый клиент уже использует сохранённые настройки.".into()));}
                     match management::query_client_environment(StatusCommand::ClientPreview{expected_revision:revision,candidate_sha256:digest}).await{
                         Ok(StatusReply::ClientReady{revision:ready}) if ready==revision=>Ok(Update::HeadlessReview(revision)),
                         _=>Err(Error::Approval),
@@ -377,7 +396,7 @@ impl StatusPanel {
         let (stop, rx) = tokio::sync::oneshot::channel();
         let (tx, done) = mpsc::channel();
         let report = std::sync::Arc::new(std::sync::Mutex::new(
-            "Проверка trust, credentials и двух loopback bind...".into(),
+            "Проверяем доверие к серверу, ключ доступа и доступность двух локальных портов...".into(),
         ));
         let monitor = report.clone();
         self.client_run = Some(ClientRun {
@@ -407,8 +426,24 @@ impl StatusPanel {
     pub(crate) fn local_running(&self) -> bool {
         self.client_run.is_some()
     }
+    pub(crate) fn client_confirmation(&self) -> Option<bool> {
+        self.client_confirm
+    }
+
     pub(crate) fn can_minimize(&self) -> bool {
         self.client_run.is_some() && self.client_confirm.is_none()
+    }
+
+    pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        if self.reopen_required || self.pending.is_some() || self.committing { return None; }
+        if self.credential_review.is_some() { return Some(('y', "Сохранить ключ")); }
+        if self.headless_review.is_some() { return Some(('y', "Применить")); }
+        if self.trust_review.is_some() { return Some(('y', "Подтвердить доверие")); }
+        if let Some(start) = self.client_confirm {
+            return Some(('y', if start { "Запустить" } else { "Остановить" }));
+        }
+        if self.expiry_review.is_some() || self.review.is_some() { return Some(('y', "Подтвердить запись")); }
+        None
     }
 
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
@@ -427,11 +462,14 @@ impl StatusPanel {
         {
             return Vec::new();
         }
+        if self.show_details && self.details.is_some() {
+            return vec![ActionItem { key: 'd', label: "К краткому состоянию" }];
+        }
         if let Some(run) = &self.client_run {
             return if run.stop.is_some() {
                 vec![ActionItem {
                     key: 'x',
-                    label: "Остановить подключение",
+                    label: "Остановить локальный прокси",
                 }]
             } else {
                 Vec::new()
@@ -441,11 +479,11 @@ impl StatusPanel {
         if !self.server && self.client_active {
             items.push(ActionItem {
                 key: 's',
-                label: "Запустить подключение",
+                label: "Запустить локальный прокси",
             });
             items.push(ActionItem {
                 key: 'h',
-                label: "Настройки внешнего клиента",
+                label: "Применить настройки к фоновому клиенту",
             });
         }
         items.push(ActionItem {
@@ -475,13 +513,16 @@ impl StatusPanel {
                 },
                 ActionItem {
                     key: 'k',
-                    label: "Плановый переход identity",
+                    label: "Плановая замена ключа доверия",
                 },
                 ActionItem {
                     key: 'c',
-                    label: "Обновить credential",
+                    label: "Обновить ключ доступа",
                 },
             ]);
+        }
+        if self.details.is_some() {
+            items.push(ActionItem { key: 'd', label: "Технические подробности" });
         }
         items
     }
@@ -504,6 +545,9 @@ impl StatusPanel {
     }
 
     pub(crate) fn summary(&self) -> String {
+        if self.show_details {
+            if let Some(details) = &self.details { return details.clone(); }
+        }
         if let Some(run) = &self.client_run {
             let status = run
                 .report
@@ -527,6 +571,18 @@ impl StatusPanel {
             return false;
         };
         key.code = code;
+        if self.show_details {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('d')) {
+                self.show_details = false;
+                self.action_focus = 0;
+            }
+            return false;
+        }
+        if key.code == KeyCode::Char('d') && items.iter().any(|item| item.key == 'd') {
+            self.show_details = true;
+            self.action_focus = 0;
+            return false;
+        }
         if self.reopen_required {
             return key.code == KeyCode::Esc;
         }
@@ -722,7 +778,7 @@ impl StatusPanel {
             if let Some(result) = result {
                 self.client_run = None;
                 self.client_confirm = None;
-                self.report=match result{Ok(())=>"Локальный runtime остановлен; OS proxy не изменён.".into(),Err(_)=>"Локальный runtime завершился с ошибкой; слушатели закрыты. Проверьте сохранённый профиль.".into()};
+                self.report=match result{Ok(())=>"Локальный прокси остановлен; системный прокси не изменён.".into(),Err(_)=>"Локальный прокси завершился с ошибкой; локальные порты закрыты. Проверьте сохранённый профиль.".into()};
             }
         }
         let Some(rx) = self.pending.as_ref() else {
@@ -735,8 +791,14 @@ impl StatusPanel {
         };
         self.pending = None;
         self.committing = false;
+        self.details = None;
+        self.show_details = false;
         match result{
             Ok(Update::Report(report))=>self.report=report,
+            Ok(Update::Observation { brief, details })=>{
+                self.report=brief;
+                self.details=details;
+            },
             Ok(Update::Review(review))=>self.review=Some(review),
             Ok(Update::Trust(review))=>self.trust_review=Some(review),
             Ok(Update::Expiry(review))=>self.expiry_review=Some(review),
@@ -746,45 +808,62 @@ impl StatusPanel {
                 self.digest=editor.saved_sha256();
                 self.client_active=editor.selected_record_is_active();
                 self.refreshed_editor=Some(*editor);
-                self.report="Credential сохранён, trust не изменён. Для новых соединений требуется отдельный Apply или запуск.".into();
+                self.report="Ключ доступа сохранён, доверие к серверу не изменено. Для новых соединений отдельно примените настройки или запустите прокси.".into();
             }
             Err(Error::Indeterminate)=>{
                 self.reopen_required=true;
                 self.report="Запись могла состояться. Закройте экран и перечитайте конфигурацию с диска, не повторяйте операцию вслепую.".into();
             }
-            Err(error)=>self.report=format!("Операция не подтверждена: {error}\nПри неопределённой записи сначала перечитайте сохранённый и runtime статус. Не повторяйте вслепую."),
+            Err(error)=>self.report=if self.server {
+                format!("Операция не подтверждена: {error}\nПри неопределённой записи сначала перечитайте сохранённый и runtime статус. Не повторяйте вслепую.")
+            } else {
+                let reason = match error {
+                    Error::Format | Error::Scope => "Неверный формат настроек или выбран не тот профиль.",
+                    Error::Approval => "Настройки или подтверждение доверия не совпадают. Откройте настройки заново.",
+                    Error::Identity | Error::Descriptor => "Не удалось подтвердить доверие к серверу. Обратитесь к администратору.",
+                    Error::Health => "Данные для защищённого подключения устарели или недоступны.",
+                    Error::Grant | Error::Credential => "Ключ доступа недействителен или доступ не разрешён. Запросите новый ключ.",
+                    Error::Storage => "Не удалось прочитать настройки или получить состояние фонового клиента. Проверьте файл и права доступа.",
+                    Error::Indeterminate => "Результат записи неизвестен. Проверьте настройки перед повтором.",
+                    Error::Clock => "Проверьте дату и время устройства.",
+                };
+                format!("Операция не подтверждена. {reason}")
+            },
         }
     }
     pub(crate) fn body(&self) -> String {
+        if self.show_details {
+            if let Some(details) = &self.details { return format!("{details}\n\nEsc: к краткому состоянию"); }
+        }
         if self.reopen_required {
             return format!("{}\nEsc: закрыть", self.report);
         }
         if let Some(field) = &self.credential_input {
-            return format!("Обновить credential, не меняя trust.\nАбсолютный путь к приватному приглашению: [скрыто, {} bytes]\nEnter: предпросмотр | Esc: отменить", field.len());
+            return format!("Обновить ключ доступа, не меняя доверие к серверу.\nАбсолютный путь к приватному приглашению: [скрыто, {} байт]\nEnter: предпросмотр | Esc: отменить", field.len());
         }
         if let Some((_, _, revision)) = &self.credential_review {
-            return format!("Credential-only refresh: revision={revision}.\nБудут созданы новые приватные файлы; trust, runtime и OS proxy не изменяются.\ny: сохранить | n/Esc: отменить");
+            return format!("Обновление ключа доступа (версия описания {revision}).\nБудут созданы защищённые файлы. Доверие к серверу, работающий прокси и настройки системы не изменятся.\ny: сохранить | n/Esc: отменить");
         }
         if let Some(revision) = self.headless_review {
-            return format!("Headless Apply: revision={revision}; точный сохранённый TOML проверен. Меняются только будущие локальные соединения, OS proxy и listeners сохраняются.\ny: применить | n/Esc: отменить");
+            return format!("Применение настроек фонового клиента (версия {revision}). Сохранённый файл проверен. Меняются только будущие соединения; системный прокси и локальные порты не меняются.\ny: применить | n/Esc: отменить");
         }
         if let Some((promote, field)) = &self.trust_input {
-            return format!("{}\nАбсолютный путь к подписанному descriptor: [скрыто, {} bytes]\nEnter: предпросмотр | Esc: отменить",
-            if *promote{"Плановый переход identity"}else{"Offline recovery"},field.len());
+            return format!("{}\nАбсолютный путь к подписанному описанию сервера: [скрыто, {} байт]\nEnter: предпросмотр | Esc: отменить",
+            if *promote{"Плановая замена ключа доверия"}else{"Восстановление доверия"},field.len());
         }
         if let Some(review) = &self.trust_review {
             return format!("{}\n\ny: подтвердить | n/Esc: отменить", review.report());
         }
         if let Some(start) = self.client_confirm {
             return if start {
-                "Запустить сохранённый активный профиль с двумя loopback listeners? OS proxy не изменяется.\ny: подтвердить | n/Esc: отменить".into()
+                "Запустить локальный прокси для выбранного сервера?\nНастройки системы не изменятся. Настройте прокси в нужных приложениях.\ny: запустить | n/Esc: отменить".into()
             } else {
-                "Остановить локальный runtime? Открытые туннели будут закрыты.\ny: подтвердить | n/Esc: отменить".into()
+                "Остановить локальный прокси? Подключённые через него приложения потеряют соединение.\ny: остановить | n/Esc: отменить".into()
             };
         }
         if let Some(run) = &self.client_run {
             if run.stop.is_none() {
-                return "Остановка локального runtime...".into();
+                return "Остановка локального прокси...".into();
             }
             let status = run
                 .report
@@ -792,7 +871,7 @@ impl StatusPanel {
                 .map(|s| s.clone())
                 .unwrap_or_else(|_| "Статус недоступен".into());
             return format!(
-                "{status}\n\nx: остановить (подтверждение). Esc: свернуть экран, runtime продолжает работу; V: вернуться."
+                "{status}\n\nx: остановить (подтверждение). Esc: свернуть экран, прокси продолжает работу; V: вернуться."
             );
         }
         if self.committing {
@@ -817,14 +896,14 @@ impl StatusPanel {
                 "t: начать ротацию | p: отозвать старый ключ после overlap | e: восстановить истёкший descriptor | "
             } else if !self.reality {
                 if self.client_active {
-                    "s: запустить локальный runtime | h: headless Apply | "
+                    "s: запустить локальный прокси | h: применить настройки фонового клиента | "
                 } else {
                     "для запуска выберите активный профиль | "
                 }
             } else if self.client_active {
-                "s: запустить локальный runtime | h: headless Apply | o: recovery | k: promotion | c: сменить credential | "
+                "s: запустить локальный прокси | h: применить настройки фонового клиента | o: восстановить доверие | k: заменить ключ доверия | c: обновить ключ доступа | "
             } else {
-                "o: recovery | k: promotion | c: сменить credential | для запуска выберите активный профиль | "
+                "o: восстановить доверие | k: заменить ключ доверия | c: обновить ключ доступа | для запуска выберите активный профиль | "
             }
         )
     }
@@ -849,6 +928,8 @@ mod tests {
             review: None,
             committing: false,
             report: String::new(),
+            details: None,
+            show_details: false,
             client_active: active,
             client_confirm: None,
             client_run: None,
@@ -864,11 +945,26 @@ mod tests {
         }
     }
     #[test]
+    fn technical_status_is_opt_in_and_never_starts_a_worker() {
+        let mut p = panel(true);
+        p.server = true;
+        p.report = "Краткое состояние".into();
+        p.details = Some("identity_sha256=public-fingerprint".into());
+        assert!(!p.summary().contains("identity_sha256"));
+        assert!(p.actions().iter().any(|a| a.key == 'd'));
+        assert!(!p.key(key(KeyCode::Char('d'))));
+        assert!(p.summary().contains("identity_sha256"));
+        assert!(!p.key(key(KeyCode::Esc)));
+        assert!(!p.summary().contains("identity_sha256"));
+        assert!(p.pending.is_none());
+    }
+
+    #[test]
     fn own_tls_status_only_offers_common_runtime_controls() {
         let mut p = panel(true);
         p.reality = false;
         assert!(!p.body().contains("promotion"));
-        assert!(p.body().contains("headless Apply"));
+        assert!(p.body().contains("применить настройки фонового клиента"));
         for ch in ['c', 'o', 'k'] {
             assert!(!p.key(key(KeyCode::Char(ch))));
             assert!(p.credential_input.is_none());
@@ -979,7 +1075,7 @@ mod tests {
         assert!(p.body().contains("active-local"));
         assert!(!p.key(key(KeyCode::Esc)));
         p.key(key(KeyCode::Char('x')));
-        assert!(p.body().contains("Открытые туннели"));
+        assert!(p.body().contains("приложения потеряют соединение"));
         p.key(key(KeyCode::Char('n')));
         assert!(matches!(
             stopped.try_recv(),
@@ -992,7 +1088,7 @@ mod tests {
         tx.send(Ok(())).unwrap();
         p.poll();
         assert!(p.client_run.is_none());
-        assert!(p.body().contains("runtime остановлен"));
+        assert!(p.body().contains("прокси остановлен"));
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let (tx, done) = mpsc::channel();
         p.client_run = Some(ClientRun {
@@ -1016,7 +1112,7 @@ mod tests {
         assert!(!p.committing);
         assert!(p.body().contains("Операция не подтверждена"));
         p.headless_review = Some(7);
-        assert!(p.body().contains("revision=7"));
+        assert!(p.body().contains("версия 7"));
         p.key(key(KeyCode::Esc));
         assert!(p.headless_review.is_none());
     }
@@ -1027,7 +1123,7 @@ mod tests {
         p.path = std::env::temp_dir().join(format!("theia-missing-start-{}", std::process::id()));
         assert!(!p.path.exists());
         p.key(key(KeyCode::Char('s')));
-        assert!(p.body().contains("OS proxy не изменяется"));
+        assert!(p.body().contains("Настройки системы не изменятся"));
         p.key(key(KeyCode::Char('y')));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while p.client_run.is_some() {

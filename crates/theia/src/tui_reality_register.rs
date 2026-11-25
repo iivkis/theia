@@ -320,6 +320,12 @@ impl RegistrationPanel {
         }
     }
 
+    pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        matches!(self.stage, Stage::Confirm(_)).then_some(if self.reenroll_id.is_some() {
+            ('Y', "Подтвердить новое доверие")
+        } else { ('y', "Сохранить") })
+    }
+
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         match &self.stage {
             Stage::Preview(_) | Stage::Saving(_) => return false,
@@ -542,7 +548,7 @@ impl RegistrationPanel {
             fields,
             selected: self.focus,
             lead: if self.owned.is_some() {
-                "Материалы подготовлены. Укажите имя профиля; сохранение и подключение раздельны."
+                "Материалы подготовлены. Имя профиля предложено автоматически; Enter — продолжить. Сохранение и подключение раздельны."
                     .into()
             } else {
                 "Регистрация уже подготовленных материалов. Сначала проверка, затем отдельное подтверждение записи.".into()

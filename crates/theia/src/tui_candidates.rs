@@ -213,6 +213,14 @@ impl CandidateReview {
         )
     }
 
+    pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if self.is_editing() || self.is_confirming() { return Vec::new(); }
+        vec![ActionItem { key: 'a', label: "Указать свой диапазон адресов (без сети)" },
+            ActionItem { key: 'b', label: "Выбрать IP для проверки" },
+            ActionItem { key: 'd', label: "Открыть каталог доменов" }]
+    }
+
     pub(crate) fn body(&self) -> String {
         let plan = self.scoped_plan();
         let (server, domains, manual) = self.group_counts();
@@ -247,17 +255,17 @@ impl CandidateReview {
         }
         match &self.scope {
             ScopeState::Overview => body.push_str(
-                "\nНет разрешения на активные проверки. Маска интерфейса не доказывает владение CIDR.\n\na: ввести собственный IPv4 CIDR только для offline-плана\nEsc: вернуться\n\nb: вручную выбрать IP для H2+H3 (отдельное согласие)",
+                "\nНет разрешения на активные проверки. Маска интерфейса не доказывает владение CIDR.",
             ),
             ScopeState::Input(input) => body.push_str(&format!(
                 "\nВведите IPv4 CIDR (/24..=/32, максимум {MAX_CIDR_TEXT} символа):\n{input}\n{}\n\nEnter: проверить пределы офлайн  Backspace: удалить  Esc: отменить",
                 self.warning.unwrap_or("Ожидается явный ввод диапазона; никакой автоматической проверки сети.")
             )),
             ScopeState::Confirm { prefix, additional } => body.push_str(&format!(
-                "\nПодтвердить офлайн-план для {prefix}?\n{additional} дополнительных IP-кандидатов.\n\nПОДТВЕРЖДЕНИЕ ОПЕРАТОРА: доступ к этому диапазону необходимо\nподтвердить независимо. Эта отметка не доказывает право владения\nи не является разрешением на активное сканирование.\n\ny: добавить только в offline-просмотр  n: отказаться  Esc: отменить",
+                "\nПодтвердить офлайн-план для {prefix}?\n{additional} дополнительных IP-кандидатов.\n\nПОДТВЕРЖДЕНИЕ ОПЕРАТОРА: доступ к этому диапазону необходимо\nподтвердить независимо. Эта отметка не доказывает право владения\nи не является разрешением на активное сканирование.",
             )),
             ScopeState::Accepted(prefix) => body.push_str(&format!(
-                "\nЛокально заявленный диапазон: {prefix}.\nЭто не является разрешением на активное сканирование.\nНикакие CIDR-адреса не подключались и не сохранялись.\n\na: изменить диапазон  b: выбрать IP и запросить отдельное H2+H3 согласие  Esc: закрыть/стереть",
+                "\nЛокально заявленный диапазон: {prefix}.\nЭто не является разрешением на активное сканирование.\nНикакие CIDR-адреса не подключались и не сохранялись.",
             )),
         }
         if !matches!(self.scope, ScopeState::Input(_)) {

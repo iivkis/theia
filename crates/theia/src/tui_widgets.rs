@@ -39,8 +39,8 @@ pub(crate) fn section(title: &str, active: bool) -> Block<'_> {
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(SURFACE).bg(SURFACE))
-        .style(Style::default().fg(TEXT).bg(SURFACE))
+        .border_style(Style::default().fg(BG).bg(BG))
+        .style(Style::default().fg(TEXT).bg(BG))
 }
 
 /// Reports share semantic title and key styling without interpreting their
@@ -70,8 +70,8 @@ pub(crate) fn report_section(title: &str, active: bool) -> Block<'_> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(SURFACE).bg(SURFACE))
-        .style(Style::default().fg(TEXT).bg(SURFACE))
+        .border_style(Style::default().fg(BG).bg(BG))
+        .style(Style::default().fg(TEXT).bg(BG))
 }
 
 pub(crate) fn report_row<'a>(value: &'a str, style: Style, first: bool) -> Line<'a> {
@@ -613,12 +613,9 @@ impl Actions<'_> {
                 } else {
                     Style::default().fg(TEXT)
                 };
-                let shortcut = if item.key == '4' {
-                    "F4".to_owned()
-                } else {
-                    item.key.to_string()
-                };
-                let label = fit_value(item.label, area.width.saturating_sub(9), false);
+                // Named actions are primary. Shortcuts remain available in
+                // F1/F2, not repeated next to every visible action.
+                let label = fit_value(item.label, area.width.saturating_sub(5), false);
                 ListItem::new(Line::from(vec![
                     Span::raw(if active {
                         " › "
@@ -628,10 +625,6 @@ impl Actions<'_> {
                         "   "
                     }),
                     Span::raw(label),
-                    Span::styled(
-                        format!("  {shortcut}"),
-                        Style::default().fg(if active { ACCENT } else { MUTED }),
-                    ),
                 ]))
                 .style(style)
             })
@@ -639,9 +632,9 @@ impl Actions<'_> {
         frame.render_widget(
             List::new(items).block(section(
                 if focused {
-                    " Действия · ↑↓ Enter "
+                    " Действия "
                 } else {
-                    " Действия · Tab "
+                    " Действия "
                 },
                 focused,
             )),
@@ -650,28 +643,41 @@ impl Actions<'_> {
     }
 }
 
+/// Shared confirmation choices: a pointer or an arrow selects, only Enter
+/// dispatches through the owning workflow. Keep the negative choice first.
+pub(crate) fn confirmation_bar(frame: &mut Frame<'_>, area: Rect, heading: &str, error: bool,
+    confirm: &str, selected: bool) {
+    canvas(frame, area);
+    if area.height == 0 { return; }
+    let heading = fit_value(heading, area.width, false);
+    frame.render_widget(Paragraph::new(heading).style(Style::default().fg(if error { ERROR } else { MUTED })),
+        Rect::new(area.x, area.y, area.width, 1));
+    if area.height < 2 { return; }
+    let half = area.width / 2;
+    for (i, (label, x, width)) in [("Отменить", area.x, half), (confirm, area.x + half, area.width - half)].into_iter().enumerate() {
+        let active = (i == 1) == selected;
+        let shown = fit_value(label, width.saturating_sub(2), false);
+        frame.render_widget(Paragraph::new(format!("{} {shown}", if active { "›" } else { " " }))
+            .style(Style::default().fg(if active { ACCENT } else { TEXT })
+                .bg(if active { FOCUS } else { BG })),
+            Rect::new(x, area.bottom() - 1, width, 1));
+    }
+}
+
 pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
-    if count == 0 || area.height < 8 {
-        return None;
-    }
-    if area.width >= 104 {
-        let parts = Layout::horizontal([
-            Constraint::Min(44),
-            Constraint::Length((area.width / 3).clamp(42, 64)),
-        ])
-        .split(area);
-        let controls = Rect::new(
-            parts[1].x,
-            parts[1].y,
-            parts[1].width,
-            parts[1].height.min((count as u16).saturating_add(2)),
-        );
-        Some([parts[0], controls])
-    } else {
-        let height = (count as u16).saturating_add(2).min(area.height / 2).max(3);
-        let parts = Layout::vertical([Constraint::Min(4), Constraint::Length(height)]).split(area);
-        Some([parts[0], parts[1]])
-    }
+    action_layout_rows(area, count, 20)
+}
+
+/// Fit actions immediately below the wrapped report, leaving room for
+/// scrolling long reports and selecting every action on compact terminals.
+pub(crate) fn action_layout_rows(area: Rect, count: usize, rows: usize) -> Option<[Rect; 2]> {
+    if count == 0 || area.height < 8 { return None; }
+    let height = (count as u16).saturating_add(2).min(area.height / 2).max(3);
+    let preferred = rows.saturating_add(2).clamp(3, 22) as u16;
+    let content_height = (area.height - height).min(preferred);
+    let report = Rect::new(area.x, area.y, area.width, content_height);
+    let controls = Rect::new(area.x, report.bottom(), area.width, height);
+    Some([report, controls])
 }
 
 pub(crate) fn action_key(
@@ -686,11 +692,11 @@ pub(crate) fn action_key(
     *focus = (*focus).min(items.len() - 1);
     match code {
         KeyCode::Up | KeyCode::BackTab => {
-            *focus = (*focus + items.len() - 1) % items.len();
+            *focus = focus.saturating_sub(1);
             None
         }
         KeyCode::Down | KeyCode::Tab => {
-            *focus = (*focus + 1) % items.len();
+            *focus = (*focus + 1).min(items.len() - 1);
             None
         }
         KeyCode::Home => {
@@ -803,7 +809,14 @@ mod tests {
             },
         ];
         let mut focus = 0;
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Up), None);
+        assert_eq!(focus, 0);
         assert_eq!(action_key(&items, &mut focus, KeyCode::Down), None);
+        assert_eq!(focus, 1);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::End), None);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Down), None);
+        assert_eq!(focus, 2);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Up), None);
         assert_eq!(focus, 1);
         assert_eq!(
             action_key(&items, &mut focus, KeyCode::Enter),

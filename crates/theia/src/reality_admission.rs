@@ -207,6 +207,11 @@ impl Secret {
         })
     }
 
+    /// Confidential key issuance only; never include in public descriptors.
+    pub(crate) fn invitation_key(&self) -> Zeroizing<[u8; 32]> {
+        self.0.clone()
+    }
+
     fn encode(&self, scope: &Scope) -> Zeroizing<String> {
         let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(&self.0[..]));
         Zeroizing::new(format!(

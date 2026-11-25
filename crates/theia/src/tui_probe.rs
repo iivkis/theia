@@ -329,6 +329,18 @@ impl ProbePanel {
         }
     }
 
+    pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if !self.is_available() || !matches!(self.state, ProbeState::Select | ProbeState::Complete { .. }) {
+            return Vec::new();
+        }
+        let mut items = vec![ActionItem { key: 't', label: "Предпросмотр проверки выбранного IP" }];
+        if self.targets.len() > 1 {
+            items.extend([ActionItem { key: 'k', label: "Предыдущий IP" }, ActionItem { key: 'j', label: "Следующий IP" }]);
+        }
+        items
+    }
+
     pub(crate) fn body(&self) -> String {
         let mut body =
             String::from("TLS/H2 + QUIC/H3: явные проверки одного локального публичного IP\n\n");
@@ -356,10 +368,10 @@ impl ProbePanel {
         ));
         match &self.state {
             ProbeState::Select => body.push_str(
-                "\n↑/↓ или j/k: выбрать адрес  Enter/t: запросить согласие  Esc: назад",
+                "",
             ),
             ProbeState::Confirm { address } => body.push_str(&format!(
-                "\nСОГЛАСИЕ НА АКТИВНЫЕ H2 И H3 ПРОВЕРКИ\n\nОператор подтверждает право проверить ОДИН назначенный IP {}:443\nс SNI {} по ДВУМ транспортам: TCP/TLS1.3 ALPN=h2 и UDP/QUIC TLS1.3 ALPN=h3.\nДва handshake без HTTP-запросов; ни соседние IP, ни домены, ни другие порты не затрагиваются.\n\ny: согласиться на ОБА запроса  n: отказаться  Esc: назад",
+                "\nСОГЛАСИЕ НА АКТИВНЫЕ H2 И H3 ПРОВЕРКИ\n\nОператор подтверждает право проверить ОДИН назначенный IP {}:443\nс SNI {} по ДВУМ транспортам: TCP/TLS1.3 ALPN=h2 и UDP/QUIC TLS1.3 ALPN=h3.\nДва handshake без HTTP-запросов; ни соседние IP, ни домены, ни другие порты не затрагиваются.",
                 address, server_name
             )),
             ProbeState::Running { address, .. } => body.push_str(&format!(
@@ -425,7 +437,7 @@ impl ProbePanel {
                         );
                     }
                     body.push_str(
-                        "REALITY готов: НЕТ. HTTP/3 semantics, fingerprint/identity и anti-DPI НЕ проверены.\nScore не является вероятностью обхода DPI.\n\nEnter/t: повторить только с новым согласием  Esc: назад",
+                        "REALITY готов: НЕТ. HTTP/3 semantics, fingerprint/identity и anti-DPI НЕ проверены.\nScore не является вероятностью обхода DPI.",
                     );
                 }
             }
@@ -455,7 +467,7 @@ impl ProbePanel {
                     }
                 };
                 body.push_str(&format!(
-                    "\nПроверка H2/H3 НЕ прошла: {code}. Оба транспорта НЕ подтверждены.\nH2/H3 score: Unknown, положительных доказательств нет.\n\nEnter/t: повторить только с новым согласием  Esc: назад"
+                    "\nПроверка H2/H3 НЕ прошла: {code}. Оба транспорта НЕ подтверждены.\nH2/H3 score: Unknown, положительных доказательств нет."
                 ));
             }
         }

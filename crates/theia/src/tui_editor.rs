@@ -162,6 +162,8 @@ fn server_invitation(
         let invitation =
             crate::reality_config::registered_invitation(document, id, credential, now)
                 .map_err(|_| "Registered REALITY publication not eligible")?;
+        // Check the actual full key before a grant or credential is saved.
+        invitation.encode().map_err(|_| "Ключ REALITY превышает лимит или невалиден")?;
         return Ok(IssuedInvitation::Reality {
             invitation,
             user: credential.map_or_else(String::new, |(user, _)| user.to_owned()),
@@ -172,6 +174,7 @@ fn server_invitation(
         None => Invitation::public_from_server(config, id),
     }
     .map_err(|_| "Selected inbound cannot issue invitations")?;
+    invitation.encode().map_err(|_| "Ключ TLS превышает лимит или невалиден")?;
     Ok(IssuedInvitation::OwnTls(invitation))
 }
 
@@ -894,6 +897,20 @@ impl Editor {
                 .get(self.selected_record)
                 .map_or("", |profile| profile.id.as_str()),
         }
+    }
+
+    /// Display address only; profile identity and selection remain keyed by ID.
+    pub(crate) fn client_profile_address(&self, id: &str) -> Option<&str> {
+        let Config::Client(doc) = &self.draft else { return None };
+        doc.client.profiles.iter().find(|p| p.id == id).map(|p| p.server.as_str())
+    }
+
+    /// Human-facing number and address; guarded operations still use the ID.
+    pub(crate) fn client_profile_label(&self, id: &str) -> Option<String> {
+        let Config::Client(doc) = &self.draft else { return None };
+        doc.client.profiles.iter().enumerate()
+            .find(|(_, p)| p.id == id)
+            .map(|(index, p)| format!("№{} · {}", index + 1, p.server))
     }
 
     pub(crate) fn require_clean_records(&self) -> Result<(), &'static str> {
