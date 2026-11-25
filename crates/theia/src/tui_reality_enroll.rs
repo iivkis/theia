@@ -90,7 +90,7 @@ fn inspect(input: &Input, now: u64) -> Result<Review, Error> {
         identity_sha256: invitation.fingerprint(),
     };
     let body = if input.access_key_only {
-        format!("ПРЕДПРОСМОТР: самодостаточный ключ REALITY.\n{}\n\nКлюч проверен на этом устройстве. Связь с сервером ещё не проверена.\nСохраняйте его только если получили от администратора, которому доверяете.\nПодключение не запускается, системный прокси не меняется.\ny: доверять и продолжить; n/Esc: назад.", invitation.access_key_summary())
+        format!("ПРЕДПРОСМОТР: самодостаточный ключ REALITY.\n{}\n\nКлюч проверен на этом устройстве. Связь с сервером ещё не проверена.\nСохраняйте его только если получили от администратора, которому доверяете.\nПодключение не запускается, системный прокси не меняется.", invitation.access_key_summary())
     } else {
         format!("ПРЕДПРОСМОТР: fingerprint совпал с введённым значением.\n{}\nAdmission-файл проверен; секрет будет скопирован в защищённое хранилище.\nTransport/XHTTP: auto. CA не требуется.\nСохранение отдельного профиля не меняет active profile, proxy или runtime.\ny: сохранить; n/Esc: отменить.", invitation.preview(now)?)
     };
@@ -726,7 +726,7 @@ impl EnrollmentPanel {
                 if self.managed_paths() { 3 } else { total - 1 },
                 total,
                 "Подтверждение доверия",
-                "Y сохранить · N / Esc назад",
+                "y доверять и сохранить · n / Esc назад",
             ),
             Stage::Applying(_) | Stage::Creating(_) => (
                 if self.managed_paths() { 4 } else { total },
@@ -778,7 +778,7 @@ impl EnrollmentPanel {
             }
             Stage::Confirm(review) => {
                 if let Some(path) = &self.new_config {
-                    format!("{}\n\nФайл настроек: {}\nПервый профиль будет выбран для подключения. Системный прокси останется выключенным.\ny: сохранить профиль; n/Esc: назад.", review.body, path.display())
+                    format!("{}\n\nФайл настроек: {}\nПервый профиль будет выбран для подключения. Системный прокси останется выключенным.", review.body, path.display())
                 } else {
                     review.body.clone()
                 }

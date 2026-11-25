@@ -431,7 +431,7 @@ impl StatusPanel {
             return if run.stop.is_some() {
                 vec![ActionItem {
                     key: 'x',
-                    label: "Остановить подключение",
+                    label: "Остановить локальный прокси",
                 }]
             } else {
                 Vec::new()
@@ -441,7 +441,7 @@ impl StatusPanel {
         if !self.server && self.client_active {
             items.push(ActionItem {
                 key: 's',
-                label: "Запустить подключение",
+                label: "Запустить локальный прокси",
             });
             items.push(ActionItem {
                 key: 'h',
@@ -777,9 +777,9 @@ impl StatusPanel {
         }
         if let Some(start) = self.client_confirm {
             return if start {
-                "Запустить сохранённый активный профиль с двумя loopback listeners? OS proxy не изменяется.\ny: подтвердить | n/Esc: отменить".into()
+                "Запустить локальный прокси для выбранного сервера?\nНастройки системы не изменятся. Настройте прокси в нужных приложениях.\ny: запустить | n/Esc: отменить".into()
             } else {
-                "Остановить локальный runtime? Открытые туннели будут закрыты.\ny: подтвердить | n/Esc: отменить".into()
+                "Остановить локальный прокси? Подключённые через него приложения потеряют соединение.\ny: остановить | n/Esc: отменить".into()
             };
         }
         if let Some(run) = &self.client_run {
@@ -1027,7 +1027,7 @@ mod tests {
         p.path = std::env::temp_dir().join(format!("theia-missing-start-{}", std::process::id()));
         assert!(!p.path.exists());
         p.key(key(KeyCode::Char('s')));
-        assert!(p.body().contains("OS proxy не изменяется"));
+        assert!(p.body().contains("Настройки системы не изменятся"));
         p.key(key(KeyCode::Char('y')));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while p.client_run.is_some() {

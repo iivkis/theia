@@ -508,12 +508,12 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
         ],
         (Role::Client, 3) if cfg!(windows) => &[
             ('p', "Включить / выключить системный прокси"),
-            ('V', "Локальный HTTP / SOCKS5"),
+            ('V', "Запустить / остановить локальный прокси"),
             ('A', "Выбрать активный профиль"),
             ('i', "Добавить ключ"),
         ],
         (Role::Client, 3) => &[
-            ('V', "Локальный HTTP / SOCKS5"),
+            ('V', "Запустить / остановить локальный прокси"),
             ('A', "Выбрать активный профиль"),
             ('i', "Добавить ключ"),
         ],
@@ -647,7 +647,11 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
             "Выберите этот профиль активным, если хотите подключаться через него.",
         )
     } else {
-        ('P', "Выберите режим подключения: системный или локальный прокси. Запуск требует подтверждения.")
+        ('P', if cfg!(windows) {
+            "Выберите системный или локальный прокси. Запуск требует подтверждения."
+        } else {
+            "Откройте подключение и запустите локальный прокси. Затем настройте нужные приложения."
+        })
     }
 }
 
@@ -4687,9 +4691,9 @@ fn draw_issuance(
                 "Пользователь: {id}\nПодключение: {}\n\n{}\n\ny: подтвердить и сохранить  n/Esc: отменить",
                 editor.map_or("", |e| e.selected_record_id()),
                 if recovering {
-                    "ВНИМАНИЕ: доступ восстановится для всех ранее разрешённых подключений.\nБудет создан новый ключ; старый восстановить нельзя.\nЧтобы изменить работающий сервер, отдельно примените права (CAS Apply)."
+                    "ВНИМАНИЕ: доступ восстановится для всех ранее разрешённых подключений.\nБудет создан новый ключ; старый восстановить нельзя.\nЧтобы изменить работающий сервер, отдельно примените права (Ctrl+R)."
                 } else if rotating {
-                    "ВНИМАНИЕ: новый ключ заменит старый для всех подключений пользователя.\nСтарый ключ перестанет работать для новых сеансов после отдельного применения прав (CAS Apply).\nТекущие сеансы продолжатся. Права и состояние пользователя не изменятся."
+                    "ВНИМАНИЕ: новый ключ заменит старый для всех подключений пользователя.\nСтарый ключ перестанет работать для новых сеансов после отдельного применения прав (Ctrl+R).\nТекущие сеансы продолжатся. Права и состояние пользователя не изменятся."
                 } else {
                     "Создать личный ключ и сохранить пользователя?\nСервер не перезапускается. После записи отдельно примените права доступа."
                 }
@@ -5030,8 +5034,8 @@ fn draw_import(
         ),
         ImportFlow::Saving => ("Сохранение профиля", "Сохраняем профиль и ключ в защищённом хранилище.\nПодключение не запускается, системный прокси не меняется.".into()),
         ImportFlow::Done => ("Профиль сохранён", format!("Профиль: {}\n{}\nИмпорт не запустил новое соединение и не изменил системный прокси.\n\nEnter: выбрать режим подключения\nEsc: закончить без запуска\n\n{}",
-            editor.map_or("Новый профиль", Editor::selected_record_id),
-            if editor.is_some_and(Editor::selected_record_is_active) { "Профиль активен в настройках." } else { "Активный профиль не изменён. Перед подключением подтвердите выбор нового профиля." },
+            editor.map_or("Новый профиль", |e| e.client_profile_address(e.selected_record_id()).unwrap_or_else(|| e.selected_record_id())),
+            if editor.is_some_and(Editor::selected_record_is_active) { "Этот сервер выбран для подключения." } else { "Выбор сервера не изменён. Перед подключением подтвердите выбор нового профиля." },
             editor.and_then(|e| e.error.as_deref()).unwrap_or(""))),
         ImportFlow::ActivateConfirm => ("Выбрать импортированный профиль", format!("Сделать профиль {} активным?\nДругие профили остаются сохранёнными. Это не запускает соединение.\n\ny: подтвердить · n/Esc: назад", editor.map_or("", Editor::selected_record_id))),
         ImportFlow::Activating => ("Сохранение выбора", "Сохраняется активный профиль. Соединение не запускается.".into()),
@@ -5212,7 +5216,10 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
         .workspace_records()
         .into_iter()
         .find(|(_, active, _)| *active)
-        .map(|(id, _, _)| id)
+        .map(|(id, _, _)| {
+            editor.client_profile_address(&id)
+                .map_or_else(|| id.clone(), |address| format!("{address} ({id})"))
+        })
         .unwrap_or_else(|| "Нет профиля".into());
     let running = ui.is_some_and(|u| u.owned_running(Role::Client));
     let (http, socks) = editor.client_proxy_addresses().unwrap_or(("—", "—"));
@@ -5230,7 +5237,7 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
         Line::raw(format!("Активный профиль: {active}")),
         Line::raw(format!(
             "Выбран: {} · {}",
-            editor.selected_record_id(),
+            editor.client_profile_address(editor.selected_record_id()).unwrap_or_else(|| editor.selected_record_id()),
             if editor.selected_reality() {
                 "REALITY"
             } else {
@@ -5655,7 +5662,13 @@ fn draw_workspace(
                         " "
                     },
                     if reality { "REALITY" } else { "TLS" },
-                    tui_widgets::fit_value(&id, records.width.saturating_sub(13), false),
+                    tui_widgets::fit_value(
+                        &if role == Role::Client {
+                            format!("{} {}", index + 1, editor.client_profile_address(&id).unwrap_or(&id))
+                        } else {
+                            id.clone()
+                        },
+                        records.width.saturating_sub(13), false),
                     if active { " *" } else { "" }
                 ))
                 .style(style)
@@ -6747,6 +6760,8 @@ mod tests {
             "Локальный прокси",
             "Активный профиль",
             "127.0.0.1",
+            "edge.example.org:443",
+            "Запустить / остановить локальный прокси",
         ] {
             assert!(screen.contains(label), "missing {label}");
         }
@@ -8314,7 +8329,7 @@ mod tests {
         assert!(matches!(ui.issuance, Some(IssueFlow::Confirm(_))));
         let review = rendered_interaction(120, 40, &model, &ui);
         assert!(review.contains("всех подключений"));
-        assert!(review.contains("CAS Apply"));
+        assert!(review.contains("Ctrl+R"));
         assert!(!review.contains("theia://v1/"));
         let Config::Server(before) = config::read_file(&path).unwrap() else {
             panic!("server");
@@ -8857,7 +8872,7 @@ mod tests {
                 ImportFlow::RefreshDone,
                 "соединение и системный прокси не менялись",
             ),
-            (ImportFlow::Saving, "Секрет не отображается"),
+            (ImportFlow::Saving, "Сохраняем профиль и ключ"),
             (ImportFlow::Done, "Профиль сохранён"),
             (ImportFlow::Failed, "Импорт НЕ подтверждён"),
         ] {

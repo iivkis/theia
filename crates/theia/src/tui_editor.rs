@@ -899,6 +899,12 @@ impl Editor {
         }
     }
 
+    /// Display address only; profile identity and selection remain keyed by ID.
+    pub(crate) fn client_profile_address(&self, id: &str) -> Option<&str> {
+        let Config::Client(doc) = &self.draft else { return None };
+        doc.client.profiles.iter().find(|p| p.id == id).map(|p| p.server.as_str())
+    }
+
     pub(crate) fn require_clean_records(&self) -> Result<(), &'static str> {
         if self.editing || self.dirty() || self.issued.is_some() {
             return Err("Сначала завершите или отмените редактирование и выдачу.");
