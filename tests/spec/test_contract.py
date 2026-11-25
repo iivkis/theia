@@ -527,7 +527,26 @@ class SpecContractTests(unittest.TestCase):
     def test_retired_local_tls_reality_has_no_production_or_compatibility_path(self):
         self.assertFalse((ROOT / "crates/theia/src/reality_identity.rs").exists())
         self.assertNotIn("SmartRealityV1", read("crates/theia/src/security_profile.rs"))
-        self.assertNotIn("SmartReality", read("crates/theia/src/invite.rs"))
+        # Registered external REALITY is not the retired local-TLS invitation.
+        # The ordinary invitation codec must still reject both registered REALITY
+        # profiles and server inbounds instead of exporting a generic TLS pin.
+        invite = read("crates/theia/src/invite.rs")
+        wire_security = re.search(r"enum WireSecurity\s*\{([^}]+)\}", invite)
+        self.assertIsNotNone(wire_security)
+        self.assertEqual(
+            [item.strip() for item in wire_security.group(1).split(",") if item.strip()],
+            ["OwnTls", "PinnedTls"],
+        )
+        self.assertRegex(
+            invite,
+            r'if profile\.reality_profile\.is_some\(\)\s*\|\|\s*profile\.tls_profile == "smart-reality"[\s\S]*?return Err\(InviteError::Invalid\);',
+        )
+        self.assertRegex(
+            invite,
+            r'if inbound\.security_mode == crate::security_profile::SecurityMode::SmartReality\s*\|\|\s*inbound\.reality\.is_some\(\)\s*\{\s*return Err\(InviteError::Unavailable\);',
+        )
+        self.assertNotIn("SmartRealityV1", invite)
+        self.assertIn("deny_unknown_fields", invite)
         self.assertNotIn("reality_key", read("crates/theia/src/config.rs"))
         self.assertNotIn("handle_identity_request", read("crates/theia/src/server.rs"))
         self.assertNotIn("handle_identity_request", read("crates/theia/src/h3_server.rs"))
