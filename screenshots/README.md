@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 3b210f224a7e096297cf45a59a919d437891c5a4
+Source: b27e7d37000a93be9215e43a90f54c3ae71a2631
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -41,6 +41,18 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## client-connection-modes
 
 ![client-connection-modes](client-connection-modes.png)
+
+## client-direct-profile-action
+
+![client-direct-profile-action](client-direct-profile-action.png)
+
+## client-direct-profile-full-address
+
+![client-direct-profile-full-address](client-direct-profile-full-address.png)
+
+## client-direct-profile-selection
+
+![client-direct-profile-selection](client-direct-profile-selection.png)
 
 ## client-file-picker
 
@@ -138,6 +150,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-reality-key-trust-review](client-reality-key-trust-review.png)
 
+## client-reality-key-trust-selected
+
+![client-reality-key-trust-selected](client-reality-key-trust-selected.png)
+
 ## client-reality-local-proxy-before-start
 
 ![client-reality-local-proxy-before-start](client-reality-local-proxy-before-start.png)
@@ -145,6 +161,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## client-reality-local-proxy-start-confirm
 
 ![client-reality-local-proxy-start-confirm](client-reality-local-proxy-start-confirm.png)
+
+## client-reality-local-proxy-start-selected
+
+![client-reality-local-proxy-start-selected](client-reality-local-proxy-start-selected.png)
 
 ## client-traffic-monitor-idle
 
