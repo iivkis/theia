@@ -349,6 +349,7 @@ struct QrScan {
 
 struct Interaction {
     viewport: Viewport,
+    welcome_choice: usize,
     editor: Option<Editor>,
     menu: Option<Menu>,
     config_dialog: Option<ConfigDialog>,
@@ -385,6 +386,7 @@ impl Interaction {
     fn new(editor: Option<Editor>) -> Self {
         Self {
             viewport: Viewport::default(),
+            welcome_choice: 0,
             editor,
             menu: None,
             config_dialog: None,
@@ -815,6 +817,10 @@ impl Interaction {
             return;
         };
         if self.editor_for(role).is_none() {
+            let form = welcome_form(role, self.welcome_choice);
+            if let Some(id) = form.hit(centered_column(body, 88), event.column, event.row) {
+                self.welcome_choice = id;
+            }
             return;
         }
         let Some(columns) = workspace_columns(body) else {
@@ -1166,6 +1172,26 @@ impl Interaction {
             }
             if let Some(role) = role {
                 let configured = self.editor_for(role).is_some();
+                if !configured {
+                    match key.code {
+                        KeyCode::Up | KeyCode::BackTab => {
+                            self.welcome_choice = (self.welcome_choice + 2) % 3;
+                            return false;
+                        }
+                        KeyCode::Down | KeyCode::Tab => {
+                            self.welcome_choice = (self.welcome_choice + 1) % 3;
+                            return false;
+                        }
+                        KeyCode::Enter => {
+                            self.open_config(role);
+                            if let Some(dialog) = self.config_dialog.as_mut() {
+                                dialog.prefer_mode(self.welcome_choice);
+                            }
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
                 if key.code == KeyCode::F(3)
                     || (!configured && key.code == KeyCode::Char('N'))
                     || (!configured
@@ -2458,7 +2484,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         }
         Screen::Server | Screen::Client => {
             let role = if model.screen == Screen::Server { Role::Server } else { Role::Client };
-            draw_workspace(frame, parts[1], role, interaction.and_then(|ui| ui.editor_for(role)));
+            draw_workspace(frame, parts[1], role, interaction.and_then(|ui| ui.editor_for(role)), interaction.map_or(0, |ui| ui.welcome_choice));
         }
         Screen::Help => modal_panel!(
             frame,
@@ -2659,6 +2685,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         match model.screen {
             Screen::Home => "↑↓ / Tab: роль • Enter: открыть • F1: помощь • q: выход",
             Screen::Help => "Shift+PgUp/PgDn или колесо: прокрутка  ·  Esc назад",
+            Screen::Server | Screen::Client if interaction.is_some_and(|ui| Interaction::panel_role(model).is_some_and(|role| ui.editor_for(role).is_none())) => {
+                "↑↓ выбрать · Enter продолжить · F2 все действия · Esc назад"
+            }
             Screen::Server => {
                 "F2/F10 Действия  ·  F3 Файл  ·  F4 Трафик  ·  F5 Сервер  ·  Ctrl+S Сохранить"
             }
@@ -2990,16 +3019,16 @@ fn draw_import(
     panel_at(frame, area, title, &body, true, viewport);
 }
 
-fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<&Editor>) {
+fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<&Editor>, welcome_choice: usize) {
     if editor.is_none() {
-        draw_welcome(frame, area, role);
+        draw_welcome(frame, area, role, welcome_choice);
         return;
     }
     let Some([nav, records, details]) = workspace_columns(area) else {
         if let Some(editor) = editor {
             draw_editor(frame, area, editor);
         } else {
-            draw_welcome(frame, area, role);
+            draw_welcome(frame, area, role, welcome_choice);
         }
         return;
     };
@@ -3085,20 +3114,31 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
             "Конфигурация ещё не открыта.",
             false,
         );
-        draw_welcome(frame, details, role);
+        draw_welcome(frame, details, role, welcome_choice);
     }
 }
 
-fn draw_welcome(frame: &mut Frame<'_>, area: Rect, role: Role) {
-    let title = if role == Role::Server { "Для сервера" } else { "Для клиента" };
-    let body = match role {
-        Role::Server => "НАЧАЛО РАБОТЫ\n\n> Enter / F3   Создать или открыть TOML\n\nSMARTTHEIA REALITY\n  Новый сервер без собственного TLS-сертификата.\n  Введите путь к TOML, затем F4 — мастер REALITY.\n\nOWN-TLS\n  Собственный сертификат и ключ.\n  Введите путь к TOML, затем F2 — мастер Own-TLS.\n\nF2: все действия   F5: сервер\nСервер не запущен этой панелью. IPC — отдельно.",
-        Role::Client => "НАЧАЛО РАБОТЫ\n\n> Enter / F3   Создать или открыть TOML\n\nПРОФИЛИ\n  F4 в выборе файла — импорт первого REALITY-приглашения.\n  F2 — новый Own-TLS; Enter — открыть существующий TOML.\n\nF2: все действия   F4: трафик\nТранспорт не проверялся. Системный прокси не изменён.",
+fn welcome_form(role: Role, selected: usize) -> Form {
+    let (reality, description, lead) = match role {
+        Role::Server => ("Создать SmartTheia REALITY", "Мастер референсов, без своего сертификата", "Сервер не запущен этой панелью. IPC — отдельно."),
+        Role::Client => ("Импорт SmartTheia REALITY", "Создать профиль из приглашения", "Транспорт не проверялся. Системный прокси не изменён."),
     };
-    // A welcome screen has one reading column, not empty sidebars.
+    Form {
+        fields: vec![
+            Field { id: 0, label: "Открыть конфигурацию", value: "Выбрать существующий TOML".into(), hint: "Enter — выбрать путь. F3 — открыть файл." },
+            Field { id: 1, label: reality, value: description.into(), hint: "Enter — выбрать новый путь, затем открыть мастер." },
+            Field { id: 2, label: "Создать Own-TLS", value: "Ручная настройка собственного TLS".into(), hint: "Enter — выбрать путь к новому TOML." },
+        ],
+        selected,
+        lead: lead.into(),
+        error: String::new(),
+    }
+}
+
+fn draw_welcome(frame: &mut Frame<'_>, area: Rect, role: Role, selected: usize) {
+    let title = if role == Role::Server { "Для сервера · начало работы" } else { "Для клиента · начало работы" };
     frame.render_widget(Clear, area);
-    let content = centered_column(area, 88);
-    panel(frame, content, title, body, true);
+    welcome_form(role, selected).render(frame, centered_column(area, 88), title);
 }
 
 fn centered_column(area: Rect, max_width: u16) -> Rect {
