@@ -1745,7 +1745,7 @@ mod selector_tests {
         )));
         std::fs::create_dir(&dir.0).unwrap();
         timeout(
-            Duration::from_secs(if drain_only { 55 } else { 80 }),
+            Duration::from_secs(59),
             async {
                 let remote = {
                     let mut selected = None;
@@ -1796,6 +1796,8 @@ mod selector_tests {
                 let digest = state.snapshot_sha256().unwrap();
                 let record =
                     crate::reality_provision::create(&state, digest, &bundle, now).unwrap();
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                let initial_publication = std::fs::read(bundle.join("publication.toml")).unwrap();
                 let token = [42u8; 32];
                 let server_path = dir.0.join("server.toml");
                 let source = include_str!("../../../examples/server.toml").replace(
@@ -1854,9 +1856,7 @@ mod selector_tests {
                     ("split-h2", Transport::H2, XhttpMode::StreamUp),
                     ("split-h3", Transport::H3, XhttpMode::StreamUp),
                 ] {
-                    if !drain_only && mode == XhttpMode::StreamUp {
-                        continue;
-                    }
+                    // Stream-up profiles remain offline during the live rotation.
                     let enrollment = dir.0.join(format!("{id}.toml"));
                     let trust = dir.0.join(format!("{id}-trust.toml"));
                     bootstrap::import(
@@ -1986,7 +1986,7 @@ mod selector_tests {
                 let (started, ready) = tokio::sync::oneshot::channel();
                 let mut server = JoinSet::new();
                 server.spawn(crate::server::run_reality_document_with_ready(
-                    server_doc,
+                    server_doc.clone(),
                     Some(started),
                 ));
                 ready.await.unwrap();
@@ -2305,8 +2305,75 @@ mod selector_tests {
                 for mut proxy in proxies {
                     proxy.shutdown().await;
                 }
-                echo_tasks.shutdown().await;
+                drop(managed_clients);
                 server.shutdown().await;
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                {
+                    // A fresh supervisor must reject a previously valid but
+                    // superseded publication, even after the old process exits.
+                    let path = bundle.join("publication.toml");
+                    let latest = std::fs::read(&path).unwrap();
+                    assert_ne!(initial_publication, latest);
+                    std::fs::write(&path, &initial_publication).unwrap();
+                    let (started, _ready) = tokio::sync::oneshot::channel();
+                    let (_drain, stop) = tokio::sync::oneshot::channel();
+                    let (draining, _acknowledged) = tokio::sync::oneshot::channel();
+                    let rejected = timeout(
+                        Duration::from_secs(3),
+                        crate::server::registered_reality_drain_fixture(
+                            server_doc.clone(), started, stop, draining,
+                        ),
+                    )
+                    .await;
+                    std::fs::write(&path, latest).unwrap();
+                    assert!(matches!(rejected, Ok(Err(crate::server::ServerError::Config))));
+
+                    // Restart using the exact durable health and publication
+                    // state. The two unopened profiles still pin revision 1.
+                    let (started, ready) = tokio::sync::oneshot::channel();
+                    let (drain, stop) = tokio::sync::oneshot::channel();
+                    let (draining, acknowledged) = tokio::sync::oneshot::channel();
+                    server.spawn(crate::server::registered_reality_drain_fixture(
+                        server_doc, started, stop, draining,
+                    ));
+                    ready.await.unwrap();
+                    for id in ["split-h2", "split-h3"] {
+                        let profile = client_doc.client.profiles.iter()
+                            .find(|profile| profile.id == id).unwrap();
+                        let client = load_client(profile).await.unwrap();
+                        let ProxyClient::Reality(managed) = &client else {
+                            panic!("wrong security mode");
+                        };
+                        let old = managed.generation().await.unwrap();
+                        assert_eq!(old.value.descriptor().revision, 1);
+                        assert_eq!(old.value.descriptor().active_reference, 0);
+                        assert_eq!(old.value.signer(), old_signer);
+                        // Authenticate the old signer, fetch the latest
+                        // announcement and verify successor TLS before CAS.
+                        managed.refresh(&old).await.unwrap();
+                        let current = managed.generation().await.unwrap();
+                        assert_eq!(current.value.signer(), successor.public_key());
+                        assert_eq!(current.value.descriptor().active_reference, 1);
+                        assert!(current.value.descriptor().revision > 1);
+                        let tunnel = client.open(Address::V4([127, 0, 0, 1]), target.port())
+                            .await.unwrap();
+                        let (mut app, local) = paired().await;
+                        let relay = tokio::spawn(tunnel.relay(local));
+                        app.write_all(b"back").await.unwrap();
+                        let mut bytes = [0; 4];
+                        app.read_exact(&mut bytes).await.unwrap();
+                        assert_eq!(&bytes, b"back");
+                        app.shutdown().await.unwrap();
+                        let mut tail = Vec::new();
+                        app.read_to_end(&mut tail).await.unwrap();
+                        assert!(tail.is_empty());
+                        relay.await.unwrap().unwrap();
+                    }
+                    drain.send(()).unwrap();
+                    acknowledged.await.unwrap();
+                    server.join_next().await.unwrap().unwrap().unwrap();
+                }
+                echo_tasks.shutdown().await;
             },
         )
         .await

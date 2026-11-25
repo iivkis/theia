@@ -20,8 +20,8 @@ const MAX_BYTES: usize = 1024 * 1024;
 #[serde(deny_unknown_fields)]
 struct History {
     schema_version: u16,
-    last: BTreeMap<String, [u8; 32]>,
     retired: BTreeSet<[u8; 32]>,
+    last: BTreeMap<String, [u8; 32]>,
 }
 impl Default for History {
     fn default() -> Self {
