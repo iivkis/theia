@@ -905,6 +905,14 @@ impl Editor {
         doc.client.profiles.iter().find(|p| p.id == id).map(|p| p.server.as_str())
     }
 
+    /// Human-facing number and address; guarded operations still use the ID.
+    pub(crate) fn client_profile_label(&self, id: &str) -> Option<String> {
+        let Config::Client(doc) = &self.draft else { return None };
+        doc.client.profiles.iter().enumerate()
+            .find(|(_, p)| p.id == id)
+            .map(|(index, p)| format!("№{} · {}", index + 1, p.server))
+    }
+
     pub(crate) fn require_clean_records(&self) -> Result<(), &'static str> {
         if self.editing || self.dirty() || self.issued.is_some() {
             return Err("Сначала завершите или отмените редактирование и выдачу.");

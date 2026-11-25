@@ -4182,7 +4182,18 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     } else if let Some(status) = interaction.and_then(|ui| ui.reality_status.as_ref()) {
         tui_widgets::canvas(frame, parts[1]);
         let items = status.actions();
-        if let Some([report, controls]) = action_layout(parts[1], items.len()) {
+        if let Some(start) = status.client_confirmation() {
+            let body = status.body();
+            let message = body.rsplit_once('\n').map_or(body.as_str(), |(message, _)| message);
+            draw_guided(
+                frame, parts[1],
+                if start { "Запуск локального прокси" } else { "Остановка локального прокси" },
+                message,
+                (1, 1, "Подтверждение",
+                    if start { "y запустить · n/Esc отменить" } else { "y остановить · n/Esc отменить" }),
+                viewport, (None, None),
+            );
+        } else if let Some([report, controls]) = action_layout(parts[1], items.len()) {
             modal_panel!(frame, report, status.title(), &status.summary(), false);
             Actions {
                 items: &items,
@@ -5216,10 +5227,7 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
         .workspace_records()
         .into_iter()
         .find(|(_, active, _)| *active)
-        .map(|(id, _, _)| {
-            editor.client_profile_address(&id)
-                .map_or_else(|| id.clone(), |address| format!("{address} ({id})"))
-        })
+        .and_then(|(id, _, _)| editor.client_profile_label(&id))
         .unwrap_or_else(|| "Нет профиля".into());
     let running = ui.is_some_and(|u| u.owned_running(Role::Client));
     let (http, socks) = editor.client_proxy_addresses().unwrap_or(("—", "—"));
@@ -5237,7 +5245,7 @@ fn draw_client_modes(frame: &mut Frame<'_>, area: Rect, editor: &Editor, ui: Opt
         Line::raw(format!("Активный профиль: {active}")),
         Line::raw(format!(
             "Выбран: {} · {}",
-            editor.client_profile_address(editor.selected_record_id()).unwrap_or_else(|| editor.selected_record_id()),
+            editor.client_profile_label(editor.selected_record_id()).unwrap_or_else(|| "Нет профиля".into()),
             if editor.selected_reality() {
                 "REALITY"
             } else {
@@ -6405,7 +6413,9 @@ mod tests {
                 assert_eq!(recommended_step(editor, false).0, 'A');
                 assert_eq!(recommended_step(editor, true).0, 'V');
                 let view = rendered_interaction(160, 42, &model, &ui);
-                assert!(view.contains("Активный профиль: home"));
+                assert!(view.contains("Активный профиль: №1 · edge.example.org:443"));
+                assert!(view.contains("Выбран: №2 · backup.example.org:443"));
+                assert!(!view.contains("(home)"));
                 assert!(view.contains("Перед запуском подтвердите выбор профиля"));
             }
             ui.select_workspace_page(role, 4);

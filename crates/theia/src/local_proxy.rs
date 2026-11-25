@@ -389,7 +389,7 @@ impl RealityClient {
         let transport = match observed >> 2 {
             2 => "H2",
             3 => "H3",
-            _ => "ещё нет подтверждённого OPEN",
+            _ => "пока нет подтверждённого соединения",
         };
         let refresh = match generation.last_refresh.load(Ordering::Relaxed) {
             1 => "успешно",
@@ -411,9 +411,9 @@ impl RealityClient {
             Some(_) => "изменилось, новые запросы перепроверят",
             None => "не подтверждено, новые запросы могут быть отклонены",
         };
-        format!("Loopback listeners работают (не доказательство удалённого соединения)\nrevision={} reference_index={} valid_now={valid}\npolicy={policy} last_open={transport}; XHTTP={}\nH3 negative cache: {}\nDescriptor refresh: {refresh}\nSaved trust: {trust_state}",
-            value.descriptor().revision,value.descriptor().active_reference,
-            xhttp_observation(observed & 3),
+        format!("Локальный прокси работает. Это не подтверждает связь с сервером.\nВерсия описания: {} · номер референса: {} · актуально: {}\nРежим передачи: {} · последнее подтверждённое соединение: {transport}; XHTTP: {}\nВременный переход с H3: {}\nОбновление описания сервера: {refresh}\nСохранённое доверие: {trust_state}",
+            value.descriptor().revision,value.descriptor().active_reference, if valid { "да" } else { "нет" },
+            if policy == "auto" { "автоматически" } else { policy }, xhttp_observation(observed & 3),
             fallback.map_or("не применяется",|v|if v{"активен: временная сетевая недоступность QUIC"}else{"не активен"}))
     }
     async fn refresh(&self, generation: &RealityGeneration) -> Result<(), ClientError> {
@@ -938,9 +938,9 @@ impl ProxyClient {
                 let opened = match d.last_transport() {
                     2 => "H2",
                     3 => "H3",
-                    _ => "ещё нет подтверждённого OPEN",
+                    _ => "пока нет подтверждённого соединения",
                 };
-                format!("Loopback listeners работают (не доказательство удалённого соединения)\nOwn-TLS policy={policy}; last_open={opened}; XHTTP={}\nH3 negative cache: {}", xhttp_observation(d.last_xhttp()), if d.fallback() { "активен: временная сетевая недоступность QUIC" } else { "не активен" })
+                format!("Локальный прокси работает. Это не подтверждает связь с сервером.\nРежим передачи: {} · последнее подтверждённое соединение: {opened}; XHTTP: {}\nВременный переход с H3: {}", if policy == "auto" { "автоматически" } else { policy }, xhttp_observation(d.last_xhttp()), if d.fallback() { "активен: временная сетевая недоступность QUIC" } else { "не активен" })
             }
         }
     }
@@ -2095,9 +2095,9 @@ mod selector_tests {
                 };
                 let current = managed.generation().await.unwrap();
                 let report = managed.runtime_report().await;
-                assert!(report.contains("Saved trust: совпадает"));
-                assert!(report.contains("last_open=ещё нет подтверждённого OPEN"));
-                assert!(report.contains(if socks_mode { "policy=h3" } else { "policy=h2" }));
+                assert!(report.contains("Сохранённое доверие: совпадает"));
+                assert!(report.contains("последнее подтверждённое соединение: пока нет подтверждённого соединения"));
+                assert!(report.contains(if socks_mode { "Режим передачи: h3" } else { "Режим передачи: h2" }));
                 managed_clients.push(managed.clone());
                 if let Carrier::H3(h3) = &current.carrier {
                     // Use the production dispatcher and a real OPEN_OK
@@ -2185,9 +2185,9 @@ mod selector_tests {
                 assert_eq!(&bytes, b"ping");
                 let report = managed_clients.last().unwrap().runtime_report().await;
                 assert!(report.contains(if socks_mode {
-                    "last_open=H3"
+                    "последнее подтверждённое соединение: H3"
                 } else {
-                    "last_open=H2"
+                    "последнее подтверждённое соединение: H2"
                 }));
                 established.push(stream);
                 proxies.push(proxy);

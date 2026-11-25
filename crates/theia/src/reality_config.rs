@@ -637,15 +637,41 @@ pub(crate) fn status_expected(
     id: &str,
     now: u64,
 ) -> Result<String, Error> {
+    let document = status_saved_document(path, expected)?;
+    status_document(&document, id, now)
+}
+
+fn status_saved_document(path: &Path, expected: [u8; 32]) -> Result<Config, Error> {
     path_string(path)?;
     let raw = config::editor_bytes(path).map_err(|_| Error::Storage)?;
     let actual: [u8; 32] = Sha256::digest(&raw).into();
     if actual != expected {
         return Err(Error::Approval);
     }
-    let document = config::parse(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
-        .map_err(|_| Error::Format)?;
-    status_document(&document, id, now)
+    config::parse(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
+        .map_err(|_| Error::Format)
+}
+
+/// Human-facing status; the diagnostic CLI report remains unchanged.
+pub(crate) fn client_status_expected(
+    path: &Path, expected: [u8; 32], id: &str, now: u64,
+) -> Result<String, Error> {
+    let Config::Client(doc) = status_saved_document(path, expected)? else {
+        return Err(Error::Format);
+    };
+    let profile = doc.client.profiles.iter().find(|p| p.id == id).ok_or(Error::Scope)?;
+    let enrollment = pinned_client(profile)?;
+    let value = enrollment.store()?.inspect(now).map_err(|_| Error::Descriptor)?;
+    let modes = value.effective_modes();
+    let yes = |v| if v { "доступен" } else { "недоступен" };
+    let valid = value.check_time(now).is_ok();
+    Ok(format!(
+        "Сервер: {}\nЗащита: REALITY\nПрофиль выбран для запуска: {}\nРежим передачи: автоматически\nОписание сервера: версия {} · {}\nПоддержка: H2 {}, H3 {}\nРежимы XHTTP: stream-one {}, stream-up {}\n{}\nСвязь с сервером пока не проверена этим экраном.",
+        profile.server, if doc.client.active_profile == id { "да" } else { "нет" },
+        value.descriptor().revision, if valid { "актуально" } else { "не действует сейчас" },
+        yes(modes.h2), yes(modes.h3), yes(modes.stream_one), yes(modes.stream_up),
+        if valid { "Можно перейти к проверке при запуске." } else { "Требуется восстановить доверие через администратора." }
+    ))
 }
 
 fn exact_client_record(path: &Path, expected: [u8; 32], id: &str) -> Result<Profile, Error> {
