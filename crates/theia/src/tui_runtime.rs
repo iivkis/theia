@@ -1053,7 +1053,9 @@ mod tests {
         }));
         assert!(matches!(panel.phase, Phase::CutoverConfirming { .. }));
         assert!(panel.body().contains("Смена материалов на текущих портах"));
-        assert!(panel.body().contains("независимая замена REALITY root необратима"));
+        assert!(panel
+            .body()
+            .contains("независимая замена REALITY root необратима"));
         panel.phase = Phase::CutoverApplying;
         panel.complete(Ok(StatusReply::RestartApplied { revision: 8 }));
         assert_eq!(panel.phase, Phase::CutoverApplied { revision: 8 });
