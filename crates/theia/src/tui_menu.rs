@@ -264,6 +264,17 @@ impl Menu {
 
     pub(crate) fn click(&mut self, area: Rect, x: u16, y: u16) {
         if area.width < 76 || area.height < 8 {
+            let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+            let rect = parts[0];
+            if x > rect.x && x < rect.right().saturating_sub(1)
+                && y > rect.y && y < rect.bottom().saturating_sub(1) {
+                let height = usize::from(rect.height.saturating_sub(2));
+                let index = Self::visible_start(self.selected(), self.count(), height) + usize::from(y - rect.y - 1);
+                if index < self.count() {
+                    if self.item.is_some() { self.item = Some(index); } else { self.group = index; }
+                    self.notice = None;
+                }
+            }
             return;
         }
         let content = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
@@ -296,17 +307,23 @@ impl Menu {
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(Clear, area);
         if area.width < 76 || area.height < 8 {
-            frame.render_widget(
-                Paragraph::new(self.body(usize::from(area.height)))
-                    .block(
-                        Block::default()
-                            .title(self.title())
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Cyan)),
-                    )
-                    .wrap(Wrap { trim: false }),
-                area,
-            );
+            let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+            let count = self.count();
+            let selected = self.selected();
+            let height = usize::from(parts[0].height.saturating_sub(2));
+            let start = Self::visible_start(selected, count, height);
+            let items = (start..(start + height).min(count)).map(|i| {
+                let (label, enabled) = if self.item.is_some() {
+                    let entry = self.groups()[self.group].entries[i];
+                    (entry.label, self.configured || !entry.requires_config)
+                } else { (self.groups()[i].title, true) };
+                let style = if i == selected { Style::default().fg(Color::Black).bg(Color::Cyan) }
+                    else if !enabled { Style::default().fg(Color::DarkGray) } else { Style::default() };
+                ListItem::new(format!("{} {label}{}", if i == selected { "›" } else { " " }, if enabled { "" } else { " [TOML]" })).style(style)
+            }).collect::<Vec<_>>();
+            let title = if self.item.is_some() { self.groups()[self.group].title } else { self.title() };
+            frame.render_widget(List::new(items).block(Block::default().title(format!("{title} · {}/{}", selected + 1, count)).borders(Borders::ALL)), parts[0]);
+            frame.render_widget(Paragraph::new(self.notice.unwrap_or("↑↓ выбрать · Enter открыть · Esc назад")), parts[1]);
             return;
         }
         let content = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
@@ -652,6 +669,54 @@ impl ConfigDialog {
             }
         }
     }
+    pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        if self.loading.is_some() { return None; }
+        if let Some(panel) = &self.reality { return panel.form(); }
+        if let Some(panel) = &self.enrollment { return panel.form(); }
+        if let Some(setup) = &self.setup {
+            if setup.review.is_some() { return None; }
+            let hints = match setup.role {
+                Role::Server => ["Уникальный ID.", "Один адрес для TCP и UDP.", "DNS-имя сертификата.", "Абсолютная file: ссылка на PEM.", "Абсолютная file: ссылка; не вставляйте ключ.", "Пользователь будет отключён до восстановления доступа."],
+                Role::Client => ["Имя профиля.", "Публичный адрес и порт.", "DNS-имя сервера.", "Абсолютная file: ссылка на доверенный CA.", "Ссылка на токен, не сам токен.", "Путь /v1/... из конфигурации сервера."],
+            };
+            return Some(Form {
+                fields: setup.labels().iter().enumerate().map(|(id, label)| Field {
+                    id, label, hint: hints[id],
+                    value: if matches!(id, 3 | 4) && !setup.fields[id].is_empty() {
+                        "Скрыто · ссылка введена".into()
+                    } else { setup.fields[id].to_string() },
+                }).collect(),
+                selected: setup.focus,
+                lead: format!("Новый файл: {}", self.input),
+                error: setup.error.unwrap_or_default().to_owned(),
+            });
+        }
+        let reality = if self.role == Role::Server { "SmartTheia REALITY" } else { "Импорт REALITY" };
+        let fields = vec![
+            Field { id: 0, label: "Открыть TOML", value: "Enter · существующий файл".into(), hint: "Введите путь к существующему файлу." },
+            Field { id: 1, label: reality, value: "F4 · создать через мастер".into(), hint: "Новый TOML, без собственного сертификата." },
+            Field { id: 2, label: "Own-TLS", value: "F2 · создать вручную".into(), hint: "Новый TOML с собственным TLS." },
+        ];
+        Some(Form {
+            fields,
+            selected: self.choice,
+            lead: format!("Путь к TOML: {}\nВведите путь прямо здесь · Ctrl+U очистить", self.input),
+            error: self.error.unwrap_or_default().to_owned(),
+        })
+    }
+
+    pub(crate) fn select_field(&mut self, id: usize) {
+        if self.loading.is_some() { return; }
+        if let Some(panel) = self.reality.as_mut() { panel.select_field(id); }
+        else if let Some(panel) = self.enrollment.as_mut() { panel.select_field(id); }
+        else if let Some(setup) = self.setup.as_mut() {
+            if setup.review.is_none() && id < setup.fields.len() { setup.focus = id; }
+        } else if id < 3 {
+            self.choice = id;
+        }
+    }
+
     pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
         if let Some(panel) = &self.reality {
             return panel.guide();
