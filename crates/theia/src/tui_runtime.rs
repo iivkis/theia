@@ -569,6 +569,20 @@ impl RuntimePanel {
         }
     }
 
+    pub(crate) fn apply_observation(&self) -> Option<([u8;32], &'static str, u64)> {
+        let (kind,revision)=match self.phase {
+            Phase::Applied{revision}=>("права доступа",revision),
+            Phase::QuotaApplied{revision}=>("лимиты",revision),
+            Phase::CutoverApplied{revision}=>("структура",revision),
+            _=>return None,
+        };
+        Some((self.saved_sha256?,kind,revision))
+    }
+
+    pub(crate) fn invalidates_apply_observation(&self) -> bool {
+        matches!(self.phase,Phase::RollbackApplying|Phase::RollbackApplied{..}|Phase::TlsRollbackApplying|Phase::TlsRollbackApplied{..}|Phase::RestartRollbackApplying|Phase::RestartRollbackApplied{..}|Phase::Indeterminate|Phase::Unavailable|Phase::LegacyStatus)
+    }
+
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
         let mut items = Vec::new();

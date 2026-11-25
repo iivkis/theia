@@ -419,6 +419,10 @@ impl EnrollmentPanel {
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
                 self.fields[self.focus] = Zeroizing::new(String::new());
             }
+            KeyCode::Enter if self.managed_paths() && self.focus < 4 && !self.fields[0].is_empty() && !self.fields[1].is_empty() && self.fields[4].is_empty() => {
+                self.focus=4;
+                self.error=None;
+            }
             KeyCode::Enter => match self.input() {
                 Ok(input) => {
                     let (tx, rx) = mpsc::channel();
@@ -501,12 +505,12 @@ impl EnrollmentPanel {
             "Только env:/file: ссылка, если в приглашении нет токена.",
         ];
         Some(Form {
-            fields: LABELS.iter().enumerate().filter(|(id, _)| !self.managed_paths() || !matches!(*id, 2 | 3)).map(|(id, label)| Field {
+            fields: LABELS.iter().enumerate().filter(|(id, _)| !self.managed_paths() || (if self.focus<4 {*id<2} else {*id>=4})).map(|(id, label)| Field {
                 id, label, hint: hints[id],
                 value: if self.fields[id].is_empty() { String::new() } else { format!("Скрыто · {} байт", self.fields[id].len()) },
             }).collect(),
             selected: self.focus,
-            lead: "1. Приглашение и файл допуска от администратора. 2. Отпечаток из отдельного канала. 3. Токен, только если нужен. Значения скрыты.".into(),
+            lead: if self.managed_paths() && self.focus<4 {"1. Получите приглашение и отдельный файл допуска у администратора. Далее — проверка отпечатка (F8 или Tab).".into()} else {"Отпечаток сверяется независимо от приглашения. Ссылка на токен нужна только при его отсутствии в приглашении. Значения скрыты.".into()},
             error: self.error.clone().unwrap_or_default(),
         })
     }
@@ -519,15 +523,18 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn guide(&self) -> (usize, usize, &'static str, &'static str) {
+        let total=if self.managed_paths(){4}else{3};
         if self.registration.is_some() {
-            return (3, 3, "Регистрация в TOML", "Enter предпросмотр · Y сохранить · Esc назад");
+            return (total,total,"Регистрация в TOML","Enter предпросмотр · Y сохранить · Esc назад");
         }
         match &self.stage {
-            Stage::Input => (1, 3, if self.focus<4 {"Приглашение и файл допуска"} else {"Проверка доверия и токена"}, "↑↓ поле · F8 раздел доверия/приглашения · Ctrl+U очистить · Enter проверить · Esc назад"),
-            Stage::Loading(_) => (2, 3, "Проверка приглашения", "Идёт локальная проверка"),
-            Stage::Confirm(_) => (2, 3, "Подтверждение доверия", "Y сохранить · N / Esc назад"),
-            Stage::Applying(_) | Stage::Creating(_) => (3, 3, "Сохранение", "Идёт запись; подключения нет"),
-            Stage::Done(_) => (3, 3, "Результат", "G зарегистрировать, если доступно · Esc назад"),
+            Stage::Input if self.managed_paths() && self.focus<4 => (1,4,"Приглашение и файл допуска","↑↓ поле · F8 далее · Enter продолжить · Ctrl+U очистить · Esc назад"),
+            Stage::Input if self.managed_paths() => (2,4,"Проверка доверия и токена","↑↓ поле · F8 назад · Enter проверить · Ctrl+U очистить · Esc отменить"),
+            Stage::Input => (1,3,"Приглашение и доверие","↑↓ поле · F8 раздел · Enter проверить · Ctrl+U очистить · Esc назад"),
+            Stage::Loading(_) => (total-1,total,"Проверка приглашения","Идёт локальная проверка"),
+            Stage::Confirm(_) => (total-1,total,"Подтверждение доверия","Y сохранить · N / Esc назад"),
+            Stage::Applying(_) | Stage::Creating(_) => (total,total,"Сохранение","Идёт запись; подключения нет"),
+            Stage::Done(_) => (total,total,"Результат","G зарегистрировать, если доступно · Esc назад"),
         }
     }
 

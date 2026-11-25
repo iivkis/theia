@@ -641,6 +641,7 @@ impl ConfigDialog {
                     self.input = path.to_owned();
                     self.error = None;
                     self.browser = None;
+                    if self.choice==3{self.choice=0;}
                 } else { browser.error = "Недопустимый путь".into(); }
             }
             return false;
@@ -651,15 +652,16 @@ impl ConfigDialog {
         }
         let code = match key.code {
             KeyCode::Up | KeyCode::BackTab => {
-                self.choice = (self.choice + 2) % 3;
+                self.choice = (self.choice + 3) % 4;
                 return false;
             }
             KeyCode::Down | KeyCode::Tab => {
-                self.choice = (self.choice + 1) % 3;
+                self.choice = (self.choice + 1) % 4;
                 return false;
             }
             KeyCode::Enter if self.choice == 1 => KeyCode::F(4),
             KeyCode::Enter if self.choice == 2 => KeyCode::F(2),
+            KeyCode::Enter if self.choice == 3 => {self.browser=Some(FileBrowser::new(&self.input));return false;}
             code => code,
         };
         match code {
@@ -784,6 +786,7 @@ impl ConfigDialog {
             Field { id: 0, label: "Открыть TOML", value: "Enter · существующий файл".into(), hint: "Введите путь к существующему файлу." },
             Field { id: 1, label: reality, value: "F4 · создать через мастер".into(), hint: "Новый TOML, без собственного сертификата." },
             Field { id: 2, label: "Own-TLS", value: "F2 · создать вручную".into(), hint: "Новый TOML с собственным TLS." },
+            Field { id: 3, label: "Выбрать файл или каталог", value: "F6 · файловый браузер".into(), hint: "Выбор пути не открывает и не создаёт файл." },
         ];
         Some(Form {
             fields,
@@ -803,7 +806,7 @@ impl ConfigDialog {
         else if let Some(panel) = self.enrollment.as_mut() { panel.select_field(id); }
         else if let Some(setup) = self.setup.as_mut() {
             if setup.review.is_none() && id < setup.fields.len() { setup.focus = id; }
-        } else if id < 3 {
+        } else if id < 4 {
             self.choice = id;
         }
     }

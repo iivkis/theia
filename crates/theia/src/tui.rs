@@ -398,6 +398,7 @@ struct Interaction {
     value_preview: bool,
     preview_text: Option<String>,
     modal_action: usize,
+    last_apply: Option<([u8;32], &'static str, u64)>,
     viewport: Viewport,
     welcome_choice: usize,
     editor: Option<Editor>,
@@ -435,13 +436,14 @@ struct Interaction {
 impl Interaction {
     fn new(editor: Option<Editor>) -> Self {
         Self {
-            workspace_page: 0,
+            workspace_page: usize::from(editor.is_some()),
             workspace_focus: WorkspaceFocus::Fields,
             workspace_action: 0,
             workspace_user: 0,
             value_preview: false,
             preview_text: None,
             modal_action: 0,
+            last_apply: None,
             viewport: Viewport::default(),
             welcome_choice: 0,
             editor,
@@ -737,6 +739,10 @@ impl Interaction {
                 self.editor = Some(editor);
                 self.config_dialog = None;
                 self.menu = None;
+                self.workspace_page=0;
+                self.workspace_focus=WorkspaceFocus::Actions;
+                self.workspace_action=0;
+                self.last_apply=None;
             }
         }
     }
@@ -937,7 +943,7 @@ impl Interaction {
             return;
         }
         let Some(columns) = workspace_columns(body) else {
-            if body.width<90 && self.workspace_focus==WorkspaceFocus::Navigation {
+            if self.workspace_focus==WorkspaceFocus::Navigation {
                 if event.row>body.y && event.row<body.bottom().saturating_sub(1) {
                     let i=usize::from(event.row-body.y-1);
                     if i<pages(role).len(){self.workspace_page=i;self.workspace_action=0;}
@@ -951,7 +957,7 @@ impl Interaction {
             }
             if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
                 let content=page_layout(body,role,self.workspace_page).map(|p|p[0]).unwrap_or(body);
-                if self.workspace_page<=1 {
+                if self.workspace_page==1 {
                     if let Some(id)=editor_field_hit(content,editor,event.column,event.row) {editor.workspace_select_field(id);self.workspace_focus=WorkspaceFocus::Fields;}
                 } else if role==Role::Server && self.workspace_page==2 && inside(content) && event.row>=content.y+2 && event.row<content.bottom().saturating_sub(1) {
                     let users=editor.workspace_users();
@@ -984,7 +990,7 @@ impl Interaction {
             return;
         }
         if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
-            if let Some([content, controls]) = page_layout(columns[2], role, self.workspace_page) {
+            if let Some([content, controls]) = page_layout(columns[2], role, self.workspace_page).or_else(||(self.workspace_focus==WorkspaceFocus::Actions).then_some([Rect::default(),columns[2]])) {
                 let items = page_actions(role, self.workspace_page);
                 if let Some(i) = (Actions { items: &items, selected: self.workspace_action }).hit(controls, event.column, event.row) {
                     self.workspace_action = i;
@@ -1001,7 +1007,7 @@ impl Interaction {
                     }
                     return;
                 }
-                if self.workspace_page <= 1 {
+                if self.workspace_page == 1 {
                     if let Some(id) = editor_field_hit(content, editor, event.column, event.row) {
                         editor.workspace_select_field(id);
                         self.workspace_focus = WorkspaceFocus::Fields;
@@ -1009,8 +1015,11 @@ impl Interaction {
                 }
                 return;
             }
-            if let Some(id) = editor_field_hit(columns[2], editor, event.column, event.row) {
-                editor.workspace_select_field(id);
+            if self.workspace_page==1 {
+                if let Some(id) = editor_field_hit(columns[2], editor, event.column, event.row) {
+                    editor.workspace_select_field(id);
+                    self.workspace_focus=WorkspaceFocus::Fields;
+                }
             }
         }
     }
@@ -1374,7 +1383,7 @@ impl Interaction {
                 }
                 if configured && self.workspace_visible() {
                     self.workspace_page = self.workspace_page.min(pages(role).len() - 1);
-                    if key.code == KeyCode::F(7) && self.workspace_page <= 1 {
+                    if key.code == KeyCode::F(7) && self.workspace_page == 1 {
                         self.value_preview = true;
                         return false;
                     }
@@ -1460,7 +1469,7 @@ impl Interaction {
                             return false;
                         }
                     }
-                    if self.workspace_page <= 1 && self.workspace_focus == WorkspaceFocus::Fields {
+                    if self.workspace_page == 1 && self.workspace_focus == WorkspaceFocus::Fields {
                         let index = self.editor_for(role).map_or(0,Editor::workspace_field_index);
                         let count = self.editor_for(role).map_or(0,Editor::field_count);
                         if key.code == KeyCode::Tab && index+1 >= count {
@@ -1470,7 +1479,7 @@ impl Interaction {
                             self.workspace_focus=WorkspaceFocus::Navigation; return false;
                         }
                     }
-                    if self.workspace_page > 1 && key.code == KeyCode::Enter {
+                    if self.workspace_page != 1 && matches!(key.code, KeyCode::Enter | KeyCode::Tab) {
                         if self.workspace_page == 4 { self.traffic_monitor = Some(crate::traffic::Monitor::new(role)); }
                         else { self.workspace_focus = WorkspaceFocus::Actions; }
                         return false;
@@ -2789,7 +2798,12 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         Some(_) => "Файл: сохранён",
         None => "Файл: не открыт",
     };
-    let state = if status.is_empty() { String::new() } else { format!("{saved} · Применение: проверьте статус процесса") };
+    let applied=if model.screen==Screen::Server {
+        interaction.and_then(|ui|ui.last_apply).and_then(|(digest,kind,revision)| {
+            file.filter(|e| !e.dirty() && e.saved_sha256()==digest).map(|_|format!("Последнее подтверждение: {kind}, rev {revision}"))
+        })
+    }else{None};
+    let state = if status.is_empty() { String::new() } else { format!("{saved} · {}",applied.unwrap_or_else(||"Применение: не подтверждено этой панелью".into())) };
     frame.render_widget(Paragraph::new(vec![Line::from(vec![
         Span::styled(format!(" {brand} "), Style::default().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {status}"), Style::default().fg(TEXT)),
@@ -3436,18 +3450,32 @@ fn user_table_start(selected: usize, count: usize, area: Rect) -> usize {
     let capacity = usize::from(area.height.saturating_sub(3)).max(1);
     selected.min(count.saturating_sub(1)).saturating_sub(capacity-1).min(count.saturating_sub(capacity))
 }
-fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui: Option<&Interaction>) {
+fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui: Option<&Interaction>, compact: bool) {
     let page = ui.map_or(0, |u| u.workspace_page.min(6));
     let items = page_actions(role, page);
     let focus = ui.map_or(WorkspaceFocus::Fields, |u| u.workspace_focus);
     let selected = ui.map_or(0, |u| u.workspace_action);
-    if workspace_columns(area).is_none() && area.width<90 && focus==WorkspaceFocus::Navigation {
+    if compact && focus==WorkspaceFocus::Navigation {
         let rows=pages(role).iter().enumerate().map(|(i,label)|ListItem::new(format!("{} {label}",if i==page{"›"}else{" "})).style(Style::default().fg(if i==page{ACCENT}else{TEXT}).bg(if i==page{FOCUS}else{SURFACE})));
         frame.render_widget(List::new(rows.collect::<Vec<_>>()).block(tui_widgets::section("Разделы · ↑↓ Enter",true)),area);
         return;
     }
     let [content, controls] = page_layout(area, role, page).unwrap_or([area, Rect::default()]);
-    if page <= 1 {
+    if page == 0 {
+        let local=if role==Role::Server {ui.map_or("Неизвестно",|u|u.server_process.status())}
+            else if ui.is_some_and(|u|u.client_background.as_ref().is_some_and(StatusPanel::local_running)||u.reality_status.as_ref().is_some_and(StatusPanel::local_running)) {"Локальный процесс запущен или запускается"} else {"Локальный процесс не запущен"};
+        let title=if role==Role::Server{"Обзор сервера"}else{"Обзор клиента"};
+        let records=if role==Role::Server{"Подключения"}else{"Профили"};
+        let users=editor.workspace_users();
+        let status=if editor.write_uncertain(){"Запись не подтверждена"}else if editor.dirty(){"Есть несохранённые изменения"}else{"Файл сохранён"};
+        let help=if role==Role::Server{"Создайте подключение, добавьте пользователя, затем запустите сервер и передайте приглашение."}else{"Импортируйте приглашение, выберите активный профиль и запустите подключение."};
+        let lines=vec![Line::styled(format!("{records}: {}",editor.record_count()),Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Line::raw(if role==Role::Server{format!("Пользователи в файле: {}",users.len())}else{editor.selection_summary()}),
+            Line::raw(format!("Конфигурация: {status}")),Line::raw(format!("Процесс: {local}")),
+            Line::raw(""),Line::styled("Что делать дальше",Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),Line::raw(help),
+            Line::raw(""),Line::raw("Tab / F6 — выбрать действие. Сохранение не применяет настройки автоматически.")];
+        frame.render_widget(Paragraph::new(lines).block(tui_widgets::section(title,true)).wrap(Wrap{trim:true}),content);
+    } else if page == 1 {
         draw_editor(frame, content, editor);
     } else if role == Role::Server && page == 2 {
         let users = editor.workspace_users();
@@ -3491,7 +3519,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
     }
     let Some([nav, records, details]) = workspace_columns(area) else {
         if let Some(editor) = editor {
-            draw_page(frame, area, role, editor, ui);
+            draw_page(frame, area, role, editor, ui, true);
         } else {
             draw_welcome(frame, area, role, welcome_choice);
         }
@@ -3561,7 +3589,7 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
                 inner,
             );
         }
-        draw_page(frame, details, role, editor, ui);
+        draw_page(frame, details, role, editor, ui, false);
     } else {
         panel(
             frame,
@@ -3796,6 +3824,11 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         }
         if let Some(runtime) = interaction.runtime.as_mut() {
             runtime.poll();
+            if let Some(observation)=runtime.apply_observation() {
+                interaction.last_apply=Some(observation);
+            } else if runtime.invalidates_apply_observation() {
+                interaction.last_apply=None;
+            }
         }
         #[cfg(windows)]
         if let Some(proxy) = interaction.system_proxy.as_mut() {
@@ -4029,7 +4062,6 @@ mod tests {
         assert_eq!(ui.workspace_focus,WorkspaceFocus::Actions);
         ui.update(&mut model,press(KeyCode::F(6)));
         ui.update(&mut model,press(KeyCode::Down));
-        ui.update(&mut model,press(KeyCode::Down));
         assert_eq!(ui.workspace_page,2);
         assert!(ui.menu.is_none());
         ui.update(&mut model,press(KeyCode::Enter));
@@ -4175,7 +4207,9 @@ mod tests {
         assert_eq!(dialog.form().unwrap().selected, 1);
         ui.update(&mut model, press(KeyCode::Enter));
         let dialog = ui.config_dialog.as_ref().unwrap();
-        let form = dialog.form().unwrap();
+        let _ = dialog;
+        ui.update(&mut model,press(KeyCode::F(8)));
+        let form = ui.config_dialog.as_ref().unwrap().form().unwrap();
         let target = guided_form_area(body, form.fields.len());
         let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y) == Some(4)).unwrap();
         ui.mouse(&mut model, click(target.x + 2, y), area);
@@ -4188,7 +4222,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let details = workspace_columns(body).unwrap()[2];
-        let details=page_layout(details,Role::Client,0).map(|p|p[0]).unwrap_or(details);
+        let details=page_layout(details,Role::Client,1).map(|p|p[0]).unwrap_or(details);
         let table = editor_layout(details).unwrap()[1];
         let y = (table.y..table.bottom()).find(|&y| editor_field_hit(details, ui.editor.as_ref().unwrap(), table.x + 2, y) == Some(1)).unwrap();
         ui.mouse(&mut model, click(table.x + 2, y), area);
@@ -4223,7 +4257,9 @@ mod tests {
                 assert!(snapshot.contains("443"));
                 assert!(snapshot.contains("ID первого пользователя"));
             } else {
-                assert!(snapshot.contains("Fingerprint"));
+                assert!(snapshot.contains("Файл допуска"));
+                ui.update(&mut model,press(KeyCode::F(8)));
+                assert!(rendered_interaction(120,40,&model,&ui).contains("Fingerprint"));
             }
             ui.update(&mut model, press(KeyCode::Esc));
             assert!(!path.exists());
