@@ -456,21 +456,57 @@ async fn launch_client_with_profile(
     doc.client.proxy.socks5_listen = socks.to_string();
     let config = dir.0.join("client.toml");
     theia::config::atomic_write(&config, &theia::config::Config::Client(doc)).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_theia"));
+    command
+        .arg("client")
+        .arg("run")
+        .arg("--config")
+        .arg(&config)
+        .env("THEIA_CI_TEST_TOKEN", token())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit());
+    // A successful TCP connect alone is not proof that this child owns the
+    // listener: an unrelated parallel fixture can claim an ephemeral port.
+    // Require the child's isolated native management endpoint to attest the
+    // exact saved config before issuing the first application CONNECT.
+    #[cfg(target_os = "linux")]
+    let control = {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = dir.0.join("ctl");
+        std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        command.env("THEIA_CLIENT_CONTROL_DIR", &path);
+        path
+    };
+    #[cfg(target_os = "windows")]
+    let control = {
+        let id = format!("ci-{}-{}", std::process::id(), http.port());
+        command.env("THEIA_CLIENT_CONTROL_PIPE", &id);
+        id
+    };
     drop(http_reservation);
     drop(socks_reservation);
-    let mut child = ChildProcess(
-        std::process::Command::new(env!("CARGO_BIN_EXE_theia"))
-            .arg("client")
-            .arg("run")
-            .arg("--config")
-            .arg(&config)
-            .env("THEIA_CI_TEST_TOKEN", token())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let mut child = ChildProcess(command.spawn().unwrap());
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        use theia::management::{StatusCommand, StatusReply};
+        let expected: [u8; 32] = Sha256::digest(std::fs::read(&config).unwrap()).into();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(child.0.try_wait().unwrap().is_none(), "client exited before readiness");
+                #[cfg(target_os = "linux")]
+                let status = theia::management::query_in(&control, StatusCommand::ClientStatus).await;
+                #[cfg(target_os = "windows")]
+                let status = theia::windows_control::query_pipe(&control, StatusCommand::ClientStatus).await;
+                if let Ok(StatusReply::ClientRunning { revision, config_sha256, .. }) = status {
+                    assert_eq!(revision, 1);
+                    assert_eq!(config_sha256, expected);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.expect("exact client readiness deadline");
+    }
     wait_for_proxy(http, &mut child).await;
     wait_for_proxy(socks, &mut child).await;
     (dir, child, http, socks)
