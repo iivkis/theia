@@ -1057,8 +1057,12 @@ impl Editor {
 
     pub fn selection_summary(&self) -> String {
         if self.selected_reality() {
-            return format!("REALITY {}/{}: {} [сохранённый профиль, runtime: V]",
-                self.selected_record + 1, self.record_count(), self.selected_record_id());
+            return format!(
+                "REALITY {}/{}: {} [сохранённый профиль, runtime: V]",
+                self.selected_record + 1,
+                self.record_count(),
+                self.selected_record_id()
+            );
         }
         match self.role {
             Role::Server => format!(
@@ -1238,10 +1242,18 @@ impl Editor {
 
     pub(crate) fn selected_reality(&self) -> bool {
         match &self.draft {
-            Config::Server(doc) => doc.server.inbounds.get(self.selected_record).is_some_and(|i|
-                i.security_mode == crate::security_profile::SecurityMode::SmartReality),
-            Config::Client(doc) => doc.client.profiles.get(self.selected_record).is_some_and(|p|
-                p.tls_profile == "smart-reality"),
+            Config::Server(doc) => doc
+                .server
+                .inbounds
+                .get(self.selected_record)
+                .is_some_and(|i| {
+                    i.security_mode == crate::security_profile::SecurityMode::SmartReality
+                }),
+            Config::Client(doc) => doc
+                .client
+                .profiles
+                .get(self.selected_record)
+                .is_some_and(|p| p.tls_profile == "smart-reality"),
         }
     }
 

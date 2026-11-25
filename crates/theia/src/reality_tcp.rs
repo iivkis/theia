@@ -8,8 +8,8 @@ use crate::{
     identity_tls::Branch,
     reality_admission::{self, Context, ReplayGuard, Secret},
     reality_generation::Manager,
-    server::{self, ServerContext, ServerError},
     reference_health::RelayLease,
+    server::{self, ServerContext, ServerError},
 };
 use std::{
     io,
@@ -301,30 +301,63 @@ pub struct PreparedTcp {
 }
 
 impl PreparedTcp {
-    pub fn prepare(listener: TcpListener, document: &Config, inbound_id: &str) -> Result<Self, ServerError> {
-        let Config::Server(doc) = document else { return Err(ServerError::Config); };
-        let inbound = doc.server.inbounds.iter().find(|i| i.id == inbound_id).ok_or(ServerError::Config)?;
-        let expected: std::net::SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
-        if listener.local_addr().map_err(|_| ServerError::Io)? != expected { return Err(ServerError::Config); }
+    pub fn prepare(
+        listener: TcpListener,
+        document: &Config,
+        inbound_id: &str,
+    ) -> Result<Self, ServerError> {
+        let Config::Server(doc) = document else {
+            return Err(ServerError::Config);
+        };
+        let inbound = doc
+            .server
+            .inbounds
+            .iter()
+            .find(|i| i.id == inbound_id)
+            .ok_or(ServerError::Config)?;
+        let expected: std::net::SocketAddr =
+            inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
+        if listener.local_addr().map_err(|_| ServerError::Io)? != expected {
+            return Err(ServerError::Config);
+        }
         let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
         let manager = Manager::new(document, inbound_id, now).map_err(|_| ServerError::Config)?;
         let lease = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
-        let context=Arc::new(ServerContext::new(inbound,&doc.server.users,&doc.server.policy));
+        let context = Arc::new(ServerContext::new(
+            inbound,
+            &doc.server.users,
+            &doc.server.policy,
+        ));
         Self::from_shared(listener, lease, context, now)
     }
 
-    pub(crate) fn from_shared(listener: TcpListener, lease: Arc<crate::reality_generation::Lease>,
-        context: Arc<ServerContext>, now: u64) -> Result<Self, ServerError> {
-        Self::from_live(listener,crate::reality_live::Live::new(lease,context,now)?)
+    pub(crate) fn from_shared(
+        listener: TcpListener,
+        lease: Arc<crate::reality_generation::Lease>,
+        context: Arc<ServerContext>,
+        now: u64,
+    ) -> Result<Self, ServerError> {
+        Self::from_live(
+            listener,
+            crate::reality_live::Live::new(lease, context, now)?,
+        )
     }
 
-    pub(crate) fn from_live(listener:TcpListener,live:Arc<crate::reality_live::Live>)->Result<Self,ServerError>{
-        Ok(Self { listener,live,relay:Arc::new(RelayGate::default()),
-            inspection_slots:Arc::new(Semaphore::new(64)) })
+    pub(crate) fn from_live(
+        listener: TcpListener,
+        live: Arc<crate::reality_live::Live>,
+    ) -> Result<Self, ServerError> {
+        Ok(Self {
+            listener,
+            live,
+            relay: Arc::new(RelayGate::default()),
+            inspection_slots: Arc::new(Semaphore::new(64)),
+        })
     }
 
     pub async fn serve(self) -> Result<(), ServerError> {
-        crate::tcp_bbr::select(&self.listener).map_err(|_| ServerError::TcpControllerUnavailable)?;
+        crate::tcp_bbr::select(&self.listener)
+            .map_err(|_| ServerError::TcpControllerUnavailable)?;
         let shared = Arc::new(self);
         let mut tasks = JoinSet::new();
         loop {

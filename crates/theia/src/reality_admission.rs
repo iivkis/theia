@@ -194,8 +194,10 @@ impl Secret {
     /// branches and both signers during planned overlap. It is not a TLS
     /// private key or bearer. Never put it in a public descriptor or logs.
     pub fn save_new(&self, scope: &Scope, path: &Path) -> Result<(), Error> {
-        if !config::valid_id(&scope.inbound) || !config::valid_remote(&scope.endpoint)
-            || !crate::bounded_input::explicit_file_path(path) {
+        if !config::valid_id(&scope.inbound)
+            || !config::valid_remote(&scope.endpoint)
+            || !crate::bounded_input::explicit_file_path(path)
+        {
             return Err(Error::Scope);
         }
         let raw = self.encode(scope);
@@ -207,22 +209,36 @@ impl Secret {
 
     fn encode(&self, scope: &Scope) -> Zeroizing<String> {
         let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(&self.0[..]));
-        Zeroizing::new(format!("THEIA-ADMISSION-V1\n{}\n{}\n{}\n",
-            scope.inbound, scope.endpoint, encoded.as_str()))
+        Zeroizing::new(format!(
+            "THEIA-ADMISSION-V1\n{}\n{}\n{}\n",
+            scope.inbound,
+            scope.endpoint,
+            encoded.as_str()
+        ))
     }
 
     /// Copy the already validated private input into a new protected file
     /// owned by this enrollment transaction. The source is never modified.
-    pub(crate) fn stage_for_profile(&self, scope: &Scope, profile: &Path)
-        -> Result<crate::client_import::PrivateBearer, Error> {
+    pub(crate) fn stage_for_profile(
+        &self,
+        scope: &Scope,
+        profile: &Path,
+    ) -> Result<crate::client_import::PrivateBearer, Error> {
         let raw = self.encode(scope);
-        crate::client_import::PrivateBearer::create_payload(profile, "admission", "key", raw.as_bytes())
-            .map_err(|_| Error::Storage)
+        crate::client_import::PrivateBearer::create_payload(
+            profile,
+            "admission",
+            "key",
+            raw.as_bytes(),
+        )
+        .map_err(|_| Error::Storage)
     }
 
     pub fn load(scope: &Scope, path: &Path) -> Result<Self, Error> {
-        if !config::valid_id(&scope.inbound) || !config::valid_remote(&scope.endpoint)
-            || !crate::bounded_input::explicit_file_path(path) {
+        if !config::valid_id(&scope.inbound)
+            || !config::valid_remote(&scope.endpoint)
+            || !crate::bounded_input::explicit_file_path(path)
+        {
             return Err(Error::Scope);
         }
         let raw = crate::bounded_input::read(path, 4096, true, true).map_err(|_| Error::Storage)?;
@@ -230,7 +246,8 @@ impl Secret {
         let mut lines = text.split('\n');
         if lines.next() != Some("THEIA-ADMISSION-V1")
             || lines.next() != Some(scope.inbound.as_str())
-            || lines.next() != Some(scope.endpoint.as_str()) {
+            || lines.next() != Some(scope.endpoint.as_str())
+        {
             return Err(Error::Scope);
         }
         let encoded = lines.next().ok_or(Error::Format)?;
@@ -240,7 +257,9 @@ impl Secret {
         let mut secret = Zeroizing::new([0; 32]);
         // Base64 may require a slightly larger output buffer for decode_slice.
         let mut decoded = Zeroizing::new([0; 33]);
-        let count = URL_SAFE_NO_PAD.decode_slice(encoded, decoded.as_mut()).map_err(|_| Error::Format)?;
+        let count = URL_SAFE_NO_PAD
+            .decode_slice(encoded, decoded.as_mut())
+            .map_err(|_| Error::Format)?;
         if count != 32 {
             return Err(Error::Format);
         }
@@ -463,10 +482,18 @@ mod tests {
     fn scope_bound_admission_material_is_create_only_and_private() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("theia-admission-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "theia-admission-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir(&dir).unwrap();
         struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let _cleanup = Cleanup(dir.clone());
         let path = dir.join("admission.key");
         let scope = scope();
@@ -475,10 +502,18 @@ mod tests {
         let original = std::fs::read(&path).unwrap();
         assert!(Secret::generate().unwrap().save_new(&scope, &path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), original);
-        let wrong = Scope { inbound: "other".into(), endpoint: scope.endpoint.clone() };
+        let wrong = Scope {
+            inbound: "other".into(),
+            endpoint: scope.endpoint.clone(),
+        };
         assert!(Secret::load(&wrong, &path).is_err());
         let restored = Secret::load(&scope, &path).unwrap();
-        let context = Context { scope: &scope, identity: [3; 32], reference: "ref.example.org", branch: Branch::H3 };
+        let context = Context {
+            scope: &scope,
+            identity: [3; 32],
+            reference: "ref.example.org",
+            branch: Branch::H3,
+        };
         let mut message = hello(context.reference, context.branch);
         seal(&restored, &context, &mut message, 2000).unwrap();
         let guard = ReplayGuard::new(4, 1000).unwrap();

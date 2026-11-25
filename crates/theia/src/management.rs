@@ -35,8 +35,8 @@ use tokio::{
 const SOCKET_NAME: &str = "theia-server.sock";
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(any(target_os="linux",target_os="windows"))]
-pub(crate) const CLIENT_TIMEOUT:Duration=Duration::from_secs(15);
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_COMMAND_BYTES: usize = 256;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -79,8 +79,14 @@ impl std::error::Error for ManagementError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCommand {
     ClientStatus,
-    ClientPreview{expected_revision:u64,candidate_sha256:[u8;32]},
-    ClientApply{expected_revision:u64,candidate_sha256:[u8;32]},
+    ClientPreview {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
+    },
+    ClientApply {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
+    },
     Health,
     Status,
     /// Explicitly rejected in this read-only slice. Never reload implicitly.
@@ -93,11 +99,22 @@ pub enum StatusCommand {
     /// Advisory last-same-port-identity recovery readiness (no PEM values).
     CheckTlsRollback,
     CheckAuthRollback,
-    ApplyAuthRollback { expected_revision:u64 },
+    ApplyAuthRollback {
+        expected_revision: u64,
+    },
     CheckRestartRollback,
-    ApplyRestartRollback{expected_revision:u64},
-    CheckRestartBound{expected_revision:u64,candidate_sha256:[u8;32]},
-    RealityStatus { id:[u8;64], len:u8, manifest:[u8;32] },
+    ApplyRestartRollback {
+        expected_revision: u64,
+    },
+    CheckRestartBound {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
+    },
+    RealityStatus {
+        id: [u8; 64],
+        len: u8,
+        manifest: [u8; 32],
+    },
     /// Explicit one-shot CAS on the protected native management endpoint.
     ApplyTlsRollback {
         expected_revision: u64,
@@ -130,9 +147,19 @@ pub enum StatusCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusReply {
-    ClientRunning{revision:u64,config_sha256:[u8;32],descriptor_revision:u64,transport:u8,fallback:bool},
-    ClientReady{revision:u64},
-    ClientApplied{revision:u64},
+    ClientRunning {
+        revision: u64,
+        config_sha256: [u8; 32],
+        descriptor_revision: u64,
+        transport: u8,
+        fallback: bool,
+    },
+    ClientReady {
+        revision: u64,
+    },
+    ClientApplied {
+        revision: u64,
+    },
     Healthy,
     Running {
         inbounds: usize,
@@ -167,23 +194,49 @@ pub enum StatusReply {
     TlsRollbackApplied {
         revision: u64,
     },
-    AuthRollbackReady { revision:u64, remaining_seconds:u64 },
-    AuthRollbackApplied { revision:u64 },
-    RestartRollbackReady{revision:u64,remaining_seconds:u64},
-    RestartRollbackApplied{revision:u64},
-    RestartPreview{same_port:bool,material_sha256:[u8;32]},
-    RealityRunning { generation:u64, revision:u64, health_revision:u64, active_reference:u8, overlap:bool },
+    AuthRollbackReady {
+        revision: u64,
+        remaining_seconds: u64,
+    },
+    AuthRollbackApplied {
+        revision: u64,
+    },
+    RestartRollbackReady {
+        revision: u64,
+        remaining_seconds: u64,
+    },
+    RestartRollbackApplied {
+        revision: u64,
+    },
+    RestartPreview {
+        same_port: bool,
+        material_sha256: [u8; 32],
+    },
+    RealityRunning {
+        generation: u64,
+        revision: u64,
+        health_revision: u64,
+        active_reference: u8,
+        overlap: bool,
+    },
     RealitySuspended,
     Applied {
         revision: u64,
     },
 }
 
-impl StatusCommand{
-    pub fn reality_status(id:&str,manifest:[u8;32])->Result<Self,ManagementError>{
-        if !crate::config::valid_id(id)||manifest==[0;32]{return Err(ManagementError::InvalidReply);}
-        let mut bytes=[0;64];bytes[..id.len()].copy_from_slice(id.as_bytes());
-        Ok(Self::RealityStatus{id:bytes,len:id.len() as u8,manifest})
+impl StatusCommand {
+    pub fn reality_status(id: &str, manifest: [u8; 32]) -> Result<Self, ManagementError> {
+        if !crate::config::valid_id(id) || manifest == [0; 32] {
+            return Err(ManagementError::InvalidReply);
+        }
+        let mut bytes = [0; 64];
+        bytes[..id.len()].copy_from_slice(id.as_bytes());
+        Ok(Self::RealityStatus {
+            id: bytes,
+            len: id.len() as u8,
+            manifest,
+        })
     }
 }
 
@@ -226,7 +279,7 @@ pub struct StatusServer {
     live: Option<Arc<crate::live_auth::LiveAuthorization>>,
     runtime: Option<Arc<crate::runtime_generation::State>>,
     restarts: Option<mpsc::Sender<crate::runtime_generation::RestartRequest>>,
-    client:Option<Arc<crate::local_proxy::ClientRuntime>>,
+    client: Option<Arc<crate::local_proxy::ClientRuntime>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -257,7 +310,7 @@ impl StatusServer {
             live: None,
             runtime: None,
             restarts: None,
-            client:None,
+            client: None,
         })
     }
 
@@ -279,11 +332,12 @@ impl StatusServer {
         self
     }
 
-    pub(crate) fn with_client(mut self,client:Arc<crate::local_proxy::ClientRuntime>)->Self{
-        self.client=Some(client);self
+    pub(crate) fn with_client(mut self, client: Arc<crate::local_proxy::ClientRuntime>) -> Self {
+        self.client = Some(client);
+        self
     }
-    pub(crate) fn with_runtime(mut self,state:Arc<crate::runtime_generation::State>)->Self{
-        self.runtime=Some(state);
+    pub(crate) fn with_runtime(mut self, state: Arc<crate::runtime_generation::State>) -> Self {
+        self.runtime = Some(state);
         self
     }
 
@@ -415,19 +469,31 @@ where
                     format!("theia-status-v1 running inbounds={inbounds}\n")
                 }
             }
-            candidate if parse_quota_revision(candidate).is_some()
-                && runtime.as_ref().is_some_and(|r|r.has_reality_ledger())=>{
-                if let (Some(preflight),Some(runtime),Some(previous))=(&preflight,&runtime,&observed){
-                    let (expected,digest)=parse_quota_revision(candidate).expect("parsed");
-                    let preflight=preflight.clone();
-                    match tokio::task::spawn_blocking(move||preflight.load_quota_candidate_bound(digest)).await{
-                        Ok(Ok(document))=>match runtime.apply_reality_quota(previous,expected,&document){
-                            Ok(revision)=>format!("theia-quota-v1 applied revision={revision}\n"),
-                            Err(_)=>"theia-quota-v1 rejected\n".into(),
+            candidate
+                if parse_quota_revision(candidate).is_some()
+                    && runtime.as_ref().is_some_and(|r| r.has_reality_ledger()) =>
+            {
+                if let (Some(preflight), Some(runtime), Some(previous)) =
+                    (&preflight, &runtime, &observed)
+                {
+                    let (expected, digest) = parse_quota_revision(candidate).expect("parsed");
+                    let preflight = preflight.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        preflight.load_quota_candidate_bound(digest)
+                    })
+                    .await
+                    {
+                        Ok(Ok(document)) => match runtime
+                            .apply_reality_quota(previous, expected, &document)
+                        {
+                            Ok(revision) => format!("theia-quota-v1 applied revision={revision}\n"),
+                            Err(_) => "theia-quota-v1 rejected\n".into(),
                         },
-                        _=>"theia-quota-v1 rejected\n".into(),
+                        _ => "theia-quota-v1 rejected\n".into(),
                     }
-                }else{"ERR unsupported\n".into()}
+                } else {
+                    "ERR unsupported\n".into()
+                }
             }
             candidate
                 if parse_restart_revision(candidate).is_some()
@@ -511,81 +577,136 @@ where
                     "ERR unsupported\n".to_owned()
                 }
             }
-            candidate if parse_restart_preview(candidate).is_some()=>{
-                if let (Some(runtime),Some(previous),Some(preflight))=(&runtime,&observed,&preflight){
-                    let (expected,digest)=parse_restart_preview(candidate).expect("parsed");
-                    let preflight=preflight.clone();
-                    let result=tokio::task::spawn_blocking(move||preflight.preview_restart_bound(digest)).await;
-                    match result{
-                        Ok(Ok((same_port,material))) if runtime.still_current(previous,expected)=>{
-                            let hex=material.iter().map(|b|format!("{b:02x}")).collect::<String>();
-                            let mode=if same_port{"same-port"}else{"fresh"};
+            candidate if parse_restart_preview(candidate).is_some() => {
+                if let (Some(runtime), Some(previous), Some(preflight)) =
+                    (&runtime, &observed, &preflight)
+                {
+                    let (expected, digest) = parse_restart_preview(candidate).expect("parsed");
+                    let preflight = preflight.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        preflight.preview_restart_bound(digest)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok((same_port, material)))
+                            if runtime.still_current(previous, expected) =>
+                        {
+                            let hex = material
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>();
+                            let mode = if same_port { "same-port" } else { "fresh" };
                             format!("theia-restart-preview-v1 {mode} sha256={hex}\n")
                         }
-                        _=>"theia-restart-preview-v1 rejected\n".into(),
+                        _ => "theia-restart-preview-v1 rejected\n".into(),
                     }
-                }else{"ERR unsupported\n".into()}
-            }
-            b"restart-rollback-check"=>{
-                match runtime.as_ref().and_then(|r|r.restart_rollback_status()){
-                    Some((revision,seconds))=>format!("theia-restart-rollback-v1 ready revision={revision} seconds={seconds}\n"),
-                    None=>"theia-restart-rollback-v1 unavailable\n".into(),
+                } else {
+                    "ERR unsupported\n".into()
                 }
             }
-            candidate if parse_restart_rollback(candidate).is_some()=>{
-                if let (Some(runtime),Some(previous),Some(restarts))=(&runtime,&observed,&restarts){
-                    let expected=parse_restart_rollback(candidate).expect("parsed");
-                    if runtime.still_current(previous,expected)&&runtime.restart_rollback_status().map(|(r,_)|r)==Some(expected){
-                        let (complete,response)=oneshot::channel();
-                        let request=crate::runtime_generation::RestartRequest{
-                            kind:crate::runtime_generation::ChangeKind::StructuralRollback,
-                            previous:previous.clone(),expected_revision:expected,
-                            candidate:previous.document.as_ref().clone(),material:None,complete,
-                        };
-                        if restarts.try_send(request).is_ok(){
-                            match response.await{
-                                Ok(Ok(revision))=>format!("theia-restart-rollback-v1 applied revision={revision}\n"),
-                                _=>"theia-restart-rollback-v1 rejected\n".into(),
-                            }
-                        }else{"theia-restart-rollback-v1 rejected\n".into()}
-                    }else{"theia-restart-rollback-v1 rejected\n".into()}
-                }else{"ERR unsupported\n".into()}
+            b"restart-rollback-check" => {
+                match runtime.as_ref().and_then(|r| r.restart_rollback_status()) {
+                    Some((revision, seconds)) => format!(
+                        "theia-restart-rollback-v1 ready revision={revision} seconds={seconds}\n"
+                    ),
+                    None => "theia-restart-rollback-v1 unavailable\n".into(),
+                }
             }
-            candidate if parse_reality_status(candidate).is_some()=>{
-                let (id,manifest)=parse_reality_status(candidate).expect("parsed");
-                match runtime.as_ref().and_then(|state|state.reality_status(id,manifest)){
-                    Some(Some(s))=>format!("theia-reality-v1 g={} r={} h={} a={} o={}\n",
-                        s.generation,s.revision,s.health_revision,s.active_reference,u8::from(s.overlap)),
-                    Some(None)=>"theia-reality-v1 suspended\n".into(),
-                    None=>"ERR unsupported\n".into(),
+            candidate if parse_restart_rollback(candidate).is_some() => {
+                if let (Some(runtime), Some(previous), Some(restarts)) =
+                    (&runtime, &observed, &restarts)
+                {
+                    let expected = parse_restart_rollback(candidate).expect("parsed");
+                    if runtime.still_current(previous, expected)
+                        && runtime.restart_rollback_status().map(|(r, _)| r) == Some(expected)
+                    {
+                        let (complete, response) = oneshot::channel();
+                        let request = crate::runtime_generation::RestartRequest {
+                            kind: crate::runtime_generation::ChangeKind::StructuralRollback,
+                            previous: previous.clone(),
+                            expected_revision: expected,
+                            candidate: previous.document.as_ref().clone(),
+                            material: None,
+                            complete,
+                        };
+                        if restarts.try_send(request).is_ok() {
+                            match response.await {
+                                Ok(Ok(revision)) => format!(
+                                    "theia-restart-rollback-v1 applied revision={revision}\n"
+                                ),
+                                _ => "theia-restart-rollback-v1 rejected\n".into(),
+                            }
+                        } else {
+                            "theia-restart-rollback-v1 rejected\n".into()
+                        }
+                    } else {
+                        "theia-restart-rollback-v1 rejected\n".into()
+                    }
+                } else {
+                    "ERR unsupported\n".into()
+                }
+            }
+            candidate if parse_reality_status(candidate).is_some() => {
+                let (id, manifest) = parse_reality_status(candidate).expect("parsed");
+                match runtime
+                    .as_ref()
+                    .and_then(|state| state.reality_status(id, manifest))
+                {
+                    Some(Some(s)) => format!(
+                        "theia-reality-v1 g={} r={} h={} a={} o={}\n",
+                        s.generation,
+                        s.revision,
+                        s.health_revision,
+                        s.active_reference,
+                        u8::from(s.overlap)
+                    ),
+                    Some(None) => "theia-reality-v1 suspended\n".into(),
+                    None => "ERR unsupported\n".into(),
                 }
             }
             b"auth-rollback-check" => {
-                if let Some(runtime)=&runtime{
-                    match runtime.auth_rollback_status(){
-                        Some((revision,seconds))=>format!("theia-auth-rollback-v1 ready revision={revision} seconds={seconds}\n"),
-                        None=>"theia-auth-rollback-v1 unavailable\n".to_owned(),
+                if let Some(runtime) = &runtime {
+                    match runtime.auth_rollback_status() {
+                        Some((revision, seconds)) => format!(
+                            "theia-auth-rollback-v1 ready revision={revision} seconds={seconds}\n"
+                        ),
+                        None => "theia-auth-rollback-v1 unavailable\n".to_owned(),
                     }
-                }else{"ERR unsupported\n".to_owned()}
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
             }
-            candidate if parse_auth_rollback_revision(candidate).is_some()=>{
-                if let (Some(runtime),Some(previous))=(&runtime,&observed){
-                    let expected=parse_auth_rollback_revision(candidate).expect("parsed");
-                    if let Some(document)=runtime.auth_rollback_candidate(previous,expected){
-                        let preflight=previous.preflight.clone();
-                        let checked=document.clone();
-                        let managed=runtime.has_reality_ledger();
-                        let valid=tokio::task::spawn_blocking(move||if managed{
-                            preflight.validate_managed_candidate(checked.as_ref().clone())
-                        }else{preflight.validate_candidate(checked.as_ref().clone())}).await;
-                        if matches!(valid,Ok(Ok(_))){
-                            match runtime.rollback_auth(previous,&document,expected){
-                                Ok(revision)=>format!("theia-auth-rollback-v1 applied revision={revision}\n"),
-                                Err(_)=>"theia-auth-rollback-v1 rejected\n".to_owned(),
+            candidate if parse_auth_rollback_revision(candidate).is_some() => {
+                if let (Some(runtime), Some(previous)) = (&runtime, &observed) {
+                    let expected = parse_auth_rollback_revision(candidate).expect("parsed");
+                    if let Some(document) = runtime.auth_rollback_candidate(previous, expected) {
+                        let preflight = previous.preflight.clone();
+                        let checked = document.clone();
+                        let managed = runtime.has_reality_ledger();
+                        let valid = tokio::task::spawn_blocking(move || {
+                            if managed {
+                                preflight.validate_managed_candidate(checked.as_ref().clone())
+                            } else {
+                                preflight.validate_candidate(checked.as_ref().clone())
                             }
-                        }else{"theia-auth-rollback-v1 rejected\n".to_owned()}
-                    }else{"theia-auth-rollback-v1 rejected\n".to_owned()}
-                }else{"ERR unsupported\n".to_owned()}
+                        })
+                        .await;
+                        if matches!(valid, Ok(Ok(_))) {
+                            match runtime.rollback_auth(previous, &document, expected) {
+                                Ok(revision) => {
+                                    format!("theia-auth-rollback-v1 applied revision={revision}\n")
+                                }
+                                Err(_) => "theia-auth-rollback-v1 rejected\n".to_owned(),
+                            }
+                        } else {
+                            "theia-auth-rollback-v1 rejected\n".to_owned()
+                        }
+                    } else {
+                        "theia-auth-rollback-v1 rejected\n".to_owned()
+                    }
+                } else {
+                    "ERR unsupported\n".to_owned()
+                }
             }
             b"tls-rollback-check" => {
                 if let Some(runtime) = &runtime {
@@ -674,8 +795,16 @@ where
                 if let Some(preflight) = preflight {
                     // 1 MiB bounded config + PEM reads belong on a worker.
                     // A timed-out worker can NEVER apply, only return a verdict.
-                    let managed=runtime.as_ref().is_some_and(|r|r.has_reality_ledger());
-                    match tokio::task::spawn_blocking(move || if managed{preflight.check_managed_file()}else{preflight.check_file()}).await {
+                    let managed = runtime.as_ref().is_some_and(|r| r.has_reality_ledger());
+                    match tokio::task::spawn_blocking(move || {
+                        if managed {
+                            preflight.check_managed_file()
+                        } else {
+                            preflight.check_file()
+                        }
+                    })
+                    .await
+                    {
                         Ok(Ok(())) => "theia-check-v1 compatible\n".to_owned(),
                         _ => "theia-check-v1 rejected\n".to_owned(),
                     }
@@ -690,9 +819,13 @@ where
                     // Worker is read-only even after IPC cancellation.
                     // The exact same validated bytes are committed only from
                     // the live async task under CAS, never by the worker.
-                    let managed=runtime.as_ref().is_some_and(|r|r.has_reality_ledger());
+                    let managed = runtime.as_ref().is_some_and(|r| r.has_reality_ledger());
                     match tokio::task::spawn_blocking(move || {
-                        if managed{preflight.load_managed_candidate_bound(sha256)}else{preflight.load_candidate_bound(sha256)}
+                        if managed {
+                            preflight.load_managed_candidate_bound(sha256)
+                        } else {
+                            preflight.load_candidate_bound(sha256)
+                        }
                     })
                     .await
                     {
@@ -718,7 +851,13 @@ where
                 }
             }
             candidate if parse_apply_revision(candidate).is_some() => {
-                if observed.as_ref().is_some_and(|view|view.document.server.inbounds.iter().any(|i|i.reality.is_some())) {
+                if observed.as_ref().is_some_and(|view| {
+                    view.document
+                        .server
+                        .inbounds
+                        .iter()
+                        .any(|i| i.reality.is_some())
+                }) {
                     "theia-apply-v1 rejected\n".to_owned()
                 } else if let (Some(preflight), Some(live)) = (preflight, live) {
                     let expected = parse_apply_revision(candidate).expect("already parsed");
@@ -809,27 +948,31 @@ fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn parse_restart_preview(command:&[u8])->Option<(u64,[u8;32])>{
-    parse_bound_command(command,b"restart-preview rev=")
+fn parse_restart_preview(command: &[u8]) -> Option<(u64, [u8; 32])> {
+    parse_bound_command(command, b"restart-preview rev=")
 }
-#[cfg(any(target_os="linux",target_os="windows"))]
-fn parse_restart_rollback(command:&[u8])->Option<u64>{
-    positive_decimal(std::str::from_utf8(command.strip_prefix(b"restart-rollback-apply rev=")?).ok()?)
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_restart_rollback(command: &[u8]) -> Option<u64> {
+    positive_decimal(
+        std::str::from_utf8(command.strip_prefix(b"restart-rollback-apply rev=")?).ok()?,
+    )
 }
-#[cfg(any(target_os="linux",target_os="windows"))]
-fn parse_reality_status(command:&[u8])->Option<(&str,[u8;32])>{
-    let raw=std::str::from_utf8(command.strip_prefix(b"reality-status id=")?).ok()?;
-    let (id,digest)=raw.split_once(" manifest=")?;
-    if !crate::config::valid_id(id){return None;}
-    Some((id,decode_digest(digest)?))
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_reality_status(command: &[u8]) -> Option<(&str, [u8; 32])> {
+    let raw = std::str::from_utf8(command.strip_prefix(b"reality-status id=")?).ok()?;
+    let (id, digest) = raw.split_once(" manifest=")?;
+    if !crate::config::valid_id(id) {
+        return None;
+    }
+    Some((id, decode_digest(digest)?))
 }
 
-#[cfg(any(target_os="linux",target_os="windows"))]
-fn parse_auth_rollback_revision(command:&[u8])->Option<u64>{
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_auth_rollback_revision(command: &[u8]) -> Option<u64> {
     positive_decimal(std::str::from_utf8(command.strip_prefix(b"auth-rollback-apply rev=")?).ok()?)
 }
 
-#[cfg(any(target_os="linux",target_os="windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_tls_rollback_revision(command: &[u8]) -> Option<u64> {
     let raw = std::str::from_utf8(command.strip_prefix(b"tls-rollback-apply rev=")?).ok()?;
     positive_decimal(raw)
@@ -848,36 +991,63 @@ fn parse_bound_command(command: &[u8], prefix: &[u8]) -> Option<(u64, [u8; 32])>
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) async fn handle_client<S>(mut stream:S,client:Arc<crate::local_proxy::ClientRuntime>)->Result<(),ManagementError>
-where S:AsyncRead+AsyncWrite+Unpin{
-    let mut command=Vec::new();
-    let mut newline=false;
-    for _ in 0..MAX_COMMAND_BYTES{
-        let mut byte=[0u8;1];
-        if stream.read_exact(&mut byte).await.is_err(){break;}
-        if byte[0]==b'\n'{newline=true;break;}
+pub(crate) async fn handle_client<S>(
+    mut stream: S,
+    client: Arc<crate::local_proxy::ClientRuntime>,
+) -> Result<(), ManagementError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut command = Vec::new();
+    let mut newline = false;
+    for _ in 0..MAX_COMMAND_BYTES {
+        let mut byte = [0u8; 1];
+        if stream.read_exact(&mut byte).await.is_err() {
+            break;
+        }
+        if byte[0] == b'\n' {
+            newline = true;
+            break;
+        }
         command.push(byte[0]);
     }
-    let response=if !newline{"ERR unsupported\n".into()}else if command==b"client-status"{
-        let (revision,digest,descriptor,transport,fallback)=client.status().await;
-        let hex=digest.iter().map(|b|format!("{b:02x}")).collect::<String>();
-        format!("theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} f={}\n",u8::from(fallback))
-    }else{
-        let candidate=parse_bound_command(&command,b"client-preview rev=").map(|(r,d)|(r,d,false))
-            .or_else(||parse_bound_command(&command,b"client-apply rev=").map(|(r,d)|(r,d,true)));
-        match candidate{
-            Some((r,d,apply))=>match client.change(r,d,apply).await{
-                Ok(revision)=>format!("theia-client-v1 {} r={revision}\n",if apply{"applied"}else{"ready"}),
-                Err(_)=>"theia-client-v1 rejected\n".into(),
+    let response = if !newline {
+        "ERR unsupported\n".into()
+    } else if command == b"client-status" {
+        let (revision, digest, descriptor, transport, fallback) = client.status().await;
+        let hex = digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        format!(
+            "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} f={}\n",
+            u8::from(fallback)
+        )
+    } else {
+        let candidate = parse_bound_command(&command, b"client-preview rev=")
+            .map(|(r, d)| (r, d, false))
+            .or_else(|| {
+                parse_bound_command(&command, b"client-apply rev=").map(|(r, d)| (r, d, true))
+            });
+        match candidate {
+            Some((r, d, apply)) => match client.change(r, d, apply).await {
+                Ok(revision) => format!(
+                    "theia-client-v1 {} r={revision}\n",
+                    if apply { "applied" } else { "ready" }
+                ),
+                Err(_) => "theia-client-v1 rejected\n".into(),
             },
-            None=>"ERR unsupported\n".into(),
+            None => "ERR unsupported\n".into(),
         }
     };
-    stream.write_all(response.as_bytes()).await.map_err(|_|ManagementError::Io)?;
-    stream.shutdown().await.map_err(|_|ManagementError::Io)
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|_| ManagementError::Io)?;
+    stream.shutdown().await.map_err(|_| ManagementError::Io)
 }
 
-#[cfg(any(target_os="linux",target_os="windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) async fn exchange<S>(
     mut stream: S,
     command: StatusCommand,
@@ -886,11 +1056,27 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request = match command {
-        StatusCommand::ClientStatus=>b"client-status\n".to_vec(),
-        StatusCommand::ClientPreview{expected_revision,candidate_sha256}|StatusCommand::ClientApply{expected_revision,candidate_sha256}=>{
-            if expected_revision==0{return Err(ManagementError::InvalidReply);}
-            let action=if matches!(command,StatusCommand::ClientApply{..}){"apply"}else{"preview"};
-            let hex=candidate_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
+        StatusCommand::ClientStatus => b"client-status\n".to_vec(),
+        StatusCommand::ClientPreview {
+            expected_revision,
+            candidate_sha256,
+        }
+        | StatusCommand::ClientApply {
+            expected_revision,
+            candidate_sha256,
+        } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
+            let action = if matches!(command, StatusCommand::ClientApply { .. }) {
+                "apply"
+            } else {
+                "preview"
+            };
+            let hex = candidate_sha256
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             format!("client-{action} rev={expected_revision} sha256={hex}\n").into_bytes()
         }
         StatusCommand::Health => b"health\n".to_vec(),
@@ -898,26 +1084,45 @@ where
         StatusCommand::Reload => b"reload\n".to_vec(),
         StatusCommand::CheckReload => b"check-reload\n".to_vec(),
         StatusCommand::CheckRestart => b"check-restart\n".to_vec(),
-        StatusCommand::CheckRestartBound{expected_revision,candidate_sha256}=>{
-            if expected_revision==0{return Err(ManagementError::InvalidReply);}
-            let digest=candidate_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
+        StatusCommand::CheckRestartBound {
+            expected_revision,
+            candidate_sha256,
+        } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
+            let digest = candidate_sha256
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             format!("restart-preview rev={expected_revision} sha256={digest}\n").into_bytes()
         }
-        StatusCommand::CheckRestartRollback=>b"restart-rollback-check\n".to_vec(),
-        StatusCommand::ApplyRestartRollback{expected_revision}=>{
-            if expected_revision==0{return Err(ManagementError::InvalidReply);}
+        StatusCommand::CheckRestartRollback => b"restart-rollback-check\n".to_vec(),
+        StatusCommand::ApplyRestartRollback { expected_revision } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
             format!("restart-rollback-apply rev={expected_revision}\n").into_bytes()
         }
-        StatusCommand::RealityStatus{id,len,manifest}=>{
-            let raw=id.get(..usize::from(len)).ok_or(ManagementError::InvalidReply)?;
-            let name=std::str::from_utf8(raw).map_err(|_|ManagementError::InvalidReply)?;
-            if !crate::config::valid_id(name){return Err(ManagementError::InvalidReply);}
-            let digest=manifest.iter().map(|b|format!("{b:02x}")).collect::<String>();
+        StatusCommand::RealityStatus { id, len, manifest } => {
+            let raw = id
+                .get(..usize::from(len))
+                .ok_or(ManagementError::InvalidReply)?;
+            let name = std::str::from_utf8(raw).map_err(|_| ManagementError::InvalidReply)?;
+            if !crate::config::valid_id(name) {
+                return Err(ManagementError::InvalidReply);
+            }
+            let digest = manifest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             format!("reality-status id={name} manifest={digest}\n").into_bytes()
         }
-        StatusCommand::CheckAuthRollback=>b"auth-rollback-check\n".to_vec(),
-        StatusCommand::ApplyAuthRollback{expected_revision}=>{
-            if expected_revision==0{return Err(ManagementError::InvalidReply);}
+        StatusCommand::CheckAuthRollback => b"auth-rollback-check\n".to_vec(),
+        StatusCommand::ApplyAuthRollback { expected_revision } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
             format!("auth-rollback-apply rev={expected_revision}\n").into_bytes()
         }
         StatusCommand::CheckTlsRollback => b"tls-rollback-check\n".to_vec(),
@@ -993,32 +1198,68 @@ where
     if reply.len() as u64 > MAX_RESPONSE_BYTES {
         return Err(ManagementError::InvalidReply);
     }
-    if matches!(command,StatusCommand::ClientStatus|StatusCommand::ClientPreview{..}|StatusCommand::ClientApply{..}){
-        let raw=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
-        if raw=="ERR unsupported\n"{return Err(ManagementError::Unsupported);}
-        if raw=="theia-client-v1 rejected\n"{return Err(ManagementError::CandidateRejected);}
-        let line=raw.strip_prefix("theia-client-v1 ").and_then(|s|s.strip_suffix('\n')).ok_or(ManagementError::InvalidReply)?;
-        let parsed=(||match command{
-            StatusCommand::ClientStatus=>{
-                let mut fields=line.split(' ');
-                let revision=positive_decimal(fields.next()?.strip_prefix("r=")?)?;
-                let config_sha256=decode_digest(fields.next()?.strip_prefix("sha256=")?)?;
-                let d=fields.next()?.strip_prefix("d=")?;
-                let descriptor_revision=if d=="0"{0}else{positive_decimal(d)?};
-                let transport=match fields.next()?.strip_prefix("t=")?{"0"=>0,"2"=>2,"3"=>3,_=>return None};
-                let fallback=match fields.next()?.strip_prefix("f=")?{"0"=>false,"1"=>true,_=>return None};
-                if fields.next().is_some()||(descriptor_revision==0&&(transport!=0||fallback)){return None;}
-                Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,fallback})
+    if matches!(
+        command,
+        StatusCommand::ClientStatus
+            | StatusCommand::ClientPreview { .. }
+            | StatusCommand::ClientApply { .. }
+    ) {
+        let raw = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        if raw == "ERR unsupported\n" {
+            return Err(ManagementError::Unsupported);
+        }
+        if raw == "theia-client-v1 rejected\n" {
+            return Err(ManagementError::CandidateRejected);
+        }
+        let line = raw
+            .strip_prefix("theia-client-v1 ")
+            .and_then(|s| s.strip_suffix('\n'))
+            .ok_or(ManagementError::InvalidReply)?;
+        let parsed = (|| match command {
+            StatusCommand::ClientStatus => {
+                let mut fields = line.split(' ');
+                let revision = positive_decimal(fields.next()?.strip_prefix("r=")?)?;
+                let config_sha256 = decode_digest(fields.next()?.strip_prefix("sha256=")?)?;
+                let d = fields.next()?.strip_prefix("d=")?;
+                let descriptor_revision = if d == "0" { 0 } else { positive_decimal(d)? };
+                let transport = match fields.next()?.strip_prefix("t=")? {
+                    "0" => 0,
+                    "2" => 2,
+                    "3" => 3,
+                    _ => return None,
+                };
+                let fallback = match fields.next()?.strip_prefix("f=")? {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                };
+                if fields.next().is_some()
+                    || (descriptor_revision == 0 && (transport != 0 || fallback))
+                {
+                    return None;
+                }
+                Some(StatusReply::ClientRunning {
+                    revision,
+                    config_sha256,
+                    descriptor_revision,
+                    transport,
+                    fallback,
+                })
             }
-            StatusCommand::ClientPreview{expected_revision,..}=>{
-                let revision=positive_decimal(line.strip_prefix("ready r=")?)?;
-                (revision==expected_revision).then_some(StatusReply::ClientReady{revision})
+            StatusCommand::ClientPreview {
+                expected_revision, ..
+            } => {
+                let revision = positive_decimal(line.strip_prefix("ready r=")?)?;
+                (revision == expected_revision).then_some(StatusReply::ClientReady { revision })
             }
-            StatusCommand::ClientApply{expected_revision,..}=>{
-                let revision=positive_decimal(line.strip_prefix("applied r=")?)?;
-                (Some(revision)==expected_revision.checked_add(1)).then_some(StatusReply::ClientApplied{revision})
+            StatusCommand::ClientApply {
+                expected_revision, ..
+            } => {
+                let revision = positive_decimal(line.strip_prefix("applied r=")?)?;
+                (Some(revision) == expected_revision.checked_add(1))
+                    .then_some(StatusReply::ClientApplied { revision })
             }
-            _=>None
+            _ => None,
         })();
         return parsed.ok_or(ManagementError::InvalidReply);
     }
@@ -1028,74 +1269,149 @@ where
     if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
         return Ok(StatusReply::Unsupported);
     }
-    if matches!(command,StatusCommand::CheckRestartBound{..}){
-        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
-        if let Some((mode,digest))=text.strip_prefix("theia-restart-preview-v1 ").and_then(|s|s.strip_suffix('\n'))
-            .and_then(|s|s.split_once(" sha256=")){
-            let same_port=match mode{"same-port"=>true,"fresh"=>false,_=>return Err(ManagementError::InvalidReply)};
-            return Ok(StatusReply::RestartPreview{same_port,material_sha256:decode_digest(digest).ok_or(ManagementError::InvalidReply)?});
+    if matches!(command, StatusCommand::CheckRestartBound { .. }) {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        if let Some((mode, digest)) = text
+            .strip_prefix("theia-restart-preview-v1 ")
+            .and_then(|s| s.strip_suffix('\n'))
+            .and_then(|s| s.split_once(" sha256="))
+        {
+            let same_port = match mode {
+                "same-port" => true,
+                "fresh" => false,
+                _ => return Err(ManagementError::InvalidReply),
+            };
+            return Ok(StatusReply::RestartPreview {
+                same_port,
+                material_sha256: decode_digest(digest).ok_or(ManagementError::InvalidReply)?,
+            });
         }
-        return match text{"theia-restart-preview-v1 rejected\n"=>Err(ManagementError::CandidateRejected),
-            "ERR unsupported\n"=>Err(ManagementError::Unsupported),_=>Err(ManagementError::InvalidReply)};
+        return match text {
+            "theia-restart-preview-v1 rejected\n" => Err(ManagementError::CandidateRejected),
+            "ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
+        };
     }
-    if command==StatusCommand::CheckRestartRollback{
-        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
-        if let Some((revision,seconds))=text.strip_prefix("theia-restart-rollback-v1 ready revision=")
-            .and_then(|s|s.strip_suffix('\n')).and_then(|s|s.split_once(" seconds=")){
-            if let (Some(revision),Some(remaining_seconds))=(positive_decimal(revision),positive_decimal(seconds)){
-                if remaining_seconds<=300{return Ok(StatusReply::RestartRollbackReady{revision,remaining_seconds});}
+    if command == StatusCommand::CheckRestartRollback {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        if let Some((revision, seconds)) = text
+            .strip_prefix("theia-restart-rollback-v1 ready revision=")
+            .and_then(|s| s.strip_suffix('\n'))
+            .and_then(|s| s.split_once(" seconds="))
+        {
+            if let (Some(revision), Some(remaining_seconds)) =
+                (positive_decimal(revision), positive_decimal(seconds))
+            {
+                if remaining_seconds <= 300 {
+                    return Ok(StatusReply::RestartRollbackReady {
+                        revision,
+                        remaining_seconds,
+                    });
+                }
             }
         }
-        return match text{"theia-restart-rollback-v1 unavailable\n"=>Err(ManagementError::CandidateRejected),
-            "ERR unsupported\n"=>Err(ManagementError::Unsupported),_=>Err(ManagementError::InvalidReply)};
+        return match text {
+            "theia-restart-rollback-v1 unavailable\n" => Err(ManagementError::CandidateRejected),
+            "ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
+        };
     }
-    if let StatusCommand::ApplyRestartRollback{expected_revision}=command{
-        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
-        let applied=text.strip_prefix("theia-restart-rollback-v1 applied revision=").and_then(|s|s.strip_suffix('\n')).and_then(positive_decimal);
-        return match applied{
-            Some(revision) if Some(revision)==expected_revision.checked_add(1)=>Ok(StatusReply::RestartRollbackApplied{revision}),
-            _ if text=="theia-restart-rollback-v1 rejected\n"=>Err(ManagementError::CandidateRejected),
-            _ if text=="ERR unsupported\n"=>Err(ManagementError::Unsupported),_=>Err(ManagementError::InvalidReply)};
+    if let StatusCommand::ApplyRestartRollback { expected_revision } = command {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        let applied = text
+            .strip_prefix("theia-restart-rollback-v1 applied revision=")
+            .and_then(|s| s.strip_suffix('\n'))
+            .and_then(positive_decimal);
+        return match applied {
+            Some(revision) if Some(revision) == expected_revision.checked_add(1) => {
+                Ok(StatusReply::RestartRollbackApplied { revision })
+            }
+            _ if text == "theia-restart-rollback-v1 rejected\n" => {
+                Err(ManagementError::CandidateRejected)
+            }
+            _ if text == "ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
+        };
     }
-    if matches!(command,StatusCommand::RealityStatus{..}){
-        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
-        if text=="theia-reality-v1 suspended\n"{return Ok(StatusReply::RealitySuspended);}
-        if text=="ERR unsupported\n"{return Err(ManagementError::Unsupported);}
-        let parsed=(||{
-            let mut fields=text.strip_prefix("theia-reality-v1 ")?.strip_suffix('\n')?.split(' ');
-            let generation=positive_decimal(fields.next()?.strip_prefix("g=")?)?;
-            let revision=positive_decimal(fields.next()?.strip_prefix("r=")?)?;
-            let health_revision=positive_decimal(fields.next()?.strip_prefix("h=")?)?;
-            let active_reference=match fields.next()?.strip_prefix("a=")?{"0"=>0,"1"=>1,"2"=>2,_=>return None};
-            let overlap=match fields.next()?.strip_prefix("o=")?{"0"=>false,"1"=>true,_=>return None};
-            if fields.next().is_some(){return None;}
-            Some(StatusReply::RealityRunning{generation,revision,health_revision,active_reference,overlap})
+    if matches!(command, StatusCommand::RealityStatus { .. }) {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        if text == "theia-reality-v1 suspended\n" {
+            return Ok(StatusReply::RealitySuspended);
+        }
+        if text == "ERR unsupported\n" {
+            return Err(ManagementError::Unsupported);
+        }
+        let parsed = (|| {
+            let mut fields = text
+                .strip_prefix("theia-reality-v1 ")?
+                .strip_suffix('\n')?
+                .split(' ');
+            let generation = positive_decimal(fields.next()?.strip_prefix("g=")?)?;
+            let revision = positive_decimal(fields.next()?.strip_prefix("r=")?)?;
+            let health_revision = positive_decimal(fields.next()?.strip_prefix("h=")?)?;
+            let active_reference = match fields.next()?.strip_prefix("a=")? {
+                "0" => 0,
+                "1" => 1,
+                "2" => 2,
+                _ => return None,
+            };
+            let overlap = match fields.next()?.strip_prefix("o=")? {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            };
+            if fields.next().is_some() {
+                return None;
+            }
+            Some(StatusReply::RealityRunning {
+                generation,
+                revision,
+                health_revision,
+                active_reference,
+                overlap,
+            })
         })();
         return parsed.ok_or(ManagementError::InvalidReply);
     }
-    if command==StatusCommand::CheckAuthRollback{
-        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
-        if let Some((revision,seconds))=text.strip_prefix("theia-auth-rollback-v1 ready revision=")
-            .and_then(|s|s.strip_suffix('\n')).and_then(|s|s.split_once(" seconds=")){
-            if let (Some(revision),Some(remaining_seconds))=(positive_decimal(revision),positive_decimal(seconds)){
-                if remaining_seconds<=300{return Ok(StatusReply::AuthRollbackReady{revision,remaining_seconds});}
+    if command == StatusCommand::CheckAuthRollback {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        if let Some((revision, seconds)) = text
+            .strip_prefix("theia-auth-rollback-v1 ready revision=")
+            .and_then(|s| s.strip_suffix('\n'))
+            .and_then(|s| s.split_once(" seconds="))
+        {
+            if let (Some(revision), Some(remaining_seconds)) =
+                (positive_decimal(revision), positive_decimal(seconds))
+            {
+                if remaining_seconds <= 300 {
+                    return Ok(StatusReply::AuthRollbackReady {
+                        revision,
+                        remaining_seconds,
+                    });
+                }
             }
         }
-        return match text{
-            "theia-auth-rollback-v1 unavailable\n"=>Err(ManagementError::CandidateRejected),
-            "ERR unsupported\n"=>Err(ManagementError::Unsupported),
-            _=>Err(ManagementError::InvalidReply),
+        return match text {
+            "theia-auth-rollback-v1 unavailable\n" => Err(ManagementError::CandidateRejected),
+            "ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
         };
     }
-    if let StatusCommand::ApplyAuthRollback{expected_revision}=command{
-        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
-        let applied=text.strip_prefix("theia-auth-rollback-v1 applied revision=")
-            .and_then(|s|s.strip_suffix('\n')).and_then(positive_decimal);
-        return match applied{
-            Some(revision) if Some(revision)==expected_revision.checked_add(1)=>Ok(StatusReply::AuthRollbackApplied{revision}),
-            _ if text=="theia-auth-rollback-v1 rejected\n"=>Err(ManagementError::CandidateRejected),
-            _ if text=="ERR unsupported\n"=>Err(ManagementError::Unsupported),
-            _=>Err(ManagementError::InvalidReply),
+    if let StatusCommand::ApplyAuthRollback { expected_revision } = command {
+        let text = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        let applied = text
+            .strip_prefix("theia-auth-rollback-v1 applied revision=")
+            .and_then(|s| s.strip_suffix('\n'))
+            .and_then(positive_decimal);
+        return match applied {
+            Some(revision) if Some(revision) == expected_revision.checked_add(1) => {
+                Ok(StatusReply::AuthRollbackApplied { revision })
+            }
+            _ if text == "theia-auth-rollback-v1 rejected\n" => {
+                Err(ManagementError::CandidateRejected)
+            }
+            _ if text == "ERR unsupported\n" => Err(ManagementError::Unsupported),
+            _ => Err(ManagementError::InvalidReply),
         };
     }
     if command == StatusCommand::CheckTlsRollback {
@@ -1272,55 +1588,81 @@ pub async fn query_in(
     .map_err(|_| ManagementError::TimedOut)?
 }
 
-#[cfg(target_os="linux")]
-pub(crate) fn client_server(client:Arc<crate::local_proxy::ClientRuntime>)->Result<Option<StatusServer>,ManagementError>{
-    let Some(directory)=std::env::var_os("THEIA_CLIENT_CONTROL_DIR")else{return Ok(None);};
-    StatusServer::bind_in(Path::new(&directory),1).map(|s|Some(s.with_client(client)))
+#[cfg(target_os = "linux")]
+pub(crate) fn client_server(
+    client: Arc<crate::local_proxy::ClientRuntime>,
+) -> Result<Option<StatusServer>, ManagementError> {
+    let Some(directory) = std::env::var_os("THEIA_CLIENT_CONTROL_DIR") else {
+        return Ok(None);
+    };
+    StatusServer::bind_in(Path::new(&directory), 1).map(|s| Some(s.with_client(client)))
 }
-#[cfg(target_os="windows")]
-pub(crate) fn client_server(client:Arc<crate::local_proxy::ClientRuntime>)->Result<Option<crate::windows_control::WindowsServer>,ManagementError>{
-    let Some(id)=std::env::var_os("THEIA_CLIENT_CONTROL_PIPE")else{return Ok(None);};
-    let id=id.into_string().map_err(|_|ManagementError::UnsafeEndpoint)?;
-    crate::windows_control::WindowsServer::bind(&id,1).map(|s|Some(s.with_client(client)))
+#[cfg(target_os = "windows")]
+pub(crate) fn client_server(
+    client: Arc<crate::local_proxy::ClientRuntime>,
+) -> Result<Option<crate::windows_control::WindowsServer>, ManagementError> {
+    let Some(id) = std::env::var_os("THEIA_CLIENT_CONTROL_PIPE") else {
+        return Ok(None);
+    };
+    let id = id
+        .into_string()
+        .map_err(|_| ManagementError::UnsafeEndpoint)?;
+    crate::windows_control::WindowsServer::bind(&id, 1).map(|s| Some(s.with_client(client)))
 }
 
-pub async fn query_client_environment(command:StatusCommand)->Result<StatusReply,ManagementError>{
-    if !matches!(command,StatusCommand::ClientStatus|StatusCommand::ClientPreview{..}|StatusCommand::ClientApply{..}){
+pub async fn query_client_environment(
+    command: StatusCommand,
+) -> Result<StatusReply, ManagementError> {
+    if !matches!(
+        command,
+        StatusCommand::ClientStatus
+            | StatusCommand::ClientPreview { .. }
+            | StatusCommand::ClientApply { .. }
+    ) {
         return Err(ManagementError::Unsupported);
     }
-    #[cfg(target_os="linux")]
+    #[cfg(target_os = "linux")]
     {
-        let directory=std::env::var_os("THEIA_CLIENT_CONTROL_DIR").ok_or(ManagementError::NotConfigured)?;
-        let path=endpoint_path(Path::new(&directory))?;
-        return timeout(CLIENT_TIMEOUT,async{
-            let stream=UnixStream::connect(path).await.map_err(|_|ManagementError::SocketUnavailable)?;
-            exchange(stream,command).await
-        }).await.map_err(|_|ManagementError::TimedOut)?;
+        let directory =
+            std::env::var_os("THEIA_CLIENT_CONTROL_DIR").ok_or(ManagementError::NotConfigured)?;
+        let path = endpoint_path(Path::new(&directory))?;
+        return timeout(CLIENT_TIMEOUT, async {
+            let stream = UnixStream::connect(path)
+                .await
+                .map_err(|_| ManagementError::SocketUnavailable)?;
+            exchange(stream, command).await
+        })
+        .await
+        .map_err(|_| ManagementError::TimedOut)?;
     }
-    #[cfg(target_os="windows")]
+    #[cfg(target_os = "windows")]
     {
-        let id=std::env::var_os("THEIA_CLIENT_CONTROL_PIPE").ok_or(ManagementError::NotConfigured)?
-            .into_string().map_err(|_|ManagementError::UnsafeEndpoint)?;
-        return crate::windows_control::query_client_pipe(&id,command).await;
+        let id = std::env::var_os("THEIA_CLIENT_CONTROL_PIPE")
+            .ok_or(ManagementError::NotConfigured)?
+            .into_string()
+            .map_err(|_| ManagementError::UnsafeEndpoint)?;
+        return crate::windows_control::query_client_pipe(&id, command).await;
     }
-    #[cfg(not(any(target_os="linux",target_os="windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     Err(ManagementError::Unsupported)
 }
 
 pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, ManagementError> {
     let kind = match command {
-        StatusCommand::ClientStatus|StatusCommand::ClientPreview{..}|StatusCommand::ClientApply{..}=>return Err(ManagementError::Unsupported),
+        StatusCommand::ClientStatus
+        | StatusCommand::ClientPreview { .. }
+        | StatusCommand::ClientApply { .. } => return Err(ManagementError::Unsupported),
         StatusCommand::Health => "health",
         StatusCommand::Status => "status",
         StatusCommand::Reload => "reload_rejected",
         StatusCommand::CheckReload => "check_reload",
         StatusCommand::CheckRestart => "check_restart",
-        StatusCommand::CheckRestartBound{..}=>"restart_preview",
-        StatusCommand::CheckRestartRollback=>"restart_rollback_check",
-        StatusCommand::ApplyRestartRollback{..}=>"restart_rollback_apply",
-        StatusCommand::RealityStatus{..}=>"reality_status",
-        StatusCommand::CheckAuthRollback=>"check_auth_rollback",
-        StatusCommand::ApplyAuthRollback{..}=>"apply_auth_rollback",
+        StatusCommand::CheckRestartBound { .. } => "restart_preview",
+        StatusCommand::CheckRestartRollback => "restart_rollback_check",
+        StatusCommand::ApplyRestartRollback { .. } => "restart_rollback_apply",
+        StatusCommand::RealityStatus { .. } => "reality_status",
+        StatusCommand::CheckAuthRollback => "check_auth_rollback",
+        StatusCommand::ApplyAuthRollback { .. } => "apply_auth_rollback",
         StatusCommand::CheckTlsRollback => "check_tls_rollback",
         StatusCommand::ApplyTlsRollback { .. } => "apply_tls_rollback",
         StatusCommand::CheckQuota => "check_quota",

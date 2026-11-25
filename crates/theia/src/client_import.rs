@@ -285,7 +285,12 @@ mod private_windows {
     pub(super) fn broad_file(path: &Path) -> io::Result<File> {
         let sid = crate::windows_control::current_user_sid()
             .map_err(|_| io::Error::other("private user SID unavailable"))?;
-        file_with_descriptor(path, descriptor_from_sddl(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FR;;;WD)"))?)
+        file_with_descriptor(
+            path,
+            descriptor_from_sddl(&format!(
+                "O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FR;;;WD)"
+            ))?,
+        )
     }
     fn file_with_descriptor(path: &Path, descriptor: Descriptor) -> io::Result<File> {
         let attrs = attrs(&descriptor);

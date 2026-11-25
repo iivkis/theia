@@ -475,20 +475,34 @@ struct AdmissionInput {
 
 impl fmt::Debug for AdmissionInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AdmissionInput").field("branch", &self.branch).finish_non_exhaustive()
+        f.debug_struct("AdmissionInput")
+            .field("branch", &self.branch)
+            .finish_non_exhaustive()
     }
 }
 
 impl AdmissionInput {
-    fn new(value: &descriptor::Verified, branch: Branch,
-        secret: Arc<crate::reality_admission::Secret>) -> Result<Self, Error> {
+    fn new(
+        value: &descriptor::Verified,
+        branch: Branch,
+        secret: Arc<crate::reality_admission::Secret>,
+    ) -> Result<Self, Error> {
         let now = crate::reference_health::unix_now().map_err(|_| Error::Clock)?;
         value.check_time(now).map_err(|_| Error::Descriptor)?;
-        Self::for_reference(value,branch,secret,usize::from(value.descriptor().active_reference))
+        Self::for_reference(
+            value,
+            branch,
+            secret,
+            usize::from(value.descriptor().active_reference),
+        )
     }
 
-    fn for_reference(value: &descriptor::Verified, branch: Branch,
-        secret: Arc<crate::reality_admission::Secret>, index: usize) -> Result<Self,Error> {
+    fn for_reference(
+        value: &descriptor::Verified,
+        branch: Branch,
+        secret: Arc<crate::reality_admission::Secret>,
+        index: usize,
+    ) -> Result<Self, Error> {
         let now = crate::reference_health::unix_now().map_err(|_| Error::Clock)?;
         value.check_time(now).map_err(|_| Error::Descriptor)?;
         let d = value.descriptor();
@@ -499,19 +513,31 @@ impl AdmissionInput {
         if branch == Branch::H2 && !value.effective_modes().h2 {
             return Err(Error::Descriptor);
         }
-        Ok(Self { scope: d.scope.clone(), public: value.signer(), reference: reference.server_name.clone(),
-            branch, not_before: d.not_before, not_after: d.not_after, secret })
+        Ok(Self {
+            scope: d.scope.clone(),
+            public: value.signer(),
+            reference: reference.server_name.clone(),
+            branch,
+            not_before: d.not_before,
+            not_after: d.not_after,
+            secret,
+        })
     }
 
     fn now(&self) -> Result<u64, rustls::Error> {
         let now = crate::reference_health::unix_now().map_err(|_| Self::refused())?;
-        if now < self.not_before || now >= self.not_after { return Err(Self::refused()); }
+        if now < self.not_before || now >= self.not_after {
+            return Err(Self::refused());
+        }
         Ok(now)
     }
 
     fn context(&self) -> crate::reality_admission::Context<'_> {
         crate::reality_admission::Context {
-            scope: &self.scope, identity: self.public, reference: &self.reference, branch: self.branch,
+            scope: &self.scope,
+            identity: self.public,
+            reference: &self.reference,
+            branch: self.branch,
         }
     }
 
@@ -521,11 +547,15 @@ impl AdmissionInput {
 }
 
 impl rustls::client::ClientHelloRandom for AdmissionInput {
-    fn random(&self, handshake: &[u8]) -> Result<[u8;32], rustls::Error> {
+    fn random(&self, handshake: &[u8]) -> Result<[u8; 32], rustls::Error> {
         let mut hello = handshake.to_vec();
         crate::reality_admission::seal(&self.secret, &self.context(), &mut hello, self.now()?)
             .map_err(|_| Self::refused())?;
-        hello.get(6..38).ok_or_else(Self::refused)?.try_into().map_err(|_| Self::refused())
+        hello
+            .get(6..38)
+            .ok_or_else(Self::refused)?
+            .try_into()
+            .map_err(|_| Self::refused())
     }
 }
 
@@ -540,15 +570,24 @@ impl fmt::Debug for AdmissionCheck {
 }
 impl rustls::server::ClientHelloCheck for AdmissionCheck {
     fn check(&self, handshake: &[u8]) -> Result<(), rustls::Error> {
-        self.guard.admit(&self.input.secret, &self.input.context(), handshake, self.input.now()?)
+        self.guard
+            .admit(
+                &self.input.secret,
+                &self.input.context(),
+                handshake,
+                self.input.now()?,
+            )
             .map_err(|_| AdmissionInput::refused())
     }
 }
 
 /// Construct the admitted TLS client. Its connection name must be the
 /// signed reference SNI, and trust remains the independent Theia root.
-pub fn admitted_client_tls(value: &descriptor::Verified, branch: Branch,
-    secret: Arc<crate::reality_admission::Secret>) -> Result<ClientConfig, Error> {
+pub fn admitted_client_tls(
+    value: &descriptor::Verified,
+    branch: Branch,
+    secret: Arc<crate::reality_admission::Secret>,
+) -> Result<ClientConfig, Error> {
     let input = AdmissionInput::new(value, branch, secret)?;
     let mut tls = client_tls(&input.scope, input.public, branch)?;
     tls.client_hello_random = Some(Arc::new(input));
@@ -557,16 +596,32 @@ pub fn admitted_client_tls(value: &descriptor::Verified, branch: Branch,
 
 /// A checked TLS server for controlled transport tests. Failure aborts TLS,
 /// so this is not a substitute for the external reference relay.
-pub fn checked_server_tls(identity: &Identity, value: &descriptor::Verified, branch: Branch,
-    secret: Arc<crate::reality_admission::Secret>, guard: Arc<crate::reality_admission::ReplayGuard>)
-    -> Result<ServerConfig, Error> {
-    checked_server_tls_for_reference(identity,value,branch,secret,guard,usize::from(value.descriptor().active_reference))
+pub fn checked_server_tls(
+    identity: &Identity,
+    value: &descriptor::Verified,
+    branch: Branch,
+    secret: Arc<crate::reality_admission::Secret>,
+    guard: Arc<crate::reality_admission::ReplayGuard>,
+) -> Result<ServerConfig, Error> {
+    checked_server_tls_for_reference(
+        identity,
+        value,
+        branch,
+        secret,
+        guard,
+        usize::from(value.descriptor().active_reference),
+    )
 }
 
-pub(crate) fn checked_server_tls_for_reference(identity: &Identity, value: &descriptor::Verified,
-    branch: Branch, secret: Arc<crate::reality_admission::Secret>,
-    guard: Arc<crate::reality_admission::ReplayGuard>, index:usize) -> Result<ServerConfig,Error> {
-    let input = AdmissionInput::for_reference(value, branch, secret,index)?;
+pub(crate) fn checked_server_tls_for_reference(
+    identity: &Identity,
+    value: &descriptor::Verified,
+    branch: Branch,
+    secret: Arc<crate::reality_admission::Secret>,
+    guard: Arc<crate::reality_admission::ReplayGuard>,
+    index: usize,
+) -> Result<ServerConfig, Error> {
+    let input = AdmissionInput::for_reference(value, branch, secret, index)?;
     if identity.scope() != &input.scope || identity.public_key() != input.public {
         return Err(Error::Key);
     }
@@ -576,8 +631,10 @@ pub(crate) fn checked_server_tls_for_reference(identity: &Identity, value: &desc
     Ok(tls)
 }
 
-pub fn admitted_quic_client(value: &descriptor::Verified,
-    secret: Arc<crate::reality_admission::Secret>) -> Result<quinn::ClientConfig, Error> {
+pub fn admitted_quic_client(
+    value: &descriptor::Verified,
+    secret: Arc<crate::reality_admission::Secret>,
+) -> Result<quinn::ClientConfig, Error> {
     let tls = admitted_client_tls(value, Branch::H3, secret)?;
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(|_| Error::Tls)?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
@@ -588,9 +645,12 @@ pub fn admitted_quic_client(value: &descriptor::Verified,
 /// Controlled QUIC counterpart of checked_server_tls. It must not be
 /// exposed as a production external inbound until datagram admission
 /// and reference relay occur before endpoint acceptance.
-pub fn checked_quic_server(identity: &Identity, value: &descriptor::Verified,
-    secret: Arc<crate::reality_admission::Secret>, guard: Arc<crate::reality_admission::ReplayGuard>)
-    -> Result<quinn::ServerConfig, Error> {
+pub fn checked_quic_server(
+    identity: &Identity,
+    value: &descriptor::Verified,
+    secret: Arc<crate::reality_admission::Secret>,
+    guard: Arc<crate::reality_admission::ReplayGuard>,
+) -> Result<quinn::ServerConfig, Error> {
     let tls = checked_server_tls(identity, value, Branch::H3, secret, guard)?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|_| Error::Tls)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));

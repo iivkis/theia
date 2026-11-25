@@ -72,7 +72,9 @@ pub(crate) fn probe(
     Config::Server(candidate.clone())
         .validate()
         .map_err(|_| RestartError::InvalidConfig)?;
-    if !candidate.server.enabled {return Err(RestartError::InvalidConfig);}
+    if !candidate.server.enabled {
+        return Err(RestartError::InvalidConfig);
+    }
     // Advisory readiness is NOT a reservation, pin, or Apply. However it
     // uses the same bounded validated PEM capture as the Apply path.
     let captured =
@@ -92,7 +94,9 @@ pub(crate) fn probe_captured(
     Config::Server(candidate.clone())
         .validate()
         .map_err(|_| RestartError::InvalidConfig)?;
-    if !candidate.server.enabled {return Err(RestartError::InvalidConfig);}
+    if !candidate.server.enabled {
+        return Err(RestartError::InvalidConfig);
+    }
     let candidate_identities = captured.identities();
     let identities_unchanged = loaded_identities.len() == candidate_identities.len()
         && active.server.inbounds.len() == candidate.server.inbounds.len()
@@ -109,15 +113,28 @@ pub(crate) fn probe_captured(
     if assess_reload(active, candidate).is_ok() && identities_unchanged {
         return Ok(RestartVerdict::AuthorizationOnly);
     }
-    if let Some(index)=same_port_reality_only(active,candidate){
-        if loaded_identities.len()==candidate_identities.len() && loaded_identities.iter().zip(&candidate_identities).enumerate().all(|(i,(a,b))|i==index||a==b){
+    if let Some(index) = same_port_reality_only(active, candidate) {
+        if loaded_identities.len() == candidate_identities.len()
+            && loaded_identities
+                .iter()
+                .zip(&candidate_identities)
+                .enumerate()
+                .all(|(i, (a, b))| i == index || a == b)
+        {
             return Ok(RestartVerdict::SamePortTlsReady);
         }
     }
-    if same_port_tls_only(active, candidate) && !identities_unchanged
-        && loaded_identities.len()==candidate_identities.len()
-        && active.server.inbounds.iter().zip(loaded_identities).zip(&candidate_identities)
-            .all(|((inbound,old),new)|inbound.reality.is_none()||old==new) {
+    if same_port_tls_only(active, candidate)
+        && !identities_unchanged
+        && loaded_identities.len() == candidate_identities.len()
+        && active
+            .server
+            .inbounds
+            .iter()
+            .zip(loaded_identities)
+            .zip(&candidate_identities)
+            .all(|((inbound, old), new)| inbound.reality.is_none() || old == new)
+    {
         return Ok(RestartVerdict::SamePortTlsReady);
     }
 
@@ -140,11 +157,16 @@ pub(crate) fn probe_captured(
                 .map_err(|_| RestartError::InvalidConfig)?,
         );
     }
-    let partial=partial_layout(active,loaded_identities,candidate,&candidate_identities);
+    let partial = partial_layout(active, loaded_identities, candidate, &candidate_identities);
     let mut next_tcp = Vec::new();
     let mut next_udp = Vec::new();
     for inbound in &candidate.server.inbounds {
-        if partial.as_ref().is_some_and(|plan|!plan.added.contains(&inbound.id)){continue;}
+        if partial
+            .as_ref()
+            .is_some_and(|plan| !plan.added.contains(&inbound.id))
+        {
+            continue;
+        }
         let tcp: SocketAddr = inbound
             .h2_listen
             .parse()
@@ -189,27 +211,59 @@ pub(crate) fn probe_captured(
 /// A partial structural edit preserves every retained listener's exact
 /// material, mode and bind. Added IDs need fresh disjoint ports; removing
 /// IDs never makes their occupied ports available during preparation.
-pub(crate) struct PartialLayout{
-    pub(crate) added:HashSet<String>,
-    pub(crate) removed:HashSet<String>,
+pub(crate) struct PartialLayout {
+    pub(crate) added: HashSet<String>,
+    pub(crate) removed: HashSet<String>,
 }
-pub(crate) fn partial_layout(active:&ServerDocument,loaded:&[IdentityHash],candidate:&ServerDocument,captured:&[IdentityHash])->Option<PartialLayout>{
-    if !same_shared_limits(active,candidate)||active.server.inbounds.len()!=loaded.len()||candidate.server.inbounds.len()!=captured.len(){return None;}
-    let mut added=HashSet::new();
-    let mut retained=0usize;
-    for (next,material) in candidate.server.inbounds.iter().zip(captured){
-        if let Some((old,old_material))=active.server.inbounds.iter().zip(loaded).find(|(old,_)|old.id==next.id){
-            let mut normalized=next.clone();
-            normalized.allowed_user_ids=old.allowed_user_ids.clone();
-            if &normalized!=old||material!=old_material{return None;}
-            retained+=1;
-        }else{
+pub(crate) fn partial_layout(
+    active: &ServerDocument,
+    loaded: &[IdentityHash],
+    candidate: &ServerDocument,
+    captured: &[IdentityHash],
+) -> Option<PartialLayout> {
+    if !same_shared_limits(active, candidate)
+        || active.server.inbounds.len() != loaded.len()
+        || candidate.server.inbounds.len() != captured.len()
+    {
+        return None;
+    }
+    let mut added = HashSet::new();
+    let mut retained = 0usize;
+    for (next, material) in candidate.server.inbounds.iter().zip(captured) {
+        if let Some((old, old_material)) = active
+            .server
+            .inbounds
+            .iter()
+            .zip(loaded)
+            .find(|(old, _)| old.id == next.id)
+        {
+            let mut normalized = next.clone();
+            normalized.allowed_user_ids = old.allowed_user_ids.clone();
+            if &normalized != old || material != old_material {
+                return None;
+            }
+            retained += 1;
+        } else {
             added.insert(next.id.clone());
         }
     }
-    let removed:HashSet<_>=active.server.inbounds.iter().filter(|old|!candidate.server.inbounds.iter().any(|next|next.id==old.id)).map(|i|i.id.clone()).collect();
-    if retained==0||(added.is_empty()&&removed.is_empty()){return None;}
-    Some(PartialLayout{added,removed})
+    let removed: HashSet<_> = active
+        .server
+        .inbounds
+        .iter()
+        .filter(|old| {
+            !candidate
+                .server
+                .inbounds
+                .iter()
+                .any(|next| next.id == old.id)
+        })
+        .map(|i| i.id.clone())
+        .collect();
+    if retained == 0 || (added.is_empty() && removed.is_empty()) {
+        return None;
+    }
+    Some(PartialLayout { added, removed })
 }
 
 /// A TLS-only in-place rotation never rebinds a TCP/UDP port, changes
@@ -219,23 +273,49 @@ pub(crate) fn partial_layout(active:&ServerDocument,loaded:&[IdentityHash],candi
 /// A single independently enrolled REALITY replacement, with every other
 /// typed field and inbound identical. Runtime additionally checks the
 /// actual native H3 capability, admission key and unused root.
-pub(crate) fn same_port_reality_only(active:&ServerDocument,candidate:&ServerDocument)->Option<usize>{
-    if active.server.inbounds.len()!=candidate.server.inbounds.len(){return None;}
-    let mut normalized=candidate.clone();
-    let mut changed=None;
-    for (i,(old,new)) in active.server.inbounds.iter().zip(&mut normalized.server.inbounds).enumerate(){
-        if old.reality==new.reality{continue;}
-        let (Some(a),Some(b))=(&old.reality,&new.reality)else{return None;};
-        if changed.is_some()||a.identity_sha256==b.identity_sha256||a.bundle==b.bundle||a.manifest_sha256==b.manifest_sha256{return None;}
-        changed=Some(i);
-        new.reality=old.reality.clone();
+pub(crate) fn same_port_reality_only(
+    active: &ServerDocument,
+    candidate: &ServerDocument,
+) -> Option<usize> {
+    if active.server.inbounds.len() != candidate.server.inbounds.len() {
+        return None;
     }
-    if &normalized==active{changed}else{None}
+    let mut normalized = candidate.clone();
+    let mut changed = None;
+    for (i, (old, new)) in active
+        .server
+        .inbounds
+        .iter()
+        .zip(&mut normalized.server.inbounds)
+        .enumerate()
+    {
+        if old.reality == new.reality {
+            continue;
+        }
+        let (Some(a), Some(b)) = (&old.reality, &new.reality) else {
+            return None;
+        };
+        if changed.is_some()
+            || a.identity_sha256 == b.identity_sha256
+            || a.bundle == b.bundle
+            || a.manifest_sha256 == b.manifest_sha256
+        {
+            return None;
+        }
+        changed = Some(i);
+        new.reality = old.reality.clone();
+    }
+    if &normalized == active {
+        changed
+    } else {
+        None
+    }
 }
 
 pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocument) -> bool {
-    if active.server.inbounds.len()!=candidate.server.inbounds.len()
-        || !active.server.inbounds.iter().any(|i|i.reality.is_none()){
+    if active.server.inbounds.len() != candidate.server.inbounds.len()
+        || !active.server.inbounds.iter().any(|i| i.reality.is_none())
+    {
         return false;
     }
     let mut normalized = candidate.clone();
@@ -247,7 +327,7 @@ pub(crate) fn same_port_tls_only(active: &ServerDocument, candidate: &ServerDocu
     {
         // A mixed deployment may rotate its ordinary TLS listeners only.
         // Never normalize away a REALITY binding or a security-mode change.
-        if original.reality.is_none() && normalized_inbound.reality.is_none(){
+        if original.reality.is_none() && normalized_inbound.reality.is_none() {
             normalized_inbound.tls_cert.clone_from(&original.tls_cert);
             normalized_inbound.tls_key.clone_from(&original.tls_key);
         }
@@ -339,25 +419,42 @@ mod tests {
     }
 
     #[test]
-    fn mixed_tls_rotation_never_normalizes_reality_binding(){
-        let source=include_str!("../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX",&"a".repeat(64));
-        let crate::config::Config::Server(mut active)=crate::config::parse(&source).unwrap()else{panic!()};
-        let mut reality=active.server.inbounds[0].clone();
-        reality.id="other-reality".into();reality.h2_listen="127.0.0.1:9443".into();reality.quic_listen=reality.h2_listen.clone();
-        reality.security_mode=crate::security_profile::SecurityMode::SmartReality;
-        reality.tls_cert.clear();reality.tls_key.clear();
-        let base=std::env::temp_dir();
-        reality.reality=Some(crate::config::RealityBinding{health_store:base.join("health").to_string_lossy().into_owned(),
-            bundle:base.join("bundle").to_string_lossy().into_owned(),initial_health_sha256:[1;32],identity_sha256:[2;32],manifest_sha256:[3;32]});
-        active.server.inbounds.insert(0,reality);
-        let mut next=active.clone();next.server.inbounds[1].tls_cert="file:new.pem".into();
-        assert!(same_port_tls_only(&active,&next));
-        next.server.inbounds[0].reality.as_mut().unwrap().manifest_sha256=[4;32];
-        assert!(!same_port_tls_only(&active,&next));
-        assert!(same_port_reality_only(&active,&next).is_none());
-        next.server.inbounds[0]=active.server.inbounds[0].clone();
-        next.server.inbounds[0].tls_key="file:unexpected.pem".into();
-        assert!(!same_port_tls_only(&active,&next));
+    fn mixed_tls_rotation_never_normalizes_reality_binding() {
+        let source = include_str!("../../../examples/server.toml")
+            .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64));
+        let crate::config::Config::Server(mut active) = crate::config::parse(&source).unwrap()
+        else {
+            panic!()
+        };
+        let mut reality = active.server.inbounds[0].clone();
+        reality.id = "other-reality".into();
+        reality.h2_listen = "127.0.0.1:9443".into();
+        reality.quic_listen = reality.h2_listen.clone();
+        reality.security_mode = crate::security_profile::SecurityMode::SmartReality;
+        reality.tls_cert.clear();
+        reality.tls_key.clear();
+        let base = std::env::temp_dir();
+        reality.reality = Some(crate::config::RealityBinding {
+            health_store: base.join("health").to_string_lossy().into_owned(),
+            bundle: base.join("bundle").to_string_lossy().into_owned(),
+            initial_health_sha256: [1; 32],
+            identity_sha256: [2; 32],
+            manifest_sha256: [3; 32],
+        });
+        active.server.inbounds.insert(0, reality);
+        let mut next = active.clone();
+        next.server.inbounds[1].tls_cert = "file:new.pem".into();
+        assert!(same_port_tls_only(&active, &next));
+        next.server.inbounds[0]
+            .reality
+            .as_mut()
+            .unwrap()
+            .manifest_sha256 = [4; 32];
+        assert!(!same_port_tls_only(&active, &next));
+        assert!(same_port_reality_only(&active, &next).is_none());
+        next.server.inbounds[0] = active.server.inbounds[0].clone();
+        next.server.inbounds[0].tls_key = "file:unexpected.pem".into();
+        assert!(!same_port_tls_only(&active, &next));
     }
 
     #[test]

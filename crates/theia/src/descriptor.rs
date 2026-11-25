@@ -567,7 +567,7 @@ impl Store {
         self.inspect_bound(now).map(|(_, value)| value)
     }
 
-    pub(crate) fn inspect_bound(&self, now: u64) -> Result<([u8;32], Verified), Error> {
+    pub(crate) fn inspect_bound(&self, now: u64) -> Result<([u8; 32], Verified), Error> {
         let (raw, _, history, verified) = self.snapshot()?;
         history.check_clock(now)?;
         Ok((Sha256::digest(raw.as_bytes()).into(), verified))
@@ -575,11 +575,17 @@ impl Store {
 
     /// Independent re-enrollment must not resurrect a key this trust
     /// history already retired, or disguise ordinary renewal as a reset.
-    pub(crate) fn inspect_replacement(&self, proposed: [u8;32], now: u64) -> Result<([u8;32], Verified), Error> {
+    pub(crate) fn inspect_replacement(
+        &self,
+        proposed: [u8; 32],
+        now: u64,
+    ) -> Result<([u8; 32], Verified), Error> {
         let (raw, _, history, verified) = self.snapshot()?;
         history.check_clock(now)?;
-        if proposed == self.anchor.public_key || proposed == verified.signer()
-            || history.retired.contains(&proposed) {
+        if proposed == self.anchor.public_key
+            || proposed == verified.signer()
+            || history.retired.contains(&proposed)
+        {
             return Err(Error::Rotation);
         }
         Ok((Sha256::digest(raw.as_bytes()).into(), verified))
@@ -592,7 +598,11 @@ impl Store {
 
     /// The entire trust history, including accepted timestamps and the
     /// old signed payload, is bound to the offline confirmation.
-    pub fn preview_update_bound(&self, document: &str, now: u64) -> Result<([u8;32], Verified, Verified), Error> {
+    pub fn preview_update_bound(
+        &self,
+        document: &str,
+        now: u64,
+    ) -> Result<([u8; 32], Verified, Verified), Error> {
         let (raw, _, history, previous) = self.snapshot()?;
         history.check_clock(now)?;
         let next = history.verify_current(document)?;
@@ -610,7 +620,11 @@ impl Store {
     ) -> Result<([u8; 32], Verified, Verified), Error> {
         let (raw, _, mut history, previous) = self.snapshot()?;
         let next_key = canonical_base64::<32>(
-            previous.descriptor.next_identity.as_deref().ok_or(Error::Rotation)?,
+            previous
+                .descriptor
+                .next_identity
+                .as_deref()
+                .ok_or(Error::Rotation)?,
         )?;
         let next = history.advance(&previous, document, next_key, now)?;
         Ok((Sha256::digest(raw.as_bytes()).into(), previous, next))
@@ -673,15 +687,31 @@ impl Store {
         expected: &Verified,
         now: u64,
     ) -> Result<Change, Error> {
-        self.update_inner(document, Some(expected.descriptor.revision), Some(expected), None, now)
+        self.update_inner(
+            document,
+            Some(expected.descriptor.revision),
+            Some(expected),
+            None,
+            now,
+        )
     }
 
     /// Offline recovery can replace an expired document, but never a
     /// different trust snapshot from the one the operator confirmed.
     pub fn update_bound(
-        &self, document: &str, expected_revision: u64, expected_snapshot: [u8;32], now: u64,
+        &self,
+        document: &str,
+        expected_revision: u64,
+        expected_snapshot: [u8; 32],
+        now: u64,
     ) -> Result<Change, Error> {
-        self.update_inner(document, Some(expected_revision), None, Some(expected_snapshot), now)
+        self.update_inner(
+            document,
+            Some(expected_revision),
+            None,
+            Some(expected_snapshot),
+            now,
+        )
     }
 
     fn update_inner(
@@ -689,11 +719,11 @@ impl Store {
         document: &str,
         expected_revision: Option<u64>,
         expected: Option<&Verified>,
-        expected_snapshot: Option<[u8;32]>,
+        expected_snapshot: Option<[u8; 32]>,
         now: u64,
     ) -> Result<Change, Error> {
         let (old, mut snapshot, history, previous) = self.snapshot()?;
-        let digest: [u8;32] = Sha256::digest(old.as_bytes()).into();
+        let digest: [u8; 32] = Sha256::digest(old.as_bytes()).into();
         if expected_snapshot.is_some_and(|expected| expected != digest) {
             return Err(Error::Rollback);
         }
@@ -743,7 +773,13 @@ impl Store {
         expected_snapshot: [u8; 32],
         now: u64,
     ) -> Result<Change, Error> {
-        self.promote_inner(successor, expected_revision, expected_key, Some(expected_snapshot), now)
+        self.promote_inner(
+            successor,
+            expected_revision,
+            expected_key,
+            Some(expected_snapshot),
+            now,
+        )
     }
 
     fn promote_inner(

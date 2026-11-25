@@ -8,25 +8,41 @@
 use crate::{
     config::Config,
     identity_tls::Branch,
-    reality_live::{Live, Route},
     reality_generation::{Lease, Manager},
+    reality_live::{Live, Route},
     reality_quic_wire::{self as wire, Cid, Flight, Inspection, Kind},
     server::{ServerContext, ServerError},
 };
-use quinn::{AsyncUdpSocket, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, TokioRuntime, UdpPoller, udp::{RecvMeta, Transmit}};
-use ring::{hmac, rand::{SecureRandom, SystemRandom}};
-use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use quinn::{
+    udp::{RecvMeta, Transmit},
+    AsyncUdpSocket, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, TokioRuntime,
+    UdpPoller,
+};
+use ring::{
+    hmac,
+    rand::{SecureRandom, SystemRandom},
+};
 use std::{
     collections::{HashMap, HashSet},
-    fmt, io::{self, IoSliceMut},
+    fmt,
+    io::{self, IoSliceMut},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
-use tokio::{net::UdpSocket, sync::{mpsc, Semaphore}, task::JoinSet, time::{Instant, timeout}};
+use subtle::ConstantTimeEq;
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, Semaphore},
+    task::JoinSet,
+    time::{timeout, Instant},
+};
+use zeroize::Zeroizing;
 
 const SESSIONS: usize = 64;
 const RETIRED_LIMIT: usize = 256;
@@ -45,11 +61,20 @@ const DNS_DEADLINE: Duration = Duration::from_secs(5);
 type SessionId = u64;
 
 #[derive(Default)]
-struct Budget { received: usize, sent: usize }
+struct Budget {
+    received: usize,
+    sent: usize,
+}
 impl Budget {
-    fn credit(&mut self, n: usize) { self.received = self.received.saturating_add(n); }
-    fn allows(&self, n: usize) -> bool { self.sent.saturating_add(n) <= self.received.saturating_mul(3) }
-    fn debit(&mut self, n: usize) { self.sent = self.sent.saturating_add(n); }
+    fn credit(&mut self, n: usize) {
+        self.received = self.received.saturating_add(n);
+    }
+    fn allows(&self, n: usize) -> bool {
+        self.sent.saturating_add(n) <= self.received.saturating_mul(3)
+    }
+    fn debit(&mut self, n: usize) {
+        self.sent = self.sent.saturating_add(n);
+    }
 }
 
 struct Path {
@@ -57,17 +82,20 @@ struct Path {
     budget: Budget,
     last: Instant,
 }
-struct Retry { cid: Cid, token: Vec<u8> }
+struct Retry {
+    cid: Cid,
+    token: Vec<u8>,
+}
 struct Session {
     original: Cid,
     client: Cid,
-    original_version:u32,
-    negotiated_version:Option<u32>,
+    original_version: u32,
+    negotiated_version: Option<u32>,
     server: HashSet<Cid>,
     retry: Option<Retry>,
     retry_echoed: bool,
     server_initial: bool,
-    initial_server_cid:Option<Cid>,
+    initial_server_cid: Option<Cid>,
     first_peer: SocketAddr,
     paths: HashMap<SocketAddr, Path>,
     deadline: Instant,
@@ -76,52 +104,95 @@ struct Session {
     paths_opened: usize,
     closed_paths: HashSet<SocketAddr>,
     generation: Option<Arc<Lease>>,
-    reference_signer: Option<[u8;32]>,
+    reference_signer: Option<[u8; 32]>,
 }
 impl Session {
-    fn new(peer: SocketAddr, original: Cid, client: Cid, version:u32,now: Instant) -> Self {
-        Self { original, client, original_version:version,negotiated_version:None,server: HashSet::new(), retry: None, retry_echoed: false, server_initial: false, initial_server_cid:None,first_peer: peer,
-            paths: HashMap::new(), deadline: now + LIFETIME, last: now, remaining: BYTES, paths_opened: 0, closed_paths: HashSet::new(), generation: None, reference_signer:None }
+    fn new(peer: SocketAddr, original: Cid, client: Cid, version: u32, now: Instant) -> Self {
+        Self {
+            original,
+            client,
+            original_version: version,
+            negotiated_version: None,
+            server: HashSet::new(),
+            retry: None,
+            retry_echoed: false,
+            server_initial: false,
+            initial_server_cid: None,
+            first_peer: peer,
+            paths: HashMap::new(),
+            deadline: now + LIFETIME,
+            last: now,
+            remaining: BYTES,
+            paths_opened: 0,
+            closed_paths: HashSet::new(),
+            generation: None,
+            reference_signer: None,
+        }
     }
     fn expired(&self, now: Instant) -> bool {
-        now >= self.deadline || now.saturating_duration_since(self.last) >= IDLE || self.remaining == 0
+        now >= self.deadline
+            || now.saturating_duration_since(self.last) >= IDLE
+            || self.remaining == 0
     }
     fn prune_paths(&mut self, now: Instant) {
         self.paths.retain(|peer, path| {
             let keep = !path.queue.is_closed() && now.saturating_duration_since(path.last) < IDLE;
-            if !keep { self.closed_paths.insert(*peer); }
+            if !keep {
+                self.closed_paths.insert(*peer);
+            }
             keep
         });
     }
     fn known(&self, datagram: &[u8]) -> bool {
         if let Some(h) = wire::long(datagram) {
-            h.kind != Kind::Retry && h.kind != Kind::VersionNegotiation
+            h.kind != Kind::Retry
+                && h.kind != Kind::VersionNegotiation
                 && (h.dcid == self.original || self.server.contains(h.dcid))
                 && (h.kind != Kind::Initial || h.scid == self.client)
         } else {
-            self.initial_server_cid.as_ref().is_some_and(|cid|wire::short_matches(datagram,cid))
+            self.initial_server_cid
+                .as_ref()
+                .is_some_and(|cid| wire::short_matches(datagram, cid))
         }
     }
     fn allows_client(&self, peer: SocketAddr, datagram: &[u8]) -> bool {
         if let Some(h) = wire::long(datagram) {
-            if !wire::coherent_datagram(datagram){return false;}
-            if peer!=self.first_peer{return false;}
-            let version=self.negotiated_version.unwrap_or(self.original_version);
-            if h.version!=version{return false;}
+            if !wire::coherent_datagram(datagram) {
+                return false;
+            }
+            if peer != self.first_peer {
+                return false;
+            }
+            let version = self.negotiated_version.unwrap_or(self.original_version);
+            if h.version != version {
+                return false;
+            }
             if h.kind == Kind::Initial {
-                if datagram.len() < wire::MIN_INITIAL || h.scid != self.client { return false; }
+                if datagram.len() < wire::MIN_INITIAL || h.scid != self.client {
+                    return false;
+                }
                 if let Some(retry) = &self.retry {
                     // The first post-Retry Initial must echo the exact
                     // token on the original path. Do not accept another
                     // server CID as a replacement before that exchange.
-                    return peer == self.first_peer && h.token == retry.token && (h.dcid == retry.cid
-                        || (self.retry_echoed && self.server_initial && self.server.contains(h.dcid)));
+                    return peer == self.first_peer
+                        && h.token == retry.token
+                        && (h.dcid == retry.cid
+                            || (self.retry_echoed
+                                && self.server_initial
+                                && self.server.contains(h.dcid)));
                 }
             }
-            self.known(datagram)||self.initial_server_cid.as_deref().is_some_and(|cid|cid.is_empty()&&h.dcid.is_empty())
+            self.known(datagram)
+                || self
+                    .initial_server_cid
+                    .as_deref()
+                    .is_some_and(|cid| cid.is_empty() && h.dcid.is_empty())
         } else {
-            self.server_initial && datagram.len()>=18 && datagram.first().is_some_and(|b| b & 0x80 == 0) &&
-                (self.paths.contains_key(&peer) || self.known(datagram))
+            self.server_initial
+                && datagram.len() >= 18
+                && datagram.first().is_some_and(|b| b & 0x80 == 0)
+                && (self.paths.contains_key(&peer) || self.known(datagram))
         }
     }
 
@@ -130,57 +201,106 @@ impl Session {
     // relay cannot learn them from 1-RTT packets. Never guess a new CID length.
     fn observe_reference(&mut self, peer: SocketAddr, packet: &[u8]) -> bool {
         if let Some(h) = wire::long(packet) {
-            if !wire::coherent_datagram(packet){return false;}
-            if h.dcid != self.client { return false; }
+            if !wire::coherent_datagram(packet) {
+                return false;
+            }
+            if h.dcid != self.client {
+                return false;
+            }
             if h.kind == Kind::VersionNegotiation {
                 // VN is advisory, never a path validation or CID update.
-                return peer==self.first_peer && self.retry.is_none() && !self.server_initial && h.scid==self.original;
+                return peer == self.first_peer
+                    && self.retry.is_none()
+                    && !self.server_initial
+                    && h.scid == self.original;
             }
             if h.kind == Kind::Retry {
-                if h.version!=self.original_version || peer != self.first_peer || self.server_initial || h.scid.is_empty() || h.scid == self.original
-                    || !wire::retry_valid(packet, &self.original) { return false; }
-                if let Some(old) = &self.retry { return old.cid == h.scid && old.token == h.token; }
-                if !self.server.is_empty() { return false; }
-                self.retry = Some(Retry { cid: h.scid.to_vec(), token: h.token.to_vec() });
+                if h.version != self.original_version
+                    || peer != self.first_peer
+                    || self.server_initial
+                    || h.scid.is_empty()
+                    || h.scid == self.original
+                    || !wire::retry_valid(packet, &self.original)
+                {
+                    return false;
+                }
+                if let Some(old) = &self.retry {
+                    return old.cid == h.scid && old.token == h.token;
+                }
+                if !self.server.is_empty() {
+                    return false;
+                }
+                self.retry = Some(Retry {
+                    cid: h.scid.to_vec(),
+                    token: h.token.to_vec(),
+                });
             } else if h.kind != Kind::Initial && h.kind != Kind::Handshake {
                 return false;
             } else {
-                if self.retry.is_some() && !self.retry_echoed { return false; }
+                if self.retry.is_some() && !self.retry_echoed {
+                    return false;
+                }
                 // Compatible v1/v2 negotiation may change version on the
                 // first server Initial, never on Retry or a later packet.
-                if let Some(version)=self.negotiated_version{
-                    if h.version!=version{return false;}
-                }else{
-                    if peer!=self.first_peer||h.kind!=Kind::Initial{return false;}
-                    self.negotiated_version=Some(h.version);
+                if let Some(version) = self.negotiated_version {
+                    if h.version != version {
+                        return false;
+                    }
+                } else {
+                    if peer != self.first_peer || h.kind != Kind::Initial {
+                        return false;
+                    }
+                    self.negotiated_version = Some(h.version);
                 }
-                if let Some(cid)=&self.initial_server_cid{
-                    if h.scid!=cid.as_slice(){return false;}
-                }else{
-                    if h.kind!=Kind::Initial||peer!=self.first_peer{return false;}
-                    self.initial_server_cid=Some(h.scid.to_vec());
+                if let Some(cid) = &self.initial_server_cid {
+                    if h.scid != cid.as_slice() {
+                        return false;
+                    }
+                } else {
+                    if h.kind != Kind::Initial || peer != self.first_peer {
+                        return false;
+                    }
+                    self.initial_server_cid = Some(h.scid.to_vec());
                 }
-                if h.kind == Kind::Initial { self.server_initial = true; }
+                if h.kind == Kind::Initial {
+                    self.server_initial = true;
+                }
             }
             if !h.scid.is_empty() && !self.server.contains(h.scid) {
-                if self.server.len() == CIDS { return false; }
+                if self.server.len() == CIDS {
+                    return false;
+                }
                 self.server.insert(h.scid.to_vec());
             }
             true
         } else {
-            self.server_initial && packet.len()>=18 && packet.first().is_some_and(|b| b & 0x80 == 0) &&
-                self.paths.contains_key(&peer)
+            self.server_initial
+                && packet.len() >= 18
+                && packet.first().is_some_and(|b| b & 0x80 == 0)
+                && self.paths.contains_key(&peer)
         }
     }
 
     fn enqueue(&mut self, peer: SocketAddr, data: Vec<u8>, now: Instant) {
         let n = data.len();
-        if n > self.remaining { return; }
-        let echoed = peer == self.first_peer && self.retry.as_ref().is_some_and(|retry|
-            wire::long(&data).is_some_and(|h| h.kind == Kind::Initial
-                && h.dcid == retry.cid && h.token == retry.token && h.scid == self.client));
-        let Some(path) = self.paths.get_mut(&peer) else { return; };
-        if now.saturating_duration_since(path.last) >= IDLE || path.queue.is_closed() { return; }
+        if n > self.remaining {
+            return;
+        }
+        let echoed = peer == self.first_peer
+            && self.retry.as_ref().is_some_and(|retry| {
+                wire::long(&data).is_some_and(|h| {
+                    h.kind == Kind::Initial
+                        && h.dcid == retry.cid
+                        && h.token == retry.token
+                        && h.scid == self.client
+                })
+            });
+        let Some(path) = self.paths.get_mut(&peer) else {
+            return;
+        };
+        if now.saturating_duration_since(path.last) >= IDLE || path.queue.is_closed() {
+            return;
+        }
         if path.queue.try_send(data).is_ok() {
             self.remaining -= n;
             path.budget.credit(n);
@@ -190,9 +310,12 @@ impl Session {
         }
     }
     fn can_reply(&self, peer: SocketAddr, n: usize) -> bool {
-        n <= self.remaining && self.paths.get(&peer).is_some_and(|p|
-            !p.queue.is_closed() && p.budget.allows(n)
-                && Instant::now().saturating_duration_since(p.last) < IDLE)
+        n <= self.remaining
+            && self.paths.get(&peer).is_some_and(|p| {
+                !p.queue.is_closed()
+                    && p.budget.allows(n)
+                    && Instant::now().saturating_duration_since(p.last) < IDLE
+            })
     }
     fn sent(&mut self, peer: SocketAddr, n: usize, now: Instant) {
         if let Some(path) = self.paths.get_mut(&peer) {
@@ -219,33 +342,49 @@ impl Retired {
         let mut peers = session.closed_paths;
         peers.extend(session.paths.keys().copied());
         peers.insert(session.first_peer);
-        Self { original: session.original, client: session.client, server: session.server,
-            peers, until: now + RETIRED_TTL }
+        Self {
+            original: session.original,
+            client: session.client,
+            server: session.server,
+            peers,
+            until: now + RETIRED_TTL,
+        }
     }
     fn blocks(&self, peer: SocketAddr, bytes: &[u8], now: Instant) -> bool {
-        if now >= self.until { return false; }
+        if now >= self.until {
+            return false;
+        }
         if let Some(h) = wire::long(bytes) {
-            return (self.peers.contains(&peer) && h.dcid == self.original && h.scid == self.client)
+            return (self.peers.contains(&peer)
+                && h.dcid == self.original
+                && h.scid == self.client)
                 || self.server.contains(h.dcid);
         }
-        self.server.iter().any(|cid| wire::short_matches(bytes,cid))
+        self.server
+            .iter()
+            .any(|cid| wire::short_matches(bytes, cid))
     }
 }
 
 struct Pending {
     flight: Flight,
     client: Cid,
-    version:u32,
+    version: u32,
     datagrams: Vec<Vec<u8>>,
     bytes: usize,
     deadline: Instant,
 }
 impl Pending {
     fn add(&mut self, data: Vec<u8>) -> Option<Inspection> {
-        let h=wire::long(&data)?;
-        if h.kind!=Kind::Initial||h.version!=self.version||h.scid!=self.client.as_slice(){return None;}
+        let h = wire::long(&data)?;
+        if h.kind != Kind::Initial || h.version != self.version || h.scid != self.client.as_slice()
+        {
+            return None;
+        }
         let total = self.bytes.checked_add(data.len())?;
-        if total > MAX_FIRST_BYTES || self.datagrams.len() >= QUEUE { return None; }
+        if total > MAX_FIRST_BYTES || self.datagrams.len() >= QUEUE {
+            return None;
+        }
         let decision = self.flight.inspect(&data);
         self.datagrams.push(data);
         self.bytes = total;
@@ -253,7 +392,11 @@ impl Pending {
     }
 }
 
-struct Reply { id: SessionId, peer: SocketAddr, data: Vec<u8> }
+struct Reply {
+    id: SessionId,
+    peer: SocketAddr,
+    data: Vec<u8>,
+}
 fn wildcard(ip: IpAddr) -> SocketAddr {
     match ip {
         IpAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
@@ -265,29 +408,64 @@ fn wildcard(ip: IpAddr) -> SocketAddr {
 /// seen from a second address does not redirect or validate the old path.
 /// Responses return only to the physical peer owning this socket.
 async fn reference_path(
-    generation: Arc<Lease>, signer:[u8;32], id: SessionId, peer: SocketAddr, deadline: Instant,
-    incoming: mpsc::Receiver<Vec<u8>>, replies: mpsc::Sender<Reply>,
+    generation: Arc<Lease>,
+    signer: [u8; 32],
+    id: SessionId,
+    peer: SocketAddr,
+    deadline: Instant,
+    incoming: mpsc::Receiver<Vec<u8>>,
+    replies: mpsc::Sender<Reply>,
 ) {
     let publication = generation.publication();
-    let Ok(now)=crate::reference_health::unix_now() else { return; };
+    let Ok(now) = crate::reference_health::unix_now() else {
+        return;
+    };
     // A session pins the signer/reference selected at its creation. When
     // overlap expires, a new path cannot silently switch to the successor's
     // reference; if this exact descriptor is no longer valid, close the path.
-    let Ok(material)=publication.select(signer,now) else{return;};
-    let value=material.verified();
-    let Ok(Ok(lease)) = timeout(DNS_DEADLINE,
-        generation.health().relay_lease(value, publication.plan_sha256())).await else { return; };
-    let Ok(address) = lease.address() else { return; };
-    let Ok(socket) = UdpSocket::bind(wildcard(address.ip())).await else { return; };
-    if socket.connect(address).await.is_err() || lease.address().ok() != Some(address) { return; }
-    pump_path(socket, id, peer, deadline, incoming, replies, || lease.address().is_ok()).await;
+    let Ok(material) = publication.select(signer, now) else {
+        return;
+    };
+    let value = material.verified();
+    let Ok(Ok(lease)) = timeout(
+        DNS_DEADLINE,
+        generation
+            .health()
+            .relay_lease(value, publication.plan_sha256()),
+    )
+    .await
+    else {
+        return;
+    };
+    let Ok(address) = lease.address() else {
+        return;
+    };
+    let Ok(socket) = UdpSocket::bind(wildcard(address.ip())).await else {
+        return;
+    };
+    if socket.connect(address).await.is_err() || lease.address().ok() != Some(address) {
+        return;
+    }
+    pump_path(socket, id, peer, deadline, incoming, replies, || {
+        lease.address().is_ok()
+    })
+    .await;
 }
 
-async fn pump_path(socket: UdpSocket, id: SessionId, peer: SocketAddr, deadline: Instant,
-    mut incoming: mpsc::Receiver<Vec<u8>>, replies: mpsc::Sender<Reply>, eligible: impl Fn() -> bool) {
+async fn pump_path(
+    socket: UdpSocket,
+    id: SessionId,
+    peer: SocketAddr,
+    deadline: Instant,
+    mut incoming: mpsc::Receiver<Vec<u8>>,
+    replies: mpsc::Sender<Reply>,
+    eligible: impl Fn() -> bool,
+) {
     let mut buf = vec![0; wire::MAX_DATAGRAM + 1];
     loop {
-        if incoming.is_closed() || !eligible() { return; }
+        if incoming.is_closed() || !eligible() {
+            return;
+        }
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return,
             data = incoming.recv() => {
@@ -307,27 +485,48 @@ async fn pump_path(socket: UdpSocket, id: SessionId, peer: SocketAddr, deadline:
     }
 }
 
-fn unique<I: Iterator<Item=SessionId>>(mut ids: I) -> Option<SessionId> {
+fn unique<I: Iterator<Item = SessionId>>(mut ids: I) -> Option<SessionId> {
     let first = ids.next()?;
     ids.next().is_none().then_some(first)
 }
-fn route(sessions: &HashMap<SessionId, Session>, peer: SocketAddr, bytes: &[u8], admitted_peer: bool) -> Option<SessionId> {
+fn route(
+    sessions: &HashMap<SessionId, Session>,
+    peer: SocketAddr,
+    bytes: &[u8],
+    admitted_peer: bool,
+) -> Option<SessionId> {
     let known = || sessions.iter().filter(|(_, s)| s.known(bytes));
-    let mut global=known();
-    if let Some((&id,session))=global.next(){
+    let mut global = known();
+    if let Some((&id, session)) = global.next() {
         // Even on an existing tuple, prefix collisions are ambiguous.
         // A tuple is not proof of association with one of several CIDs.
-        if global.next().is_some(){return None;}
-        return (session.paths.contains_key(&peer)||bytes[0]&0x80==0).then_some(id);
+        if global.next().is_some() {
+            return None;
+        }
+        return (session.paths.contains_key(&peer) || bytes[0] & 0x80 == 0).then_some(id);
     }
-    if wire::long(bytes).is_some_and(|h|h.dcid.is_empty()&&h.kind==Kind::Handshake){
-        return unique(sessions.iter().filter(|(_,s)|s.first_peer==peer&&s.initial_server_cid.as_deref()==Some(&[])).map(|(&id,_)|id));
+    if wire::long(bytes).is_some_and(|h| h.dcid.is_empty() && h.kind == Kind::Handshake) {
+        return unique(
+            sessions
+                .iter()
+                .filter(|(_, s)| {
+                    s.first_peer == peer && s.initial_server_cid.as_deref() == Some(&[])
+                })
+                .map(|(&id, _)| id),
+        );
     }
     // On an existing, unambiguous physical tuple the reference can decrypt
     // packets carrying an encrypted, newly issued CID. Do not learn it from
     // unauthenticated bytes or guess which of several connections owns it.
-    if admitted_peer || bytes.len()<18 || !bytes.first().is_some_and(|b| b & 0x80 == 0) { return None; }
-    unique(sessions.iter().filter(|(_, s)| s.paths.contains_key(&peer)).map(|(&id, _)| id))
+    if admitted_peer || bytes.len() < 18 || !bytes.first().is_some_and(|b| b & 0x80 == 0) {
+        return None;
+    }
+    unique(
+        sessions
+            .iter()
+            .filter(|(_, s)| s.paths.contains_key(&peer))
+            .map(|(&id, _)| id),
+    )
 }
 
 // A generation-specific authenticated CID namespace permits routing all
@@ -342,8 +541,13 @@ struct LocalCidKey {
 impl LocalCidKey {
     fn fresh() -> Result<Self, ServerError> {
         let mut secret = Zeroizing::new([0u8; 32]);
-        SystemRandom::new().fill(&mut secret[..]).map_err(|_| ServerError::Tls)?;
-        Ok(Self { key: hmac::Key::new(hmac::HMAC_SHA256, &secret[..]), sequence: AtomicU64::new(0) })
+        SystemRandom::new()
+            .fill(&mut secret[..])
+            .map_err(|_| ServerError::Tls)?;
+        Ok(Self {
+            key: hmac::Key::new(hmac::HMAC_SHA256, &secret[..]),
+            sequence: AtomicU64::new(0),
+        })
     }
     fn tag(&self, prefix: &[u8]) -> hmac::Tag {
         let mut mac = hmac::Context::with_key(&self.key);
@@ -352,7 +556,9 @@ impl LocalCidKey {
         mac.sign()
     }
     fn matches(&self, cid: &[u8]) -> bool {
-        if cid.len() != LOCAL_CID_LEN { return false; }
+        if cid.len() != LOCAL_CID_LEN {
+            return false;
+        }
         let tag = self.tag(&cid[..10]);
         bool::from(cid[10..].ct_eq(&tag.as_ref()[..10]))
     }
@@ -371,9 +577,15 @@ impl LocalCidKey {
 }
 struct NativeCids(Arc<LocalCidKey>);
 impl ConnectionIdGenerator for NativeCids {
-    fn generate_cid(&mut self) -> ConnectionId { ConnectionId::new(&self.0.next()) }
-    fn cid_len(&self) -> usize { LOCAL_CID_LEN }
-    fn cid_lifetime(&self) -> Option<Duration> { None }
+    fn generate_cid(&mut self) -> ConnectionId {
+        ConnectionId::new(&self.0.next())
+    }
+    fn cid_len(&self) -> usize {
+        LOCAL_CID_LEN
+    }
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
 }
 
 // Quinn receives the original physical source address, not a loopback proxy
@@ -385,7 +597,9 @@ struct LocalSocket {
     receive: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
 }
 impl fmt::Debug for LocalSocket {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("RealityQuicSocket(<redacted>)") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RealityQuicSocket(<redacted>)")
+    }
 }
 #[derive(Debug)]
 struct Ready;
@@ -395,11 +609,17 @@ impl UdpPoller for Ready {
     }
 }
 impl AsyncUdpSocket for LocalSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> { Box::pin(Ready) }
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Box::pin(Ready)
+    }
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
         // GSO is not advertised; no packet splitting or byte rewriting.
-        if transmit.segment_size.is_some() { return Err(io::ErrorKind::InvalidInput.into()); }
-        let result = self.socket.try_send_to(transmit.contents, transmit.destination);
+        if transmit.segment_size.is_some() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let result = self
+            .socket
+            .try_send_to(transmit.contents, transmit.destination);
         match result {
             Ok(n) if n == transmit.contents.len() => Ok(()),
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
@@ -407,9 +627,19 @@ impl AsyncUdpSocket for LocalSocket {
             Err(e) => Err(e),
         }
     }
-    fn poll_recv(&self, cx: &mut TaskContext<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> Poll<io::Result<usize>> {
-        if bufs.is_empty() || meta.is_empty() { return Poll::Ready(Ok(0)); }
-        let mut receiver = self.receive.lock().map_err(|_| io::Error::other("QUIC receive lock"))?;
+    fn poll_recv(
+        &self,
+        cx: &mut TaskContext<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        if bufs.is_empty() || meta.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let mut receiver = self
+            .receive
+            .lock()
+            .map_err(|_| io::Error::other("QUIC receive lock"))?;
         match receiver.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
@@ -419,15 +649,29 @@ impl AsyncUdpSocket for LocalSocket {
                     return Poll::Pending;
                 }
                 bufs[0][..bytes.len()].copy_from_slice(&bytes);
-                meta[0] = RecvMeta { addr, len: bytes.len(), stride: bytes.len(), ecn: None, dst_ip: None };
+                meta[0] = RecvMeta {
+                    addr,
+                    len: bytes.len(),
+                    stride: bytes.len(),
+                    ecn: None,
+                    dst_ip: None,
+                };
                 Poll::Ready(Ok(1))
             }
         }
     }
-    fn local_addr(&self) -> io::Result<SocketAddr> { self.socket.local_addr() }
-    fn may_fragment(&self) -> bool { true }
-    fn max_transmit_segments(&self) -> usize { 1 }
-    fn max_receive_segments(&self) -> usize { 1 }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+    fn may_fragment(&self) -> bool {
+        true
+    }
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
 }
 
 /// Actual UDP composition for a single prepared generation. No wildcard
@@ -440,45 +684,88 @@ pub struct PreparedQuic {
     local_cids: Arc<LocalCidKey>,
     path_slots: Arc<Semaphore>,
     live: Arc<Live>,
-    tickets: Arc<Mutex<HashMap<(SocketAddr,Cid), Ticket>>>,
+    tickets: Arc<Mutex<HashMap<(SocketAddr, Cid), Ticket>>>,
 }
 struct Ticket {
     route: Arc<Route>,
     until: Instant,
 }
 impl PreparedQuic {
-    pub fn prepare(socket: UdpSocket, document: &Config, inbound_id: &str) -> Result<Self, ServerError> {
-        let Config::Server(doc) = document else { return Err(ServerError::Config); };
-        let inbound = doc.server.inbounds.iter().find(|i| i.id == inbound_id).ok_or(ServerError::Config)?;
-        let expected: SocketAddr = inbound.quic_listen.parse().map_err(|_| ServerError::Config)?;
-        if socket.local_addr().map_err(|_| ServerError::Io)? != expected { return Err(ServerError::Config); }
+    pub fn prepare(
+        socket: UdpSocket,
+        document: &Config,
+        inbound_id: &str,
+    ) -> Result<Self, ServerError> {
+        let Config::Server(doc) = document else {
+            return Err(ServerError::Config);
+        };
+        let inbound = doc
+            .server
+            .inbounds
+            .iter()
+            .find(|i| i.id == inbound_id)
+            .ok_or(ServerError::Config)?;
+        let expected: SocketAddr = inbound
+            .quic_listen
+            .parse()
+            .map_err(|_| ServerError::Config)?;
+        if socket.local_addr().map_err(|_| ServerError::Io)? != expected {
+            return Err(ServerError::Config);
+        }
         let now = crate::reference_health::unix_now().map_err(|_| ServerError::Config)?;
         let manager = Manager::new(document, inbound_id, now).map_err(|_| ServerError::Config)?;
         let generation = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
-        let context=Arc::new(ServerContext::new(inbound,&doc.server.users,&doc.server.policy));
+        let context = Arc::new(ServerContext::new(
+            inbound,
+            &doc.server.users,
+            &doc.server.policy,
+        ));
         Self::from_shared(socket, generation, context, now)
     }
 
-    pub(crate) fn from_shared(socket: UdpSocket, generation: Arc<Lease>,
-        context: Arc<ServerContext>, now: u64) -> Result<Self, ServerError> {
-        Self::from_live(socket,Live::new(generation,context,now)?)
+    pub(crate) fn from_shared(
+        socket: UdpSocket,
+        generation: Arc<Lease>,
+        context: Arc<ServerContext>,
+        now: u64,
+    ) -> Result<Self, ServerError> {
+        Self::from_live(socket, Live::new(generation, context, now)?)
     }
 
-    pub(crate) fn from_live(socket:UdpSocket,live:Arc<Live>)->Result<Self,ServerError>{
-        let server=live.current().and_then(|g|g.default_quic()).ok_or(ServerError::Config)?;
+    pub(crate) fn from_live(socket: UdpSocket, live: Arc<Live>) -> Result<Self, ServerError> {
+        let server = live
+            .current()
+            .and_then(|g| g.default_quic())
+            .ok_or(ServerError::Config)?;
         let socket = Arc::new(socket);
         let (local, rx) = mpsc::channel(SESSIONS * 2);
         let local_cids = Arc::new(LocalCidKey::fresh()?);
         let mut endpoint_config = EndpointConfig::default();
         let cid_key = local_cids.clone();
         endpoint_config.cid_generator(move || Box::new(NativeCids(cid_key.clone())));
-        endpoint_config.max_udp_payload_size(LOCAL_MAX as u16).map_err(|_| ServerError::Config)?;
-        let virtual_socket = Arc::new(LocalSocket { socket: socket.clone(), receive: Mutex::new(rx) });
-        let endpoint = Endpoint::new_with_abstract_socket(endpoint_config, Some(server),
-            virtual_socket, Arc::new(TokioRuntime)).map_err(|_| ServerError::Io)?;
-        Ok(Self { socket,endpoint,local,local_cids,live,
-            tickets:Arc::new(Mutex::new(HashMap::new())),
-            path_slots: Arc::new(Semaphore::new(SESSIONS * PATHS)) })
+        endpoint_config
+            .max_udp_payload_size(LOCAL_MAX as u16)
+            .map_err(|_| ServerError::Config)?;
+        let virtual_socket = Arc::new(LocalSocket {
+            socket: socket.clone(),
+            receive: Mutex::new(rx),
+        });
+        let endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config,
+            Some(server),
+            virtual_socket,
+            Arc::new(TokioRuntime),
+        )
+        .map_err(|_| ServerError::Io)?;
+        Ok(Self {
+            socket,
+            endpoint,
+            local,
+            local_cids,
+            live,
+            tickets: Arc::new(Mutex::new(HashMap::new())),
+            path_slots: Arc::new(Semaphore::new(SESSIONS * PATHS)),
+        })
     }
 
     pub async fn serve(self) -> Result<(), ServerError> {
@@ -491,10 +778,10 @@ impl PreparedQuic {
         result
     }
 
-    async fn accept_native(&self)->Result<(),ServerError>{
-        let mut tasks=JoinSet::new();
+    async fn accept_native(&self) -> Result<(), ServerError> {
+        let mut tasks = JoinSet::new();
         loop {
-            tokio::select!{
+            tokio::select! {
                 _=tasks.join_next(),if !tasks.is_empty()=>{},
                 incoming=self.endpoint.accept()=>{
                     let Some(incoming)=incoming else{return Err(ServerError::Io);};
@@ -521,15 +808,39 @@ impl PreparedQuic {
         }
     }
 
-    fn open_path(&self, workers: &mut JoinSet<()>, replies: &mpsc::Sender<Reply>, id: SessionId,
-        session: &mut Session, peer: SocketAddr) -> bool {
-        if let Some(path) = session.paths.get(&peer) { return !path.queue.is_closed(); }
-        if session.closed_paths.contains(&peer) || session.paths_opened >= PATHS { return false; }
-        let Ok(slot) = self.path_slots.clone().try_acquire_owned() else { return false; };
+    fn open_path(
+        &self,
+        workers: &mut JoinSet<()>,
+        replies: &mpsc::Sender<Reply>,
+        id: SessionId,
+        session: &mut Session,
+        peer: SocketAddr,
+    ) -> bool {
+        if let Some(path) = session.paths.get(&peer) {
+            return !path.queue.is_closed();
+        }
+        if session.closed_paths.contains(&peer) || session.paths_opened >= PATHS {
+            return false;
+        }
+        let Ok(slot) = self.path_slots.clone().try_acquire_owned() else {
+            return false;
+        };
         let (tx, rx) = mpsc::channel(QUEUE);
-        session.paths.insert(peer, Path { queue: tx, budget: Budget::default(), last: Instant::now() });
+        session.paths.insert(
+            peer,
+            Path {
+                queue: tx,
+                budget: Budget::default(),
+                last: Instant::now(),
+            },
+        );
         session.paths_opened += 1;
-        let (Some(generation),Some(signer))=(session.generation.clone(),session.reference_signer) else { session.paths.remove(&peer); return false; };
+        let (Some(generation), Some(signer)) =
+            (session.generation.clone(), session.reference_signer)
+        else {
+            session.paths.remove(&peer);
+            return false;
+        };
         let deadline = session.deadline;
         let replies = replies.clone();
         workers.spawn(async move {
@@ -693,23 +1004,40 @@ impl PreparedQuic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn peer(port: u16) -> SocketAddr { SocketAddr::from(([127,0,0,1], port)) }
+    fn peer(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
     fn session(p: SocketAddr, server: &[u8]) -> Session {
-        let mut s = Session::new(p, vec![1;8], vec![2;8], wire::V1,Instant::now());
+        let mut s = Session::new(p, vec![1; 8], vec![2; 8], wire::V1, Instant::now());
         s.server.insert(server.to_vec());
-        s.server_initial=true;s.initial_server_cid=Some(server.to_vec());
-        s.negotiated_version=Some(wire::V1);
+        s.server_initial = true;
+        s.initial_server_cid = Some(server.to_vec());
+        s.negotiated_version = Some(wire::V1);
         let (queue, _rx) = mpsc::channel(1);
-        s.paths.insert(p, Path { queue, budget: Budget::default(), last: Instant::now() });
+        s.paths.insert(
+            p,
+            Path {
+                queue,
+                budget: Budget::default(),
+                last: Instant::now(),
+            },
+        );
         s
     }
     #[test]
     fn amplification_is_per_path_and_never_promoted_by_cid_or_retry() {
-        let mut s = session(peer(1), &[3;8]);
+        let mut s = session(peer(1), &[3; 8]);
         let (first_queue, _first_rx) = mpsc::channel(1);
         s.paths.get_mut(&peer(1)).unwrap().queue = first_queue;
         let (queue, _rx) = mpsc::channel(1);
-        s.paths.insert(peer(2), Path { queue, budget: Budget::default(), last: Instant::now() });
+        s.paths.insert(
+            peer(2),
+            Path {
+                queue,
+                budget: Budget::default(),
+                last: Instant::now(),
+            },
+        );
         s.paths.get_mut(&peer(1)).unwrap().budget.credit(1200);
         assert!(s.can_reply(peer(1), 3600));
         assert!(!s.can_reply(peer(1), 3601));
@@ -722,91 +1050,122 @@ mod tests {
     }
     #[test]
     fn known_cid_rebinding_and_unknown_rotation_are_unambiguous() {
-        let old = peer(1); let new = peer(2);
+        let old = peer(1);
+        let new = peer(2);
         let mut table = HashMap::new();
-        table.insert(1, session(old, &[3;8]));
-        let known = [0x40,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
-        let rotated = [0x40,4,4,4,4,4,4,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+        table.insert(1, session(old, &[3; 8]));
+        let known = [
+            0x40, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let rotated = [
+            0x40, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         assert_eq!(route(&table, new, &known, false), Some(1));
         assert_eq!(route(&table, old, &rotated, false), Some(1));
         assert_eq!(route(&table, new, &rotated, false), None);
-        let mut greased=known;greased[0]=0;
-        assert_eq!(route(&table,new,&greased,false),Some(1));
-        let mut greased_unknown=rotated;greased_unknown[0]=0;
-        assert_eq!(route(&table,old,&greased_unknown,false),Some(1));
-        assert_eq!(route(&table,new,&greased_unknown,false),None);
+        let mut greased = known;
+        greased[0] = 0;
+        assert_eq!(route(&table, new, &greased, false), Some(1));
+        let mut greased_unknown = rotated;
+        greased_unknown[0] = 0;
+        assert_eq!(route(&table, old, &greased_unknown, false), Some(1));
+        assert_eq!(route(&table, new, &greased_unknown, false), None);
         assert_eq!(route(&table, old, &rotated, true), None);
-        table.insert(2, session(old, &[5;8]));
+        table.insert(2, session(old, &[5; 8]));
         assert_eq!(route(&table, old, &rotated, false), None);
-        table.insert(3, session(peer(3), &[3;8]));
+        table.insert(3, session(peer(3), &[3; 8]));
         assert_eq!(route(&table, new, &known, false), None);
         assert_eq!(route(&table, old, &known, false), None);
     }
     #[test]
-    fn first_flight_is_version_and_client_cid_bound(){
-        let mut initial=vec![0xc0,0,0,0,1,8];initial.extend_from_slice(&[1;8]);
-        initial.push(8);initial.extend_from_slice(&[2;8]);
-        initial.extend_from_slice(&[0,0x44,0x96]);initial.resize(1200,0);
-        let h=wire::long(&initial).unwrap();
-        let mut pending=Pending{flight:Flight::new(&h).unwrap(),client:h.scid.to_vec(),
-            version:h.version,datagrams:Vec::new(),bytes:0,deadline:Instant::now()+FIRST_DEADLINE};
-        let mut other=initial.clone();other[0]=0xd0;
+    fn first_flight_is_version_and_client_cid_bound() {
+        let mut initial = vec![0xc0, 0, 0, 0, 1, 8];
+        initial.extend_from_slice(&[1; 8]);
+        initial.push(8);
+        initial.extend_from_slice(&[2; 8]);
+        initial.extend_from_slice(&[0, 0x44, 0x96]);
+        initial.resize(1200, 0);
+        let h = wire::long(&initial).unwrap();
+        let mut pending = Pending {
+            flight: Flight::new(&h).unwrap(),
+            client: h.scid.to_vec(),
+            version: h.version,
+            datagrams: Vec::new(),
+            bytes: 0,
+            deadline: Instant::now() + FIRST_DEADLINE,
+        };
+        let mut other = initial.clone();
+        other[0] = 0xd0;
         other[1..5].copy_from_slice(&wire::V2.to_be_bytes());
         assert!(pending.add(other).is_none());
-        let mut other=initial.clone();other[15]^=1;
+        let mut other = initial.clone();
+        other[15] ^= 1;
         assert!(pending.add(other).is_none());
-        assert!(pending.datagrams.is_empty()&&pending.bytes==0);
+        assert!(pending.datagrams.is_empty() && pending.bytes == 0);
     }
 
     #[test]
-    fn zero_cid_and_retry_cid_cannot_authorize_migration(){
-        let p=peer(1);
-        let mut s=session(p,&[3;8]);
-        s.initial_server_cid=Some(Vec::new());
-        s.server.insert(vec![9;8]); // historical Retry CID, not a 1-RTT CID
-        let mut short=vec![0x40];short.extend_from_slice(&[9;8]);short.extend_from_slice(&[0;24]);
-        let mut table=HashMap::from([(1,s)]);
-        assert_eq!(route(&table,peer(2),&short,false),None);
-        assert_eq!(route(&table,p,&short,false),Some(1));
-        let mut handshake=vec![0xe0,0,0,0,1,0,8];
-        handshake.extend_from_slice(&[2;8]);handshake.push(20);handshake.extend_from_slice(&[0;20]);
-        assert_eq!(route(&table,p,&handshake,false),Some(1));
-        assert!(table[&1].allows_client(p,&handshake));
-        assert_eq!(route(&table,peer(2),&handshake,false),None);
-        table.insert(2,session(p,&[4;8]));
-        assert_eq!(route(&table,p,&short,false),None);
+    fn zero_cid_and_retry_cid_cannot_authorize_migration() {
+        let p = peer(1);
+        let mut s = session(p, &[3; 8]);
+        s.initial_server_cid = Some(Vec::new());
+        s.server.insert(vec![9; 8]); // historical Retry CID, not a 1-RTT CID
+        let mut short = vec![0x40];
+        short.extend_from_slice(&[9; 8]);
+        short.extend_from_slice(&[0; 24]);
+        let mut table = HashMap::from([(1, s)]);
+        assert_eq!(route(&table, peer(2), &short, false), None);
+        assert_eq!(route(&table, p, &short, false), Some(1));
+        let mut handshake = vec![0xe0, 0, 0, 0, 1, 0, 8];
+        handshake.extend_from_slice(&[2; 8]);
+        handshake.push(20);
+        handshake.extend_from_slice(&[0; 20]);
+        assert_eq!(route(&table, p, &handshake, false), Some(1));
+        assert!(table[&1].allows_client(p, &handshake));
+        assert_eq!(route(&table, peer(2), &handshake, false), None);
+        table.insert(2, session(p, &[4; 8]));
+        assert_eq!(route(&table, p, &short, false), None);
     }
 
     #[test]
-    fn opaque_cid_new_address_is_not_connection_or_validation_evidence(){
-        let mut table=HashMap::new();
-        table.insert(1,session(peer(1),&[1;8]));
-        table.insert(2,session(peer(2),&[2;8]));
+    fn opaque_cid_new_address_is_not_connection_or_validation_evidence() {
+        let mut table = HashMap::new();
+        table.insert(1, session(peer(1), &[1; 8]));
+        table.insert(2, session(peer(2), &[2; 8]));
         // Either reference-side connection could have received this
         // newly issued, encrypted CID. The observer sees identical bytes.
-        let mut opaque=vec![0x40];opaque.extend_from_slice(&[9;8]);opaque.extend_from_slice(&[0;24]);
-        assert_eq!(route(&table,peer(3),&opaque,false),None);
-        for s in table.values(){
-            assert!(!s.can_reply(peer(3),1));
-            assert!(!s.allows_client(peer(3),&opaque));
+        let mut opaque = vec![0x40];
+        opaque.extend_from_slice(&[9; 8]);
+        opaque.extend_from_slice(&[0; 24]);
+        assert_eq!(route(&table, peer(3), &opaque, false), None);
+        for s in table.values() {
+            assert!(!s.can_reply(peer(3), 1));
+            assert!(!s.allows_client(peer(3), &opaque));
         }
-        assert_eq!(route(&table,peer(1),&opaque,true),None);
-        assert_eq!(table.len(),2);
+        assert_eq!(route(&table, peer(1), &opaque, true), None);
+        assert_eq!(table.len(), 2);
     }
 
     #[test]
     fn quotas_expiry_and_queue_failure_do_not_create_credit() {
         let p = peer(1);
-        let mut s = session(p, &[3;8]);
+        let mut s = session(p, &[3; 8]);
         let now = Instant::now();
-        s.enqueue(p, vec![0;1200], now);
+        s.enqueue(p, vec![0; 1200], now);
         assert!(!s.can_reply(p, 1)); // receiver was dropped
         assert_eq!(s.remaining, BYTES);
         assert!(s.expired(now + LIFETIME));
         assert!(s.expired(now + IDLE));
         let (queue, mut rx) = mpsc::channel(1);
-        s.paths.insert(p, Path { queue, budget: Budget::default(), last: Instant::now() });
-        let bytes = vec![0;1200];
+        s.paths.insert(
+            p,
+            Path {
+                queue,
+                budget: Budget::default(),
+                last: Instant::now(),
+            },
+        );
+        let bytes = vec![0; 1200];
         s.enqueue(p, bytes.clone(), now);
         s.enqueue(p, bytes.clone(), now);
         assert_eq!(s.remaining, BYTES - 1200);
@@ -836,28 +1195,30 @@ mod tests {
     // TLS keys and does not terminate the connection; only the fixture's
     // socket setup bypasses production public-DNS eligibility.
     #[tokio::test]
-    async fn external_quic_retry_then_authenticated_stream_through_relay(){
-        let cert=rcgen::generate_simple_self_signed(vec!["reference.example".into()]).unwrap();
-        let mut roots=rustls::RootCertStore::empty();
+    async fn external_quic_retry_then_authenticated_stream_through_relay() {
+        let cert = rcgen::generate_simple_self_signed(vec!["reference.example".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let key=rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into();
-        let reference=crate::quic_transport::server_endpoint(peer(0),vec![cert.cert.der().clone()],key).unwrap();
-        let target=reference.local_addr().unwrap();
-        let listener=UdpSocket::bind(peer(0)).await.unwrap();
-        let relay_addr=listener.local_addr().unwrap();
-        let client=crate::quic_transport::client_endpoint(peer(0),roots).unwrap();
-        let physical=client.local_addr().unwrap();
-        let upstream=UdpSocket::bind(peer(0)).await.unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into();
+        let reference =
+            crate::quic_transport::server_endpoint(peer(0), vec![cert.cert.der().clone()], key)
+                .unwrap();
+        let target = reference.local_addr().unwrap();
+        let listener = UdpSocket::bind(peer(0)).await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let client = crate::quic_transport::client_endpoint(peer(0), roots).unwrap();
+        let physical = client.local_addr().unwrap();
+        let upstream = UdpSocket::bind(peer(0)).await.unwrap();
         upstream.connect(target).await.unwrap();
-        let (tx,rx)=mpsc::channel(QUEUE);
-        let (rtx,mut rrx)=mpsc::channel(QUEUE);
-        let deadline=Instant::now()+Duration::from_secs(15);
-        let pump=tokio::spawn(pump_path(upstream,1,physical,deadline,rx,rtx,||true));
-        let relay=tokio::spawn(async move{
-            let mut buf=vec![0;wire::MAX_DATAGRAM+1];
-            let mut state:Option<Session>=None;
-            loop{
-                tokio::select!{
+        let (tx, rx) = mpsc::channel(QUEUE);
+        let (rtx, mut rrx) = mpsc::channel(QUEUE);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let pump = tokio::spawn(pump_path(upstream, 1, physical, deadline, rx, rtx, || true));
+        let relay = tokio::spawn(async move {
+            let mut buf = vec![0; wire::MAX_DATAGRAM + 1];
+            let mut state: Option<Session> = None;
+            loop {
+                tokio::select! {
                     _=tokio::time::sleep_until(deadline)=>break,
                     result=listener.recv_from(&mut buf)=>{
                         let (n,peer)=result.unwrap();
@@ -887,27 +1248,33 @@ mod tests {
                 }
             }
         });
-        let server=tokio::spawn(async move{
-            let initial=reference.accept().await.unwrap();
+        let server = tokio::spawn(async move {
+            let initial = reference.accept().await.unwrap();
             assert!(!initial.remote_address_validated());
             initial.retry().unwrap();
-            let next=reference.accept().await.unwrap();
+            let next = reference.accept().await.unwrap();
             assert!(next.remote_address_validated());
-            let conn=crate::quic_transport::accept(next).await.unwrap();
-            let (mut send,mut recv)=conn.accept_bi().await.unwrap();
-            assert_eq!(recv.read_to_end(1024).await.unwrap(),b"external");
+            let conn = crate::quic_transport::accept(next).await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            assert_eq!(recv.read_to_end(1024).await.unwrap(), b"external");
             send.write_all(b"reference").await.unwrap();
             send.finish().unwrap();
             conn.closed().await;
         });
-        let result=timeout(Duration::from_secs(12),async{
-            let conn=crate::quic_transport::connect(&client,relay_addr,"reference.example").await.unwrap();
-            let (mut send,mut recv)=conn.open_bi().await.unwrap();
-            send.write_all(b"external").await.unwrap();send.finish().unwrap();
-            assert_eq!(recv.read_to_end(1024).await.unwrap(),b"reference");
-            conn.close(0u32.into(),b"done");
-        }).await;
-        relay.abort();pump.abort();server.abort();
+        let result = timeout(Duration::from_secs(12), async {
+            let conn = crate::quic_transport::connect(&client, relay_addr, "reference.example")
+                .await
+                .unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(b"external").await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(1024).await.unwrap(), b"reference");
+            conn.close(0u32.into(), b"done");
+        })
+        .await;
+        relay.abort();
+        pump.abort();
+        server.abort();
         result.unwrap();
     }
 
@@ -926,8 +1293,24 @@ mod tests {
         let (b_tx, b_rx) = mpsc::channel(4);
         let (reply_tx, mut reply_rx) = mpsc::channel(4);
         let deadline = Instant::now() + Duration::from_secs(3);
-        let a = tokio::spawn(pump_path(upstream_a, 1, peer(100), deadline, a_rx, reply_tx.clone(), || true));
-        let b = tokio::spawn(pump_path(upstream_b, 1, peer(200), deadline, b_rx, reply_tx, || true));
+        let a = tokio::spawn(pump_path(
+            upstream_a,
+            1,
+            peer(100),
+            deadline,
+            a_rx,
+            reply_tx.clone(),
+            || true,
+        ));
+        let b = tokio::spawn(pump_path(
+            upstream_b,
+            1,
+            peer(200),
+            deadline,
+            b_rx,
+            reply_tx,
+            || true,
+        ));
         let first = vec![0xc0; 1200];
         let second = vec![0x40; 49];
         a_tx.send(first.clone()).await.unwrap();
@@ -935,7 +1318,10 @@ mod tests {
         let mut buf = [0u8; 2048];
         let mut seen = HashMap::new();
         for _ in 0..2 {
-            let (n, addr) = timeout(Duration::from_secs(1), reference.recv_from(&mut buf)).await.unwrap().unwrap();
+            let (n, addr) = timeout(Duration::from_secs(1), reference.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
             seen.insert(addr, buf[..n].to_vec());
         }
         assert_eq!(seen.get(&addr_a), Some(&first));
@@ -945,12 +1331,21 @@ mod tests {
         reference.send_to(b"new-path", addr_b).await.unwrap();
         let mut replies = HashMap::new();
         for _ in 0..2 {
-            let reply = timeout(Duration::from_secs(1), reply_rx.recv()).await.unwrap().unwrap();
+            let reply = timeout(Duration::from_secs(1), reply_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(reply.id, 1);
             replies.insert(reply.peer, reply.data);
         }
-        assert_eq!(replies.get(&peer(100)).map(Vec::as_slice), Some(b"old-path".as_slice()));
-        assert_eq!(replies.get(&peer(200)).map(Vec::as_slice), Some(b"new-path".as_slice()));
+        assert_eq!(
+            replies.get(&peer(100)).map(Vec::as_slice),
+            Some(b"old-path".as_slice())
+        );
+        assert_eq!(
+            replies.get(&peer(200)).map(Vec::as_slice),
+            Some(b"new-path".as_slice())
+        );
         drop(a_tx);
         drop(b_tx);
         timeout(Duration::from_secs(1), a).await.unwrap().unwrap();
@@ -958,63 +1353,78 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_packets_cannot_cross_connection_boundaries(){
-        fn packet(dcid:u8)->Vec<u8>{
-            let mut p=vec![0xe0,0,0,0,1,8];p.extend_from_slice(&[dcid;8]);
-            p.push(8);p.extend_from_slice(&[2;8]);p.push(17);p.extend_from_slice(&[0;17]);p
+    fn coalesced_packets_cannot_cross_connection_boundaries() {
+        fn packet(dcid: u8) -> Vec<u8> {
+            let mut p = vec![0xe0, 0, 0, 0, 1, 8];
+            p.extend_from_slice(&[dcid; 8]);
+            p.push(8);
+            p.extend_from_slice(&[2; 8]);
+            p.push(17);
+            p.extend_from_slice(&[0; 17]);
+            p
         }
-        let mut bytes=packet(3);
+        let mut bytes = packet(3);
         bytes.extend(packet(3));
         assert!(wire::coherent_datagram(&bytes));
         bytes.extend(packet(4));
         assert!(!wire::coherent_datagram(&bytes));
-        let mut bytes=packet(3);
-        bytes.extend([0x40]);bytes.extend([3;8]);bytes.extend([0;17]);
+        let mut bytes = packet(3);
+        bytes.extend([0x40]);
+        bytes.extend([3; 8]);
+        bytes.extend([0; 17]);
         assert!(wire::coherent_datagram(&bytes));
-        let last=packet(3).len()+1;bytes[last]=4;
+        let last = packet(3).len() + 1;
+        bytes[last] = 4;
         assert!(!wire::coherent_datagram(&bytes));
     }
 
     #[test]
     fn retirement_is_bounded_and_dead_path_cannot_reset_credit() {
         let p = peer(10);
-        let mut s = session(p, &[3;8]);
+        let mut s = session(p, &[3; 8]);
         let now = Instant::now();
         s.prune_paths(now);
         assert!(s.paths.is_empty());
         assert!(s.closed_paths.contains(&p));
-        let retired = Retired::from_session(s,now);
-        let known = [0x40,3,3,3,3,3,3,3,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
-        assert!(retired.blocks(p,&known,now));
-        assert!(retired.blocks(peer(20),&known,now));
-        assert!(!retired.blocks(p,&known,now+RETIRED_TTL));
+        let retired = Retired::from_session(s, now);
+        let known = [
+            0x40, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert!(retired.blocks(p, &known, now));
+        assert!(retired.blocks(peer(20), &known, now));
+        assert!(!retired.blocks(p, &known, now + RETIRED_TTL));
     }
 
     #[test]
     fn retry_token_never_transfers_to_another_path_or_grants_credit() {
         let p = peer(10);
-        let mut s = session(p,&[3;8]);
-        s.server_initial=false;s.negotiated_version=None;s.initial_server_cid=None;
-        s.retry = Some(Retry { cid: vec![3;8], token: vec![9] });
-        let (tx,_rx) = mpsc::channel(2);
+        let mut s = session(p, &[3; 8]);
+        s.server_initial = false;
+        s.negotiated_version = None;
+        s.initial_server_cid = None;
+        s.retry = Some(Retry {
+            cid: vec![3; 8],
+            token: vec![9],
+        });
+        let (tx, _rx) = mpsc::channel(2);
         s.paths.get_mut(&p).unwrap().queue = tx;
-        let mut packet = vec![0xc0,0,0,0,1,8];
-        packet.extend_from_slice(&[3;8]);
+        let mut packet = vec![0xc0, 0, 0, 0, 1, 8];
+        packet.extend_from_slice(&[3; 8]);
         packet.push(8);
-        packet.extend_from_slice(&[2;8]);
-        packet.extend_from_slice(&[1,9,0x44,0x95]); // 1173 bytes
-        packet.resize(1200,0);
+        packet.extend_from_slice(&[2; 8]);
+        packet.extend_from_slice(&[1, 9, 0x44, 0x95]); // 1173 bytes
+        packet.resize(1200, 0);
         // The packet length field must cover a whole initial packet.
         assert!(wire::long(&packet).is_some());
-        assert!(s.allows_client(p,&packet));
-        assert!(!s.allows_client(peer(11),&packet));
+        assert!(s.allows_client(p, &packet));
+        assert!(!s.allows_client(peer(11), &packet));
         let mut forged = packet.clone();
         forged[24] ^= 1;
-        assert!(!s.allows_client(p,&forged));
-        assert!(!s.can_reply(p,1));
-        s.enqueue(p,packet,Instant::now());
+        assert!(!s.allows_client(p, &forged));
+        assert!(!s.can_reply(p, 1));
+        s.enqueue(p, packet, Instant::now());
         assert!(s.retry_echoed);
-        assert!(s.can_reply(p,3600));
-        assert!(!s.can_reply(p,3601));
+        assert!(s.can_reply(p, 3600));
+        assert!(!s.can_reply(p, 3601));
     }
 }

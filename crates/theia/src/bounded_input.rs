@@ -160,18 +160,31 @@ mod private_windows {
     }
 
     pub(super) fn check(file: &File) -> bool {
-        let Ok(current) = crate::windows_control::current_user_sid() else { return false; };
-        let Some(user) = sid(&current) else { return false; };
-        let Some(system) = sid("S-1-5-18") else { return false; };
+        let Ok(current) = crate::windows_control::current_user_sid() else {
+            return false;
+        };
+        let Some(user) = sid(&current) else {
+            return false;
+        };
+        let Some(system) = sid("S-1-5-18") else {
+            return false;
+        };
         let mut owner = null_mut();
         let mut acl: *mut ACL = null_mut();
         let mut descriptor = null_mut();
         // SAFETY: file handle is borrowed for the duration of this call;
         // output pointers point to live stack variables.
         let result = unsafe {
-            GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT,
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner, null_mut(), &mut acl, null_mut(), &mut descriptor)
+                &mut owner,
+                null_mut(),
+                &mut acl,
+                null_mut(),
+                &mut descriptor,
+            )
         };
         let descriptor = Local(descriptor);
         if result != 0 || descriptor.0.is_null() || acl.is_null() || owner.is_null() {
@@ -185,7 +198,8 @@ mod private_windows {
         let mut revision = 0;
         // SAFETY: descriptor and output variables are live.
         if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0
-            || control & SE_DACL_PROTECTED == 0 {
+            || control & SE_DACL_PROTECTED == 0
+        {
             return false;
         }
         // SAFETY: ACL points into the live kernel-validated descriptor.
@@ -212,7 +226,9 @@ mod private_windows {
             let actual = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast::<c_void>() };
             let is_user = unsafe { EqualSid(actual, user.0) } != 0;
             let is_system = unsafe { EqualSid(actual, system.0) } != 0;
-            if !is_user && !is_system { return false; }
+            if !is_user && !is_system {
+                return false;
+            }
             seen_user |= is_user;
             seen_system |= is_system;
         }

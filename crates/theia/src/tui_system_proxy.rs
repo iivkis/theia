@@ -40,7 +40,7 @@ struct Local {
     address: SocketAddr,
     manual: bool,
     task: JoinHandle<Result<(), ClientError>>,
-    reality:Option<std::sync::Arc<crate::local_proxy::RealityClient>>,
+    reality: Option<std::sync::Arc<crate::local_proxy::RealityClient>>,
 }
 
 struct Worker {
@@ -163,12 +163,13 @@ impl Worker {
                     .map_err(|error| error.to_string())?;
                 let address = prepared.http_address().map_err(|error| error.to_string())?;
                 let manual = prepared.manual;
-                let reality=prepared.reality_monitor();
+                let reality = prepared.reality_monitor();
                 let task = tokio::spawn(prepared.serve());
                 self.local = Some(Local {
                     address,
                     manual,
-                    task,reality,
+                    task,
+                    reality,
                 });
                 Ok("Оба локальных listener привязаны; удалённый транспорт не проверен.".into())
             }

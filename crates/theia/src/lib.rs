@@ -36,15 +36,15 @@ pub mod quic_transport;
 pub(crate) mod quota;
 pub mod reality_admission;
 pub mod reality_bootstrap;
+mod reality_checkpoint;
 pub mod reality_cli;
 pub mod reality_config;
 pub mod reality_generation;
 mod reality_live;
-mod reality_checkpoint;
 pub mod reality_provision;
-pub mod reality_tcp;
 pub mod reality_quic;
 mod reality_quic_wire;
+pub mod reality_tcp;
 pub mod reference_cli;
 pub mod reference_health;
 pub mod reference_maintenance;
@@ -64,10 +64,10 @@ pub(crate) mod tui_discovery;
 pub(crate) mod tui_domain;
 pub mod tui_editor;
 pub(crate) mod tui_probe;
-mod tui_reality_review;
-mod tui_reality_provision;
 mod tui_reality_enroll;
+mod tui_reality_provision;
 mod tui_reality_register;
+mod tui_reality_review;
 mod tui_reality_status;
 pub(crate) mod tui_runtime;
 #[cfg(windows)]
@@ -126,11 +126,18 @@ pub enum Command {
     ServerApplyReload {
         expected_revision: u64,
     },
-    ServerApplyReloadBound{expected_revision:u64,candidate_sha256:[u8;32]},
+    ServerApplyReloadBound {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
+    },
     ServerAuthRollbackCheck,
-    ServerAuthRollbackApply{expected_revision:u64},
+    ServerAuthRollbackApply {
+        expected_revision: u64,
+    },
     ServerRestartRollbackCheck,
-    ServerRestartRollbackApply{expected_revision:u64},
+    ServerRestartRollbackApply {
+        expected_revision: u64,
+    },
     ClientRun {
         config: String,
     },
@@ -139,7 +146,11 @@ pub enum Command {
         config: String,
     },
     ClientStatus,
-    ClientApply{expected_revision:u64,candidate_sha256:[u8;32],apply:bool},
+    ClientApply {
+        expected_revision: u64,
+        candidate_sha256: [u8; 32],
+        apply: bool,
+    },
     ClientProxyStatus,
     ClientProxyRecover,
     ConfigValidate {
@@ -306,18 +317,24 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 candidate_sha256,
             })
         }
-        ["server","reload","--apply","--expected-revision",revision,"--sha256",digest,"--confirm"]=>Ok(Command::ServerApplyReloadBound{
-            expected_revision:expected_revision(revision)?,
-            candidate_sha256:parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
-        }),
-        ["server","restart","rollback","--check"]=>Ok(Command::ServerRestartRollbackCheck),
-        ["server","restart","rollback","--apply","--expected-revision",revision,"--confirm"]=>Ok(Command::ServerRestartRollbackApply{
-            expected_revision:expected_revision(revision)?,
-        }),
-        ["server","auth","rollback","--check"]=>Ok(Command::ServerAuthRollbackCheck),
-        ["server","auth","rollback","--apply","--expected-revision",revision,"--confirm"]=>Ok(Command::ServerAuthRollbackApply{
-            expected_revision:expected_revision(revision)?,
-        }),
+        ["server", "reload", "--apply", "--expected-revision", revision, "--sha256", digest, "--confirm"] => {
+            Ok(Command::ServerApplyReloadBound {
+                expected_revision: expected_revision(revision)?,
+                candidate_sha256: parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
+            })
+        }
+        ["server", "restart", "rollback", "--check"] => Ok(Command::ServerRestartRollbackCheck),
+        ["server", "restart", "rollback", "--apply", "--expected-revision", revision, "--confirm"] => {
+            Ok(Command::ServerRestartRollbackApply {
+                expected_revision: expected_revision(revision)?,
+            })
+        }
+        ["server", "auth", "rollback", "--check"] => Ok(Command::ServerAuthRollbackCheck),
+        ["server", "auth", "rollback", "--apply", "--expected-revision", revision, "--confirm"] => {
+            Ok(Command::ServerAuthRollbackApply {
+                expected_revision: expected_revision(revision)?,
+            })
+        }
         ["server", "reload", "--expected-revision", raw] => {
             if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(CliError::InvalidArguments);
@@ -336,13 +353,21 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 config: config_path(path)?,
             })
         }
-        ["client","status"]=>Ok(Command::ClientStatus),
-        ["client","reload","--check","--expected-revision",revision,"--sha256",digest]=>Ok(Command::ClientApply{
-            expected_revision:expected_revision(revision)?,candidate_sha256:parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,apply:false,
-        }),
-        ["client","reload","--apply","--expected-revision",revision,"--sha256",digest,"--confirm"]=>Ok(Command::ClientApply{
-            expected_revision:expected_revision(revision)?,candidate_sha256:parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,apply:true,
-        }),
+        ["client", "status"] => Ok(Command::ClientStatus),
+        ["client", "reload", "--check", "--expected-revision", revision, "--sha256", digest] => {
+            Ok(Command::ClientApply {
+                expected_revision: expected_revision(revision)?,
+                candidate_sha256: parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
+                apply: false,
+            })
+        }
+        ["client", "reload", "--apply", "--expected-revision", revision, "--sha256", digest, "--confirm"] => {
+            Ok(Command::ClientApply {
+                expected_revision: expected_revision(revision)?,
+                candidate_sha256: parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
+                apply: true,
+            })
+        }
         ["client", "proxy", "--status"] => Ok(Command::ClientProxyStatus),
         ["client", "proxy", "--recover", "--confirm"] => Ok(Command::ClientProxyRecover),
         ["config", "validate", "--config", path] => Ok(Command::ConfigValidate {

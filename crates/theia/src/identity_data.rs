@@ -73,7 +73,7 @@ fn now() -> Result<u64, ClientError> {
 pub struct FixtureControl(Arc<ServerContext>);
 
 impl FixtureControl {
-    pub fn renew(&self, document: &str, expected: [u8;32]) -> Result<u64, ServerError> {
+    pub fn renew(&self, document: &str, expected: [u8; 32]) -> Result<u64, ServerError> {
         self.0.renew_identity_fixture(document, expected)
     }
 }
@@ -103,17 +103,39 @@ impl PreparedFixture {
     /// Exercise admission and identity verification with real native
     /// carriers, without contacting an external reference.
     pub fn new_admitted(
-        tcp: TcpListener, identity: &Identity, signed: &str,
-        inbound: &Inbound, users: &[User], policy: &ServerPolicy,
-        admission: (Arc<crate::reality_admission::Secret>, Arc<crate::reality_admission::ReplayGuard>),
+        tcp: TcpListener,
+        identity: &Identity,
+        signed: &str,
+        inbound: &Inbound,
+        users: &[User],
+        policy: &ServerPolicy,
+        admission: (
+            Arc<crate::reality_admission::Secret>,
+            Arc<crate::reality_admission::ReplayGuard>,
+        ),
     ) -> Result<Self, ServerError> {
-        Self::build(tcp, identity, signed, inbound, users, policy, Some(admission))
+        Self::build(
+            tcp,
+            identity,
+            signed,
+            inbound,
+            users,
+            policy,
+            Some(admission),
+        )
     }
 
     fn build(
-        tcp: TcpListener, identity: &Identity, signed: &str,
-        inbound: &Inbound, users: &[User], policy: &ServerPolicy,
-        admission: Option<(Arc<crate::reality_admission::Secret>, Arc<crate::reality_admission::ReplayGuard>)>,
+        tcp: TcpListener,
+        identity: &Identity,
+        signed: &str,
+        inbound: &Inbound,
+        users: &[User],
+        policy: &ServerPolicy,
+        admission: Option<(
+            Arc<crate::reality_admission::Secret>,
+            Arc<crate::reality_admission::ReplayGuard>,
+        )>,
     ) -> Result<Self, ServerError> {
         let local = tcp.local_addr().map_err(|_| ServerError::Io)?;
         if !local.ip().is_loopback()
@@ -143,17 +165,30 @@ impl PreparedFixture {
             Arc::from(signed),
         )?);
         let tls = match &admission {
-            Some((secret, guard)) => crate::identity_tls::checked_server_tls(identity, &value, Branch::H2, secret.clone(), guard.clone()),
+            Some((secret, guard)) => crate::identity_tls::checked_server_tls(
+                identity,
+                &value,
+                Branch::H2,
+                secret.clone(),
+                guard.clone(),
+            ),
             None => identity.server_tls("localhost", Branch::H2),
-        }.map_err(|_| ServerError::Tls)?;
+        }
+        .map_err(|_| ServerError::Tls)?;
         let h2 = TlsAcceptor::from(Arc::new(tls));
         let h3 = if value.descriptor().h3 {
             Some(
                 quinn::Endpoint::server(
                     match &admission {
-                        Some((secret, guard)) => crate::identity_tls::checked_quic_server(identity, &value, secret.clone(), guard.clone()),
+                        Some((secret, guard)) => crate::identity_tls::checked_quic_server(
+                            identity,
+                            &value,
+                            secret.clone(),
+                            guard.clone(),
+                        ),
                         None => identity.quic_server("localhost"),
-                    }.map_err(|_| ServerError::Tls)?,
+                    }
+                    .map_err(|_| ServerError::Tls)?,
                     local,
                 )
                 .map_err(|_| ServerError::Io)?,
@@ -235,7 +270,10 @@ impl FixtureClient {
     }
 
     pub fn new_admitted(
-        remote: SocketAddr, token: &str, value: Verified, branch: Branch,
+        remote: SocketAddr,
+        token: &str,
+        value: Verified,
+        branch: Branch,
         secret: Arc<crate::reality_admission::Secret>,
     ) -> Result<Self, ClientError> {
         value.check_time(now()?).map_err(|_| ClientError::Tls)?;
@@ -280,7 +318,6 @@ impl FixtureClient {
     }
 }
 
-
 /// Persistent trust-backed application-plane client for controlled loopback
 /// fixtures. Re-read the verified store before every new logical operation.
 /// A new signed revision (or explicitly promoted signer) replaces the
@@ -314,7 +351,12 @@ impl ManagedFixtureClient {
         })
     }
 
-    fn build(remote: SocketAddr, token: &str, value: Verified, branch: Branch) -> Result<FixtureClient, ClientError> {
+    fn build(
+        remote: SocketAddr,
+        token: &str,
+        value: Verified,
+        branch: Branch,
+    ) -> Result<FixtureClient, ClientError> {
         let mut client = FixtureClient::new(remote, token, value, branch)?;
         client.carrier = match client.carrier {
             Carrier::H2(h2) => Carrier::H2(h2.with_connection_pool()),
@@ -334,7 +376,9 @@ impl ManagedFixtureClient {
                 return Err(ClientError::Tls);
             }
             if old.signer() == value.signer() {
-                if old.compare(&value).map_err(|_| ClientError::Tls)? == descriptor::Change::Unchanged {
+                if old.compare(&value).map_err(|_| ClientError::Tls)?
+                    == descriptor::Change::Unchanged
+                {
                     return Ok(previous.clone());
                 }
             } else if value.descriptor().revision <= old.descriptor().revision {

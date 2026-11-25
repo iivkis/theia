@@ -3,7 +3,10 @@
 //! modified. All filesystem operations are off the terminal event loop.
 use crate::{reality_bootstrap::Error, reality_provision, reference_health};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::{path::{Path, PathBuf}, sync::mpsc::{self, Receiver, TryRecvError}};
+use std::{
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, TryRecvError},
+};
 
 const LIMIT: usize = 1024;
 
@@ -47,14 +50,18 @@ pub(crate) struct ProvisionPanel {
 fn hex(bytes: [u8; 32]) -> String {
     use std::fmt::Write;
     let mut output = String::with_capacity(64);
-    for byte in bytes { let _ = write!(output, "{byte:02x}"); }
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
     output
 }
 
 fn validate_paths(health: &Path, output: &Path) -> Result<(), Error> {
     if !crate::bounded_input::explicit_file_path(health)
         || !crate::bounded_input::explicit_file_path(output)
-        || health == output || output.file_name().is_none() {
+        || health == output
+        || output.file_name().is_none()
+    {
         return Err(Error::Storage);
     }
     match std::fs::symlink_metadata(output) {
@@ -64,8 +71,10 @@ fn validate_paths(health: &Path, output: &Path) -> Result<(), Error> {
 }
 
 fn read_state(path: &Path) -> Result<reference_health::State, Error> {
-    reference_health::Store::new(path).map_err(|_| Error::Storage)?
-        .inspect().map_err(|_| Error::Health)
+    reference_health::Store::new(path)
+        .map_err(|_| Error::Storage)?
+        .inspect()
+        .map_err(|_| Error::Health)
 }
 
 fn preview(health: &Path, output: &Path, now: u64) -> Result<Review, Error> {
@@ -74,13 +83,22 @@ fn preview(health: &Path, output: &Path, now: u64) -> Result<Review, Error> {
     render_review(&state, output, now, None)
 }
 
-fn render_review(state: &reference_health::State, output: &Path, now: u64, checked: Option<Box<CheckedPlan>>) -> Result<Review, Error> {
+fn render_review(
+    state: &reference_health::State,
+    output: &Path,
+    now: u64,
+    checked: Option<Box<CheckedPlan>>,
+) -> Result<Review, Error> {
     let review = reality_provision::preview(state, now)?;
     let body = format!("ПРЕДПРОСМОТР: только локальный комплект, не live Apply.\n{}\n{}\nhealth_sha256={}\nplan_sha256={}\nКаталог: {}\nIdentity, admission и descriptor создаются автоматически.\nПрава пользователей и runtime не меняются.\ny: создать новый комплект; Esc/n: отменить.",
         state.plan().preview().map_err(|_| Error::Health)?,
         state.report(now).map_err(|_| Error::Health)?,
         hex(review.health_sha256), hex(review.plan_sha256), output.display());
-    Ok(Review { digest: review.health_sha256, body, checked })
+    Ok(Review {
+        digest: review.health_sha256,
+        body,
+        checked,
+    })
 }
 
 fn apply(health: &Path, output: &Path, approved: [u8; 32], now: u64) -> Result<String, Error> {
@@ -124,9 +142,13 @@ fn check_plan(
     validate_paths(health, output)?;
     new_health_path(health)?;
     let (plan, actual) = read_plan(plan_path)?;
-    if actual != expected { return Err(Error::Approval); }
+    if actual != expected {
+        return Err(Error::Approval);
+    }
     let approved = plan.digest().map_err(|_| Error::Health)?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|_| Error::Storage)?;
     let evidence = runtime.block_on(async {
         tokio::select! {
@@ -138,23 +160,38 @@ fn check_plan(
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     let state = reference_health::State::new(plan, evidence, now).map_err(|_| Error::Health)?;
     let mut review = render_review(&state, output, now, None)?;
-    review.checked = Some(Box::new(CheckedPlan { source_digest: expected, state }));
+    review.checked = Some(Box::new(CheckedPlan {
+        source_digest: expected,
+        state,
+    }));
     review.body.push_str("\nПосле подтверждения сохраняется новый health store и новый комплект. При отмене ничего не записывается.");
     Ok(review)
 }
 
-fn apply_checked(plan_path: &Path, health: &Path, output: &Path, review: Review, now: u64) -> Result<String, Error> {
+fn apply_checked(
+    plan_path: &Path,
+    health: &Path,
+    output: &Path,
+    review: Review,
+    now: u64,
+) -> Result<String, Error> {
     let Some(checked) = review.checked else {
         return apply(health, output, review.digest, now);
     };
     validate_paths(health, output)?;
     new_health_path(health)?;
     let (_, digest) = read_plan(plan_path)?;
-    if digest != checked.source_digest { return Err(Error::Approval); }
+    if digest != checked.source_digest {
+        return Err(Error::Approval);
+    }
     let fresh = reality_provision::preview(&checked.state, now)?;
-    if fresh.health_sha256 != review.digest { return Err(Error::Approval); }
-    reference_health::Store::new(health).map_err(|_| Error::Storage)?
-        .enroll(&checked.state).map_err(|error| match error {
+    if fresh.health_sha256 != review.digest {
+        return Err(Error::Approval);
+    }
+    reference_health::Store::new(health)
+        .map_err(|_| Error::Storage)?
+        .enroll(&checked.state)
+        .map_err(|error| match error {
             reference_health::Error::Indeterminate => Error::Indeterminate,
             _ => Error::Storage,
         })?;
@@ -167,18 +204,30 @@ fn apply_checked(plan_path: &Path, health: &Path, output: &Path, review: Review,
 
 impl ProvisionPanel {
     pub(crate) fn new() -> Self {
-        Self { fields: std::array::from_fn(|_| String::new()), focus: 0, stage: Stage::Input, error: None }
+        Self {
+            fields: std::array::from_fn(|_| String::new()),
+            focus: 0,
+            stage: Stage::Input,
+            error: None,
+        }
     }
 
     fn paths(&self) -> (PathBuf, PathBuf, PathBuf) {
-        (PathBuf::from(&self.fields[0]), PathBuf::from(&self.fields[1]), PathBuf::from(&self.fields[2]))
+        (
+            PathBuf::from(&self.fields[0]),
+            PathBuf::from(&self.fields[1]),
+            PathBuf::from(&self.fields[2]),
+        )
     }
 
     pub(crate) fn paste(&mut self, text: &str) {
-        if !matches!(self.stage, Stage::Input) { return; }
+        if !matches!(self.stage, Stage::Input) {
+            return;
+        }
         let value = text.trim_end_matches(['\r', '\n']);
         let field = &mut self.fields[self.focus];
-        if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= LIMIT {
+        if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= LIMIT
+        {
             field.push_str(value);
         }
     }
@@ -188,7 +237,9 @@ impl ProvisionPanel {
             Stage::Loading(_) | Stage::LoadingPlan(_) | Stage::Applying(_) => return false,
             Stage::Checking { .. } => {
                 if key.code == KeyCode::Esc {
-                    if let Stage::Checking { cancel, .. } = std::mem::replace(&mut self.stage, Stage::Input) {
+                    if let Stage::Checking { cancel, .. } =
+                        std::mem::replace(&mut self.stage, Stage::Input)
+                    {
                         let _ = cancel.send(());
                     }
                 }
@@ -205,7 +256,8 @@ impl ProvisionPanel {
                         let (cancel, cancel_rx) = tokio::sync::oneshot::channel();
                         self.stage = Stage::Checking { result, cancel };
                         let _worker = std::thread::spawn(move || {
-                            let _ = tx.send(check_plan(&plan, &health, &output, expected, cancel_rx));
+                            let _ =
+                                tx.send(check_plan(&plan, &health, &output, expected, cancel_rx));
                         });
                     }
                     _ => {}
@@ -214,15 +266,24 @@ impl ProvisionPanel {
             }
             Stage::Confirm(_) => {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('n') => { self.stage = Stage::Input; }
+                    KeyCode::Esc | KeyCode::Char('n') => {
+                        self.stage = Stage::Input;
+                    }
                     KeyCode::Char('y') if key.modifiers.is_empty() => {
                         let (health, output, plan) = self.paths();
-                        let Stage::Confirm(review) = std::mem::replace(&mut self.stage, Stage::Input) else { return false; };
+                        let Stage::Confirm(review) =
+                            std::mem::replace(&mut self.stage, Stage::Input)
+                        else {
+                            return false;
+                        };
                         let (tx, rx) = mpsc::channel();
                         self.stage = Stage::Applying(rx);
                         let _worker = std::thread::spawn(move || {
-                            let result = reference_health::unix_now().map_err(|_| Error::Clock)
-                                .and_then(|now| apply_checked(&plan, &health, &output, review, now));
+                            let result = reference_health::unix_now()
+                                .map_err(|_| Error::Clock)
+                                .and_then(|now| {
+                                    apply_checked(&plan, &health, &output, review, now)
+                                });
                             let _ = tx.send(result);
                         });
                     }
@@ -235,9 +296,15 @@ impl ProvisionPanel {
         match key.code {
             KeyCode::Esc => return true,
             KeyCode::Tab => self.focus = (self.focus + 1) % self.fields.len(),
-            KeyCode::BackTab => self.focus = (self.focus + self.fields.len() - 1) % self.fields.len(),
-            KeyCode::Backspace => { self.fields[self.focus].pop(); }
-            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => self.fields[self.focus].clear(),
+            KeyCode::BackTab => {
+                self.focus = (self.focus + self.fields.len() - 1) % self.fields.len()
+            }
+            KeyCode::Backspace => {
+                self.fields[self.focus].pop();
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                self.fields[self.focus].clear()
+            }
             KeyCode::Enter => {
                 let (health, output, plan) = self.paths();
                 self.error = None;
@@ -245,7 +312,8 @@ impl ProvisionPanel {
                     let (tx, rx) = mpsc::channel();
                     self.stage = Stage::Loading(rx);
                     let _worker = std::thread::spawn(move || {
-                        let result = reference_health::unix_now().map_err(|_| Error::Clock)
+                        let result = reference_health::unix_now()
+                            .map_err(|_| Error::Clock)
                             .and_then(|now| preview(&health, &output, now));
                         let _ = tx.send(result);
                     });
@@ -257,8 +325,13 @@ impl ProvisionPanel {
                     });
                 }
             }
-            KeyCode::Char(ch) if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) && !ch.is_control() => {
-                if self.fields[self.focus].len() + ch.len_utf8() <= LIMIT { self.fields[self.focus].push(ch); }
+            KeyCode::Char(ch)
+                if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                    && !ch.is_control() =>
+            {
+                if self.fields[self.focus].len() + ch.len_utf8() <= LIMIT {
+                    self.fields[self.focus].push(ch);
+                }
             }
             _ => {}
         }
@@ -320,26 +393,50 @@ impl ProvisionPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reference_health::{Evidence, Plan, Target, State, Store};
+    use crate::reference_health::{Evidence, Plan, State, Store, Target};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn exact_preview_rejects_changed_health_and_existing_output() {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("theia-provision-ui-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "theia-provision-ui-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir(&dir).unwrap();
         let health = dir.join("health");
         let output = dir.join("output");
-        let state = State::new(Plan { schema_version: 1, inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
-            own_ips: vec!["93.184.216.1".parse().unwrap()],
-            references: vec![Target { server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap() }] },
-            vec![Evidence { h2_status: Some(200), h3_status: None }], 1000).unwrap();
+        let state = State::new(
+            Plan {
+                schema_version: 1,
+                inbound: "edge".into(),
+                endpoint: "edge.example.org:443".into(),
+                own_ips: vec!["93.184.216.1".parse().unwrap()],
+                references: vec![Target {
+                    server_name: "reference.example.org".into(),
+                    address: "93.184.216.2:443".parse().unwrap(),
+                }],
+            },
+            vec![Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
+            1000,
+        )
+        .unwrap();
         Store::new(&health).unwrap().enroll(&state).unwrap();
         let review = preview(&health, &output, 1000).unwrap();
         assert!(review.body.contains("reference.example.org"));
         assert!(!output.exists());
-        assert!(matches!(apply(&health, &output, [0; 32], 1000), Err(Error::Approval)));
-        assert!(matches!(apply(&health, &output, review.digest, 1061), Err(Error::Health)));
+        assert!(matches!(
+            apply(&health, &output, [0; 32], 1000),
+            Err(Error::Approval)
+        ));
+        assert!(matches!(
+            apply(&health, &output, review.digest, 1061),
+            Err(Error::Health)
+        ));
         assert!(!output.exists());
         let message = apply(&health, &output, review.digest, 1001).unwrap();
         assert!(message.contains("Runtime НЕ изменён"));
@@ -350,30 +447,73 @@ mod tests {
     #[test]
     fn plan_preview_is_offline_and_checked_state_is_guarded_before_storage() {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("theia-plan-ui-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "theia-plan-ui-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir(&dir).unwrap();
         let plan_path = dir.join("plan");
         let health = dir.join("health");
         let output = dir.join("bundle");
-        let plan = Plan { schema_version: 1, inbound: "edge".into(), endpoint: "edge.example.org:443".into(),
+        let plan = Plan {
+            schema_version: 1,
+            inbound: "edge".into(),
+            endpoint: "edge.example.org:443".into(),
             own_ips: vec!["93.184.216.1".parse().unwrap()],
-            references: vec![Target { server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap() }] };
+            references: vec![Target {
+                server_name: "reference.example.org".into(),
+                address: "93.184.216.2:443".parse().unwrap(),
+            }],
+        };
         let raw = toml::to_string(&plan).unwrap();
         std::fs::write(&plan_path, &raw).unwrap();
         let approval = plan_preview(&plan_path, &health, &output).unwrap();
         assert!(approval.body.contains("reference.example.org"));
         assert!(!health.exists() && !output.exists());
         let (_tx, rx) = tokio::sync::oneshot::channel();
-        assert!(matches!(check_plan(&plan_path, &health, &output, [0;32], rx), Err(Error::Approval)));
-        let state = State::new(plan, vec![Evidence { h2_status: Some(200), h3_status: None }], 1000).unwrap();
-        let make_review = || render_review(&state, &output, 1000, Some(Box::new(CheckedPlan { source_digest: approval.digest, state: state.clone() }))).unwrap();
+        assert!(matches!(
+            check_plan(&plan_path, &health, &output, [0; 32], rx),
+            Err(Error::Approval)
+        ));
+        let state = State::new(
+            plan,
+            vec![Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
+            1000,
+        )
+        .unwrap();
+        let make_review = || {
+            render_review(
+                &state,
+                &output,
+                1000,
+                Some(Box::new(CheckedPlan {
+                    source_digest: approval.digest,
+                    state: state.clone(),
+                })),
+            )
+            .unwrap()
+        };
         std::fs::write(&plan_path, format!("{raw}\n# changed")).unwrap();
-        assert!(matches!(apply_checked(&plan_path, &health, &output, make_review(), 1000), Err(Error::Approval)));
+        assert!(matches!(
+            apply_checked(&plan_path, &health, &output, make_review(), 1000),
+            Err(Error::Approval)
+        ));
         assert!(!health.exists() && !output.exists());
         std::fs::write(&plan_path, raw).unwrap();
-        assert!(matches!(apply_checked(&plan_path, &health, &output, make_review(), 1061), Err(Error::Health)));
+        assert!(matches!(
+            apply_checked(&plan_path, &health, &output, make_review(), 1061),
+            Err(Error::Health)
+        ));
         assert!(!health.exists() && !output.exists());
-        assert!(apply_checked(&plan_path, &health, &output, make_review(), 1001).unwrap().contains("Runtime НЕ изменён"));
+        assert!(
+            apply_checked(&plan_path, &health, &output, make_review(), 1001)
+                .unwrap()
+                .contains("Runtime НЕ изменён")
+        );
         assert!(Store::new(&health).unwrap().inspect().is_ok());
         assert!(output.join("provision.toml").exists());
         std::fs::remove_dir_all(dir).unwrap();
@@ -387,7 +527,11 @@ mod tests {
         panel.key(key(KeyCode::Tab));
         panel.paste("relative");
         assert!(matches!(panel.stage, Stage::Input));
-        panel.stage = Stage::Confirm(Review { digest: [1;32], body: "review".into(), checked: None });
+        panel.stage = Stage::Confirm(Review {
+            digest: [1; 32],
+            body: "review".into(),
+            checked: None,
+        });
         panel.key(key(KeyCode::Char('n')));
         assert!(matches!(panel.stage, Stage::Input));
         assert!(panel.key(key(KeyCode::Esc)));

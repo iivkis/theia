@@ -77,44 +77,70 @@ impl H3Client {
     }
 
     pub(crate) fn identity_fixture(
-        remote: SocketAddr, token: &str, value: &crate::descriptor::Verified,
+        remote: SocketAddr,
+        token: &str,
+        value: &crate::descriptor::Verified,
     ) -> Result<Self, ClientError> {
         let d = value.descriptor();
-        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string() || !value.effective_modes().h3 {
+        if !remote.ip().is_loopback()
+            || d.scope.endpoint != remote.to_string()
+            || !value.effective_modes().h3
+        {
             return Err(ClientError::Configuration);
         }
-        let quic = crate::identity_tls::quic_client(&d.scope, value.signer()).map_err(|_| ClientError::Tls)?;
+        let quic = crate::identity_tls::quic_client(&d.scope, value.signer())
+            .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, "localhost", token, value, quic)
     }
 
     pub(crate) fn admitted_fixture(
-        remote: SocketAddr, token: &str, value: &crate::descriptor::Verified,
+        remote: SocketAddr,
+        token: &str,
+        value: &crate::descriptor::Verified,
         secret: Arc<crate::reality_admission::Secret>,
     ) -> Result<Self, ClientError> {
         let d = value.descriptor();
-        if !remote.ip().is_loopback() || d.scope.endpoint != remote.to_string() || !value.effective_modes().h3 {
+        if !remote.ip().is_loopback()
+            || d.scope.endpoint != remote.to_string()
+            || !value.effective_modes().h3
+        {
             return Err(ClientError::Configuration);
         }
-        let name = &d.references.get(usize::from(d.active_reference)).ok_or(ClientError::Configuration)?.server_name;
-        let quic = crate::identity_tls::admitted_quic_client(value, secret).map_err(|_| ClientError::Tls)?;
+        let name = &d
+            .references
+            .get(usize::from(d.active_reference))
+            .ok_or(ClientError::Configuration)?
+            .server_name;
+        let quic = crate::identity_tls::admitted_quic_client(value, secret)
+            .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, name, token, value, quic)
     }
 
     pub(crate) fn admitted_runtime(
-        remote: SocketAddr, token: &str, value: &crate::descriptor::Verified,
+        remote: SocketAddr,
+        token: &str,
+        value: &crate::descriptor::Verified,
         secret: Arc<crate::reality_admission::Secret>,
     ) -> Result<Self, ClientError> {
         let d = value.descriptor();
         if remote.port() == 0 || remote.ip().is_unspecified() || !value.effective_modes().h3 {
             return Err(ClientError::Configuration);
         }
-        let name = &d.references.get(usize::from(d.active_reference)).ok_or(ClientError::Configuration)?.server_name;
-        let quic = crate::identity_tls::admitted_quic_client(value, secret).map_err(|_| ClientError::Tls)?;
+        let name = &d
+            .references
+            .get(usize::from(d.active_reference))
+            .ok_or(ClientError::Configuration)?
+            .server_name;
+        let quic = crate::identity_tls::admitted_quic_client(value, secret)
+            .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, name, token, value, quic)
     }
 
     fn identity_carrier(
-        remote: SocketAddr, name: &str, token: &str, value: &crate::descriptor::Verified,
+        remote: SocketAddr,
+        name: &str,
+        token: &str,
+        value: &crate::descriptor::Verified,
         quic: quinn::ClientConfig,
     ) -> Result<Self, ClientError> {
         let d = value.descriptor();
@@ -153,7 +179,10 @@ impl H3Client {
         self.fetch_identity_document(false).await
     }
 
-    pub(crate) async fn fetch_identity_document(&self,successor:bool) -> Result<String, ClientError> {
+    pub(crate) async fn fetch_identity_document(
+        &self,
+        successor: bool,
+    ) -> Result<String, ClientError> {
         let routes = self
             .identity_routes
             .as_ref()
@@ -167,9 +196,13 @@ impl H3Client {
                 .clone();
             let mut parts = self.uri.clone().into_parts();
             parts.path_and_query = Some(
-                (if successor { &routes.successor } else { &routes.descriptor })
-                    .parse()
-                    .map_err(|_| ClientError::Configuration)?,
+                (if successor {
+                    &routes.successor
+                } else {
+                    &routes.descriptor
+                })
+                .parse()
+                .map_err(|_| ClientError::Configuration)?,
             );
             let uri = Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
             let request = Request::get(uri)
@@ -665,8 +698,13 @@ pub struct H3Tunnel {
 
 impl H3Tunnel {
     #[cfg(test)]
-    pub(crate) fn rebind_for_test(&self, socket:std::net::UdpSocket)->Result<(),ClientError>{
-        self._lease.connection()._endpoint.endpoint.rebind(socket).map_err(|_|ClientError::Io)
+    pub(crate) fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), ClientError> {
+        self._lease
+            .connection()
+            ._endpoint
+            .endpoint
+            .rebind(socket)
+            .map_err(|_| ClientError::Io)
     }
 
     /// True when both tunnels share one verified transport connection.

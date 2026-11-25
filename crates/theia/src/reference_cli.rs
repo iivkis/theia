@@ -50,7 +50,9 @@ fn hash(raw: &str) -> Result<[u8; 32], CliError> {
 }
 
 pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
-    if let [kind @ ("publication-status" | "publication-monitor"), "--store", s, "--publication", p, "--plan-sha256", h, rest @ ..] = args {
+    if let [kind @ ("publication-status" | "publication-monitor"), "--store", s, "--publication", p, "--plan-sha256", h, rest @ ..] =
+        args
+    {
         let action = match (*kind, rest) {
             ("publication-status", []) => Action::PublicationStatus(hash(h)?),
             ("publication-monitor", ["--confirm-refresh"]) => Action::PublicationMonitor(hash(h)?),
@@ -58,8 +60,15 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
         };
         let store = path(s)?;
         let publication = path(p)?;
-        if store == publication { return Err(CliError::InvalidArguments); }
-        return Ok(Command { plan: None, store: Some(store), publication: Some(publication), action });
+        if store == publication {
+            return Err(CliError::InvalidArguments);
+        }
+        return Ok(Command {
+            plan: None,
+            store: Some(store),
+            publication: Some(publication),
+            action,
+        });
     }
     let (plan, store, action) = match args {
         ["preview", "--plan", p] => (Some(*p), None, Action::Preview),
@@ -190,9 +199,16 @@ pub async fn run(command: Command) -> Result<String, Error> {
         Action::Monitor(expected) => monitor(get_store()?, expected).await,
         Action::PublicationStatus(expected) | Action::PublicationMonitor(expected) => {
             let path = command.publication.as_deref().ok_or(Error::Format)?;
-            let publication = crate::identity_publication::Publication::new(Path::new(path)).map_err(|_| Error::Storage)?;
+            let publication = crate::identity_publication::Publication::new(Path::new(path))
+                .map_err(|_| Error::Storage)?;
             if matches!(command.action, Action::PublicationStatus(_)) {
-                crate::reference_maintenance::inspect(get_store()?, &publication, expected, health::unix_now()?).map(|value| value.report())
+                crate::reference_maintenance::inspect(
+                    get_store()?,
+                    &publication,
+                    expected,
+                    health::unix_now()?,
+                )
+                .map(|value| value.report())
             } else {
                 crate::reference_maintenance::monitor(get_store()?, &publication, expected).await
             }
@@ -256,7 +272,15 @@ mod tests {
         let store = dir.join("state.toml");
         let publication = dir.join("publication.toml");
         let digest = "01".repeat(32);
-        let args = ["publication-monitor", "--store", store.to_str().unwrap(), "--publication", publication.to_str().unwrap(), "--plan-sha256", &digest];
+        let args = [
+            "publication-monitor",
+            "--store",
+            store.to_str().unwrap(),
+            "--publication",
+            publication.to_str().unwrap(),
+            "--plan-sha256",
+            &digest,
+        ];
         assert!(parse(&args).is_err());
         let mut confirmed = args.to_vec();
         confirmed.push("--confirm-refresh");

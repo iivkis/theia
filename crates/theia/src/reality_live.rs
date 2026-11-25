@@ -11,7 +11,10 @@ use crate::{
     reality_generation::Lease,
     server::{ServerContext, ServerError},
 };
-use std::sync::{Arc,RwLock,atomic::{AtomicBool,Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
 use tokio_rustls::TlsAcceptor;
 
 pub(crate) struct Route {
@@ -25,23 +28,49 @@ pub(crate) struct Route {
 impl Route {
     fn material(&self) -> &PublishedIdentity {
         let p = self.lease.publication();
-        if self.successor { p.next().expect("prepared successor") } else { p.active() }
+        if self.successor {
+            p.next().expect("prepared successor")
+        } else {
+            p.active()
+        }
     }
-    pub(crate) fn generation_id(&self)->([u8;32],u64){
-        (self.lease.publication().snapshot_sha256(),self.lease.status().health_revision)
+    pub(crate) fn generation_id(&self) -> ([u8; 32], u64) {
+        (
+            self.lease.publication().snapshot_sha256(),
+            self.lease.status().health_revision,
+        )
     }
     pub(crate) fn current(&self, now: u64) -> bool {
         let v = self.material().verified();
-        v.check_time(now).is_ok() && self.lease.health().validate_active(v.descriptor(),now).is_ok()
+        v.check_time(now).is_ok()
+            && self
+                .lease
+                .health()
+                .validate_active(v.descriptor(), now)
+                .is_ok()
     }
     fn matches(&self, guard: &ReplayGuard, branch: Branch, hello: &[u8], now: u64) -> bool {
-        if !self.current(now) || (branch == Branch::H3 && self.quic.is_none()) { return false; }
+        if !self.current(now) || (branch == Branch::H3 && self.quic.is_none()) {
+            return false;
+        }
         let value = self.material().verified();
         let d = value.descriptor();
-        let Some(reference) = d.references.get(self.reference) else { return false; };
-        guard.admit(&self.lease.admission(), &Context {
-            scope: &d.scope, identity: value.signer(), reference: &reference.server_name, branch,
-        }, hello, now).is_ok()
+        let Some(reference) = d.references.get(self.reference) else {
+            return false;
+        };
+        guard
+            .admit(
+                &self.lease.admission(),
+                &Context {
+                    scope: &d.scope,
+                    identity: value.signer(),
+                    reference: &reference.server_name,
+                    branch,
+                },
+                hello,
+                now,
+            )
+            .is_ok()
     }
 }
 
@@ -50,20 +79,42 @@ pub(crate) struct Generation {
     routes: Vec<Arc<Route>>,
 }
 impl Generation {
-    fn prepare(lease: Arc<Lease>, base: &ServerContext, handshake: &Arc<ReplayGuard>, now: u64,gate:Arc<RwLock<bool>>)
-        -> Result<Self, ServerError> {
+    fn prepare(
+        lease: Arc<Lease>,
+        base: &ServerContext,
+        handshake: &Arc<ReplayGuard>,
+        now: u64,
+        gate: Arc<RwLock<bool>>,
+    ) -> Result<Self, ServerError> {
         let publication = lease.publication();
         let mut routes = Vec::new();
-        for (successor, material) in [(false, Some(publication.active())), (true, publication.next())] {
-            let Some(material) = material else { continue; };
+        for (successor, material) in [
+            (false, Some(publication.active())),
+            (true, publication.next()),
+        ] {
+            let Some(material) = material else {
+                continue;
+            };
             let value = material.verified();
-            if value.check_time(now).is_err() { continue; }
-            lease.health().validate_active(value.descriptor(),now).map_err(|_| ServerError::Config)?;
+            if value.check_time(now).is_err() {
+                continue;
+            }
+            lease
+                .health()
+                .validate_active(value.descriptor(), now)
+                .map_err(|_| ServerError::Config)?;
             let d = value.descriptor();
-            let next = if successor { None } else {
+            let next = if successor {
+                None
+            } else {
                 publication.next().map(|m| Arc::<str>::from(m.signed()))
             };
-            let context = Arc::new(base.fork_identity(value,Arc::from(material.signed()),next,gate.clone())?);
+            let context = Arc::new(base.fork_identity(
+                value,
+                Arc::from(material.signed()),
+                next,
+                gate.clone(),
+            )?);
             // Active reference first. Other signed, operator-approved SNI
             // values allow authenticated clients with a previously signed
             // descriptor to reconnect. An invalid marker still uses only
@@ -71,16 +122,26 @@ impl Generation {
             // This lets a client with a still-valid pre-failover descriptor
             // authenticate and retrieve the new signed active index.
             let active = usize::from(d.active_reference);
-            for index in std::iter::once(active).chain((0..d.references.len()).filter(|i| *i != active)) {
+            for index in
+                std::iter::once(active).chain((0..d.references.len()).filter(|i| *i != active))
+            {
                 let reference = &d.references[index];
-                let mut tls = material.identity().server_tls(&reference.server_name,Branch::H2)
+                let mut tls = material
+                    .identity()
+                    .server_tls(&reference.server_name, Branch::H2)
                     .map_err(|_| ServerError::Tls)?;
                 tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
                 let tcp = TlsAcceptor::from(Arc::new(tls));
                 let quic = if d.h3 && reference.h3 {
                     let tls = crate::identity_tls::checked_server_tls_for_reference(
-                        material.identity(),value,Branch::H3,lease.admission(),handshake.clone(),index)
-                        .map_err(|_| ServerError::Tls)?;
+                        material.identity(),
+                        value,
+                        Branch::H3,
+                        lease.admission(),
+                        handshake.clone(),
+                        index,
+                    )
+                    .map_err(|_| ServerError::Tls)?;
                     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
                         .map_err(|_| ServerError::Tls)?;
                     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
@@ -90,122 +151,219 @@ impl Generation {
                     // grants equivalent validation or amplification credit.
                     cfg.migration(true);
                     Some(Arc::new(cfg))
-                } else { None };
-                routes.push(Arc::new(Route { lease:lease.clone(),successor,reference:index,context:context.clone(),tcp,quic }));
+                } else {
+                    None
+                };
+                routes.push(Arc::new(Route {
+                    lease: lease.clone(),
+                    successor,
+                    reference: index,
+                    context: context.clone(),
+                    tcp,
+                    quic,
+                }));
             }
         }
-        if routes.is_empty() { return Err(ServerError::Config); }
-        Ok(Self { lease,routes })
+        if routes.is_empty() {
+            return Err(ServerError::Config);
+        }
+        Ok(Self { lease, routes })
     }
-    pub(crate) fn select(&self, guard: &ReplayGuard, branch: Branch, hello: &[u8], now: u64) -> Option<Arc<Route>> {
-        self.routes.iter().find(|route| route.matches(guard,branch,hello,now)).cloned()
+    pub(crate) fn select(
+        &self,
+        guard: &ReplayGuard,
+        branch: Branch,
+        hello: &[u8],
+        now: u64,
+    ) -> Option<Arc<Route>> {
+        self.routes
+            .iter()
+            .find(|route| route.matches(guard, branch, hello, now))
+            .cloned()
     }
-    pub(crate) fn relay_value(&self,now:u64)->Option<&Verified> {
-        relay_value(&self.lease,now)
+    pub(crate) fn relay_value(&self, now: u64) -> Option<&Verified> {
+        relay_value(&self.lease, now)
     }
     pub(crate) fn default_quic(&self) -> Option<quinn::ServerConfig> {
-        self.routes.iter().find_map(|r|r.quic.as_ref().map(|cfg|(**cfg).clone()))
+        self.routes
+            .iter()
+            .find_map(|r| r.quic.as_ref().map(|cfg| (**cfg).clone()))
     }
 }
 
-pub(crate) fn relay_value(lease:&Lease,now:u64)->Option<&Verified> {
-    let p=lease.publication();
-    [Some(p.active()),p.next()].into_iter().flatten().map(|m|m.verified()).find(|v|
-        v.check_time(now).is_ok() && lease.health().validate_active(v.descriptor(),now).is_ok())
+pub(crate) fn relay_value(lease: &Lease, now: u64) -> Option<&Verified> {
+    let p = lease.publication();
+    [Some(p.active()), p.next()]
+        .into_iter()
+        .flatten()
+        .map(|m| m.verified())
+        .find(|v| {
+            v.check_time(now).is_ok() && lease.health().validate_active(v.descriptor(), now).is_ok()
+        })
 }
 
-#[cfg(any(target_os="linux",target_os="windows"))]
-pub(crate) struct PreparedReplacement{generation:Arc<Generation>,gate:Arc<RwLock<bool>>}
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) struct PreparedReplacement {
+    generation: Arc<Generation>,
+    gate: Arc<RwLock<bool>>,
+}
 
 pub(crate) struct Live {
     base: Arc<ServerContext>,
     slot: RwLock<Option<Arc<Generation>>>,
-    gate:RwLock<Arc<RwLock<bool>>>,
+    gate: RwLock<Arc<RwLock<bool>>>,
     // A routing replay window is shared by every generation. The QUIC TLS
     // boundary has a separate equally long-lived replay window.
     pub(crate) guard: Arc<ReplayGuard>,
     handshake: Arc<ReplayGuard>,
     h3: bool,
-    retired:AtomicBool,
+    retired: AtomicBool,
 }
 impl Live {
-    pub(crate) fn new(lease:Arc<Lease>,base:Arc<ServerContext>,now:u64)->Result<Arc<Self>,ServerError>{
-        Self::with_guard_start(lease,base,now,now)
+    pub(crate) fn new(
+        lease: Arc<Lease>,
+        base: Arc<ServerContext>,
+        now: u64,
+    ) -> Result<Arc<Self>, ServerError> {
+        Self::with_guard_start(lease, base, now, now)
     }
-    pub(crate) fn with_guard_start(lease:Arc<Lease>,base:Arc<ServerContext>,now:u64,guard_start:u64)->Result<Arc<Self>,ServerError>{
-        let guard=Arc::new(ReplayGuard::new(65536,guard_start).map_err(|_|ServerError::Config)?);
-        let handshake=Arc::new(ReplayGuard::new(65536,guard_start).map_err(|_|ServerError::Config)?);
-        let gate=Arc::new(RwLock::new(true));
-        let initial=Arc::new(Generation::prepare(lease,&base,&handshake,now,gate.clone())?);
-        let h3=initial.default_quic().is_some();
-        Ok(Arc::new(Self{base,slot:RwLock::new(Some(initial)),gate:RwLock::new(gate),guard,handshake,h3,retired:AtomicBool::new(false)}))
+    pub(crate) fn with_guard_start(
+        lease: Arc<Lease>,
+        base: Arc<ServerContext>,
+        now: u64,
+        guard_start: u64,
+    ) -> Result<Arc<Self>, ServerError> {
+        let guard =
+            Arc::new(ReplayGuard::new(65536, guard_start).map_err(|_| ServerError::Config)?);
+        let handshake =
+            Arc::new(ReplayGuard::new(65536, guard_start).map_err(|_| ServerError::Config)?);
+        let gate = Arc::new(RwLock::new(true));
+        let initial = Arc::new(Generation::prepare(
+            lease,
+            &base,
+            &handshake,
+            now,
+            gate.clone(),
+        )?);
+        let h3 = initial.default_quic().is_some();
+        Ok(Arc::new(Self {
+            base,
+            slot: RwLock::new(Some(initial)),
+            gate: RwLock::new(gate),
+            guard,
+            handshake,
+            h3,
+            retired: AtomicBool::new(false),
+        }))
     }
-    pub(crate) fn current(&self)->Option<Arc<Generation>>{
-        if self.retired.load(Ordering::Acquire){return None;}
+    pub(crate) fn current(&self) -> Option<Arc<Generation>> {
+        if self.retired.load(Ordering::Acquire) {
+            return None;
+        }
         self.slot.read().ok()?.clone()
     }
-    pub(crate) fn status(&self)->Option<crate::reality_generation::Status>{
-        let now=crate::reference_health::unix_now().ok()?;
-        let generation=self.current()?;
-        if generation.relay_value(now).is_none(){return None;}
-        let mut status=generation.lease.status();
-        let p=generation.lease.publication();
-        status.active_usable=p.active().verified().check_time(now).is_ok();
-        status.successor_usable=p.next().is_some_and(|m|m.verified().check_time(now).is_ok());
-        status.overlap=status.active_usable&&status.successor_usable;
-        if !status.active_usable{
-            let next=p.next()?.verified().descriptor();
-            status.revision=next.revision;
-            status.active_reference=next.active_reference;
+    pub(crate) fn status(&self) -> Option<crate::reality_generation::Status> {
+        let now = crate::reference_health::unix_now().ok()?;
+        let generation = self.current()?;
+        if generation.relay_value(now).is_none() {
+            return None;
+        }
+        let mut status = generation.lease.status();
+        let p = generation.lease.publication();
+        status.active_usable = p.active().verified().check_time(now).is_ok();
+        status.successor_usable = p
+            .next()
+            .is_some_and(|m| m.verified().check_time(now).is_ok());
+        status.overlap = status.active_usable && status.successor_usable;
+        if !status.active_usable {
+            let next = p.next()?.verified().descriptor();
+            status.revision = next.revision;
+            status.active_reference = next.active_reference;
         }
         Some(status)
     }
-    pub(crate) fn publish(&self,lease:Arc<Lease>,now:u64)->Result<(),ServerError>{
+    pub(crate) fn publish(&self, lease: Arc<Lease>, now: u64) -> Result<(), ServerError> {
         if self.current().as_ref().is_some_and(|old| {
-            let a=old.lease.status();let b=lease.status();
-            a.generation==b.generation && a.health_revision==b.health_revision &&
-                a.active_usable==b.active_usable && a.successor_usable==b.successor_usable
-        }) { return Ok(()); }
-        let gate=self.gate.read().map_err(|_|ServerError::Config)?;
-        let candidate=Arc::new(Generation::prepare(lease,&self.base,&self.handshake,now,gate.clone())?);
+            let a = old.lease.status();
+            let b = lease.status();
+            a.generation == b.generation
+                && a.health_revision == b.health_revision
+                && a.active_usable == b.active_usable
+                && a.successor_usable == b.successor_usable
+        }) {
+            return Ok(());
+        }
+        let gate = self.gate.read().map_err(|_| ServerError::Config)?;
+        let candidate = Arc::new(Generation::prepare(
+            lease,
+            &self.base,
+            &self.handshake,
+            now,
+            gate.clone(),
+        )?);
         // A transport policy change requires structural Apply, not an
         // implicit rebind. The publication rotation/failover contract retains modes.
-        if candidate.default_quic().is_some()!=self.h3 { return Err(ServerError::Config); }
-        let mut slot=self.slot.write().map_err(|_|ServerError::Config)?;
-        if self.retired.load(Ordering::Acquire){return Err(ServerError::Config);}
-        *slot=Some(candidate);
+        if candidate.default_quic().is_some() != self.h3 {
+            return Err(ServerError::Config);
+        }
+        let mut slot = self.slot.write().map_err(|_| ServerError::Config)?;
+        if self.retired.load(Ordering::Acquire) {
+            return Err(ServerError::Config);
+        }
+        *slot = Some(candidate);
         Ok(())
     }
-    pub(crate) fn inbound_id(&self)->&str{&self.base.inbound_id}
-    #[cfg(any(target_os="linux",target_os="windows"))]
-    pub(crate) fn prepare_replacement(&self,lease:Arc<Lease>,now:u64)->Result<PreparedReplacement,ServerError>{
-        let gate=Arc::new(RwLock::new(true));
-        let generation=Arc::new(Generation::prepare(lease,&self.base,&self.handshake,now,gate.clone())?);
-        if generation.default_quic().is_some()!=self.h3{return Err(ServerError::Config);}
-        Ok(PreparedReplacement{generation,gate})
+    pub(crate) fn inbound_id(&self) -> &str {
+        &self.base.inbound_id
     }
-    #[cfg(any(target_os="linux",target_os="windows"))]
-    pub(crate) fn commit_replacement<T>(&self,candidate:PreparedReplacement,
-        commit:impl FnOnce(&mut dyn FnMut())->Result<T,()>)->Result<T,()>{
-        let mut gate=self.gate.write().map_err(|_|())?;
-        let previous_gate=gate.clone();
-        let mut slot=self.slot.write().map_err(|_|())?;
-        let mut previous=previous_gate.write().map_err(|_|())?;
-        if self.retired.load(Ordering::Acquire){return Err(());}
-        let mut candidate=Some(candidate);
-        let mut publish=||{
-            let next=candidate.take().expect("single supervisor commit");
-            *previous=false;
-            *gate=next.gate;
-            *slot=Some(next.generation);
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub(crate) fn prepare_replacement(
+        &self,
+        lease: Arc<Lease>,
+        now: u64,
+    ) -> Result<PreparedReplacement, ServerError> {
+        let gate = Arc::new(RwLock::new(true));
+        let generation = Arc::new(Generation::prepare(
+            lease,
+            &self.base,
+            &self.handshake,
+            now,
+            gate.clone(),
+        )?);
+        if generation.default_quic().is_some() != self.h3 {
+            return Err(ServerError::Config);
+        }
+        Ok(PreparedReplacement { generation, gate })
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub(crate) fn commit_replacement<T>(
+        &self,
+        candidate: PreparedReplacement,
+        commit: impl FnOnce(&mut dyn FnMut()) -> Result<T, ()>,
+    ) -> Result<T, ()> {
+        let mut gate = self.gate.write().map_err(|_| ())?;
+        let previous_gate = gate.clone();
+        let mut slot = self.slot.write().map_err(|_| ())?;
+        let mut previous = previous_gate.write().map_err(|_| ())?;
+        if self.retired.load(Ordering::Acquire) {
+            return Err(());
+        }
+        let mut candidate = Some(candidate);
+        let mut publish = || {
+            let next = candidate.take().expect("single supervisor commit");
+            *previous = false;
+            *gate = next.gate;
+            *slot = Some(next.generation);
         };
         commit(&mut publish)
     }
-    pub(crate) fn retire(&self){
-        self.retired.store(true,Ordering::Release);
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
         self.suspend();
     }
-    pub(crate) fn suspend(&self){
-        if let Ok(mut slot)=self.slot.write(){*slot=None;}
+    pub(crate) fn suspend(&self) {
+        if let Ok(mut slot) = self.slot.write() {
+            *slot = None;
+        }
     }
 }

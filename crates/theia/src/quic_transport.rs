@@ -197,10 +197,17 @@ pub async fn accept(incoming: quinn::Incoming) -> Result<Connection, QuicError> 
 }
 
 /// Select the already authenticated generation for this single Initial.
-pub(crate) async fn accept_with(incoming:quinn::Incoming,config:Arc<quinn::ServerConfig>)->Result<Connection,QuicError>{
-    let pending=incoming.accept_with(config).map_err(|_|QuicError::Handshake)?;
-    let connection=timeout(HANDSHAKE_TIMEOUT,pending).await.map_err(|_|QuicError::Timeout)?
-        .map_err(|_|QuicError::Handshake)?;
+pub(crate) async fn accept_with(
+    incoming: quinn::Incoming,
+    config: Arc<quinn::ServerConfig>,
+) -> Result<Connection, QuicError> {
+    let pending = incoming
+        .accept_with(config)
+        .map_err(|_| QuicError::Handshake)?;
+    let connection = timeout(HANDSHAKE_TIMEOUT, pending)
+        .await
+        .map_err(|_| QuicError::Timeout)?
+        .map_err(|_| QuicError::Handshake)?;
     checked(connection)
 }
 
