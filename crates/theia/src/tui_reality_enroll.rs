@@ -484,6 +484,37 @@ impl EnrollmentPanel {
         None
     }
 
+    pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        if self.registration.is_some() || !matches!(self.stage, Stage::Input) {
+            return None;
+        }
+        let hints = [
+            "Вставьте theia:// приглашение или абсолютный путь к защищённому URI-файлу.",
+            "Отдельно полученный admission-файл от администратора сервера.",
+            "Абсолютный путь нового файла профиля.",
+            "Абсолютный путь нового хранилища доверия.",
+            "Сверьте 64 hex-символа по независимому доверенному каналу.",
+            "Только env:/file: ссылка, если в приглашении нет токена.",
+        ];
+        Some(Form {
+            fields: LABELS.iter().enumerate().filter(|(id, _)| !self.managed_paths() || !matches!(*id, 2 | 3)).map(|(id, label)| Field {
+                id, label, hint: hints[id],
+                value: if self.fields[id].is_empty() { String::new() } else { format!("Скрыто · {} байт", self.fields[id].len()) },
+            }).collect(),
+            selected: self.focus,
+            lead: "Подтвердите источник доверия. Секретные значения скрыты.".into(),
+            error: self.error.clone().unwrap_or_default(),
+        })
+    }
+
+    pub(crate) fn select_field(&mut self, id: usize) {
+        if self.registration.is_none() && matches!(self.stage, Stage::Input)
+            && id < LABELS.len() && (!self.managed_paths() || !matches!(id, 2 | 3)) {
+            self.focus = id;
+        }
+    }
+
     pub(crate) fn guide(&self) -> (usize, usize, &'static str, &'static str) {
         if self.registration.is_some() {
             return (3, 3, "Регистрация в TOML", "Enter предпросмотр · Y сохранить · Esc назад");
