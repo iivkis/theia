@@ -160,6 +160,75 @@ fn decode(w: usize, h: usize, pixels: &[u8]) -> Result<Zeroizing<String>, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn png_image(color: png::ColorType, pixels: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut data, 1, 1);
+            encoder.set_color(color);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(pixels).unwrap();
+        }
+        data
+    }
+
+    #[test]
+    fn png_color_conversion_preserves_luma_and_composites_transparency() {
+        for (color, pixel, expected) in [
+            (png::ColorType::Grayscale, vec![33], 33),
+            (png::ColorType::GrayscaleAlpha, vec![0, 0], 255),
+            (png::ColorType::GrayscaleAlpha, vec![0, 128], 127),
+            (png::ColorType::Rgb, vec![255, 0, 0], 76),
+            (png::ColorType::Rgba, vec![0, 0, 0, 128], 127),
+            (png::ColorType::Rgba, vec![255, 255, 255, 0], 255),
+        ] {
+            let (w, h, p) = png_pixels(&png_image(color, &pixel)).unwrap();
+            assert_eq!((w, h), (1, 1));
+            assert_eq!(p.as_slice(), &[expected]);
+        }
+        assert!(png_pixels(b"not PNG").is_err());
+        assert!(pixel_count(0, 1).is_err());
+        assert!(pixel_count(4097, 1).is_err());
+        assert!(decode(2, 2, &[0; 3]).is_err());
+    }
+
+    #[test]
+    fn exact_svg_renders_matrix_and_rejects_duplicates_or_outside_quiet_zone() {
+        let crate::config::Config::Client(doc) =
+            crate::config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else { panic!("client") };
+        let link = crate::invite::Invitation::public_from_profile(&doc.client.profiles[0])
+            .unwrap().encode().unwrap();
+        let qr = qrcode::QrCode::new(link.as_bytes()).unwrap();
+        let size = qr.width() + 8;
+        let scaled = size * 4;
+        let header = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {size} {size}\" width=\"{scaled}\" height=\"{scaled}\" shape-rendering=\"crispEdges\"><rect width=\"100%\" height=\"100%\" fill=\"white\"/><path fill=\"black\" d=\"");
+        let suffix = "\"/></svg>";
+        let mut matrix = String::new();
+        use std::fmt::Write;
+        for y in 0..qr.width() {
+            for x in 0..qr.width() {
+                if qr[(x, y)] == qrcode::Color::Dark {
+                    write!(&mut matrix, "M{} {}h1v1h-1z", x + 4, y + 4).unwrap();
+                }
+            }
+        }
+        let svg = format!("{header}{matrix}{suffix}");
+        let (w, pixels) = theia_svg(svg.as_bytes()).unwrap();
+        assert_eq!(w, scaled);
+        assert_eq!(decode(w, w, &pixels).unwrap().as_str(), link.as_str());
+        for malformed in ["M4 4h1v1h-1zM4 4h1v1h-1z", "M0 4h1v1h-1z", "M4 0h1v1h-1z", "M4 4<script>"] {
+            assert!(theia_svg(format!("{header}{malformed}{suffix}").as_bytes()).is_err());
+        }
+        assert!(theia_svg(svg.replace("fill=\"white\"", "fill=\"red\"").as_bytes()).is_err());
+        assert!(image_path("image.PNG"));
+        assert!(image_path("image.svg"));
+        assert!(!image_path("image.jpg"));
+        assert!(!image_path("theia://image.svg"));
+        assert!(scan_file("relative.svg").is_err());
+        assert!(scan_file("image.jpg").is_err());
+    }
+
     #[test]
     fn decodes_actual_png_qr_matrix_and_rejects_noninvitation() {
         let crate::config::Config::Client(doc) =

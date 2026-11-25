@@ -206,6 +206,70 @@ impl ProcessPanel {
 mod tests {
     use super::*;
     #[test]
+    fn owned_worker_reports_ready_and_only_stops_after_confirmation() {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready) = tokio::sync::oneshot::channel();
+        let (done_tx, done) = mpsc::channel();
+        let mut panel = ProcessPanel::new();
+        panel.worker = Some(Worker {
+            stop: Some(stop),
+            ready,
+            done,
+            thread: None,
+            inbounds: None,
+        });
+        panel.poll();
+        assert_eq!(panel.status(), "Подготовка");
+        ready_tx.send(2).unwrap();
+        panel.poll();
+        assert_eq!(panel.status(), "Запущен");
+        assert!(panel.body().contains("Inbound: 2"));
+        assert!(panel.key(KeyCode::Esc, None));
+        assert!(panel.running());
+        assert!(!panel.key(KeyCode::Char('x'), None));
+        assert!(panel.body().contains("Остановить запущенный"));
+        panel.key(KeyCode::Char('n'), None);
+        assert!(stopped.try_recv().is_err());
+        assert_eq!(panel.status(), "Запущен");
+        panel.key(KeyCode::Char('x'), None);
+        panel.key(KeyCode::Char('y'), None);
+        stopped.try_recv().unwrap();
+        assert_eq!(panel.status(), "Останавливается");
+        assert!(panel.body().contains("admission"));
+        done_tx.send(Ok(())).unwrap();
+        panel.poll();
+        assert!(!panel.running());
+        assert!(panel.body().contains("завершение listener tasks подтверждено"));
+    }
+
+    #[test]
+    fn worker_disconnect_does_not_claim_success_and_start_confirmation_can_cancel() {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let (_ready_tx, ready) = tokio::sync::oneshot::channel();
+        let (done_tx, done) = mpsc::channel();
+        let mut panel = ProcessPanel::new();
+        panel.confirm = Some(true);
+        assert!(panel.body().contains("Открываются указанные сетевые порты"));
+        assert!(!panel.key(KeyCode::Esc, None));
+        assert!(panel.confirm.is_none());
+        panel.confirm = Some(true);
+        panel.key(KeyCode::Char('y'), None);
+        assert!(panel.body().contains("Сначала откройте серверный TOML"));
+        panel.worker = Some(Worker {
+            stop: Some(stop),
+            ready,
+            done,
+            thread: None,
+            inbounds: None,
+        });
+        drop(done_tx);
+        panel.poll();
+        assert!(!panel.running());
+        stopped.try_recv().unwrap();
+        assert!(panel.body().contains("Сервер не работает"));
+    }
+
+    #[test]
     fn no_config_means_no_start_and_no_confirm() {
         let mut p = ProcessPanel::new();
         assert!(!p.key(KeyCode::Char('s'), None));

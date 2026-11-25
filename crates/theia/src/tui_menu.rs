@@ -853,6 +853,133 @@ fn default_config(filename: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn wait_dialog(dialog: &mut ConfigDialog) -> Option<crate::tui_editor::Editor> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dialog.loading.is_some() {
+            if let Some(editor) = dialog.poll() {
+                return Some(editor);
+            }
+            assert!(std::time::Instant::now() < deadline, "configuration worker stalled");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        None
+    }
+
+    #[test]
+    fn server_setup_masks_material_and_creates_disabled_owner_only_after_review() {
+        let mut setup = FirstSetup::new(Role::Server);
+        assert!(setup.body("server.toml").contains("Первый пользователь отключён"));
+        setup.key(press(KeyCode::Enter));
+        assert!(setup.review.is_none());
+        assert!(setup.body("server.toml").contains("Ошибка:"));
+        setup.key(press(KeyCode::Up));
+        assert_eq!(setup.focus, 5);
+        setup.key(press(KeyCode::Down));
+        assert_eq!(setup.focus, 0);
+        setup.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        setup.paste("inbound");
+        setup.key(press(KeyCode::Char('x')));
+        setup.key(press(KeyCode::Backspace));
+        assert_eq!(setup.fields[0].as_str(), "inbound");
+        setup.paste("bad\nvalue");
+        setup.paste(&"a".repeat(4097));
+        assert_eq!(setup.fields[0].as_str(), "inbound");
+        for (i, value) in ["127.0.0.1:443", "example.org", "file:/cert.pem", "file:/key.pem"].iter().enumerate() {
+            *setup.fields[i + 1] = value.to_string();
+        }
+        assert!(!setup.body("server.toml").contains("key.pem"));
+        setup.key(press(KeyCode::Enter));
+        assert!(setup.review.is_some());
+        setup.paste("ignored");
+        assert_eq!(setup.fields[0].as_str(), "inbound");
+        assert!(setup.body("server.toml").contains("Подтверждение"));
+        setup.key(press(KeyCode::Char('n')));
+        assert!(setup.review.is_none());
+        setup.key(press(KeyCode::Enter));
+        let SetupAction::Create(Config::Server(doc)) = setup.key(press(KeyCode::Char('Y'))) else {
+            panic!("expected reviewed server config");
+        };
+        assert!(doc.server.users[0].disabled);
+        assert_eq!(doc.server.users[0].token_sha256.len(), 64);
+        assert_eq!(doc.server.inbounds[0].allowed_user_ids, vec!["owner"]);
+        assert_eq!(doc.server.inbounds[0].h2_listen, doc.server.inbounds[0].quic_listen);
+        assert!(matches!(setup.key(press(KeyCode::Esc)), SetupAction::Back));
+    }
+
+    #[test]
+    fn first_config_dialog_creates_once_reopens_and_refuses_overwrite() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("tui-test").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("client.toml");
+        let mut dialog = ConfigDialog::new(Role::Client, Some(&path));
+        assert!(dialog.body().contains("открытие или создание"));
+        dialog.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        dialog.key(press(KeyCode::Enter));
+        assert!(dialog.body().contains("Укажите путь"));
+        dialog.key(press(KeyCode::F(2)));
+        assert!(dialog.setup.is_none());
+        dialog.key(press(KeyCode::Char('x')));
+        dialog.key(press(KeyCode::Backspace));
+        dialog.paste("bad\npath");
+        dialog.paste(&"a".repeat(4097));
+        assert!(dialog.input.is_empty());
+        dialog.paste(path.to_str().unwrap());
+        dialog.key(press(KeyCode::Enter));
+        assert!(dialog.body().contains("Проверяется"));
+        assert!(!dialog.key(press(KeyCode::Esc)));
+        assert!(wait_dialog(&mut dialog).is_none());
+        assert!(dialog.error.is_some());
+        assert!(!path.exists());
+        dialog.key(press(KeyCode::F(2)));
+        dialog.paste("test");
+        assert!(dialog.setup.is_some());
+        dialog.key(press(KeyCode::Esc));
+        assert!(dialog.setup.is_none());
+
+        for attempt in 0..2 {
+            dialog.key(press(KeyCode::F(2)));
+            let setup = dialog.setup.as_mut().unwrap();
+            for (i, value) in ["main", "example.org:443", "example.org", "file:/ca.pem", "env:THEIA_TOKEN", "/v1/route"].iter().enumerate() {
+                *setup.fields[i] = value.to_string();
+            }
+            dialog.key(press(KeyCode::Enter));
+            assert!(dialog.body().contains("Подтверждение"));
+            let before = std::fs::read(&path).ok();
+            dialog.key(press(KeyCode::Char('y')));
+            assert!(dialog.body().contains("Создаётся"));
+            let editor = wait_dialog(&mut dialog);
+            if attempt == 0 {
+                assert_eq!(editor.unwrap().role(), Role::Client);
+                assert!(before.is_none());
+            } else {
+                assert!(editor.is_none());
+                assert!(dialog.error.is_some());
+                assert_eq!(std::fs::read(&path).unwrap(), before.unwrap());
+            }
+        }
+        dialog.key(press(KeyCode::Enter));
+        assert_eq!(wait_dialog(&mut dialog).unwrap().role(), Role::Client);
+        assert!(dialog.key(press(KeyCode::Esc)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disconnected_config_worker_clears_busy_state() {
+        let mut dialog = ConfigDialog::new(Role::Client, None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        dialog.loading = Some(rx);
+        dialog.creating = true;
+        drop(tx);
+        assert!(dialog.poll().is_none());
+        assert!(dialog.loading.is_none());
+        assert!(!dialog.creating);
+        assert!(dialog.body().contains("Операция не подтверждена"));
+    }
+
     #[test]
     fn first_setup_requires_valid_fields_and_explicit_confirmation() {
         let mut setup = FirstSetup::new(Role::Client);
