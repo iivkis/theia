@@ -593,8 +593,16 @@ impl ConnectionIdGenerator for NativeCids {
 // therefore remain applicable. No extra listener can bypass admission.
 // When a bounded queue or OS send buffer fills, UDP may drop a datagram.
 struct LocalSocket {
-    socket: Arc<UdpSocket>,
+    // The endpoint driver can outlive the listener task. Detachment removes
+    // its physical socket ownership synchronously, even on task cancellation.
+    socket: Mutex<Option<Arc<UdpSocket>>>,
     receive: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+}
+impl LocalSocket {
+    fn detach(&self) {
+        let mut socket = self.socket.lock().unwrap_or_else(|e| e.into_inner());
+        *socket = None;
+    }
 }
 impl fmt::Debug for LocalSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -617,9 +625,9 @@ impl AsyncUdpSocket for LocalSocket {
         if transmit.segment_size.is_some() {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        let result = self
-            .socket
-            .try_send_to(transmit.contents, transmit.destination);
+        let socket = self.socket.lock().map_err(|_| io::Error::other("QUIC send lock"))?;
+        let socket = socket.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
+        let result = socket.try_send_to(transmit.contents, transmit.destination);
         match result {
             Ok(n) if n == transmit.contents.len() => Ok(()),
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
@@ -661,7 +669,8 @@ impl AsyncUdpSocket for LocalSocket {
         }
     }
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
+        self.socket.lock().map_err(|_| io::Error::other("QUIC send lock"))?
+            .as_ref().ok_or(io::ErrorKind::BrokenPipe)?.local_addr()
     }
     fn may_fragment(&self) -> bool {
         true
@@ -680,6 +689,7 @@ impl AsyncUdpSocket for LocalSocket {
 pub struct PreparedQuic {
     socket: Arc<UdpSocket>,
     endpoint: Endpoint,
+    virtual_socket: Arc<LocalSocket>,
     local: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     local_cids: Arc<LocalCidKey>,
     path_slots: Arc<Semaphore>,
@@ -690,6 +700,16 @@ struct Ticket {
     route: Arc<Route>,
     until: Instant,
 }
+impl Drop for PreparedQuic {
+    fn drop(&mut self) {
+        // Keep the physical socket attached for the entire native drain.
+        // Once the generation exits, no detached Quinn driver may retain
+        // the bind or transmit on the retired listener.
+        self.endpoint.close(0u32.into(), b"backend closed");
+        self.virtual_socket.detach();
+    }
+}
+
 impl PreparedQuic {
     pub fn prepare(
         socket: UdpSocket,
@@ -747,19 +767,20 @@ impl PreparedQuic {
             .max_udp_payload_size(LOCAL_MAX as u16)
             .map_err(|_| ServerError::Config)?;
         let virtual_socket = Arc::new(LocalSocket {
-            socket: socket.clone(),
+            socket: Mutex::new(Some(socket.clone())),
             receive: Mutex::new(rx),
         });
         let endpoint = Endpoint::new_with_abstract_socket(
             endpoint_config,
             Some(server),
-            virtual_socket,
+            virtual_socket.clone(),
             Arc::new(TokioRuntime),
         )
         .map_err(|_| ServerError::Io)?;
         Ok(Self {
             socket,
             endpoint,
+            virtual_socket,
             local,
             local_cids,
             live,
@@ -777,13 +798,10 @@ impl PreparedQuic {
         self,
         phase: watch::Receiver<server::GenerationPhase>,
     ) -> Result<(), ServerError> {
-        let endpoint = self.endpoint.clone();
-        let result = tokio::select! {
+        tokio::select! {
             result = self.accept_native(phase.clone()) => result,
             result = self.dispatch(phase) => result,
-        };
-        endpoint.close(0u32.into(), b"backend closed");
-        result
+        }
     }
 
     async fn accept_native(
@@ -1035,6 +1053,23 @@ impl PreparedQuic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn detached_virtual_endpoint_releases_physical_udp_bind() {
+        let physical = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let address = physical.local_addr().unwrap();
+        let (_sender, receive) = mpsc::channel(1);
+        let virtual_socket = Arc::new(LocalSocket {
+            socket: Mutex::new(Some(physical.clone())),
+            receive: Mutex::new(receive),
+        });
+        let driver = virtual_socket.clone();
+        assert_eq!(driver.local_addr().unwrap(), address);
+        virtual_socket.detach();
+        drop(physical);
+        assert_eq!(driver.local_addr().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        let _replacement = UdpSocket::bind(address).await.unwrap();
+    }
     fn peer(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
