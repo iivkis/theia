@@ -1685,11 +1685,15 @@ impl Interaction {
                 return false;
             }
             if model.screen == Screen::Server && key.code == KeyCode::Char('R') {
-                self.runtime = Some(RuntimePanel::open_restart());
+                self.runtime = Some(if self.server_process.running() {
+                    RuntimePanel::open_restart_at(self.server_process.management_endpoint())
+                } else { RuntimePanel::open_restart() });
                 return false;
             }
             if model.screen == Screen::Server && key.code == KeyCode::Char('v') {
-                self.runtime = Some(RuntimePanel::open(None, false));
+                self.runtime = Some(if self.server_process.running() {
+                    RuntimePanel::open_at(self.server_process.management_endpoint(), None, false)
+                } else { RuntimePanel::open(None, false) });
                 return false;
             }
             if model.screen == Screen::Server && key.code == KeyCode::Char('p') {
@@ -2415,7 +2419,9 @@ impl Interaction {
                     match editor.require_clean_records() {
                         Ok(()) => {
                             editor.error = None;
-                            self.reality_status = Some(StatusPanel::open(editor));
+                            self.reality_status = Some(if editor.role() == Role::Server && self.server_process.running() {
+                                StatusPanel::open_with_endpoint(editor, self.server_process.management_endpoint())
+                            } else { StatusPanel::open(editor) });
                         }
                         Err(message) => editor.error = Some(message.into()),
                     }
@@ -2548,7 +2554,9 @@ impl Interaction {
                     } else {
                         Some(editor.saved_sha256())
                     };
-                    self.runtime = Some(RuntimePanel::open(saved, apply_shortcut));
+                    self.runtime = Some(if self.server_process.running() {
+                        RuntimePanel::open_at(self.server_process.management_endpoint(), saved, apply_shortcut)
+                    } else { RuntimePanel::open(saved, apply_shortcut) });
                     editor.error = None;
                 }
                 return false;
@@ -2560,7 +2568,9 @@ impl Interaction {
                             .into(),
                     );
                 } else {
-                    self.runtime = Some(RuntimePanel::open_restart());
+                    self.runtime = Some(if self.server_process.running() {
+                    RuntimePanel::open_restart_at(self.server_process.management_endpoint())
+                } else { RuntimePanel::open_restart() });
                     editor.error = None;
                 }
                 return false;
