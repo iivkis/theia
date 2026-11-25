@@ -172,7 +172,11 @@ class SpecContractTests(unittest.TestCase):
         workflow = read(".github/workflows/ci.yml")
         self.assertNotIn("actions/setup-go", workflow)
         self.assertIn("--test independent_h2_loopback -- --ignored", workflow)
-        self.assertIn("actual_chromium_h2_settings_and_pseudo_order_reference", workflow)
+        self.assertIn("run_f13_observations.py f13-observations", workflow)
+        runner = read("tests/benchmark/run_f13_observations.py")
+        self.assertIn("actual_chromium_h2_settings_and_pseudo_order_reference", runner)
+        self.assertIn("actual_chromium_h3_initial_reference", runner)
+        self.assertIn("subprocess.run(command", runner)
         h2_tls = (spike / "tests" / "h2_tls.rs")
         self.assertTrue(h2_tls.is_file())
         loss_test = spike / "tests" / "quic_bbr_loss.rs"
@@ -272,8 +276,15 @@ class SpecContractTests(unittest.TestCase):
         for term in ("pub async fn serve(", "pub async fn run_file(",
                      "fn allowed_destination(", "URL_SAFE_NO_PAD", "Sha256::digest",
                      "ct_eq(", "lookup_host(", "TcpStream::connect",
-                     "Frame::OpenOk", "TlsAcceptor", "max_concurrent_streams"):
+                     "Frame::OpenOk", "TlsAcceptor", "Carrier::H2.h2_server()",
+                     "Carrier::H2.accepts_tls("):
             self.assertIn(term, implementation)
+        policy = read("crates/theia/src/transport_policy.rs")
+        for term in ("MAX_BIDI_STREAMS: u32 = 32", "MAX_HEADER_LIST_BYTES: u32 = 8192",
+                     "builder.max_concurrent_streams(MAX_BIDI_STREAMS)",
+                     "builder.max_header_list_size(MAX_HEADER_LIST_BYTES)",
+                     "rustls::ProtocolVersion::TLSv1_3"):
+            self.assertIn(term, policy)
         for term in ("h2_tls_stream_acknowledges_tcp_open_only_after_echo_dial",
                      "h2_tls_default_policy_rejects_private_ip_without_tcp_dial",
                      "h2_tls_rejects_missing_bearer_before_smarttheia",
