@@ -172,7 +172,7 @@ impl EnrollmentPanel {
         let identity = crate::parse_restart_digest(&self.fields[4]).ok_or(Error::Approval)?;
         let token = (!self.fields[5].is_empty()).then(|| self.fields[5].clone());
         Ok(Input {
-            source: path(0),
+            source: if self.fields[0].starts_with("theia://") { PathBuf::new() } else { path(0) },
             inline: self.fields[0].starts_with("theia://").then(|| self.fields[0].clone()),
             admission: path(1),
             profile: path(2),

@@ -74,4 +74,24 @@ mod tests {
         assert!(invalid.is_empty());
         assert!(qr_svg("invalid").is_err());
     }
+
+    #[test]
+    fn protected_qr_export_is_complete_and_create_new() {
+        let crate::config::Config::Client(doc) = crate::config::parse(include_str!("../../../examples/client.toml")).unwrap() else { panic!("client"); };
+        let link = crate::invite::Invitation::public_from_profile(&doc.client.profiles[0]).unwrap().encode().unwrap();
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("qr-test").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let config = dir.join("client.toml");
+        let (first, is_qr) = export_qr(&config, &link).unwrap();
+        assert!(is_qr);
+        let (second, is_qr) = export_qr(&config, &link).unwrap();
+        assert!(is_qr && first != second);
+        let expected = qr_svg(&link).unwrap().unwrap();
+        for path in [first, second] {
+            let actual = crate::bounded_input::read(&path, 2 * 1024 * 1024, true, true).unwrap();
+            assert_eq!(&actual[..], expected.as_bytes());
+        }
+        assert!(!config.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
