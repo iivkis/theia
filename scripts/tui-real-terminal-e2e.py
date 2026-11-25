@@ -565,7 +565,8 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
             tty.send(fingerprint + "\r")
             tty.wait("ПРЕДПРОСМОТР: fingerprint совпал")
             tty.send("y")
-            tty.wait("Следующий шаг: g")
+            # Successful managed enrollment opens registration automatically.
+            tty.wait("Материалы подготовлены")
 
         # First complete local enrollment, cancel before TOML registration.
         before = set(base.glob(".theia-enroll-*"))
@@ -573,8 +574,6 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         enroll()
         assert client.read_bytes() == saved
         assert len(set(base.glob(".theia-enroll-*")) - before) == 1
-        tty.send("g")
-        tty.wait("Материалы подготовлены")
         tty.send("\x1b")
         tty.wait("Режим подключения")
         assert set(base.glob(".theia-enroll-*")) == before
@@ -582,8 +581,6 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
 
         # Re-run and actually register: still no implicit activation.
         enroll()
-        tty.send("g")
-        tty.wait("Материалы подготовлены")
         tty.send("\x15reality-profile\r")
         tty.wait("Register REALITY profile")
         assert client.read_bytes() == saved
