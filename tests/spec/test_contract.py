@@ -313,6 +313,15 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("retired_product_security_profiles_are_rejected_before_network",
                       read("crates/theia/tests/client_h2.rs"))
 
+    def test_real_goaway_regression_matrix_is_present(self):
+        code = read("crates/theia/tests/goaway.rs")
+        for term in ("real_h2_goaway_drains_live_streams_without_reusing_carrier",
+                     "real_h3_goaway_drains_live_streams_without_reusing_carrier",
+                     "connection.graceful_shutdown()", "connection.shutdown(0).await",
+                     "shares_transport_with", "h2_scenario(true)", "h3_scenario(true)"):
+            self.assertIn(term, code)
+        self.assertIn("cargo test --workspace --all-targets --locked", read(".github/workflows/ci.yml"))
+
     def test_m22_local_proxy_gate_and_cli_wiring(self):
         implementation = read("crates/theia/src/local_proxy.rs")
         client = read("crates/theia/src/client.rs")

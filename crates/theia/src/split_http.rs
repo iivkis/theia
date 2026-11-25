@@ -199,6 +199,7 @@ pub(crate) enum Leg {
     Download,
 }
 
+#[cfg(test)]
 pub(crate) fn leg<T>(request: &Request<T>) -> Option<Leg> {
     leg_at(request, UPLOAD_PATH, DOWNLOAD_PATH)
 }

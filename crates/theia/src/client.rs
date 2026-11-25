@@ -579,8 +579,7 @@ impl H2Client {
             return result;
         }
         *stage = HelloOutcome::Pending;
-        let result = self.open_inner(open, operation, stream_up, stage).await;
-        result
+        self.open_inner(open, operation, stream_up, stage).await
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H2Connection, ClientError> {
