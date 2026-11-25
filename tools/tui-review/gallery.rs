@@ -80,7 +80,12 @@ fn visual_review_gallery() {
         };
         for (key, label) in keys {
             let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
-            ui.update(&mut model, press(KeyCode::Char(*key)));
+            if role == Role::Server && *key == 's' {
+                ui.update(&mut model, press(KeyCode::F(5)));
+                assert!(ui.show_server_process, "server process capture must open the actual panel");
+            } else {
+                ui.update(&mut model, press(KeyCode::Char(*key)));
+            }
             // An unavailable action deliberately records the actual error, not a mock success.
             review_capture(&format!("{prefix}-action-{label}"), &model, &ui);
         }

@@ -68,7 +68,7 @@ def main():
             if "HIDDEN" in mods or not symbol.strip():
                 continue
             font = bolditalic if "BOLD" in mods and "ITALIC" in mods else bold if "BOLD" in mods else italic if "ITALIC" in mods else normal
-            draw.text((x,y+1), symbol, font=font, fill=fg, anchor="lt")
+            draw.text((x,y+16), symbol, font=font, fill=fg, anchor="ls")
             if "UNDERLINED" in mods:
                 draw.line((x,y+18,x+cw-1,y+18), fill=fg)
             if "CROSSED_OUT" in mods:
@@ -81,6 +81,8 @@ def main():
     required = {"home-role-selection","help","server-page-overview","server-page-connections","server-page-users",
                 "client-page-overview","client-page-profiles","client-action-invitation-import","server-action-reality-wizard"}
     assert required <= {e["scenario"] for e in entries}
+    hashes = {e["scenario"]: e["sha256"] for e in entries}
+    assert hashes["server-action-server-process"] != hashes["server-page-connections"], "server process screenshot duplicates connections"
     assert len(entries) >= 50, f"unexpectedly incomplete gallery: {len(entries)}"
     manifest = {"schema_version":1,"source_sha":args.source_sha,"platform":"linux","columns":120,"rows":40,
                 "pixel_width":1200,"pixel_height":840,"renderer":"Ratatui TestBackend + DejaVu Sans Mono",
