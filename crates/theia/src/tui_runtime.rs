@@ -1051,7 +1051,9 @@ mod tests {
             same_port: true,
             material_sha256: [5; 32],
         }));
-        assert!(panel.body().contains("Смена TLS на текущих портах"));
+        assert!(matches!(panel.phase, Phase::CutoverConfirming { .. }));
+        assert!(panel.body().contains("Смена материалов на текущих портах"));
+        assert!(panel.body().contains("независимая замена REALITY root необратима"));
         panel.phase = Phase::CutoverApplying;
         panel.complete(Ok(StatusReply::RestartApplied { revision: 8 }));
         assert_eq!(panel.phase, Phase::CutoverApplied { revision: 8 });
