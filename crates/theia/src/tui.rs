@@ -1451,6 +1451,16 @@ impl Interaction {
                 return;
             }
         }
+        if self.pending.is_some() && self.saving.is_none() {
+            let items = dirty_transition_actions();
+            if let Some([_, controls]) = action_layout(body, items.len()) {
+                if let Some(index) = (Actions { items: &items, selected: self.modal_action })
+                    .hit(controls, event.column, event.row) {
+                    self.modal_action = index;
+                }
+            }
+            return;
+        }
         if let Some(menu) = self.menu.as_mut() {
             menu.click(body, event.column, event.row);
             return;
@@ -3394,7 +3404,11 @@ impl Interaction {
         }
 
         if let Some(original) = self.pending {
-            match key.code {
+            let items = dirty_transition_actions();
+            let Some(code) = tui_widgets::action_key(&items, &mut self.modal_action, key.code) else {
+                return false;
+            };
+            match code {
                 KeyCode::Char('s') => {
                     self.start_save();
                     return false;
@@ -3404,8 +3418,9 @@ impl Interaction {
                     self.pending = None;
                     return model.update(original);
                 }
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Char('n') => {
                     self.pending = None;
+                    self.modal_action = 0;
                 }
                 _ => {}
             }
@@ -3804,10 +3819,19 @@ impl Interaction {
             && key.code == KeyCode::Char('c');
         if editor.dirty() && navigation {
             self.pending = Some(key);
+            self.modal_action = 0;
             return false;
         }
         model.update(key)
     }
+}
+
+fn dirty_transition_actions() -> [ActionItem; 3] {
+    [
+        ActionItem { key: 'n', label: "Остаться в редакторе" },
+        ActionItem { key: 's', label: "Сохранить и продолжить" },
+        ActionItem { key: 'd', label: "Не сохранять и продолжить" },
+    ]
 }
 
 fn shell_layout(area: Rect) -> [Rect; 3] {
@@ -4016,6 +4040,19 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
     (rows, focus)
 }
 
+/// Remove only standalone legacy confirmation-key legends when the
+/// explicit choices are available. Never remove substantive review content.
+fn confirmation_body(body: &str) -> String {
+    body.lines().filter(|line| {
+        let text = line.trim();
+        let confirm = text.starts_with("y: ") || text.starts_with("Y: ")
+            || text.starts_with("y ") || text.starts_with("Y ");
+        let cancel = text.contains("n/Esc") || text.contains("N/Esc")
+            || text.contains("n / Esc") || text.contains("N / Esc");
+        !(confirm && cancel && !text.contains("ВНИМАНИЕ"))
+    }).collect::<Vec<_>>().join("\n")
+}
+
 fn panel_at(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4031,6 +4068,11 @@ fn panel_at(
         area
     };
     let page = usize::from(area.height.saturating_sub(2)).max(1);
+    let cleaned;
+    let body = if viewport.is_some_and(|v| v.confirmation.get()) {
+        cleaned = confirmation_body(body);
+        cleaned.as_str()
+    } else { body };
     let (rows, focus) = visual_rows(body, usize::from(area.width.saturating_sub(2)));
     let count = rows.len();
     // Auto-reveal focus in typed forms only. Confirmation/review screens
@@ -4115,6 +4157,11 @@ fn draw_guided(
     if let Some(v) = viewport { v.guided.set(true); }
     tui_widgets::canvas(frame, area);
     let width = area.width.min(108).saturating_sub(4);
+    let cleaned;
+    let body = if viewport.is_some_and(|v| v.confirmation.get()) {
+        cleaned = confirmation_body(body);
+        cleaned.as_str()
+    } else { body };
     let review_lines = if form.is_none() {
         Some(match &review {
             Some(review) => review.lines(width),
@@ -4645,14 +4692,16 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             interaction.and_then(|ui| ui.editor.as_ref()),
             viewport,
         );
-    } else if interaction.is_some_and(|ui| ui.pending.is_some()) {
-        modal_panel!(
-            frame,
-            parts[1],
-            "Не сохранено: подтвердите переход",
-            "s: сохранить и продолжить\nd: отменить изменения и продолжить\nEsc: остаться в редакторе\n\nНи одна опция не применяет конфигурацию к runtime.",
-            true,
-        );
+    } else if let Some(ui) = interaction.filter(|ui| ui.pending.is_some()) {
+        tui_widgets::canvas(frame, parts[1]);
+        let items = dirty_transition_actions();
+        if let Some([report, controls]) = action_layout(parts[1], items.len()) {
+            modal_panel!(frame, report, "Есть несохранённые изменения",
+                "Сохранить изменения перед выходом?\nРаботающий процесс не изменится.", false);
+            Actions { items: &items, selected: ui.modal_action }.render(frame, controls);
+        } else {
+            Actions { items: &items, selected: ui.modal_action }.render(frame, parts[1]);
+        }
     } else if let Some(domain) = interaction.and_then(|ui| ui.domain.as_ref()) {
         if let Some(form) = domain.form() {
             draw_guided(
@@ -7658,7 +7707,8 @@ mod tests {
         assert!(!interaction.update(&mut model, press(KeyCode::Char('q'))));
         assert!(interaction.pending.is_some());
         assert_eq!(model.screen, Screen::Server);
-        assert!(!interaction.update(&mut model, press(KeyCode::Esc)));
+        assert_eq!(interaction.modal_action, 0);
+        assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
         assert!(interaction.pending.is_none());
         assert!(!interaction.update(&mut model, press(KeyCode::Char('q'))));
         assert!(interaction.update(&mut model, press(KeyCode::Char('d'))));
