@@ -343,7 +343,10 @@ mod tests {
             }
             for (w, h) in [(120, 32), (70, 36), (60, 18)] {
                 let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-                terminal.draw(|frame| monitor.render(frame, frame.area())).unwrap();
+                terminal.draw(|frame| {
+                    let area = frame.area();
+                    monitor.render(frame, area);
+                }).unwrap();
                 let buffer = terminal.backend().buffer();
                 let screen = buffer.content.iter().map(|cell| cell.symbol()).collect::<String>();
                 assert!(screen.contains("H2"), "{w}x{h}");
