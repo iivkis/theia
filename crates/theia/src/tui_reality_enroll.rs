@@ -205,6 +205,14 @@ impl EnrollmentPanel {
         Ok(panel)
     }
 
+    pub(crate) fn first_from_source(path: PathBuf, source: Zeroizing<String>) -> Result<Self, &'static str> {
+        if source.len() > bootstrap::MAX_URI { return Err("Приглашение превышает лимит v1."); }
+        let mut panel = Self::first(path)?;
+        panel.fields[0] = source;
+        panel.focus = 1;
+        Ok(panel)
+    }
+
     fn managed_paths(&self) -> bool {
         self.config.is_some() || self.new_config.is_some()
     }

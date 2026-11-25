@@ -225,6 +225,61 @@ impl Editor {
     /// The source's bearer is never written to TOML; the file is protected by
     /// a fresh owner-only directory and private ACL/mode on both platforms.
     /// Caller must explicitly review ID/endpoint/SNI/transport and CA trust.
+    /// First Own-TLS import: create only a real, fully reviewed profile.
+    /// A conflicting destination is never replaced; credentials survive an
+    /// indeterminate publication but are removed after a pre-commit refusal.
+    pub(crate) fn create_first_invitation(
+        path: &Path,
+        invite: &Invitation,
+        ca_ref: &str,
+        public_ref: Option<&str>,
+    ) -> Result<Self, &'static str> {
+        let path = std::path::absolute(path).map_err(|_| "Недопустимый путь настроек.")?;
+        if !crate::bounded_input::explicit_file_path(&path)
+            || !matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            || !path.parent().is_some_and(Path::is_dir)
+        {
+            return Err("Выберите новый файл настроек в существующем каталоге.");
+        }
+        let ca = client_import::checked_ca_ref(Some(ca_ref))
+            .map_err(|_| "Не удалось проверить доверенный сертификат.")?;
+        let mut secret = if let Some(bytes) = invite.token_bytes() {
+            let token = Zeroizing::new(bytes);
+            Some(PrivateBearer::create(&path, &token).map_err(|_| "Не удалось сохранить личный ключ.")?)
+        } else { None };
+        let credential = match secret.as_ref() {
+            Some(saved) => saved.reference().map_err(|_| "Не удалось создать ссылку на личный ключ.")?,
+            None => public_ref.filter(|r| client_import::valid_explicit_reference(r))
+                .ok_or("Публичному приглашению нужен отдельный ключ (env:ИМЯ).")?.to_owned(),
+        };
+        let profile = invite.to_profile(&credential, ca)
+            .map_err(|_| "Приглашение содержит недопустимые параметры.")?;
+        let candidate = Config::Client(config::ClientDocument {
+            schema_version: 1,
+            management: config::Management { ipc: "auto".into(), log_level: "info".into() },
+            ui: config::Ui { language: "ru".into() },
+            client: config::ClientSettings {
+                active_profile: profile.id.clone(),
+                profiles: vec![profile],
+                proxy: config::LocalProxy {
+                    http_listen: "127.0.0.1:7890".into(),
+                    socks5_listen: "127.0.0.1:7891".into(),
+                    system_proxy: config::SystemProxy::Off,
+                },
+            },
+        });
+        candidate.validate().map_err(|_| "Профиль не прошёл проверку настроек.")?;
+        match config::guarded_create(&path, &candidate) {
+            Ok(()) => { if let Some(secret) = secret.as_mut() { secret.commit(); } }
+            Err(config::WriteFailure::BeforeReplace(_)) => return Err("Файл не создан. Проверьте путь, права и отсутствие существующего файла."),
+            Err(config::WriteFailure::AfterReplace(_)) => {
+                if let Some(secret) = secret.as_mut() { secret.commit(); }
+                return Err("Создание не подтверждено. Откройте файл заново; не повторяйте импорт вслепую.");
+            }
+        }
+        Self::load(Role::Client, &path).map_err(|_| "Файл записан, но открыть его не удалось. Откройте настройки заново.")
+    }
+
     pub fn import_invitation(
         &mut self,
         invite: &Invitation,

@@ -264,6 +264,8 @@ enum ImportFlow {
     RefreshDone,
     Saving,
     Done,
+    ActivateConfirm,
+    Activating,
     Failed,
 }
 
@@ -411,9 +413,9 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
         (_, 4) => &[('4',"Открыть монитор трафика")],
         (Role::Server, 5) => &[('S',"Сохранить файл"),('a',"Применить права доступа"),('v',"Состояние / другие изменения"),('Q',"Лимиты подключений"),('o',"Открыть файл"),('R',"Проверить перезапуск"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
         (Role::Server, 6) => &[('p',"Сетевая диагностика"),('V',"Состояние (только REALITY)")],
-        (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
+        (Role::Client, 0) => &[('i',"Импорт ключа Theia"),('V',"Подключить / отключить"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки"),('o',"Открыть файл настроек")],
         (Role::Client, 1) => &[('V',"Подключить / отключить"),('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт приглашения"),('E',"Сертификат Own-TLS"),('D',"Удалить профиль")],
-        (Role::Client, 2) => &[('i',"Импорт ссылки или QR"),('I',"Импорт REALITY")],
+        (Role::Client, 2) => &[('i',"Импорт ключа, файла или QR"),('I',"Расширенный импорт REALITY")],
         (Role::Client, 3) if cfg!(windows) => &[('p',"Управление системным прокси")],
         (Role::Client, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('V',"Состояние и применение"),('K',"Подтвердить доверие"),('M',"Регистрация материалов")],
         (Role::Client, 6) => &[('V',"Диагностика подключения")],
@@ -755,6 +757,15 @@ impl Interaction {
                         ImportFlow::Failed
                     });
                 }
+                if matches!(self.importing, Some(ImportFlow::Activating)) {
+                    if saved {
+                        self.importing = None;
+                        self.client_background = None;
+                        self.reality_status = self.editor.as_ref().map(StatusPanel::open);
+                    } else {
+                        self.importing = Some(ImportFlow::Failed);
+                    }
+                }
                 if saved {
                     if let Some(original) = self.pending.take() {
                         return Ok(model.update(original));
@@ -876,6 +887,9 @@ impl Interaction {
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
             if let Some(editor) = dialog.poll() {
+                if dialog.imported() {
+                    self.importing = Some(ImportFlow::Done);
+                }
                 self.editor = Some(editor);
                 self.config_dialog = None;
                 self.menu = None;
@@ -1723,7 +1737,7 @@ impl Interaction {
         let inactive_editor =
             base && Self::panel_role(model).is_some_and(|role| self.editor_for(role).is_none());
         if self.editor.is_none() || inactive_editor {
-            if model.screen == Screen::Client && key.code == KeyCode::Char('I') {
+            if model.screen == Screen::Client && matches!(key.code, KeyCode::Char('i' | 'I')) {
                 self.open_config(Role::Client);
                 if let Some(dialog) = self.config_dialog.as_mut() { dialog.prefer_reality(); }
                 return false;
@@ -2414,7 +2428,31 @@ impl Interaction {
                 },
                 ImportFlow::RefreshSaving => self.importing = Some(ImportFlow::RefreshSaving),
                 ImportFlow::Saving => self.importing = Some(ImportFlow::Saving),
-                state @ (ImportFlow::Done | ImportFlow::RefreshDone | ImportFlow::Failed) => {
+                ImportFlow::Done => match key.code {
+                    KeyCode::Enter if self.client_background.as_ref().is_some_and(StatusPanel::local_running) => {
+                        editor.error = Some("Сначала остановите текущее подключение. Esc — выйти, V — управление подключением.".into());
+                        self.importing = Some(ImportFlow::Done);
+                    }
+                    KeyCode::Enter if editor.selected_record_is_active() && !editor.dirty() && !editor.write_uncertain() => {
+                        self.client_background = None;
+                        self.reality_status = Some(StatusPanel::open(editor));
+                    }
+                    KeyCode::Enter => self.importing = Some(ImportFlow::ActivateConfirm),
+                    KeyCode::Esc => {}
+                    _ => self.importing = Some(ImportFlow::Done),
+                },
+                ImportFlow::ActivateConfirm => match key.code {
+                    KeyCode::Char('y') if key.modifiers.is_empty() => {
+                        match editor.review_record(RecordAction::ActivateProfile, &[]).and_then(|review| editor.stage_record(review)) {
+                            Ok(()) => { self.importing = Some(ImportFlow::Activating); self.start_save(); }
+                            Err(error) => { editor.error = Some(error.into()); self.importing = Some(ImportFlow::Done); }
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => self.importing = Some(ImportFlow::Done),
+                    _ => self.importing = Some(ImportFlow::ActivateConfirm),
+                },
+                ImportFlow::Activating => self.importing = Some(ImportFlow::Activating),
+                state @ (ImportFlow::RefreshDone | ImportFlow::Failed) => {
                     if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                         self.importing = Some(state);
                     }
@@ -3725,7 +3763,7 @@ fn draw_import(
             lead: "Получите личное приглашение у администратора. Вставьте ссылку или путь к присланному файлу. Подключение не запустится автоматически.".into(),
             error: editor.and_then(|e| e.error.clone()).unwrap_or_default(),
         };
-        draw_guided(frame, area, "Импорт подключения", "", (1, 2, "Источник приглашения", "Enter проверить · F6 выбрать файл · Ctrl+U очистить · Esc отменить"), viewport, (Some(form), None));
+        draw_guided(frame, area, "Импорт подключения", "", (1, 5, "Вставить ключ", "Enter проверить · F6 выбрать файл · Ctrl+U очистить · Esc отменить"), viewport, (Some(form), None));
         return;
     }
     if let ImportFlow::Trust{ca,..}=flow {
@@ -3748,9 +3786,9 @@ fn draw_import(
             ),
         ),
         ImportFlow::Preview { invitation, ca, public_ref } => (
-            "F-14: безопасный предпросмотр подключения",
+            "Проверка ключа · собственный TLS",
             format!(
-                "Профиль: {}\nEndpoint: {}\nTLS SNI: {}\nSecurity mode: {}\nTransport: {:?}\nXHTTP: {:?}\nBearer: {}\nCA trust: {}\nДоверенный CA проверяется отдельно от приглашения.\n\nЗапись добавит НОВЫЙ неактивный профиль. Не перезаписывает существующий ID.\n{}Никакого connect/Apply/Windows proxy.\n\nc: указать доверенный сертификат (выбор файла)\n{}y: явно подтвердить запись  n/Esc: отменить\n\n{}",
+                "Профиль: {}\nАдрес сервера: {}\nИмя сертификата: {}\nТип подключения: {}\nТранспорт: {:?}\nРежим: {:?}\nЛичный ключ: {}\nДоверенный сертификат: {}\nПолучите сертификат отдельно от приглашения.\n\nСохраняется новый профиль без подключения. Существующий профиль не заменяется.\n{}Системный прокси не изменяется.\n\nc: выбрать доверенный сертификат\n{}y: сохранить профиль  n/Esc: отменить\n\n{}",
                 invitation.id, invitation.endpoint, invitation.server_name,
                 invitation.security_mode().canonical_name(), invitation.transport, invitation.xhttp_mode(),
                 if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },
@@ -3789,8 +3827,13 @@ fn draw_import(
             "Credential сохранён",
             "Старый файл сохранён. Проверьте доступ отдельно; соединение и системный прокси не менялись. Enter/Esc: закрыть.".into(),
         ),
-        ImportFlow::Saving => ("F-14: безопасное сохранение", "Создание нового приватного bearer и guarded TOML commit. Секрет не отображается.\nНикакого подключения или системного прокси.".into()),
-        ImportFlow::Done => ("Приглашение импортировано", "Новый профиль сохранён. Ранее выбранный активный профиль не изменён.\nСетевые соединения не открывались; системный прокси не изменён.\n\nСледующий шаг: откройте «Профили», выберите новый профиль и сделайте его активным (A). Затем сохраните настройки и откройте «Подключить / отключить» (V). Доверие к сертификату нужно проверить независимо.\n\nEnter/Esc: закрыть".into()),
+        ImportFlow::Saving => ("Сохранение профиля", "Создание нового приватного bearer и guarded TOML commit. Секрет не отображается.\nНикакого подключения или системного прокси.".into()),
+        ImportFlow::Done => ("Профиль сохранён", format!("Профиль: {}\n{}\nСоединение не запущено, системный прокси не изменён.\n\nEnter: перейти к подключению\nEsc: закончить без запуска\n\n{}",
+            editor.map_or("Новый профиль", Editor::selected_record_id),
+            if editor.is_some_and(Editor::selected_record_is_active) { "Профиль активен в настройках." } else { "Активный профиль не изменён. Перед подключением подтвердите выбор нового профиля." },
+            editor.and_then(|e| e.error.as_deref()).unwrap_or(""))),
+        ImportFlow::ActivateConfirm => ("Выбрать импортированный профиль", format!("Сделать профиль {} активным?\nДругие профили остаются сохранёнными. Это не запускает соединение.\n\ny: подтвердить · n/Esc: назад", editor.map_or("", Editor::selected_record_id))),
+        ImportFlow::Activating => ("Сохранение выбора", "Сохраняется активный профиль. Соединение не запускается.".into()),
         ImportFlow::Failed => (
             "Импорт НЕ подтверждён",
             format!(
@@ -3799,7 +3842,12 @@ fn draw_import(
             ),
         ),
     };
-    panel_at(frame, area, title, &body, true, viewport);
+    match flow {
+        ImportFlow::Preview { .. } => draw_guided(frame, area, title, &body, (3, 5, "Параметры и доверие", "c сертификат · y сохранить · Esc отменить"), viewport, (None, None)),
+        ImportFlow::Done => draw_guided(frame, area, title, &body, (5, 5, "Подключение", "Enter перейти к подключению · Esc закончить"), viewport, (None, None)),
+        ImportFlow::ActivateConfirm => draw_guided(frame, area, title, &body, (5, 5, "Выбор профиля", "y подтвердить · n/Esc назад"), viewport, (None, None)),
+        _ => panel_at(frame, area, title, &body, true, viewport),
+    }
 }
 
 fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool) {
@@ -4040,12 +4088,12 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
 fn welcome_form(role: Role, selected: usize) -> Form {
     let (reality, description, lead) = match role {
         Role::Server => ("Настроить новый сервер (REALITY)", "Рекомендуется: не нужен собственный TLS-сертификат", "Настраиваете сервер впервые? Выберите создание REALITY. Если Theia уже настроена, откройте существующий файл."),
-        Role::Client => ("Подключиться по приглашению", "Для SmartTheia REALITY: ссылка и файл допуска", "Настраиваете клиент впервые? Получите приглашение у администратора. Если профили уже сохранены, откройте их файл."),
+        Role::Client => ("Импортировать ключ Theia", "Ссылка или файл · тип определяется автоматически", "Настраиваете клиент впервые? Получите приглашение у администратора. Если профили уже сохранены, откройте их файл."),
     };
     Form {
         fields: vec![
             Field { id: 0, label: "Открыть сохранённые настройки", value: "У меня уже есть файл настроек (.toml)".into(), hint: "Enter — выбрать путь. F3 — открыть файл." },
-            Field { id: 1, label: reality, value: description.into(), hint: "Enter — выбрать новый путь, затем открыть мастер." },
+            Field { id: 1, label: reality, value: description.into(), hint: "Enter — подтвердить предложенный файл настроек, затем открыть мастер." },
             Field { id: 2, label: "Настроить вручную (Own-TLS)", value: "Расширенная настройка с сертификатом".into(), hint: "Выбирайте только если администратор выдал необходимые TLS-данные." },
         ],
         selected,
@@ -4282,6 +4330,8 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
         if let Some(enrollment) = interaction.reality_enrollment.as_mut() {
             if let Some(editor) = enrollment.poll() {
                 interaction.editor = Some(editor);
+                interaction.reality_enrollment = None;
+                interaction.importing = Some(ImportFlow::Done);
             }
         }
         if let Some(status) = interaction.reality_status.as_mut() {
@@ -4806,12 +4856,11 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Enter));
         let dialog = ui.config_dialog.as_ref().unwrap();
         let _ = dialog;
-        ui.update(&mut model,press(KeyCode::F(8)));
         let form = ui.config_dialog.as_ref().unwrap().form().unwrap();
         let target = guided_form_area(body, form.fields.len());
-        let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y) == Some(4)).unwrap();
+        let y = (target.y..target.bottom()).find(|&y| form.hit(target, target.x + 2, y) == Some(0)).unwrap();
         ui.mouse(&mut model, click(target.x + 2, y), area);
-        assert_eq!(ui.config_dialog.as_ref().unwrap().form().unwrap().selected, 4);
+        assert_eq!(ui.config_dialog.as_ref().unwrap().form().unwrap().selected, 0);
         assert!(!path.exists());
         assert!(!ui.server_process.running());
 
@@ -4844,7 +4893,7 @@ mod tests {
             dialog.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
             dialog.paste(path.to_str().unwrap());
             let snapshot = rendered_interaction(120, 40, &model, &ui);
-            assert!(snapshot.contains("REALITY"));
+            assert!(snapshot.contains(if role == Role::Server { "REALITY" } else { "Импорт ключа Theia" }));
             assert!(snapshot.contains("Own-TLS"));
             ui.update(&mut model, press(KeyCode::Down));
             ui.update(&mut model, press(KeyCode::Enter));
@@ -4855,9 +4904,8 @@ mod tests {
                 assert!(snapshot.contains("443"));
                 assert!(snapshot.contains("ID первого пользователя"));
             } else {
-                assert!(snapshot.contains("Файл допуска"));
-                ui.update(&mut model,press(KeyCode::F(8)));
-                assert!(rendered_interaction(120,40,&model,&ui).contains("Fingerprint"));
+                assert!(snapshot.contains("Ключ Theia"));
+                assert!(snapshot.contains("тип подключения") || snapshot.contains("Тип подключения"));
             }
             ui.update(&mut model, press(KeyCode::Esc));
             assert!(!path.exists());
@@ -5871,7 +5919,7 @@ mod tests {
         model.update(press(KeyCode::Char('2')));
         ui.update(&mut model, press(KeyCode::Char('I')));
         assert!(ui.config_dialog.is_some());
-        assert!(rendered_interaction(120, 40, &model, &ui).contains("Импорт REALITY"));
+        assert!(rendered_interaction(120, 40, &model, &ui).contains("Импорт ключа Theia"));
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.config_dialog.is_none());
     }
@@ -6246,7 +6294,7 @@ mod tests {
                 "соединение и системный прокси не менялись",
             ),
             (ImportFlow::Saving, "Секрет не отображается"),
-            (ImportFlow::Done, "активный профиль не изменён"),
+            (ImportFlow::Done, "Профиль сохранён"),
             (ImportFlow::Failed, "Импорт НЕ подтверждён"),
         ] {
             let screen = render(|f, a| draw_import(f, a, &flow, None, None));

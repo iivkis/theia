@@ -126,8 +126,8 @@ const CLIENT: &[Group] = &[
     Group {
         title: "Профили и приглашения",
         entries: &[
-            entry("Импорт ссылки, URI-файла или изображения QR", key('i')),
-            always("Импорт первого REALITY-профиля", key('I')),
+            always("Импорт ключа, файла или изображения QR", key('i')),
+            always("Расширенный импорт REALITY", key('I')),
             entry("Создать профиль", key('N')),
             entry("Выбрать активный профиль", key('A')),
             entry(
@@ -535,6 +535,168 @@ impl FileBrowser {
     }
 }
 
+// First-run input is independent of the security mode and contains no
+// editable protocol parameters. Only the existing validated backends save.
+struct FirstInvite {
+    source: Zeroizing<String>,
+    own: Option<crate::invite::Invitation>,
+    ca: String,
+    reference: String,
+    focus: usize,
+    review: bool,
+    error: Option<&'static str>,
+    browser: Option<FileBrowser>,
+    reading: Option<std::sync::mpsc::Receiver<Result<(Zeroizing<String>, crate::client_import::ProductSource), &'static str>>>,
+}
+
+enum FirstInviteAction {
+    Stay,
+    Back,
+    Save(crate::invite::Invitation, String, Option<String>),
+}
+
+impl FirstInvite {
+    fn new() -> Self {
+        Self { source: Zeroizing::new(String::new()), own: None, ca: String::new(),
+            reference: String::new(), focus: 0, review: false, error: None, browser: None, reading: None }
+    }
+    fn paste(&mut self, value: &str) {
+        if self.browser.is_some() || self.review || self.reading.is_some() { return; }
+        let value = value.trim_end_matches(['\r', '\n']);
+        if value.chars().any(char::is_control) { return; }
+        if self.own.is_none() {
+            if self.source.len().saturating_add(value.len()) <= crate::invite::MAX_URI {
+                self.source.push_str(value);
+            }
+        } else {
+            let field = if self.focus == 0 { &mut self.ca } else { &mut self.reference };
+            if field.len().saturating_add(value.len()) <= 4096 { field.push_str(value); }
+        }
+    }
+    fn select_field(&mut self, id: usize) {
+        if let Some(browser) = self.browser.as_mut() { browser.select_field(id); }
+        else if !self.review && self.reading.is_none() {
+            self.focus = if self.own.as_ref().is_some_and(|i| !i.has_token()) { id.min(1) } else { 0 };
+        }
+    }
+    fn form(&self) -> Option<crate::tui_widgets::Form> {
+        use crate::tui_widgets::{Field, Form};
+        if let Some(browser) = &self.browser { return Some(browser.form()); }
+        if self.review || self.reading.is_some() { return None; }
+        let (fields, lead) = if let Some(invite) = &self.own {
+            let mut fields = vec![Field { id:0, label:"Доверенный сертификат (CA)",
+                value:if self.ca.is_empty() { String::new() } else { "Файл выбран".into() },
+                hint:"F6 — выбрать PEM-сертификат, полученный отдельно от администратора." }];
+            if !invite.has_token() {
+                fields.push(Field { id:1, label:"Ссылка на отдельный ключ", value:if self.reference.is_empty() { String::new() } else { "Ссылка указана".into() },
+                    hint:"Для публичного приглашения укажите env:ИМЯ. Сам секрет не вставляйте." });
+            }
+            (fields, format!("Тип определён: собственный TLS\nСервер: {} · {}\nПодтвердите доверие к серверу.", invite.endpoint, invite.server_name))
+        } else {
+            (vec![Field { id:0, label:"Ключ Theia", value:if self.source.is_empty() { String::new() } else { format!("Введено {} байт (скрыто)", self.source.len()) },
+                hint:"Вставьте theia:// или выберите файл приглашения / изображение QR через F6." }],
+                "Получите личный ключ у администратора. Тип подключения определится автоматически.".into())
+        };
+        Some(Form { fields, selected:self.focus, lead, error:self.error.unwrap_or_default().into() })
+    }
+    fn guide(&self) -> (usize, usize, &'static str, &'static str) {
+        if self.browser.is_some() { return (1, 5, "Выбор файла", "↑↓ выбрать · Enter принять · Esc назад"); }
+        if self.reading.is_some() { return (2, 5, "Определение типа", "Локальная проверка"); }
+        if self.review { return (4, 5, "Сохранение профиля", "y сохранить · n/Esc назад"); }
+        if self.own.is_some() { (3, 5, "Параметры и доверие", "↑↓ поле · F6 файл · Enter проверить · Esc назад") }
+        else { (1, 5, "Вставить ключ", "Enter проверить · F6 файл/QR · Ctrl+U очистить · Esc назад") }
+    }
+    fn body(&self, path: &str) -> String {
+        if self.reading.is_some() { return "Проверяем приглашение локально. Сеть не используется.".into(); }
+        if self.review {
+            if let Some(invite) = &self.own {
+                return format!("Тип: собственный TLS\nПрофиль: {}\nСервер: {}\nИмя TLS: {}\nДоверенный сертификат выбран и проверен локально.\nЛичный ключ будет сохранён защищённо; публичное приглашение использует указанную ссылку.\n\nФайл настроек: {path}\nСоздаётся первый активный профиль. Соединение и системный прокси не запускаются.", invite.id, invite.endpoint, invite.server_name);
+            }
+        }
+        String::new()
+    }
+    fn key(&mut self, key: KeyEvent) -> FirstInviteAction {
+        if self.reading.is_some() { return FirstInviteAction::Stay; }
+        if let Some(browser) = self.browser.as_mut() {
+            if key.code == KeyCode::Esc { self.browser = None; }
+            else if let Some(path) = browser.key(key.code, "") {
+                if let Some(path) = path.to_str().filter(|p| p.len() <= 4090 && !p.chars().any(char::is_control)) {
+                    if self.own.is_some() { self.ca = format!("file:{path}"); }
+                    else { self.source = Zeroizing::new(path.to_owned()); }
+                    self.error = None;
+                } else { self.error = Some("Недопустимый путь файла."); }
+                self.browser = None;
+            }
+            return FirstInviteAction::Stay;
+        }
+        if self.review {
+            match key.code {
+                KeyCode::Char('y') if key.modifiers.is_empty() => {
+                    if let Some(invite) = self.own.take() {
+                        return FirstInviteAction::Save(invite, std::mem::take(&mut self.ca),
+                            (!self.reference.is_empty()).then(|| std::mem::take(&mut self.reference)));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => self.review = false,
+                _ => {}
+            }
+            return FirstInviteAction::Stay;
+        }
+        self.error = None;
+        match key.code {
+            KeyCode::Esc => {
+                if self.own.take().is_some() { self.ca.clear(); self.reference.clear(); self.focus = 0; }
+                else { return FirstInviteAction::Back; }
+            }
+            KeyCode::F(6) if self.focus == 0 => {
+                self.browser = Some(FileBrowser::files(if self.own.is_some() { self.ca.strip_prefix("file:").unwrap_or(&self.ca) } else { self.source.as_str() }));
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab if self.own.as_ref().is_some_and(|i| !i.has_token()) => self.focus = 1 - self.focus,
+            KeyCode::Enter => {
+                if let Some(invite) = &self.own {
+                    if crate::client_import::checked_ca_ref(Some(&self.ca)).is_err() {
+                        self.error = Some("Выберите доверенный PEM-сертификат через F6.");
+                    } else if !invite.has_token() && !crate::client_import::valid_explicit_reference(&self.reference) {
+                        self.error = Some("Укажите отдельную ссылку env:ИМЯ.");
+                    } else { self.review = true; }
+                } else if !self.source.is_empty() {
+                    let source = self.source.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let worker = std::thread::Builder::new().name("theia-first-invite".into()).spawn(move || {
+                        let result = (|| {
+                            let source = if crate::qr_import::image_path(source.trim()) {
+                                crate::qr_import::scan_file(source.trim())?
+                            } else { source };
+                            let product = crate::client_import::read_product_source(source.trim())
+                                .map_err(|_| "Не удалось прочитать ключ. Проверьте ссылку целиком или выберите файл.")?;
+                            Ok((source, product))
+                        })();
+                        let _ = tx.send(result);
+                    });
+                    if worker.is_ok() { self.reading = Some(rx); }
+                    else { self.error = Some("Не удалось начать проверку ключа."); }
+                } else { self.error = Some("Вставьте ключ или выберите файл."); }
+            }
+            KeyCode::Backspace => {
+                if self.own.is_none() { self.source.pop(); }
+                else if self.focus == 0 { self.ca.pop(); }
+                else { self.reference.pop(); }
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                if self.own.is_none() { self.source.clear(); }
+                else if self.focus == 0 { self.ca.clear(); }
+                else { self.reference.clear(); }
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                let mut buf = [0; 4];
+                self.paste(ch.encode_utf8(&mut buf));
+            }
+            _ => {}
+        }
+        FirstInviteAction::Stay
+    }
+}
+
 pub(crate) struct ConfigDialog {
     pub(crate) role: Role,
     input: String,
@@ -544,6 +706,8 @@ pub(crate) struct ConfigDialog {
     setup: Option<FirstSetup>,
     reality: Option<crate::tui_reality_provision::ProvisionPanel>,
     enrollment: Option<crate::tui_reality_enroll::EnrollmentPanel>,
+    first_invite: Option<FirstInvite>,
+    imported: bool,
     creating: bool,
     browser: Option<FileBrowser>,
 }
@@ -570,10 +734,14 @@ impl ConfigDialog {
             setup: None,
             reality: None,
             enrollment: None,
+            first_invite: None,
+            imported: false,
             creating: false,
             browser: None,
         }
     }
+    pub(crate) fn imported(&self) -> bool { self.imported }
+
     pub(crate) fn suggested_mode(role: Role) -> usize {
         let filename=if role==Role::Server {"server.toml"} else {"client.toml"};
         if default_config(filename).is_file() {0} else {1}
@@ -586,6 +754,7 @@ impl ConfigDialog {
     }
     pub(crate) fn paste(&mut self, text: &str) {
         if self.browser.is_some() { return; }
+        if let Some(panel) = self.first_invite.as_mut() { panel.paste(text); return; }
         if let Some(panel) = self.enrollment.as_mut() {
             panel.paste(text);
             return;
@@ -607,6 +776,24 @@ impl ConfigDialog {
     }
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.loading.is_some() {
+            return false;
+        }
+        if let Some(panel) = self.first_invite.as_mut() {
+            match panel.key(key) {
+                FirstInviteAction::Stay => {}
+                FirstInviteAction::Back => { self.first_invite = None; }
+                FirstInviteAction::Save(invite, ca, reference) => {
+                    let path = std::path::PathBuf::from(&self.input);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    match std::thread::Builder::new().name("theia-first-own-tls".into()).spawn(move || {
+                        let result = crate::tui_editor::Editor::create_first_invitation(&path, &invite, &ca, reference.as_deref());
+                        let _ = tx.send(result);
+                    }) {
+                        Ok(_) => { self.loading = Some(rx); self.creating = true; self.imported = true; self.first_invite = None; }
+                        Err(_) => { self.first_invite = None; self.error = Some("Не удалось начать сохранение. Повторите импорт."); }
+                    }
+                }
+            }
             return false;
         }
         if let Some(panel) = self.enrollment.as_mut() {
@@ -695,10 +882,14 @@ impl ConfigDialog {
                 if self.input.is_empty() {
                     self.error = Some("Укажите путь нового TOML.");
                 } else if self.role == Role::Client {
-                    match crate::tui_reality_enroll::EnrollmentPanel::first(std::path::PathBuf::from(&self.input)) {
-                        Ok(panel) => { self.enrollment = Some(panel); self.error = None; }
-                        Err(error) => self.error = Some(error),
-                    }
+                    let path = std::path::absolute(&self.input);
+                    if path.as_ref().is_ok_and(|p| crate::bounded_input::explicit_file_path(p)
+                        && matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                        && p.parent().is_some_and(std::path::Path::is_dir)) {
+                        self.first_invite = Some(FirstInvite::new());
+                        self.error = None;
+                        self.imported = false;
+                    } else { self.error = Some("Выберите новый файл настроек в существующем каталоге."); }
                 } else {
                     match crate::tui_reality_provision::ProvisionPanel::first(
                         std::path::PathBuf::from(&self.input),
@@ -750,8 +941,34 @@ impl ConfigDialog {
         false
     }
     pub(crate) fn poll(&mut self) -> Option<crate::tui_editor::Editor> {
+        if let Some(panel) = self.first_invite.as_mut() {
+            use std::sync::mpsc::TryRecvError;
+            let result = match panel.reading.as_ref()?.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => Err("Проверка ключа прервана."),
+            };
+            panel.reading = None;
+            match result {
+                Ok((_, crate::client_import::ProductSource::OwnTls(invite))) => {
+                    panel.source.clear();
+                    panel.own = Some(invite);
+                    panel.focus = 0;
+                }
+                Ok((source, crate::client_import::ProductSource::Reality)) => {
+                    match crate::tui_reality_enroll::EnrollmentPanel::first_from_source(std::path::PathBuf::from(&self.input), source) {
+                        Ok(enrollment) => { self.enrollment = Some(enrollment); self.first_invite = None; }
+                        Err(error) => panel.error = Some(error),
+                    }
+                }
+                Err(error) => panel.error = Some(error),
+            }
+            return None;
+        }
         if let Some(panel) = self.enrollment.as_mut() {
-            return panel.poll();
+            let result = panel.poll();
+            if result.is_some() { self.imported = true; }
+            return result;
         }
         if let Some(panel) = self.reality.as_mut() {
             return panel.poll();
@@ -769,6 +986,7 @@ impl ConfigDialog {
         match result {
             Ok(editor) => Some(editor),
             Err(reason) => {
+                self.imported = false;
                 self.error = Some(reason);
                 None
             }
@@ -777,6 +995,7 @@ impl ConfigDialog {
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
         if self.loading.is_some() { return None; }
+        if let Some(panel) = &self.first_invite { return panel.form(); }
         if let Some(browser) = &self.browser { return Some(browser.form()); }
         if let Some(panel) = &self.reality { return panel.form(); }
         if let Some(panel) = &self.enrollment { return panel.form(); }
@@ -798,7 +1017,7 @@ impl ConfigDialog {
                 error: setup.error.unwrap_or_default().to_owned(),
             });
         }
-        let reality = if self.role == Role::Server { "SmartTheia REALITY" } else { "Импорт REALITY" };
+        let reality = if self.role == Role::Server { "SmartTheia REALITY" } else { "Импорт ключа Theia" };
         let fields = vec![
             Field { id: 0, label: "Открыть сохранённые настройки", value: "Для уже настроенной Theia".into(), hint: "Выберите существующий файл .toml через F6 или введите его путь." },
             Field { id: 1, label: reality, value: "Рекомендуемый мастер для новой настройки".into(), hint: "Оставьте предложенный путь, если файл ещё не существует. Существующий файл не заменяется." },
@@ -815,6 +1034,7 @@ impl ConfigDialog {
 
     pub(crate) fn select_field(&mut self, id: usize) {
         if self.loading.is_some() { return; }
+        if let Some(panel) = self.first_invite.as_mut() { panel.select_field(id); return; }
         if let Some(browser) = self.browser.as_mut() {
             browser.select_field(id);
             return;
@@ -833,6 +1053,7 @@ impl ConfigDialog {
     }
 
     pub(crate) fn guide(&self) -> Option<(usize, usize, &'static str, &'static str)> {
+        if let Some(panel) = &self.first_invite { return Some(panel.guide()); }
         if let Some(panel) = &self.reality {
             return panel.guide();
         }
@@ -849,7 +1070,9 @@ impl ConfigDialog {
     }
     pub(crate) fn title(&self) -> &'static str {
         if self.browser.is_some() { return "Выбор файла · ↑↓ Enter Esc"; }
-        if self.enrollment.is_some() {
+        if self.first_invite.is_some() {
+            "Импорт ключа Theia"
+        } else if self.enrollment.is_some() {
             "Импорт REALITY"
         } else if self.reality.is_some() {
             "Мастер REALITY"
@@ -868,6 +1091,7 @@ impl ConfigDialog {
                 "Проверяется существующий TOML; ничего не записывается.".into()
             };
         }
+        if let Some(panel) = &self.first_invite { return panel.body(&self.input); }
         if let Some(panel) = &self.enrollment {
             return panel.body();
         }
@@ -885,7 +1109,7 @@ impl ConfigDialog {
         let reality = if self.role == Role::Server {
             "SmartTheia REALITY  ·  мастер подбора, без своего сертификата"
         } else {
-            "Импорт REALITY  ·  создать TOML из приглашения"
+            "Импорт ключа Theia · Own-TLS или REALITY"
         };
         let choices = [
             ("Enter", "Открыть существующий TOML"),
