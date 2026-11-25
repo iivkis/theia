@@ -450,7 +450,8 @@ impl rustls::server::ResolvesServerCert for RenewingLeaf {
 /// Independent trust, reconstructed only from the enrolled key and scope.
 /// Do not append public/system roots or accept a root from the peer.
 pub fn client_tls(scope: &Scope, public: [u8; 32], branch: Branch) -> Result<ClientConfig, Error> {
-    let mut config = branch.carrier()
+    let mut config = branch
+        .carrier()
         .client_tls(pinned_roots(scope, public, branch)?)
         .map_err(|_| Error::Tls)?;
     config.resumption = rustls::client::Resumption::disabled();

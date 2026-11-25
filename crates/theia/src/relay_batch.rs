@@ -134,17 +134,27 @@ mod tests {
         let mut bytes = [0; MAX_BATCH];
         let mut source = Source {
             items: VecDeque::from([
-                Ok(vec![7; MAX_BATCH]), Ok(vec![8]),
+                Ok(vec![7; MAX_BATCH]),
+                Ok(vec![8]),
                 Err(io::Error::from(io::ErrorKind::BrokenPipe)),
             ]),
             polls: 0,
         };
-        assert_eq!(batch.read(&mut source, &mut bytes).await.unwrap(), MAX_BATCH);
+        assert_eq!(
+            batch.read(&mut source, &mut bytes).await.unwrap(),
+            MAX_BATCH
+        );
         assert_eq!(source.polls, 1);
         assert_eq!(batch.read(&mut source, &mut bytes).await.unwrap(), 1);
         assert_eq!(bytes[0], 8);
-        assert_eq!(batch.read(&mut source, &mut bytes).await.unwrap_err().kind(),
-                   io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            batch
+                .read(&mut source, &mut bytes)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
         assert_eq!(source.polls, 3);
     }
 }

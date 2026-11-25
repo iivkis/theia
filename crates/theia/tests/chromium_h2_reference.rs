@@ -30,9 +30,9 @@ fn emit_tls(name: &str, capture: &Arc<Mutex<Capture>>) {
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use h2_wire::{inspect, Observation, MAX_CAPTURE_BYTES};
 use rustls::pki_types::PrivatePkcs8KeyDer;
+use sha2::{Digest, Sha256};
 use std::{
     io,
     pin::Pin,

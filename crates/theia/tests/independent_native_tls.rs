@@ -36,10 +36,9 @@ impl Drop for Fixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "native browser CI supplies pinned independent hyper-h2 and aioquic"]
 async fn native_clients_require_pki_and_exact_alpn() {
-    let scratch = Scratch(std::env::temp_dir().join(format!(
-        "theia-native-independent-{}",
-        std::process::id()
-    )));
+    let scratch = Scratch(
+        std::env::temp_dir().join(format!("theia-native-independent-{}", std::process::id())),
+    );
     fs::create_dir(&scratch.0).unwrap();
     tokio::time::timeout(Duration::from_secs(55), async {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -53,13 +52,23 @@ async fn native_clients_require_pki_and_exact_alpn() {
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/e2e/independent_native_tls.py");
         let mut fixture = Fixture(
-            Command::new("python").arg(script).arg(&scratch.0).spawn().unwrap()
+            Command::new("python")
+                .arg(script)
+                .arg(&scratch.0)
+                .spawn()
+                .unwrap(),
         );
         let ports = loop {
             if let Ok(raw) = fs::read_to_string(scratch.0.join("ready")) {
-                break raw.lines().map(|line| line.parse::<u16>().unwrap()).collect::<Vec<_>>();
+                break raw
+                    .lines()
+                    .map(|line| line.parse::<u16>().unwrap())
+                    .collect::<Vec<_>>();
             }
-            assert!(fixture.0.try_wait().unwrap().is_none(), "fixture exited before readiness");
+            assert!(
+                fixture.0.try_wait().unwrap().is_none(),
+                "fixture exited before readiness"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(ports.len(), 4);
@@ -76,7 +85,10 @@ async fn native_clients_require_pki_and_exact_alpn() {
             (1, "localhost", trusted.clone()),
         ] {
             let client = H2Client::new(&endpoint(index).to_string(), name, &token, roots).unwrap();
-            assert!(matches!(client.open(target.clone(), 443).await, Err(ClientError::Tls)));
+            assert!(matches!(
+                client.open(target.clone(), 443).await,
+                Err(ClientError::Tls)
+            ));
         }
         for (index, name, roots) in [
             (2, "localhost", wrong),
@@ -84,14 +96,29 @@ async fn native_clients_require_pki_and_exact_alpn() {
             (3, "localhost", trusted.clone()),
         ] {
             let client = H3Client::new(endpoint(index), name, &token, roots).unwrap();
-            assert!(matches!(client.open(target.clone(), 443).await, Err(ClientError::Tls)));
+            assert!(matches!(
+                client.open(target.clone(), 443).await,
+                Err(ClientError::Tls)
+            ));
         }
         // Only correct trust and ALPN reach independent HTTP admission. The
         // peer denies the request and the client must not initiate HELLO/OPEN.
-        let h2 = H2Client::new(&endpoint(0).to_string(), "localhost", &token, trusted.clone()).unwrap();
-        assert!(matches!(h2.open(target.clone(), 443).await, Err(ClientError::Unauthorized)));
+        let h2 = H2Client::new(
+            &endpoint(0).to_string(),
+            "localhost",
+            &token,
+            trusted.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            h2.open(target.clone(), 443).await,
+            Err(ClientError::Unauthorized)
+        ));
         let h3 = H3Client::new(endpoint(2), "localhost", &token, trusted).unwrap();
-        assert!(matches!(h3.open(target, 443).await, Err(ClientError::Unauthorized)));
+        assert!(matches!(
+            h3.open(target, 443).await,
+            Err(ClientError::Unauthorized)
+        ));
         fs::write(scratch.0.join("done"), b"done").unwrap();
         loop {
             if let Some(status) = fixture.0.try_wait().unwrap() {
@@ -100,5 +127,7 @@ async fn native_clients_require_pki_and_exact_alpn() {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }).await.expect("bounded independent native TLS matrix");
+    })
+    .await
+    .expect("bounded independent native TLS matrix");
 }

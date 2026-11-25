@@ -813,7 +813,10 @@ impl H3Tunnel {
             let mut buffer = [0; crate::relay_batch::MAX_BATCH];
             let mut batch = crate::relay_batch::ReadyBatch::default();
             loop {
-                let n = batch.read(&mut read, &mut buffer).await.map_err(|_| ClientError::Io)?;
+                let n = batch
+                    .read(&mut read, &mut buffer)
+                    .await
+                    .map_err(|_| ClientError::Io)?;
                 let frame = if n == 0 {
                     Frame::Fin
                 } else {

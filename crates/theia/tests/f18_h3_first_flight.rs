@@ -404,12 +404,16 @@ fn emit_initial(name: &str, initial: InitialShape) {
 // Server-side negotiated facts, not an estimate of encrypted packet contents.
 // No SNI text, header names/values, key material, or raw frames are retained.
 fn emit_h3_session(name: &str, connection: &quinn::Connection, request: &http::Request<()>) {
-    let handshake = connection.handshake_data().unwrap()
-        .downcast::<quinn::crypto::rustls::HandshakeData>().unwrap();
+    let handshake = connection
+        .handshake_data()
+        .unwrap()
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .unwrap();
     assert_eq!(handshake.protocol.as_deref(), Some(b"h3".as_slice()));
     let json = format!(
         "{{\"alpn_h3\":true,\"sni_present\":{},\"ordinary_fields\":{}}}",
-        handshake.server_name.is_some(), request.headers().len()
+        handshake.server_name.is_some(),
+        request.headers().len()
     );
     f13_evidence::emit(name, &json);
 }

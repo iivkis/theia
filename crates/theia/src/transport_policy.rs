@@ -56,12 +56,11 @@ impl Carrier {
         if roots.is_empty() {
             return Err(rustls::Error::General("empty explicit trust store".into()));
         }
-        let mut config = ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let mut config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         self.configure_client(&mut config);
         Ok(config)
     }
@@ -71,12 +70,11 @@ impl Carrier {
         certificates: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<ServerConfig, rustls::Error> {
-        let mut config = ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
-        .with_single_cert(certificates, key)?;
+        let mut config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_no_client_auth()
+                .with_single_cert(certificates, key)?;
         self.configure_server(&mut config);
         Ok(config)
     }
@@ -118,10 +116,15 @@ mod tests {
             let client = carrier.client_tls(roots.clone()).unwrap();
             assert_eq!(client.alpn_protocols, vec![carrier.alpn().to_vec()]);
             assert!(!client.enable_early_data);
-            let server = carrier.server_tls(
-                vec![certificate.cert.der().clone()],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der()).into(),
-            ).unwrap();
+            let server = carrier
+                .server_tls(
+                    vec![certificate.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(
+                        certificate.key_pair.serialize_der(),
+                    )
+                    .into(),
+                )
+                .unwrap();
             assert_eq!(server.alpn_protocols, vec![carrier.alpn().to_vec()]);
             assert_eq!(server.max_early_data_size, 0);
             assert!(carrier.client_tls(RootCertStore::empty()).is_err());
@@ -129,7 +132,9 @@ mod tests {
             assert!(carrier.accepts_tls(version, Some(carrier.alpn())));
             assert!(!carrier.accepts_tls(version, Some(wrong.alpn())));
             assert!(!carrier.accepts_tls(version, None));
-            assert!(!carrier.accepts_tls(Some(rustls::ProtocolVersion::TLSv1_2), Some(carrier.alpn())));
+            assert!(
+                !carrier.accepts_tls(Some(rustls::ProtocolVersion::TLSv1_2), Some(carrier.alpn()))
+            );
             assert!(!carrier.accepts_tls(None, Some(carrier.alpn())));
         }
     }
