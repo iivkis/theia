@@ -362,4 +362,9 @@ require("native_binary_performance_comparison" in browser
         and "--require-comparison --policy tests/benchmark/native-diagnostic-policy.json" in browser
         and "Build exact native baseline before candidate" in browser,
         "native baseline and candidate comparison remains mandatory")
+require("actual_native_h3_client_initial_reference" in browser
+        and "real_default_h2_settings_and_pseudo_headers_are_measured" in browser
+        and "check_f13_observations.py f13-observations" in browser
+        and "test_f13_observations.py" in spec,
+        "real native and browser first-flight observation matrix must remain mandatory")
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")

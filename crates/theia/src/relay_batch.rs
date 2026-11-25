@@ -104,7 +104,10 @@ mod tests {
         let mut reader = BatchReader::new();
         let mut data = [0; MAX_BATCH];
         assert_eq!(reader.read(&mut source, &mut data).await.unwrap(), 1);
-        assert_eq!(Instant::now() - start, MAX_WAIT);
+        let elapsed = Instant::now() - start;
+        assert!(elapsed >= MAX_WAIT);
+        // Tokio timers have millisecond granularity and may round the deadline.
+        assert!(elapsed <= MAX_WAIT + Duration::from_millis(1));
         writer.write_all(b"b").await.unwrap();
         writer.shutdown().await.unwrap();
         assert_eq!(reader.read(&mut source, &mut data).await.unwrap(), 1);

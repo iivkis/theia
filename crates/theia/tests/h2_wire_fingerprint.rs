@@ -23,7 +23,7 @@ fn emit_tls(name: &str, capture: &Arc<Mutex<Capture>>) {
         summary.legacy_version, summary.cipher_suites.len(), summary.extensions_in_wire_order.len(),
         summary.supported_groups.len(), summary.has_grease_extension(), summary.has_alps(),
         summary.sni_present, summary.supported_versions.contains(&0x0304),
-        summary.alpn.iter().any(|alpn| alpn == b"h2")
+        summary.alpn.iter().any(|alpn| alpn.as_slice() == b"h2")
     );
     f13_evidence::emit(name, &json);
 }

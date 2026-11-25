@@ -17,6 +17,8 @@ def example():
         rows.append(dict(platform="linux", transport="h2", group=f"{600:064x}",
                          **{"class": "tunnel"}, variant=variant, score=score))
     return dict(schema=1, model_sha256="a"*64, calibration_sha256="b"*64,
+                baseline_revision="1"*40, candidate_revision="2"*40,
+                corpus_sha256="d"*64, review_report_sha256="e"*64,
                 threshold=.5, excluded_groups=["c"*64], required_strata=[["linux","h2"]], rows=rows)
 
 
@@ -27,7 +29,20 @@ class ClassifierEvidenceTests(unittest.TestCase):
         row = result["strata"][0]
         self.assertTrue(row["fpr_upper_within_one_percent"])
         self.assertEqual(row["delta_tpr"], -1)
+        self.assertEqual(row["paired_outcomes"], dict(off_only=1,on_only=0,both=0,neither=0))
         self.assertGreater(row["true_positive_on"]["upper95"], 0)
+
+    def test_provenance_and_full_matrix_are_required_when_requested(self):
+        doc = example()
+        with self.assertRaises(ValueError):
+            checker.report(doc, expected_candidate="3"*40)
+        with self.assertRaises(ValueError):
+            checker.report(doc, expected_baseline="3"*40)
+        with self.assertRaises(ValueError):
+            checker.report(doc, full_matrix=True)
+        doc["candidate_revision"] = doc["baseline_revision"]
+        with self.assertRaises(ValueError):
+            checker.report(doc)
 
     def test_small_sample_does_not_prove_low_false_positive_rate(self):
         d = example()
