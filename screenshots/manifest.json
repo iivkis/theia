@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "35f09e0279c0d16f571e7acc50a3ec3cd6383ea1",
+  "source_sha": "1e9433c2d80bee719077e9af5d2fda19724767ee",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -42,7 +42,7 @@
     {
       "scenario": "client-action-reality-import",
       "file": "client-action-reality-import.png",
-      "sha256": "b93d4fa1d3efeb467b15f4c1340ac4e6c6b9d1177db57f3b7cc7310a609e6bd7",
+      "sha256": "c2771627f3d4721029e7cc13833fe3791ada1ec209faa1d1a4eb258547d54818",
       "state_fixture": false
     },
     {
@@ -60,7 +60,7 @@
     {
       "scenario": "client-connection-modes",
       "file": "client-connection-modes.png",
-      "sha256": "7da6073e88b5ac0eff20516c42645ebccf97d23ff578b8dd2503dceb0a4815e3",
+      "sha256": "79c80eed692d9d4406ff034a27f0215a0cd34a0b75f908651de5cfe473b3b227",
       "state_fixture": false
     },
     {
@@ -72,7 +72,7 @@
     {
       "scenario": "client-first-key-connect",
       "file": "client-first-key-connect.png",
-      "sha256": "221ef7f530bcf025cdd0316845abc66076f4d6908eff0b7bda7ce30153749b9d",
+      "sha256": "1dbc9f2ccc8d9596dbb131abe71c6284fb37608dd6347238a1ac42a030590ee3",
       "state_fixture": false
     },
     {
@@ -150,7 +150,7 @@
     {
       "scenario": "client-page-proxy",
       "file": "client-page-proxy.png",
-      "sha256": "7da6073e88b5ac0eff20516c42645ebccf97d23ff578b8dd2503dceb0a4815e3",
+      "sha256": "79c80eed692d9d4406ff034a27f0215a0cd34a0b75f908651de5cfe473b3b227",
       "state_fixture": false
     },
     {
@@ -163,6 +163,30 @@
       "scenario": "client-page-traffic",
       "file": "client-page-traffic.png",
       "sha256": "321cef21748a4ba68cf9e09092b0c382201a21b10377ef13ca7096c119cf97c3",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-reality-key-connect",
+      "file": "client-reality-key-connect.png",
+      "sha256": "209700df1039b50924e263f93f439715dc4bf637dd0af11c65fce4f712dbfa80",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-reality-key-masked",
+      "file": "client-reality-key-masked.png",
+      "sha256": "b15aa2a360c55847fc971a158b34c120e1ae47a8169ad7509a59225430c749b0",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-reality-key-saved",
+      "file": "client-reality-key-saved.png",
+      "sha256": "862033aedd7ad0902d9a0162fc15a5704b9300a65137f750775ec5e558a5cf2e",
+      "state_fixture": false
+    },
+    {
+      "scenario": "client-reality-key-trust-review",
+      "file": "client-reality-key-trust-review.png",
+      "sha256": "9bad0e56e20ba6bf3dab78e3001b42b1e5533907b65faee79784db0bd9138ff2",
       "state_fixture": false
     },
     {

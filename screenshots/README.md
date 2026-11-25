@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 35f09e0279c0d16f571e7acc50a3ec3cd6383ea1
+Source: 1e9433c2d80bee719077e9af5d2fda19724767ee
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -109,6 +109,22 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## client-page-traffic
 
 ![client-page-traffic](client-page-traffic.png)
+
+## client-reality-key-connect
+
+![client-reality-key-connect](client-reality-key-connect.png)
+
+## client-reality-key-masked
+
+![client-reality-key-masked](client-reality-key-masked.png)
+
+## client-reality-key-saved
+
+![client-reality-key-saved](client-reality-key-saved.png)
+
+## client-reality-key-trust-review
+
+![client-reality-key-trust-review](client-reality-key-trust-review.png)
 
 ## client-traffic-monitor-idle
 
