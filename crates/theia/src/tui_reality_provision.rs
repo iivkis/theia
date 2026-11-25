@@ -256,7 +256,10 @@ impl WizardInput {
     }
     fn parse(config: PathBuf, source: [u8; 32], fields: &[String; 7]) -> Result<Self, Error> {
         if !config::valid_id(&fields[0]) { return Err(Error::Scope); }
-        let listen: SocketAddr = fields[1].parse().map_err(|_| Error::Scope)?;
+        let listen: SocketAddr = match fields[1].parse::<u16>() {
+            Ok(port) => SocketAddr::from(([0, 0, 0, 0], port)),
+            Err(_) => fields[1].parse().map_err(|_| Error::Scope)?,
+        };
         if listen.port() == 0 { return Err(Error::Scope); }
         let endpoint = format!("{}:{}", fields[2], listen.port());
         if !config::valid_remote(&endpoint) { return Err(Error::Scope); }
@@ -291,15 +294,27 @@ impl WizardInput {
     async fn resolve(&self) -> Result<reference_health::Plan, Error> {
         let mut references = Vec::new();
         for (name, pinned) in &self.candidates {
-            let ip = match pinned {
-                Some(ip) => *ip,
-                None => {
-                    let mut addresses = crate::camouflage_domain_dns::resolve_manual_domain(name, crate::camouflage_domain_dns::DnsConsent::Approved).await.map_err(|_| Error::Health)?;
-                    addresses.sort();
-                    addresses.into_iter().find(|ip| !self.own_ips.contains(ip)).ok_or(Error::Health)?
-                }
+            let mut addresses = match pinned {
+                Some(ip) => vec![*ip],
+                None => match crate::camouflage_domain_dns::resolve_manual_domain(name, crate::camouflage_domain_dns::DnsConsent::Approved).await {
+                    Ok(ips) => ips,
+                    Err(_) if self.automatic => continue,
+                    Err(_) => return Err(Error::Health),
+                },
             };
-            references.push(reference_health::Target { server_name: name.clone(), address: SocketAddr::new(ip, 443) });
+            addresses.sort();
+            let target = addresses.into_iter().map(|ip| reference_health::Target {
+                server_name: name.clone(), address: SocketAddr::new(ip, 443),
+            }).find(|target| {
+                let mut candidate = references.clone();
+                candidate.push(target.clone());
+                self.plan(candidate).is_ok()
+            });
+            match target {
+                Some(target) => references.push(target),
+                None if self.automatic => {},
+                None => return Err(Error::Health),
+            }
         }
         self.plan(references)
     }
@@ -326,7 +341,7 @@ fn rank_checked(input: &WizardInput, plan: reference_health::Plan, evidence: Vec
 enum WizardStage {
     Input,
     DnsConfirm(Box<WizardInput>),
-    Resolving(Receiver<Result<(WizardInput, reference_health::Plan), Error>>),
+    Resolving(Receiver<Result<(WizardInput, reference_health::Plan), Error>>, tokio::sync::oneshot::Sender<()>),
     ProbeConfirm(Box<(WizardInput, reference_health::Plan)>),
     Checking(Receiver<Result<(WizardInput, reference_health::State, String), Error>>, tokio::sync::oneshot::Sender<()>),
     CreateConfirm(Box<(WizardInput, reference_health::State, String)>),
@@ -338,6 +353,7 @@ struct Wizard {
     source: [u8; 32],
     fields: [String; 7],
     focus: usize,
+    advanced: bool,
     stage: WizardStage,
     error: String,
     registration: Option<RegistrationPanel>,
@@ -349,10 +365,18 @@ impl Wizard {
         let config = std::path::absolute(editor.saved_path()).map_err(|_| "Недопустимый путь TOML.")?;
         let id = crate::tui_editor::generated_id("inbound")?;
         Ok(Self { config, source: editor.saved_sha256(), fields: [
-            id, "0.0.0.0:443".into(), String::new(), String::new(),
+            id, "443".into(), String::new(), String::new(),
             crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[..3].join(","),
             String::new(), "auto".into(),
-        ], focus: 1, stage: WizardStage::Input, error: String::new(), registration: None })
+        ], focus: 1, advanced: false, stage: WizardStage::Input, error: String::new(), registration: None })
+    }
+    fn visible_fields(&self) -> &[usize] {
+        if self.advanced { &[0, 1, 2, 3, 4, 5, 6] } else { &[1, 2, 3, 5] }
+    }
+    fn move_focus(&mut self, forward: bool) {
+        let fields = self.visible_fields();
+        let index = fields.iter().position(|field| *field == self.focus).unwrap_or(0);
+        self.focus = fields[(index + if forward {1} else {fields.len() - 1}) % fields.len()];
     }
     fn paste(&mut self, text: &str) {
         if let Some(panel) = self.registration.as_mut() { panel.paste(text); return; }
@@ -369,8 +393,12 @@ impl Wizard {
             WizardStage::Input => {
                 match key.code {
                     KeyCode::Esc => return true,
-                    KeyCode::Tab => self.focus = (self.focus + 1) % self.fields.len(),
-                    KeyCode::BackTab => self.focus = (self.focus + self.fields.len() - 1) % self.fields.len(),
+                    KeyCode::F(2) => {
+                        self.advanced = !self.advanced;
+                        if !self.visible_fields().contains(&self.focus) { self.focus = 1; }
+                    }
+                    KeyCode::Tab => self.move_focus(true),
+                    KeyCode::BackTab => self.move_focus(false),
                     KeyCode::Backspace => { self.fields[self.focus].pop(); }
                     KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => self.fields[self.focus].clear(),
                     KeyCode::Enter => {
@@ -387,15 +415,20 @@ impl Wizard {
             WizardStage::DnsConfirm(input) if key.code == KeyCode::Char('y') && key.modifiers.is_empty() => {
                 let input = *input;
                 let (tx, rx) = mpsc::channel();
+                let (cancel, cancelled) = tokio::sync::oneshot::channel();
                 let _worker = std::thread::spawn(move || {
                     let result = input.check_source().and_then(|()| {
                         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| Error::Storage)?;
-                        let plan = rt.block_on(input.resolve())?;
+                        let plan = rt.block_on(async { tokio::select! {
+                            biased;
+                            _ = cancelled => Err(Error::Health),
+                            result = input.resolve() => result,
+                        } })?;
                         Ok((input, plan))
                     });
                     let _ = tx.send(result);
                 });
-                WizardStage::Resolving(rx)
+                WizardStage::Resolving(rx, cancel)
             }
             WizardStage::ProbeConfirm(value) if key.code == KeyCode::Char('y') && key.modifiers.is_empty() => {
                 let (input, plan) = *value;
@@ -456,7 +489,7 @@ impl Wizard {
             }
             WizardStage::DnsConfirm(_) | WizardStage::ProbeConfirm(_) | WizardStage::CreateConfirm(_) if matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) => WizardStage::Input,
             WizardStage::Checking(_, cancel) if key.code == KeyCode::Esc => { let _ = cancel.send(()); WizardStage::Input }
-            WizardStage::Resolving(_) if key.code == KeyCode::Esc => WizardStage::Input,
+            WizardStage::Resolving(_, cancel) if key.code == KeyCode::Esc => { let _ = cancel.send(()); WizardStage::Input },
             WizardStage::Done(_) if key.code == KeyCode::Esc => return true,
             other => other,
         };
@@ -465,7 +498,7 @@ impl Wizard {
     fn poll(&mut self) -> Option<Editor> {
         if let Some(panel) = self.registration.as_mut() { return panel.poll(); }
         let result = match &self.stage {
-            WizardStage::Resolving(rx) => match rx.try_recv() {
+            WizardStage::Resolving(rx, _) => match rx.try_recv() {
                 Ok(value) => value.map(|v| WizardStage::ProbeConfirm(Box::new(v))),
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
             },
@@ -489,13 +522,20 @@ impl Wizard {
         match &self.stage {
             WizardStage::Input => {
                 let mut out = String::from("Новый REALITY inbound. Без TLS cert/key.\n");
-                for (i, (label, value)) in WIZARD_LABELS.iter().zip(&self.fields).enumerate() { out.push_str(&format!("{} {label}: {value}\n", if i == self.focus { ">" } else { " " })); }
-                out.push_str("auto: подобрать по оценкам; manual: сохранить порядок.\nEnter: проверить поля; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
+                for &i in self.visible_fields() {
+                    let label = if i == 1 && !self.advanced { "Порт (или bind)" } else { WIZARD_LABELS[i] };
+                    out.push_str(&format!("{} {label}: {}\n", if i == self.focus { ">" } else { " " }, self.fields[i]));
+                }
+                out.push_str(if self.advanced { "auto: подобрать по оценкам; manual: сохранить порядок.\nF2: скрыть расширенные.\n" } else { "ID создаётся автоматически; референсы подбираются из каталога.\nУкажите все собственные IP, включая публичный/NAT: это обязательная защита от self-reference.\nF2: расширенные (ID, домены/IP, manual).\n" });
+                out.push_str("Enter: проверить и подобрать; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
                 out.push_str(&self.error); out
             }
             WizardStage::DnsConfirm(input) => format!("DNS: только перечисленные домены без заданного IP.\n{}\nНет TLS/QUIC соединений. y: DNS; n/Esc: отменить.", input.candidates.iter().map(|(name, ip)| format!("{name}: {}", ip.map_or("DNS".into(), |ip| ip.to_string()))).collect::<Vec<_>>().join("\n")),
-            WizardStage::Resolving(_) => "Ограниченный DNS. Esc: отменить ожидание, без TLS/записи.".into(),
-            WizardStage::ProbeConfirm(value) => format!("Проверить только эти IP:443 и SNI (public PKI, H2/H3 HEAD):\n{}\ny: проверить; n/Esc: отменить.", value.1.preview().unwrap_or_else(|_| "Неверный план".into())),
+            WizardStage::Resolving(_, _) => "Ограниченный DNS. Esc: отменить ожидание, без TLS/записи.".into(),
+            WizardStage::ProbeConfirm(value) => {
+                let skipped = value.0.candidates.iter().filter(|(name, _)| !value.1.references.iter().any(|t| &t.server_name == name)).map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+                format!("Проверить только эти IP:443 и SNI (public PKI, H2/H3 HEAD):\n{}\nИсключены DNS/недопустимые/повторные IP: {}\ny: проверить; n/Esc: отменить.", value.1.preview().unwrap_or_else(|_| "Неверный план".into()), skipped.join(", "))
+            },
             WizardStage::Checking(_, _) => "Проверка согласованных IP; Esc: отменить без записи.".into(),
             WizardStage::CreateConfirm(value) => value.2.clone(),
             WizardStage::Saving(_) => "Создание локальных материалов; не закрывайте экран. Runtime не меняется.".into(),
@@ -715,6 +755,12 @@ mod tests {
         std::fs::write(&path, include_str!("../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))).unwrap();
         let editor = Editor::load(Role::Server, &path).unwrap();
         let mut wizard = Wizard::new(&editor).unwrap();
+        assert_eq!(wizard.fields[1], "443");
+        assert!(!wizard.body().contains("Выбор: auto / manual"));
+        wizard.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert!(wizard.body().contains("Выбор: auto / manual"));
+        wizard.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert!(!wizard.body().contains("Выбор: auto / manual"));
         wizard.fields[1] = "127.0.0.1:9443".into();
         wizard.fields[2] = "127.0.0.1".into();
         wizard.fields[3] = "127.0.0.1".into();

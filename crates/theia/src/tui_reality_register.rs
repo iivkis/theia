@@ -246,6 +246,9 @@ impl RegistrationPanel {
     }
 
     pub(crate) fn own_material(mut self, owned: crate::tui_staged_material::StagedMaterial) -> Self {
+        if self.role == Role::Client && self.fields[2].is_empty() {
+            if let Ok(id) = crate::tui_editor::generated_id("profile") { self.fields[2] = id; }
+        }
         self.owned = Some(owned);
         self
     }

@@ -207,7 +207,7 @@ impl EnrollmentPanel {
         match &self.stage {
             Stage::Loading(_) | Stage::Applying(_) => return false,
             Stage::Done(_) => {
-                if key.code == KeyCode::Char('g') {
+                if key.code == KeyCode::Char('g') && (self.config.is_none() || self.owned.is_some()) {
                     if let (Some((path, digest)), Ok(input)) = (&self.config, self.input()) {
                         match crate::tui_reality_register::RegistrationPanel::from_enrollment(
                             path.clone(),
@@ -343,7 +343,7 @@ impl EnrollmentPanel {
                 self.error = Some(format!(
                     "ОТКАЗ: {error}. При неопределённой записи проверьте файлы перед повтором."
                 ));
-                self.stage = if error == Error::Indeterminate { Stage::Done("Неопределённая запись. Закройте и проверьте файлы; повтор заблокирован.".into()) } else { Stage::Input };
+                self.stage = if error == Error::Indeterminate { Stage::Done("ОТКАЗ: неопределённая запись. Закройте и проверьте файлы; повтор заблокирован.".into()) } else { Stage::Input };
             }
         }
         None
@@ -379,7 +379,7 @@ impl EnrollmentPanel {
             Stage::Confirm(review) => review.body.clone(),
             Stage::Applying(_) => "Сохранение защищённого профиля; runtime не меняется.".into(),
             Stage::Done(body) => {
-                if self.config.is_some() {
+                if self.config.is_some() && self.owned.is_some() {
                     format!("{body}\nСледующий шаг: g — зарегистрировать созданный enrollment в сохранённом TOML (отдельный preview/confirm).\n{}",self.error.as_deref().unwrap_or(""))
                 } else {
                     body.clone()
@@ -480,20 +480,24 @@ mod tests {
     #[test]
     fn wizard_handoff_keeps_original_config_binding_and_requires_profile_id() {
         let mut panel = EnrollmentPanel::new();
-        let cfg = std::env::temp_dir().join("client.toml");
-        panel.config = Some((cfg.clone(), [3; 32]));
-        panel.fields[2] = Zeroizing::new(
-            std::env::temp_dir()
-                .join("enrollment")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        use sha2::{Digest, Sha256};
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("enroll-handoff").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let cfg = dir.join("client.toml");
+        std::fs::write(&cfg, include_str!("../../../examples/client.toml")).unwrap();
+        let digest = Sha256::digest(std::fs::read(&cfg).unwrap()).into();
+        let root = dir.join("enrollment");
+        panel.owned = Some(crate::tui_staged_material::StagedMaterial::create(&root, &cfg, digest).unwrap());
+        panel.config = Some((cfg.clone(), digest));
+        panel.fields[2] = Zeroizing::new(root.join("profile.toml").to_string_lossy().into_owned());
         panel.fields[4] = Zeroizing::new("ab".repeat(32));
         panel.stage = Stage::Done("saved".into());
         panel.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         assert!(panel.registration.is_some());
         assert!(panel.body().contains("ID профиля"));
         assert!(panel.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!root.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
