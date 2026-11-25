@@ -35,7 +35,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 use std::{
@@ -3050,15 +3050,31 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     };
     // Keep navigation and status distinct from the form at normal terminal sizes.
     // Compact terminals retain the complete keyboard-first editor.
-    if area.height < 20 || area.width < 48 {
+    if area.height < 26 || area.width < 48 {
         panel(frame, area, title, &message, true);
         return;
     }
     let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(7), Constraint::Length(5), Constraint::Length(3)]).split(area);
     let status = format!("{}\n{} · {}\n{}", editor.selection_summary(), mode, dirty, users.trim_end());
     panel(frame, parts[0], "Обзор", &status, false);
-    let fields = format!("{}\n{}\n{}", editor.fields_overview(), editor.field_name(), help);
-    panel(frame, parts[1], title, &fields, true);
+    let form = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(parts[1]);
+    let rows = editor.workspace_fields().into_iter().map(|(label, value, selected)| {
+        let marker = if selected { "› " } else { "  " };
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Row::new(vec![format!("{marker}{label}"), value]).style(style)
+    });
+    frame.render_widget(
+        Table::new(rows, [Constraint::Length(17), Constraint::Min(1)])
+            .header(Row::new(["Параметр", "Значение"]).style(Style::default().fg(Color::DarkGray)))
+            .column_spacing(2)
+            .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))),
+        form[0],
+    );
+    panel(frame, form[1], "Поле", &format!("{}\n{help}", editor.field_name()), false);
     let notice = format!("{}\n{}", editor.error.as_deref().unwrap_or(""), editor.notice);
     panel(frame, parts[2], "Состояние", &notice, false);
     panel(frame, parts[3], "Действия", actions, false);
@@ -3335,6 +3351,42 @@ mod tests {
         assert_eq!(model.selected, Role::Client);
         assert!(!ui.server_process.running());
         assert!(ui.config_dialog.is_none());
+    }
+
+    #[test]
+    fn first_run_modes_are_visible_and_reality_wizard_has_progress() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("first-run-ui").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        for role in [Role::Server, Role::Client] {
+            let path = root.join(if role == Role::Server { "server.toml" } else { "client.toml" });
+            let mut ui = Interaction::new(None);
+            let mut model = Model::new(Some(role));
+            ui.update(&mut model, press(KeyCode::Enter));
+            let dialog = ui.config_dialog.as_mut().unwrap();
+            dialog.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            dialog.paste(path.to_str().unwrap());
+            let snapshot = rendered_interaction(120, 40, &model, &ui);
+            assert!(snapshot.contains("REALITY"));
+            assert!(snapshot.contains("Own-TLS"));
+            ui.update(&mut model, press(KeyCode::Down));
+            ui.update(&mut model, press(KeyCode::Enter));
+            let snapshot = rendered_interaction(120, 40, &model, &ui);
+            assert!(snapshot.contains("ШАГ 1/"));
+            assert!(snapshot.contains("Следующее действие"));
+            if role == Role::Server {
+                assert!(snapshot.contains("443"));
+                assert!(snapshot.contains("ID первого пользователя"));
+            } else {
+                assert!(snapshot.contains("Fingerprint"));
+            }
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(!path.exists());
+            assert!(ui.config_dialog.is_some());
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(ui.config_dialog.is_none());
+            assert!(!ui.server_process.running());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
