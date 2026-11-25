@@ -420,7 +420,10 @@ mod tests {
         let items = [ActionItem { key: 's', label: "Запустить сервер" }];
         let mut terminal = Terminal::new(TestBackend::new(42, 6)).unwrap();
         for focused in [false, true] {
-            terminal.draw(|f| Actions { items: &items, selected: 0 }.render_with_focus(f, f.area(), focused)).unwrap();
+            terminal.draw(|f| {
+                let area = f.area();
+                Actions { items: &items, selected: 0 }.render_with_focus(f, area, focused);
+            }).unwrap();
             assert_eq!(terminal.backend().buffer().content().iter().any(|c| c.bg == FOCUS), focused);
         }
     }
