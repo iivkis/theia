@@ -631,6 +631,25 @@ impl Wizard {
             registration: None,
         })
     }
+    /// Explain common form mistakes before the shared validator; never replace it.
+    fn basic_error(&self) -> Option<(usize, &'static str)> {
+        let port = self.fields[1].parse::<u16>().ok()
+            .or_else(|| self.fields[1].parse::<SocketAddr>().ok().map(|a| a.port()));
+        if port.is_none_or(|p| p == 0) { return Some((1, "Укажите порт от 1 до 65535. Обычно подходит 443.")); }
+        let endpoint = format!("{}:{}", self.fields[2], port.unwrap_or(443));
+        if !config::valid_remote(&endpoint) { return Some((2, "Введите публичный IP или домен вашего сервера без https:// и без порта. Для IPv6 используйте квадратные скобки.")); }
+        if self.fields[3].split(',').any(|v| v.trim().parse::<IpAddr>().is_err()) {
+            return Some((3, "Введите IP вашего сервера. Если их несколько, разделите запятыми. Не вводите домены или адреса сторонних сайтов."));
+        }
+        if self.fields[5].trim().is_empty() {
+            return Some((5, if self.source.is_none() {"Придумайте имя первого пользователя, например phone. Доступ появится только после выдачи приглашения."}else{"Выберите хотя бы одного активного пользователя с помощью F6. Если их нет, создайте пользователя отдельно."}));
+        }
+        if self.source.is_none() && !config::valid_id(&self.fields[5]) {
+            return Some((5,"Имя первого пользователя должно быть одним допустимым ID, например phone или laptop."));
+        }
+        None
+    }
+
     fn visible_fields(&self) -> &[usize] {
         if self.advanced {
             &[0, 1, 2, 3, 4, 5, 6]
@@ -710,6 +729,12 @@ impl Wizard {
                         self.fields[self.focus].clear()
                     }
                     KeyCode::Enter => {
+                        if let Some((field, message)) = self.basic_error() {
+                            self.focus = field;
+                            self.error = message.into();
+                            self.stage = WizardStage::Input;
+                            return false;
+                        }
                         match WizardInput::parse(self.config.clone(), self.source, &self.fields) {
                             Ok(input) => {
                                 self.error.clear();
@@ -1176,12 +1201,12 @@ impl ProvisionPanel {
         let first = wizard.source.is_none();
         let labels = [
             ("ID подключения", "Уникальное имя подключения, создаётся автоматически."),
-            ("Порт TCP/UDP", "443 по умолчанию. Можно указать конкретный адрес:порт."),
-            ("Адрес сервера для клиентов", "Адрес вашего сервера, который получат клиенты. Например vpn.example.com. Не адрес стороннего сайта."),
-            ("Собственные IP сервера", "Перечислите все IP этого сервера через запятую, включая публичный адрес и NAT. Это исключает выбор самого себя."),
+            ("Порт TCP/UDP", "Оставьте 443, если не знаете, зачем менять. Порт должен быть доступен на сервере."),
+            ("Адрес сервера для клиентов", "Введите IP или домен VPS из панели хостинга, без https:// и порта. Не адрес стороннего сайта."),
+            ("Собственные IP сервера", "IP из панели хостинга. Включите все адреса этого сервера, в том числе публичные/NAT. При нескольких адресах разделите запятыми."),
             ("Домены референсов", "До трёх доменов или домен=IP, через запятую."),
             (if first { "ID первого пользователя" } else { "Пользователи с доступом" },
-             if first { "Пользователь отключён до явного выпуска токена." } else { "ID через запятую; F6 открывает список с флажками доступа." }),
+             if first { "Придумайте имя, например phone. После создания нажмите «Выдать доступ отключённому» на обзоре сервера." } else { "Нажмите F6 и отметьте нужных пользователей. Никому не выдаётся доступ автоматически." }),
             ("Режим подбора", "auto — по результатам проверок; manual — в заданном порядке."),
         ];
         Some(Form {
@@ -1189,7 +1214,7 @@ impl ProvisionPanel {
                 id, label: labels[id].0, hint: labels[id].1, value: wizard.fields[id].clone(),
             }).collect(),
             selected: wizard.focus,
-            lead: if wizard.advanced { "Расширенные параметры · F2 скрыть".into() } else { "Без собственного TLS-сертификата · F2 расширенные".into() },
+            lead: if wizard.advanced { "Расширенные параметры · F2 скрыть".into() } else { "Укажите адрес своего сервера, его IP и пользователя. Остальное мастер подберёт. F2 — расширенные настройки.".into() },
             error: wizard.error.clone(),
         })
     }

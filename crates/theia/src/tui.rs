@@ -373,13 +373,14 @@ fn pages(role: Role) -> &'static [&'static str] {
 
 fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
     let entries: &[(char, &str)] = match (role, page) {
-        (Role::Server, 0) => &[('s',"Запуск / остановка сервера"),('W',"Создать REALITY"),('N',"Новое подключение"),('v',"Проверить работающий сервер"),('u',"Добавить пользователя"),('b',"Восстановить доступ")],
+        (Role::Server, 0) => &[('s',"Запустить / остановить сервер"),('W',"Создать REALITY"),('N',"Новое подключение"),('v',"Проверить / применить изменения"),('u',"Добавить пользователя и приглашение"),('b',"Выдать доступ отключённому"),('S',"Сохранить настройки")],
         (Role::Server, 1) => &[('N',"Создать подключение"),('W',"Мастер REALITY"),('V',"Состояние REALITY"),('G',"Настроить доступ"),('Q',"Лимиты"),('E',"Сертификат TLS"),('D',"Удалить подключение")],
         (Role::Server, 2) => &[('u',"Добавить пользователя"),('x',"Отключить"),('b',"Восстановить доступ"),('t',"Обновить токен"),('G',"Назначить доступ"),('U',"Удалить пользователя")],
         (Role::Server, 3) => &[('u',"Создать пользователя и приглашение"),('b',"Выдать приглашение отключённому"),('t',"Обновить приглашение"),('l',"Публичная ссылка")],
+        (_, 4) => &[('4',"Открыть монитор трафика")],
         (Role::Server, 5) => &[('o',"Открыть файл"),('S',"Сохранить файл"),('v',"Статус и применение изменений"),('R',"Проверить готовность перезапуска"),('K',"Заменить доверие"),('M',"Регистрация материалов")],
         (Role::Server, 6) => &[('p',"Сетевая диагностика"),('V',"Состояние REALITY")],
-        (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль")],
+        (Role::Client, 0) => &[('V',"Подключить / отключить"),('i',"Импорт приглашения"),('N',"Новый профиль"),('A',"Выбрать активный профиль"),('S',"Сохранить настройки")],
         (Role::Client, 1) => &[('A',"Выбрать активный профиль"),('N',"Создать профиль"),('i',"Импорт"),('E',"Доверие Own-TLS"),('D',"Удалить профиль")],
         (Role::Client, 2) => &[('i',"Импорт ссылки или QR"),('I',"Импорт REALITY")],
         (Role::Client, 3) if cfg!(windows) => &[('p',"Управление системным прокси")],
@@ -388,6 +389,48 @@ fn page_actions(role: Role, page: usize) -> Vec<ActionItem> {
         _ => &[],
     };
     entries.iter().map(|(key,label)| ActionItem { key:*key, label:*label }).collect()
+}
+
+/// A recommendation is navigation only. It never writes, applies, or starts a process.
+fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str) {
+    if editor.write_uncertain() { return ('o', "Запись не подтверждена. Проверьте файл и откройте его заново (F3)."); }
+    if editor.dirty() { return ('S', "Сохраните изменения. Работающий процесс не изменится автоматически."); }
+    if editor.role() == Role::Server {
+        if editor.record_count() == 0 { return ('W', "Создайте первое подключение."); }
+        let users = editor.workspace_users();
+        if !users.iter().any(|(_, disabled, granted)| !*disabled && *granted) {
+            if users.iter().any(|(_, disabled, granted)| *disabled && *granted) {
+                return ('b', "Выдайте приглашение первому пользователю: сейчас его доступ отключён.");
+            }
+            return ('u', "Создайте пользователя и получите его личное приглашение.");
+        }
+        if !owned_running { return ('s', "Запустите сервер, если он ещё не работает как внешний сервис."); }
+        ('v', "Проверьте, применены ли сохранённые права доступа. Передайте приглашение клиенту безопасным способом.")
+    } else if editor.record_count() == 0 {
+        ('i', "Получите приглашение у администратора и импортируйте его.")
+    } else if owned_running {
+        ('V', "Локальный процесс запущен или запускается. Откройте его состояние для проверки туннеля.")
+    } else if !editor.selected_record_is_active() {
+        ('A', "Выберите этот профиль активным, если хотите подключаться через него.")
+    } else {
+        ('V', "Откройте подключение и подтвердите запуск. Системный прокси не включается автоматически.")
+    }
+}
+
+fn invitation_actions(flow: &IssueFlow) -> Vec<ActionItem> {
+    match flow {
+        IssueFlow::Offer => vec![
+            ActionItem { key: 'f', label: "Сохранить приглашение в файл" },
+            ActionItem { key: 'Q', label: "Создать QR-код" },
+            ActionItem { key: 'c', label: "Копировать в буфер обмена" },
+            ActionItem { key: 'n', label: "Закрыть без выдачи" },
+        ],
+        IssueFlow::Public(_) => vec![
+            ActionItem { key: 'Q', label: "Создать QR-код" },
+            ActionItem { key: 'c', label: "Копировать в буфер обмена" },
+        ],
+        _ => Vec::new(),
+    }
 }
 
 struct Interaction {
@@ -656,6 +699,24 @@ impl Interaction {
         }
     }
 
+    fn owned_running(&self, role: Role) -> bool {
+        if role == Role::Server { self.server_process.running() }
+        else { self.client_background.as_ref().is_some_and(StatusPanel::local_running)
+            || self.reality_status.as_ref().is_some_and(StatusPanel::local_running) }
+    }
+
+    fn recommended_action(&self, role: Role) -> usize {
+        let Some(editor) = self.editor_for(role) else { return 0; };
+        let (key, _) = recommended_step(editor, self.owned_running(role));
+        page_actions(role, 0).iter().position(|item| item.key == key).unwrap_or(0)
+    }
+
+    fn select_workspace_page(&mut self, role: Role, page: usize) {
+        self.workspace_page = page.min(pages(role).len() - 1);
+        self.workspace_action = if self.workspace_page == 0 { self.recommended_action(role) } else { 0 };
+        self.workspace_focus = WorkspaceFocus::Navigation;
+    }
+
     fn editor_for(&self, role: Role) -> Option<&Editor> {
         self.editor.as_ref().filter(|edit| edit.role() == role)
     }
@@ -741,7 +802,9 @@ impl Interaction {
                 self.menu = None;
                 self.workspace_page=0;
                 self.workspace_focus=WorkspaceFocus::Actions;
-                self.workspace_action=0;
+                if let Some(role) = Self::panel_role(model) {
+                    self.workspace_action = self.recommended_action(role);
+                }
                 self.last_apply=None;
             }
         }
@@ -901,6 +964,15 @@ impl Interaction {
             }
             return;
         }
+        if let Some(flow) = self.issuance.as_ref() {
+            let items = invitation_actions(flow);
+            if let Some([_,controls]) = action_layout(body,items.len()) {
+                if let Some(index) = (Actions {items:&items,selected:self.modal_action}).hit(controls,event.column,event.row) {
+                    self.modal_action=index;
+                }
+                return;
+            }
+        }
         if let Some(IssueFlow::Input(id)) = self.issuance.as_mut() {
             if self.issue_kind != IssueKind::NewUser {
                 let disabled = self.issue_kind == IssueKind::Reenable;
@@ -953,7 +1025,7 @@ impl Interaction {
             if self.workspace_focus==WorkspaceFocus::Navigation {
                 if event.row>body.y && event.row<body.bottom().saturating_sub(1) {
                     let i=usize::from(event.row-body.y-1);
-                    if i<pages(role).len(){self.workspace_page=i;self.workspace_action=0;}
+                    if i<pages(role).len(){self.select_workspace_page(role,i);}
                 }
                 return;
             }
@@ -979,9 +1051,7 @@ impl Interaction {
         if inside(nav) && event.row > nav.y && event.row < nav.bottom().saturating_sub(1) {
             let index = usize::from(event.row - nav.y - 1);
             if index < pages(role).len() {
-                self.workspace_page = index;
-                self.workspace_action = 0;
-                self.workspace_focus = WorkspaceFocus::Navigation;
+                self.select_workspace_page(role,index);
             }
             return;
         }
@@ -1395,6 +1465,9 @@ impl Interaction {
                         return false;
                     }
                     if key.code == KeyCode::F(6) {
+                        if self.workspace_page == 0 && self.workspace_focus == WorkspaceFocus::Fields {
+                            self.workspace_action = self.recommended_action(role);
+                        }
                         self.workspace_focus = match self.workspace_focus {
                             WorkspaceFocus::Fields | WorkspaceFocus::Users => WorkspaceFocus::Actions,
                             WorkspaceFocus::Actions => WorkspaceFocus::Navigation,
@@ -1404,25 +1477,24 @@ impl Interaction {
                     }
                     if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Left | KeyCode::Right) {
                         let n = pages(role).len();
-                        self.workspace_page = (self.workspace_page + if key.code == KeyCode::Right { 1 } else { n - 1 }) % n;
-                        self.workspace_action = 0;
-                        self.workspace_focus = WorkspaceFocus::Navigation;
+                        let page = (self.workspace_page + if key.code == KeyCode::Right { 1 } else { n - 1 }) % n;
+                        self.select_workspace_page(role,page);
                         return false;
                     }
                     if self.workspace_focus == WorkspaceFocus::Navigation {
                         match key.code {
                             KeyCode::Up | KeyCode::Down => {
                                 let n = pages(role).len();
-                                self.workspace_page = (self.workspace_page + if key.code == KeyCode::Down { 1 } else { n - 1 }) % n;
-                                self.workspace_action = 0;
+                                let page = (self.workspace_page + if key.code == KeyCode::Down { 1 } else { n - 1 }) % n;
+                                self.select_workspace_page(role,page);
                                 return false;
                             }
                             KeyCode::Enter | KeyCode::Tab => {
-                                if self.workspace_page == 4 {
-                                    self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
-                                } else {
-                                    self.workspace_focus = if role == Role::Server && self.workspace_page == 2 { WorkspaceFocus::Users } else { WorkspaceFocus::Actions };
-                                }
+                                self.workspace_focus = if role == Role::Server && self.workspace_page == 2 { WorkspaceFocus::Users } else if self.workspace_page == 1 { WorkspaceFocus::Fields } else { WorkspaceFocus::Actions };
+                                return false;
+                            }
+                            KeyCode::BackTab => {
+                                self.workspace_focus = WorkspaceFocus::Actions;
                                 return false;
                             }
                             _ => {}
@@ -1462,6 +1534,7 @@ impl Interaction {
                                 } else { None };
                                 self.workspace_focus = WorkspaceFocus::Fields;
                                 let command = match ch {
+                                    '4' => KeyEvent::new(KeyCode::F(4),KeyModifiers::NONE),
                                     's' if role == Role::Server => KeyEvent::new(KeyCode::F(5),KeyModifiers::NONE),
                                     'o' => KeyEvent::new(KeyCode::F(3),KeyModifiers::NONE),
                                     'S' => KeyEvent::new(KeyCode::Char('s'),KeyModifiers::CONTROL),
@@ -1487,9 +1560,8 @@ impl Interaction {
                             self.workspace_focus=WorkspaceFocus::Navigation; return false;
                         }
                     }
-                    if self.workspace_page != 1 && matches!(key.code, KeyCode::Enter | KeyCode::Tab) {
-                        if self.workspace_page == 4 { self.traffic_monitor = Some(crate::traffic::Monitor::new(role)); }
-                        else { self.workspace_focus = WorkspaceFocus::Actions; }
+                    if self.workspace_page != 1 && matches!(key.code, KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab) {
+                        self.workspace_focus = if key.code == KeyCode::BackTab { WorkspaceFocus::Navigation } else { WorkspaceFocus::Actions };
                         return false;
                     }
                 }
@@ -1645,6 +1717,10 @@ impl Interaction {
             return false;
         }
         if let Some(flow) = self.issuance.take() {
+            let items = invitation_actions(&flow);
+            let code = if key.modifiers.is_empty() { tui_widgets::action_key(&items, &mut self.modal_action, key.code) } else { Some(key.code) };
+            let Some(code) = code else { self.issuance = Some(flow); return false; };
+            let key = KeyEvent { code, ..key };
             match flow {
                 IssueFlow::Input(mut id) => match key.code {
                     KeyCode::Up | KeyCode::Down if self.issue_kind != IssueKind::NewUser => {
@@ -1925,7 +2001,7 @@ impl Interaction {
                             }
                             Err(_) => {
                                 editor.error =
-                                    Some("Неверный URI или локальный файл приглашения.".into());
+                                    Some("Не удалось прочитать приглашение. Проверьте ссылку целиком или абсолютный путь к файлу; при необходимости запросите новую ссылку.".into());
                                 self.importing = Some(ImportFlow::Input(source));
                             }
                         }
@@ -2790,9 +2866,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             format!(
                 "THEIA  •  Клиент  |  {}",
                 if local {
-                    "Локальный runtime активен/запускается"
+                    "Локальный процесс запущен/запускается"
                 } else {
-                    "Локальный runtime не запущен этой панелью"
+                    "Локальный процесс не запущен этой панелью"
                 }
             )
         }
@@ -2954,6 +3030,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             interaction.and_then(|ui| ui.editor.as_ref()),
             interaction.map_or(IssueKind::NewUser, |ui| ui.issue_kind),
             viewport,
+            interaction.map_or(0, |ui| ui.modal_action),
         );
     } else if let Some(flow) = interaction.and_then(|ui| ui.revocation.as_ref()) {
         draw_revocation(
@@ -3118,6 +3195,7 @@ fn draw_issuance(
     editor: Option<&Editor>,
     kind: IssueKind,
     viewport: Option<&Viewport>,
+    action_focus: usize,
 ) {
     let rotating = kind == IssueKind::Rotation;
     let recovering = kind == IssueKind::Reenable;
@@ -3271,7 +3349,13 @@ fn draw_issuance(
     } else {
         body
     };
-    panel_at(frame, area, title, &body, true, viewport);
+    let items = invitation_actions(flow);
+    if let Some([report, controls]) = action_layout(area, items.len()) {
+        panel_at(frame, report, title, &body, false, viewport);
+        Actions {items:&items, selected:action_focus}.render(frame, controls);
+    } else {
+        panel_at(frame, area, title, &body, true, viewport);
+    }
 }
 
 fn draw_revocation(
@@ -3346,7 +3430,7 @@ fn draw_import(
                 hint: "Вставьте ссылку theia:// или абсолютный путь к URI-файлу, PNG или SVG QR. Содержимое скрыто.",
             }],
             selected: 0,
-            lead: "Проверка не запускает подключение и не меняет системный прокси.".into(),
+            lead: "Получите личное приглашение у администратора. Вставьте ссылку или путь к присланному файлу. Подключение не запустится автоматически.".into(),
             error: editor.and_then(|e| e.error.clone()).unwrap_or_default(),
         };
         draw_guided(frame, area, "Импорт подключения", "", (1, 2, "Источник приглашения", "Enter проверить · Esc отменить"), viewport, (Some(form), None));
@@ -3418,8 +3502,8 @@ fn draw_import(
 
 fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool) {
     let (key, title, details) = match role {
-        Role::Server => ("1", "Для сервера", "Создание подключений REALITY / Own-TLS\nПользователи и приглашения\nЗапуск и управление сервером"),
-        Role::Client => ("2", "Для клиента", "Импорт приглашений и профили\nПодключение и мониторинг трафика\nHTTP/SOCKS5 и системный прокси"),
+        Role::Server => ("1", "Для сервера", "У меня есть сервер (VPS)\nХочу дать доступ другим устройствам\nНастройка, пользователи и запуск"),
+        Role::Client => ("2", "Для клиента", "Хочу подключиться к готовому серверу\nУ меня есть приглашение администратора\nИмпорт, подключение и статистика"),
     };
     let area = Rect::new(area.x.saturating_add(1), area.y, area.width.saturating_sub(2), area.height);
     let bg = if selected { FOCUS } else { SURFACE };
@@ -3472,12 +3556,14 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         let records=if role==Role::Server{"Подключения"}else{"Профили"};
         let users=editor.workspace_users();
         let status=if editor.write_uncertain(){"Запись не подтверждена"}else if editor.dirty(){"Есть несохранённые изменения"}else{"Файл сохранён"};
-        let help=if role==Role::Server{"Создайте подключение, добавьте пользователя, затем запустите сервер и передайте приглашение."}else{"Импортируйте приглашение, выберите активный профиль и запустите подключение."};
+        let (next_key, help) = recommended_step(editor, ui.is_some_and(|u| u.owned_running(role)));
+        let next_label = items.iter().find(|item| item.key == next_key).map_or("Открыть файл (F3)", |item| item.label);
         let lines=vec![Line::styled(format!("{records}: {}",editor.record_count()),Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
             Line::raw(if role==Role::Server{format!("Пользователи в файле: {}",users.len())}else{editor.selection_summary()}),
             Line::raw(format!("Конфигурация: {status}")),Line::raw(format!("Процесс: {local}")),
-            Line::raw(""),Line::styled("Что делать дальше",Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),Line::raw(help),
-            Line::raw(""),Line::raw("Tab / F6 — выбрать действие. Сохранение не применяет настройки автоматически.")];
+            Line::raw(""),Line::styled("Следующий шаг",Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),Line::raw(help),
+            Line::styled(next_label,Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            Line::raw("Tab — к действиям, Enter — открыть. Сохранение не запускает процесс.")];
         frame.render_widget(Paragraph::new(lines).block(tui_widgets::section(title,true)).wrap(Wrap{trim:true}),content);
     } else if page == 1 {
         draw_editor(frame, content, editor);
@@ -3487,7 +3573,7 @@ fn draw_page(frame: &mut Frame<'_>, area: Rect, role: Role, editor: &Editor, ui:
         let start = user_table_start(selected, users.len(), content);
         let rows = users.iter().enumerate().skip(start).take(usize::from(content.height.saturating_sub(3))).map(|(i,(id,disabled,granted))| {
             let color = if *disabled { WARNING } else { TEXT };
-            Row::new(vec![format!("{} {id}", if i == selected { "›" } else { " " }), if *granted { "Да" } else { "Нет" }.into(), if *disabled { "Отключён" } else { "Разрешён" }.into()])
+            Row::new(vec![format!("{} {id}", if i == selected { "›" } else { " " }), if *granted { "Выдан" } else { "Нет" }.into(), if *disabled { "Отключён" } else if *granted { "Разрешён" } else { "Нет доступа" }.into()])
                 .style(Style::default().fg(color).bg(if i == selected { FOCUS } else { SURFACE }))
         });
         frame.render_widget(Table::new(rows,[Constraint::Percentage(50),Constraint::Percentage(20),Constraint::Percentage(30)])
@@ -3608,14 +3694,14 @@ fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<
 
 fn welcome_form(role: Role, selected: usize) -> Form {
     let (reality, description, lead) = match role {
-        Role::Server => ("Создать SmartTheia REALITY", "Мастер референсов, без своего сертификата", "Начните с создания подключения или откройте файл. Сервер не запущен этой панелью. IPC — отдельно."),
-        Role::Client => ("Импорт SmartTheia REALITY", "Создать профиль из приглашения", "Начните с приглашения или откройте файл. Транспорт не проверялся. Системный прокси не изменён."),
+        Role::Server => ("Создать SmartTheia REALITY", "Для нового сервера без собственного TLS-сертификата", "Настраиваете сервер впервые? Выберите создание REALITY. Если Theia уже настроена, откройте существующий файл."),
+        Role::Client => ("Импорт SmartTheia REALITY", "У меня есть приглашение от администратора", "Настраиваете клиент впервые? Получите приглашение у администратора. Если профили уже сохранены, откройте их файл."),
     };
     Form {
         fields: vec![
             Field { id: 0, label: "Открыть конфигурацию", value: "Выбрать существующий TOML".into(), hint: "Enter — выбрать путь. F3 — открыть файл." },
             Field { id: 1, label: reality, value: description.into(), hint: "Enter — выбрать новый путь, затем открыть мастер." },
-            Field { id: 2, label: "Создать Own-TLS", value: "Ручная настройка собственного TLS".into(), hint: "Enter — выбрать путь к новому TOML." },
+            Field { id: 2, label: "Создать Own-TLS", value: "Расширенный вариант: свой сертификат".into(), hint: "Выбирайте только если администратор выдал необходимые TLS-данные." },
         ],
         selected,
         lead: lead.into(),
@@ -4053,6 +4139,23 @@ mod tests {
         let (rows, _) = visual_rows("one two three four", 5);
         assert!(rows.len() >= 4);
         assert!(rows.iter().all(|row| row.width() <= 5));
+    }
+
+    #[test]
+    fn onboarding_recommendation_and_invitation_actions_are_read_only() {
+        let path=std::env::temp_dir().join(crate::tui_editor::generated_id("onboarding").unwrap());
+        std::fs::write(&path,include_str!("../../../examples/client.toml")).unwrap();
+        let editor=Editor::load(Role::Client,&path).unwrap();
+        assert_eq!(recommended_step(&editor,false).0,'V');
+        let actions=invitation_actions(&IssueFlow::Offer);
+        assert_eq!(actions[0].key,'f');
+        assert!(actions.iter().all(|a| a.key!='y'));
+        let before=std::fs::read(&path).unwrap();
+        let mut ui=Interaction::new(Some(editor));
+        ui.select_workspace_page(Role::Client,0);
+        assert_eq!(ui.workspace_focus,WorkspaceFocus::Navigation);
+        assert_eq!(std::fs::read(&path).unwrap(),before);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

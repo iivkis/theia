@@ -168,7 +168,7 @@ impl Form {
             let rect = Rect::new(g.rows.x, g.rows.y + (offset as u16) * g.stride, g.rows.width, g.stride);
             let marker = if selected { "▎ " } else { "  " };
             let label = if picker && !field.label.starts_with('[') { format!("{marker}{}  {}", if selected { "●" } else { "○" }, field.label) } else { format!("{marker}{}", field.label) };
-            let value = if field.value.is_empty() { "Введите значение" } else { field.value.as_str() };
+            let value = if field.value.is_empty() { if picker { "Выбрать" } else { "Введите значение" } } else { field.value.as_str() };
             let label_style = Style::default().fg(if selected { ACCENT } else { TEXT }).add_modifier(Modifier::BOLD);
             let value_style = Style::default().fg(if field.value.is_empty() || picker { MUTED } else { TEXT })
                 .bg(if selected { FOCUS } else if picker { BG } else { INPUT });

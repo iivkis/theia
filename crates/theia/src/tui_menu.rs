@@ -783,15 +783,15 @@ impl ConfigDialog {
         }
         let reality = if self.role == Role::Server { "SmartTheia REALITY" } else { "Импорт REALITY" };
         let fields = vec![
-            Field { id: 0, label: "Открыть TOML", value: "Enter · существующий файл".into(), hint: "Введите путь к существующему файлу." },
-            Field { id: 1, label: reality, value: "F4 · создать через мастер".into(), hint: "Новый TOML, без собственного сертификата." },
-            Field { id: 2, label: "Own-TLS", value: "F2 · создать вручную".into(), hint: "Новый TOML с собственным TLS." },
+            Field { id: 0, label: "Открыть сохранённые настройки", value: "Для уже настроенной Theia".into(), hint: "Выберите существующий файл .toml через F6 или введите его путь." },
+            Field { id: 1, label: reality, value: "Рекомендуемый мастер для новой настройки".into(), hint: "Оставьте предложенный путь, если файл ещё не существует. Существующий файл не заменяется." },
+            Field { id: 2, label: "Own-TLS", value: "Расширенная ручная настройка".into(), hint: "Требуются собственный сертификат или данные доверия от администратора." },
             Field { id: 3, label: "Выбрать файл или каталог", value: "F6 · файловый браузер".into(), hint: "Выбор пути не открывает и не создаёт файл." },
         ];
         Some(Form {
             fields,
             selected: self.choice,
-            lead: format!("Путь к TOML: {}\nF6 выбрать файл/каталог · Ctrl+U очистить · путь можно ввести", self.input),
+            lead: format!("Файл настроек: {}\nEnter продолжить · F6 выбрать файл · Ctrl+U изменить путь", self.input),
             error: self.error.unwrap_or_default().to_owned(),
         })
     }
