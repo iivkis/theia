@@ -89,6 +89,7 @@ pub enum StatusCommand {
     CheckTlsRollback,
     CheckAuthRollback,
     ApplyAuthRollback { expected_revision:u64 },
+    RealityStatus { id:[u8;64], len:u8, manifest:[u8;32] },
     /// Explicit one-shot CAS on the protected native management endpoint.
     ApplyTlsRollback {
         expected_revision: u64,
@@ -157,9 +158,19 @@ pub enum StatusReply {
     },
     AuthRollbackReady { revision:u64, remaining_seconds:u64 },
     AuthRollbackApplied { revision:u64 },
+    RealityRunning { generation:u64, revision:u64, health_revision:u64, active_reference:u8, overlap:bool },
+    RealitySuspended,
     Applied {
         revision: u64,
     },
+}
+
+impl StatusCommand{
+    pub fn reality_status(id:&str,manifest:[u8;32])->Result<Self,ManagementError>{
+        if !crate::config::valid_id(id)||manifest==[0;32]{return Err(ManagementError::InvalidReply);}
+        let mut bytes=[0;64];bytes[..id.len()].copy_from_slice(id.as_bytes());
+        Ok(Self::RealityStatus{id:bytes,len:id.len() as u8,manifest})
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -466,6 +477,15 @@ where
                     "ERR unsupported\n".to_owned()
                 }
             }
+            candidate if parse_reality_status(candidate).is_some()=>{
+                let (id,manifest)=parse_reality_status(candidate).expect("parsed");
+                match runtime.as_ref().and_then(|state|state.reality_status(id,manifest)){
+                    Some(Some(s))=>format!("theia-reality-v1 g={} r={} h={} a={} o={}\n",
+                        s.generation,s.revision,s.health_revision,s.active_reference,u8::from(s.overlap)),
+                    Some(None)=>"theia-reality-v1 suspended\n".into(),
+                    None=>"ERR unsupported\n".into(),
+                }
+            }
             b"auth-rollback-check" => {
                 if let Some(runtime)=&runtime{
                     match runtime.auth_rollback_status(){
@@ -710,6 +730,14 @@ fn parse_restart_revision(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_reality_status(command:&[u8])->Option<(&str,[u8;32])>{
+    let raw=std::str::from_utf8(command.strip_prefix(b"reality-status id=")?).ok()?;
+    let (id,digest)=raw.split_once(" manifest=")?;
+    if !crate::config::valid_id(id){return None;}
+    Some((id,decode_digest(digest)?))
+}
+
+#[cfg(any(target_os="linux",target_os="windows"))]
 fn parse_auth_rollback_revision(command:&[u8])->Option<u64>{
     positive_decimal(std::str::from_utf8(command.strip_prefix(b"auth-rollback-apply rev=")?).ok()?)
 }
@@ -746,6 +774,13 @@ where
         StatusCommand::Reload => b"reload\n".to_vec(),
         StatusCommand::CheckReload => b"check-reload\n".to_vec(),
         StatusCommand::CheckRestart => b"check-restart\n".to_vec(),
+        StatusCommand::RealityStatus{id,len,manifest}=>{
+            let raw=id.get(..usize::from(len)).ok_or(ManagementError::InvalidReply)?;
+            let name=std::str::from_utf8(raw).map_err(|_|ManagementError::InvalidReply)?;
+            if !crate::config::valid_id(name){return Err(ManagementError::InvalidReply);}
+            let digest=manifest.iter().map(|b|format!("{b:02x}")).collect::<String>();
+            format!("reality-status id={name} manifest={digest}\n").into_bytes()
+        }
         StatusCommand::CheckAuthRollback=>b"auth-rollback-check\n".to_vec(),
         StatusCommand::ApplyAuthRollback{expected_revision}=>{
             if expected_revision==0{return Err(ManagementError::InvalidReply);}
@@ -829,6 +864,22 @@ where
     }
     if reply == b"ERR unsupported\n" && command == StatusCommand::Reload {
         return Ok(StatusReply::Unsupported);
+    }
+    if matches!(command,StatusCommand::RealityStatus{..}){
+        let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
+        if text=="theia-reality-v1 suspended\n"{return Ok(StatusReply::RealitySuspended);}
+        if text=="ERR unsupported\n"{return Err(ManagementError::Unsupported);}
+        let parsed=(||{
+            let mut fields=text.strip_prefix("theia-reality-v1 ")?.strip_suffix('\n')?.split(' ');
+            let generation=positive_decimal(fields.next()?.strip_prefix("g=")?)?;
+            let revision=positive_decimal(fields.next()?.strip_prefix("r=")?)?;
+            let health_revision=positive_decimal(fields.next()?.strip_prefix("h=")?)?;
+            let active_reference=match fields.next()?.strip_prefix("a=")?{"0"=>0,"1"=>1,"2"=>2,_=>return None};
+            let overlap=match fields.next()?.strip_prefix("o=")?{"0"=>false,"1"=>true,_=>return None};
+            if fields.next().is_some(){return None;}
+            Some(StatusReply::RealityRunning{generation,revision,health_revision,active_reference,overlap})
+        })();
+        return parsed.ok_or(ManagementError::InvalidReply);
     }
     if command==StatusCommand::CheckAuthRollback{
         let text=std::str::from_utf8(&reply).map_err(|_|ManagementError::InvalidReply)?;
@@ -1036,6 +1087,7 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
         StatusCommand::Reload => "reload_rejected",
         StatusCommand::CheckReload => "check_reload",
         StatusCommand::CheckRestart => "check_restart",
+        StatusCommand::RealityStatus{..}=>"reality_status",
         StatusCommand::CheckAuthRollback=>"check_auth_rollback",
         StatusCommand::ApplyAuthRollback{..}=>"apply_auth_rollback",
         StatusCommand::CheckTlsRollback => "check_tls_rollback",

@@ -28,6 +28,7 @@ pub(crate) struct State {
     // configs live exclusively in the single supervisor, never in replies.
     rollback_until: RwLock<Option<Instant>>,
     auth_rollback: RwLock<Option<AuthRollback>>,
+    reality: std::collections::HashMap<String,([u8;32],Arc<crate::reality_live::Live>)>,
 }
 
 struct AuthRollback {
@@ -42,7 +43,18 @@ impl State {
             current: RwLock::new(Arc::new(initial)),
             rollback_until: RwLock::new(None),
             auth_rollback: RwLock::new(None),
+            reality:std::collections::HashMap::new(),
         }
+    }
+
+    pub(crate) fn with_reality(mut self,entries:std::collections::HashMap<String,([u8;32],Arc<crate::reality_live::Live>)>)->Self{
+        self.reality=entries;
+        self
+    }
+    pub(crate) fn reality_status(&self,id:&str,manifest:[u8;32])->Option<Option<crate::reality_generation::Status>>{
+        let (expected,live)=self.reality.get(id)?;
+        if *expected!=manifest{return None;}
+        Some(live.status())
     }
 
     /// Advisory rollback readiness. Never returns certificates, keys or

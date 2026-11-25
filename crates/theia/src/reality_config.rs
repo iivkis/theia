@@ -264,6 +264,96 @@ pub(crate) fn status_expected(path: &Path, expected: [u8; 32], id: &str, now: u6
     status_document(&document, id, now)
 }
 
+
+fn exact_server_record(path:&Path,expected:[u8;32],id:&str)->Result<Inbound,Error>{
+    path_string(path)?;
+    let bytes=config::editor_bytes(path).map_err(|_|Error::Storage)?;
+    let actual:[u8;32]=Sha256::digest(&bytes).into();
+    if actual!=expected{return Err(Error::Approval);}
+    let Config::Server(doc)=config::parse(std::str::from_utf8(&bytes).map_err(|_|Error::Format)?)
+        .map_err(|_|Error::Format)? else{return Err(Error::Format);};
+    let inbound=doc.server.inbounds.into_iter().find(|i|i.id==id).ok_or(Error::Scope)?;
+    if inbound.security_mode!=SecurityMode::SmartReality || inbound.reality.is_none(){return Err(Error::Format);}
+    Ok(inbound)
+}
+
+pub(crate) fn runtime_status_command(path:&Path,expected:[u8;32],id:&str)
+    ->Result<crate::management::StatusCommand,Error>{
+    let inbound=exact_server_record(path,expected,id)?;
+    crate::management::StatusCommand::reality_status(id,inbound.reality.ok_or(Error::Format)?.manifest_sha256)
+        .map_err(|_|Error::Format)
+}
+
+fn rotation_snapshot(path:&Path,expected:[u8;32],id:&str,now:u64)
+    ->Result<(PathBuf,crate::descriptor::Scope,crate::identity_publication::Status),Error>{
+    let inbound=exact_server_record(path,expected,id)?;
+    let binding=inbound.reality.as_ref().ok_or(Error::Format)?;
+    let addr:SocketAddr=inbound.h2_listen.parse().map_err(|_|Error::Scope)?;
+    let scope=crate::descriptor::Scope{inbound:id.to_owned(),endpoint:format!("{}:{}",inbound.server_name,addr.port())};
+    let state=reference_health::Store::new(Path::new(&binding.health_store)).and_then(|s|s.inspect()).map_err(|_|Error::Health)?;
+    let directory=PathBuf::from(&binding.bundle);
+    let (value,stamp)=crate::reality_provision::inspect_registered_snapshot(&directory,binding,&state,&scope,now)?;
+    state.validate_active(value.descriptor(),now).map_err(|_|Error::Health)?;
+    let publication=crate::identity_publication::Publication::new(&directory.join("publication.toml"))?;
+    let status=publication.inspect(now)?;
+    if status.snapshot_sha256!=stamp.publication{return Err(Error::Approval);}
+    Ok((directory,scope,status))
+}
+
+pub(crate) struct RotationReview{
+    directory:PathBuf,
+    expected:[u8;32],
+    fingerprint:[u8;32],
+    identity:Option<crate::identity_tls::Identity>,
+    report:String,
+}
+impl RotationReview{
+    pub(crate) fn report(&self)->&str{&self.report}
+    pub(crate) fn prepare(path:&Path,digest:[u8;32],id:&str,retire:bool,now:u64)->Result<Self,Error>{
+        let (directory,scope,status)=rotation_snapshot(path,digest,id,now)?;
+        let (fingerprint,identity,report)=if retire{
+            let ends=status.overlap_ends_at.ok_or(Error::Identity)?;
+            let fingerprint=status.next_fingerprint.ok_or(Error::Identity)?;
+            if now<ends{return Err(Error::Approval);}
+            (fingerprint,None,format!("Отозвать старую identity после overlap.\nСтарый fingerprint={}\nНовый fingerprint={}\nОткрытые туннели не закрываются; пропустившие overlap клиенты требуют независимого enrollment.",
+                hex(status.active_fingerprint),hex(fingerprint)))
+        }else{
+            if !status.valid_now||status.next_fingerprint.is_some(){return Err(Error::Approval);}
+            let key=crate::identity_tls::Identity::generate(scope).map_err(|_|Error::Identity)?;
+            let fingerprint=bootstrap::fingerprint(key.public_key());
+            (fingerprint,Some(key),format!("Начать плановую ротацию identity (7 суток).\nТекущий fingerprint={}\nСледующий fingerprint={}\nОба ключа действуют в overlap; новый ключ пока только в памяти.",
+                hex(status.active_fingerprint),hex(fingerprint)))
+        };
+        Ok(Self{directory,expected:status.snapshot_sha256,fingerprint,identity,report})
+    }
+    pub(crate) fn apply(self,path:&Path,digest:[u8;32],id:&str,now:u64)->Result<String,Error>{
+        let (directory,scope,status)=rotation_snapshot(path,digest,id,now)?;
+        if directory!=self.directory||status.snapshot_sha256!=self.expected{return Err(Error::Approval);}
+        let publication=crate::identity_publication::Publication::new(&directory.join("publication.toml"))?;
+        if let Some(identity)=self.identity{
+            if identity.scope()!=&scope||!status.valid_now||status.next_fingerprint.is_some(){return Err(Error::Approval);}
+            let key_path=directory.join(format!("identity-{}.key",hex(self.fingerprint)));
+            identity.save_new(&key_path).map_err(|e|match e{
+                crate::identity_tls::Error::Indeterminate=>Error::Indeterminate,_=>Error::Storage,
+            })?;
+            if let Err(error)=publication.begin_rotation(&key_path,self.expected,self.fingerprint,now){
+                // Definite failure: delete only the exact key created by
+                // this operation. An uncertain publication keeps material.
+                if error!=Error::Indeterminate && crate::identity_tls::Identity::load(&key_path,&scope)
+                    .is_ok_and(|k|k.public_key()==identity.public_key()){
+                    let _=std::fs::remove_file(&key_path);
+                }
+                return Err(error);
+            }
+            Ok("Ротация опубликована. Live worker перечитает bundle; проверьте runtime отдельно.".into())
+        }else{
+            if status.next_fingerprint!=Some(self.fingerprint){return Err(Error::Approval);}
+            publication.promote(self.expected,self.fingerprint,now)?;
+            Ok("Старая identity отозвана в публикации; live worker применит новое поколение. Проверьте runtime.".into())
+        }
+    }
+}
+
 fn status_document(document: &Config, id: &str, now: u64) -> Result<String, Error> {
     match document {
         Config::Server(doc) => {

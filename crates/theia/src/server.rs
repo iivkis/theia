@@ -2432,6 +2432,8 @@ async fn run_reality_document_inner(document:ServerDocument,
     let mut ready = Vec::with_capacity(document.server.inbounds.len());
     #[cfg(any(target_os="linux",target_os="windows"))]
     let mut loaded_identities=Vec::new();
+    #[cfg(any(target_os="linux",target_os="windows"))]
+    let mut reality_status=HashMap::new();
     for inbound in &document.server.inbounds {
         let tcp_addr: SocketAddr = inbound.h2_listen.parse().map_err(|_| ServerError::Config)?;
         let udp_addr: SocketAddr = inbound.quic_listen.parse().map_err(|_| ServerError::Config)?;
@@ -2465,6 +2467,8 @@ async fn run_reality_document_inner(document:ServerDocument,
                 // no TLS response and no speculative reference forwarding.
                 (None, Some(udp))
             };
+            #[cfg(any(target_os="linux",target_os="windows"))]
+            reality_status.insert(inbound.id.clone(),(inbound.reality.as_ref().ok_or(ServerError::Config)?.manifest_sha256,live_generation.clone()));
             ready.push(Ready::Reality(tcp,quic,silent,manager,live_generation));
         } else {
             let material = tls_material(inbound)?;
@@ -2482,7 +2486,7 @@ async fn run_reality_document_inner(document:ServerDocument,
     let runtime=config_path.map(|path|Arc::new(crate::runtime_generation::State::new(
         crate::runtime_generation::View{document:Arc::new(document.clone()),inbounds:ready.len(),
             preflight:Arc::new(crate::reload_preflight::ReloadPreflight::new(path.to_owned(),document.clone(),loaded_identities)),
-            live:live.clone()})));
+            live:live.clone()}).with_reality(reality_status)));
     #[cfg(target_os = "linux")]
     let management = crate::management::StatusServer::from_environment(ready.len()).map_err(|_| ServerError::Io)?
         .map(|server|if let Some(runtime)=runtime{server.with_runtime(runtime)}else{server});

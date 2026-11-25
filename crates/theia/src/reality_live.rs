@@ -134,6 +134,20 @@ impl Live {
     pub(crate) fn current(&self)->Option<Arc<Generation>>{
         self.slot.read().ok()?.clone()
     }
+    pub(crate) fn status(&self)->Option<crate::reality_generation::Status>{
+        let now=crate::reference_health::unix_now().ok()?;
+        let generation=self.current()?;
+        if generation.relay_value(now).is_none(){return None;}
+        let mut status=generation.lease.status();
+        let p=generation.lease.publication();
+        status.active_usable=p.active().verified().check_time(now).is_ok();
+        status.successor_usable=p.next().is_some_and(|m|m.verified().check_time(now).is_ok());
+        status.overlap=status.active_usable&&status.successor_usable;
+        if !status.active_usable{
+            status.revision=p.next()?.verified().descriptor().revision;
+        }
+        Some(status)
+    }
     pub(crate) fn publish(&self,lease:Arc<Lease>,now:u64)->Result<(),ServerError>{
         if self.current().as_ref().is_some_and(|old| {
             let a=old.lease.status();let b=lease.status();
