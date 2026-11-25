@@ -20,6 +20,7 @@ pub(crate) struct IdentityRoutes {
     upload: String,
     download: String,
     pub(crate) descriptor: String,
+    pub(crate) successor: String,
 }
 
 impl IdentityRoutes {
@@ -40,6 +41,7 @@ impl IdentityRoutes {
             upload: format!("{prefix}/stream-up/upload"),
             download: format!("{prefix}/stream-up/download"),
             descriptor: format!("{prefix}/descriptor"),
+            successor: format!("{prefix}/successor"),
         })
     }
 

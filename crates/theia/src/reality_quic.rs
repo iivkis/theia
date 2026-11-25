@@ -8,7 +8,7 @@
 use crate::{
     config::Config,
     identity_tls::Branch,
-    reality_admission::{Context, ReplayGuard},
+    reality_live::{Live, Route},
     reality_generation::{Lease, Manager},
     reality_quic_wire::{self as wire, Cid, Flight, Inspection, Kind},
     server::{ServerContext, ServerError},
@@ -72,11 +72,12 @@ struct Session {
     remaining: usize,
     paths_opened: usize,
     closed_paths: HashSet<SocketAddr>,
+    generation: Option<Arc<Lease>>,
 }
 impl Session {
     fn new(peer: SocketAddr, original: Cid, client: Cid, now: Instant) -> Self {
         Self { original, client, server: HashSet::new(), retry: None, retry_echoed: false, server_initial: false, first_peer: peer,
-            paths: HashMap::new(), deadline: now + LIFETIME, last: now, remaining: BYTES, paths_opened: 0, closed_paths: HashSet::new() }
+            paths: HashMap::new(), deadline: now + LIFETIME, last: now, remaining: BYTES, paths_opened: 0, closed_paths: HashSet::new(), generation: None }
     }
     fn expired(&self, now: Instant) -> bool {
         now >= self.deadline || now.saturating_duration_since(self.last) >= IDLE || self.remaining == 0
@@ -243,7 +244,8 @@ async fn reference_path(
     incoming: mpsc::Receiver<Vec<u8>>, replies: mpsc::Sender<Reply>,
 ) {
     let publication = generation.publication();
-    let value = publication.active().verified();
+    let Ok(now)=crate::reference_health::unix_now() else { return; };
+    let Some(value)=crate::reality_live::relay_value(&generation,now) else { return; };
     let Ok(Ok(lease)) = timeout(DNS_DEADLINE,
         generation.health().relay_lease(value, publication.plan_sha256())).await else { return; };
     let Ok(address) = lease.address() else { return; };
@@ -408,9 +410,12 @@ pub struct PreparedQuic {
     local: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     local_cids: Arc<LocalCidKey>,
     path_slots: Arc<Semaphore>,
-    context: Arc<ServerContext>,
-    generation: Arc<Lease>,
-    guard: ReplayGuard,
+    live: Arc<Live>,
+    tickets: Arc<Mutex<HashMap<(SocketAddr,Cid), Ticket>>>,
+}
+struct Ticket {
+    route: Arc<Route>,
+    until: Instant,
 }
 impl PreparedQuic {
     pub fn prepare(socket: UdpSocket, document: &Config, inbound_id: &str) -> Result<Self, ServerError> {
@@ -429,22 +434,11 @@ impl PreparedQuic {
 
     pub(crate) fn from_shared(socket: UdpSocket, generation: Arc<Lease>,
         context: Arc<ServerContext>, now: u64) -> Result<Self, ServerError> {
-        let publication = generation.publication();
-        if publication.next().is_some() { return Err(ServerError::Config); }
-        let material = publication.active();
-        let value = material.verified();
-        if !value.effective_modes().h3 { return Err(ServerError::Config); }
-        // The dispatcher consumes admission once for routing. A separate
-        // guard at the native TLS boundary consumes it once for handshake
-        // authorization. This also rejects a new Initial using a formerly
-        // issued CID after Quinn has retired the original connection.
-        let handshake_guard = Arc::new(ReplayGuard::new(65536, now).map_err(|_| ServerError::Config)?);
-        let tls = crate::identity_tls::checked_server_tls(material.identity(), value, Branch::H3,
-            generation.admission(), handshake_guard).map_err(|_| ServerError::Tls)?;
-        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|_| ServerError::Tls)?;
-        let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        server.transport_config(crate::quic_transport::transport_config());
-        server.migration(false);
+        Self::from_live(socket,Live::new(generation,context,now)?)
+    }
+
+    pub(crate) fn from_live(socket:UdpSocket,live:Arc<Live>)->Result<Self,ServerError>{
+        let server=live.current().and_then(|g|g.default_quic()).ok_or(ServerError::Config)?;
         let socket = Arc::new(socket);
         let (local, rx) = mpsc::channel(SESSIONS * 2);
         let local_cids = Arc::new(LocalCidKey::fresh()?);
@@ -455,19 +449,47 @@ impl PreparedQuic {
         let virtual_socket = Arc::new(LocalSocket { socket: socket.clone(), receive: Mutex::new(rx) });
         let endpoint = Endpoint::new_with_abstract_socket(endpoint_config, Some(server),
             virtual_socket, Arc::new(TokioRuntime)).map_err(|_| ServerError::Io)?;
-        let guard = ReplayGuard::new(65536, now).map_err(|_| ServerError::Config)?;
-        Ok(Self { socket, endpoint, local, local_cids, context, generation, guard,
+        Ok(Self { socket,endpoint,local,local_cids,live,
+            tickets:Arc::new(Mutex::new(HashMap::new())),
             path_slots: Arc::new(Semaphore::new(SESSIONS * PATHS)) })
     }
 
     pub async fn serve(self) -> Result<(), ServerError> {
         let endpoint = self.endpoint.clone();
         let result = tokio::select! {
-            result = crate::h3_server::serve(endpoint.clone(), self.context.clone()) => result,
+            result = self.accept_native() => result,
             result = self.dispatch() => result,
         };
         endpoint.close(0u32.into(), b"backend closed");
         result
+    }
+
+    async fn accept_native(&self)->Result<(),ServerError>{
+        let mut tasks=JoinSet::new();
+        loop {
+            tokio::select!{
+                _=tasks.join_next(),if !tasks.is_empty()=>{},
+                incoming=self.endpoint.accept()=>{
+                    let Some(incoming)=incoming else{return Err(ServerError::Io);};
+                    let key=(incoming.remote_address(),incoming.orig_dst_cid().as_ref().to_vec());
+                    let ticket=self.tickets.lock().map_err(|_|ServerError::Io)?.remove(&key);
+                    let Some(ticket)=ticket else{incoming.ignore();continue;};
+                    let Ok(now)=crate::reference_health::unix_now() else{incoming.ignore();continue;};
+                    if ticket.until<=Instant::now() || !ticket.route.current(now) {
+                        incoming.ignore();continue;
+                    }
+                    let Some(config)=ticket.route.quic.clone() else{incoming.ignore();continue;};
+                    let context=ticket.route.context.clone();
+                    let Some(slot)=context.connection_slot() else{incoming.refuse();continue;};
+                    tasks.spawn(async move{
+                        let _slot=slot;
+                        if let Ok(connection)=crate::quic_transport::accept_with(incoming,config).await{
+                            crate::h3_server::run_connection(connection,context).await;
+                        }
+                    });
+                }
+            }
+        }
     }
 
     fn open_path(&self, workers: &mut JoinSet<()>, replies: &mpsc::Sender<Reply>, id: SessionId,
@@ -478,7 +500,7 @@ impl PreparedQuic {
         let (tx, rx) = mpsc::channel(QUEUE);
         session.paths.insert(peer, Path { queue: tx, budget: Budget::default(), last: Instant::now() });
         session.paths_opened += 1;
-        let generation = self.generation.clone();
+        let Some(generation) = session.generation.clone() else { session.paths.remove(&peer); return false; };
         let deadline = session.deadline;
         let replies = replies.clone();
         workers.spawn(async move {
@@ -514,6 +536,7 @@ impl PreparedQuic {
                         if let Some(s) = sessions.remove(&id) { retired.push(Retired::from_session(s,now)); }
                     }
                     admitted.retain(|_, (_, until)| *until > now);
+                    self.tickets.lock().map_err(|_|ServerError::Io)?.retain(|_,ticket|ticket.until>now);
                 }
                 _ = workers.join_next(), if !workers.is_empty() => {}
                 reply = replies.recv() => {
@@ -555,11 +578,10 @@ impl PreparedQuic {
                         let initial_continuation = header.as_ref().is_some_and(|h|
                             admitted.iter().any(|((addr, _), (scid, until))|
                                 *addr == peer && *until > now && h.scid == scid.as_slice()));
-                        let initial_current = !is_initial || crate::reference_health::unix_now().is_ok_and(|wall| {
-                            let value = self.generation.publication().active().verified();
-                            value.check_time(wall).is_ok()
-                                && self.generation.health().validate_active(value.descriptor(),wall).is_ok()
-                        });
+                        // A continuation belongs to the already selected
+                        // handshake. Native TLS validates its own immutable
+                        // ticket; a fresh Initial cannot get a ticket here.
+                        let initial_current = !is_initial || existing_local || initial_continuation;
                         if n <= LOCAL_MAX && initial_current && (!is_initial || existing_local || initial_continuation) {
                             let _ = self.local.try_send((peer, data.to_vec()));
                         }
@@ -592,29 +614,28 @@ impl PreparedQuic {
                     let Some(p) = pending.remove(&key) else { continue; };
                     let Some(decision) = decision else { continue; };
                     let Ok(wall) = crate::reference_health::unix_now() else { continue; };
-                    let publication = self.generation.publication();
-                    let value = publication.active().verified();
-                    if value.check_time(wall).is_err()
-                        || self.generation.health().validate_active(value.descriptor(),wall).is_err() { continue; }
-                    let d = value.descriptor();
-                    let Some(reference) = d.references.get(usize::from(d.active_reference)) else { continue; };
-                    let secret = self.generation.admission();
-                    let context = Context { scope: &d.scope, identity: value.signer(), reference: &reference.server_name, branch: Branch::H3 };
-                    let allowed = match decision {
-                        Inspection::Hello(hello) => self.guard.admit(&secret, &context, &hello, wall).is_ok(),
-                        Inspection::Invalid => false,
-                        Inspection::Pending => continue,
+                    let Some(generation)=self.live.current() else {continue;};
+                    let selected=match decision{
+                        Inspection::Hello(hello)=>generation.select(&self.live.guard,Branch::H3,&hello,wall),
+                        Inspection::Invalid=>None,
+                        Inspection::Pending=>continue,
                     };
-                    if allowed {
-                        if admitted.len() >= SESSIONS { continue; }
-                        if p.datagrams.iter().any(|packet| packet.len() > LOCAL_MAX) { continue; }
-                        admitted.insert(key, (p.client, now + LIFETIME));
-                        for packet in p.datagrams { let _ = self.local.try_send((peer, packet)); }
-                    } else {
+                    if let Some(route)=selected{
+                        if admitted.len()>=SESSIONS || p.datagrams.iter().any(|packet|packet.len()>LOCAL_MAX){continue;}
+                        {
+                            let mut tickets=self.tickets.lock().map_err(|_|ServerError::Io)?;
+                            if tickets.len()>=SESSIONS || tickets.contains_key(&key){continue;}
+                            tickets.insert(key.clone(),Ticket{route,until:now+FIRST_DEADLINE});
+                        }
+                        admitted.insert(key,(p.client,now+LIFETIME));
+                        for packet in p.datagrams{let _=self.local.try_send((peer,packet));}
+                    }else{
+                        if generation.relay_value(wall).is_none(){continue;}
                         if sessions.len() + retired.len() >= RETIRED_LIMIT { continue; }
                         let Some(next) = sequence.checked_add(1) else { return Err(ServerError::Io); };
                         sequence = next;
                         let mut s = Session::new(peer, h.dcid.to_vec(), p.client, now);
+                        s.generation=Some(generation.lease.clone());
                         if !self.open_path(&mut workers, &reply_tx, sequence, &mut s, peer) { continue; }
                         for packet in p.datagrams { s.enqueue(peer, packet, now); }
                         sessions.insert(sequence, s);

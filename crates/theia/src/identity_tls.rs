@@ -484,8 +484,15 @@ impl AdmissionInput {
         secret: Arc<crate::reality_admission::Secret>) -> Result<Self, Error> {
         let now = crate::reference_health::unix_now().map_err(|_| Error::Clock)?;
         value.check_time(now).map_err(|_| Error::Descriptor)?;
+        Self::for_reference(value,branch,secret,usize::from(value.descriptor().active_reference))
+    }
+
+    fn for_reference(value: &descriptor::Verified, branch: Branch,
+        secret: Arc<crate::reality_admission::Secret>, index: usize) -> Result<Self,Error> {
+        let now = crate::reference_health::unix_now().map_err(|_| Error::Clock)?;
+        value.check_time(now).map_err(|_| Error::Descriptor)?;
         let d = value.descriptor();
-        let reference = d.references.get(usize::from(d.active_reference)).ok_or(Error::Descriptor)?;
+        let reference = d.references.get(index).ok_or(Error::Descriptor)?;
         if branch == Branch::H3 && (!d.h3 || !reference.h3 || !value.effective_modes().h3) {
             return Err(Error::Descriptor);
         }
@@ -553,7 +560,13 @@ pub fn admitted_client_tls(value: &descriptor::Verified, branch: Branch,
 pub fn checked_server_tls(identity: &Identity, value: &descriptor::Verified, branch: Branch,
     secret: Arc<crate::reality_admission::Secret>, guard: Arc<crate::reality_admission::ReplayGuard>)
     -> Result<ServerConfig, Error> {
-    let input = AdmissionInput::new(value, branch, secret)?;
+    checked_server_tls_for_reference(identity,value,branch,secret,guard,usize::from(value.descriptor().active_reference))
+}
+
+pub(crate) fn checked_server_tls_for_reference(identity: &Identity, value: &descriptor::Verified,
+    branch: Branch, secret: Arc<crate::reality_admission::Secret>,
+    guard: Arc<crate::reality_admission::ReplayGuard>, index:usize) -> Result<ServerConfig,Error> {
+    let input = AdmissionInput::for_reference(value, branch, secret,index)?;
     if identity.scope() != &input.scope || identity.public_key() != input.public {
         return Err(Error::Key);
     }

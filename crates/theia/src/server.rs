@@ -154,6 +154,7 @@ struct IdentityRoutePolicy {
     not_before: u64,
     not_after: u64,
     signed: Arc<str>,
+    successor: Option<Arc<str>>,
     signer: [u8; 32],
     descriptor: crate::descriptor::Descriptor,
     digest: [u8; 32],
@@ -266,11 +267,30 @@ impl ServerContext {
             not_before: d.not_before,
             not_after: d.not_after,
             signed,
+            successor: None,
             signer: value.signer(),
             descriptor: d.clone(),
             digest: value.payload_sha256(),
         }));
         Ok(self)
+    }
+
+    pub(crate) fn fork_identity(&self, value: &crate::descriptor::Verified,
+        signed: Arc<str>, successor: Option<Arc<str>>) -> Result<Self,ServerError> {
+        let d=value.descriptor();
+        if d.scope.inbound!=self.inbound_id || value.check_time(crate::reference_health::unix_now()
+            .map_err(|_|ServerError::Config)?).is_err() { return Err(ServerError::Config); }
+        let paths=crate::split_http::IdentityRoutes::new(&d.path_prefix).map_err(|_|ServerError::Config)?;
+        Ok(Self {
+            inbound_id:self.inbound_id.clone(), security_mode:self.security_mode,
+            identity_routes:Some(RwLock::new(IdentityRoutePolicy {
+                paths,stream_one:d.stream_one,stream_up:d.stream_up,not_before:d.not_before,
+                not_after:d.not_after,signed,successor,signer:value.signer(),descriptor:d.clone(),digest:value.payload_sha256(),
+            })),
+            authorization:self.authorization.clone(),policy:self.policy.clone(),
+            global_streams:self.global_streams.clone(),user_streams:self.user_streams.clone(),
+            connection_slots:self.connection_slots.clone(),live_quota:self.live_quota.clone(),peer_budget:self.peer_budget.clone(),
+        })
     }
 
     /// Controlled loopback fixture only. Update a compatible signed
@@ -326,7 +346,8 @@ impl ServerContext {
     pub(crate) fn is_descriptor_request<T>(&self, request: &Request<T>) -> bool {
         self.identity_routes.as_ref().is_some_and(|routes| {
             routes.read().is_ok_and(|routes|
-                request.method() == Method::GET && request.uri().path() == routes.paths.descriptor)
+                request.method() == Method::GET && (request.uri().path() == routes.paths.descriptor
+                    || request.uri().path() == routes.paths.successor))
         })
     }
 
@@ -341,7 +362,7 @@ impl ServerContext {
             .read().map_err(|_| StatusCode::NOT_FOUND)?;
         if !routes.current()
             || request.method() != Method::GET
-            || request.uri().path() != routes.paths.descriptor
+            || (request.uri().path() != routes.paths.descriptor && request.uri().path() != routes.paths.successor)
             || request.uri().query().is_some()
             || request
                 .headers()
@@ -369,7 +390,10 @@ impl ServerContext {
                     .and_then(|value| value.to_str().ok()),
             )
             .map_err(AuthFailure::status)?;
-        Ok((permit, routes.signed.clone()))
+        let signed = if request.uri().path() == routes.paths.successor {
+            routes.successor.clone().ok_or(StatusCode::NOT_FOUND)?
+        } else { routes.signed.clone() };
+        Ok((permit, signed))
     }
 
     pub(crate) fn connection_slot(&self) -> Option<ConnectionSlot> {
@@ -2398,7 +2422,7 @@ pub(crate) async fn run_reality_document_with_ready(
     enum Ready {
         Plain(TcpListener, TlsAcceptor, quinn::Endpoint, Arc<ServerContext>),
         Reality(crate::reality_tcp::PreparedTcp, Option<crate::reality_quic::PreparedQuic>,
-            Option<tokio::net::UdpSocket>),
+            Option<tokio::net::UdpSocket>,crate::reality_generation::Manager,Arc<crate::reality_live::Live>),
     }
     let mut ready = Vec::with_capacity(document.server.inbounds.len());
     for inbound in &document.server.inbounds {
@@ -2415,24 +2439,18 @@ pub(crate) async fn run_reality_document_with_ready(
             let manager = crate::reality_generation::Manager::new(&config, &inbound.id, now)
                 .map_err(|_| ServerError::Config)?;
             let generation = Arc::new(manager.refresh(now).map_err(|_| ServerError::Config)?);
-            let publication = generation.publication();
-            if publication.next().is_some() { return Err(ServerError::Config); }
-            let material = publication.active();
-            let value = material.verified();
-            let h3 = value.descriptor().h3;
-            let context = Arc::new(context.with_identity(inbound, value, Arc::from(material.signed()))?);
-            let tcp = crate::reality_tcp::PreparedTcp::from_shared(listener, generation.clone(),
-                context.clone(), now)?;
+            let h3=generation.publication().active().verified().descriptor().h3;
+            let live_generation=crate::reality_live::Live::new(generation,Arc::new(context),now)?;
+            let tcp=crate::reality_tcp::PreparedTcp::from_live(listener,live_generation.clone())?;
             let udp = tokio::net::UdpSocket::bind(udp_addr).await.map_err(|_| ServerError::Io)?;
             let (quic, silent) = if h3 {
-                (Some(crate::reality_quic::PreparedQuic::from_shared(udp, generation,
-                    context, now)?), None)
+                (Some(crate::reality_quic::PreparedQuic::from_live(udp,live_generation.clone())?),None)
             } else {
                 // Keep the approved UDP port reserved; no H3 advertisement,
                 // no TLS response and no speculative reference forwarding.
                 (None, Some(udp))
             };
-            ready.push(Ready::Reality(tcp, quic, silent));
+            ready.push(Ready::Reality(tcp,quic,silent,manager,live_generation));
         } else {
             let material = tls_material(inbound)?;
             let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
@@ -2455,7 +2473,19 @@ pub(crate) async fn run_reality_document_with_ready(
                 tasks.spawn(serve(listener, acceptor, context.clone()));
                 tasks.spawn(crate::h3_server::serve(endpoint, context));
             }
-            Ready::Reality(tcp, quic, silent) => {
+            Ready::Reality(tcp,quic,silent,manager,live_generation) => {
+                tasks.spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let Ok(now)=crate::reference_health::unix_now() else{live_generation.suspend();continue;};
+                        match manager.refresh(now) {
+                            Ok(lease)=>if live_generation.publish(Arc::new(lease),now).is_err(){live_generation.suspend();},
+                            Err(_)=>live_generation.suspend(),
+                        }
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(),ServerError>(())
+                });
                 tasks.spawn(tcp.serve());
                 if let Some(quic) = quic { tasks.spawn(quic.serve()); }
                 if let Some(socket) = silent { silent_sockets.push(socket); }

@@ -5,7 +5,6 @@
 
 use crate::{
     config::Config,
-    descriptor::Verified,
     identity_tls::Branch,
     reality_admission::{self, Context, ReplayGuard, Secret},
     reality_generation::Manager,
@@ -296,10 +295,7 @@ impl RelayGate {
 /// by this task's JoinSet and cancelled on shutdown.
 pub struct PreparedTcp {
     listener: TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-    context: Arc<ServerContext>,
-    lease: Arc<crate::reality_generation::Lease>,
-    guard: Arc<ReplayGuard>,
+    live: Arc<crate::reality_live::Live>,
     relay: Arc<RelayGate>,
     inspection_slots: Arc<Semaphore>,
 }
@@ -321,21 +317,12 @@ impl PreparedTcp {
 
     pub(crate) fn from_shared(listener: TcpListener, lease: Arc<crate::reality_generation::Lease>,
         context: Arc<ServerContext>, now: u64) -> Result<Self, ServerError> {
-        let publication = lease.publication();
-        // Single identity only for this backend candidate: never silently
-        // select the wrong signer during a dual-key overlap.
-        if publication.next().is_some() { return Err(ServerError::Config); }
-        let material = publication.active();
-        let value = material.verified();
-        let reference = active_reference(value)?;
-        let mut tls = material.identity().server_tls(reference, Branch::H2).map_err(|_| ServerError::Tls)?;
-        tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-        // Admission is checked exactly once by the TCP first-flight
-        // dispatcher, not again by the TLS callback.
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-        let guard = Arc::new(ReplayGuard::new(65536, now).map_err(|_| ServerError::Config)?);
-        Ok(Self { listener, acceptor, context, lease, guard,
-            relay: Arc::new(RelayGate::default()), inspection_slots: Arc::new(Semaphore::new(64)) })
+        Self::from_live(listener,crate::reality_live::Live::new(lease,context,now)?)
+    }
+
+    pub(crate) fn from_live(listener:TcpListener,live:Arc<crate::reality_live::Live>)->Result<Self,ServerError>{
+        Ok(Self { listener,live,relay:Arc::new(RelayGate::default()),
+            inspection_slots:Arc::new(Semaphore::new(64)) })
     }
 
     pub async fn serve(self) -> Result<(), ServerError> {
@@ -353,42 +340,25 @@ impl PreparedTcp {
                     tasks.spawn(async move {
                         let Ok(inspected) = inspect(socket).await else { return; };
                         let Ok(now) = crate::reference_health::unix_now() else { return; };
-                        let publication = backend.lease.publication();
-                        let material = publication.active();
-                        let value = material.verified();
-                        if value.check_time(now).is_err()
-                            || backend.lease.health().validate_active(value.descriptor(),now).is_err() { return; }
-                        let Ok(reference) = active_reference(value) else { return; };
-                        let secret = backend.lease.admission();
-                        let admission = Context { scope: &value.descriptor().scope,
-                            identity: value.signer(), reference, branch: Branch::H2 };
-                        let decision = inspected.classify(&backend.guard, &secret, &admission, now);
-                        match decision {
-                            Decision::Admitted(io) => {
-                                let Some(connection) = backend.context.connection_slot() else { return; };
-                                drop(slot);
-                                server::serve_h2_socket(io, backend.acceptor.clone(), backend.context.clone(),
-                                    peer, connection, crate::diagnostics::next_id()).await;
-                            }
-                            Decision::Relay(io) => {
-                                // Keep the bounded inspection slot through
-                                // DNS revalidation and relay construction.
-                                let Ok(lease) = backend.lease.health().relay_lease(value, publication.plan_sha256()).await else { return; };
-                                let _ = backend.relay.relay(io, &lease).await;
-                                drop(slot);
-                            }
+                        let Some(generation)=backend.live.current() else { return; };
+                        let selected=inspected.hello.as_ref().and_then(|hello|
+                            generation.select(&backend.live.guard,Branch::H2,hello,now));
+                        if let Some(route)=selected {
+                            let Some(connection)=route.context.connection_slot() else { return; };
+                            drop(slot);
+                            server::serve_h2_socket(inspected.io,route.tcp.clone(),route.context.clone(),
+                                peer,connection,crate::diagnostics::next_id()).await;
+                        } else {
+                            let Some(value)=generation.relay_value(now) else { return; };
+                            let Ok(lease)=generation.lease.health().relay_lease(value,generation.lease.publication().plan_sha256()).await else { return; };
+                            let _=backend.relay.relay(inspected.io,&lease).await;
+                            drop(slot);
                         }
                     });
                 }
             }
         }
     }
-}
-
-fn active_reference(value: &Verified) -> Result<&str, ServerError> {
-    let d = value.descriptor();
-    d.references.get(usize::from(d.active_reference)).map(|r| r.server_name.as_str())
-        .ok_or(ServerError::Config)
 }
 
 #[cfg(test)]
