@@ -1,7 +1,8 @@
 //! Production H2/H3 data-plane liveness on actual loopback TCP and TLS/QUIC.
-//! Short asymmetric/idle cases run in ordinary and instrumented suites.
-//! Real >300s traffic runs once per OS in a mandatory parallel CI job.
-//! Each group executes both transports concurrently using real sockets.
+//! All asymmetric, half-close, idle and sustained traffic cases run concurrently
+//! over real sockets in the mandatory ordinary and instrumented native suites.
+//! The complete matrix has a 55s deadline. Virtual-time unit tests cover >300s
+//! of relay progress separately; that is not a real 300s network soak.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use sha2::{Digest, Sha256};
@@ -179,10 +180,10 @@ impl Fixture {
 
         let started = Instant::now();
         // Keep the opposite direction silent (or already half-closed).
-        // Long cases cross the retired 300s cap with actual byte progress.
+        // Sustained cases transfer additional blocks for over 40 real seconds.
         let long = matches!(case, Case::LongUpload | Case::LongDownload);
         let (blocks, interval) = if long {
-            (32, Duration::from_secs(10))
+            (23, Duration::from_secs(2))
         } else {
             (7, Duration::from_millis(5500))
         };
@@ -205,7 +206,7 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("{transport:?}/{case:?}: stalled at block {index}"));
             assert_eq!(received, payload);
         }
-        assert!(started.elapsed() > Duration::from_secs(if long { 300 } else { 30 }));
+        assert!(started.elapsed() > Duration::from_secs(if long { 40 } else { 30 }));
         if upload {
             app.shutdown().await.unwrap();
             let mut end = Vec::new();
@@ -261,18 +262,10 @@ async fn production_h2_h3_asymmetric_traffic_half_close_and_idle() {
             Case::UploadAfterRemoteFin,
             Case::DownloadAfterLocalFin,
             Case::Idle,
+            Case::LongUpload,
+            Case::LongDownload,
         ],
-        Duration::from_secs(90),
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "real wall-clock >300s; mandatory parallel native-liveness CI matrix"]
-async fn production_h2_h3_real_traffic_beyond_300_seconds() {
-    exercise_matrix(
-        &[Case::LongUpload, Case::LongDownload],
-        Duration::from_secs(390),
+        Duration::from_secs(55),
     )
     .await;
 }

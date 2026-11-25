@@ -23,8 +23,6 @@ EXPECTED_JOBS = frozenset({
 })
 
 MERGED_JOBS = EXPECTED_JOBS | frozenset({
-    "Real 300s relay liveness (ubuntu-latest)",
-    "Real 300s relay liveness (windows-latest)",
     "Coverage instrumented (ubuntu-latest)",
     "Coverage instrumented (windows-latest)",
     "Production line coverage >= 80%",

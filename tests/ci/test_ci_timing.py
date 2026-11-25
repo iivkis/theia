@@ -40,10 +40,12 @@ def snapshot(run_id=1, sha="a" * 40, event="pull_request", merged=False):
 
 
 class TimingTests(unittest.TestCase):
-    def test_merged_dev_matrix_requires_coverage_and_both_long_liveness_jobs(self):
+    def test_merged_dev_matrix_requires_coverage_without_separate_soak_jobs(self):
         run, jobs = snapshot(merged=True)
         result = timing.summarize(run, jobs)
         self.assertEqual(set(result["jobs"]), timing.MERGED_JOBS)
+        self.assertEqual(len(result["jobs"]), 16)
+        self.assertNotIn("Real 300s relay liveness (ubuntu-latest)", result["jobs"])
         self.assertEqual(result["runner_job_seconds"], len(timing.MERGED_JOBS) * 60)
         after = timing.summarize(*snapshot(2, merged=True))
         self.assertIn("Production line coverage >= 80%", timing.compare(result, after))

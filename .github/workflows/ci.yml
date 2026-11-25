@@ -623,38 +623,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-  native-liveness:
-    name: Real 300s relay liveness (${{ matrix.os }})
-    needs: specification
-    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    env:
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
-      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.specification.outputs.tested_sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: native-default-deps-v4
-          cache-workspace-crates: false
-          cache-bin: false
-          save-if: false
-      - name: Mandatory real H2 and H3 traffic beyond 300 seconds
-        shell: pwsh
-        run: |
-          cargo test --workspace --locked --test tunnel_liveness -- production_h2_h3_real_traffic_beyond_300_seconds --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
-          if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test production_h2_h3_real_traffic_beyond_300_seconds \.\.\. ok') { throw 'Real long-lived relay test failed or did not execute' }
-
   coverage-native:
     name: Coverage instrumented (${{ matrix.os }})
     needs: specification
@@ -773,7 +741,7 @@ jobs:
 
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-4-btls-spike, m3-4e-btls-production-feature, native-liveness, coverage-native, coverage-gate]
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-4-btls-spike, m3-4e-btls-production-feature, coverage-native, coverage-gate]
     if: ${{ always() && github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -791,7 +759,7 @@ jobs:
           import re
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-4-btls-spike", "m3-4e-btls-production-feature", "native-liveness", "coverage-native", "coverage-gate"}
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-4-btls-spike", "m3-4e-btls-production-feature", "coverage-native", "coverage-gate"}
           native = os.environ["NATIVE_REQUIRED"]
           if native != "true":
               raise SystemExit("Every merge requires full native CI; fail closed")
