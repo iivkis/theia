@@ -142,7 +142,7 @@ require(needs("coverage-native") == {"specification"} and
         needs("coverage-gate") == {"specification", "coverage-native"},
         "coverage gate must consume both native jobs")
 for term in ("os: [ubuntu-latest, windows-latest]", "llvm-tools-preview",
-             "cargo llvm-cov test --workspace --all-targets --all-features --locked --lcov",
+             "cargo llvm-cov test --workspace --all-targets --all-features --locked --no-report",
              "cargo llvm-cov report --json --include-build-script",
              "--no-report --lib -- windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override --ignored --exact",
              "--no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact",
@@ -297,4 +297,44 @@ require(
     and "cancel-in-progress: false" in workflow,
     "different merged commits must never cancel one another",
 )
+# Cache privileges are separate from repository contents permissions.
+# The privileged formatter and all non-producers remain read-only for caches.
+require(re.search(r"(?m)^cache-mode: read$", workflow) is not None,
+        "cache access defaults to read-only")
+cache_writers = {"m0-1-api-spike", "m0-1-windows-spike", "rust-tests",
+                 "windows-smoke", "m3-4-btls-spike",
+                 "m3-4e-btls-production-feature", "coverage-native"}
+for name in mandatory | {"ci-gate"}:
+    payload = job(name)
+    require(("    cache-mode: write" in payload) == (name in cache_writers),
+            f"{name}: unexpected cache-write privilege")
+    if name in cache_writers:
+        require(needs(name) == {"specification"}
+                and "if: " + dev_merge in payload
+                and "cache-workspace-crates: false" in payload
+                and "cache-bin: false" in payload,
+                f"{name}: cache producer must be trusted and dependency-only")
+require("rust-cache" not in spec and "actions/cache" not in spec,
+        "never restore executable caches in the write-privileged source publisher")
+for name in ("rust-tests", "windows-smoke", "browser-e2e", "native-liveness"):
+    payload = job(name)
+    require("shared-key: native-default-deps-v4" in payload
+            and 'CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in payload
+            and 'CARGO_PROFILE_TEST_DEBUG: "line-tables-only"' in payload
+            and "cache-workspace-crates: false" in payload
+            and "cache-bin: false" in payload,
+            f"{name}: incompatible shared native cache or workspace output caching")
+for name in ("browser-e2e", "native-liveness"):
+    require("save-if: false" in job(name), f"{name}: restore-only cache consumer")
+require("shared-key: native-default-deps-v4" not in coverage_native,
+        "instrumented outputs must never share the default native target cache")
+require(coverage_native.count("cargo llvm-cov report --lcov --include-build-script") == 1
+        and coverage_native.index("Instrument real disposable Windows proxy and ConPTY lifecycle")
+        < coverage_native.index("Export LCOV once after all native instrumented tests"),
+        "export LCOV exactly once, after all mandatory instrumented cases")
+require("$bins = @($testEvents | Where-Object" in browser
+        and "if ($bins.Count -eq 0)" in browser
+        and "$_.profile.test -eq $false" in browser
+        and "$_.target.kind -contains 'bin'" in browser,
+        "F-14 must reuse a genuine same-build Windows client, with explicit build fallback")
 print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")

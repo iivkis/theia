@@ -13,10 +13,11 @@ timing = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(timing)
 
 
-def snapshot(run_id=1, sha="a" * 40, event="pull_request"):
+def snapshot(run_id=1, sha="a" * 40, event="pull_request", merged=False):
     run = {
         "id": run_id, "run_attempt": 1, "head_sha": sha, "event": event,
-        "name": "CI (tests first)", "status": "completed", "conclusion": "success",
+        "name": "CI (merged dev)" if merged else "CI (tests first)",
+        "status": "completed", "conclusion": "success",
         "created_at": "2026-11-24T12:00:00Z",
         "run_started_at": "2026-11-24T12:00:01Z",
         "updated_at": "2026-11-24T12:02:00Z",
@@ -34,11 +35,29 @@ def snapshot(run_id=1, sha="a" * 40, event="pull_request"):
             "number": 2, "name": "Manual release compilation", "status": "completed",
             "conclusion": "skipped", "started_at": None, "completed_at": None,
         }],
-    } for name in sorted(timing.EXPECTED_JOBS)]
+    } for name in sorted(timing.MERGED_JOBS if merged else timing.EXPECTED_JOBS)]
     return run, {"total_count": len(jobs), "jobs": jobs}
 
 
 class TimingTests(unittest.TestCase):
+    def test_merged_dev_matrix_requires_coverage_and_both_long_liveness_jobs(self):
+        run, jobs = snapshot(merged=True)
+        result = timing.summarize(run, jobs)
+        self.assertEqual(set(result["jobs"]), timing.MERGED_JOBS)
+        self.assertEqual(result["runner_job_seconds"], len(timing.MERGED_JOBS) * 60)
+        after = timing.summarize(*snapshot(2, merged=True))
+        self.assertIn("Production line coverage >= 80%", timing.compare(result, after))
+        with self.assertRaises(timing.EvidenceError):
+            timing.compare(result, timing.summarize(*snapshot(2)))
+        for missing in timing.MERGED_JOBS - timing.EXPECTED_JOBS:
+            broken = deepcopy(jobs)
+            broken["jobs"] = [job for job in broken["jobs"] if job["name"] != missing]
+            broken["total_count"] -= 1
+            with self.assertRaises(timing.EvidenceError):
+                timing.summarize(run, broken)
+        with self.assertRaises(timing.EvidenceError):
+            timing.summarize(*snapshot(event="push", merged=True))
+
     def test_real_sanitized_api_snapshots_match_observed_durations(self):
         path = SOURCE.parents[1] / "tests" / "ci" / "fixtures" / "timing-snapshots.json"
         snapshots = json.loads(path.read_text(encoding="utf-8"))
