@@ -50,15 +50,35 @@ fn measure(comparison: bool) {
         sha.clone()
     };
     let mut command = Command::new("python");
-    command.arg(script)
+    command
+        .arg(script)
         .args(["--baseline", &baseline, "--candidate", binary])
-        .args(["--baseline-revision", &baseline_sha, "--candidate-revision", &sha])
-        .arg("--cert").arg(cert).arg("--key").arg(key)
-        .arg("--output").arg(output);
+        .args([
+            "--baseline-revision",
+            &baseline_sha,
+            "--candidate-revision",
+            &sha,
+        ])
+        .arg("--cert")
+        .arg(cert)
+        .arg("--key")
+        .arg(key)
+        .arg("--output")
+        .arg(output);
     if comparison {
-        command.args(["--repetitions", "3", "--conditions", "clean", "relay-delay", "udp-loss"]);
+        command.args([
+            "--repetitions",
+            "3",
+            "--conditions",
+            "clean",
+            "relay-delay",
+            "udp-loss",
+        ]);
     }
     let result = command.output().expect("native measurement harness");
-    assert!(result.status.success(), "controlled benchmark failed: {}",
-            String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "controlled benchmark failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }

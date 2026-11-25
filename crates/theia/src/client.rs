@@ -1003,7 +1003,10 @@ impl Tunnel {
             let mut buffer = [0; 4096];
             let mut batch = crate::relay_batch::BatchReader::new();
             loop {
-                let size = batch.read(&mut read, &mut buffer).await.map_err(|_| ClientError::Io)?;
+                let size = batch
+                    .read(&mut read, &mut buffer)
+                    .await
+                    .map_err(|_| ClientError::Io)?;
                 let frame = if size == 0 {
                     Frame::Fin
                 } else {

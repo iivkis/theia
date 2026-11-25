@@ -2,12 +2,12 @@
 //! test. This is a research comparison with Theia's measured H2 baseline.
 //! The browser context alone accepts a generated loopback-only test cert;
 //! production Theia (default rustls/optional BoringSSL) still verifies PKI.
-#[path = "support/h2_wire.rs"]
-mod h2_wire;
 #[path = "../../../spikes/m0_1/src/client_hello.rs"]
 mod client_hello;
 #[path = "support/f13_evidence.rs"]
 mod f13_evidence;
+#[path = "support/h2_wire.rs"]
+mod h2_wire;
 
 fn emit_tls(name: &str, capture: &Arc<Mutex<Capture>>) {
     let summary = {
@@ -27,7 +27,6 @@ fn emit_tls(name: &str, capture: &Arc<Mutex<Capture>>) {
     );
     f13_evidence::emit(name, &json);
 }
-
 
 use bytes::Bytes;
 use h2_wire::{inspect, Observation, MAX_CAPTURE_BYTES};

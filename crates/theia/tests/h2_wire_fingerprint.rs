@@ -2,12 +2,12 @@
 //! the production H2Client, including its optional BoringSSL TLS backend.
 //! Capture occurs *after* a verified TLS1.3 handshake on test-only loopback.
 //! No TLS secrets, authorization values, HPACK block or raw frames are logged.
-#[path = "support/h2_wire.rs"]
-mod h2_wire;
 #[path = "../../../spikes/m0_1/src/client_hello.rs"]
 mod client_hello;
 #[path = "support/f13_evidence.rs"]
 mod f13_evidence;
+#[path = "support/h2_wire.rs"]
+mod h2_wire;
 
 fn emit_tls(name: &str, capture: &Arc<Mutex<Capture>>) {
     let summary = {
@@ -27,7 +27,6 @@ fn emit_tls(name: &str, capture: &Arc<Mutex<Capture>>) {
     );
     f13_evidence::emit(name, &json);
 }
-
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use h2_wire::{inspect, Observation, MAX_CAPTURE_BYTES};

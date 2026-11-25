@@ -9,10 +9,10 @@
 //! fingerprint equivalence or a modified REALITY TLS handshake.
 #![forbid(unsafe_code)]
 
-#[path = "support/f18_research_identity.rs"]
-mod identity;
 #[path = "support/f13_evidence.rs"]
 mod f13_evidence;
+#[path = "support/f18_research_identity.rs"]
+mod identity;
 
 use bytes::{Buf, Bytes};
 use identity::{Branch, Failure, ReplayWindow, Transcript};
@@ -410,33 +410,60 @@ async fn actual_native_h3_client_initial_reference() {
         let mut roots = RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
         let endpoint = server_endpoint(
-            "127.0.0.1:0".parse().unwrap(), vec![cert.cert.der().clone()],
+            "127.0.0.1:0".parse().unwrap(),
+            vec![cert.cert.der().clone()],
             PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
-        ).unwrap();
+        )
+        .unwrap();
         let (front, initial, proxy) = udp_witness(endpoint.local_addr().unwrap()).await;
         let (done, finished) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let connection = accept(endpoint.accept().await.unwrap()).await.unwrap();
-            let mut http3 = h3::server::Connection::new(h3_quinn::Connection::new(connection.clone()))
-                .await.unwrap();
-            let (request, mut stream) = http3.accept().await.unwrap().unwrap()
-                .resolve_request().await.unwrap();
+            let mut http3 =
+                h3::server::Connection::new(h3_quinn::Connection::new(connection.clone()))
+                    .await
+                    .unwrap();
+            let (request, mut stream) = http3
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
             assert_eq!(request.method(), http::Method::POST);
             assert_eq!(request.uri().path(), "/v1/theia-example/session");
-            stream.send_response(http::Response::builder().status(403).body(()).unwrap()).await.unwrap();
+            stream
+                .send_response(http::Response::builder().status(403).body(()).unwrap())
+                .await
+                .unwrap();
             stream.finish().await.unwrap();
             finished.await.unwrap();
             connection.close(0u32.into(), b"fixture done");
         });
-        let client = H3Client::new(front, "localhost", &URL_SAFE_NO_PAD.encode([0x42;32]), roots).unwrap();
-        assert!(matches!(client.open(Address::V4([127,0,0,1]), 443).await, Err(ClientError::Unauthorized)));
-        let observation = initial.await.unwrap().expect("actual native client QUIC Initial");
+        let client = H3Client::new(
+            front,
+            "localhost",
+            &URL_SAFE_NO_PAD.encode([0x42; 32]),
+            roots,
+        )
+        .unwrap();
+        assert!(matches!(
+            client.open(Address::V4([127, 0, 0, 1]), 443).await,
+            Err(ClientError::Unauthorized)
+        ));
+        let observation = initial
+            .await
+            .unwrap()
+            .expect("actual native client QUIC Initial");
         assert_eq!(observation.version, 1);
         emit_initial("native-h3-initial.json", observation);
         done.send(()).unwrap();
         server.await.unwrap();
         proxy.abort();
-    }).await.expect("bounded native H3 first-flight observation");
+    })
+    .await
+    .expect("bounded native H3 first-flight observation");
 }
 
 /// Independent real-browser HTTP/3 reference. The only certificate exception

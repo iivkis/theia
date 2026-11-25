@@ -20,6 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
 use tokio::{
     io::AsyncWriteExt,
     net::{lookup_host, TcpListener, TcpStream},
@@ -28,8 +30,6 @@ use tokio::{
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
-#[cfg(test)]
-use tokio::io::AsyncReadExt;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(30);

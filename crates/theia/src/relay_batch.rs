@@ -22,7 +22,10 @@ pub(crate) struct BatchReader {
 
 impl BatchReader {
     pub(crate) fn new() -> Self {
-        Self { eof: false, deferred: None }
+        Self {
+            eof: false,
+            deferred: None,
+        }
     }
 
     pub(crate) async fn read<R: AsyncRead + Unpin>(
@@ -31,7 +34,10 @@ impl BatchReader {
         buffer: &mut [u8],
     ) -> io::Result<usize> {
         if buffer.is_empty() || buffer.len() > MAX_BATCH {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "relay batch bound"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "relay batch bound",
+            ));
         }
         if let Some(error) = self.deferred.take() {
             return Err(error);
@@ -68,12 +74,20 @@ impl BatchReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, pin::Pin, task::{Context, Poll}};
+    use std::{
+        collections::VecDeque,
+        pin::Pin,
+        task::{Context, Poll},
+    };
     use tokio::io::{AsyncWriteExt, ReadBuf};
 
     struct Source(VecDeque<io::Result<Vec<u8>>>);
     impl AsyncRead for Source {
-        fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
             match self.0.pop_front() {
                 Some(Ok(bytes)) => {
                     assert!(bytes.len() <= buf.remaining());
@@ -119,15 +133,27 @@ mod tests {
     async fn full_buffer_returns_without_wait_and_never_discards_read_data_on_error() {
         let mut reader = BatchReader::new();
         let mut source = Source(VecDeque::from([
-            Ok(vec![7; MAX_BATCH]), Ok(vec![8]), Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+            Ok(vec![7; MAX_BATCH]),
+            Ok(vec![8]),
+            Err(io::Error::from(io::ErrorKind::BrokenPipe)),
         ]));
         let mut data = [0; MAX_BATCH];
         let start = Instant::now();
-        assert_eq!(reader.read(&mut source, &mut data).await.unwrap(), MAX_BATCH);
+        assert_eq!(
+            reader.read(&mut source, &mut data).await.unwrap(),
+            MAX_BATCH
+        );
         assert_eq!(Instant::now(), start);
         assert_eq!(reader.read(&mut source, &mut data).await.unwrap(), 1);
         assert_eq!(data[0], 8);
-        assert_eq!(reader.read(&mut source, &mut data).await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            reader
+                .read(&mut source, &mut data)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
         assert!(reader.read(&mut source, &mut []).await.is_err());
     }
 }
