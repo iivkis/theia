@@ -70,7 +70,9 @@ impl H3Client {
             identity_quic: None,
             identity_routes: None,
             padding: crate::descriptor::Padding::default(),
-            own_routes: Some(crate::split_http::IdentityRoutes::new(crate::split_http::EXAMPLE_PREFIX)?),
+            own_routes: Some(crate::split_http::IdentityRoutes::new(
+                crate::split_http::EXAMPLE_PREFIX,
+            )?),
             connect_timeout: Duration::from_secs(10),
             certificate_pin: None,
             stream_up: false,
@@ -276,7 +278,12 @@ impl H3Client {
         }
         let routes = crate::split_http::IdentityRoutes::new(prefix)?;
         let mut parts = self.uri.clone().into_parts();
-        parts.path_and_query = Some(routes.single.parse().map_err(|_| ClientError::Configuration)?);
+        parts.path_and_query = Some(
+            routes
+                .single
+                .parse()
+                .map_err(|_| ClientError::Configuration)?,
+        );
         self.uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
         self.own_routes = Some(routes);
         Ok(self)
@@ -395,11 +402,7 @@ impl H3Client {
         self.verified_connection().await.map(|_| ())
     }
 
-    async fn open_selected(
-        &self,
-        open: Frame,
-        operation: u64,
-    ) -> Result<H3Tunnel, ClientError> {
+    async fn open_selected(&self, open: Frame, operation: u64) -> Result<H3Tunnel, ClientError> {
         use crate::split_http::HelloOutcome;
         let mut stage = HelloOutcome::Pending;
         let Some(mode) = &self.auto_mode else {
@@ -423,7 +426,9 @@ impl H3Client {
         // The original H3 attempt already completed HTTP admission.
         // UDP silence in the second attempt must not authorize H2 fallback.
         match result {
-            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => Err(ClientError::Timeout),
+            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => {
+                Err(ClientError::Timeout)
+            }
             other => other,
         }
     }
@@ -445,7 +450,9 @@ impl H3Client {
         *stage = HelloOutcome::Pending;
         let result = self.open_inner(open, operation, stream_up, stage).await;
         match result {
-            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => Err(ClientError::Timeout),
+            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => {
+                Err(ClientError::Timeout)
+            }
             other => other,
         }
     }
@@ -566,10 +573,7 @@ impl H3Client {
                 )?)
                 .await
                 .map_err(&mut admission_error)?;
-            let upload_response = upload
-                .recv_response()
-                .await
-                .map_err(&mut admission_error)?;
+            let upload_response = upload.recv_response().await.map_err(&mut admission_error)?;
             split_http::check_status(upload_response.status())?;
             if upload
                 .recv_data()
@@ -598,13 +602,13 @@ impl H3Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let mut stream = sender
-                .send_request(crate::channel_binding::attach(binding, self.padding.request(request)?)?)
+                .send_request(crate::channel_binding::attach(
+                    binding,
+                    self.padding.request(request)?,
+                )?)
                 .await
                 .map_err(&mut admission_error)?;
-            let response = stream
-                .recv_response()
-                .await
-                .map_err(&mut admission_error)?;
+            let response = stream.recv_response().await.map_err(&mut admission_error)?;
             let (tx, rx) = stream.split();
             (response, tx, rx)
         };
@@ -656,12 +660,18 @@ impl H3Client {
             "hello_ack_received",
             "op" = Value::Count(operation)
         );
-        let Frame::HelloAck { accepted_capabilities, .. } = ack else {
+        let Frame::HelloAck {
+            accepted_capabilities,
+            ..
+        } = ack
+        else {
             return Err(ClientError::Protocol);
         };
         *stage = crate::split_http::HelloOutcome::Acked;
         if let Some(padding) = self.padding.frame(accepted_capabilities)? {
-            state.apply(Direction::Send, &padding).map_err(|_| ClientError::Protocol)?;
+            state
+                .apply(Direction::Send, &padding)
+                .map_err(|_| ClientError::Protocol)?;
             send(&mut tx, &padding).await?;
         }
         state

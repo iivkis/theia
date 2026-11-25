@@ -228,11 +228,17 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
         {
             let approval = match (*kind, tail) {
                 ("credential-refresh-preview", []) => None,
-                ("credential-refresh-save", ["--sha256", digest, "--confirm"]) => Some(hash(digest)?),
+                ("credential-refresh-save", ["--sha256", digest, "--confirm"]) => {
+                    Some(hash(digest)?)
+                }
                 _ => return Err(CliError::InvalidArguments),
             };
-            Command::CredentialRefresh { config: path(c)?, id: (*id).to_owned(),
-                invitation: path(i)?, approval }
+            Command::CredentialRefresh {
+                config: path(c)?,
+                id: (*id).to_owned(),
+                invitation: path(i)?,
+                approval,
+            }
         }
         ["registered-status", "--config", c, "--id", id] if config::valid_id(id) => {
             Command::RegisteredStatus {
@@ -543,14 +549,23 @@ fn publication_status(
 pub fn run(command: Command) -> Result<String, Error> {
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
     match command {
-        Command::CredentialRefresh { config, id, invitation, approval } => {
+        Command::CredentialRefresh {
+            config,
+            id,
+            invitation,
+            approval,
+        } => {
             let path = Path::new(&config);
             let source = Path::new(&invitation);
             if let Some(expected) = approval {
                 reality_config::save_credential_refresh(path, &id, source, expected, now)?;
-                Ok("Credential saved; trust unchanged; runtime UNCHANGED; explicit Apply required".into())
+                Ok(
+                    "Credential saved; trust unchanged; runtime UNCHANGED; explicit Apply required"
+                        .into(),
+                )
             } else {
-                let (digest, revision) = reality_config::preview_credential_refresh(path, &id, source, now)?;
+                let (digest, revision) =
+                    reality_config::preview_credential_refresh(path, &id, source, now)?;
                 Ok(format!("Credential-only refresh; profile={id}\nrevision={revision}\ntrust unchanged; runtime UNCHANGED\napproval_sha256={}", hex(digest)))
             }
         }
@@ -1017,13 +1032,30 @@ mod tests {
         let c = dir.file("client.toml");
         let i = dir.file("invitation");
         let digest = "01".repeat(32);
-        let prefix = ["credential-refresh-save", "--config", c.as_str(), "--id", "client", "--invitation", i.as_str()];
+        let prefix = [
+            "credential-refresh-save",
+            "--config",
+            c.as_str(),
+            "--id",
+            "client",
+            "--invitation",
+            i.as_str(),
+        ];
         assert!(parse(&prefix).is_err());
         let args = [prefix.as_slice(), &["--sha256", &digest, "--confirm"]].concat();
-        assert!(matches!(parse(&args), Ok(Command::CredentialRefresh { approval: Some(_), .. })));
+        assert!(matches!(
+            parse(&args),
+            Ok(Command::CredentialRefresh {
+                approval: Some(_),
+                ..
+            })
+        ));
         let mut preview = prefix;
         preview[0] = "credential-refresh-preview";
-        assert!(matches!(parse(&preview), Ok(Command::CredentialRefresh { approval: None, .. })));
+        assert!(matches!(
+            parse(&preview),
+            Ok(Command::CredentialRefresh { approval: None, .. })
+        ));
     }
 
     #[test]

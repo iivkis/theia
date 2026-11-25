@@ -512,10 +512,7 @@ impl Interaction {
     }
 
     fn update(&mut self, model: &mut Model, key: KeyEvent) -> bool {
-        if key.kind != KeyEventKind::Press
-            || self.saving.is_some()
-            || self.exporting.is_some()
-        {
+        if key.kind != KeyEventKind::Press || self.saving.is_some() || self.exporting.is_some() {
             return false;
         }
         #[cfg(windows)]

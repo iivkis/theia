@@ -411,7 +411,9 @@ impl H2Client {
             certificate_pin: None,
             identity_routes: None,
             padding: crate::descriptor::Padding::default(),
-            own_routes: Some(crate::split_http::IdentityRoutes::new(crate::split_http::EXAMPLE_PREFIX)?),
+            own_routes: Some(crate::split_http::IdentityRoutes::new(
+                crate::split_http::EXAMPLE_PREFIX,
+            )?),
             stream_up: false,
             auto_mode: None,
             pool: crate::connection_pool::Pool::default(),
@@ -448,7 +450,12 @@ impl H2Client {
         }
         let routes = crate::split_http::IdentityRoutes::new(prefix)?;
         let mut parts = self.uri.clone().into_parts();
-        parts.path_and_query = Some(routes.single.parse().map_err(|_| ClientError::Configuration)?);
+        parts.path_and_query = Some(
+            routes
+                .single
+                .parse()
+                .map_err(|_| ClientError::Configuration)?,
+        );
         self.uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
         self.own_routes = Some(routes);
         Ok(self)
@@ -536,11 +543,7 @@ impl H2Client {
         result
     }
 
-    async fn open_selected(
-        &self,
-        open: Frame,
-        operation: u64,
-    ) -> Result<Tunnel, ClientError> {
+    async fn open_selected(&self, open: Frame, operation: u64) -> Result<Tunnel, ClientError> {
         use crate::split_http::HelloOutcome;
         let mut stage = HelloOutcome::Pending;
         let Some(mode) = &self.auto_mode else {
@@ -681,7 +684,14 @@ impl H2Client {
             .await?;
         // A network transition during a queued/dialing admission invalidates
         // reuse before any HTTP headers or bearer are sent.
-        if route.is_some() && self.endpoint.parse().ok().and_then(crate::network_scope::observe) != route {
+        if route.is_some()
+            && self
+                .endpoint
+                .parse()
+                .ok()
+                .and_then(crate::network_scope::observe)
+                != route
+        {
             lease.retire();
             return Err(ClientError::Io);
         }
@@ -692,7 +702,10 @@ impl H2Client {
         // retry. The lease's Drop removes the draining connection from reuse
         // while other admitted leases retain it.
         let mut admission_error = |error: h2::Error| {
-            if error.is_go_away() && error.is_remote() && error.reason() == Some(h2::Reason::NO_ERROR) {
+            if error.is_go_away()
+                && error.is_remote()
+                && error.reason() == Some(h2::Reason::NO_ERROR)
+            {
                 lease.retire();
                 *stage = crate::split_http::HelloOutcome::Draining;
             }
@@ -761,7 +774,10 @@ impl H2Client {
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
             let (response, tx) = sender
-                .send_request(crate::channel_binding::attach(binding, self.padding.request(request)?)?, false)
+                .send_request(
+                    crate::channel_binding::attach(binding, self.padding.request(request)?)?,
+                    false,
+                )
                 .map_err(&mut admission_error)?;
             (response.await.map_err(&mut admission_error)?, tx)
         };
@@ -818,12 +834,18 @@ impl H2Client {
             "hello_ack_received",
             "op" = Value::Count(operation)
         );
-        let Frame::HelloAck { accepted_capabilities, .. } = ack else {
+        let Frame::HelloAck {
+            accepted_capabilities,
+            ..
+        } = ack
+        else {
             return Err(ClientError::Protocol);
         };
         *stage = crate::split_http::HelloOutcome::Acked;
         if let Some(padding) = self.padding.frame(accepted_capabilities)? {
-            state.apply(Direction::Send, &padding).map_err(|_| ClientError::Protocol)?;
+            state
+                .apply(Direction::Send, &padding)
+                .map_err(|_| ClientError::Protocol)?;
             send_frame(&mut outgoing, &padding, false).await?;
         }
         state

@@ -550,29 +550,49 @@ mod tests {
 
     #[test]
     fn replacement_v1_roundtrips_own_tls_and_rejects_retired_profiles() {
-        let Config::Client(doc) = crate::config::parse(include_str!("../../../examples/client.toml")).unwrap() else { panic!() };
+        let Config::Client(doc) =
+            crate::config::parse(include_str!("../../../examples/client.toml")).unwrap()
+        else {
+            panic!()
+        };
         let mut profile = doc.client.profiles[0].clone();
         for transport in [Transport::H2, Transport::H3, Transport::Auto] {
             profile.transport = transport;
-            let link = Invitation::public_from_profile(&profile).unwrap().encode().unwrap();
+            let link = Invitation::public_from_profile(&profile)
+                .unwrap()
+                .encode()
+                .unwrap();
             let payload = link.strip_prefix(PREFIX).unwrap();
             let raw = String::from_utf8(URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
             let decoded = Invitation::decode(&link).unwrap();
-            assert_eq!(decoded.to_profile("env:TOKEN", None).unwrap().path_prefix, profile.path_prefix);
+            assert_eq!(
+                decoded.to_profile("env:TOKEN", None).unwrap().path_prefix,
+                profile.path_prefix
+            );
             assert_eq!(decoded.transport, transport);
             assert_eq!(decoded.encode().unwrap(), link);
             for bad in [
                 raw.replace("own-tls", "pinned-tls"),
                 raw.replace("own-tls", "browser-h2-btls-v1"),
                 raw.replace("/v1/theia-example", "/v1/../x"),
-                raw.lines().filter(|line| !line.starts_with("path_prefix = ")).collect::<Vec<_>>().join("\n"),
+                raw.lines()
+                    .filter(|line| !line.starts_with("path_prefix = "))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 format!("{raw}leaf_sha256 = \"{}\"\n", "42".repeat(32)),
                 format!("{raw}tls_ca = \"file:/untrusted.pem\"\n"),
             ] {
-                assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bad))).is_err());
+                assert!(
+                    Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bad)))
+                        .is_err()
+                );
             }
         }
-        for mode in ["browser-h2-btls-v1".into(), format!("pinned-cert-v1:{}", "42".repeat(32)), format!("pinned-cert-stream-up-v1:{}", "42".repeat(32))] {
+        for mode in [
+            "browser-h2-btls-v1".into(),
+            format!("pinned-cert-v1:{}", "42".repeat(32)),
+            format!("pinned-cert-stream-up-v1:{}", "42".repeat(32)),
+        ] {
             profile.tls_profile = mode;
             assert!(Invitation::public_from_profile(&profile).is_err());
         }

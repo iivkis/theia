@@ -449,15 +449,21 @@ impl ServerDocument {
             }
             let udp = listen(&inbound.quic_listen, &format!("{field}.quic_listen"))?;
             let tcp = listen(&inbound.h2_listen, &format!("{field}.h2_listen"))?;
-            let reality = inbound.security_mode == crate::security_profile::SecurityMode::SmartReality;
+            let reality =
+                inbound.security_mode == crate::security_profile::SecurityMode::SmartReality;
             ensure(
                 reality || inbound.security_mode.is_plain(),
                 format!("{field}.security_mode"),
                 "only own TLS and smart-reality are supported",
             )?;
             ensure(
-                if reality { inbound.path_prefix.is_none() } else {
-                    inbound.path_prefix.as_deref().is_some_and(crate::split_http::valid_prefix)
+                if reality {
+                    inbound.path_prefix.is_none()
+                } else {
+                    inbound
+                        .path_prefix
+                        .as_deref()
+                        .is_some_and(crate::split_http::valid_prefix)
                 },
                 format!("{field}.path_prefix"),
                 "own TLS requires an explicit /v1/<prefix>; REALITY uses the signed descriptor",
@@ -590,8 +596,13 @@ impl ClientDocument {
                 "expected absolute file: reference to PEM CA bundle",
             )?;
             ensure(
-                if profile.tls_profile == "smart-reality" { profile.path_prefix.is_none() } else {
-                    profile.path_prefix.as_deref().is_some_and(crate::split_http::valid_prefix)
+                if profile.tls_profile == "smart-reality" {
+                    profile.path_prefix.is_none()
+                } else {
+                    profile
+                        .path_prefix
+                        .as_deref()
+                        .is_some_and(crate::split_http::valid_prefix)
                 },
                 format!("{field}.path_prefix"),
                 "own TLS requires an explicit /v1/<prefix>; REALITY uses the signed descriptor",
@@ -929,8 +940,11 @@ mod tests {
                 let invalid = source.replace("/v1/theia-example", bad);
                 assert!(parse(&invalid).unwrap_err().field.contains("path_prefix"));
             }
-            let missing = source.lines().filter(|line| !line.starts_with("path_prefix = "))
-                .collect::<Vec<_>>().join("\n");
+            let missing = source
+                .lines()
+                .filter(|line| !line.starts_with("path_prefix = "))
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(parse(&missing).unwrap_err().field.contains("path_prefix"));
         }
     }
@@ -1063,15 +1077,29 @@ mod tests {
     #[test]
     fn retired_security_modes_are_rejected_even_with_experimental_backend() {
         let source = client();
-        for mode in ["browser-h2-btls-v1".into(), format!("pinned-cert-v1:{}", "42".repeat(32)), format!("pinned-cert-stream-up-v1:{}", "42".repeat(32))] {
+        for mode in [
+            "browser-h2-btls-v1".into(),
+            format!("pinned-cert-v1:{}", "42".repeat(32)),
+            format!("pinned-cert-stream-up-v1:{}", "42".repeat(32)),
+        ] {
             for transport in ["h2", "h3", "auto"] {
-                let bad = source.replace("tls_profile = \"default\"", &format!("tls_profile = \"{mode}\""))
-                    .replace("transport = \"auto\"", &format!("transport = \"{transport}\""));
+                let bad = source
+                    .replace(
+                        "tls_profile = \"default\"",
+                        &format!("tls_profile = \"{mode}\""),
+                    )
+                    .replace(
+                        "transport = \"auto\"",
+                        &format!("transport = \"{transport}\""),
+                    );
                 assert!(parse(&bad).is_err());
             }
         }
         for mode in ["pinned-cert-v1", "pinned-cert-stream-up-v1"] {
-            let bad = server().replace("[[server.inbounds]]", &format!("[[server.inbounds]]\nsecurity_mode = \"{mode}\""));
+            let bad = server().replace(
+                "[[server.inbounds]]",
+                &format!("[[server.inbounds]]\nsecurity_mode = \"{mode}\""),
+            );
             assert!(parse(&bad).is_err());
         }
     }

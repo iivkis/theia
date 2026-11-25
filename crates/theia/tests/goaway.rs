@@ -24,7 +24,10 @@ const TOKEN: [u8; 32] = [0x42; 32];
 const TARGET: u16 = 12345;
 
 fn check_request<T>(request: &Request<T>, split: bool) -> Option<(u32, bool)> {
-    assert_eq!(request.headers()["authorization"].to_str().unwrap(), format!("Bearer {}", URL_SAFE_NO_PAD.encode(TOKEN)));
+    assert_eq!(
+        request.headers()["authorization"].to_str().unwrap(),
+        format!("Bearer {}", URL_SAFE_NO_PAD.encode(TOKEN))
+    );
     if !split {
         assert_eq!(request.method(), http::Method::POST);
         assert_eq!(request.uri().path(), "/v1/theia-example/session");
@@ -41,7 +44,11 @@ fn check_request<T>(request: &Request<T>, split: bool) -> Option<(u32, bool)> {
         }
         _ => panic!("unexpected split route"),
     };
-    let id = request.headers()["theia-pair-id"].to_str().unwrap().parse::<u32>().unwrap();
+    let id = request.headers()["theia-pair-id"]
+        .to_str()
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
     assert!(id > 0);
     Some((id, upload))
 }
@@ -51,7 +58,11 @@ fn check_request<T>(request: &Request<T>, split: bool) -> Option<(u32, bool)> {
 fn pair<T>(pending: &mut HashMap<u32, (bool, T)>, id: u32, upload: bool, leg: T) -> Option<(T, T)> {
     if let Some((previous_upload, previous)) = pending.remove(&id) {
         assert_ne!(previous_upload, upload);
-        Some(if upload { (leg, previous) } else { (previous, leg) })
+        Some(if upload {
+            (leg, previous)
+        } else {
+            (previous, leg)
+        })
     } else {
         assert!(pending.insert(id, (upload, leg)).is_none());
         None
@@ -66,11 +77,26 @@ struct Echo {
 impl Echo {
     fn reply(&mut self, frame: Frame) -> Frame {
         match (self.stage, frame) {
-            (0, Frame::Hello { version: protocol::VERSION, .. }) => {
+            (
+                0,
+                Frame::Hello {
+                    version: protocol::VERSION,
+                    ..
+                },
+            ) => {
                 self.stage = 1;
-                Frame::HelloAck { version: protocol::VERSION, accepted_capabilities: 0 }
+                Frame::HelloAck {
+                    version: protocol::VERSION,
+                    accepted_capabilities: 0,
+                }
             }
-            (1, Frame::OpenTcp { address: Address::V4([127, 0, 0, 1]), port: TARGET }) => {
+            (
+                1,
+                Frame::OpenTcp {
+                    address: Address::V4([127, 0, 0, 1]),
+                    port: TARGET,
+                },
+            ) => {
                 self.stage = 2;
                 Frame::OpenOk
             }
@@ -95,10 +121,15 @@ async fn h2_echo((request, mut respond): H2Leg, down: Option<H2Leg>) {
         let mut empty = download.into_body();
         assert!(empty.data().await.is_none());
         assert!(empty.trailers().await.unwrap().is_none());
-        respond.send_response(Response::builder().status(200).body(()).unwrap(), true).unwrap();
-        down.send_response(Response::builder().status(200).body(()).unwrap(), false).unwrap()
+        respond
+            .send_response(Response::builder().status(200).body(()).unwrap(), true)
+            .unwrap();
+        down.send_response(Response::builder().status(200).body(()).unwrap(), false)
+            .unwrap()
     } else {
-        respond.send_response(Response::builder().status(200).body(()).unwrap(), false).unwrap()
+        respond
+            .send_response(Response::builder().status(200).body(()).unwrap(), false)
+            .unwrap()
     };
     let mut echo = Echo::default();
     while let Some(chunk) = incoming.data().await {
@@ -108,7 +139,9 @@ async fn h2_echo((request, mut respond): H2Leg, down: Option<H2Leg>) {
             let reply = echo.reply(frame);
             // Test data fits the initial HTTP/2 window; actual wire framing
             // and flow-credit release still use the native h2 implementation.
-            outgoing.send_data(Bytes::from(protocol::encode(&reply).unwrap()), false).unwrap();
+            outgoing
+                .send_data(Bytes::from(protocol::encode(&reply).unwrap()), false)
+                .unwrap();
         }
         incoming.flow_control().release_capacity(size).unwrap();
     }
@@ -123,14 +156,22 @@ async fn h3_echo((_request, mut stream): H3Leg, down: Option<H3Leg>) {
     let (mut tx, mut rx) = if let Some((_download, mut down)) = down {
         assert!(down.recv_data().await.unwrap().is_none());
         assert!(down.recv_trailers().await.unwrap().is_none());
-        stream.send_response(Response::builder().status(200).body(()).unwrap()).await.unwrap();
+        stream
+            .send_response(Response::builder().status(200).body(()).unwrap())
+            .await
+            .unwrap();
         stream.finish().await.unwrap();
-        down.send_response(Response::builder().status(200).body(()).unwrap()).await.unwrap();
+        down.send_response(Response::builder().status(200).body(()).unwrap())
+            .await
+            .unwrap();
         let (_, rx) = stream.split();
         let (tx, _) = down.split();
         (tx, rx)
     } else {
-        stream.send_response(Response::builder().status(200).body(()).unwrap()).await.unwrap();
+        stream
+            .send_response(Response::builder().status(200).body(()).unwrap())
+            .await
+            .unwrap();
         stream.split()
     };
     let mut echo = Echo::default();
@@ -138,7 +179,9 @@ async fn h3_echo((_request, mut stream): H3Leg, down: Option<H3Leg>) {
         let bytes = chunk.copy_to_bytes(chunk.remaining());
         for frame in echo.decoder.feed(&bytes).unwrap() {
             let reply = echo.reply(frame);
-            tx.send_data(Bytes::from(protocol::encode(&reply).unwrap())).await.unwrap();
+            tx.send_data(Bytes::from(protocol::encode(&reply).unwrap()))
+                .await
+                .unwrap();
         }
     }
     assert!(rx.recv_trailers().await.unwrap().is_none());
@@ -148,7 +191,13 @@ async fn h3_echo((_request, mut stream): H3Leg, down: Option<H3Leg>) {
 
 type Drain = (oneshot::Receiver<()>, oneshot::Sender<()>);
 
-async fn h2_peer(listener: TcpListener, acceptor: TlsAcceptor, drain: Drain, requests: mpsc::UnboundedSender<usize>, split: bool) {
+async fn h2_peer(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    drain: Drain,
+    requests: mpsc::UnboundedSender<usize>,
+    split: bool,
+) {
     let mut connections = JoinSet::new();
     let mut drain = Some(drain);
     // Exactly two physical connections: two admitted streams on the first,
@@ -207,10 +256,17 @@ async fn h2_peer(listener: TcpListener, acceptor: TlsAcceptor, drain: Drain, req
             while let Some(result) = handlers.join_next().await { result.unwrap(); }
         });
     }
-    while let Some(result) = connections.join_next().await { result.unwrap(); }
+    while let Some(result) = connections.join_next().await {
+        result.unwrap();
+    }
 }
 
-async fn h3_peer(endpoint: quinn::Endpoint, drain: Drain, requests: mpsc::UnboundedSender<usize>, split: bool) {
+async fn h3_peer(
+    endpoint: quinn::Endpoint,
+    drain: Drain,
+    requests: mpsc::UnboundedSender<usize>,
+    split: bool,
+) {
     let mut connections = JoinSet::new();
     let mut drain = Some(drain);
     for index in 0..2 {
@@ -272,7 +328,9 @@ async fn h3_peer(endpoint: quinn::Endpoint, drain: Drain, requests: mpsc::Unboun
             let _ = timeout(Duration::from_secs(3), quic.closed()).await;
         });
     }
-    while let Some(result) = connections.join_next().await { result.unwrap(); }
+    while let Some(result) = connections.join_next().await {
+        result.unwrap();
+    }
 }
 
 async fn exchange(app: &mut DuplexStream, bytes: &[u8]) {
@@ -295,7 +353,10 @@ macro_rules! assert_drain {
         let address = Address::V4([127, 0, 0, 1]);
         let first = client.open(address.clone(), TARGET).await.unwrap();
         let second = client.open(address.clone(), TARGET).await.unwrap();
-        assert!(first.shares_transport_with(&second), "precondition: real connection reuse");
+        assert!(
+            first.shares_transport_with(&second),
+            "precondition: real connection reuse"
+        );
         assert_eq!($requests.recv().await, Some(0));
         assert_eq!($requests.recv().await, Some(0));
         let (mut left, first_io) = tokio::io::duplex(4096);
@@ -318,7 +379,11 @@ macro_rules! assert_drain {
         exchange(&mut fresh, b"new verified connection").await;
         exchange(&mut left, b"old still live").await;
         exchange(&mut right, b"parallel old still live").await;
-        tokio::join!(finish(left, first_relay), finish(right, second_relay), finish(fresh, fresh_relay));
+        tokio::join!(
+            finish(left, first_relay),
+            finish(right, second_relay),
+            finish(fresh, fresh_relay)
+        );
         drop(client);
     }};
 }
@@ -327,48 +392,82 @@ macro_rules! assert_drain {
 async fn real_h2_goaway_drains_live_streams_without_reusing_carrier() {
     timeout(Duration::from_secs(18), async {
         tokio::join!(h2_scenario(false), h2_scenario(true));
-    }).await.expect("bounded native H2 GOAWAY matrix");
+    })
+    .await
+    .expect("bounded native H2 GOAWAY matrix");
 }
 
 async fn h2_scenario(split: bool) {
-        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(certificate.cert.der().clone()).unwrap();
-        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate.cert.der().clone()], PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der()).into()).unwrap();
-        tls.alpn_protocols = vec![b"h2".to_vec()];
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (drain, command) = oneshot::channel();
-        let (sent, ack) = oneshot::channel();
-        let (witness, mut requests) = mpsc::unbounded_channel();
-        let peer = tokio::spawn(h2_peer(listener, TlsAcceptor::from(Arc::new(tls)), (command, sent), witness, split));
-        let client = H2Client::new(&address.to_string(), "localhost", &URL_SAFE_NO_PAD.encode(TOKEN), roots).unwrap().with_stream_up(split).unwrap().with_connection_pool();
-        assert_drain!(client, requests, drain, ack);
-        peer.await.unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate.cert.der().clone()).unwrap();
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![certificate.cert.der().clone()],
+        PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der()).into(),
+    )
+    .unwrap();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (drain, command) = oneshot::channel();
+    let (sent, ack) = oneshot::channel();
+    let (witness, mut requests) = mpsc::unbounded_channel();
+    let peer = tokio::spawn(h2_peer(
+        listener,
+        TlsAcceptor::from(Arc::new(tls)),
+        (command, sent),
+        witness,
+        split,
+    ));
+    let client = H2Client::new(
+        &address.to_string(),
+        "localhost",
+        &URL_SAFE_NO_PAD.encode(TOKEN),
+        roots,
+    )
+    .unwrap()
+    .with_stream_up(split)
+    .unwrap()
+    .with_connection_pool();
+    assert_drain!(client, requests, drain, ack);
+    peer.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_h3_goaway_drains_live_streams_without_reusing_carrier() {
     timeout(Duration::from_secs(18), async {
         tokio::join!(h3_scenario(false), h3_scenario(true));
-    }).await.expect("bounded native H3 GOAWAY matrix");
+    })
+    .await
+    .expect("bounded native H3 GOAWAY matrix");
 }
 
 async fn h3_scenario(split: bool) {
-        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(certificate.cert.der().clone()).unwrap();
-        let endpoint = theia::quic_transport::server_endpoint("127.0.0.1:0".parse().unwrap(),
-            vec![certificate.cert.der().clone()], PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der()).into()).unwrap();
-        let address = endpoint.local_addr().unwrap();
-        let (drain, command) = oneshot::channel();
-        let (sent, ack) = oneshot::channel();
-        let (witness, mut requests) = mpsc::unbounded_channel();
-        let peer = tokio::spawn(h3_peer(endpoint, (command, sent), witness, split));
-        let client = H3Client::new(address, "localhost", &URL_SAFE_NO_PAD.encode(TOKEN), roots).unwrap().with_stream_up(split).unwrap().with_connection_pool();
-        assert_drain!(client, requests, drain, ack);
-        peer.await.unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate.cert.der().clone()).unwrap();
+    let endpoint = theia::quic_transport::server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        vec![certificate.cert.der().clone()],
+        PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der()).into(),
+    )
+    .unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let (drain, command) = oneshot::channel();
+    let (sent, ack) = oneshot::channel();
+    let (witness, mut requests) = mpsc::unbounded_channel();
+    let peer = tokio::spawn(h3_peer(endpoint, (command, sent), witness, split));
+    let client = H3Client::new(address, "localhost", &URL_SAFE_NO_PAD.encode(TOKEN), roots)
+        .unwrap()
+        .with_stream_up(split)
+        .unwrap()
+        .with_connection_pool();
+    assert_drain!(client, requests, drain, ack);
+    peer.await.unwrap();
 }

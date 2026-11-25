@@ -17,8 +17,11 @@ pub(crate) const DOWNLOAD_PATH: &str = "/v1/theia-example/stream-up/download";
 pub const EXAMPLE_PREFIX: &str = "/v1/theia-example";
 pub(crate) fn valid_prefix(prefix: &str) -> bool {
     prefix.strip_prefix("/v1/").is_some_and(|tail| {
-        !tail.is_empty() && tail.len() <= 64
-            && tail.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        !tail.is_empty()
+            && tail.len() <= 64
+            && tail
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     })
 }
 
@@ -153,18 +156,12 @@ impl AutoMode {
 
     pub(crate) fn select(&self) -> Result<ModeTicket, ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
-        Ok(cache.observe(
-            crate::network_scope::observe(self.remote),
-            Instant::now(),
-        ))
+        Ok(cache.observe(crate::network_scope::observe(self.remote), Instant::now()))
     }
 
     fn current(&self, ticket: ModeTicket) -> Result<bool, ClientError> {
         let mut cache = self.cache.lock().map_err(|_| ClientError::Configuration)?;
-        cache.observe(
-            crate::network_scope::observe(self.remote),
-            Instant::now(),
-        );
+        cache.observe(crate::network_scope::observe(self.remote), Instant::now());
         Ok(cache.current(ticket))
     }
 
@@ -172,7 +169,10 @@ impl AutoMode {
     /// A successful split ACK is the only evidence that can cache split.
     /// Never import a different transport's decision or retry after OPEN.
     pub(crate) fn after_attempt(
-        &self, ticket: ModeTicket, stream_up: bool, outcome: HelloOutcome,
+        &self,
+        ticket: ModeTicket,
+        stream_up: bool,
+        outcome: HelloOutcome,
     ) -> Result<bool, ClientError> {
         if stream_up && outcome == HelloOutcome::Acked {
             self.remember(ticket)?;
@@ -383,7 +383,15 @@ mod tests {
             assert!(leg(&request).is_none());
             assert_eq!(pair_id(&request), Some(17));
         }
-        for prefix in ["/v1", "/v1/", "/v1/../x", "/v1/a/b", "/v1/a?b", "/v1/a%2fb", "/v2/edge"] {
+        for prefix in [
+            "/v1",
+            "/v1/",
+            "/v1/../x",
+            "/v1/a/b",
+            "/v1/a?b",
+            "/v1/a%2fb",
+            "/v2/edge",
+        ] {
             assert!(IdentityRoutes::new(prefix).is_err());
         }
     }

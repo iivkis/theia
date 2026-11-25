@@ -462,7 +462,7 @@ mod tests {
                 enabled: true,
                 inbounds: vec![Inbound {
                     id: "edge".into(),
-                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
+                    path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
                     allowed_user_ids: vec!["user".into()],
                     quic_listen: "127.0.0.1:9443".into(),
                     h2_listen: "127.0.0.1:9443".into(),

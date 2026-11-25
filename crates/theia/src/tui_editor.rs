@@ -933,8 +933,13 @@ impl Editor {
 
     /// Validated SNI of the selected server inbound.
     pub fn selected_server_name(&self) -> Option<&str> {
-        let Config::Server(doc) = &self.draft else { return None; };
-        doc.server.inbounds.get(self.selected_record).map(|inbound| inbound.server_name.as_str())
+        let Config::Server(doc) = &self.draft else {
+            return None;
+        };
+        doc.server
+            .inbounds
+            .get(self.selected_record)
+            .map(|inbound| inbound.server_name.as_str())
     }
 
     pub fn selected_record_is_active(&self) -> bool {
@@ -1565,7 +1570,10 @@ mod tests {
     #[test]
     fn retired_pinned_modes_cannot_be_loaded_into_editor() {
         for mode in ["pinned-cert-v1", "pinned-cert-stream-up-v1"] {
-            let source = server_source().replace("[[server.inbounds]]", &format!("[[server.inbounds]]\nsecurity_mode = \"{mode}\""));
+            let source = server_source().replace(
+                "[[server.inbounds]]",
+                &format!("[[server.inbounds]]\nsecurity_mode = \"{mode}\""),
+            );
             let file = Temp::write(&source);
             assert!(Editor::load(Role::Server, &file.0).is_err());
         }
@@ -1812,7 +1820,10 @@ mod tests {
 
     #[test]
     fn editor_refuses_retired_browser_security_profile() {
-        let source = include_str!("../../../examples/client.toml").replace("tls_profile = \"default\"", "tls_profile = \"browser-h2-btls-v1\"");
+        let source = include_str!("../../../examples/client.toml").replace(
+            "tls_profile = \"default\"",
+            "tls_profile = \"browser-h2-btls-v1\"",
+        );
         let temp = Temp::write(&source);
         assert!(Editor::load(Role::Client, &temp.0).is_err());
     }

@@ -229,14 +229,24 @@ struct Observation {
 // Never classify errors from bind, socket allocation, receive, TLS or QUIC
 // protocol processing as endpoint unavailability.
 fn definitive_send_error(error: io::ErrorKind) -> bool {
-    matches!(error, io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable | io::ErrorKind::ConnectionRefused)
+    matches!(
+        error,
+        io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn handshake_timeout_error(sent: bool, received: bool, refused: bool) -> QuicError {
-    if received { QuicError::Timeout }
-    else if refused { QuicError::EndpointNetworkRefused }
-    else if sent { QuicError::Unreachable }
-    else { QuicError::Timeout }
+    if received {
+        QuicError::Timeout
+    } else if refused {
+        QuicError::EndpointNetworkRefused
+    } else if sent {
+        QuicError::Unreachable
+    } else {
+        QuicError::Timeout
+    }
 }
 
 impl AsyncUdpSocket for Observation {
@@ -252,7 +262,8 @@ impl AsyncUdpSocket for Observation {
             }
             Err(error) => {
                 if self.remote.get() == Some(&transmit.destination)
-                    && definitive_send_error(error.kind()) {
+                    && definitive_send_error(error.kind())
+                {
                     self.network_refused.store(true, Ordering::SeqCst);
                 }
                 Err(error)
@@ -338,20 +349,21 @@ impl ObservedEndpoint {
         if !matches!(ServerName::try_from(name), Ok(ServerName::DnsName(_))) {
             return Err(QuicError::Configuration);
         }
-        self.observation.remote.set(remote).map_err(|_| QuicError::Configuration)?;
+        self.observation
+            .remote
+            .set(remote)
+            .map_err(|_| QuicError::Configuration)?;
         let pending = self
             .endpoint
             .connect(remote, name)
             .map_err(|_| QuicError::Configuration)?;
         match timeout(deadline, pending).await {
             Ok(Ok(connection)) => checked(connection),
-            Ok(Err(quinn::ConnectionError::TimedOut)) | Err(_) => {
-                Err(handshake_timeout_error(
-                    self.observation.sent.load(Ordering::SeqCst),
-                    self.observation.received.load(Ordering::SeqCst),
-                    self.observation.network_refused.load(Ordering::SeqCst),
-                ))
-            }
+            Ok(Err(quinn::ConnectionError::TimedOut)) | Err(_) => Err(handshake_timeout_error(
+                self.observation.sent.load(Ordering::SeqCst),
+                self.observation.received.load(Ordering::SeqCst),
+                self.observation.network_refused.load(Ordering::SeqCst),
+            )),
             Ok(Err(_)) => Err(QuicError::Handshake),
         }
     }
@@ -372,13 +384,34 @@ mod observed_errors {
         for error in [NetworkUnreachable, HostUnreachable, ConnectionRefused] {
             assert!(definitive_send_error(error));
         }
-        for error in [PermissionDenied, AddrNotAvailable, WouldBlock, Interrupted, OutOfMemory,
-            ConnectionReset, TimedOut, Other, InvalidInput] {
+        for error in [
+            PermissionDenied,
+            AddrNotAvailable,
+            WouldBlock,
+            Interrupted,
+            OutOfMemory,
+            ConnectionReset,
+            TimedOut,
+            Other,
+            InvalidInput,
+        ] {
             assert!(!definitive_send_error(error));
         }
-        assert_eq!(handshake_timeout_error(false, false, true), QuicError::EndpointNetworkRefused);
-        assert_eq!(handshake_timeout_error(true, true, true), QuicError::Timeout);
-        assert_eq!(handshake_timeout_error(true, false, false), QuicError::Unreachable);
-        assert_eq!(handshake_timeout_error(false, false, false), QuicError::Timeout);
+        assert_eq!(
+            handshake_timeout_error(false, false, true),
+            QuicError::EndpointNetworkRefused
+        );
+        assert_eq!(
+            handshake_timeout_error(true, true, true),
+            QuicError::Timeout
+        );
+        assert_eq!(
+            handshake_timeout_error(true, false, false),
+            QuicError::Unreachable
+        );
+        assert_eq!(
+            handshake_timeout_error(false, false, false),
+            QuicError::Timeout
+        );
     }
 }

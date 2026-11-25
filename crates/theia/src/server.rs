@@ -217,7 +217,10 @@ impl ServerContext {
             security_mode: inbound.security_mode,
             identity_routes: None,
             padding: crate::descriptor::Padding::default(),
-            own_routes: inbound.path_prefix.as_deref().and_then(|prefix| crate::split_http::IdentityRoutes::new(prefix).ok()),
+            own_routes: inbound
+                .path_prefix
+                .as_deref()
+                .and_then(|prefix| crate::split_http::IdentityRoutes::new(prefix).ok()),
             identity_gate: None,
             authorization,
             policy: policy.clone(),
@@ -387,13 +390,20 @@ impl ServerContext {
         Ok(next.revision)
     }
 
-    pub(crate) fn pad_response<T>(&self, mut response: Response<T>) -> Result<Response<T>, ServerError> {
-        self.padding.add_header(response.headers_mut()).map_err(|_| ServerError::Config)?;
+    pub(crate) fn pad_response<T>(
+        &self,
+        mut response: Response<T>,
+    ) -> Result<Response<T>, ServerError> {
+        self.padding
+            .add_header(response.headers_mut())
+            .map_err(|_| ServerError::Config)?;
         Ok(response)
     }
 
     pub(crate) fn padding_frame(&self, accepted: u32) -> Result<Option<Frame>, ServerError> {
-        self.padding.frame(accepted).map_err(|_| ServerError::Config)
+        self.padding
+            .frame(accepted)
+            .map_err(|_| ServerError::Config)
     }
 
     pub(crate) fn split_leg<T>(&self, request: &Request<T>) -> Option<crate::split_http::Leg> {
@@ -509,7 +519,10 @@ impl ServerContext {
             }),
             None => {
                 !self.security_mode.is_stream_up()
-                    && self.own_routes.as_ref().is_some_and(|routes| request.uri().path() == routes.single)
+                    && self
+                        .own_routes
+                        .as_ref()
+                        .is_some_and(|routes| request.uri().path() == routes.single)
             }
         };
         if !single_allowed
@@ -1255,8 +1268,12 @@ async fn handle_split_request(
         .map_err(|_| ServerError::Http2)?;
     // POST response contains only an empty acknowledgement. All downstream
     // SmartTheia frames travel on the independent GET response.
-    let upload_ack = Response::builder().status(StatusCode::OK).body(()).map_err(|_| ServerError::Http2)?;
-    up.send_response(context.pad_response(upload_ack)?, true).map_err(|_| ServerError::Http2)?;
+    let upload_ack = Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .map_err(|_| ServerError::Http2)?;
+    up.send_response(context.pad_response(upload_ack)?, true)
+        .map_err(|_| ServerError::Http2)?;
     let outgoing = down
         .send_response(context.pad_response(response)?, false)
         .map_err(|_| ServerError::Http2)?;
@@ -1406,7 +1423,9 @@ async fn handle_frames(
             .map_err(|_| ServerError::Protocol)?;
         send_frame(outgoing, &ack).await?;
         if let Some(padding) = context.padding_frame(capabilities & protocol::CAP_PADDING)? {
-            state.apply(Direction::Send, &padding).map_err(|_| ServerError::Protocol)?;
+            state
+                .apply(Direction::Send, &padding)
+                .map_err(|_| ServerError::Protocol)?;
             send_frame(outgoing, &padding).await?;
         }
         let open = loop {
@@ -3613,7 +3632,7 @@ mod hardening_tests {
                 inbounds: vec![
                     Inbound {
                         id: "edge-a".into(),
-                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
+                        path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
                         allowed_user_ids: vec!["alice".into()],
                         h2_listen: "127.0.0.1:9443".into(),
                         quic_listen: "127.0.0.1:9443".into(),
@@ -3625,7 +3644,7 @@ mod hardening_tests {
                     },
                     Inbound {
                         id: "edge-b".into(),
-                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
+                        path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
                         allowed_user_ids: vec!["bob".into()],
                         h2_listen: "127.0.0.1:9444".into(),
                         quic_listen: "127.0.0.1:9444".into(),

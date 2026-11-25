@@ -281,7 +281,11 @@ async fn explicit_xhttp_client_scenario(
     profile.server = endpoint.to_string();
     profile.server_name = "localhost".into();
     profile.transport = transport;
-    profile.xhttp_mode = Some(if stream_up { config::XhttpMode::StreamUp } else { config::XhttpMode::StreamOne });
+    profile.xhttp_mode = Some(if stream_up {
+        config::XhttpMode::StreamUp
+    } else {
+        config::XhttpMode::StreamOne
+    });
     let uri = Invitation::public_from_profile(&profile)
         .unwrap()
         .encode()

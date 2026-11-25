@@ -77,7 +77,7 @@ impl Fixture {
         let h3 = udp.local_addr().unwrap();
         let inbound = Inbound {
             id: "test".into(),
-        path_prefix: Some("/v1/theia-example".into()),
+            path_prefix: Some("/v1/theia-example".into()),
             security_mode: mode,
             reality: None,
             allowed_user_ids: vec!["client".into()],
@@ -229,13 +229,22 @@ impl Fixture {
             // Only supported Own-TLS profiles are serialized. Additional
             // certificate pins below are laboratory-only API inputs.
             let received = if pin.is_none() {
-                let invite = Invitation::public_from_profile(&profile).unwrap().encode().unwrap();
-                Invitation::decode(&invite).unwrap().to_profile("env:TEST_TOKEN", None).unwrap()
+                let invite = Invitation::public_from_profile(&profile)
+                    .unwrap()
+                    .encode()
+                    .unwrap();
+                Invitation::decode(&invite)
+                    .unwrap()
+                    .to_profile("env:TEST_TOKEN", None)
+                    .unwrap()
             } else {
                 profile.clone()
             };
             assert_eq!(received.transport, profile.transport);
-            assert_eq!(received.effective_xhttp_mode(), profile.effective_xhttp_mode());
+            assert_eq!(
+                received.effective_xhttp_mode(),
+                profile.effective_xhttp_mode()
+            );
             let imported_pin = pin;
             let stream_up = received.effective_xhttp_mode() == config::XhttpMode::StreamUp;
             let token = URL_SAFE_NO_PAD.encode(TOKEN);

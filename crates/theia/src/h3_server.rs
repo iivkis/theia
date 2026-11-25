@@ -424,8 +424,14 @@ async fn relay_request(
 }
 
 async fn respond_admitted(stream: &mut Stream, context: &ServerContext) -> Result<(), ServerError> {
-    let response = Response::builder().status(StatusCode::OK).body(()).map_err(|_| ServerError::Protocol)?;
-    stream.send_response(context.pad_response(response)?).await.map_err(|_| ServerError::Io)
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .map_err(|_| ServerError::Protocol)?;
+    stream
+        .send_response(context.pad_response(response)?)
+        .await
+        .map_err(|_| ServerError::Io)
 }
 
 async fn respond(stream: &mut Stream, status: StatusCode) -> Result<(), ServerError> {
@@ -518,7 +524,9 @@ async fn handle_frames(
             .map_err(|_| ServerError::Protocol)?;
         send(tx, &ack).await?;
         if let Some(padding) = context.padding_frame(capabilities & protocol::CAP_PADDING)? {
-            state.apply(Direction::Send, &padding).map_err(|_| ServerError::Protocol)?;
+            state
+                .apply(Direction::Send, &padding)
+                .map_err(|_| ServerError::Protocol)?;
             send(tx, &padding).await?;
         }
         let open = loop {

@@ -191,7 +191,8 @@ impl StatusPanel {
                 let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
                 if let Some(approval) = approval {
                     reality_config::save_credential_refresh(&path, &id, &source, approval, now)?;
-                    let mut editor = Editor::load(Role::Client, &path).map_err(|_| Error::Indeterminate)?;
+                    let mut editor =
+                        Editor::load(Role::Client, &path).map_err(|_| Error::Indeterminate)?;
                     for _ in 0..editor.record_count() {
                         if editor.selected_record_id() == id {
                             break;
@@ -203,8 +204,10 @@ impl StatusPanel {
                     }
                     Ok(Update::CredentialSaved(Box::new(editor)))
                 } else {
-                    let (approval, revision) = reality_config::preview_credential_refresh_for_editor(
-                        &path, digest, &id, &source, now)?;
+                    let (approval, revision) =
+                        reality_config::preview_credential_refresh_for_editor(
+                            &path, digest, &id, &source, now,
+                        )?;
                     Ok(Update::CredentialReview(source, approval, revision))
                 }
             })();
@@ -371,7 +374,7 @@ impl StatusPanel {
             if let Some((source, approval, revision)) = self.credential_review.take() {
                 match key.code {
                     KeyCode::Char('y') => self.start_credential(source, Some(approval)),
-                    KeyCode::Char('n') | KeyCode::Esc => {},
+                    KeyCode::Char('n') | KeyCode::Esc => {}
                     _ => self.credential_review = Some((source, approval, revision)),
                 }
                 return false;
@@ -384,10 +387,18 @@ impl StatusPanel {
                         self.credential_input = None;
                         self.start_credential(source, None);
                     }
-                    KeyCode::Backspace => { field.pop(); }
-                    KeyCode::Char(ch) if !ch.is_control() && field.len() + ch.len_utf8() <= 1024
-                        && (key.modifiers.is_empty() || key.modifiers == crossterm::event::KeyModifiers::SHIFT) => field.push(ch),
-                    _ => {},
+                    KeyCode::Backspace => {
+                        field.pop();
+                    }
+                    KeyCode::Char(ch)
+                        if !ch.is_control()
+                            && field.len() + ch.len_utf8() <= 1024
+                            && (key.modifiers.is_empty()
+                                || key.modifiers == crossterm::event::KeyModifiers::SHIFT) =>
+                    {
+                        field.push(ch)
+                    }
+                    _ => {}
                 }
                 return false;
             }

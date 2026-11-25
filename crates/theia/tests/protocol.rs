@@ -455,8 +455,15 @@ fn bounded_mutation_corpus_never_panics_or_exceeds_decoder_bound() {
         seed ^= seed << 5;
         seed
     };
-    let valid = [hello(), ack(), open(), Frame::OpenOk, Frame::Fin,
-        Frame::Data(vec![0x5a; 64]), Frame::Padding(vec![0; 32])];
+    let valid = [
+        hello(),
+        ack(),
+        open(),
+        Frame::OpenOk,
+        Frame::Fin,
+        Frame::Data(vec![0x5a; 64]),
+        Frame::Padding(vec![0; 32]),
+    ];
     for iteration in 0..4096 {
         let mut wire = if iteration % 2 == 0 {
             encode(&valid[iteration % valid.len()]).unwrap()
@@ -486,7 +493,10 @@ fn bounded_mutation_corpus_never_panics_or_exceeds_decoder_bound() {
             at = end;
         }
         if at == wire.len() && decoder.finish().is_ok() {
-            let canonical: Vec<u8> = observed.iter().flat_map(|frame| encode(frame).unwrap()).collect();
+            let canonical: Vec<u8> = observed
+                .iter()
+                .flat_map(|frame| encode(frame).unwrap())
+                .collect();
             assert_eq!(canonical, wire);
         }
     }

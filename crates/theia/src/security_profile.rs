@@ -29,7 +29,6 @@ impl SecurityMode {
     pub(crate) fn is_stream_up(self) -> bool {
         self == Self::PinnedCertStreamUpV1
     }
-
 }
 
 /// Pin the entire DER leaf, not just the SPKI. Certificate renewal requires
@@ -101,10 +100,16 @@ mod tests {
 
     #[test]
     fn laboratory_security_modes_are_not_serializable_product_modes() {
-        for mode in [SecurityMode::PinnedCertV1, SecurityMode::PinnedCertStreamUpV1] {
+        for mode in [
+            SecurityMode::PinnedCertV1,
+            SecurityMode::PinnedCertStreamUpV1,
+        ] {
             let source = include_str!("../../../examples/server.toml")
                 .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"42".repeat(32));
-            let crate::config::Config::Server(mut doc) = crate::config::parse(&source).unwrap() else { panic!() };
+            let crate::config::Config::Server(mut doc) = crate::config::parse(&source).unwrap()
+            else {
+                panic!()
+            };
             doc.server.inbounds[0].security_mode = mode;
             assert!(crate::config::Config::Server(doc).validate().is_err());
         }

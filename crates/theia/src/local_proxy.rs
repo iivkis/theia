@@ -72,7 +72,10 @@ async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
     load_client_with_budget(profile, crate::connection_pool::profile_budget()).await
 }
 
-async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> Result<ProxyClient, ClientError> {
+async fn load_client_with_budget(
+    profile: &Profile,
+    budget: Arc<Semaphore>,
+) -> Result<ProxyClient, ClientError> {
     if profile.tls_profile != "default" && profile.tls_profile != "smart-reality" {
         return Err(ClientError::Configuration);
     }
@@ -82,7 +85,10 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
             .map(Arc::new)
             .map(ProxyClient::Reality);
     }
-    let prefix = profile.path_prefix.as_deref().ok_or(ClientError::Configuration)?;
+    let prefix = profile
+        .path_prefix
+        .as_deref()
+        .ok_or(ClientError::Configuration)?;
     let cert = load_file(
         profile
             .tls_ca
@@ -116,7 +122,12 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
             } else {
                 client
             };
-            Ok(ProxyClient::Direct(Carrier::from_options(Some(Arc::new(client.with_connection_pool())), None, ttl, budget)?))
+            Ok(ProxyClient::Direct(Carrier::from_options(
+                Some(Arc::new(client.with_connection_pool())),
+                None,
+                ttl,
+                budget,
+            )?))
         }
         Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
@@ -134,7 +145,12 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
                 h3
             });
             if profile.transport == Transport::H3 {
-                return Ok(ProxyClient::Direct(Carrier::from_options(None, Some(h3), ttl, budget)?));
+                return Ok(ProxyClient::Direct(Carrier::from_options(
+                    None,
+                    Some(h3),
+                    ttl,
+                    budget,
+                )?));
             }
             // Both carriers use the same resolved endpoint. Do not resolve
             // the hostname again during fallback; retain the configured SNI,
@@ -148,7 +164,12 @@ async fn load_client_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> R
             } else {
                 h2
             });
-            Ok(ProxyClient::Direct(Carrier::from_options(Some(h2), Some(h3), ttl, budget)?))
+            Ok(ProxyClient::Direct(Carrier::from_options(
+                Some(h2),
+                Some(h3),
+                ttl,
+                budget,
+            )?))
         }
     }
 }
@@ -196,7 +217,10 @@ impl RealityClient {
     fn now() -> Result<u64, ClientError> {
         crate::reference_health::unix_now().map_err(|_| ClientError::Tls)
     }
-    async fn prepare_with_budget(profile: &Profile, budget: Arc<Semaphore>) -> Result<Self, ClientError> {
+    async fn prepare_with_budget(
+        profile: &Profile,
+        budget: Arc<Semaphore>,
+    ) -> Result<Self, ClientError> {
         // No DNS/credential use before the enrollment and independent trust
         // anchor have been checked.
         let enrollment = crate::reality_config::pinned_client(profile)
@@ -436,9 +460,11 @@ impl RealityClient {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     // CAS binds refresh to the generation used for the GET.
                     let ok = self.refresh(&generation).await.is_ok();
-                    generation.last_refresh.store(if ok { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+                    generation
+                        .last_refresh
+                        .store(if ok { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
                     match self.generation().await {
-                        Ok(current) if Arc::ptr_eq(&current, &generation) => {},
+                        Ok(current) if Arc::ptr_eq(&current, &generation) => {}
                         _ => break,
                     }
                 }
@@ -548,7 +574,10 @@ impl AutoClient {
             .lock()
             .map_err(|_| ClientError::Configuration)?;
         let previous = cache.generation;
-        let observed = cache.observe(crate::network_scope::observe(self.h3.remote()), Instant::now());
+        let observed = cache.observe(
+            crate::network_scope::observe(self.h3.remote()),
+            Instant::now(),
+        );
         if previous != cache.generation {
             self.cache_changed.notify_one();
         }
@@ -587,7 +616,10 @@ impl AutoClient {
     /// Check the generation without consuming a due recheck. Both
     /// foreground and maintenance use this before taking another step.
     fn same_scope(&self, generation: u64) -> Result<bool, ClientError> {
-        let mut cache = self.negative.lock().map_err(|_| ClientError::Configuration)?;
+        let mut cache = self
+            .negative
+            .lock()
+            .map_err(|_| ClientError::Configuration)?;
         let scope = crate::network_scope::observe(self.h3.remote());
         if scope != cache.route || scope.is_none() {
             cache.route = scope;
@@ -602,7 +634,9 @@ impl AutoClient {
     /// probe operations. Only a pre-authenticated QuicUnreachable result
     /// can reach the retry branch. Every other error remains terminal.
     async fn attempt_h3<T, F, Fut>(
-        &self, generation: u64, mut attempt: F,
+        &self,
+        generation: u64,
+        mut attempt: F,
     ) -> Result<Option<T>, ClientError>
     where
         F: FnMut() -> Fut,
@@ -624,15 +658,23 @@ impl AutoClient {
                     if self.complete(generation, true)? {
                         return Ok(None);
                     }
-                    crate::diag!(Warn, "client.auto", "stale_quic_probe_rejected",
-                        "generation" = Value::Count(generation));
+                    crate::diag!(
+                        Warn,
+                        "client.auto",
+                        "stale_quic_probe_rejected",
+                        "generation" = Value::Count(generation)
+                    );
                     return Err(ClientError::QuicUnreachable);
                 }
                 Err(error) => {
                     self.complete(generation, false)?;
-                    crate::diag!(Warn, "client.auto", "terminal_h3_failure_no_fallback",
+                    crate::diag!(
+                        Warn,
+                        "client.auto",
+                        "terminal_h3_failure_no_fallback",
                         "generation" = Value::Count(generation),
-                        "reason" = Value::Label(error_kind(&error)));
+                        "reason" = Value::Label(error_kind(&error))
+                    );
                     return Err(error);
                 }
             }
@@ -648,7 +690,10 @@ impl AutoClient {
     async fn prepare(&self) -> Result<(u64, bool), ClientError> {
         let _gate = self.recheck_gate.lock().await;
         let recheck = {
-            let mut cache = self.negative.lock().map_err(|_| ClientError::Configuration)?;
+            let mut cache = self
+                .negative
+                .lock()
+                .map_err(|_| ClientError::Configuration)?;
             let now = Instant::now();
             let scope = crate::network_scope::observe(self.h3.remote());
             match cache.expires {
@@ -662,10 +707,14 @@ impl AutoClient {
         if let Some(generation) = recheck {
             match self.attempt_h3(generation, || self.h3.probe()).await {
                 Ok(Some(())) => crate::diag!(Debug, "client.auto", "background_h3_verified"),
-                Ok(None) => {},
+                Ok(None) => {}
                 Err(error) => {
-                    crate::diag!(Warn, "client.auto", "background_h3_terminal_failure",
-                        "reason" = Value::Label(error_kind(&error)));
+                    crate::diag!(
+                        Warn,
+                        "client.auto",
+                        "background_h3_terminal_failure",
+                        "reason" = Value::Label(error_kind(&error))
+                    );
                     return Err(error);
                 }
             }
@@ -678,7 +727,11 @@ impl AutoClient {
     /// runtime shutdown or a security/credential generation replacement.
     async fn maintain(&self) -> Result<(), ClientError> {
         loop {
-            let pending = self.negative.lock().map_err(|_| ClientError::Configuration)?.expires;
+            let pending = self
+                .negative
+                .lock()
+                .map_err(|_| ClientError::Configuration)?
+                .expires;
             let Some(deadline) = pending else {
                 self.cache_changed.notified().await;
                 continue;
@@ -696,7 +749,10 @@ impl AutoClient {
     async fn fetch_identity_document(&self, successor: bool) -> Result<String, ClientError> {
         let (generation, cached) = self.prepare().await?;
         if !cached {
-            if let Some(value) = self.attempt_h3(generation, || self.h3.fetch_identity_document(successor)).await? {
+            if let Some(value) = self
+                .attempt_h3(generation, || self.h3.fetch_identity_document(successor))
+                .await?
+            {
                 return Ok(value);
             }
         }
@@ -708,30 +764,53 @@ impl AutoClient {
 
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let (generation, cached) = self.prepare().await?;
-        crate::diag!(Debug, "client.auto", "transport_select",
+        crate::diag!(
+            Debug,
+            "client.auto",
+            "transport_select",
             "generation" = Value::Count(generation),
-            "negative_cache_hit" = Value::Flag(cached));
+            "negative_cache_hit" = Value::Flag(cached)
+        );
         // XHTTP caches remain carrier-local; only the configured mode
         // restriction crosses the transport boundary.
         if !cached {
-            if let Some(tunnel) = self.attempt_h3(generation, || self.h3.open(address.clone(), port)).await? {
-                crate::diag!(Debug, "client.auto", "selected_h3",
-                    "generation" = Value::Count(generation));
+            if let Some(tunnel) = self
+                .attempt_h3(generation, || self.h3.open(address.clone(), port))
+                .await?
+            {
+                crate::diag!(
+                    Debug,
+                    "client.auto",
+                    "selected_h3",
+                    "generation" = Value::Count(generation)
+                );
                 eprintln!("transport=h3");
                 return Ok(ProxyTunnel::H3(Box::new(tunnel)));
             }
-            crate::diag!(Warn, "client.auto", "h3_udp_silent_fallback_h2",
-                "generation" = Value::Count(generation));
+            crate::diag!(
+                Warn,
+                "client.auto",
+                "h3_udp_silent_fallback_h2",
+                "generation" = Value::Count(generation)
+            );
             eprintln!("transport=h2 reason=quic_unreachable");
         } else {
-            crate::diag!(Debug, "client.auto", "negative_cache_fallback_h2",
-                "generation" = Value::Count(generation));
+            crate::diag!(
+                Debug,
+                "client.auto",
+                "negative_cache_fallback_h2",
+                "generation" = Value::Count(generation)
+            );
             eprintln!("transport=h2 reason=quic_negative_cache");
         }
         if !self.same_scope(generation)? {
             return Err(ClientError::QuicUnreachable);
         }
-        self.h2.open(address, port).await.map(Box::new).map(ProxyTunnel::H2)
+        self.h2
+            .open(address, port)
+            .await
+            .map(Box::new)
+            .map(ProxyTunnel::H2)
     }
 }
 
@@ -749,16 +828,28 @@ impl Carrier {
         }
     }
 
-    fn from_options(mut h2: Option<Arc<H2Client>>, mut h3: Option<Arc<H3Client>>, ttl: Duration, budget: Arc<Semaphore>) -> Result<Self, ClientError> {
+    fn from_options(
+        mut h2: Option<Arc<H2Client>>,
+        mut h3: Option<Arc<H3Client>>,
+        ttl: Duration,
+        budget: Arc<Semaphore>,
+    ) -> Result<Self, ClientError> {
         if let Some(client) = h2.as_mut() {
-            Arc::get_mut(client).ok_or(ClientError::Configuration)?.set_profile_budget(budget.clone());
+            Arc::get_mut(client)
+                .ok_or(ClientError::Configuration)?
+                .set_profile_budget(budget.clone());
         }
         if let Some(client) = h3.as_mut() {
-            Arc::get_mut(client).ok_or(ClientError::Configuration)?.set_profile_budget(budget);
+            Arc::get_mut(client)
+                .ok_or(ClientError::Configuration)?
+                .set_profile_budget(budget);
         }
         match (h2, h3) {
             (Some(h2), Some(h3)) => Ok(Self::Auto(Arc::new(AutoClient {
-                h2, h3, ttl, negative: Mutex::new(NegativeCache::default()),
+                h2,
+                h3,
+                ttl,
+                negative: Mutex::new(NegativeCache::default()),
                 cache_changed: Notify::new(),
                 recheck_gate: tokio::sync::Mutex::new(()),
             }))),
@@ -770,8 +861,16 @@ impl Carrier {
 
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
-            Self::H2(client) => client.open(address, port).await.map(Box::new).map(ProxyTunnel::H2),
-            Self::H3(client) => client.open(address, port).await.map(Box::new).map(ProxyTunnel::H3),
+            Self::H2(client) => client
+                .open(address, port)
+                .await
+                .map(Box::new)
+                .map(ProxyTunnel::H2),
+            Self::H3(client) => client
+                .open(address, port)
+                .await
+                .map(Box::new)
+                .map(ProxyTunnel::H3),
             Self::Auto(client) => client.open(address, port).await,
         }
     }
@@ -980,9 +1079,7 @@ impl ClientRuntime {
         let mut changes = self.slot.subscribe();
         loop {
             let view = changes.borrow_and_update().clone();
-            let maintenance = async {
-                view.client.maintain().await
-            };
+            let maintenance = async { view.client.maintain().await };
             tokio::select! {
                 result=maintenance=>return result,
                 result=changes.changed()=>if result.is_err(){return Err(ClientError::Io);},
@@ -1240,9 +1337,7 @@ async fn serve_proxy(
     socks: TcpListener,
     client: ProxyClient,
 ) -> Result<(), ClientError> {
-    let maintenance = async {
-        client.maintain().await
-    };
+    let maintenance = async { client.maintain().await };
     serve_proxy_loop(http, socks, || client.clone(), maintenance).await
 }
 
@@ -2156,41 +2251,56 @@ mod selector_tests {
         let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
         let token = URL_SAFE_NO_PAD.encode([0x42u8; 32]);
         let auto = AutoClient {
-            h2: Arc::new(H2Client::new(&remote.to_string(), "localhost", &token, roots.clone()).unwrap()),
+            h2: Arc::new(
+                H2Client::new(&remote.to_string(), "localhost", &token, roots.clone()).unwrap(),
+            ),
             h3: Arc::new(H3Client::new(remote, "localhost", &token, roots).unwrap()),
             ttl: Duration::from_secs(900),
             negative: Mutex::new(NegativeCache::default()),
             cache_changed: Notify::new(),
             recheck_gate: tokio::sync::Mutex::new(()),
         };
-        for error in [ClientError::Tls, ClientError::Unauthorized, ClientError::Protocol,
-            ClientError::Timeout, ClientError::Io, ClientError::Http3, ClientError::Rejected(429)] {
+        for error in [
+            ClientError::Tls,
+            ClientError::Unauthorized,
+            ClientError::Protocol,
+            ClientError::Timeout,
+            ClientError::Io,
+            ClientError::Http3,
+            ClientError::Rejected(429),
+        ] {
             let (generation, _) = auto.observe().unwrap();
             let mut calls = 0;
-            let result = auto.attempt_h3(generation, || {
-                calls += 1;
-                std::future::ready(Err::<(), _>(error))
-            }).await;
+            let result = auto
+                .attempt_h3(generation, || {
+                    calls += 1;
+                    std::future::ready(Err::<(), _>(error))
+                })
+                .await;
             assert!(matches!(result, Err(actual) if actual == error));
             assert_eq!(calls, 1);
             assert!(!auto.observe().unwrap().1);
         }
         let (generation, _) = auto.observe().unwrap();
         let mut calls = 0;
-        let result = auto.attempt_h3(generation, || {
-            calls += 1;
-            std::future::ready(Err::<(), _>(ClientError::QuicUnreachable))
-        }).await;
+        let result = auto
+            .attempt_h3(generation, || {
+                calls += 1;
+                std::future::ready(Err::<(), _>(ClientError::QuicUnreachable))
+            })
+            .await;
         assert!(matches!(result, Ok(None)));
         assert_eq!(calls, AUTO_QUIC_ATTEMPTS);
         assert!(auto.observe().unwrap().1);
         auto.complete(generation, false).unwrap();
         let (generation, _) = auto.observe().unwrap();
         let mut calls = 0;
-        let result = auto.attempt_h3(generation, || {
-            calls += 1;
-            std::future::ready(Err::<(), _>(ClientError::QuicEndpointNetworkRefused))
-        }).await;
+        let result = auto
+            .attempt_h3(generation, || {
+                calls += 1;
+                std::future::ready(Err::<(), _>(ClientError::QuicEndpointNetworkRefused))
+            })
+            .await;
         assert!(matches!(result, Ok(None)));
         assert_eq!(calls, 1);
         assert!(auto.observe().unwrap().1);
@@ -2469,7 +2579,8 @@ mod selector_tests {
         assert!(load_client(&invalid).await.is_err());
         let mut pinned = profile.clone();
         pinned.xhttp_mode = None;
-        pinned.tls_profile = crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
+        pinned.tls_profile =
+            crate::security_profile::CertificatePin::from_der(cert.cert.der().as_ref()).profile();
         assert!(load_client(&pinned).await.is_err());
         let mut automatic_mode = profile.clone();
         automatic_mode.xhttp_mode = Some(XhttpMode::Auto);
@@ -2485,7 +2596,7 @@ mod selector_tests {
 
         let inbound = Inbound {
             id: "edge".into(),
-                path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
+            path_prefix: Some(crate::split_http::EXAMPLE_PREFIX.into()),
             allowed_user_ids: vec!["client".into()],
             h2_listen: "127.0.0.1:0".into(),
             quic_listen: "127.0.0.1:0".into(),

@@ -526,7 +526,10 @@ impl Profile {
         now: u64,
     ) -> Result<([u8; 32], Zeroizing<[u8; 32]>, u64), Error> {
         self.admission()?;
-        let (snapshot, current) = self.store()?.inspect_bound(now).map_err(|_| Error::Descriptor)?;
+        let (snapshot, current) = self
+            .store()?
+            .inspect_bound(now)
+            .map_err(|_| Error::Descriptor)?;
         current.check_time(now).map_err(|_| Error::Descriptor)?;
         let invite = Invitation::decode(uri, now)?;
         if invite.scope != current.descriptor().scope
@@ -535,12 +538,22 @@ impl Profile {
         {
             return Err(Error::Approval);
         }
-        let verified = verify(&invite.signed, &invite.scope, invite.public,
-            invite.revision, self.policy(), now)?;
+        let verified = verify(
+            &invite.signed,
+            &invite.scope,
+            invite.public,
+            invite.revision,
+            self.policy(),
+            now,
+        )?;
         if verified.payload_sha256() != current.payload_sha256() {
             return Err(Error::Approval);
         }
-        Ok((snapshot, invite.bearer.ok_or(Error::Credential)?, invite.revision))
+        Ok((
+            snapshot,
+            invite.bearer.ok_or(Error::Credential)?,
+            invite.revision,
+        ))
     }
 
     pub(crate) fn same_trust_as(&self, other: &Self) -> bool {

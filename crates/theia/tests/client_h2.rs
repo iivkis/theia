@@ -1211,7 +1211,7 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
         let remote = listener.local_addr().unwrap();
         let mut inbound = Inbound {
             id: "h2-test".into(),
-        path_prefix: Some("/v1/theia-example".into()),
+            path_prefix: Some("/v1/theia-example".into()),
             allowed_user_ids: vec!["client".into()],
             h2_listen: remote.to_string(),
             quic_listen: remote.to_string(),
@@ -1268,8 +1268,15 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
 #[test]
 fn retired_product_security_profiles_are_rejected_before_network() {
     let source = include_str!("../../../examples/client.toml");
-    for mode in ["browser-h2-btls-v1".into(), format!("pinned-cert-v1:{}", "42".repeat(32)), format!("pinned-cert-stream-up-v1:{}", "42".repeat(32))] {
-        let invalid = source.replace("tls_profile = \"default\"", &format!("tls_profile = \"{mode}\""));
+    for mode in [
+        "browser-h2-btls-v1".into(),
+        format!("pinned-cert-v1:{}", "42".repeat(32)),
+        format!("pinned-cert-stream-up-v1:{}", "42".repeat(32)),
+    ] {
+        let invalid = source.replace(
+            "tls_profile = \"default\"",
+            &format!("tls_profile = \"{mode}\""),
+        );
         assert!(theia::config::parse(&invalid).is_err());
     }
 }

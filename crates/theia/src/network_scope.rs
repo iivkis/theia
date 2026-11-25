@@ -31,14 +31,16 @@ pub(crate) fn observe(remote: SocketAddr) -> Option<Scope> {
     let before = platform::epoch()?;
     let source = crate::local_proxy::route_source(remote)?;
     let after = platform::epoch()?;
-    (before == after).then_some(Scope { source, epoch: after })
+    (before == after).then_some(Scope {
+        source,
+        epoch: after,
+    })
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
     use std::{
-        io,
-        mem,
+        io, mem,
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
         sync::{Mutex, OnceLock},
     };
@@ -73,7 +75,7 @@ mod platform {
             | libc::RTMGRP_IPV6_ROUTE
             | libc::RTMGRP_IPV4_RULE) as u32
             | (1 << 18); // RTNLGRP_IPV6_RULE (group 19).
-        // SAFETY: a fully initialized address, borrowed only during bind.
+                         // SAFETY: a fully initialized address, borrowed only during bind.
         let status = unsafe {
             libc::bind(
                 fd.as_raw_fd(),
@@ -106,7 +108,12 @@ mod platform {
             for _ in 0..256 {
                 // SAFETY: fd is owned by self; writable one-byte buffer.
                 let n = unsafe {
-                    libc::recv(fd, (&mut byte as *mut u8).cast(), 1, libc::MSG_DONTWAIT | libc::MSG_TRUNC)
+                    libc::recv(
+                        fd,
+                        (&mut byte as *mut u8).cast(),
+                        1,
+                        libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                    )
                 };
                 if n > 0 {
                     self.changed()?;
@@ -138,7 +145,11 @@ mod platform {
 
     pub(super) fn epoch() -> Option<u64> {
         static OBSERVER: OnceLock<Mutex<Observer>> = OnceLock::new();
-        OBSERVER.get_or_init(|| Mutex::new(Observer::default())).lock().ok()?.poll()
+        OBSERVER
+            .get_or_init(|| Mutex::new(Observer::default()))
+            .lock()
+            .ok()?
+            .poll()
     }
 }
 
@@ -147,7 +158,10 @@ mod platform {
     use std::{
         ffi::c_void,
         ptr,
-        sync::{atomic::{AtomicU64, Ordering}, OnceLock},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            OnceLock,
+        },
     };
     use windows_sys::Win32::{
         Foundation::HANDLE,
@@ -163,18 +177,32 @@ mod platform {
 
     fn changed() {
         // Saturation disables caching instead of reusing an old generation.
-        let _ = EPOCH.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_add(1)));
+        let _ = EPOCH.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_add(1))
+        });
     }
 
-    unsafe extern "system" fn route(_: *const c_void, _: *const MIB_IPFORWARD_ROW2, _: MIB_NOTIFICATION_TYPE) {
+    unsafe extern "system" fn route(
+        _: *const c_void,
+        _: *const MIB_IPFORWARD_ROW2,
+        _: MIB_NOTIFICATION_TYPE,
+    ) {
         changed();
     }
 
-    unsafe extern "system" fn interface(_: *const c_void, _: *const MIB_IPINTERFACE_ROW, _: MIB_NOTIFICATION_TYPE) {
+    unsafe extern "system" fn interface(
+        _: *const c_void,
+        _: *const MIB_IPINTERFACE_ROW,
+        _: MIB_NOTIFICATION_TYPE,
+    ) {
         changed();
     }
 
-    unsafe extern "system" fn address(_: *const c_void, _: *const MIB_UNICASTIPADDRESS_ROW, _: MIB_NOTIFICATION_TYPE) {
+    unsafe extern "system" fn address(
+        _: *const c_void,
+        _: *const MIB_UNICASTIPADDRESS_ROW,
+        _: MIB_NOTIFICATION_TYPE,
+    ) {
         changed();
     }
 
@@ -186,8 +214,20 @@ mod platform {
         unsafe {
             let results = [
                 NotifyRouteChange2(AF_UNSPEC, Some(route), ptr::null(), false, &mut handles[0]),
-                NotifyIpInterfaceChange(AF_UNSPEC, Some(interface), ptr::null(), false, &mut handles[1]),
-                NotifyUnicastIpAddressChange(AF_UNSPEC, Some(address), ptr::null(), false, &mut handles[2]),
+                NotifyIpInterfaceChange(
+                    AF_UNSPEC,
+                    Some(interface),
+                    ptr::null(),
+                    false,
+                    &mut handles[1],
+                ),
+                NotifyUnicastIpAddressChange(
+                    AF_UNSPEC,
+                    Some(address),
+                    ptr::null(),
+                    false,
+                    &mut handles[2],
+                ),
             ];
             if results.iter().all(|status| *status == 0) {
                 return true;
@@ -238,6 +278,9 @@ mod tests {
         // An actual concurrent network change can make a single observation
         // unavailable. Retry within a bounded number of local observations.
         assert!((0..16).any(|_| observe(remote).is_some()));
-        assert_eq!(peer.recv_from(&mut [0; 1]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            peer.recv_from(&mut [0; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

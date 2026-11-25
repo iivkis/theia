@@ -64,7 +64,8 @@ fn random_inclusive(min: u64, max: u64) -> Result<u64, ClientError> {
     let rng = SystemRandom::new();
     for _ in 0..64 {
         let mut bytes = [0u8; 8];
-        rng.fill(&mut bytes).map_err(|_| ClientError::Configuration)?;
+        rng.fill(&mut bytes)
+            .map_err(|_| ClientError::Configuration)?;
         let n = u64::from_ne_bytes(bytes);
         if n >= threshold {
             return Ok(min + n % span);
@@ -139,11 +140,13 @@ impl<C> Lease<C> {
     /// leases. This is a rotation trigger, never a tunnel termination limit.
     pub(crate) fn record_data(&self, size: usize) {
         let increment = size as u64;
-        let prior = self.entry.bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |old| Some(old.saturating_add(increment)),
-        ).unwrap_or_else(|old| old);
+        let prior = self
+            .entry
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                Some(old.saturating_add(increment))
+            })
+            .unwrap_or_else(|old| old);
         if prior.saturating_add(increment) >= self.entry.byte_limit {
             self.entry.retire();
         }
@@ -203,7 +206,8 @@ impl<C: Send + Sync + 'static> Pool<C> {
                 && entry.route == route
                 && Instant::now() < entry.deadline
                 && entry.bytes.load(Ordering::Acquire) < entry.byte_limit
-                && entry.next_id.load(Ordering::Acquire) <= crate::split_http::MAX_PAIR_IDS as usize
+                && entry.next_id.load(Ordering::Acquire)
+                    <= crate::split_http::MAX_PAIR_IDS as usize
                 && alive(&entry.connection);
             if !retain {
                 entry.retire();
@@ -226,7 +230,11 @@ impl<C: Send + Sync + 'static> Pool<C> {
             // of a pair ID is possible even after cancellation or expiry.
             let id = entry.next_id.fetch_add(1, Ordering::AcqRel) as u32;
             entry.active.fetch_add(1, Ordering::AcqRel);
-            return Some(Lease { entry: entry.clone(), id, admitted: false });
+            return Some(Lease {
+                entry: entry.clone(),
+                id,
+                admitted: false,
+            });
         }
         None
     }
@@ -254,18 +262,31 @@ impl<C: Send + Sync + 'static> Pool<C> {
                 return Ok(lease);
             }
             if self.connections.available_permits() == 0 || self.profile.available_permits() == 0 {
-                if let Some(index) = entries.iter().position(|entry| entry.active.load(Ordering::Acquire) == 0) {
+                if let Some(index) = entries
+                    .iter()
+                    .position(|entry| entry.active.load(Ordering::Acquire) == 0)
+                {
                     entries.remove(index).retire();
                 }
             }
             let limit = || ClientError::Open(crate::protocol::ErrorCode::ResourceLimit);
-            let permit = self.connections.clone().try_acquire_owned().map_err(|_| limit())?;
-            let profile_permit = self.profile.clone().try_acquire_owned().map_err(|_| limit())?;
+            let permit = self
+                .connections
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| limit())?;
+            let profile_permit = self
+                .profile
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| limit())?;
             (permit, profile_permit)
         };
         let (age, byte_limit) = self.policy.sample()?;
         let connection = create.await?;
-        let deadline = Instant::now().checked_add(age).ok_or(ClientError::Configuration)?;
+        let deadline = Instant::now()
+            .checked_add(age)
+            .ok_or(ClientError::Configuration)?;
         let entry = Arc::new(Entry {
             connection,
             route,
@@ -327,7 +348,10 @@ mod tests {
         active.admitted();
         let mut busy = Vec::new();
         for _ in 1..MAX_TUNNELS {
-            let mut lease = pool.acquire(route, true, |_| true, async { Ok(1) }).await.unwrap();
+            let mut lease = pool
+                .acquire(route, true, |_| true, async { Ok(1) })
+                .await
+                .unwrap();
             lease.admitted();
             busy.push(lease);
         }
@@ -376,9 +400,15 @@ mod tests {
             volume_max_bytes: 10,
         });
         let route = Some("127.0.0.1:0".parse().unwrap());
-        let mut first = pool.acquire(route, true, |_| true, async { Ok(1) }).await.unwrap();
+        let mut first = pool
+            .acquire(route, true, |_| true, async { Ok(1) })
+            .await
+            .unwrap();
         first.admitted();
-        let mut second = pool.acquire(route, true, |_| true, async { Ok(2) }).await.unwrap();
+        let mut second = pool
+            .acquire(route, true, |_| true, async { Ok(2) })
+            .await
+            .unwrap();
         second.admitted();
         assert!(first.shares_connection(&second));
         first.record_data(4);
@@ -388,7 +418,10 @@ mod tests {
         assert!(first.entry.retired.load(Ordering::Acquire));
         second.record_data(usize::MAX);
         assert_eq!(first.entry.bytes.load(Ordering::Acquire), u64::MAX);
-        let mut fresh = pool.acquire(route, true, |_| true, async { Ok(3) }).await.unwrap();
+        let mut fresh = pool
+            .acquire(route, true, |_| true, async { Ok(3) })
+            .await
+            .unwrap();
         fresh.admitted();
         assert!(!first.shares_connection(&fresh));
         assert_eq!(*first.connection(), 1);
@@ -409,18 +442,32 @@ mod tests {
         let pool = Pool::default();
         let route = Some("127.0.0.1:0".parse().unwrap());
         let accepting = std::sync::Arc::new(AtomicBool::new(true));
-        let mut first = pool.acquire(route, true, |c: &Arc<AtomicBool>| c.load(Ordering::Acquire),
-            async { Ok(accepting.clone()) }).await.unwrap();
+        let mut first = pool
+            .acquire(
+                route,
+                true,
+                |c: &Arc<AtomicBool>| c.load(Ordering::Acquire),
+                async { Ok(accepting.clone()) },
+            )
+            .await
+            .unwrap();
         first.admitted();
-        let pending = pool.acquire(route, true, |_| true, async { Ok(accepting.clone()) }).await.unwrap();
+        let pending = pool
+            .acquire(route, true, |_| true, async { Ok(accepting.clone()) })
+            .await
+            .unwrap();
         assert!(first.shares_connection(&pending));
         // Model a carrier reporting GOAWAY while an admitted stream lives.
         // Failed or cancelled admission retires the connection, not leases.
         accepting.store(false, Ordering::Release);
         drop(pending);
         assert!(!first.accepting_new_streams());
-        let mut next = pool.acquire(route, true, |c| c.load(Ordering::Acquire),
-            async { Ok(Arc::new(AtomicBool::new(true))) }).await.unwrap();
+        let mut next = pool
+            .acquire(route, true, |c| c.load(Ordering::Acquire), async {
+                Ok(Arc::new(AtomicBool::new(true)))
+            })
+            .await
+            .unwrap();
         next.admitted();
         assert!(!first.shares_connection(&next));
         assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 2);
@@ -438,9 +485,15 @@ mod tests {
         let source = "127.0.0.1:0".parse().unwrap();
         let a = Some(Scope::fixture(source, 1));
         let b = Some(Scope::fixture(source, 2));
-        let mut old = pool.acquire(a, true, |_| true, async { Ok(1) }).await.unwrap();
+        let mut old = pool
+            .acquire(a, true, |_| true, async { Ok(1) })
+            .await
+            .unwrap();
         old.admitted();
-        let mut fresh = pool.acquire(b, true, |_| true, async { Ok(2) }).await.unwrap();
+        let mut fresh = pool
+            .acquire(b, true, |_| true, async { Ok(2) })
+            .await
+            .unwrap();
         fresh.admitted();
         assert!(old.entry.retired.load(Ordering::Acquire));
         assert_eq!(*old.connection(), 1);
@@ -460,19 +513,27 @@ mod tests {
         let mut leases = Vec::new();
         for pool in [&h2, &h3] {
             for _ in 0..MAX_CONNECTIONS {
-                let mut lease = pool.acquire(None, false, |_| true, async { Ok(7) }).await.unwrap();
+                let mut lease = pool
+                    .acquire(None, false, |_| true, async { Ok(7) })
+                    .await
+                    .unwrap();
                 lease.admitted();
                 leases.push(lease);
             }
         }
         assert_eq!(budget.available_permits(), 0);
-        assert!(matches!(next.acquire(None, false, |_| true, async { Ok(8) }).await,
-            Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))));
+        assert!(matches!(
+            next.acquire(None, false, |_| true, async { Ok(8) }).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))
+        ));
         drop(h2);
         drop(h3);
         assert_eq!(budget.available_permits(), 0);
         drop(leases.pop());
-        let fresh = next.acquire(None, false, |_| true, async { Ok(8) }).await.unwrap();
+        let fresh = next
+            .acquire(None, false, |_| true, async { Ok(8) })
+            .await
+            .unwrap();
         assert_eq!(*fresh.connection(), 8);
     }
 
@@ -513,8 +574,7 @@ mod tests {
             .unwrap();
         assert_eq!(*e.connection(), 5);
         assert!(matches!(
-            pool.acquire(other, false, |_| true, async { Ok(6) })
-                .await,
+            pool.acquire(other, false, |_| true, async { Ok(6) }).await,
             Err(ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))
         ));
         drop(a);
