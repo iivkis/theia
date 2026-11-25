@@ -569,6 +569,27 @@ impl RuntimePanel {
         }
     }
 
+    pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        let mut items = Vec::new();
+        if matches!(self.phase, Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. }) && self.saved_sha256.is_some() {
+            if matches!(self.phase, Phase::Viewing { .. }) { items.push(ActionItem { key:'a', label:"Применить права доступа" }); }
+            if matches!(self.phase, Phase::Viewing { .. } | Phase::Applied { .. }) {
+                items.push(ActionItem { key:'b', label:"Откатить права доступа" });
+                items.push(ActionItem { key:'c', label:"Применить лимиты" });
+            }
+            items.extend([
+                ActionItem { key:'s', label:"Применить структуру сервера" },
+                ActionItem { key:'z', label:"Откатить структуру" },
+                ActionItem { key:'t', label:"Откатить TLS" },
+            ]);
+        }
+        if !matches!(self.phase, Phase::Checking | Phase::Applying | Phase::Confirming { .. } | Phase::RollbackChecking | Phase::RollbackConfirming { .. } | Phase::RollbackApplying | Phase::QuotaChecking { .. } | Phase::QuotaConfirming { .. } | Phase::QuotaApplying | Phase::CutoverChecking { .. } | Phase::CutoverConfirming { .. } | Phase::CutoverApplying | Phase::TlsRollbackChecking | Phase::TlsRollbackConfirming { .. } | Phase::TlsRollbackApplying | Phase::RestartRollbackChecking | Phase::RestartRollbackConfirming { .. } | Phase::RestartRollbackApplying | Phase::RestartChecking) {
+            items.push(ActionItem { key:'r', label:"Обновить состояние" });
+        }
+        items
+    }
+
     pub(crate) fn title(&self) -> &'static str {
         match self.phase {
             Phase::RestartChecking

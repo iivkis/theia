@@ -423,6 +423,19 @@ impl Panel {
         false
     }
 
+    pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if self.phase != Phase::Idle || self.unavailable { return Vec::new(); }
+        vec![
+            ActionItem { key:'s', label:"Запустить локальный прокси" },
+            ActionItem { key:'a', label:"Включить системный прокси" },
+            ActionItem { key:'r', label:"Восстановить настройки" },
+            ActionItem { key:'c', label:"Восстановить после сбоя" },
+            ActionItem { key:'x', label:"Остановить" },
+            ActionItem { key:'v', label:"Обновить состояние" },
+        ]
+    }
+
     pub(crate) fn body(&self) -> String {
         let status = if self.unavailable || self.phase == Phase::Busy {
             "Операция не подтверждена / состояние обновляется"
