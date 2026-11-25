@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 83dce740a671a55900c03f69a2995470268047c4
+Source: 2d936acb097a8c79b46b303d0f4762addbf9f3ba
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -42,9 +42,29 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-file-picker](client-file-picker.png)
 
-## client-first-run-reality
+## client-first-key-connect
 
-![client-first-run-reality](client-first-run-reality.png)
+![client-first-key-connect](client-first-key-connect.png)
+
+## client-first-key-input
+
+![client-first-key-input](client-first-key-input.png)
+
+## client-first-key-save-review
+
+![client-first-key-save-review](client-first-key-save-review.png)
+
+## client-first-key-saved
+
+![client-first-key-saved](client-first-key-saved.png)
+
+## client-first-key-trust
+
+![client-first-key-trust](client-first-key-trust.png)
+
+## client-first-run-key-import
+
+![client-first-run-key-import](client-first-run-key-import.png)
 
 ## client-focus-actions
 
