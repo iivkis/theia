@@ -2181,14 +2181,16 @@ fn shell_layout(area: Rect) -> [Rect; 3] {
 }
 
 fn home_layout(area: Rect) -> [Rect; 2] {
+    let mut content = centered_column(area, 112);
+    let wide = content.width >= 80;
+    content.height = content.height.min(if wide { 11 } else { 18 });
+    if area.height > content.height + 2 {
+        content.y += 2;
+    }
     let parts = Layout::default()
-        .direction(if area.width >= 80 {
-            Direction::Horizontal
-        } else {
-            Direction::Vertical
-        })
+        .direction(if wide { Direction::Horizontal } else { Direction::Vertical })
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+        .split(content);
     [parts[0], parts[1]]
 }
 
@@ -2455,20 +2457,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     match model.screen {
         Screen::Home => {
             let cards = home_layout(parts[1]);
-            panel(
-                frame,
-                cards[0],
-                "[1] Для сервера",
-                "Управление входящими подключениями\nПользователи и приглашения\nЗапуск сервера, TLS и диагностика\n\nEnter: открыть выбранную панель",
-                model.selected == Role::Server,
-            );
-            panel(
-                frame,
-                cards[1],
-                "[2] Для клиента",
-                "Импорт приглашений и профили\nПодключение и мониторинг трафика\nЛокальный HTTP/SOCKS5 и системный прокси\n\nEnter: открыть выбранную панель",
-                model.selected == Role::Client,
-            );
+            draw_role_card(frame, cards[0], Role::Server, model.selected == Role::Server);
+            draw_role_card(frame, cards[1], Role::Client, model.selected == Role::Client);
         }
         Screen::Server | Screen::Client => {
             let role = if model.screen == Screen::Server { Role::Server } else { Role::Client };
@@ -2999,6 +2989,28 @@ fn draw_import(
         ),
     };
     panel_at(frame, area, title, &body, true, viewport);
+}
+
+fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool) {
+    let (key, title, details) = match role {
+        Role::Server => ("1", "Для сервера", "Создание подключений REALITY / Own-TLS\nПользователи и приглашения\nЗапуск и управление сервером"),
+        Role::Client => ("2", "Для клиента", "Импорт приглашений и профили\nПодключение и мониторинг трафика\nHTTP/SOCKS5 и системный прокси"),
+    };
+    let area = Rect::new(area.x.saturating_add(1), area.y, area.width.saturating_sub(2), area.height);
+    let bg = if selected { FOCUS } else { SURFACE };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(format!(" {key} "), Style::default().bg(if selected { ACCENT } else { MUTED }).fg(BG).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {title}"), Style::default().fg(if selected { ACCENT } else { TEXT }).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::raw(""),
+        Line::styled(details.lines().next().unwrap_or(""), Style::default().fg(TEXT)),
+        Line::styled(details.lines().nth(1).unwrap_or(""), Style::default().fg(MUTED)),
+        Line::styled(details.lines().nth(2).unwrap_or(""), Style::default().fg(MUTED)),
+        Line::raw(""),
+        Line::styled(if selected { "› Enter  Открыть" } else { "  Выбрать ↑↓ / Tab" }, Style::default().fg(if selected { ACCENT } else { MUTED })),
+    ];
+    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(bg)).wrap(Wrap { trim: true }), area);
 }
 
 fn draw_workspace(frame: &mut Frame<'_>, area: Rect, role: Role, editor: Option<&Editor>, welcome_choice: usize) {
