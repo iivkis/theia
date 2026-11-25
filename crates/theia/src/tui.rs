@@ -1841,6 +1841,8 @@ impl Interaction {
 
         if editor.editing {
             match key.code {
+                KeyCode::Left | KeyCode::Up if !editor.choice_options().is_empty() => editor.cycle_choice(false),
+                KeyCode::Right | KeyCode::Down | KeyCode::Char(' ') if !editor.choice_options().is_empty() => editor.cycle_choice(true),
                 KeyCode::Esc => editor.cancel(),
                 KeyCode::Enter => {
                     editor.accept();
@@ -3184,7 +3186,9 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     } else {
         "Сохранено"
     };
-    let help = if editor.editing {
+    let help = if editor.editing && !editor.choice_options().is_empty() {
+        "Ввод · ←→ / Пробел выбрать · Enter проверить · Esc отменить"
+    } else if editor.editing {
         "Ввод · Ctrl+U очистить · Enter проверить · Esc отменить"
     } else {
         "↑↓ запись · ←→ / Tab поле · Enter изменить"
@@ -3263,7 +3267,15 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
     frame.render_widget(table, table_area);
     let error = editor.error.as_deref();
     if wide {
-        panel(frame, detail, "Поле", &format!("{}\n{help}", editor.field_name()), false);
+        let field_detail = if editor.editing && !editor.choice_options().is_empty() {
+            let choices = editor.choice_options().iter().map(|value| {
+                if *value == editor.input.as_str() { format!("[● {value}]") } else { format!("[○ {value}]") }
+            }).collect::<Vec<_>>().join("  ");
+            format!("{choices}\n{help}")
+        } else {
+            format!("{}\n{help}", editor.field_name())
+        };
+        panel(frame, detail, "Поле", &field_detail, false);
         let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(bottom);
         panel(frame, parts[0], "Состояние", &format!("{}\n{}", error.unwrap_or(""), editor.notice), false);
         panel(frame, parts[1], "Действия", actions, false);
@@ -3546,6 +3558,29 @@ mod tests {
         assert_eq!(model.selected, Role::Client);
         assert!(!ui.server_process.running());
         assert!(ui.config_dialog.is_none());
+    }
+
+    #[test]
+    fn transport_choice_changes_only_draft_after_enter_and_cancel_restores_value() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("transport-choice").unwrap());
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Client));
+        ui.editor.as_mut().unwrap().workspace_select_field(2);
+        ui.update(&mut model, press(KeyCode::Enter));
+        let before = ui.editor.as_ref().unwrap().field_value();
+        ui.update(&mut model, press(KeyCode::Right));
+        assert_ne!(ui.editor.as_ref().unwrap().input, before);
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert_eq!(ui.editor.as_ref().unwrap().field_value(), before);
+        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Right));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.editor.as_ref().unwrap().dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
