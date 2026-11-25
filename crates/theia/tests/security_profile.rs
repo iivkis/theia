@@ -312,7 +312,8 @@ async fn h2_h3_pinned_identity_and_mode_are_fail_closed() {
         let port = target.local_addr().unwrap().port();
 
         // Trusted certificate with wrong pin, wrong hostname with right
-        // pin, bad bearer, and both directions of mode mismatch.
+        // pin, bad bearer, and both directions of unexpected/missing proof.
+        // With the shared route, proof mismatch is authorization failure (401).
         pinned
             .errors(
                 Some(pinned.other_pin),
@@ -344,7 +345,7 @@ async fn h2_h3_pinned_identity_and_mode_are_fail_closed() {
             )
             .await;
         pinned
-            .errors(None, "localhost", &TOKEN, port, ClientError::Rejected(404))
+            .errors(None, "localhost", &TOKEN, port, ClientError::Unauthorized)
             .await;
         plain
             .errors(
@@ -352,7 +353,7 @@ async fn h2_h3_pinned_identity_and_mode_are_fail_closed() {
                 "localhost",
                 &TOKEN,
                 port,
-                ClientError::Rejected(404),
+                ClientError::Unauthorized,
             )
             .await;
         assert!(timeout(Duration::from_millis(250), target.accept())

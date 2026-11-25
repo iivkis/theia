@@ -248,7 +248,7 @@ async fn h2_peer(
                         }
                         Some(Err(error)) if accepted == expected && pending.is_empty() && handlers.is_empty()
                             && error.get_io().is_some_and(|io| matches!(io.kind(),
-                                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof)) => {
+                                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::UnexpectedEof)) => {
                             // Only after all expected handlers completed successfully.
                             // The client independently checks all DATA and both FIN/EOF.
                             break;

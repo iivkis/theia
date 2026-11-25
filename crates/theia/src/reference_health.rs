@@ -1274,6 +1274,11 @@ mod tests {
                     break;
                 };
                 assert_head(&request);
+                // HEAD has no request body. Wait for its actual FIN before
+                // returning the response and releasing the receive half.
+                // Otherwise STOP_SENDING can race the client's finish().
+                assert!(stream.recv_data().await.unwrap().is_none());
+                assert!(stream.recv_trailers().await.unwrap().is_none());
                 stream
                     .send_response(
                         http::Response::builder()
