@@ -893,8 +893,13 @@ mod tests {
             assert_eq!(rx.open(&cid, &new, now, end, true).unwrap().number, 2);
             assert_eq!(rx.open(&cid, &old, now, end, true).unwrap().payload, b"old");
             assert_eq!(rx.open(&cid, &old, now, end, true), Err(Error::Duplicate));
+            assert_eq!(rx.retirement_deadline(), Some(end));
             rx.expire(end);
-            assert_eq!(rx.open(&cid, &old, end, end, true), Err(Error::TooOld));
+            assert_eq!(rx.retirement_deadline(), None);
+            // Without the retired key the old packet cannot be authenticated.
+            // Crypto also leaves it eligible for stateless-reset detection.
+            assert_eq!(rx.open(&cid, &old, end, end, true), Err(Error::Crypto));
+            assert_eq!(rx.generation(), 1);
             tx.acknowledged(pn);
             tx.update(true).unwrap();
             let (pn, next) = tx.seal(&cid, b"next").unwrap();
