@@ -283,14 +283,22 @@ impl H3Client {
         timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
             let route = crate::network_scope::observe(self.remote);
             let reusable = self.reuse_connections && self.certificate_pin.is_none();
-            let mut lease = self.pool.acquire(route, reusable,
-                |connection| !connection.driver.0.is_finished(),
-                self.connect_verified(diagnostics::next_id())).await?;
+            let mut lease = self
+                .pool
+                .acquire(
+                    route,
+                    reusable,
+                    |connection| !connection.driver.0.is_finished(),
+                    self.connect_verified(diagnostics::next_id()),
+                )
+                .await?;
             if route.is_some() && crate::network_scope::observe(self.remote) != route {
                 lease.retire();
                 return Err(ClientError::Io);
             }
-            if !lease.accepting_new_streams() { return Err(ClientError::Http3); }
+            if !lease.accepting_new_streams() {
+                return Err(ClientError::Http3);
+            }
             let connection = lease.connection();
             let mut sender = connection
                 .sender

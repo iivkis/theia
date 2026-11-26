@@ -358,17 +358,37 @@ impl H2Client {
             .or(self.own_routes.as_ref())
             .ok_or(ClientError::Configuration)?;
         timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
-            let route = self.endpoint.parse().ok().and_then(crate::network_scope::observe);
-            let reusable = self.reuse_connections && self.certificate_pin.is_none()
+            let route = self
+                .endpoint
+                .parse()
+                .ok()
+                .and_then(crate::network_scope::observe);
+            let reusable = self.reuse_connections
+                && self.certificate_pin.is_none()
                 && matches!(&self.connector, H2Tls::Rustls(_));
-            let mut lease = self.pool.acquire(route, reusable,
-                |connection| !connection.driver.0.is_finished(),
-                self.connect_verified(diagnostics::next_id())).await?;
-            if route.is_some() && self.endpoint.parse().ok().and_then(crate::network_scope::observe) != route {
+            let mut lease = self
+                .pool
+                .acquire(
+                    route,
+                    reusable,
+                    |connection| !connection.driver.0.is_finished(),
+                    self.connect_verified(diagnostics::next_id()),
+                )
+                .await?;
+            if route.is_some()
+                && self
+                    .endpoint
+                    .parse()
+                    .ok()
+                    .and_then(crate::network_scope::observe)
+                    != route
+            {
                 lease.retire();
                 return Err(ClientError::Io);
             }
-            if !lease.accepting_new_streams() { return Err(ClientError::Http2); }
+            if !lease.accepting_new_streams() {
+                return Err(ClientError::Http2);
+            }
             let connection = lease.connection();
             let sender = connection
                 .sender
