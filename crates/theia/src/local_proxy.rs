@@ -2355,7 +2355,8 @@ async fn udp_association(
                         while let Some(data)=down_rx.recv().await {
                             observer.lock().unwrap_or_else(|e|e.into_inner()).incoming(&data);
                             if !udp_relay::encode_socks_into(&mut packet, &address, port, &data) {
-                                crate::traffic::udp_queue_drop();
+                                // SOCKS framing may exceed the UDP maximum;
+                                // this is not queue congestion.
                                 continue;
                             }
                             let n=timeout(REPLY_TIMEOUT,socket.send_to(&packet,source)).await
@@ -2371,6 +2372,39 @@ async fn udp_association(
             }
         }
     }
+}
+
+#[cfg(test)]
+async fn udp_revoked_fallback_fixture(client: &ProxyClient) {
+    use crate::udp_relay::{self, Tunnel, QUEUE};
+    use tokio::sync::mpsc;
+    let local_origin = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let verified = crate::routing::dpi::VerifiedUdp::disabled_fixture(
+        udp_relay::connect(local_origin.local_addr().unwrap()).await.unwrap(),
+    );
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = target.local_addr().unwrap().port();
+    let authorization = verified.fallback_policy();
+    let ProxyClient::Direct(client) = client else { panic!("own TLS fixture"); };
+    let carrier = client.carrier.clone();
+    let fallback = Box::pin(async move {
+        // A successful OPEN is insufficient if the local routing lease
+        // was revoked before the application datagram could be sent.
+        let tunnel = carrier.open_udp(Address::V4([127, 0, 0, 1]), port).await?;
+        authorization.revoke_fixture();
+        Ok(tunnel)
+    });
+    let (up, rx) = mpsc::channel(QUEUE);
+    let (down, _responses) = mpsc::channel(QUEUE);
+    up.send(b"must not escape".to_vec()).await.unwrap();
+    let result = timeout(
+        Duration::from_secs(5),
+        Tunnel::VerifiedQuic(Box::new(verified), fallback).relay(rx, down),
+    ).await.unwrap();
+    assert!(matches!(result, Err(ClientError::Open(ErrorCode::PolicyDenied))));
+    let mut buf = [0; 32];
+    assert!(timeout(Duration::from_millis(50), local_origin.recv_from(&mut buf)).await.is_err());
+    assert!(timeout(Duration::from_millis(50), target.recv_from(&mut buf)).await.is_err());
 }
 
 #[cfg(test)]
@@ -3834,6 +3868,7 @@ mod selector_tests {
                     ));
                 }
                 udp_prewrite_fallback_fixture(&proxy_client).await;
+                udp_revoked_fallback_fixture(&proxy_client).await;
                 udp_socks_fixture(&proxy_client).await;
                 let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = target.local_addr().unwrap().port();

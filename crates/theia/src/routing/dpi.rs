@@ -258,7 +258,15 @@ impl Engine {
                             key,
                         });
                     }
-                    _ => self.cache.failed(&key, strategy),
+                    Ok(Ok(_)) => {
+                        // Local scope/consent changed, not evidence against
+                        // the peer or a strategy on the previous network.
+                    }
+                    _ if self.enabled() && self.policy_current(policy) => {
+                        self.cache.failed(&key, strategy);
+                    }
+                    _ => {}
+
                 }
             }
             None
@@ -290,6 +298,11 @@ pub(crate) struct FallbackPolicy {
 impl FallbackPolicy {
     pub(crate) fn check(&self) -> Result<(), ClientError> {
         self.engine.check_policy(self.digest)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revoke_fixture(&self) {
+        self.engine.authorize_policy(None);
     }
 }
 
