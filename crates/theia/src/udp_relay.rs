@@ -13,7 +13,7 @@ use std::{
 use tokio::{
     net::UdpSocket,
     sync::mpsc,
-    time::{sleep_until, timeout, Instant},
+    time::{sleep_until, timeout, timeout_at, Instant},
 };
 
 pub(crate) const MAX_FLOWS: usize = 8;
@@ -206,17 +206,16 @@ async fn relay_local(
     };
     let receive = async {
         let mut buf = vec![0; protocol::MAX_DATAGRAM + 1];
-        let mut waiting = verified;
+        let mut waiting = verified.then(|| Instant::now() + FIRST_RESPONSE);
         loop {
-            let n = if waiting {
-                timeout(FIRST_RESPONSE, socket.recv(&mut buf)).await.map_err(|_| ClientError::Timeout)?
+            let n = if let Some(deadline) = waiting {
+                timeout_at(deadline, socket.recv(&mut buf)).await.map_err(|_| ClientError::Timeout)?
             } else {
                 socket.recv(&mut buf).await
             }.map_err(|_| ClientError::Io)?;
             if n > protocol::MAX_DATAGRAM { continue; }
-            if waiting {
+            if waiting.take().is_some() {
                 crate::traffic::udp_peer_reply();
-                waiting = false;
             }
             if deliver(&download, || buf[..n].to_vec())? {
                 traffic.download(n);

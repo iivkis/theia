@@ -2263,9 +2263,14 @@ async fn udp_association(
     } else {
         Some(SocketAddr::new(peer.ip(), port))
     };
-    type Observer = Arc<std::sync::Mutex<crate::routing::dpi::udp::Observer>>;
-    let mut flows =
-        std::collections::HashMap::<(Address, u16), (mpsc::Sender<Vec<u8>>, Observer)>::new();
+    use crate::routing::dpi::udp::{self, Candidate};
+    type Observer = Arc<std::sync::Mutex<udp::Observer>>;
+    struct Flow {
+        tx: mpsc::Sender<Vec<u8>>,
+        observer: Observer,
+        classification: tokio::sync::watch::Sender<Candidate>,
+    }
+    let mut flows = std::collections::HashMap::<(Address, u16), Flow>::new();
     let mut tasks = tokio::task::JoinSet::new();
     let mut buf = vec![0; 65536];
     let mut control_byte = [0; 1];
@@ -2274,37 +2279,45 @@ async fn udp_association(
             result=control.read(&mut control_byte)=>{
                 return match result { Ok(0)=>Ok(()), Ok(_)=>Err(ClientError::Protocol), Err(_)=>Err(ClientError::Io) };
             }
-            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,(tx,_)|!tx.is_closed()); }
+            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,flow|!flow.tx.is_closed()); }
             result=socket.recv_from(&mut buf)=>{
                 let (n,source)=result.map_err(|_|ClientError::Io)?;
                 if source.ip()!=peer.ip() || pinned.is_some_and(|old|old!=source) { continue; }
                 let Some((address,port,data))=udp_relay::parse_socks(&buf[..n]) else { continue; };
                 if pinned.is_none() { pinned=Some(source); }
                 let key=(address,port);
-                if let Some((tx,observer))=flows.get(&key) {
+                if let Some(flow)=flows.get(&key) {
                     // Full queue drops the datagram, never replays it.
-                    if !tx.is_closed() {
-                        match tx.try_reserve() {
+                    if !flow.tx.is_closed() {
+                        match flow.tx.try_reserve() {
                             Ok(permit) => {
-                                observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
+                                let next=flow.observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
+                                // Publish only after this datagram is admitted.
                                 permit.send(data.to_vec());
+                                if next != Candidate::Pending {
+                                    flow.classification.send_if_modified(|current| {
+                                        if *current == Candidate::Pending { *current=next; true } else { false }
+                                    });
+                                }
                             }
                             Err(_) => crate::traffic::udp_queue_drop(),
                         }
                         continue;
                     }
                 }
-                flows.retain(|_,(tx,_)|!tx.is_closed());
+                flows.retain(|_,flow|!flow.tx.is_closed());
                 if tasks.len()>=MAX_FLOWS { crate::traffic::udp_queue_drop(); continue; }
                 let (tx,rx)=mpsc::channel(QUEUE);
                 let _=tx.try_send(data.to_vec());
-                let observer=Arc::new(std::sync::Mutex::new(crate::routing::dpi::udp::Observer::default()));
+                let observer=Arc::new(std::sync::Mutex::new(udp::Observer::default()));
                 let candidate=observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
-                flows.insert(key.clone(),(tx,observer.clone()));
+                let (classification,classified)=tokio::sync::watch::channel(candidate);
+                flows.insert(key.clone(),Flow { tx, observer: observer.clone(), classification });
                 let socket=socket.clone();
                 let proxy=(*client).clone();
                 tasks.spawn(async move {
                     let (address,port)=key;
+                    let candidate=udp::await_candidate(classified).await;
                     let tunnel=proxy.open_udp(address.clone(),port,&candidate).await?;
                     let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
                     let relay=tunnel.relay(rx,down_tx);
@@ -2312,11 +2325,15 @@ async fn udp_association(
                         while let Some(data)=down_rx.recv().await {
                             observer.lock().unwrap_or_else(|e|e.into_inner()).incoming(&data);
                             let Some(packet)=udp_relay::encode_socks(&address,port,&data) else { continue; };
-                            let _=socket.send_to(&packet,source).await.map_err(|_|ClientError::Io)?;
+                            let n=timeout(REPLY_TIMEOUT,socket.send_to(&packet,source)).await
+                                .map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
+                            if n!=packet.len(){return Err(ClientError::Io);}
                         }
                         Ok::<(),ClientError>(())
                     };
-                    tokio::select! { result=relay=>result, result=deliver=>result }
+                    // On clean termination drain accepted responses instead
+                    // of cancelling the downstream queue when relay returns.
+                    tokio::try_join!(relay, deliver).map(|_| ())
                 });
             }
         }

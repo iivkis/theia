@@ -497,6 +497,21 @@ pub(crate) fn test_initial(version: u32, hello: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_initial_parts(version: u32, hello: &[u8]) -> [Vec<u8>; 2] {
+    assert!(hello.len() > 16 && hello.len() < 1024);
+    let first = [vec![6, 0, 16], hello[..16].to_vec()].concat();
+    let rest = &hello[16..];
+    let mut second = vec![6, 16];
+    if rest.len() < 64 {
+        second.push(rest.len() as u8);
+    } else {
+        second.extend(((rest.len() as u16) | 0x4000).to_be_bytes());
+    }
+    second.extend(rest);
+    [tests::initial_packet(0, &first, version), tests::initial_packet(1, &second, version)]
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn hex(s: &str) -> Vec<u8> {

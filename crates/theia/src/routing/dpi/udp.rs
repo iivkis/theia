@@ -1,5 +1,9 @@
 //! Passive UDP classification. No integrity-field or encrypted-payload mutation.
 use super::quic;
+use std::{collections::VecDeque, time::{Duration, Instant}};
+const STUN_LIMIT: usize = 16;
+const STUN_TTL: Duration = Duration::from_secs(30);
+const CLASSIFY_BUDGET: Duration = Duration::from_millis(30);
 const COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stun {
@@ -39,10 +43,11 @@ impl Stun {
             && self.transaction == response.transaction
     }
 }
-/// Classification is not peer authentication. Only a complete first QUIC
-/// v1 ClientHello offering h3 may request independent authenticated evidence.
-#[derive(Debug, PartialEq, Eq)]
+/// Classification is not peer authentication. Only a complete bounded initial
+/// QUIC v1 flight offering h3 may request independent authenticated evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Candidate {
+    Pending,
     QuicH3(String),
     Stun,
     Other,
@@ -52,39 +57,69 @@ pub(crate) enum Candidate {
 pub(crate) struct Observer {
     quic: quic::Observer,
     done: bool,
-    request: Option<Stun>,
+    stun_flow: bool,
+    requests: VecDeque<(Stun, Instant)>,
 }
 impl Observer {
+    fn request(&mut self, message: Stun) {
+        if message.class != 0 { return; }
+        let now = Instant::now();
+        self.requests.retain(|(old, expires)| *old != message && *expires > now);
+        if self.requests.len() >= STUN_LIMIT { self.requests.pop_front(); }
+        self.requests.push_back((message, now + STUN_TTL));
+    }
     pub(crate) fn outgoing(&mut self, data: &[u8]) -> Candidate {
+        if self.stun_flow {
+            if let Some(message) = stun(data) { self.request(message); }
+            return Candidate::Stun;
+        }
         if self.done {
             return Candidate::Other;
         }
         if let Some(message) = stun(data) {
-            self.request = Some(message);
+            self.request(message);
+            self.stun_flow = true;
             self.done = true;
             crate::traffic::udp_stun_flow();
             return Candidate::Stun;
         }
         match self.quic.observe(data) {
-            quic::Result::Pending => {}
+            quic::Result::Pending => Candidate::Pending,
             quic::Result::Hello { name, version, h3 } => {
                 self.done = true;
                 crate::traffic::udp_quic_flow();
                 if version == crate::reality_quic_wire::V1 && h3 {
-                    return Candidate::QuicH3(name);
+                    Candidate::QuicH3(name)
+                } else {
+                    Candidate::Other
                 }
             }
-            quic::Result::Unsupported => self.done = true,
+            quic::Result::Unsupported => {
+                self.done = true;
+                Candidate::Other
+            }
         }
-        Candidate::Other
     }
     pub(crate) fn incoming(&mut self, data: &[u8]) {
-        if self.request.is_some_and(|request| {
-            stun(data).is_some_and(|response| request.matches_response(response))
-        }) {
-            self.request = None;
-            crate::traffic::udp_stun_response();
+        if !self.stun_flow { return; }
+        self.requests.retain(|(_, expires)| *expires > Instant::now());
+        if let Some(response) = stun(data) {
+            if let Some(index) = self.requests.iter().position(|(request, _)| request.matches_response(response)) {
+                self.requests.remove(index);
+                crate::traffic::udp_stun_response();
+            }
         }
+    }
+}
+
+/// Only a pending initial flight waits; other UDP does not incur this delay.
+/// The flow task never consumes queued application datagrams during detection.
+pub(crate) async fn await_candidate(mut classification: tokio::sync::watch::Receiver<Candidate>) -> Candidate {
+    let initial = classification.borrow_and_update().clone();
+    if initial != Candidate::Pending { return initial; }
+    match tokio::time::timeout(CLASSIFY_BUDGET, classification.wait_for(|value| *value != Candidate::Pending)).await {
+        Ok(Ok(value)) => value.clone(),
+        _ => Candidate::Other,
     }
 }
 /// Probe independently with an ordinary, strictly verified QUIC connection.
@@ -103,7 +138,7 @@ pub(super) async fn probe_quic(
     config.transport_config(crate::quic_transport::transport_config());
     let bind = match scope {
         Some(scope) => scope.bind_address(),
-        None => if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().ok()?,
+        None => (if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).parse().ok()?,
     };
     let mut endpoint = quinn::Endpoint::client(bind).ok()?;
     endpoint.set_default_client_config(config);
@@ -142,8 +177,7 @@ mod tests {
         serving.abort();
     }
 
-    #[test]
-    fn quic_candidate_requires_v1_h3_and_complete_initial() {
+    fn h3_hello() -> Vec<u8> {
         let mut hello = super::super::tls::fixture("example.org");
         // Fixture has exactly one extension block containing SNI. Add h3 ALPN.
         let ext = [0, 16, 0, 5, 0, 3, 2, b'h', b'3'];
@@ -155,14 +189,60 @@ mod tests {
         hello[3..5].copy_from_slice(&record_len.to_be_bytes());
         let body_len = (hello.len() - 9) as u32;
         hello[6..9].copy_from_slice(&body_len.to_be_bytes()[1..]);
+        hello.split_off(5)
+    }
+
+    #[tokio::test]
+    async fn fragmented_classification_is_bounded_and_sticky() {
+        let hello = h3_hello();
+        let packets = crate::reality_quic_wire::test_initial_parts(crate::reality_quic_wire::V1, &hello);
+        let mut observer = Observer::default();
+        assert_eq!(observer.outgoing(&packets[0]), Candidate::Pending);
+        let (tx, rx) = tokio::sync::watch::channel(Candidate::Pending);
+        let complete = observer.outgoing(&packets[1]);
+        assert_eq!(complete, Candidate::QuicH3("example.org".into()));
+        tx.send(complete.clone()).unwrap();
+        assert_eq!(await_candidate(rx).await, complete);
+        let (_tx, rx) = tokio::sync::watch::channel(Candidate::Pending);
+        assert_eq!(await_candidate(rx).await, Candidate::Other);
+    }
+
+    #[test]
+    fn quic_candidate_requires_v1_h3_and_complete_initial() {
+        let hello = h3_hello();
         for version in [crate::reality_quic_wire::V1, crate::reality_quic_wire::V2] {
-            let packet = crate::reality_quic_wire::test_initial(version, &hello[5..]);
+            let packet = crate::reality_quic_wire::test_initial(version, &hello);
             let expected = if version == crate::reality_quic_wire::V1 { Candidate::QuicH3("example.org".into()) } else { Candidate::Other };
             assert_eq!(Observer::default().outgoing(&packet), expected);
         }
         let plain = super::super::tls::fixture("example.org");
         let packet = crate::reality_quic_wire::test_initial(crate::reality_quic_wire::V1, &plain[5..]);
         assert_eq!(Observer::default().outgoing(&packet), Candidate::Other);
+    }
+
+    #[test]
+    fn stun_concurrent_transactions_retransmission_and_expiry() {
+        let mut observer = Observer::default();
+        let request = |id: u8| {
+            let mut bytes = vec![0, 1, 0, 0];
+            bytes.extend(COOKIE);
+            bytes.extend([id; 12]);
+            bytes
+        };
+        for id in 0..=STUN_LIMIT as u8 {
+            assert_eq!(observer.outgoing(&request(id)), Candidate::Stun);
+        }
+        assert_eq!(observer.requests.len(), STUN_LIMIT);
+        observer.outgoing(&request(1));
+        assert_eq!(observer.requests.len(), STUN_LIMIT);
+        let mut response = request(1);
+        response[0] = 1;
+        observer.incoming(&response);
+        observer.incoming(&response);
+        assert_eq!(observer.requests.len(), STUN_LIMIT - 1);
+        observer.requests.iter_mut().for_each(|(_, expiry)| *expiry = Instant::now());
+        observer.incoming(&response);
+        assert!(observer.requests.is_empty());
     }
 
     #[test]
@@ -188,6 +268,6 @@ mod tests {
         assert_eq!(observer.outgoing(&req), Candidate::Stun);
         res[19] ^= 1;
         observer.incoming(&res);
-        assert!(observer.request.is_none());
+        assert!(observer.requests.is_empty());
     }
 }
