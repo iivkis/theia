@@ -31,7 +31,8 @@ max_connections_total = 1024
 connect_timeout_ms = 10000
 
 # Optional routing example (requires explicit Save/Apply and revision updates).
-# direct_dpi currently uses the authenticated VPS fallback only; no local DPI engine.
+# direct_dpi prefers an explicitly enabled native client TCP DPI backend;
+# unsupported/failed local attempts use authenticated VPS fallback.
 # [server.policy.routing]
 # revision = 2
 # [[server.policy.routing.rules]]

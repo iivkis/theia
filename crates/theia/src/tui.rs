@@ -782,7 +782,7 @@ impl RoutingPanel {
     fn action_label(value: &str) -> &str {
         match value {
             "direct" => "Напрямую",
-            "direct_dpi" => "Anti-DPI (пока через VPS)",
+            "direct_dpi" => "Anti-DPI / резерв VPS",
             "blocked" => "Блокировать",
             "allowed" => "Через сервер",
             _ => value,
@@ -9022,15 +9022,20 @@ mod tests {
         panel.edit(None);
         let (_, fields, _) = panel.fields.as_mut().unwrap();
         *fields = [
-            "dpi fallback".into(),
-            "direct_dpi".into(),
+            "local".into(),
+            "direct".into(),
             "full:localhost".into(),
             String::new(),
         ];
         assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
         assert_eq!(panel.settings.rules.len(), 1);
-        assert_eq!(panel.settings.rules[0].action, crate::routing::Action::DirectDpi);
-        assert!(panel.body().contains("Anti-DPI (пока через VPS)"));
+        assert_eq!(panel.settings.rules[0].action, crate::routing::Action::Direct);
+        panel.edit(None);
+        let (_, fields, _) = panel.fields.as_mut().unwrap();
+        *fields = ["DPI".into(), "direct_dpi".into(), "example.org".into(), String::new()];
+        assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
+        assert_eq!(panel.settings.rules[1].action, crate::routing::Action::DirectDpi);
+        assert!(panel.body().contains("Anti-DPI / резерв VPS"));
         assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
         assert!(editor.dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);

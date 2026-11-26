@@ -177,13 +177,13 @@ pub(crate) async fn response_data(
     if headers.get(DIGEST_HEADER).and_then(|v| v.to_str().ok()) != Some(expected.as_str()) {
         return Err(StatusCode::CONFLICT);
     }
-    if publication
-        .snapshot
-        .policy()
-        .domain_decision(&domain)
-        .map_err(|_| StatusCode::BAD_REQUEST)?
-        .is_some()
-    {
+    // An explicitly selected direct_dpi route may request authenticated
+    // DNS pins even when its domain decision is already conclusive.
+    if matches!(
+        publication.snapshot.policy().domain_decision(&domain)
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+        Some(action) if action != super::Action::DirectDpi
+    ) {
         return Err(StatusCode::BAD_REQUEST);
     }
     let addresses = tokio::time::timeout(deadline, tokio::net::lookup_host((domain.as_str(), 1)))

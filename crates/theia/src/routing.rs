@@ -1,6 +1,7 @@
 //! Shared route matching primitives for server and client.
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
 pub(crate) mod client_state;
+pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub mod geodata;
 mod settings;

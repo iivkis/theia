@@ -904,6 +904,7 @@ impl AutoClient {
 
 enum ProxyTunnel {
     Direct(TcpStream),
+    Dpi(Box<crate::routing::dpi::Tunnel>),
     H2(Box<Tunnel>),
     H3(Box<H3Tunnel>),
 }
@@ -1056,9 +1057,30 @@ async fn routed_open(
             Err(denied())
         }
         Action::Allowed => carrier.open(address, port).await,
-        // No verified local packet backend is available yet. Never substitute
-        // a plain direct connection, resolve locally, or replay application data.
-        Action::DirectDpi => carrier.open(address, port).await,
+        Action::DirectDpi => {
+            // Initial native backend supports domain HTTPS TCP only. Resolve
+            // via the authenticated policy endpoint, never the local resolver.
+            if cache.dpi.enabled() && port == 443 {
+                if let Address::Dns(name) = &address {
+                    let ips = match pinned {
+                        Some(ips) => ips,
+                        None => carrier.resolve_routing(name, snapshot.digest()).await?,
+                    };
+                    let permitted = ips.iter().all(|ip| {
+                        policy.matching_action(Some(name), Some(*ip))
+                            == Ok(Some(Action::DirectDpi))
+                    });
+                    if permitted {
+                        if let Some(tunnel) = cache.dpi.open(name, port, &ips, snapshot.digest()).await {
+                            return Ok(ProxyTunnel::Dpi(Box::new(tunnel)));
+                        }
+                    }
+                }
+            }
+            // Failed local probe/dial or unsupported traffic uses the same
+            // authenticated VPS carrier. No silent unprotected direct route.
+            carrier.open(address, port).await
+        }
         Action::Direct => client_state::dial_direct(address, port, pinned)
             .await
             .map(ProxyTunnel::Direct),
@@ -1172,7 +1194,7 @@ pub(crate) fn xhttp_observation(code: u8) -> &'static str {
 impl ProxyTunnel {
     fn open_code(&self) -> u8 {
         let (transport, up) = match self {
-            Self::Direct(_) => return 0,
+            Self::Direct(_) | Self::Dpi(_) => return 0,
             Self::H2(t) => (2, t.opened_stream_up()),
             Self::H3(t) => (3, t.opened_stream_up()),
         };
@@ -1182,6 +1204,7 @@ impl ProxyTunnel {
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
         match self {
             Self::Direct(target) => client_state::relay_direct(socket, target).await,
+            Self::Dpi(tunnel) => (*tunnel).relay(socket).await,
             Self::H2(tunnel) => tunnel.relay(socket).await,
             Self::H3(tunnel) => tunnel.relay(socket).await,
         }
@@ -1328,6 +1351,7 @@ impl ClientRuntime {
             )
             .await?
         };
+        client.routing_cache().dpi.set_enabled(candidate.client.proxy.direct_dpi.unwrap_or(false));
         Box::pin(client.routing_policy()).await?;
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
@@ -1475,6 +1499,7 @@ async fn prepare_proxy(
         Some(path),
     )
     .await?;
+    client.routing_cache().dpi.set_enabled(document.client.proxy.direct_dpi.unwrap_or(false));
     client.routing_policy().await?;
     crate::diag!(Info, "client.proxy", "transport_preflight_passed");
     // All startup validation and both binds must succeed before accepting.
