@@ -3,7 +3,6 @@
 use crate::{
     diagnostics::{self, Value},
     protocol::{self, Decoder, Direction, Frame, Role, Session},
-    quic_transport,
     server::{self, GenerationPhase, ServerContext, ServerError},
 };
 use bytes::{Buf, Bytes};
@@ -57,7 +56,7 @@ impl OwnTlsConfig {
 /// Clones are configuration handles, not additional owners of the live UDP
 /// socket. The socket is moved exactly once into the serving generation.
 #[derive(Clone)]
-pub(crate) enum OwnTlsEndpoint {
+pub enum OwnTlsEndpoint {
     Native {
         socket: Arc<Mutex<Option<std::net::UdpSocket>>>,
         config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
@@ -83,6 +82,11 @@ impl OwnTlsEndpoint {
             scope,
             local,
         })
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        let Self::Native { local, .. } = self;
+        Ok(*local)
     }
 
     pub(crate) fn set_server_config(&self, tls: OwnTlsConfig) {
@@ -156,14 +160,22 @@ async fn serve_native_generation(
             _ = connections.join_next(), if !connections.is_empty() => {}
             incoming = listener.accept() => {
                 let candidate = incoming.map_err(|_| ServerError::Io)?;
-                let Some(slot) = context.connection_slot() else { continue; };
+                let connection_id = diagnostics::next_id();
+                crate::diag!(Trace, "server.h3", "quic_incoming", "connection" = Value::Count(connection_id));
+                let Some(slot) = context.connection_slot() else {
+                    crate::diag!(Warn, "server.h3", "connection_quota_rejected", "connection" = Value::Count(connection_id));
+                    continue;
+                };
                 let tls = config.read().unwrap_or_else(|e| e.into_inner()).clone();
                 let context = context.clone();
                 let phase = phase.clone();
                 connections.spawn(async move {
                     let _slot = slot;
                     if let Ok(Ok(session)) = timeout(HANDSHAKE_TIMEOUT, handshake_udp::accept(candidate, tls)).await {
+                        crate::diag!(Debug, "server.h3", "quic_verified", "connection" = Value::Count(connection_id));
                         let _ = run_native_session(session, context, phase).await;
+                    } else {
+                        crate::diag!(Warn, "server.h3", "quic_tls_handshake_rejected", "connection" = Value::Count(connection_id));
                     }
                 });
             }
@@ -208,133 +220,9 @@ mod endpoint_tests {
     }
 }
 
-struct ConnectionGuard(quinn::Connection);
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.0.close(0u32.into(), b"session closed");
-    }
-}
-
-struct EndpointGuard(quinn::Endpoint);
-
-impl Drop for EndpointGuard {
-    fn drop(&mut self) {
-        self.0.close(0u32.into(), b"listener closed");
-    }
-}
-
-/// Own the listener, handshake tasks, connections and stream handlers.
-/// No detached tasks survive a cancelled listener. Reuse a ServerContext
-/// across transports when wiring the CLI, so their quotas cannot diverge.
-pub async fn serve(
-    endpoint: quinn::Endpoint,
-    context: Arc<ServerContext>,
-) -> Result<(), ServerError> {
-    let (_owner, phase) = watch::channel(GenerationPhase::Active);
-    serve_generation(endpoint, context, phase).await
-}
-
-pub(crate) async fn serve_generation(
-    endpoint: quinn::Endpoint,
-    context: Arc<ServerContext>,
-    mut phase: watch::Receiver<GenerationPhase>,
-) -> Result<(), ServerError> {
-    if !server::await_generation_activation(&mut phase).await {
-        crate::diag!(Info, "server.h3", "generation_aborted_before_activation");
-        return Ok(());
-    }
-    crate::diag!(Info, "server.h3", "listener_active");
-    let endpoint = EndpointGuard(endpoint);
-    let mut connections = JoinSet::new();
-    loop {
-        tokio::select! {
-            change = phase.changed() => {
-                if change.is_err() || *phase.borrow() == GenerationPhase::Drain {
-                    break;
-                }
-            }
-            _ = connections.join_next(), if !connections.is_empty() => {}
-            incoming = endpoint.0.accept() => {
-                let Some(incoming) = incoming else {
-                    return Err(ServerError::Io);
-                };
-                let connection_id = diagnostics::next_id();
-                crate::diag!(Trace, "server.h3", "quic_incoming",
-                    "connection" = Value::Count(connection_id));
-                let Some(slot) = context.connection_slot() else {
-                    crate::diag!(Warn, "server.h3", "connection_quota_rejected",
-                        "connection" = Value::Count(connection_id));
-                    incoming.refuse();
-                    continue;
-                };
-                let context = context.clone();
-                let connection_phase = phase.clone();
-                connections.spawn(async move {
-                    let _slot = slot;
-                    let Ok(connection) = quic_transport::accept(incoming).await else {
-                        crate::diag!(Warn, "server.h3", "quic_tls_handshake_rejected",
-                            "connection" = Value::Count(connection_id));
-                        return;
-                    };
-                    crate::diag!(Debug, "server.h3", "quic_verified",
-                        "connection" = Value::Count(connection_id));
-                    run_connection(connection, context, connection_phase).await;
-                });
-            }
-        }
-    }
-    // Quinn does not expose a portable accept-only half-close on Endpoint:
-    // while existing streams drain, refuse all NEW datagrams/connection
-    // attempts. EndpointGuard closes everything after the bounded window.
-    crate::diag!(Info, "server.h3", "generation_draining");
-    let _ = timeout(server::GENERATION_DRAIN, async {
-        while !connections.is_empty() {
-            tokio::select! {
-                _ = connections.join_next() => {}
-                incoming = endpoint.0.accept() => {
-                    if let Some(incoming) = incoming {
-                        incoming.refuse();
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    })
-    .await;
-    Ok(())
-}
-
-pub(crate) async fn run_connection(
-    connection: quinn::Connection,
-    context: Arc<ServerContext>,
-    phase: watch::Receiver<GenerationPhase>,
-) {
-    let guard = ConnectionGuard(connection);
-    let peer = guard.0.remote_address().ip();
-    let binding = if context.requires_channel_binding() {
-        let mut key = zeroize::Zeroizing::new([0u8; 32]);
-        if guard
-            .0
-            .export_keying_material(
-                &mut key[..],
-                crate::channel_binding::LABEL,
-                crate::channel_binding::H3,
-            )
-            .is_err()
-        {
-            return;
-        }
-        Some(Arc::new(crate::channel_binding::Admission::new(key)))
-    } else {
-        None
-    };
-    let transport = h3_quinn::Connection::new(guard.0.clone());
-    run_h3(transport, context, phase, peer, binding, async {
-        let _ = guard.0.closed().await;
-    })
-    .await;
+/// Start the native server on a previously prepared UDP bind.
+pub async fn serve(endpoint: OwnTlsEndpoint, context: Arc<ServerContext>) -> Result<(), ServerError> {
+    endpoint.serve(context).await
 }
 
 /// Experimental loopback entry point; no external listener or configuration

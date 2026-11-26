@@ -1283,7 +1283,7 @@ mod probe_tests {
         let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let server = crate::quic_transport::server_endpoint(
+        let server = crate::quinn_reference::server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             vec![der.clone()],
             key.into(),

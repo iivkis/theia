@@ -2653,7 +2653,7 @@ async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
     let der = cert.cert.der().clone();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(der.clone()).unwrap();
-    let origin = crate::quic_transport::server_endpoint(
+    let origin = crate::quinn_reference::server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
         vec![der],
         rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
@@ -2661,7 +2661,7 @@ async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
     .unwrap();
     let origin_port = origin.local_addr().unwrap().port();
     let endpoint =
-        crate::quic_transport::client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
+        crate::quinn_reference::client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
     let client_addr = endpoint.local_addr().unwrap();
     let bridge_addr = app.local_addr().unwrap();
     let bridge = tokio::spawn(async move {
@@ -2684,7 +2684,7 @@ async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
         }
     });
     let server = async {
-        let connection = crate::quic_transport::accept(origin.accept().await.unwrap())
+        let connection = crate::quinn_reference::accept(origin.accept().await.unwrap())
             .await
             .unwrap();
         let (mut tx, mut rx) = connection.accept_bi().await.unwrap();
@@ -2695,7 +2695,7 @@ async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
         connection
     };
     let client = async {
-        let connection = crate::quic_transport::connect(&endpoint, bridge_addr, "localhost")
+        let connection = crate::quinn_reference::connect(&endpoint, bridge_addr, "localhost")
             .await
             .unwrap();
         let (mut tx, mut rx) = connection.open_bi().await.unwrap();
@@ -3539,7 +3539,7 @@ mod selector_tests {
         let mut roots = RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let server = crate::quic_transport::server_endpoint(
+        let server = crate::quinn_reference::server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             vec![cert.cert.der().clone()],
             key.into(),

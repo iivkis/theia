@@ -1101,12 +1101,12 @@ mod tests {
         roots.add(cert.cert.der().clone()).unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into();
         let reference =
-            crate::quic_transport::server_endpoint(peer(0), vec![cert.cert.der().clone()], key)
+            crate::quinn_reference::server_endpoint(peer(0), vec![cert.cert.der().clone()], key)
                 .unwrap();
         let target = reference.local_addr().unwrap();
         let listener = UdpSocket::bind(peer(0)).await.unwrap();
         let relay_addr = listener.local_addr().unwrap();
-        let client = crate::quic_transport::client_endpoint(peer(0), roots).unwrap();
+        let client = crate::quinn_reference::client_endpoint(peer(0), roots).unwrap();
         let physical = client.local_addr().unwrap();
         let upstream = UdpSocket::bind(peer(0)).await.unwrap();
         upstream.connect(target).await.unwrap();
@@ -1154,7 +1154,7 @@ mod tests {
             initial.retry().unwrap();
             let next = reference.accept().await.unwrap();
             assert!(next.remote_address_validated());
-            let conn = crate::quic_transport::accept(next).await.unwrap();
+            let conn = crate::quinn_reference::accept(next).await.unwrap();
             let (mut send, mut recv) = conn.accept_bi().await.unwrap();
             assert_eq!(recv.read_to_end(1024).await.unwrap(), b"external");
             send.write_all(b"reference").await.unwrap();
@@ -1162,7 +1162,7 @@ mod tests {
             conn.closed().await;
         });
         let result = timeout(Duration::from_secs(12), async {
-            let conn = crate::quic_transport::connect(&client, relay_addr, "reference.example")
+            let conn = crate::quinn_reference::connect(&client, relay_addr, "reference.example")
                 .await
                 .unwrap();
             let (mut send, mut recv) = conn.open_bi().await.unwrap();

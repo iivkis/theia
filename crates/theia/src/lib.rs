@@ -38,6 +38,11 @@ pub mod protocol;
 mod qr_import;
 pub mod quic_core;
 pub mod quic_transport;
+#[cfg(test)]
+extern crate self as theia;
+#[cfg(test)]
+#[path = "../tests/support/quinn_reference.rs"]
+pub(crate) mod quinn_reference;
 pub(crate) mod quota;
 pub mod reality_admission;
 pub mod reality_bootstrap;

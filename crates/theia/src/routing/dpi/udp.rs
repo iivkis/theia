@@ -387,7 +387,7 @@ mod tests {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der.clone()).unwrap();
         let config = super::super::tls::tls_config(roots).unwrap();
-        let endpoint = crate::quic_transport::server_endpoint(
+        let endpoint = crate::quinn_reference::server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             vec![der],
             rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
