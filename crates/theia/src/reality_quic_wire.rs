@@ -419,22 +419,7 @@ impl Flight {
             match varint(bytes, &mut pos)? {
                 0 | 1 => {} // PADDING, PING
                 kind @ (2 | 3) => {
-                    let mut low = varint(bytes, &mut pos)?;
-                    varint(bytes, &mut pos)?; // ACK delay
-                    let count = varint(bytes, &mut pos)?;
-                    low = low.checked_sub(varint(bytes, &mut pos)?)?;
-                    if count > 256 {
-                        return None;
-                    }
-                    for _ in 0..count {
-                        low = low.checked_sub(varint(bytes, &mut pos)?.checked_add(2)?)?;
-                        low = low.checked_sub(varint(bytes, &mut pos)?)?;
-                    }
-                    if kind == 3 {
-                        for _ in 0..3 {
-                            varint(bytes, &mut pos)?;
-                        }
-                    }
+                    crate::quic_core::ack::Ack::decode(bytes, &mut pos, kind == 3)?;
                 }
                 6 => {
                     let start = usize::try_from(varint(bytes, &mut pos)?).ok()?;
