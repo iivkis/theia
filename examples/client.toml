@@ -27,6 +27,9 @@ system_proxy = "off"
 # Explicit local consent: selected direct_dpi rules may expose your device IP
 # to the destination and perform a separate authenticated TLS probe. Off by default.
 # direct_dpi = true
+# Separate opt-in for credential-free STUN Binding on pinned public domain:3478.
+# The STUN server sees your device IP; reachability is not authentication.
+# direct_dpi_stun = true
 
 [management]
 ipc = "auto"

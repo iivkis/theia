@@ -903,6 +903,7 @@ pub struct H3Tunnel {
 impl H3Tunnel {
     pub(crate) async fn relay_udp(
         mut self,
+        mut first: Option<Vec<u8>>,
         mut upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
         download: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> Result<(), ClientError> {
@@ -918,7 +919,7 @@ impl H3Tunnel {
         let activity = crate::udp_relay::Activity::new();
         let writing = std::sync::atomic::AtomicBool::new(false);
         let send_loop = async {
-            while let Some(data) = upload.recv().await {
+            while let Some(data) = crate::udp_relay::next_datagram(&mut first, &mut upload).await {
                 let size = data.len();
                 let frame = Frame::Datagram(data);
                 tx_state
@@ -941,9 +942,10 @@ impl H3Tunnel {
                 match frame {
                     Frame::Datagram(data) => {
                         let size = data.len();
-                        download.send(data).await.map_err(|_| ClientError::Io)?;
-                        traffic.download(size);
-                        activity.touch();
+                        if crate::udp_relay::deliver(&download, || data)? {
+                            traffic.download(size);
+                            activity.touch();
+                        }
                     }
                     Frame::Padding(_) => tokio::task::yield_now().await,
                     Frame::Fin => return Ok::<(), ClientError>(()),

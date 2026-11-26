@@ -64,6 +64,45 @@ pub(super) async fn read_record(socket: &mut TcpStream) -> Result<Vec<u8>, Clien
     Ok(bytes)
 }
 
+/// Observe a complete bounded server handshake instead of counting a record
+/// containing only its message type as a successful first response.
+pub(super) enum ServerFlight {
+    Hello(Vec<u8>),
+    Alert(Vec<u8>),
+}
+
+pub(super) async fn read_server_hello(socket: &mut TcpStream) -> Result<ServerFlight, ClientError> {
+    let mut raw = Vec::new();
+    let mut handshake = Vec::new();
+    for _ in 0..16 {
+        let record = read_record(socket).await?;
+        if record[0] == 21 && raw.is_empty() && record[1] == 3 && (1..=3).contains(&record[2]) && record.len() == 7 {
+            return Ok(ServerFlight::Alert(record));
+        }
+        if record[0] != 22 || record[1] != 3 || !(1..=3).contains(&record[2]) {
+            return Err(ClientError::Protocol);
+        }
+        if raw.len() + record.len() > tls::FLIGHT_LIMIT {
+            return Err(ClientError::Protocol);
+        }
+        handshake.extend_from_slice(&record[5..]);
+        raw.extend_from_slice(&record);
+        if handshake.first() != Some(&2) {
+            return Err(ClientError::Protocol);
+        }
+        if handshake.len() >= 4 {
+            let total = 4 + (usize::from(handshake[1]) << 16) + (usize::from(handshake[2]) << 8) + usize::from(handshake[3]);
+            if !(42..=32 * 1024).contains(&total) {
+                return Err(ClientError::Protocol);
+            }
+            if handshake.len() >= total {
+                return if tls::server_hello(&handshake[..total]) { Ok(ServerFlight::Hello(raw)) } else { Err(ClientError::Protocol) };
+            }
+        }
+    }
+    Err(ClientError::Protocol)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +132,31 @@ mod tests {
         let mut prefix = Vec::new();
         assert!(!read_hello(&mut proxy, &mut prefix).await.unwrap());
         assert_eq!(prefix, b"hello");
+    }
+
+    #[tokio::test]
+    async fn fragmented_server_hello_requires_complete_message_and_preserves_records() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (left, right) = tokio::join!(connect(listener.local_addr().unwrap()), listener.accept());
+        let mut client = left.unwrap();
+        let (mut server, _) = right.unwrap();
+        let mut message = vec![2, 0, 0, 38, 3, 3];
+        message.extend([1; 32]);
+        message.extend([0, 0x13, 1, 0]);
+        assert!(tls::server_hello(&message));
+        for n in 0..message.len() {
+            assert!(!tls::server_hello(&message[..n]));
+        }
+        let mut wire = Vec::new();
+        for part in [&message[..2], &message[2..]] {
+            wire.extend([22, 3, 3, 0, part.len() as u8]);
+            wire.extend(part);
+        }
+        server.write_all(&wire).await.unwrap();
+        assert!(matches!(read_server_hello(&mut client).await.unwrap(), ServerFlight::Hello(response) if response == wire));
+        let alert = [21, 3, 3, 0, 2, 2, 40];
+        server.write_all(&alert).await.unwrap();
+        assert!(matches!(read_server_hello(&mut client).await.unwrap(), ServerFlight::Alert(response) if response == alert));
     }
 
     #[tokio::test]

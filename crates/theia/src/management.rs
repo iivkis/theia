@@ -40,7 +40,7 @@ pub(crate) const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_COMMAND_BYTES: usize = 256;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) const MAX_RESPONSE_BYTES: u64 = 512;
+pub(crate) const MAX_RESPONSE_BYTES: u64 = 1024;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_CLIENTS: usize = 8;
 
@@ -156,7 +156,7 @@ pub enum StatusReply {
         fallback: bool,
         routing_revision: u64,
         routing_state: u8,
-        routing_totals: [u64; 20],
+        routing_totals: [u64; 38],
     },
     ClientReady {
         revision: u64,
@@ -1276,7 +1276,7 @@ where
                     return None;
                 }
                 let mut counters = fields.next()?.strip_prefix("rt=")?.split(',');
-                let mut routing_totals = [0; 20];
+                let mut routing_totals = [0; 38];
                 for counter in &mut routing_totals {
                     *counter = unsigned(counters.next()?)?;
                 }
@@ -1928,7 +1928,7 @@ mod strict_wire_matrix_tests {
             (4, 3, 1, false),
         ] {
             let response = format!(
-                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={} rr=2 rs=1 rt=10,20,30,40,5,1,2,6,7,8,11,12,13,14,15,16,17,18,19,20\n",
+                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={} rr=2 rs=1 rt=10,20,30,40,5,1,2,6,7,8,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38\n",
                 u8::from(f)
             );
             assert_eq!(
@@ -1943,18 +1943,30 @@ mod strict_wire_matrix_tests {
                     routing_revision: 2,
                     routing_state: 1,
                     routing_totals: [
-                        10, 20, 30, 40, 5, 1, 2, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+                        10, 20, 30, 40, 5, 1, 2, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38
                     ],
                 })
             );
         }
+        // Maximal counters still fit the fixed response budget.
+        let max_counters = [u64::MAX; 38].iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        let max_response = format!("theia-client-v1 r={} sha256={hex} d={} t=3 x=2 f=0 rr={} rs=1 rt={max_counters}\n", u64::MAX, u64::MAX, u64::MAX);
+        assert!(max_response.len() as u64 <= MAX_RESPONSE_BYTES);
+        assert!(matches!(peer(status, "client-status\n", max_response.as_bytes()).await,
+            Ok(StatusReply::ClientRunning { routing_totals, .. }) if routing_totals == [u64::MAX; 38]));
+        let zeros = ["0"; 38].join(",");
+        let noncanonical = format!("{},01", ["0"; 37].join(","));
         for response in [
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt={zeros}\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={noncanonical}\n"),
             format!(
-                "theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
+                "theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
             ),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,0,0,0,0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"),
             format!(
-                "theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,01\n"
+                "theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,01\n"
             ),
             format!("theia-client-v1 r=07 sha256={hex} d=0 t=0 x=0 f=0\n"),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=3 x=0 f=0\n"),

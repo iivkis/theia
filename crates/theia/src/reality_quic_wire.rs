@@ -8,8 +8,8 @@ use ring::{aead, hkdf};
 pub(crate) type Cid = Vec<u8>;
 pub(crate) const MAX_DATAGRAM: usize = 65527;
 pub(crate) const MIN_INITIAL: usize = 1200;
-pub(crate) const V1: u32 = 1;
-pub(crate) const V2: u32 = 0x6b3343cf;
+pub(crate) use crate::quic_core::wire::{V1, V2};
+use crate::quic_core::wire::{decode_number, varint};
 const MAX_CRYPTO: usize = crate::reality_admission::MAX_HELLO;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,15 +36,6 @@ fn take<'a>(bytes: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
     let end = pos.checked_add(n)?;
     let value = bytes.get(*pos..end)?;
     *pos = end;
-    Some(value)
-}
-fn varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
-    let first = *take(bytes, pos, 1)?.first()?;
-    let n = 1usize << (first >> 6);
-    let mut value = u64::from(first & 63);
-    for &b in take(bytes, pos, n - 1)? {
-        value = (value << 8) | u64::from(b);
-    }
     Some(value)
 }
 fn cid<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
@@ -190,6 +181,18 @@ pub(crate) fn short_matches(bytes: &[u8], cid: &[u8]) -> bool {
 /// Retry integrity is a public consistency check, not proof of the client's
 /// address or of the reference's TLS identity. Token bytes remain opaque.
 pub(crate) fn retry_valid(bytes: &[u8], original: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    let Some(header) = long(bytes) else { return false; };
+    if header.kind != Kind::Retry { return false; }
+    let split = bytes.len() - 16;
+    retry_integrity_tag(header.version, &bytes[..split], original)
+        .is_some_and(|tag| bool::from(tag.as_slice().ct_eq(&bytes[split..])))
+}
+
+/// Public Retry integrity tag, not authentication. Use only for the
+/// standardized Retry pseudo-packet with the RFC fixed key and nonce.
+pub(crate) fn retry_integrity_tag(version: u32, packet: &[u8], original: &[u8]) -> Option<[u8; 16]> {
+    if original.len() > 20 || packet.len() > MAX_DATAGRAM - 16 { return None; }
     const KEY: [u8; 16] = [
         0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8,
         0x4e,
@@ -197,13 +200,7 @@ pub(crate) fn retry_valid(bytes: &[u8], original: &[u8]) -> bool {
     const NONCE: [u8; 12] = [
         0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
     ];
-    let Some(header) = long(bytes) else {
-        return false;
-    };
-    if original.len() > 20 || header.kind != Kind::Retry {
-        return false;
-    }
-    let (key, nonce) = match header.version {
+    let (key, nonce) = match version {
         V1 => (KEY, NONCE),
         V2 => (
             [
@@ -214,24 +211,19 @@ pub(crate) fn retry_valid(bytes: &[u8], original: &[u8]) -> bool {
                 0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a,
             ],
         ),
-        _ => return false,
+        _ => return None,
     };
-    let split = bytes.len() - 16;
-    let mut aad = Vec::with_capacity(1 + original.len() + split);
+    let mut aad = Vec::with_capacity(1 + original.len() + packet.len());
     aad.push(original.len() as u8);
     aad.extend_from_slice(original);
-    aad.extend_from_slice(&bytes[..split]);
-    let Ok(key) = aead::UnboundKey::new(&aead::AES_128_GCM, &key) else {
-        return false;
-    };
-    let mut tag = bytes[split..].to_vec();
-    aead::LessSafeKey::new(key)
-        .open_in_place(
-            aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(aad),
-            &mut tag,
-        )
-        .is_ok()
+    aad.extend_from_slice(packet);
+    let key = aead::UnboundKey::new(&aead::AES_128_GCM, &key).ok()?;
+    let tag = aead::LessSafeKey::new(key).seal_in_place_separate_tag(
+        aead::Nonce::assume_unique_for_key(nonce),
+        aead::Aad::from(aad),
+        &mut [],
+    ).ok()?;
+    tag.as_ref().try_into().ok()
 }
 
 struct Size(usize);
@@ -327,19 +319,6 @@ impl InitialKeys {
         Some((pn, plain.to_vec()))
     }
 }
-fn decode_number(truncated: u64, len: usize, largest: Option<u64>) -> Option<u64> {
-    let expected = largest.map_or(0, |n| n + 1);
-    let window = 1u64 << (len * 8);
-    let half = window / 2;
-    let mut candidate = (expected & !(window - 1)) | truncated;
-    if candidate + half <= expected && candidate < (1u64 << 62) - window {
-        candidate += window;
-    } else if candidate > expected + half && candidate >= window {
-        candidate -= window;
-    }
-    (candidate < (1u64 << 62)).then_some(candidate)
-}
-
 pub(crate) enum Inspection {
     Pending,
     Hello(Vec<u8>),
@@ -441,22 +420,7 @@ impl Flight {
             match varint(bytes, &mut pos)? {
                 0 | 1 => {} // PADDING, PING
                 kind @ (2 | 3) => {
-                    let mut low = varint(bytes, &mut pos)?;
-                    varint(bytes, &mut pos)?; // ACK delay
-                    let count = varint(bytes, &mut pos)?;
-                    low = low.checked_sub(varint(bytes, &mut pos)?)?;
-                    if count > 256 {
-                        return None;
-                    }
-                    for _ in 0..count {
-                        low = low.checked_sub(varint(bytes, &mut pos)?.checked_add(2)?)?;
-                        low = low.checked_sub(varint(bytes, &mut pos)?)?;
-                    }
-                    if kind == 3 {
-                        for _ in 0..3 {
-                            varint(bytes, &mut pos)?;
-                        }
-                    }
+                    crate::quic_core::ack::Ack::decode(bytes, &mut pos, kind == 3)?;
                 }
                 6 => {
                     let start = usize::try_from(varint(bytes, &mut pos)?).ok()?;
@@ -494,6 +458,21 @@ pub(crate) fn test_initial(version: u32, hello: &[u8]) -> Vec<u8> {
     }
     frames.extend(hello);
     tests::initial_packet(0, &frames, version)
+}
+
+#[cfg(test)]
+pub(crate) fn test_initial_parts(version: u32, hello: &[u8]) -> [Vec<u8>; 2] {
+    assert!(hello.len() > 16 && hello.len() < 1024);
+    let first = [vec![6, 0, 16], hello[..16].to_vec()].concat();
+    let rest = &hello[16..];
+    let mut second = vec![6, 16];
+    if rest.len() < 64 {
+        second.push(rest.len() as u8);
+    } else {
+        second.extend(((rest.len() as u16) | 0x4000).to_be_bytes());
+    }
+    second.extend(rest);
+    [tests::initial_packet(0, &first, version), tests::initial_packet(1, &second, version)]
 }
 
 #[cfg(test)]

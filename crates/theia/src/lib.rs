@@ -35,6 +35,7 @@ mod network_scope;
 mod padding;
 pub mod protocol;
 mod qr_import;
+pub mod quic_core;
 pub mod quic_transport;
 pub(crate) mod quota;
 pub mod reality_admission;

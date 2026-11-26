@@ -851,6 +851,41 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn native_quic_retry_preserves_independent_identity_and_exporter() {
+        use crate::quic_core::{handshake_udp, listener::Listener, wire::Version};
+        use tokio::net::UdpSocket;
+        let identity = Identity::generate(scope()).unwrap();
+        let wrong = Identity::generate(scope()).unwrap();
+        let name = "edge.example.org";
+        for version in [Version::V1, Version::V2] {
+            for (key, valid) in [(identity.public_key(), true), (wrong.public_key(), false)] {
+                let mut sc = identity.server_tls(name, Branch::H3).unwrap();
+                sc.send_tls13_tickets = 0;
+                let cc = client_tls(&scope(), key, Branch::H3).unwrap();
+                let mut listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2).unwrap();
+                let addr = listener.local_addr();
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let (client, server) = timeout(StdDuration::from_secs(15), async {
+                    tokio::join!(
+                        handshake_udp::connect(socket, addr, version, Arc::new(cc), ServerName::try_from(name).unwrap()),
+                        async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await },
+                    )
+                }).await.unwrap();
+                if valid {
+                    let mut client = client.unwrap();
+                    let mut server = server.unwrap();
+                    let ck = client.take_channel_binding().unwrap();
+                    let sk = server.take_channel_binding().unwrap();
+                    assert_eq!(&ck[..], &sk[..]);
+                } else {
+                    assert!(client.is_err());
+                    assert!(server.is_err());
+                }
+            }
+        }
+    }
+
     #[test]
     fn identity_key_is_create_only_and_bound_to_scope_across_restart() {
         use std::sync::atomic::{AtomicU64, Ordering};
