@@ -6,6 +6,8 @@ pub(crate) mod exchange;
 pub(crate) mod flow;
 pub mod packet;
 #[cfg(target_os = "linux")]
+pub(crate) mod linux_ingress;
+#[cfg(target_os = "linux")]
 pub mod nfqueue;
 pub mod geodata;
 mod settings;

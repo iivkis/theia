@@ -1841,12 +1841,173 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     serving.await
 }
 
+/// Experimental native-ingress adapter for an already isolated platform
+/// harness. It uses the same authenticated client, classifier, shared flow
+/// table and H2/H3 carrier as explicit proxy ingress. It does NOT install
+/// system rules, assert capture readiness, or provide an egress exemption.
+/// A production backend must own those operations before calling it.
+#[cfg(target_os = "linux")]
+pub struct NativeIngress {
+    client: ProxyClient,
+    raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
+    _owner: NativeOwner,
+}
+
+#[cfg(target_os = "linux")]
+struct RawLease {
+    flow: crate::routing::flow::FlowLease,
+    digest: [u8; 32],
+    last: Instant,
+    denied: bool,
+}
+
+#[cfg(target_os = "linux")]
+static NATIVE_OWNER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+struct NativeOwner;
+#[cfg(target_os = "linux")]
+impl NativeOwner {
+    fn acquire() -> Result<Self, ClientError> {
+        NATIVE_OWNER.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .map(|_| Self).map_err(|_| ClientError::Configuration)
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for NativeOwner {
+    fn drop(&mut self) {
+        NATIVE_OWNER.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl NativeIngress {
+    /// Preflight only; the caller owns an isolated network namespace/rule
+    /// transaction. No new CLI or second system interception mode.
+    pub async fn prepare(path: &Path) -> Result<Self, ClientError> {
+        let owner = NativeOwner::acquire()?;
+        let raw = zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ClientError::Configuration)?);
+        let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
+            .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
+        let client = prepare_client(&document, path).await?;
+        Ok(Self { client, raw: Mutex::new(std::collections::HashMap::new()), _owner: owner })
+    }
+
+    /// Deliver only a conclusive early Pass to NFQUEUE. Unknown domain/app,
+    /// Modify, Redirect and all errors fail closed on raw packet ingress.
+    /// No raw TCP connection is moved to the carrier after its SYN.
+    pub async fn verdict(&self, packet: crate::routing::nfqueue::Packet<'_>) -> std::io::Result<crate::routing::PacketAction> {
+        use crate::routing::PacketAction;
+        let action = if packet.local_output() {
+            match packet.metadata() {
+                Some(meta) => self.raw_verdict(meta).await,
+                None => PacketAction::Drop,
+            }
+        } else {
+            PacketAction::Drop
+        };
+        packet.finish(action)
+    }
+
+    async fn raw_verdict(&self, meta: crate::routing::packet::PacketMeta) -> crate::routing::PacketAction {
+        use crate::routing::{Evidence, PacketAction, packet::Transport};
+        let Ok(snapshot) = self.client.routing_policy().await else { return PacketAction::Drop; };
+        let cache = self.client.routing_cache();
+        let digest = snapshot.digest();
+        let matched = meta.classify(snapshot.policy(), Evidence::Unknown, Evidence::Unknown)
+            .ok().and_then(|c| c.action()).map(Action::packet_action);
+        let Ok(mut raw) = self.raw.lock() else { return PacketAction::Drop; };
+        let now = Instant::now();
+        raw.retain(|_, entry| now.duration_since(entry.last) < Duration::from_secs(60));
+        let current = matched == Some(PacketAction::Pass) && cache.dpi.check_policy(digest).is_ok();
+        if let Some(entry) = raw.get_mut(&meta.flow) {
+            entry.last = now;
+            if !current || entry.digest != digest { entry.denied = true; }
+            return if !entry.denied && entry.flow.commit(PacketAction::Pass).is_ok() { PacketAction::Pass } else { PacketAction::Drop };
+        }
+        // TCP must start from a SYN without ACK/RST/FIN. A lost or expired
+        // flow is never silently recreated from a middle-of-stream packet.
+        if !current || (meta.flow.transport == Transport::Tcp && !meta.tcp_flags.is_some_and(|f| f & 0x17 == 0x02)) {
+            return PacketAction::Drop;
+        }
+        let Ok(flow) = cache.flows.begin_native(cache.dpi.clone(), meta.flow, digest, PacketAction::Pass) else { return PacketAction::Drop; };
+        if flow.commit(PacketAction::Pass).is_err() { return PacketAction::Drop; }
+        raw.insert(meta.flow, RawLease { flow, digest, last: now, denied: false });
+        PacketAction::Pass
+    }
+
+    /// Terminate an already redirected TCP connection using the original
+    /// target from conntrack. Native domain/application are Unknown.
+    /// Only carrier Redirect (or legal pre-payload Modify fallback) is
+    /// supported here: local Pass must use a separate proven egress path.
+    pub async fn relay_linux_tcp(&self, stream: TcpStream) -> Result<(), ClientError> {
+        let key = crate::routing::linux_ingress::original_tcp(&stream).map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
+        let (carrier, flow, address) = self.redirect(key).await?;
+        let tunnel = carrier.open(address, key.destination.port()).await?;
+        tunnel.relay_guarded(stream, Some(&flow)).await
+    }
+
+    /// Common UDP handoff for a trusted platform adapter with a terminated
+    /// datagram flow. The OS-specific receiver/response injection is not
+    /// implemented here. Channels remain bounded by the platform adapter.
+    pub async fn relay_terminated_udp(
+        &self,
+        key: crate::routing::packet::FlowKey,
+        upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        download: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), ClientError> {
+        if key.transport != crate::routing::packet::Transport::Udp {
+            return Err(ClientError::Protocol);
+        }
+        let (carrier, flow, address) = self.redirect(key).await?;
+        let tunnel = carrier.open_udp(address, key.destination.port()).await?;
+        tunnel.relay_guarded(upload, download, Some(&flow)).await
+    }
+
+    async fn redirect(&self, key: crate::routing::packet::FlowKey) -> Result<(Carrier, crate::routing::flow::FlowLease, Address), ClientError> {
+        use crate::routing::{Evidence, PacketAction};
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        if key.destination.port() == 0 || key.source.port() == 0
+            || key.destination.ip().is_loopback() || key.destination.ip().is_unspecified()
+            || key.destination.ip().is_multicast() || key.destination == key.source
+            || matches!(key.destination, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.ip().is_unicast_link_local() || v6.ip().to_ipv4_mapped().is_some()) {
+            return Err(denied());
+        }
+        let (carrier, cache) = match &self.client {
+            ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
+            ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
+        };
+        let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+        let configured = snapshot.policy().classify_with_application(
+            Evidence::Unknown, Evidence::Known(key.destination.ip()), Evidence::Unknown
+        ).map_err(|_| denied())?.action().ok_or_else(denied)?.packet_action();
+        if !matches!(configured, PacketAction::Redirect | PacketAction::Modify) {
+            return Err(denied());
+        }
+        let flow = cache.flows.begin_native(cache.dpi.clone(), key, snapshot.digest(), configured)?;
+        let address = match key.destination.ip() {
+            IpAddr::V4(ip) => Address::V4(ip.octets()),
+            IpAddr::V6(ip) => Address::V6(ip.octets()),
+        };
+        Ok((carrier, flow, address))
+    }
+}
+
 /// Shared startup preflight: never changes the OS proxy or claims an
 /// authenticated remote tunnel merely because the listeners bind.
 async fn prepare_proxy(
     document: &config::ClientDocument,
     path: &Path,
 ) -> Result<(TcpListener, TcpListener, ProxyClient), ClientError> {
+    let client = prepare_client(document, path).await?;
+    // All startup validation and both binds must succeed before accepting.
+    let http = TcpListener::bind(&document.client.proxy.http_listen).await.map_err(|_| ClientError::Io)?;
+    let socks = TcpListener::bind(&document.client.proxy.socks5_listen).await.map_err(|_| ClientError::Io)?;
+    crate::diag!(Info, "client.proxy", "listeners_bound", "count" = Value::Count(2));
+    Ok((http, socks, client))
+}
+
+async fn prepare_client(document: &config::ClientDocument, path: &Path) -> Result<ProxyClient, ClientError> {
     let profile = document
         .client
         .profiles
@@ -1875,20 +2036,7 @@ async fn prepare_proxy(
         .set_stun_enabled(document.client.proxy.direct_dpi_stun.unwrap_or(false));
     client.routing_policy().await?;
     crate::diag!(Info, "client.proxy", "transport_preflight_passed");
-    // All startup validation and both binds must succeed before accepting.
-    let http = TcpListener::bind(&document.client.proxy.http_listen)
-        .await
-        .map_err(|_| ClientError::Io)?;
-    let socks = TcpListener::bind(&document.client.proxy.socks5_listen)
-        .await
-        .map_err(|_| ClientError::Io)?;
-    crate::diag!(
-        Info,
-        "client.proxy",
-        "listeners_bound",
-        "count" = Value::Count(2)
-    );
-    Ok((http, socks, client))
+    Ok(client)
 }
 
 /// A Windows TUI starts the local client independently of OS proxy consent.

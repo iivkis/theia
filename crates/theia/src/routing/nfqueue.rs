@@ -87,6 +87,7 @@ struct Captured {
     bytes: Vec<u8>,
     meta: Option<PacketMeta>,
     checksum_pending: bool,
+    local_output: bool,
 }
 fn decode(data: &[u8], queue: u16) -> io::Result<Captured> {
     let (kind, _, body) = checked_header(data)?;
@@ -97,11 +98,13 @@ fn decode(data: &[u8], queue: u16) -> io::Result<Captured> {
     let mut rest = &body[NFGEN..];
     let (mut id, mut payload, mut captured_len, mut skb, mut input, mut output) = (None, None, None, None, None, None);
     let mut ethertype = 0;
+    let mut local_output = false;
     while let Some((kind, value)) = next_attr(&mut rest)? {
         match kind {
             1 if id.is_none() && value.len() == 7 => {
                 id = Some(be32(&value[..4]));
                 ethertype = u16::from_be_bytes([value[4], value[5]]);
+                local_output = value[6] == 3; // NF_INET_LOCAL_OUT
             }
             5 if input.is_none() && value.len() == 4 => input = Some(be32(value)),
             6 if output.is_none() && value.len() == 4 => output = Some(be32(value)),
@@ -128,6 +131,7 @@ fn decode(data: &[u8], queue: u16) -> io::Result<Captured> {
         bytes: bytes.to_vec(),
         meta,
         checksum_pending: skb & 5 != 0,
+        local_output,
     })
 }
 
@@ -249,7 +253,7 @@ impl Queue {
         attr(&mut attrs, 2, &data);
         let result = send(fd, &message(VERDICT, REQUEST, 0, self.number, &attrs));
         if result.is_err() {
-            self.fd.take();
+            drop(self.fd.take());
         }
         result
     }
@@ -264,7 +268,7 @@ impl Queue {
             Ok(captured) => Ok(Packet { queue: self, captured, done: false }),
             Err(error) => {
                 if !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) {
-                    self.fd.take();
+                    drop(self.fd.take());
                 }
                 Err(error)
             }
@@ -282,12 +286,13 @@ impl Packet<'_> {
     pub fn metadata(&self) -> Option<PacketMeta> { self.captured.meta }
     pub fn bytes(&self) -> &[u8] { &self.captured.bytes }
     pub fn checksum_pending(&self) -> bool { self.captured.checksum_pending }
+    pub fn local_output(&self) -> bool { self.captured.local_output }
 
     /// Pass only a complete supported packet. Until an actual redirect or
     /// modification adapter owns the payload, those actions are Drop.
     /// Returns the actual disposition, not the requested action.
     pub fn finish(mut self, action: PacketAction) -> io::Result<PacketAction> {
-        let accept = action == PacketAction::Pass && self.captured.meta.is_some();
+        let accept = action == PacketAction::Pass && self.captured.local_output && self.captured.meta.is_some();
         let result = self.queue.verdict(self.captured.id, accept);
         self.done = true;
         result.map(|()| if accept { PacketAction::Pass } else { PacketAction::Drop })

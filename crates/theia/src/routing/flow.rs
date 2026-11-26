@@ -1,7 +1,7 @@
 //! Shared client flow lifetime and irreversible first-payload authorization.
 //! Compatibility ingress uses synthetic IDs; native backends must bind their
 //! platform flow identities to this same table before forwarding any payload.
-use super::{dpi::Engine, PacketAction};
+use super::{dpi::Engine, packet::FlowKey, PacketAction};
 use crate::{client::ClientError, protocol::{Address, ErrorCode}};
 use std::{
     collections::HashMap,
@@ -23,6 +23,7 @@ struct Identity {
     port: u16,
     digest: [u8; 32],
     configured: PacketAction,
+    native: Option<FlowKey>,
 }
 
 struct Entry {
@@ -34,6 +35,7 @@ struct Entry {
 struct State {
     next: u64,
     entries: HashMap<u64, Entry>,
+    native: HashMap<FlowKey, u64>,
 }
 
 /// One bounded table for the client process, including retained generations.
@@ -80,18 +82,55 @@ impl FlowTable {
         digest: [u8; 32],
         configured: PacketAction,
     ) -> Result<FlowLease, ClientError> {
+        self.begin_inner(engine, protocol, target, port, digest, configured, None)
+    }
+
+    pub(crate) fn begin_native(
+        self: &Arc<Self>,
+        engine: Arc<Engine>,
+        key: FlowKey,
+        digest: [u8; 32],
+        configured: PacketAction,
+    ) -> Result<FlowLease, ClientError> {
+        use super::packet::Transport;
+        let protocol = match key.transport {
+            Transport::Tcp => Protocol::Tcp,
+            Transport::Udp => Protocol::Udp,
+        };
+        let target = match key.destination.ip() {
+            std::net::IpAddr::V4(ip) => Address::V4(ip.octets()),
+            std::net::IpAddr::V6(ip) => Address::V6(ip.octets()),
+        };
+        self.begin_inner(engine, protocol, target, key.destination.port(), digest, configured, Some(key))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_inner(
+        self: &Arc<Self>,
+        engine: Arc<Engine>,
+        protocol: Protocol,
+        target: Address,
+        port: u16,
+        digest: [u8; 32],
+        configured: PacketAction,
+        native: Option<FlowKey>,
+    ) -> Result<FlowLease, ClientError> {
         if port == 0 || configured == PacketAction::Drop {
             return Err(denied());
         }
         engine.check_policy(digest)?;
-        let identity = Identity { protocol, target, port, digest, configured };
+        let identity = Identity { protocol, target, port, digest, configured, native };
         let mut state = self.state.lock().map_err(|_| denied())?;
         if state.entries.len() >= self.capacity {
             return Err(ClientError::Open(ErrorCode::ResourceLimit));
         }
+        if native.is_some_and(|key| state.native.contains_key(&key)) {
+            return Err(denied());
+        }
         let id = state.next.checked_add(1).ok_or(ClientError::Open(ErrorCode::ResourceLimit))?;
         state.next = id;
         state.entries.insert(id, Entry { identity: identity.clone(), committed: None });
+        if let Some(key) = native { state.native.insert(key, id); }
         Ok(FlowLease { table: self.clone(), id, identity, engine })
     }
 }
@@ -146,6 +185,9 @@ impl Drop for FlowLease {
     fn drop(&mut self) {
         if let Ok(mut state) = self.table.state.lock() {
             state.entries.remove(&self.id);
+            if let Some(key) = self.identity.native {
+                if state.native.get(&key) == Some(&self.id) { state.native.remove(&key); }
+            }
         }
     }
 }
@@ -207,6 +249,24 @@ mod tests {
         let flow = begin(&table, &engine, PacketAction::Modify).unwrap();
         flow.commit(PacketAction::Redirect).unwrap();
         assert!(flow.commit(PacketAction::Modify).is_err());
+    }
+
+    #[test]
+    fn native_tuple_shares_quota_and_cannot_be_owned_twice() {
+        let (table, engine) = setup();
+        let key = FlowKey {
+            source: "192.0.2.1:1234".parse().unwrap(),
+            destination: "198.51.100.1:443".parse().unwrap(),
+            transport: super::super::packet::Transport::Tcp,
+            interface: 1,
+        };
+        let flow = table.begin_native(engine.clone(), key, [1; 32], PacketAction::Redirect).unwrap();
+        assert!(table.begin_native(engine.clone(), key, [1; 32], PacketAction::Pass).is_err());
+        assert!(begin(&table, &engine, PacketAction::Pass).is_err());
+        flow.commit(PacketAction::Redirect).unwrap();
+        assert!(flow.commit(PacketAction::Pass).is_err());
+        drop(flow);
+        assert!(table.begin_native(engine, key, [1; 32], PacketAction::Redirect).is_ok());
     }
 
     #[test]
