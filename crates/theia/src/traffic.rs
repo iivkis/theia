@@ -84,22 +84,39 @@ static UDP_CLIENT_H2: Counters = Counters::new();
 static UDP_CLIENT_H3: Counters = Counters::new();
 static UDP_SERVER_H2: Counters = Counters::new();
 static UDP_SERVER_H3: Counters = Counters::new();
-static UDP_QUIC: AtomicU64=AtomicU64::new(0);
-static UDP_STUN: AtomicU64=AtomicU64::new(0);
-static UDP_STUN_RESPONSE: AtomicU64=AtomicU64::new(0);
-static UDP_DPI_FALLBACK: AtomicU64=AtomicU64::new(0);
-pub(crate) fn enter_udp(role:Role,h3:bool,direct:bool)->Relay<'static>{
-    if direct {return UDP_DIRECT.enter();}
-    (match (role,h3){(Role::Client,false)=>&UDP_CLIENT_H2,(Role::Client,true)=>&UDP_CLIENT_H3,(Role::Server,false)=>&UDP_SERVER_H2,(Role::Server,true)=>&UDP_SERVER_H3}).enter()
+static UDP_QUIC: AtomicU64 = AtomicU64::new(0);
+static UDP_STUN: AtomicU64 = AtomicU64::new(0);
+static UDP_STUN_RESPONSE: AtomicU64 = AtomicU64::new(0);
+static UDP_DPI_FALLBACK: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn enter_udp(role: Role, h3: bool, direct: bool) -> Relay<'static> {
+    if direct {
+        return UDP_DIRECT.enter();
+    }
+    (match (role, h3) {
+        (Role::Client, false) => &UDP_CLIENT_H2,
+        (Role::Client, true) => &UDP_CLIENT_H3,
+        (Role::Server, false) => &UDP_SERVER_H2,
+        (Role::Server, true) => &UDP_SERVER_H3,
+    })
+    .enter()
 }
-pub(crate) fn udp_quic_flow(){UDP_QUIC.fetch_add(1,Ordering::Relaxed);}
-pub(crate) fn udp_stun_flow(){UDP_STUN.fetch_add(1,Ordering::Relaxed);}
-pub(crate) fn udp_stun_response(){UDP_STUN_RESPONSE.fetch_add(1,Ordering::Relaxed);}
-pub(crate) fn udp_dpi_fallback(){UDP_DPI_FALLBACK.fetch_add(1,Ordering::Relaxed);}
+pub(crate) fn udp_quic_flow() {
+    UDP_QUIC.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_stun_flow() {
+    UDP_STUN.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_stun_response() {
+    UDP_STUN_RESPONSE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_dpi_fallback() {
+    UDP_DPI_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
 #[cfg(test)]
 #[test]
-fn udp_routing_summary_reports_independent_counters(){
-    let report=routing_summary_from([0,0,0,0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9,10]);
+fn udp_routing_summary_reports_independent_counters() {
+    let report =
+        routing_summary_from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert!(report.contains("UDP VPS:"));
     assert!(report.contains("QUIC Initial 7 · STUN 8 · совпавший ответ 9"));
     assert!(report.contains("UDP Anti-DPI: только VPS, открыто 10"));
@@ -123,8 +140,9 @@ pub(crate) fn dpi_first_failure() {
 pub(crate) fn routing_totals() -> [u64; 20] {
     let direct = CLIENT_DIRECT.snapshot();
     let proxied = snapshot(Role::Client);
-    let udp=UDP_DIRECT.snapshot();
-    let h2=UDP_CLIENT_H2.snapshot();let h3=UDP_CLIENT_H3.snapshot();
+    let udp = UDP_DIRECT.snapshot();
+    let h2 = UDP_CLIENT_H2.snapshot();
+    let h3 = UDP_CLIENT_H3.snapshot();
     [
         direct.upload,
         direct.download,
@@ -136,7 +154,16 @@ pub(crate) fn routing_totals() -> [u64; 20] {
         DPI_FIRST_RESPONSE.load(Ordering::Relaxed),
         DPI_FALLBACK_OPEN.load(Ordering::Relaxed),
         DPI_FIRST_FAILURE.load(Ordering::Relaxed),
-        udp.upload,udp.download,h2.upload.saturating_add(h3.upload),h2.download.saturating_add(h3.download),udp.active,h2.active.saturating_add(h3.active),UDP_QUIC.load(Ordering::Relaxed),UDP_STUN.load(Ordering::Relaxed),UDP_STUN_RESPONSE.load(Ordering::Relaxed),UDP_DPI_FALLBACK.load(Ordering::Relaxed),
+        udp.upload,
+        udp.download,
+        h2.upload.saturating_add(h3.upload),
+        h2.download.saturating_add(h3.download),
+        udp.active,
+        h2.active.saturating_add(h3.active),
+        UDP_QUIC.load(Ordering::Relaxed),
+        UDP_STUN.load(Ordering::Relaxed),
+        UDP_STUN_RESPONSE.load(Ordering::Relaxed),
+        UDP_DPI_FALLBACK.load(Ordering::Relaxed),
     ]
 }
 
@@ -145,8 +172,8 @@ pub(crate) fn routing_summary() -> String {
 }
 
 pub(crate) fn routing_summary_from(totals: [u64; 20]) -> String {
-    let [direct_up, direct_down, proxy_up, proxy_down, blocked, direct_active, proxy_active,
-        dpi_first_response, dpi_fallback_open, dpi_first_failure,udp_direct_up,udp_direct_down,udp_proxy_up,udp_proxy_down,udp_direct_active,udp_proxy_active,quic,stun,stun_response,udp_fallback] = totals;
+    let [direct_up, direct_down, proxy_up, proxy_down, blocked, direct_active, proxy_active, dpi_first_response, dpi_fallback_open, dpi_first_failure, udp_direct_up, udp_direct_down, udp_proxy_up, udp_proxy_down, udp_direct_active, udp_proxy_active, quic, stun, stun_response, udp_fallback] =
+        totals;
     format!(
         "Через VPS: ↑ {} ↓ {} · активно {proxy_active}\nНапрямую: ↑ {} ↓ {} · активно {direct_active}\nЗаблокировано: {blocked}\nAnti-DPI: первый ответ TLS {dpi_first_response} · резерв VPS {dpi_fallback_open}\nОшибки первого обмена: {dpi_first_failure}\nUDP VPS: ↑ {} ↓ {} · активно {udp_proxy_active}\nUDP напрямую: ↑ {} ↓ {} · активно {udp_direct_active}\nUDP: QUIC Initial {quic} · STUN {stun} · совпавший ответ {stun_response}\nUDP Anti-DPI: только VPS, открыто {udp_fallback}",
         bytes(proxy_up),

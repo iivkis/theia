@@ -1942,7 +1942,9 @@ mod strict_wire_matrix_tests {
                     fallback: f,
                     routing_revision: 2,
                     routing_state: 1,
-                    routing_totals: [10,20,30,40,5,1,2,6,7,8,11,12,13,14,15,16,17,18,19,20],
+                    routing_totals: [
+                        10, 20, 30, 40, 5, 1, 2, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+                    ],
                 })
             );
         }

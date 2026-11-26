@@ -1,19 +1,26 @@
 //! Native proxy-based Anti-DPI coordinator. All processing is on owned
 //! TCP streams; no raw packets, drivers or platform-specific DPI modules.
+mod quic;
 mod strategy;
 mod tcp;
 mod tls;
 pub(crate) mod udp;
-mod quic;
 
 use crate::{client::ClientError, network_scope};
-use std::{net::{IpAddr,SocketAddr},sync::{atomic::{AtomicBool,Ordering},Arc},time::Duration};
-use tokio::{io::AsyncWriteExt,net::TcpStream,sync::Semaphore,time::timeout};
-use strategy::{Key,Strategy,Verdict};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use strategy::{Key, Strategy, Verdict};
+use tokio::{io::AsyncWriteExt, net::TcpStream, sync::Semaphore, time::timeout};
 
-const ATTEMPT: Duration=Duration::from_secs(2);
-const OPEN_BUDGET: Duration=Duration::from_secs(6);
-const FIRST_FLIGHT: Duration=Duration::from_secs(5);
+const ATTEMPT: Duration = Duration::from_secs(2);
+const OPEN_BUDGET: Duration = Duration::from_secs(6);
+const FIRST_FLIGHT: Duration = Duration::from_secs(5);
 
 /// Profile-local, bounded strategy evidence. No state on disk or in logs.
 /// Consent is local configuration, not a command in the server snapshot.
@@ -49,8 +56,13 @@ impl Engine {
         ips: &[IpAddr],
         policy: [u8; 32],
     ) -> Option<Tunnel> {
-        if !self.enabled() || port != 443 || ips.is_empty() || ips.len() > 64
-            || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false))
+        if !self.enabled()
+            || port != 443
+            || ips.is_empty()
+            || ips.len() > 64
+            || !ips
+                .iter()
+                .all(|ip| crate::server::allowed_destination(*ip, false))
         {
             return None;
         }
@@ -112,7 +124,6 @@ impl Engine {
     }
 }
 
-
 pub(crate) struct Tunnel {
     target: TcpStream,
     strategy: Strategy,
@@ -128,59 +139,90 @@ pub(crate) enum RelayOutcome {
 }
 
 impl Tunnel {
-    pub(crate) async fn relay(mut self, mut client: TcpStream) -> Result<RelayOutcome,ClientError> {
-        let mut prefix=Vec::new();
-        let ready=match timeout(FIRST_FLIGHT,tcp::read_hello(&mut client,&mut prefix)).await {
-            Ok(Ok(ready))=>ready,
-            Ok(Err(error))=>return Err(error),
-            Err(_)=>false,
+    pub(crate) async fn relay(
+        mut self,
+        mut client: TcpStream,
+    ) -> Result<RelayOutcome, ClientError> {
+        let mut prefix = Vec::new();
+        let ready = match timeout(FIRST_FLIGHT, tcp::read_hello(&mut client, &mut prefix)).await {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => false,
         };
-        let transformed=if ready { tls::transform(&prefix,&self.key.name,self.strategy) } else { None };
-        let Some(transformed)=transformed else {
+        let transformed = if ready {
+            tls::transform(&prefix, &self.key.name, self.strategy)
+        } else {
+            None
+        };
+        let Some(transformed) = transformed else {
             // Unsupported protocol, ECH, SNI mismatch, partial input or
             // timeout: no origin application bytes have left this process.
-            return Ok(RelayOutcome::Fallback { client,prefix });
+            return Ok(RelayOutcome::Fallback { client, prefix });
         };
-        if !self.engine.enabled() || network_scope::observe(self.key.address)!=Some(self.key.network) {
-            return Ok(RelayOutcome::Fallback { client,prefix });
+        if !self.engine.enabled()
+            || network_scope::observe(self.key.address) != Some(self.key.network)
+        {
+            return Ok(RelayOutcome::Fallback { client, prefix });
         }
         // From the first attempted write onward, even a partial write or
         // timeout is terminal for this stream. Never replay it over the VPS.
-        let response=timeout(FIRST_FLIGHT,async {
-            self.target.write_all(&transformed).await.map_err(|_|ClientError::Io)?;
-            let response=tcp::read_record(&mut self.target).await?;
-            if response[0]!=22 || response[1]!=3 || !(1..=3).contains(&response[2]) || response[5]!=2 {
+        let response = timeout(FIRST_FLIGHT, async {
+            self.target
+                .write_all(&transformed)
+                .await
+                .map_err(|_| ClientError::Io)?;
+            let response = tcp::read_record(&mut self.target).await?;
+            if response[0] != 22
+                || response[1] != 3
+                || !(1..=3).contains(&response[2])
+                || response[5] != 2
+            {
                 return Err(ClientError::Protocol);
             }
             Ok(response)
-        }).await;
-        let response=match response {
-            Ok(Ok(response))=>response,
-            Ok(Err(error))=>{
-                self.engine.cache.failed(&self.key,self.strategy);
+        })
+        .await;
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                self.engine.cache.failed(&self.key, self.strategy);
                 crate::traffic::dpi_first_failure();
                 return Err(error);
             }
-            Err(_)=>{
-                self.engine.cache.failed(&self.key,self.strategy);
+            Err(_) => {
+                self.engine.cache.failed(&self.key, self.strategy);
                 crate::traffic::dpi_first_failure();
                 return Err(ClientError::Timeout);
             }
         };
-        timeout(FIRST_FLIGHT,client.write_all(&response)).await.map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
+        timeout(FIRST_FLIGHT, client.write_all(&response))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::Io)?;
         crate::traffic::dpi_first_response();
-        super::client_state::relay_direct_after_first(client,self.target,prefix.len(),response.len()).await?;
+        super::client_state::relay_direct_after_first(
+            client,
+            self.target,
+            prefix.len(),
+            response.len(),
+        )
+        .await?;
         Ok(RelayOutcome::Finished)
     }
 
     #[cfg(test)]
     pub(crate) fn fixture(target: TcpStream, name: &str) -> Self {
-        let address=target.peer_addr().unwrap();
+        let address = target.peer_addr().unwrap();
         Self {
             target,
-            strategy:Strategy::Header,
-            engine:Arc::new(Engine::default()),
-            key:Key { name:name.into(),address,policy:[1;32],network:network_scope::Scope::fixture(address,0) },
+            strategy: Strategy::Header,
+            engine: Arc::new(Engine::default()),
+            key: Key {
+                name: name.into(),
+                address,
+                policy: [1; 32],
+                network: network_scope::Scope::fixture(address, 0),
+            },
         }
     }
 }
@@ -191,11 +233,23 @@ mod tests {
     #[tokio::test]
     async fn disabled_or_private_targets_never_probe() {
         let engine = Arc::new(Engine::default());
-        assert!(engine.open("example.org", 443, &["8.8.8.8".parse().unwrap()], [1; 32]).await.is_none());
+        assert!(engine
+            .open("example.org", 443, &["8.8.8.8".parse().unwrap()], [1; 32])
+            .await
+            .is_none());
         engine.set_enabled(true);
-        assert!(engine.open("localhost", 443, &["127.0.0.1".parse().unwrap()], [1; 32]).await.is_none());
-        assert!(engine.open("example.org", 80, &["8.8.8.8".parse().unwrap()], [1; 32]).await.is_none());
-        assert!(engine.open("example.org", 443, &[], [1; 32]).await.is_none());
+        assert!(engine
+            .open("localhost", 443, &["127.0.0.1".parse().unwrap()], [1; 32])
+            .await
+            .is_none());
+        assert!(engine
+            .open("example.org", 80, &["8.8.8.8".parse().unwrap()], [1; 32])
+            .await
+            .is_none());
+        assert!(engine
+            .open("example.org", 443, &[], [1; 32])
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -234,9 +288,13 @@ mod tests {
                 assert_eq!(client_ok.is_some(), expected);
                 assert_eq!(server_ok, expected);
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 }
 
 #[cfg(test)]
-pub(crate) fn test_hello()->Vec<u8>{tls::fixture("example.org")}
+pub(crate) fn test_hello() -> Vec<u8> {
+    tls::fixture("example.org")
+}

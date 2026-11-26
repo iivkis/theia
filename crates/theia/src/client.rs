@@ -648,7 +648,11 @@ impl H2Client {
         self.open_frame(Frame::OpenTcp { address, port }).await
     }
 
-    pub(crate) async fn open_udp(&self, address: Address, port: u16) -> Result<Tunnel, ClientError> {
+    pub(crate) async fn open_udp(
+        &self,
+        address: Address,
+        port: u16,
+    ) -> Result<Tunnel, ClientError> {
         self.open_frame(Frame::OpenUdp { address, port }).await
     }
 
@@ -1095,47 +1099,67 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    pub(crate) async fn relay_udp(mut self, mut upload: tokio::sync::mpsc::Receiver<Vec<u8>>, download: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<(),ClientError> {
-        if !self.state.udp() { return Err(ClientError::Protocol); }
-        let traffic=crate::traffic::enter_udp(crate::Role::Client,false,false);
-        let outgoing=&mut self.outgoing; let incoming=&mut self.incoming;
-        let decoder=&mut self.decoder;
-        let mut tx_state=self.state.clone();
-        let mut rx_state=self.state.clone();
-        let activity=crate::udp_relay::Activity::new();
-    let writing=std::sync::atomic::AtomicBool::new(false);
-        let send_loop=async {
-            while let Some(data)=upload.recv().await {
-                let size=data.len();
-                let frame=Frame::Datagram(data);
-                tx_state.apply(Direction::Send,&frame).map_err(|_|ClientError::Protocol)?;
-                writing.store(true,std::sync::atomic::Ordering::Relaxed);
-                timeout(IO_TIMEOUT,send_frame(outgoing,&frame,false)).await.map_err(|_|ClientError::Timeout)??;
-                writing.store(false,std::sync::atomic::Ordering::Relaxed);
+    pub(crate) async fn relay_udp(
+        mut self,
+        mut upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        download: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), ClientError> {
+        if !self.state.udp() {
+            return Err(ClientError::Protocol);
+        }
+        let traffic = crate::traffic::enter_udp(crate::Role::Client, false, false);
+        let outgoing = &mut self.outgoing;
+        let incoming = &mut self.incoming;
+        let decoder = &mut self.decoder;
+        let mut tx_state = self.state.clone();
+        let mut rx_state = self.state.clone();
+        let activity = crate::udp_relay::Activity::new();
+        let writing = std::sync::atomic::AtomicBool::new(false);
+        let send_loop = async {
+            while let Some(data) = upload.recv().await {
+                let size = data.len();
+                let frame = Frame::Datagram(data);
+                tx_state
+                    .apply(Direction::Send, &frame)
+                    .map_err(|_| ClientError::Protocol)?;
+                writing.store(true, std::sync::atomic::Ordering::Relaxed);
+                timeout(IO_TIMEOUT, send_frame(outgoing, &frame, false))
+                    .await
+                    .map_err(|_| ClientError::Timeout)??;
+                writing.store(false, std::sync::atomic::Ordering::Relaxed);
                 traffic.upload(size);
                 activity.touch();
             }
-            Ok::<(),ClientError>(())
+            Ok::<(), ClientError>(())
         };
-        let receive_loop=async {
+        let receive_loop = async {
             loop {
-                let frame=decoder.next(incoming).await?.ok_or(ClientError::Protocol)?;
-                rx_state.apply(Direction::Receive,&frame).map_err(|_|ClientError::Protocol)?;
+                let frame = decoder.next(incoming).await?.ok_or(ClientError::Protocol)?;
+                rx_state
+                    .apply(Direction::Receive, &frame)
+                    .map_err(|_| ClientError::Protocol)?;
                 match frame {
-                    Frame::Datagram(data)=>{ let size=data.len(); download.send(data).await.map_err(|_|ClientError::Io)?; traffic.download(size); activity.touch(); }
-                    Frame::Padding(_)=>tokio::task::yield_now().await,
-                    Frame::Fin=>return Ok::<(),ClientError>(()),
-                    Frame::Abort(code)=>return Err(ClientError::Open(code)),
-                    _=>return Err(ClientError::Protocol),
+                    Frame::Datagram(data) => {
+                        let size = data.len();
+                        download.send(data).await.map_err(|_| ClientError::Io)?;
+                        traffic.download(size);
+                        activity.touch();
+                    }
+                    Frame::Padding(_) => tokio::task::yield_now().await,
+                    Frame::Fin => return Ok::<(), ClientError>(()),
+                    Frame::Abort(code) => return Err(ClientError::Open(code)),
+                    _ => return Err(ClientError::Protocol),
                 }
             }
         };
-        let result=tokio::select! { result=send_loop=>result, result=receive_loop=>result, ()=activity.expire()=>Ok(()) };
+        let result = tokio::select! { result=send_loop=>result, result=receive_loop=>result, ()=activity.expire()=>Ok(()) };
         if writing.load(std::sync::atomic::Ordering::Relaxed) || result.is_err() {
             outgoing.send_reset(h2::Reason::CANCEL);
             return result.and(Err(ClientError::Timeout));
         }
-        timeout(IO_TIMEOUT,send_frame(outgoing,&Frame::Fin,true)).await.map_err(|_|ClientError::Timeout)??;
+        timeout(IO_TIMEOUT, send_frame(outgoing, &Frame::Fin, true))
+            .await
+            .map_err(|_| ClientError::Timeout)??;
         Ok(())
     }
 
@@ -1154,7 +1178,9 @@ impl Tunnel {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        if self.state.udp() { return Err(ClientError::Protocol); }
+        if self.state.udp() {
+            return Err(ClientError::Protocol);
+        }
         let traffic = crate::traffic::enter(crate::Role::Client, false);
         let operation = self.operation;
         crate::diag!(

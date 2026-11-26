@@ -366,19 +366,44 @@ mod tests {
     async fn direct_dpi_dns_is_explicit_digest_bound_and_acl_checked() {
         use crate::routing::{Action, Rule};
         let (snapshot, wire) = snapshot::Snapshot::build(
-            "scope", 2, &[Rule {
-                name: "dpi".into(), action: Action::DirectDpi,
-                domains: vec!["full:localhost".into()], ips: vec![],
-            }], &[], &[],
-        ).unwrap();
-        let published = Published { snapshot, wire: wire.into() };
+            "scope",
+            2,
+            &[Rule {
+                name: "dpi".into(),
+                action: Action::DirectDpi,
+                domains: vec!["full:localhost".into()],
+                ips: vec![],
+            }],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let published = Published {
+            snapshot,
+            wire: wire.into(),
+        };
         let mut request = http::Request::new(());
         let deadline = Duration::from_secs(2);
         request_domain(&mut request, "localhost", [0; 32]).unwrap();
-        assert_eq!(response_data(&published, request.headers(), true, deadline).await.unwrap_err(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_data(&published, request.headers(), true, deadline)
+                .await
+                .unwrap_err(),
+            StatusCode::CONFLICT
+        );
         request_domain(&mut request, "localhost", published.snapshot.digest()).unwrap();
-        assert_eq!(response_data(&published, request.headers(), false, deadline).await.unwrap_err(), StatusCode::FORBIDDEN);
-        let ips = decode_ips(&response_data(&published, request.headers(), true, deadline).await.unwrap()).unwrap();
+        assert_eq!(
+            response_data(&published, request.headers(), false, deadline)
+                .await
+                .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        let ips = decode_ips(
+            &response_data(&published, request.headers(), true, deadline)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert!(!ips.is_empty() && ips.iter().all(IpAddr::is_loopback));
     }
 

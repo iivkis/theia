@@ -525,7 +525,10 @@ fn page_actions_for(
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
         ],
-        (Role::Client, 6) => &[('j', "Обновить состояние"), ('d', "Разрешить / отключить Anti-DPI")],
+        (Role::Client, 6) => &[
+            ('j', "Обновить состояние"),
+            ('d', "Разрешить / отключить Anti-DPI"),
+        ],
         (Role::Client, 5) => &[('S', "Сохранить файл"), ('o', "Открыть другой файл")],
         _ => &[],
     };
@@ -3268,7 +3271,8 @@ impl Interaction {
                                     if let Some(editor) = self.editor.as_mut() {
                                         match editor.review_direct_dpi_permission() {
                                             Ok(review) => {
-                                                self.records = Some(RecordFlow::Confirm(Box::new(review)));
+                                                self.records =
+                                                    Some(RecordFlow::Confirm(Box::new(review)));
                                                 editor.error = None;
                                             }
                                             Err(message) => editor.error = Some(message.into()),
@@ -9014,7 +9018,9 @@ mod tests {
             fallback: false,
             routing_revision: 5,
             routing_state: 1,
-            routing_totals: [10,20,30,40,2,1,1,3,4,5,10,20,30,40,1,2,3,4,5,6],
+            routing_totals: [
+                10, 20, 30, 40, 2, 1, 1, 3, 4, 5, 10, 20, 30, 40, 1, 2, 3, 4, 5, 6,
+            ],
         }))
         .unwrap();
         observation.poll();
@@ -9053,12 +9059,23 @@ mod tests {
         ];
         assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
         assert_eq!(panel.settings.rules.len(), 1);
-        assert_eq!(panel.settings.rules[0].action, crate::routing::Action::Direct);
+        assert_eq!(
+            panel.settings.rules[0].action,
+            crate::routing::Action::Direct
+        );
         panel.edit(None);
         let (_, fields, _) = panel.fields.as_mut().unwrap();
-        *fields = ["DPI".into(), "direct_dpi".into(), "example.org".into(), String::new()];
+        *fields = [
+            "DPI".into(),
+            "direct_dpi".into(),
+            "example.org".into(),
+            String::new(),
+        ];
         assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
-        assert_eq!(panel.settings.rules[1].action, crate::routing::Action::DirectDpi);
+        assert_eq!(
+            panel.settings.rules[1].action,
+            crate::routing::Action::DirectDpi
+        );
         assert!(panel.body().contains("Anti-DPI / резерв VPS"));
         assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
         assert!(editor.dirty());

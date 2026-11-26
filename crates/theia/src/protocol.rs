@@ -78,7 +78,10 @@ pub enum Frame {
         address: Address,
         port: u16,
     },
-    OpenUdp { address: Address, port: u16 },
+    OpenUdp {
+        address: Address,
+        port: u16,
+    },
     OpenOk,
     OpenError(ErrorCode),
     Data(Vec<u8>),
@@ -138,7 +141,9 @@ fn validate(frame: &Frame) -> Result<(), ProtocolError> {
                 }
             }
         }
-        Frame::Datagram(data) if data.len() > MAX_DATAGRAM => return Err(ProtocolError::FrameTooLarge),
+        Frame::Datagram(data) if data.len() > MAX_DATAGRAM => {
+            return Err(ProtocolError::FrameTooLarge)
+        }
         Frame::Data(data) | Frame::Padding(data) if data.len() > MAX_PAYLOAD => {
             return Err(ProtocolError::FrameTooLarge);
         }
@@ -188,7 +193,14 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
             p.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
             p.extend_from_slice(bytes);
             p.extend_from_slice(&port.to_be_bytes());
-            (if matches!(frame, Frame::OpenUdp { .. }) { 0x06 } else { 0x03 }, p)
+            (
+                if matches!(frame, Frame::OpenUdp { .. }) {
+                    0x06
+                } else {
+                    0x03
+                },
+                p,
+            )
         }
         Frame::OpenOk => (0x04, Vec::new()),
         Frame::OpenError(code) => (0x05, (*code as u16).to_be_bytes().to_vec()),
@@ -290,7 +302,11 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, ProtocolError> {
                 _ => return Err(ProtocolError::InvalidAddress),
             };
             let port = u16::from_be_bytes([p[p.len() - 2], p[p.len() - 1]]);
-            if bytes[0] == 0x06 { Frame::OpenUdp { address, port } } else { Frame::OpenTcp { address, port } }
+            if bytes[0] == 0x06 {
+                Frame::OpenUdp { address, port }
+            } else {
+                Frame::OpenTcp { address, port }
+            }
         }
         0x04 => {
             if !p.is_empty() {
@@ -438,7 +454,9 @@ impl Session {
         self.phase == Phase::Open
     }
 
-    pub(crate) fn udp(&self) -> bool { self.udp }
+    pub(crate) fn udp(&self) -> bool {
+        self.udp
+    }
 
     pub fn is_closed(&self) -> bool {
         self.phase == Phase::Closed
@@ -495,8 +513,18 @@ impl Session {
                 self.accepted_capabilities = *accepted_capabilities;
                 self.phase = Phase::NeedOpen;
             }
-            (Role::Client, Phase::NeedOpen, Direction::Send, Frame::OpenTcp { .. } | Frame::OpenUdp { .. })
-            | (Role::Server, Phase::NeedOpen, Direction::Receive, Frame::OpenTcp { .. } | Frame::OpenUdp { .. }) => {
+            (
+                Role::Client,
+                Phase::NeedOpen,
+                Direction::Send,
+                Frame::OpenTcp { .. } | Frame::OpenUdp { .. },
+            )
+            | (
+                Role::Server,
+                Phase::NeedOpen,
+                Direction::Receive,
+                Frame::OpenTcp { .. } | Frame::OpenUdp { .. },
+            ) => {
                 self.udp = matches!(frame, Frame::OpenUdp { .. });
                 self.phase = Phase::NeedOpenResult;
             }
@@ -509,9 +537,12 @@ impl Session {
                 self.phase = Phase::Closed;
             }
             (_, Phase::Open, Direction::Send, Frame::Data(_)) if !self.udp && !self.sent_fin => {}
-            (_, Phase::Open, Direction::Receive, Frame::Data(_)) if !self.udp && !self.received_fin => {}
-            (_, Phase::Open, Direction::Send, Frame::Datagram(_)) if self.udp && !self.sent_fin => {}
-            (_, Phase::Open, Direction::Receive, Frame::Datagram(_)) if self.udp && !self.received_fin => {}
+            (_, Phase::Open, Direction::Receive, Frame::Data(_))
+                if !self.udp && !self.received_fin => {}
+            (_, Phase::Open, Direction::Send, Frame::Datagram(_)) if self.udp && !self.sent_fin => {
+            }
+            (_, Phase::Open, Direction::Receive, Frame::Datagram(_))
+                if self.udp && !self.received_fin => {}
             (_, Phase::Open, Direction::Send, Frame::Fin) if !self.sent_fin => {
                 self.sent_fin = true;
             }
@@ -539,30 +570,92 @@ impl Session {
 
 #[cfg(test)]
 mod udp_tests {
- use super::*;
- #[test]
- fn udp_wire_and_fsm_are_distinct() {
-  let open=Frame::OpenUdp { address:Address::Dns("example.org".into()), port:443 };
-  for frame in [open.clone(),Frame::Datagram(vec![]),Frame::Datagram(vec![1;MAX_DATAGRAM])] { assert_eq!(decode(&encode(&frame).unwrap()).unwrap(),frame); }
-  assert!(encode(&Frame::Datagram(vec![0;MAX_DATAGRAM+1])).is_err());
-  for (role,hello,ack,send,recv) in [(Role::Client,Direction::Send,Direction::Receive,Direction::Send,Direction::Receive),(Role::Server,Direction::Receive,Direction::Send,Direction::Receive,Direction::Send)] {
-   let mut s=Session::new(role);
-   s.apply(hello,&Frame::Hello{version:VERSION,capabilities:0}).unwrap();
-   s.apply(ack,&Frame::HelloAck{version:VERSION,accepted_capabilities:0}).unwrap();
-   s.apply(send,&open).unwrap();
-   assert!(s.apply(send,&Frame::Datagram(vec![1])).is_err());
-   s.apply(recv,&Frame::OpenOk).unwrap();
-   assert!(s.udp()); assert!(s.apply(send,&Frame::Data(vec![1])).is_err());
-   s.apply(send,&Frame::Datagram(vec![1])).unwrap();
-   s.apply(recv,&Frame::Datagram(vec![])).unwrap();
-   s.apply(send,&Frame::Fin).unwrap(); assert!(s.apply(send,&Frame::Datagram(vec![])).is_err());
-   s.apply(recv,&Frame::Fin).unwrap(); s.finish().unwrap();
-   let mut tcp=Session::new(role);
-   tcp.apply(hello,&Frame::Hello{version:VERSION,capabilities:0}).unwrap();
-   tcp.apply(ack,&Frame::HelloAck{version:VERSION,accepted_capabilities:0}).unwrap();
-   tcp.apply(send,&Frame::OpenTcp{address:Address::V4([127,0,0,1]),port:443}).unwrap();
-   tcp.apply(recv,&Frame::OpenOk).unwrap();
-   assert!(tcp.apply(send,&Frame::Datagram(vec![1])).is_err());
-  }
- }
+    use super::*;
+    #[test]
+    fn udp_wire_and_fsm_are_distinct() {
+        let open = Frame::OpenUdp {
+            address: Address::Dns("example.org".into()),
+            port: 443,
+        };
+        for frame in [
+            open.clone(),
+            Frame::Datagram(vec![]),
+            Frame::Datagram(vec![1; MAX_DATAGRAM]),
+        ] {
+            assert_eq!(decode(&encode(&frame).unwrap()).unwrap(), frame);
+        }
+        assert!(encode(&Frame::Datagram(vec![0; MAX_DATAGRAM + 1])).is_err());
+        for (role, hello, ack, send, recv) in [
+            (
+                Role::Client,
+                Direction::Send,
+                Direction::Receive,
+                Direction::Send,
+                Direction::Receive,
+            ),
+            (
+                Role::Server,
+                Direction::Receive,
+                Direction::Send,
+                Direction::Receive,
+                Direction::Send,
+            ),
+        ] {
+            let mut s = Session::new(role);
+            s.apply(
+                hello,
+                &Frame::Hello {
+                    version: VERSION,
+                    capabilities: 0,
+                },
+            )
+            .unwrap();
+            s.apply(
+                ack,
+                &Frame::HelloAck {
+                    version: VERSION,
+                    accepted_capabilities: 0,
+                },
+            )
+            .unwrap();
+            s.apply(send, &open).unwrap();
+            assert!(s.apply(send, &Frame::Datagram(vec![1])).is_err());
+            s.apply(recv, &Frame::OpenOk).unwrap();
+            assert!(s.udp());
+            assert!(s.apply(send, &Frame::Data(vec![1])).is_err());
+            s.apply(send, &Frame::Datagram(vec![1])).unwrap();
+            s.apply(recv, &Frame::Datagram(vec![])).unwrap();
+            s.apply(send, &Frame::Fin).unwrap();
+            assert!(s.apply(send, &Frame::Datagram(vec![])).is_err());
+            s.apply(recv, &Frame::Fin).unwrap();
+            s.finish().unwrap();
+            let mut tcp = Session::new(role);
+            tcp.apply(
+                hello,
+                &Frame::Hello {
+                    version: VERSION,
+                    capabilities: 0,
+                },
+            )
+            .unwrap();
+            tcp.apply(
+                ack,
+                &Frame::HelloAck {
+                    version: VERSION,
+                    accepted_capabilities: 0,
+                },
+            )
+            .unwrap();
+            tcp.apply(
+                send,
+                &Frame::OpenTcp {
+                    address: Address::V4([127, 0, 0, 1]),
+                    port: 443,
+                },
+            )
+            .unwrap();
+            tcp.apply(recv, &Frame::OpenOk).unwrap();
+            assert!(tcp.apply(send, &Frame::Datagram(vec![1])).is_err());
+        }
+    }
 }

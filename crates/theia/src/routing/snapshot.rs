@@ -320,13 +320,19 @@ mod tests {
         let (server, wire) = Snapshot::build("inbound", 2, &[dpi], &data, &[]).unwrap();
         let client = Snapshot::decode(&wire, "inbound").unwrap();
         assert_eq!(server.digest(), client.digest());
-        assert_eq!(client.policy().domain_decision("www.example.com").unwrap(), Some(Action::DirectDpi));
+        assert_eq!(
+            client.policy().domain_decision("www.example.com").unwrap(),
+            Some(Action::DirectDpi)
+        );
         assert!(Action::DirectDpi.permits_server_egress());
         assert!(Action::Allowed.permits_server_egress());
         assert!(!Action::Direct.permits_server_egress());
         assert!(!Action::Blocked.permits_server_egress());
         let (original, _) = Snapshot::build("inbound", 2, &[rule()], &data, &[]).unwrap();
-        assert_eq!(original.checkpoint().accepts(&client), Err(SnapshotError::Equivocation));
+        assert_eq!(
+            original.checkpoint().accepts(&client),
+            Err(SnapshotError::Equivocation)
+        );
     }
 
     #[test]

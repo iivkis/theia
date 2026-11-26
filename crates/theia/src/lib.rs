@@ -58,7 +58,6 @@ mod relay_liveness;
 pub mod reload_preflight;
 pub mod restart_guard;
 pub mod routing;
-mod udp_relay;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
 pub mod security_profile;
@@ -90,6 +89,7 @@ mod tui_staged_material;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;
 mod tui_widgets;
+mod udp_relay;
 #[cfg(target_os = "windows")]
 pub mod windows_control;
 #[cfg(target_os = "windows")]

@@ -1324,13 +1324,19 @@ impl Editor {
             return Err("Требуется клиентская конфигурация.");
         };
         doc.client.proxy.direct_dpi = Some(enable);
-        candidate.validate().map_err(|_| "Настройки клиента не прошли проверку.")?;
+        candidate
+            .validate()
+            .map_err(|_| "Настройки клиента не прошли проверку.")?;
         Ok(RecordReview {
             source: self.saved_sha256(),
             selected: self.selected_record_id().to_owned(),
             candidate,
             next_selection: self.selected_record,
-            confirmation_label: if enable { "Разрешить Anti-DPI" } else { "Отключить Anti-DPI" },
+            confirmation_label: if enable {
+                "Разрешить Anti-DPI"
+            } else {
+                "Отключить Anti-DPI"
+            },
             body: if enable {
                 "Разрешить локальный Anti-DPI для этого файла клиента?\n\nДля правил direct_dpi возможен прямой выход и TLS-проверка назначения: сайт увидит IP вашего устройства. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
             } else {
