@@ -3,7 +3,8 @@
 //! The management endpoint stays owned by the same process and protected by
 //! the same Unix permissions / Windows SID DACL across listener generations.
 //! A short read/write lock is ONLY held during in-memory CAS publication;
-//! disk, PEM, network and the async supervisor are never run under this lock.
+//! PEM, network and expensive preparation never run under this lock. The
+//! automatic DAT commit additionally performs a bounded guarded TOML write.
 use crate::{
     config::ServerDocument,
     live_auth::{LiveAuthError, LiveAuthorization, StagedAuthorization},
@@ -214,6 +215,55 @@ impl State {
             live: Arc::new(view.live.with_new_baseline(candidate.clone())),
         });
         Ok(revision)
+    }
+
+    /// Only replace the dataset manifest and increment its policy revision.
+    /// Never overwrite a pending editor change, roll back a dataset release,
+    /// or install a partially prepared policy. An uncertain disk write is
+    /// reported as failure; a subsequent explicit Apply/restart reconciles it.
+    pub(crate) fn activate_geodata(
+        &self,
+        view: &Arc<View>,
+        path: &std::path::Path,
+        manifest: crate::routing::geodata::Manifest,
+    ) -> Result<bool, LiveAuthError> {
+        use crate::config::{self, Config};
+        let old = view.document.server.policy.routing.as_ref().ok_or(LiveAuthError::InvalidCandidate)?;
+        let pinned = old.datasets.as_ref().ok_or(LiveAuthError::InvalidCandidate)?;
+        if manifest == *pinned { return Ok(false); }
+        if manifest.release <= pinned.release { return Err(LiveAuthError::InvalidCandidate); }
+        let mut candidate = view.document.as_ref().clone();
+        let next = candidate.server.policy.routing.as_mut().ok_or(LiveAuthError::InvalidCandidate)?;
+        next.revision = next.revision.checked_add(1).ok_or(LiveAuthError::RevisionExhausted)?;
+        next.datasets = Some(manifest);
+        let expected = view.live.revision()?;
+        let source = config::editor_bytes(path).map_err(|_| LiveAuthError::Unavailable)?;
+        let parsed = config::parse(std::str::from_utf8(&source).map_err(|_| LiveAuthError::InvalidCandidate)?)
+            .map_err(|_| LiveAuthError::InvalidCandidate)?;
+        if parsed != Config::Server(view.document.as_ref().clone()) {
+            return Err(LiveAuthError::StaleRevision);
+        }
+        let stage = self.stage_managed_auth(view, &candidate, expected)?;
+        let next_view = Arc::new(View {
+            document: Arc::new(candidate.clone()),
+            inbounds: view.inbounds,
+            preflight: Arc::new(view.preflight.rebased(candidate.clone())),
+            live: Arc::new(view.live.with_new_baseline(candidate.clone())),
+        });
+        let mut current = self.current.write().map_err(|_| LiveAuthError::Unavailable)?;
+        if !Arc::ptr_eq(&current, view) || view.live.revision()? != expected {
+            return Err(LiveAuthError::StaleRevision);
+        }
+        let mut rollback = self.auth_rollback.write().map_err(|_| LiveAuthError::Unavailable)?;
+        // No roster/quota/identity changes. Publish only after the exact-byte
+        // disk CAS succeeds. The AuthCell lock rejects a stale prepared stage.
+        view.live.publish_with(stage, || {
+            config::guarded_write(path, &Config::Server(candidate), &source)
+                .map(|_| ()).map_err(|_| LiveAuthError::Unavailable)
+        })?;
+        *rollback = None;
+        *current = next_view;
+        Ok(true)
     }
 
     fn stage_managed_auth(

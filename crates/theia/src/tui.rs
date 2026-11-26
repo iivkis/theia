@@ -431,7 +431,7 @@ fn pages(role: Role) -> &'static [&'static str] {
         ],
         Role::Client => &[
             "Обзор", "Профили", "Импорт ключа", "Подключение",
-            "Статистика", "Настройки",
+            "Статистика", "Настройки", "Маршрутизация",
         ],
     }
 }
@@ -509,6 +509,7 @@ fn page_actions_for(role: Role, page: usize, editor: Option<&Editor>, user: usiz
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
         ],
+        (Role::Client, 6) => &[('j', "Обновить состояние")],
         (Role::Client, 5) => &[
             ('S', "Сохранить файл"),
             ('o', "Открыть другой файл"),
@@ -869,6 +870,61 @@ impl RoutingPanel {
     }
 }
 
+struct RoutingObservation {
+    digest: [u8; 32],
+    pending: Option<mpsc::Receiver<Result<crate::management::StatusReply, crate::management::ManagementError>>>,
+    report: String,
+    observed: Option<std::time::Instant>,
+    next: std::time::Instant,
+}
+impl RoutingObservation {
+    fn new(digest: [u8; 32]) -> Self {
+        Self { digest, pending: None, report: String::new(), observed: None, next: std::time::Instant::now() }
+    }
+    fn refresh(&mut self) {
+        if self.pending.is_some() { return; }
+        let (tx, rx) = mpsc::channel();
+        self.pending = Some(rx);
+        let _worker = std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(|_| crate::management::ManagementError::Io)
+                .and_then(|rt| rt.block_on(crate::management::query_client_environment(crate::management::StatusCommand::ClientStatus)));
+            let _ = tx.send(result);
+        });
+    }
+    fn poll(&mut self) {
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok(Ok(crate::management::StatusReply::ClientRunning { config_sha256, routing_revision, routing_state, routing_totals, .. })) if config_sha256 == self.digest => {
+                    let status = match routing_state {
+                        1 => format!("Правила актуальны · ревизия {routing_revision}"),
+                        2 => format!("Правила просрочены · ревизия {routing_revision}; новые соединения ждут проверки"),
+                        3 => "Синхронизация выполняется".into(),
+                        _ => "Правила ещё не подтверждены".into(),
+                    };
+                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP-байты.", crate::traffic::routing_summary_from(routing_totals));
+                    self.observed = Some(std::time::Instant::now());
+                }
+                Err(TryRecvError::Empty) => return,
+                _ => {
+                    self.report = "Состояние фонового клиента с этим TOML не подтверждено. Проверьте запуск и настройки IPC.".into();
+                    self.observed = None;
+                }
+            }
+            self.pending = None;
+            self.next = std::time::Instant::now() + Duration::from_secs(3);
+        }
+        if std::time::Instant::now() >= self.next { self.refresh(); }
+    }
+    fn body(&self) -> String {
+        if self.report.is_empty() { return "Проверяем состояние клиента…".into(); }
+        match self.observed {
+            Some(time) => format!("{}\nСнимок получен {} с назад{}", self.report, time.elapsed().as_secs(), if time.elapsed() > Duration::from_secs(6) { " (устарел)" } else { "" }),
+            None => self.report.clone(),
+        }
+    }
+}
+
 struct Interaction {
     workspace_page: usize,
     workspace_focus: WorkspaceFocus,
@@ -899,6 +955,7 @@ struct Interaction {
     qr_scan: Option<QrScan>,
     records: Option<RecordFlow>,
     routing_panel: Option<RoutingPanel>,
+    routing_observation: Option<RoutingObservation>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
     candidate_batch: Option<CandidateBatchPanel>,
@@ -950,6 +1007,7 @@ impl Interaction {
             qr_scan: None,
             records: None,
             routing_panel: None,
+            routing_observation: None,
             discovery: None,
             candidates: None,
             candidate_batch: None,
@@ -1265,6 +1323,7 @@ impl Interaction {
 
     fn select_workspace_page(&mut self, role: Role, page: usize) {
         self.workspace_page = page.min(pages(role).len() - 1);
+        self.routing_observation = None;
         self.workspace_monitor = if self.workspace_page == 4 {
             Some(crate::traffic::Monitor::new(role))
         } else {
@@ -1463,6 +1522,14 @@ impl Interaction {
 
     fn poll_navigation(&mut self, model: &mut Model) {
         if let Some(panel) = self.routing_panel.as_mut() { panel.poll(); }
+        if model.screen == Screen::Client && self.workspace_page == 6 {
+            if let Some(editor) = self.editor.as_ref().filter(|e| e.role() == Role::Client) {
+                let digest = editor.saved_sha256();
+                let observation = self.routing_observation.get_or_insert_with(|| RoutingObservation::new(digest));
+                if observation.digest != digest { *observation = RoutingObservation::new(digest); }
+                observation.poll();
+            }
+        }
         if let Some(scan) = self.qr_scan.as_ref() {
             let result = match scan.done.try_recv() {
                 Ok(result) => Some(result),
@@ -2882,6 +2949,10 @@ impl Interaction {
                                 &mut self.workspace_action,
                                 key.code,
                             ) {
+                                if ch == 'j' && role == Role::Client && self.workspace_page == 6 {
+                                    if let Some(observation) = self.routing_observation.as_mut() { observation.refresh(); }
+                                    return false;
+                                }
                                 if ch == 'J' && role == Role::Server && self.workspace_page == 7 {
                                     if let Some(editor) = self.editor.as_mut() {
                                         if editor.dirty() || editor.write_uncertain() {
@@ -6314,6 +6385,8 @@ fn page_layout_for(area: Rect, role: Role, page: usize, editor: Option<&Editor>,
         10
     } else if role == Role::Client && page == 2 {
         7
+    } else if role == Role::Client && page == 6 {
+        14
     } else if page == 5 {
         8
     } else if role == Role::Server && page == 3 {
@@ -6695,6 +6768,14 @@ fn draw_page(
                     .filter(|(sha, _, _)| !editor.dirty() && *sha == editor.saved_sha256())
                     .map_or_else(|| "Работа с сохранёнными настройками не подтверждена".into(), |(_, kind, revision)| format!("Последнее подтверждение: {kind}, rev {revision}"));
                 format!("Сервер: {status}\n{applied}\nВнешний сервис: проверьте через «Состояние».\nСохранение файла не применяет изменения.")
+            }
+            (Role::Client,6) => {
+                if editor.dirty() || editor.write_uncertain() { "Сохранённые настройки изменились. Состояние выбранного файла не подтверждено.".into() }
+                else if let Some(local) = ui.and_then(|u| u.client_background.as_ref()).and_then(|p| p.routing_observation(editor.saved_sha256())) {
+                    format!("Источник: локальный процесс этой панели\n{local}\nСчётчики с запуска процесса, полезные TCP-байты.")
+                } else {
+                    ui.and_then(|u| u.routing_observation.as_ref()).filter(|o| o.digest == editor.saved_sha256()).map_or_else(|| "Проверяем состояние клиента…".into(), RoutingObservation::body)
+                }
             }
             (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию: allowed (через сервер).".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),

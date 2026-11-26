@@ -274,6 +274,16 @@ impl LiveAuthorization {
     /// Linearization point. All inbound/H2/H3 contexts load from the single
     /// RwLock. Two valid stages against one revision cannot both commit.
     pub fn publish(&self, staged: StagedAuthorization) -> Result<u64, LiveAuthError> {
+        self.publish_with(staged, || Ok(()))
+    }
+
+    /// A bounded durable configuration CAS may precede the infallible Arc swap.
+    /// No candidate data parsing, downloading or compilation under this lock.
+    pub(crate) fn publish_with(
+        &self,
+        staged: StagedAuthorization,
+        persist: impl FnOnce() -> Result<(), LiveAuthError>,
+    ) -> Result<u64, LiveAuthError> {
         if !Arc::ptr_eq(&self.shared, &staged.owner) {
             return Err(LiveAuthError::ForeignStage);
         }
@@ -286,6 +296,7 @@ impl LiveAuthorization {
             return Err(LiveAuthError::StaleRevision);
         }
         let revision = staged.snapshot.revision;
+        persist()?;
         *guard = staged.snapshot;
         Ok(revision)
     }

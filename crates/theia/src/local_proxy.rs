@@ -1163,7 +1163,7 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 7]) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -1195,6 +1195,8 @@ impl ClientRuntime {
             observed >> 2,
             observed & 3,
             fallback,
+            view.client.routing_cache().observation(),
+            crate::traffic::routing_totals(),
         )
     }
     async fn candidate(

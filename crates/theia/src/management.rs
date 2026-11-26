@@ -40,7 +40,7 @@ pub(crate) const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_COMMAND_BYTES: usize = 256;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) const MAX_RESPONSE_BYTES: u64 = 256;
+pub(crate) const MAX_RESPONSE_BYTES: u64 = 512;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_CLIENTS: usize = 8;
 
@@ -154,6 +154,9 @@ pub enum StatusReply {
         transport: u8,
         xhttp: u8,
         fallback: bool,
+        routing_revision: u64,
+        routing_state: u8,
+        routing_totals: [u64; 7],
     },
     ClientReady {
         revision: u64,
@@ -1015,13 +1018,14 @@ where
     let response = if !newline {
         "ERR unsupported\n".into()
     } else if command == b"client-status" {
-        let (revision, digest, descriptor, transport, xhttp, fallback) = client.status().await;
+        let (revision, digest, descriptor, transport, xhttp, fallback, (routing_revision, routing_state), totals) = client.status().await;
+        let totals = totals.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
         let hex = digest
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         format!(
-            "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} x={xhttp} f={}\n",
+            "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} x={xhttp} f={} rr={routing_revision} rs={routing_state} rt={totals}\n",
             u8::from(fallback)
         )
     } else {
@@ -1240,7 +1244,18 @@ where
                     "1" => true,
                     _ => return None,
                 };
-                if fields.next().is_some() || ((transport == 0) != (xhttp == 0)) {
+                let unsigned = |raw: &str| if raw == "0" { Some(0) } else { positive_decimal(raw) };
+                let routing_revision = unsigned(fields.next()?.strip_prefix("rr=")?)?;
+                let routing_state = match fields.next()?.strip_prefix("rs=")? {
+                    "0" => 0, "1" => 1, "2" => 2, "3" => 3, _ => return None,
+                };
+                if ((routing_state == 1 || routing_state == 2) != (routing_revision != 0)) {
+                    return None;
+                }
+                let mut counters = fields.next()?.strip_prefix("rt=")?.split(',');
+                let mut routing_totals = [0; 7];
+                for counter in &mut routing_totals { *counter = unsigned(counters.next()?)?; }
+                if counters.next().is_some() || fields.next().is_some() || ((transport == 0) != (xhttp == 0)) {
                     return None;
                 }
                 Some(StatusReply::ClientRunning {
@@ -1250,6 +1265,9 @@ where
                     transport,
                     xhttp,
                     fallback,
+                    routing_revision,
+                    routing_state,
+                    routing_totals,
                 })
             }
             StatusCommand::ClientPreview {
@@ -1882,7 +1900,7 @@ mod strict_wire_matrix_tests {
             (4, 3, 1, false),
         ] {
             let response = format!(
-                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={}\n",
+                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={} rr=2 rs=1 rt=10,20,30,40,5,1,2\n",
                 u8::from(f)
             );
             assert_eq!(
@@ -1893,7 +1911,10 @@ mod strict_wire_matrix_tests {
                     descriptor_revision: d,
                     transport: t,
                     xhttp: x,
-                    fallback: f
+                    fallback: f,
+                    routing_revision: 2,
+                    routing_state: 1,
+                    routing_totals: [10,20,30,40,5,1,2],
                 })
             );
         }

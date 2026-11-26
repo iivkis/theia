@@ -3192,25 +3192,39 @@ async fn run_supervised_file(
         .with_reality_ledger(limits.ledger.clone()),
     );
 
-    // Download candidates only; pinned TOML remains the authority until guarded Apply.
+    // Refresh the pinned pair through a durable TOML + live policy CAS.
     let _geodata_refresh = SupervisorTask(tokio::spawn({
         let runtime = runtime.clone();
+        let path = config_path.to_owned();
         async move {
             let mut next_refresh = tokio::time::Instant::now();
             let mut last_directory = None;
             loop {
-                let settings = runtime.snapshot().ok().and_then(|view| view.document.server.policy.routing.clone());
-                if let Some(settings) = settings {
-                    if let Some(directory) = settings.geodata_directory {
-                        if last_directory.as_ref() != Some(&directory) || tokio::time::Instant::now() >= next_refresh {
-                            last_directory = Some(directory.clone());
-                            next_refresh = tokio::time::Instant::now() + crate::routing::geodata::REFRESH_INTERVAL;
-                            if let Ok(store) = crate::routing::geodata::Store::new(directory.into()) {
-                            if store.refresh(&settings.rules).await.is_err() {
-                                crate::diag!(Warn, "server", "geodata_refresh_failed");
-                            } else {
-                                crate::diag!(Info, "server", "geodata_candidate_ready");
-                            }
+                if let Ok(view) = runtime.snapshot() {
+                    if let Some(settings) = view.document.server.policy.routing.clone() {
+                        if let Some(directory) = settings.geodata_directory {
+                            if last_directory.as_ref() != Some(&directory) || tokio::time::Instant::now() >= next_refresh {
+                                last_directory = Some(directory.clone());
+                                next_refresh = tokio::time::Instant::now() + crate::routing::geodata::REFRESH_INTERVAL;
+                                let result = async {
+                                    let store = crate::routing::geodata::Store::new(directory.into()).map_err(|_| ())?;
+                                    let pair = store.refresh(&settings.rules).await.map_err(|_| ())?;
+                                    let manifest = pair.manifest().clone();
+                                    drop(pair);
+                                    let runtime = runtime.clone();
+                                    let path = path.clone();
+                                    tokio::task::spawn_blocking(move || runtime.activate_geodata(&view, &path, manifest))
+                                        .await.map_err(|_| ())?.map_err(|_| ())
+                                }.await;
+                                match result {
+                                    Ok(true) => crate::diag!(Info, "server", "geodata_activated"),
+                                    Ok(false) => {},
+                                    Err(()) => {
+                                        // Retry conflicts and temporary failures without replacing pending edits.
+                                        next_refresh = tokio::time::Instant::now() + Duration::from_secs(300);
+                                        crate::diag!(Warn, "server", "geodata_refresh_or_apply_failed");
+                                    }
+                                }
                             }
                         }
                     }

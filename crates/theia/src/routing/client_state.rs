@@ -123,6 +123,15 @@ impl Cache {
         state.retry = None;
         Ok(snapshot)
     }
+    /// (revision, state): 0 unknown, 1 fresh, 2 expired, 3 synchronizing.
+    pub(crate) fn observation(&self) -> (u64, u8) {
+        let Ok(state) = self.state.try_lock() else { return (0, 3); };
+        match state.snapshot.as_ref() {
+            Some(s) => (s.manifest().revision, if state.expires.is_some_and(|t| Instant::now() < t) { 1 } else { 2 }),
+            None => (0, 0),
+        }
+    }
+
     pub(crate) fn report(&self) -> String {
         let Ok(state) = self.state.try_lock() else { return "Правила маршрутизации: обновляются".into(); };
         let revision = state.snapshot.as_ref().map(|s| s.manifest().revision);
