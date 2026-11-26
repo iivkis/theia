@@ -426,91 +426,67 @@ enum WorkspaceFocus {
 fn pages(role: Role) -> &'static [&'static str] {
     match role {
         Role::Server => &[
-            "Обзор",
-            "Подключения",
-            "Пользователи",
-            "Приглашения",
-            "Статистика",
-            "Настройки",
-            "Диагностика",
+            "Обзор", "Подключения", "Пользователи и ключи", "Управление",
+            "Статистика", "Настройки", "Диагностика",
         ],
         Role::Client => &[
-            "Обзор",
-            "Профили",
-            "Импорт",
-            "Подключение",
-            "Статистика",
-            "Настройки",
-            "Диагностика",
+            "Обзор", "Профили", "Импорт ключа", "Подключение",
+            "Статистика", "Настройки",
         ],
     }
 }
 
+/// Record selection is only useful on pages scoped to an inbound or profile.
+fn page_has_records(role: Role, page: usize) -> bool {
+    page == 1 || (role == Role::Server && page == 2)
+        || (role == Role::Client && page == 3)
+}
+
+fn page_has_users(role: Role, page: usize) -> bool {
+    role == Role::Server && page == 2
+}
+
+/// Each operation has one visible owner. The overview only navigates there.
 fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionItem> {
     let entries: &[(char, &str)] = match (role, page) {
-        (Role::Server, 0) => &[
-            ('N', "Создать подключение"),
-            ('u', "Добавить пользователя"),
-            ('b', "Восстановить доступ"),
-            ('G', "Выбрать пользователей"),
-            ('s', "Запуск / остановка"),
-            ('S', "Сохранить файл"),
-            ('a', "Применить права доступа"),
-            ('v', "Состояние / другие изменения"),
-            ('o', "Открыть другой файл"),
-        ],
+        (_, 0) => &[('>', "Перейти к следующему шагу")],
         (Role::Server, 1) => &[
             ('N', "Создать подключение"),
-            ('G', "Кому разрешён доступ"),
-            ('V', "Состояние (только REALITY)"),
-            ('E', "Сертификат (только Own-TLS)"),
+            ('G', "Разрешить доступ пользователям"),
+            ('V', "Состояние REALITY"),
+            ('E', "Свой TLS-сертификат"),
+            ('K', "Заменить доверие REALITY"),
+            ('M', "Регистрация материалов"),
+            ('w', "Комплект по готовому плану"),
             ('D', "Удалить подключение"),
         ],
         (Role::Server, 2) => &[
-            ('u', "Добавить пользователя"),
-            ('G', "Выбрать права доступа"),
-            ('b', "Восстановить доступ"),
+            ('u', "Добавить пользователя и выдать ключ"),
+            ('b', "Восстановить доступ и выдать ключ"),
+            ('t', "Заменить ключ пользователя"),
             ('x', "Отключить пользователя"),
-            ('t', "Заменить приглашение"),
             ('U', "Удалить пользователя"),
+            ('l', "Публичная ссылка (без ключа доступа)"),
         ],
         (Role::Server, 3) => &[
-            ('u', "Новый пользователь и ссылка"),
-            ('b', "Восстановить доступ"),
-            ('t', "Заменить приглашение"),
-            ('l', "Ссылка без секрета"),
+            ('s', "Запуск / остановка"),
+            ('a', "Применить права доступа"),
+            ('v', "Состояние / другие изменения"),
+            ('R', "Проверить перезапуск"),
         ],
         (_, 4) => &[('4', "Открыть монитор трафика")],
         (Role::Server, 5) => &[
             ('S', "Сохранить файл"),
-            ('a', "Применить права доступа"),
-            ('v', "Состояние / другие изменения"),
+            ('o', "Открыть другой файл"),
             ('Q', "Лимиты подключений"),
-            ('o', "Открыть файл"),
-            ('R', "Проверить перезапуск"),
-            ('K', "Заменить доверие"),
-            ('M', "Регистрация материалов"),
         ],
-        (Role::Server, 6) => &[
-            ('p', "Сетевая диагностика"),
-            ('V', "Состояние (только REALITY)"),
-        ],
-        (Role::Client, 0) => &[
-            ('P', "Режим подключения"),
-            ('L', "Выбрать другой профиль"),
-            ('i', "Импорт ключа Theia"),
-            ('V', "Локальный прокси"),
-            ('N', "Новый профиль"),
-            ('A', "Выбрать активный профиль"),
-            ('S', "Сохранить настройки"),
-            ('o', "Открыть файл настроек"),
-        ],
+        (Role::Server, 6) => &[('p', "Сетевая диагностика")],
         (Role::Client, 1) => &[
-            ('V', "Подключить / отключить"),
-            ('A', "Выбрать активный профиль"),
-            ('N', "Создать профиль"),
-            ('i', "Импорт приглашения"),
-            ('E', "Сертификат Own-TLS"),
+            ('N', "Создать профиль вручную"),
+            ('E', "Доверенный сертификат и ключ"),
+            ('K', "Подтвердить доверие REALITY"),
+            ('M', "Регистрация материалов"),
+            ('l', "Публичная ссылка (без ключа доступа)"),
             ('D', "Удалить профиль"),
         ],
         (Role::Client, 2) => &[
@@ -522,85 +498,60 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
             ('V', "Запустить / остановить локальный прокси"),
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
-            ('i', "Добавить ключ"),
         ],
         (Role::Client, 3) => &[
             ('V', "Запустить / остановить локальный прокси"),
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
-            ('i', "Добавить ключ"),
         ],
         (Role::Client, 5) => &[
-            ('o', "Открыть файл"),
             ('S', "Сохранить файл"),
-            ('V', "Состояние и применение"),
-            ('K', "Подтвердить доверие"),
-            ('M', "Регистрация материалов"),
+            ('o', "Открыть другой файл"),
         ],
-        (Role::Client, 6) => &[('V', "Диагностика подключения")],
         _ => &[],
     };
     let Some(editor) = editor else {
-        return entries
-            .iter()
-            .map(|(key, label)| ActionItem { key: *key, label })
-            .collect();
+        return entries.iter().map(|&(key, label)| ActionItem { key, label }).collect();
     };
-    // Presentation-only availability. Direct shortcuts still pass through all
-    // existing validation/confirmation guards. Keep rendering and dispatch
-    // on this same list, including mouse hit testing.
     let reality = editor.selected_reality();
     let active = editor.selected_record_is_active();
     let has_record = editor.record_count() > 0;
-    let users = if role == Role::Server {
-        editor.workspace_users()
-    } else {
-        Vec::new()
-    };
-    let can_recover = users
-        .iter()
-        .any(|(_, disabled, granted)| *disabled && *granted);
-    let can_rotate = users
-        .iter()
-        .any(|(_, disabled, granted)| !*disabled && *granted);
-    entries
-        .iter()
-        .filter_map(|&(key, label)| {
-            let available = match (role, key) {
-                (Role::Server, 'V' | 'K') | (Role::Client, 'K') => has_record && reality,
-                (_, 'E') => has_record && !reality,
-                (Role::Server, 'D') => editor.record_count() > 1,
-                (Role::Client, 'D' | 'A') => has_record && !active,
-                (Role::Client, 'L') => editor.record_count() > 1,
-                (Role::Server, 'b') => can_recover,
-                (Role::Server, 'x' | 't') => can_rotate,
-                _ => true,
-            };
-            let label = match (role, key) {
-                (Role::Server, 'V') => "Состояние REALITY",
-                (Role::Server, 'E') => "Свой TLS-сертификат",
-                (Role::Client, 'E') => "Доверенный сертификат и ключ",
-                (Role::Client, 'V') if !active && page == 1 => "Состояние профиля",
-                (Role::Client, 'p') if !editor.system_proxy_allowed() => {
-                    "Настроить и включить системный прокси"
-                }
-                (Role::Client, 'V') if page == 3 && !active => "Состояние выбранного профиля",
-                _ => label,
-            };
-            // The overview is a starting point, not a second command catalog.
-            // Keep the next recommended action (both possible runtime states)
-            // and the everyday entry points; the dedicated sections retain the
-            // rest of the operations.
-            let overview = page != 0
-                || matches!(
-                    (role, key),
-                    (Role::Server, 's' | 'N' | 'u') | (Role::Client, 'P' | 'i' | 'L')
-                )
-                || key == recommended_step(editor, false).0
-                || key == recommended_step(editor, true).0;
-            (available && overview).then_some(ActionItem { key, label })
-        })
-        .collect()
+    let users = if role == Role::Server { editor.workspace_users() } else { Vec::new() };
+    let can_recover = users.iter().any(|(_, disabled, granted)| *disabled && *granted);
+    let can_rotate = users.iter().any(|(_, disabled, granted)| !*disabled && *granted);
+    entries.iter().filter_map(|&(key, label)| {
+        let available = match (role, key) {
+            (Role::Server, 'V' | 'K') | (Role::Client, 'K') => has_record && reality,
+            (_, 'E') => has_record && !reality,
+            (Role::Server, 'D') => editor.record_count() > 1,
+            (Role::Client, 'D' | 'A') => has_record && !active,
+            (Role::Client, 'L') => editor.record_count() > 1,
+            (Role::Server, 'b') => can_recover,
+            (Role::Server, 'x' | 't') => can_rotate,
+            (_, 'l' | 'M') => has_record,
+            (Role::Server, 'U') => !users.is_empty(),
+            _ => true,
+        };
+        let label = match (role, key) {
+            (Role::Client, 'p') if !editor.system_proxy_allowed() => "Настроить и включить системный прокси",
+            (Role::Client, 'V') if !active => "Состояние выбранного профиля",
+            _ => label,
+        };
+        available.then_some(ActionItem { key, label })
+    }).collect()
+}
+
+/// The dashboard is a navigator, not a second command dispatcher.
+fn recommendation_page(role: Role, key: char) -> (usize, char) {
+    match (role, key) {
+        (_, 'o' | 'S') => (5, key),
+        (Role::Server, 'N' | 'G') => (1, key),
+        (Role::Server, 'u' | 'b') => (2, key),
+        (Role::Server, _) => (3, key),
+        (Role::Client, 'i') => (2, key),
+        (Role::Client, 'A') => (3, key),
+        (Role::Client, _) => (3, 'V'),
+    }
 }
 
 /// A recommendation is navigation only. It never writes, applies, or starts a process.
@@ -1087,39 +1038,31 @@ impl Interaction {
         }
     }
 
-    fn recommended_action(&self, role: Role) -> usize {
-        let Some(editor) = self.editor_for(role) else {
-            return 0;
-        };
-        let (key, _) = recommended_step(editor, self.owned_running(role));
-        page_actions(role, 0, Some(editor))
-            .iter()
-            .position(|item| item.key == key)
-            .unwrap_or(0)
+    fn visible_workspace_action(&self, _role: Role) -> usize {
+        if self.workspace_page == 0 { 0 } else { self.workspace_action }
     }
 
-    fn visible_workspace_action(&self, role: Role) -> usize {
-        if self.workspace_page == 0 && self.workspace_focus == WorkspaceFocus::Fields {
-            self.recommended_action(role)
-        } else {
-            self.workspace_action
-        }
+    fn follow_recommendation(&mut self, role: Role) {
+        let Some(editor) = self.editor_for(role) else { return; };
+        let (key, _) = recommended_step(editor, self.owned_running(role));
+        let (page, key) = recommendation_page(role, key);
+        let action = page_actions(role, page, Some(editor)).iter()
+            .position(|item| item.key == key).unwrap_or(0);
+        self.select_workspace_page(role, page);
+        self.workspace_action = action;
+        self.workspace_focus = WorkspaceFocus::Actions;
     }
 
     fn select_workspace_page(&mut self, role: Role, page: usize) {
         self.workspace_page = page.min(pages(role).len() - 1);
-        self.workspace_action = if self.workspace_page == 0 {
-            self.recommended_action(role)
-        } else {
-            0
-        };
+        self.workspace_action = 0;
         self.workspace_focus = WorkspaceFocus::Navigation;
     }
 
     fn workspace_content_focus(&self, role: Role) -> WorkspaceFocus {
         match (role, self.workspace_page) {
             (_, 1) => WorkspaceFocus::Fields,
-            (Role::Server, 2 | 3) => WorkspaceFocus::Users,
+            (Role::Server, 2) => WorkspaceFocus::Users,
             _ => WorkspaceFocus::Actions,
         }
     }
@@ -1141,11 +1084,7 @@ impl Interaction {
             .map_or(0, |e| e.workspace_users().len());
         let action_count = page_actions(role, self.workspace_page, self.editor_for(role)).len();
         self.workspace_action = self.workspace_action.min(action_count.saturating_sub(1));
-        let from_detail = if count > 0
-            && (self.workspace_page == 1
-                || (role == Role::Server && matches!(self.workspace_page, 2 | 3))
-                || (role == Role::Client && self.workspace_page == 3))
-        {
+        let from_detail = if count > 0 && page_has_records(role, self.workspace_page) {
             WorkspaceFocus::Records
         } else {
             WorkspaceFocus::Navigation
@@ -1153,7 +1092,7 @@ impl Interaction {
         if self.workspace_focus == WorkspaceFocus::Fields && detail != WorkspaceFocus::Fields {
             self.workspace_focus = detail;
             if self.workspace_page == 0 {
-                self.workspace_action = self.recommended_action(role);
+                self.workspace_action = 0;
             }
         }
         match (self.workspace_focus, code) {
@@ -1163,12 +1102,10 @@ impl Interaction {
             (WorkspaceFocus::Navigation, KeyCode::Down) => {
                 if self.workspace_page + 1 < pages(role).len() {
                     self.select_workspace_page(role, self.workspace_page + 1);
-                } else if count > 0 {
-                    self.workspace_focus = WorkspaceFocus::Records;
                 }
             }
             (WorkspaceFocus::Navigation, KeyCode::Right) => {
-                self.workspace_focus = if self.workspace_page == 1 && count > 0 {
+                self.workspace_focus = if page_has_records(role, self.workspace_page) && count > 0 {
                     WorkspaceFocus::Records
                 } else {
                     detail
@@ -1188,11 +1125,7 @@ impl Interaction {
                         editor.workspace_select(index);
                     }
                     self.workspace_user = 0;
-                    self.workspace_action = if self.workspace_page == 0 {
-                        self.recommended_action(role)
-                    } else {
-                        0
-                    };
+                    self.workspace_action = 0;
                 }
             }
             (WorkspaceFocus::Records, KeyCode::Left) => {
@@ -1369,13 +1302,7 @@ impl Interaction {
                     0
                 };
                 self.workspace_focus = WorkspaceFocus::Actions;
-                if let Some(role) = Self::panel_role(model) {
-                    self.workspace_action = if self.workspace_page == 0 {
-                        self.recommended_action(role)
-                    } else {
-                        0
-                    };
-                }
+                self.workspace_action = 0;
                 self.last_apply = None;
             }
         }
@@ -1893,11 +1820,7 @@ impl Interaction {
                             self.workspace_user = 0;
                         }
                     }
-                    self.workspace_action = if self.workspace_page == 0 {
-                        self.recommended_action(role)
-                    } else {
-                        0
-                    };
+                    self.workspace_action = 0;
                 }
                 return;
             }
@@ -1940,8 +1863,7 @@ impl Interaction {
                         editor.workspace_select_field(id);
                         self.workspace_focus = WorkspaceFocus::Fields;
                     }
-                } else if role == Role::Server
-                    && matches!(self.workspace_page, 2 | 3)
+                } else if page_has_users(role, self.workspace_page)
                     && inside(content)
                     && event.row >= content.y + 2
                     && event.row < content.bottom().saturating_sub(1)
@@ -1966,7 +1888,8 @@ impl Interaction {
             return;
         }
         let records = columns[1];
-        if inside(records)
+        if page_has_records(role, self.workspace_page)
+            && inside(records)
             && event.row > records.y
             && event.row < records.bottom().saturating_sub(1)
         {
@@ -1978,11 +1901,7 @@ impl Interaction {
                     self.workspace_user = 0;
                 }
             }
-            self.workspace_action = if self.workspace_page == 0 {
-                self.recommended_action(role)
-            } else {
-                0
-            };
+            self.workspace_action = 0;
             self.workspace_focus = WorkspaceFocus::Records;
             return;
         }
@@ -2005,8 +1924,7 @@ impl Interaction {
                     self.workspace_focus = WorkspaceFocus::Actions;
                     return;
                 }
-                if role == Role::Server
-                    && matches!(self.workspace_page, 2 | 3)
+                if page_has_users(role, self.workspace_page)
                     && inside(content)
                     && event.row >= content.y + 2
                 {
@@ -2221,10 +2139,11 @@ impl Interaction {
         {
             self.client_background = self.reality_status.take();
             if key.code == KeyCode::F(10) {
-                self.menu = Some(Menu::new(
-                    Role::Client,
-                    self.editor_for(Role::Client).is_some(),
-                ));
+                if self.editor_for(Role::Client).is_some() {
+                    self.workspace_focus = WorkspaceFocus::Navigation;
+                } else {
+                    self.menu = Some(Menu::new(Role::Client, false));
+                }
             }
             return false;
         }
@@ -2525,7 +2444,7 @@ impl Interaction {
                     // A connection is the scope of user rights and invitations. The
                     // same shortcut works in every server workspace, even when
                     // the sidebar is hidden on a compact terminal.
-                    if (role == Role::Server || self.workspace_page == 3)
+                    if page_has_records(role, self.workspace_page)
                         && key.modifiers.is_empty()
                         && matches!(key.code, KeyCode::Char('j' | 'k'))
                     {
@@ -2533,11 +2452,7 @@ impl Interaction {
                             editor.select_record(key.code == KeyCode::Char('j'));
                         }
                         self.workspace_user = 0;
-                        self.workspace_action = if self.workspace_page == 0 {
-                            self.recommended_action(role)
-                        } else {
-                            0
-                        };
+                        self.workspace_action = 0;
                         return false;
                     }
                     if key.code == KeyCode::F(7) && self.workspace_focus == WorkspaceFocus::Records
@@ -2561,7 +2476,7 @@ impl Interaction {
                         if self.workspace_page == 0
                             && self.workspace_focus == WorkspaceFocus::Fields
                         {
-                            self.workspace_action = self.recommended_action(role);
+                            self.workspace_action = 0;
                         }
                         self.workspace_focus = match self.workspace_focus {
                             WorkspaceFocus::Fields | WorkspaceFocus::Users => {
@@ -2570,7 +2485,7 @@ impl Interaction {
                             WorkspaceFocus::Actions => WorkspaceFocus::Navigation,
                             WorkspaceFocus::Records => self.workspace_content_focus(role),
                             WorkspaceFocus::Navigation => {
-                                if role == Role::Server && matches!(self.workspace_page, 2 | 3) {
+                                if page_has_users(role, self.workspace_page) {
                                     WorkspaceFocus::Users
                                 } else {
                                     WorkspaceFocus::Fields
@@ -2613,8 +2528,7 @@ impl Interaction {
                                 return false;
                             }
                             KeyCode::Enter | KeyCode::Tab => {
-                                self.workspace_focus = if role == Role::Server
-                                    && matches!(self.workspace_page, 2 | 3)
+                                self.workspace_focus = if page_has_users(role, self.workspace_page)
                                 {
                                     WorkspaceFocus::Users
                                 } else if self.workspace_page == 1 {
@@ -2635,8 +2549,7 @@ impl Interaction {
                             _ => {}
                         }
                     }
-                    if role == Role::Server
-                        && matches!(self.workspace_page, 2 | 3)
+                    if page_has_users(role, self.workspace_page)
                         && matches!(
                             self.workspace_focus,
                             WorkspaceFocus::Fields | WorkspaceFocus::Users
@@ -2673,7 +2586,7 @@ impl Interaction {
                         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                             self.workspace_focus = if key.code == KeyCode::Tab {
                                 WorkspaceFocus::Navigation
-                            } else if role == Role::Server && matches!(self.workspace_page, 2 | 3) {
+                            } else if page_has_users(role, self.workspace_page) {
                                 WorkspaceFocus::Users
                             } else {
                                 WorkspaceFocus::Fields
@@ -2699,8 +2612,11 @@ impl Interaction {
                                 &mut self.workspace_action,
                                 key.code,
                             ) {
-                                let selected = if role == Role::Server
-                                    && matches!(self.workspace_page, 2 | 3)
+                                if ch == '>' && self.workspace_page == 0 {
+                                    self.follow_recommendation(role);
+                                    return false;
+                                }
+                                let selected = if page_has_users(role, self.workspace_page)
                                 {
                                     self.editor_for(role).and_then(|e| {
                                         e.workspace_users()
@@ -2784,7 +2700,7 @@ impl Interaction {
                         }
                     }
                     if self.workspace_page != 1
-                        && !(role == Role::Server && matches!(self.workspace_page, 2 | 3))
+                        && !(page_has_users(role, self.workspace_page))
                         && self.workspace_focus == WorkspaceFocus::Fields
                         && !page_actions(role, self.workspace_page, self.editor_for(role))
                             .is_empty()
@@ -2792,7 +2708,7 @@ impl Interaction {
                         && matches!(key.code, KeyCode::Enter | KeyCode::Up | KeyCode::Down)
                     {
                         if self.workspace_page == 0 {
-                            self.workspace_action = self.recommended_action(role);
+                            self.workspace_action = 0;
                         }
                         self.workspace_focus = WorkspaceFocus::Actions;
                         // Open the selected workflow, not its confirmation.
@@ -2804,7 +2720,7 @@ impl Interaction {
                         if self.workspace_page == 0
                             && self.workspace_focus == WorkspaceFocus::Fields
                         {
-                            self.workspace_action = self.recommended_action(role);
+                            self.workspace_action = 0;
                         }
                         self.workspace_focus = if key.code == KeyCode::BackTab {
                             WorkspaceFocus::Navigation
@@ -2824,7 +2740,11 @@ impl Interaction {
                     return false;
                 }
                 if matches!(key.code, KeyCode::F(10) | KeyCode::F(2)) {
-                    self.menu = Some(Menu::new(role, configured));
+                    if configured {
+                        self.workspace_focus = WorkspaceFocus::Navigation;
+                    } else {
+                        self.menu = Some(Menu::new(role, false));
+                    }
                     return false;
                 }
                 if key.code == KeyCode::F(4) {
@@ -4175,7 +4095,7 @@ fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
         return None;
     }
     let cols = Layout::horizontal([
-        Constraint::Length((area.width / 3).clamp(34, 46)),
+        Constraint::Length(28),
         Constraint::Length(2),
         Constraint::Min(1),
     ])
@@ -4855,7 +4775,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             frame,
             parts[1],
             "Справка",
-            "НАЧАЛО РАБОТЫ\n← →: выбрать роль   Enter: открыть   Esc: назад\nF1: справка   q / Ctrl+C: выйти\n\nНАВИГАЦИЯ\nF2: все действия   F3: открыть файл   F4: трафик\n← →: перейти между областями   ↑ ↓: выбрать строку\nВнизу списка разделов можно перейти к профилям или подключениям.\nВнизу таблицы параметров или пользователей — к действиям.\nEnter: открыть или изменить выбранное поле\nTab, F6 и Alt+←/→ — дополнительные сочетания.\n\nСЕРВЕР\nN: новое подключение   W: мастер REALITY   F5: запуск и остановка\nu: новый пользователь   G: права доступа   x: отключение\nb: восстановление   t: новый токен   l: публичное приглашение\nv: состояние   Ctrl+R: предпросмотр применения прав\n\nКЛИЕНТ\ni: импорт ссылки, файла или QR   V: подключение и состояние\nN: новый профиль   A: выбрать активный профиль\n\nБЕЗОПАСНОСТЬ\nCtrl+S: сохранить файл, не менять работающий процесс.\nИзменение работающего процесса, доверия и сетевые запросы требуют отдельного подтверждения.",
+            "НАЧАЛО РАБОТЫ\n← →: выбрать роль   Enter: открыть   Esc: назад\nF1: справка   q / Ctrl+C: выйти\n\nНАВИГАЦИЯ\nF2: разделы   F3: открыть файл   F4: трафик\n← →: перейти между областями   ↑ ↓: выбрать строку\nСписок профилей или подключений показывается только в связанных разделах.\nВнизу таблицы параметров или пользователей — к действиям.\nEnter: открыть или изменить выбранное поле\nTab, F6 и Alt+←/→ — дополнительные сочетания.\n\nСЕРВЕР\nN: новое подключение   W: мастер REALITY   F5: запуск и остановка\nu: новый пользователь   G: права доступа   x: отключение\nb: восстановление   t: новый токен   l: публичное приглашение\nv: состояние   Ctrl+R: предпросмотр применения прав\n\nКЛИЕНТ\ni: импорт ссылки, файла или QR   V: подключение и состояние\nN: новый профиль   A: выбрать активный профиль\n\nБЕЗОПАСНОСТЬ\nCtrl+S: сохранить файл, не менять работающий процесс.\nИзменение работающего процесса, доверия и сетевые запросы требуют отдельного подтверждения.",
             true,
         ),
     }
@@ -6081,7 +6001,7 @@ fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> 
                 .saturating_add(2))
             .min(u16::MAX as usize) as u16
         })
-    } else if role == Role::Server && matches!(page, 2 | 3) {
+    } else if page_has_users(role, page) {
         editor.map_or(6, |e| {
             (e.workspace_users().len() as u16)
                 .saturating_add(3)
@@ -6196,7 +6116,7 @@ fn draw_page(
     ui: Option<&Interaction>,
     compact: bool,
 ) {
-    let page = ui.map_or(0, |u| u.workspace_page.min(6));
+    let page = ui.map_or(0, |u| u.workspace_page.min(pages(role).len() - 1));
     let items = page_actions(role, page, Some(editor));
     let focus = ui.map_or(WorkspaceFocus::Fields, |u| u.workspace_focus);
     let selected = ui.map_or(0, |u| u.visible_workspace_action(role));
@@ -6250,10 +6170,10 @@ fn draw_page(
             "Файл сохранён"
         };
         let (next_key, help) = recommended_step(editor, ui.is_some_and(|u| u.owned_running(role)));
-        let next_label = items
-            .iter()
-            .find(|item| item.key == next_key)
-            .map_or("Открыть файл (F3)", |item| item.label);
+        let (next_page, action_key) = recommendation_page(role, next_key);
+        let next_items = page_actions(role, next_page, Some(editor));
+        let next_label = next_items.iter().find(|item| item.key == action_key)
+            .map_or(pages(role)[next_page], |item| item.label);
         if role == Role::Server {
             let allowed = users
                 .iter()
@@ -6333,7 +6253,7 @@ fn draw_page(
         draw_client_modes(frame, content, editor, ui);
     } else if page == 1 {
         draw_editor(frame, content, editor, focus == WorkspaceFocus::Fields);
-    } else if role == Role::Server && matches!(page, 2 | 3) {
+    } else if page_has_users(role, page) {
         let users = editor.workspace_users();
         let selected = ui
             .map_or(0, |u| u.workspace_user)
@@ -6393,11 +6313,7 @@ fn draw_page(
             .block(tui_widgets::section(
                 &format!(
                     "{}: {}",
-                    if page == 3 {
-                        "Приглашения для"
-                    } else {
-                        "Доступ к"
-                    },
+                    "Пользователи и ключи для",
                     editor.selected_record_id()
                 ),
                 focus == WorkspaceFocus::Users,
@@ -6417,9 +6333,9 @@ fn draw_page(
         }
         // Render explanatory text only in unused table rows. Mouse selection
         // still uses the same row geometry and cannot select the help text.
-        if page == 3 && users.len() <= 3 && content.height >= 9 {
+        if users.len() <= 3 && content.height >= 9 {
             let y = content.y + 2 + users.len() as u16 + 1;
-            let hint = "Личная ссылка показывается один раз.\nЕсли потеряли её, выберите пользователя и «Заменить приглашение».\nСтарый ключ перестанет работать для новых сеансов после применения прав.";
+            let hint = "Личная ссылка показывается один раз.\nЕсли потеряли её, выберите пользователя и «Заменить ключ пользователя».\nСтарый ключ перестанет работать для новых сеансов после применения прав.";
             frame.render_widget(
                 Paragraph::new(hint)
                     .style(Style::default().fg(MUTED))
@@ -6434,7 +6350,8 @@ fn draw_page(
         }
     } else {
         let description = match (role,page) {
-            (Role::Client,2) => "Добавьте ключ от администратора.\n\nПроверьте адрес сервера и сохраните профиль.\nПодключение запускается отдельно.",
+            (Role::Client,2) => "Вставьте личный ключ от администратора или выберите файл / QR.\nТип подключения определяется автоматически.\nПодключение запускается отдельно.",
+            (Role::Server,3) => "Запуск, остановка и применение сохранённых изменений.\nСохранение файла само по себе не меняет работающий сервер.",
             (_,4) => "Скорость, объём и активные соединения.\n\nДанные только локального процесса Theia.",
             (_,5) => "Сохранение записывает файл.\nПрименение меняет работающий процесс отдельно.",
             _ => "Проверьте состояние подключения.\nСетевые проверки требуют согласия.",
@@ -6452,7 +6369,7 @@ fn draw_page(
             focus == WorkspaceFocus::Actions
                 || (focus == WorkspaceFocus::Fields
                     && page != 1
-                    && !(role == Role::Server && matches!(page, 2 | 3))),
+                    && !(page_has_users(role, page))),
         );
     } else if focus == WorkspaceFocus::Actions && !items.is_empty() {
         Actions {
@@ -6476,7 +6393,7 @@ fn draw_workspace(
     }
     let Some([nav, records, details]) = workspace_columns(area) else {
         if let Some(editor) = editor {
-            if ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Records) {
+            if ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Records && page_has_records(role, u.workspace_page)) {
                 draw_workspace_records(frame, area, role, editor, true);
             } else {
                 draw_page(frame, area, role, editor, ui, true);
@@ -6515,13 +6432,12 @@ fn draw_workspace(
         nav,
     );
     if let Some(editor) = editor {
-        draw_workspace_records(
-            frame,
-            records,
-            role,
-            editor,
-            ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Records),
-        );
+        if page_has_records(role, page) {
+            draw_workspace_records(
+                frame, records, role, editor,
+                ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Records),
+            );
+        }
         draw_page(frame, details, role, editor, ui, false);
     } else {
         panel(
@@ -7201,7 +7117,7 @@ mod tests {
                     }
                     let expected_focus = if page == 1 {
                         WorkspaceFocus::Fields
-                    } else if role == Role::Server && matches!(page, 2 | 3) {
+                    } else if page_has_users(role, page) {
                         WorkspaceFocus::Users
                     } else {
                         WorkspaceFocus::Actions
@@ -7228,7 +7144,7 @@ mod tests {
                         ui.mouse(&mut model, click_at(table.x + 2, y), area);
                         assert_eq!(ui.editor.as_ref().unwrap().workspace_field_index(), 1);
                         assert!(!ui.editor.as_ref().unwrap().editing);
-                    } else if role == Role::Server && matches!(page, 2 | 3) {
+                    } else if page_has_users(role, page) {
                         let content = layout.unwrap()[0];
                         ui.mouse(&mut model, click_at(content.x + 2, content.y + 2), area);
                         assert_eq!(ui.workspace_focus, WorkspaceFocus::Users);
@@ -7907,6 +7823,9 @@ mod tests {
         let screen = rendered_interaction(80, 24, &model, &ui);
         assert!(screen.contains("Запуск / остановка"));
         ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.workspace_page, 3);
+        assert!(!ui.show_server_process);
+        ui.update(&mut model, press(KeyCode::Enter));
         assert!(ui.show_server_process);
         assert!(!ui.server_process.running());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
@@ -8001,7 +7920,7 @@ mod tests {
         let area = Rect::new(0, 0, 120, 40);
         let [_, _, workspace] = workspace_columns(shell_layout(area)[1]).unwrap();
         for role in [Role::Server, Role::Client] {
-            for page in [0, 2, 4, 5, 6] {
+            for page in [0, 2, 4, 5] {
                 let [content, controls] = page_layout(workspace, role, page, None).unwrap();
                 assert_eq!(controls.x, content.x);
                 assert_eq!(controls.width, content.width);
@@ -8039,6 +7958,51 @@ mod tests {
     }
 
     #[test]
+    fn workspace_has_single_owner_for_every_visible_operation() {
+        for role in [Role::Server, Role::Client] {
+            let mut seen = std::collections::HashSet::new();
+            for page in 0..pages(role).len() {
+                for item in page_actions(role, page, None) {
+                    assert!(seen.insert(item.key), "duplicate action {}", item.key);
+                }
+            }
+            assert!(!page_has_records(role, 0));
+            assert!(!page_has_records(role, 4));
+            assert!(!page_has_records(role, 5));
+        }
+        assert_eq!(recommendation_page(Role::Server, 'b'), (2, 'b'));
+        assert_eq!(recommendation_page(Role::Client, 'i'), (2, 'i'));
+        assert_eq!(recommendation_page(Role::Client, 'A'), (3, 'A'));
+        assert_eq!(recommendation_page(Role::Server, 'S'), (5, 'S'));
+        assert!(!page_has_users(Role::Server, 3));
+        assert_eq!(pages(Role::Client).len(), 6);
+    }
+
+    #[test]
+    fn configured_sections_shortcut_uses_navigation_not_second_menu() {
+        for role in [Role::Server, Role::Client] {
+            let path = std::env::temp_dir().join(crate::tui_editor::generated_id("single-nav").unwrap());
+            let original = if role == Role::Server {
+                server_issuance_fixture()
+            } else {
+                include_str!("../../../examples/client.toml").to_owned()
+            };
+            std::fs::write(&path, &original).unwrap();
+            let mut model = Model::new(Some(role));
+            let mut ui = Interaction::new(Some(Editor::load(role, &path).unwrap()));
+            for key in [KeyCode::F(2), KeyCode::F(10)] {
+                ui.update(&mut model, press(key));
+                assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+                assert!(ui.menu.is_none());
+                assert!(!ui.owned_running(role));
+                assert!(!ui.editor.as_ref().unwrap().dirty());
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn workspace_actions_follow_record_mode_and_eligibility() {
         let path =
             std::env::temp_dir().join(crate::tui_editor::generated_id("review-actions").unwrap());
@@ -8059,11 +8023,12 @@ mod tests {
         let editor = Editor::load(Role::Client, &path).unwrap();
         let items = page_actions(Role::Client, 1, Some(&editor));
         assert!(!items.iter().any(|a| matches!(a.key, 'A' | 'D')));
-        assert!(items.iter().any(|a| a.key == 'V'));
+        assert!(!items.iter().any(|a| matches!(a.key, 'V' | 'i' | 'A')));
+        assert!(page_actions(Role::Client, 3, Some(&editor)).iter().any(|a| a.key == 'V'));
         let mut selected = 0;
         assert_eq!(
             tui_widgets::action_key(&items, &mut selected, KeyCode::Enter),
-            Some(KeyCode::Char('V'))
+            Some(KeyCode::Char('N'))
         );
         std::fs::remove_file(path).unwrap();
     }
