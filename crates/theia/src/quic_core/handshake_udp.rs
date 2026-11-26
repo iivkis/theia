@@ -462,10 +462,7 @@ pub async fn establish(
     config: Config,
 ) -> Result<LabSession, Error> {
     let address = socket.local_addr().map_err(Error::Io)?;
-    if !address.ip().is_loopback()
-        || !peer.ip().is_loopback()
-        || peer.port() == 0
-        || address == peer
+    if !super::loopback_pair(address, peer)
         || local == remote
         || local == [0; CID_LEN]
         || remote == [0; CID_LEN]
