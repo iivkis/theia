@@ -363,6 +363,61 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_h3_request_response_and_exporter_v1_v2() {
+        use crate::quic_core::{h3_adapter::NativeConnection, handshake_udp, listener::Listener};
+        use bytes::{Buf, Bytes};
+        use std::{future::poll_fn, time::Duration};
+        use tokio::net::UdpSocket;
+        for version in [Version::V1, Version::V2] {
+            let (cc, mut sc) = configs();
+            sc.send_tls13_tickets = 0;
+            let mut listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2).unwrap();
+            let addr = listener.local_addr();
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let (client, server) = tokio::join!(
+                    handshake_udp::connect(socket, addr, version, Arc::new(cc), ServerName::try_from("localhost").unwrap()),
+                    async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await },
+                );
+                let (client, ck) = NativeConnection::start(client.unwrap()).unwrap();
+                let (server, sk) = NativeConnection::start(server.unwrap()).unwrap();
+                assert_eq!(&ck[..], &sk[..]);
+                let (client, server) = tokio::join!(
+                    h3::client::new::<_, _, Bytes>(client),
+                    async { h3::server::builder().build::<_, Bytes>(server).await },
+                );
+                let (mut driver, mut sender) = client.unwrap();
+                let mut server = server.unwrap();
+                let driver = tokio::spawn(async move { let _ = poll_fn(|cx| driver.poll_close(cx)).await; });
+                let ((), ()) = tokio::join!(async {
+                    let mut request = sender.send_request(http::Request::builder().uri("https://localhost/native").body(()).unwrap()).await.unwrap();
+                    request.send_data(Bytes::from_static(b"native request")).await.unwrap();
+                    request.finish().await.unwrap();
+                    assert_eq!(request.recv_response().await.unwrap().status(), 200);
+                    let mut data = Vec::new();
+                    while let Some(mut buf) = request.recv_data().await.unwrap() {
+                        data.extend_from_slice(&buf.copy_to_bytes(buf.remaining()));
+                    }
+                    assert_eq!(data, b"native response");
+                }, async {
+                    let resolver = server.accept().await.unwrap().unwrap();
+                    let (req, mut stream) = resolver.resolve_request().await.unwrap();
+                    assert_eq!(req.uri().path(), "/native");
+                    let mut data = Vec::new();
+                    while let Some(mut buf) = stream.recv_data().await.unwrap() {
+                        data.extend_from_slice(&buf.copy_to_bytes(buf.remaining()));
+                    }
+                    assert_eq!(data, b"native request");
+                    stream.send_response(http::Response::builder().status(200).body(()).unwrap()).await.unwrap();
+                    stream.send_data(Bytes::from_static(b"native response")).await.unwrap();
+                    stream.finish().await.unwrap();
+                });
+                driver.abort();
+            }).await.unwrap();
+        }
+    }
+
     #[test]
     fn bidi_and_replenishment_respects_direction_and_consumption() {
         use crate::quic_core::{flow::ReceiveFlow, send_flow::SendFlow};

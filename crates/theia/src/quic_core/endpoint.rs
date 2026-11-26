@@ -48,6 +48,7 @@ pub struct LabSession {
     confirmed: bool,
     idle: Idle,
     binding: Option<zeroize::Zeroizing<[u8; 32]>>,
+    peer_application_close: Option<u64>,
 }
 
 impl LabSession {
@@ -96,7 +97,7 @@ impl LabSession {
         Ok(Self { socket, paths: Paths::new_validated(peer), local_cid, remote_cid, protection: Some(protection), acknowledgments: History::default(),
             send, receive,
             scheduler: Scheduler::default(), closed: false, shutdown: Shutdown::default(), server, confirmed,
-            idle: Idle::new(Instant::now(), Duration::from_secs(30)), binding: None })
+            idle: Idle::new(Instant::now(), Duration::from_secs(30)), binding: None, peer_application_close: None })
     }
 
     pub fn handshake_confirmed(&self) -> bool { self.confirmed }
@@ -106,6 +107,8 @@ impl LabSession {
     pub(crate) fn take_channel_binding(&mut self) -> Option<zeroize::Zeroizing<[u8; 32]>> {
         if self.active() { self.binding.take() } else { None }
     }
+
+    pub(crate) fn peer_application_close(&self) -> Option<u64> { self.peer_application_close }
 
     pub(crate) fn peer_streams(&self) -> Vec<u64> { self.receive.peer_streams() }
 
@@ -357,7 +360,9 @@ impl LabSession {
         let now = Instant::now();
         self.tick(now);
         if self.closed { return Ok(false); }
-        let wait = self.deadline().map_or(wait, |at| wait.min(at.saturating_duration_since(now)));
+        let idle = if self.active() { self.idle.deadline(self.scheduler.base_pto()) } else { None };
+        let wait = [self.shutdown.deadline(), idle].into_iter().flatten().fold(wait, |wait, at|
+            wait.min(at.saturating_duration_since(now)));
         let result = self.recv_inner(wait).await;
         if result.is_err() { self.abort(); } else { self.tick(Instant::now()); }
         result
@@ -416,7 +421,8 @@ impl LabSession {
             // Cross-IP path changes require independent recovery state.
         }
         self.idle.received(now);
-        if parsed.iter().any(|frame| matches!(frame, Frame::Close { .. })) {
+        if let Some(Frame::Close { application, code, .. }) = parsed.iter().find(|frame| matches!(frame, Frame::Close { .. })) {
+            if *application { self.peer_application_close = Some(*code); }
             self.shutdown.peer(now, self.scheduler.base_pto()).map_err(|_| Error::Protocol)?;
             // Draining is silent. Drop keys now; retain the connection
             // object/route until the shutdown deadline.
