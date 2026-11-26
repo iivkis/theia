@@ -690,13 +690,71 @@ pub(crate) mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         fs::write(&ca_path, cert.cert.pem()).unwrap();
         let bearer = PrivateBearer::create(&path, &[42; 32]).unwrap();
+        // Startup now authenticates the routing snapshot before binding local
+        // proxies. Exercise that real preflight instead of assuming an offline
+        // example endpoint can start the client.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let endpoint = upstream.local_addr().unwrap().to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut tls = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        )
+        .unwrap();
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let inbound = config::Inbound {
+            id: "proxy-test".into(),
+            path_prefix: Some("/v1/theia-example".into()),
+            allowed_user_ids: vec!["client".into()],
+            h2_listen: endpoint.clone(),
+            quic_listen: "127.0.0.1:0".into(),
+            server_name: "localhost".into(),
+            tls_cert: "unused-test-fixture".into(),
+            tls_key: "unused-test-fixture".into(),
+            security_mode: Default::default(),
+            reality: None,
+        };
+        let context = std::sync::Arc::new(crate::server::ServerContext::new(
+            &inbound,
+            &[config::User {
+                id: "client".into(),
+                token_sha256: format!("{:x}", Sha256::digest([42; 32])),
+                disabled: false,
+            }],
+            &config::ServerPolicy {
+                routing: None,
+                allow_private_ips: true,
+                max_connections_per_user: 8,
+                max_connections_total: 8,
+                connect_timeout_ms: 1500,
+            },
+        ));
+        let server = runtime.spawn(async move {
+            crate::server::serve(
+                tokio::net::TcpListener::from_std(upstream).unwrap(),
+                tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls)),
+                context,
+            )
+            .await
+        });
         let Config::Client(mut doc) =
             config::parse(include_str!("../../../examples/client.toml")).unwrap()
         else {
             panic!("client fixture required");
         };
         let profile = &mut doc.client.profiles[0];
-        profile.server = "127.0.0.1:443".into();
+        profile.server = endpoint;
         profile.server_name = "localhost".into();
         profile.transport = config::Transport::H2;
         profile.tls_ca = Some(format!("file:{}", ca_path.display()));
@@ -811,6 +869,8 @@ pub(crate) mod tests {
         assert_original();
         drop(panel);
         drop(bearer);
+        server.abort();
+        drop(runtime);
         fs::remove_dir_all(directory).unwrap();
         assert_original();
     }
