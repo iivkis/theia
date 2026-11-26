@@ -412,31 +412,31 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
         // so an allocator cannot repeatedly return the same unusable port.
         let mut tcp_rejected = Vec::new();
         let mut udp_rejected = Vec::new();
-        let mut last_error = None;
+        let mut errors = Vec::new();
         let addr = std::net::SocketAddr::new(ip, 0);
         for _ in 0..128 {
             match UdpSocket::bind(addr) {
                 Ok(udp) => match TcpListener::bind(udp.local_addr().unwrap()) {
                     Ok(tcp) => return (tcp, udp),
                     Err(error) => {
-                        last_error = Some(error);
+                        errors.push(error);
                         udp_rejected.push(udp);
                     }
                 },
-                Err(error) => last_error = Some(error),
+                Err(error) => errors.push(error),
             }
             match TcpListener::bind(addr) {
                 Ok(tcp) => match UdpSocket::bind(tcp.local_addr().unwrap()) {
                     Ok(udp) => return (tcp, udp),
                     Err(error) => {
-                        last_error = Some(error);
+                        errors.push(error);
                         tcp_rejected.push(tcp);
                     }
                 },
-                Err(error) => last_error = Some(error),
+                Err(error) => errors.push(error),
             }
         }
-        panic!("cannot reserve a shared TCP/UDP port on {ip}: {last_error:?}");
+        panic!("cannot reserve a shared TCP/UDP port on {ip}: {:?}", errors.last());
     };
     let own = reserve(localhost);
     let smart = reserve(std::net::Ipv4Addr::LOCALHOST.into());
