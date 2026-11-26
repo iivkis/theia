@@ -160,8 +160,11 @@ impl Tunnel {
         match self {
             Self::VerifiedLocal(verified, fallback) => {
                 let Some(first) = upload.recv().await else { return Ok(()); };
-                let stun = verified.strategy == crate::routing::dpi::UdpStrategy::StunBinding;
-                if !verified.admissible()? || (stun && crate::routing::dpi::udp::plain_binding(&first).is_none()) {
+                let stun = match verified.strategy {
+                    crate::routing::dpi::UdpStrategy::StunBinding(strategy) => Some(strategy),
+                    crate::routing::dpi::UdpStrategy::QuicV1 => None,
+                };
+                if !verified.admissible()? || stun.is_some_and(|strategy| crate::routing::dpi::udp::prepare_binding(&first, strategy).is_none()) {
                     let authorization = verified.fallback_policy();
                     drop(verified);
                     authorization.check()?;
@@ -175,8 +178,8 @@ impl Tunnel {
                 // Once a send is attempted no fallback or replay is legal.
                 drop(fallback);
                 verified.check_policy()?;
-                let result = if stun {
-                    relay_stun(&verified.socket, first, upload, download).await
+                let result = if let Some(strategy) = stun {
+                    relay_stun(&verified.socket, strategy, first, upload, download).await
                 } else {
                     relay_local(&verified.socket, Some(FIRST_RESPONSE), Some(first), upload, download).await
                 };
@@ -265,20 +268,23 @@ async fn relay_local(
 /// No credentials or unrelated UDP may leak by reusing the same target tuple.
 async fn relay_stun(
     socket: &UdpSocket,
+    strategy: crate::routing::dpi::udp::BindingStrategy,
     first: Vec<u8>,
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), LocalRelayError> {
-    use crate::routing::dpi::udp::BindingTransactions;
+    use crate::routing::dpi::udp::{prepare_binding, BindingTransactions};
     let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
     let activity = Activity::new();
     let requests = Mutex::new(BindingTransactions::default());
     if !requests.lock().unwrap_or_else(|e| e.into_inner()).admit(&first) {
         return Err(LocalRelayError::Application(ClientError::Protocol));
     }
-    timeout(FIRST_RESPONSE, send_datagram(socket, &first)).await
+    let packet = prepare_binding(&first, strategy).ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+    timeout(FIRST_RESPONSE, send_datagram(socket, &packet)).await
         .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
         .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+    if packet.len() != first.len() { crate::traffic::udp_stun_fingerprint(); }
     traffic.upload(first.len());
     activity.touch();
     crate::traffic::udp_stun_local();
@@ -288,7 +294,9 @@ async fn relay_stun(
                 // No switch or replay once the local flow was used.
                 return Err(LocalRelayError::Application(ClientError::Protocol));
             }
-            send_datagram(socket, &data).await.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+            let packet = prepare_binding(&data, strategy).ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+            send_datagram(socket, &packet).await.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+            if packet.len() != data.len() { crate::traffic::udp_stun_fingerprint(); }
             traffic.upload(data.len());
             activity.touch();
         }
@@ -497,6 +505,36 @@ mod tests {
         assert_eq!(&buf[..n], b"first");
         assert!(matches!(task.await.unwrap(), Err(LocalRelayError::Peer(ClientError::Timeout))));
         assert!(timeout(Duration::from_millis(30), target.recv_from(&mut buf)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stun_relay_uses_selected_strategy_and_rejects_other_payload() {
+        use crate::routing::dpi::udp::{BindingStrategy, prepare_binding};
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = connect(target.local_addr().unwrap()).await.unwrap();
+        let (up, rx) = mpsc::channel(QUEUE);
+        let (down, mut responses) = mpsc::channel(QUEUE);
+        let mut first = vec![0, 1, 0, 0, 0x21, 0x12, 0xa4, 0x42];
+        first.extend([7; 12]);
+        let expected = prepare_binding(&first, BindingStrategy::Fingerprint).unwrap().into_owned();
+        let task = tokio::spawn(async move {
+            relay_stun(&socket, BindingStrategy::Fingerprint, first, rx, down).await
+        });
+        let mut buf = [0; 512];
+        let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], expected.as_slice());
+        let mut response = expected[..20].to_vec();
+        response[0] = 1;
+        response[2..4].copy_from_slice(&12u16.to_be_bytes());
+        response.extend([0, 0x20, 0, 8, 0, 1, 0x21, 0x13, 1, 2, 3, 4]);
+        let mut wrong = response.clone();
+        wrong[19] ^= 1;
+        target.send_to(&wrong, peer).await.unwrap();
+        target.send_to(&response, peer).await.unwrap();
+        assert_eq!(timeout(Duration::from_secs(2), responses.recv()).await.unwrap().unwrap(), response);
+        up.send(b"not Binding".to_vec()).await.unwrap();
+        assert!(matches!(task.await.unwrap(), Err(LocalRelayError::Application(ClientError::Protocol))));
+        assert!(timeout(Duration::from_millis(50), target.recv_from(&mut buf)).await.is_err());
     }
 
     #[tokio::test]

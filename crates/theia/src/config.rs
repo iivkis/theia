@@ -697,6 +697,8 @@ impl ClientDocument {
             "unknown profile",
         )?;
         let proxy = &self.client.proxy;
+        ensure(proxy.direct_dpi_stun != Some(true) || proxy.direct_dpi == Some(true),
+            "client.proxy.direct_dpi_stun", "requires explicit direct_dpi consent")?;
         let http = listen(&proxy.http_listen, "client.proxy.http_listen")?;
         let socks = listen(&proxy.socks5_listen, "client.proxy.socks5_listen")?;
         for (address, field) in [

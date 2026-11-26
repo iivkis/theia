@@ -47,7 +47,7 @@ struct UdpEvidence {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UdpStrategy { QuicV1, StunBinding }
+pub(crate) enum UdpStrategy { QuicV1, StunBinding(udp::BindingStrategy) }
 
 pub(crate) struct VerifiedUdp {
     pub(crate) socket: tokio::net::UdpSocket,
@@ -67,7 +67,7 @@ impl VerifiedUdp {
     pub(crate) fn admissible(&self) -> Result<bool, ClientError> {
         self.check_policy()?;
         Ok(self.engine.enabled()
-            && (self.strategy != UdpStrategy::StunBinding || self.engine.stun_enabled())
+            && (!matches!(self.strategy, UdpStrategy::StunBinding(_)) || self.engine.stun_enabled())
             && network_scope::observe(self.key.address) == Some(self.key.network)
             && self.socket.local_addr().is_ok_and(|local| self.key.network.matches_local(local))
             && self.engine.cached_udp(&self.key) == Some(true))
@@ -228,21 +228,27 @@ impl Engine {
                     || network_scope::observe(address) != Some(network) { continue; }
                 if self.cached_udp(&key) == Some(false) { continue; }
                 let _permit = self.probes.try_acquire().ok()?;
-                let good = timeout(ATTEMPT, async {
-                    let socket = scoped_udp(address, network).await?;
+                let mut selected = None;
+                for strategy in [udp::BindingStrategy::Fingerprint, udp::BindingStrategy::Plain] {
+                    let good = timeout(Duration::from_millis(1200), async {
+                        let socket = scoped_udp(address, network).await?;
+                        if !self.stun_enabled() || !self.policy_current(policy)
+                            || network_scope::observe(address) != Some(network) { return None; }
+                        udp::probe_stun(&socket, strategy).await
+                    }).await.ok().flatten().is_some();
                     if !self.stun_enabled() || !self.policy_current(policy)
-                        || network_scope::observe(address) != Some(network) { return None; }
-                    udp::probe_stun(&socket).await
-                }).await.ok().flatten().is_some();
+                        || network_scope::observe(address) != Some(network) { break; }
+                    crate::traffic::udp_stun_probe(good);
+                    if good { selected = Some(strategy); break; }
+                }
                 if !self.stun_enabled() || !self.policy_current(policy)
                     || network_scope::observe(address) != Some(network) { continue; }
-                crate::traffic::udp_stun_probe(good);
-                self.remember_udp(key.clone(), good);
-                if !good { continue; }
+                self.remember_udp(key.clone(), selected.is_some());
+                let Some(strategy) = selected else { continue; };
                 if let Some(socket) = scoped_udp(address, network).await {
                     if self.stun_enabled() && self.policy_current(policy)
                         && network_scope::observe(address) == Some(network) {
-                        return Some(VerifiedUdp { socket, strategy: UdpStrategy::StunBinding, engine: self.clone(), key });
+                        return Some(VerifiedUdp { socket, strategy: UdpStrategy::StunBinding(strategy), engine: self.clone(), key });
                     }
                 }
             }

@@ -156,7 +156,7 @@ pub enum StatusReply {
         fallback: bool,
         routing_revision: u64,
         routing_state: u8,
-        routing_totals: [u64; 37],
+        routing_totals: [u64; 38],
     },
     ClientReady {
         revision: u64,
@@ -1276,7 +1276,7 @@ where
                     return None;
                 }
                 let mut counters = fields.next()?.strip_prefix("rt=")?.split(',');
-                let mut routing_totals = [0; 37];
+                let mut routing_totals = [0; 38];
                 for counter in &mut routing_totals {
                     *counter = unsigned(counters.next()?)?;
                 }
@@ -1928,7 +1928,7 @@ mod strict_wire_matrix_tests {
             (4, 3, 1, false),
         ] {
             let response = format!(
-                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={} rr=2 rs=1 rt=10,20,30,40,5,1,2,6,7,8,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37\n",
+                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={} rr=2 rs=1 rt=10,20,30,40,5,1,2,6,7,8,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38\n",
                 u8::from(f)
             );
             assert_eq!(
@@ -1943,7 +1943,7 @@ mod strict_wire_matrix_tests {
                     routing_revision: 2,
                     routing_state: 1,
                     routing_totals: [
-                        10, 20, 30, 40, 5, 1, 2, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37
+                        10, 20, 30, 40, 5, 1, 2, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38
                     ],
                 })
             );

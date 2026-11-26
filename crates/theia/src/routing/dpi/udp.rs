@@ -83,9 +83,9 @@ fn binding_success(data: &[u8]) -> Option<Stun> {
         let end = 4 + ((len + 3) & !3);
         let value = &rest[4..4+len];
         match kind {
-            0x0020 if !mapped && matches!(value, [0, 1, ..] if len == 8)
-                || kind == 0x0020 && !mapped && matches!(value, [0, 2, ..] if len == 20) => {
-                if u16::from_be_bytes(value[2..4].try_into().ok()?) ^ 0x2112 == 0 { return None; }
+            0x0020 if !mapped && ((len == 8 && value.starts_with(&[0, 1]))
+                || (len == 20 && value.starts_with(&[0, 2]))) => {
+                if (u16::from_be_bytes(value[2..4].try_into().ok()?) ^ 0x2112) == 0 { return None; }
                 mapped = true;
             }
             0x8028 if len == 4 && end == rest.len() && fingerprint(data) => {},
@@ -100,16 +100,40 @@ fn binding_success(data: &[u8]) -> Option<Stun> {
     mapped.then_some(message)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindingStrategy { Fingerprint, Plain }
+
+/// RFC 8489 optional FINGERPRINT on an otherwise unprotected Binding request.
+/// Existing attributes, transaction ID, and already-present FINGERPRINT are
+/// preserved. No MESSAGE-INTEGRITY, TURN or ICE messages can enter this path.
+pub(crate) fn prepare_binding(data: &[u8], strategy: BindingStrategy) -> Option<std::borrow::Cow<'_, [u8]>> {
+    plain_binding(data)?;
+    if strategy == BindingStrategy::Plain || fingerprint(data) {
+        return Some(std::borrow::Cow::Borrowed(data));
+    }
+    let len = u16::try_from(data.len().checked_sub(20)?.checked_add(8)?).ok()?;
+    if usize::from(len) + 20 > 512 { return None; }
+    let mut result = Vec::with_capacity(data.len() + 8);
+    result.extend_from_slice(data);
+    result[2..4].copy_from_slice(&len.to_be_bytes());
+    let mut crc = flate2::Crc::new();
+    crc.update(&result);
+    result.extend([0x80, 0x28, 0, 4]);
+    result.extend((crc.sum() ^ 0x5354554e).to_be_bytes());
+    Some(std::borrow::Cow::Owned(result))
+}
+
 /// One independent CSPRNG Binding request to the connected peer. This is
 /// reachability evidence only; no STUN MESSAGE-INTEGRITY key is available.
-pub(super) async fn probe_stun(socket: &tokio::net::UdpSocket) -> Option<()> {
+pub(super) async fn probe_stun(socket: &tokio::net::UdpSocket, strategy: BindingStrategy) -> Option<()> {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut request = [0u8; 20];
     request[1] = 1;
     request[4..8].copy_from_slice(&COOKIE);
     SystemRandom::new().fill(&mut request[8..]).ok()?;
     let expected = plain_binding(&request)?;
-    crate::udp_relay::send_datagram(socket, &request).await.ok()?;
+    let packet = prepare_binding(&request, strategy)?;
+    crate::udp_relay::send_datagram(socket, &packet).await.ok()?;
     let mut response = [0; 513];
     // The caller imposes the absolute time budget. Also bound invalid input.
     for _ in 0..8 {
@@ -394,6 +418,22 @@ mod tests {
     }
 
     #[test]
+    fn optional_fingerprint_preserves_transaction_and_is_idempotent() {
+        let mut request = vec![0, 1, 0, 0];
+        request.extend(COOKIE);
+        request.extend([7; 12]);
+        let packet = prepare_binding(&request, BindingStrategy::Fingerprint).unwrap();
+        assert_eq!(packet.len(), request.len() + 8);
+        assert_eq!(plain_binding(&packet), plain_binding(&request));
+        assert!(fingerprint(&packet));
+        assert!(matches!(prepare_binding(&packet, BindingStrategy::Fingerprint), Some(std::borrow::Cow::Borrowed(_))));
+        assert_eq!(prepare_binding(&request, BindingStrategy::Plain).unwrap().as_ref(), request.as_slice());
+        let mut bad = packet.into_owned();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(prepare_binding(&bad, BindingStrategy::Fingerprint).is_none());
+    }
+
+    #[test]
     fn binding_admission_rejects_credentials_and_unmatched_responses() {
         let mut request = vec![0, 1, 0, 0];
         request.extend(COOKIE);
@@ -422,6 +462,7 @@ mod tests {
         let server = async {
             let mut buf = [0; 512];
             let (n, peer) = target.recv_from(&mut buf).await.unwrap();
+            assert!(fingerprint(&buf[..n]));
             let response = binding_response(&buf[..n]);
             let mut wrong = response.clone();
             wrong[19] ^= 1;
@@ -432,7 +473,7 @@ mod tests {
             target.send_to(&response, peer).await.unwrap();
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(probe_stun(&socket), server)
+            tokio::join!(probe_stun(&socket, BindingStrategy::Fingerprint), server)
         }).await.unwrap();
         assert!(result.is_some());
     }

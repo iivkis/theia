@@ -1329,7 +1329,7 @@ impl Editor {
             return Err("Требуется клиентская конфигурация.");
         };
         doc.client.proxy.direct_dpi = Some(enable);
-        doc.client.proxy.direct_dpi_stun = Some(enable);
+        if !enable { doc.client.proxy.direct_dpi_stun = Some(false); }
         candidate
             .validate()
             .map_err(|_| "Настройки клиента не прошли проверку.")?;
@@ -1344,9 +1344,32 @@ impl Editor {
                 "Отключить Anti-DPI"
             },
             body: if enable {
-                "Разрешить локальный Anti-DPI для этого файла клиента?\n\nДля правил direct_dpi возможен прямой выход и независимая TLS/QUIC-проверка назначения, а также экспериментальный STUN Binding без учётных данных (сервер STUN увидит IP; ответ не удостоверяет его личность). Сайт увидит IP вашего устройства. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
+                "Разрешить локальный Anti-DPI для этого файла клиента?\n\nДля правил direct_dpi возможен прямой выход и независимая TLS/QUIC-проверка назначения: сайт увидит IP вашего устройства. STUN разрешается отдельно. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
             } else {
                 "Отключить локальный Anti-DPI?\nПравила direct_dpi будут использовать VPS после перезапуска клиента. Текущие соединения не изменятся.\n\ny: отключить · n/Esc: отменить".into()
+            },
+        })
+    }
+
+    pub(crate) fn review_direct_dpi_stun_permission(&self) -> Result<RecordReview, &'static str> {
+        self.require_clean_records()?;
+        if self.write_uncertain { return Err("Откройте настройки заново."); }
+        if !self.direct_dpi_allowed() { return Err("Сначала разрешите и сохраните Anti-DPI."); }
+        let enable = !self.direct_dpi_stun_allowed();
+        let mut candidate = self.original.clone();
+        let Config::Client(doc) = &mut candidate else { return Err("Требуется клиентская конфигурация."); };
+        doc.client.proxy.direct_dpi_stun = Some(enable);
+        candidate.validate().map_err(|_| "Настройки клиента не прошли проверку.")?;
+        Ok(RecordReview {
+            source: self.saved_sha256(),
+            selected: self.selected_record_id().to_owned(),
+            candidate,
+            next_selection: self.selected_record,
+            confirmation_label: if enable { "Разрешить STUN" } else { "Отключить STUN" },
+            body: if enable {
+                "Разрешить экспериментальный локальный STUN Binding?\n\nТолько direct_dpi, публичный домен и UDP/3478. Сервер STUN увидит IP устройства. Независимый ответ подтверждает доступность, но не удостоверяет сервер. Возможен дополнительный FINGERPRINT без изменения защищённых полей. ICE/TURN и прочий UDP остаются через VPS.\nСохраните настройки и перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
+            } else {
+                "Отключить локальный STUN? После сохранения и перезапуска новые STUN direct_dpi будут идти через VPS.\n\ny: отключить · n/Esc: отменить".into()
             },
         })
     }
