@@ -782,6 +782,7 @@ struct Wizard {
     focus: usize,
     advanced: bool,
     sources: bool,
+    catalogue: bool,
     custom_enabled: bool,
     ranges_enabled: bool,
     dns_details: bool,
@@ -812,7 +813,7 @@ impl Wizard {
                 "443".into(),
                 String::new(),
                 String::new(),
-                "catalog".into(),
+                String::new(),
                 String::new(),
                 "auto".into(),
                 String::new(),
@@ -820,6 +821,7 @@ impl Wizard {
             focus: 2,
             advanced: false,
             sources: false,
+            catalogue: true,
             custom_enabled: false,
             ranges_enabled: false,
             dns_details: false,
@@ -856,7 +858,7 @@ impl Wizard {
                 "443".into(),
                 String::new(),
                 String::new(),
-                "catalog".into(),
+                String::new(),
                 String::new(),
                 "auto".into(),
                 String::new(),
@@ -864,6 +866,7 @@ impl Wizard {
             focus: 2,
             advanced: false,
             sources: false,
+            catalogue: true,
             custom_enabled: false,
             ranges_enabled: false,
             dns_details: false,
@@ -890,23 +893,20 @@ impl Wizard {
     }
 
     fn catalogue_enabled(&self) -> bool {
-        self.fields[4].split(',').any(|item| item.trim() == "catalog")
+        self.catalogue
     }
 
     fn custom_domains(&self) -> String {
-        self.fields[4].split(',').filter(|item| item.trim() != "catalog").collect::<Vec<_>>().join(",")
-    }
-
-    fn set_custom_domains(&mut self, custom: String, catalogue: bool) {
-        self.fields[4] = if catalogue {
-            if custom.is_empty() { "catalog".into() } else { format!("catalog,{custom}") }
-        } else { custom };
+        self.fields[4].clone()
     }
 
     fn effective_fields(&self) -> [String; 8] {
         let mut fields = self.fields.clone();
         if !self.custom_enabled {
-            fields[4] = if self.catalogue_enabled() { "catalog".into() } else { String::new() };
+            fields[4].clear();
+        }
+        if self.catalogue {
+            fields[4] = if fields[4].is_empty() { "catalog".into() } else { format!("catalog,{}", fields[4]) };
         }
         if !self.ranges_enabled {
             fields[7].clear();
@@ -942,12 +942,8 @@ impl Wizard {
     }
 
     fn put_value(&mut self, value: String) {
-        if self.focus == 4 {
-            self.set_custom_domains(value, self.catalogue_enabled());
-        } else {
-            if self.focus == 3 { self.suggested_ip = None; }
-            self.fields[self.focus] = value;
-        }
+        if self.focus == 3 { self.suggested_ip = None; }
+        self.fields[self.focus] = value;
         self.error.clear();
     }
 
@@ -964,6 +960,9 @@ impl Wizard {
         let fields = self.effective_fields();
         if self.custom_enabled && self.custom_domains().trim().is_empty() {
             return Some((4, "Введите хотя бы одно имя сайта или выключите этот источник."));
+        }
+        if self.custom_enabled && self.fields[4].split(',').any(|v| v.trim() == "catalog") {
+            return Some((4, "Введите настоящее имя сайта. Готовый каталог включается отдельным переключателем."));
         }
         if self.ranges_enabled && fields[7].trim().is_empty() {
             return Some((7, "Введите разрешённый диапазон или выключите этот источник."));
@@ -1043,6 +1042,9 @@ impl Wizard {
                 },
             ));
         }
+        if self.source.is_some() && self.available_users.is_empty() {
+            return Some((5, "Нет активных пользователей. Вернитесь к списку пользователей и создайте или восстановите доступ."));
+        }
         if self.source.is_none() && !config::valid_id(&self.fields[5]) {
             return Some((5,"Имя первого пользователя должно быть одним допустимым ID, например phone или laptop."));
         }
@@ -1068,7 +1070,7 @@ impl Wizard {
     }
     fn toggle_source(&mut self) {
         match self.focus {
-            8 => self.set_custom_domains(self.custom_domains(), !self.catalogue_enabled()),
+            8 => self.catalogue = !self.catalogue,
             9 => self.custom_enabled = !self.custom_enabled,
             10 => self.ranges_enabled = !self.ranges_enabled,
             _ => return,
@@ -2066,6 +2068,15 @@ mod tests {
         wizard.paste("example.org");
         assert_eq!(wizard.custom_domains(), "example.org");
         assert!(wizard.catalogue_enabled());
+        wizard.focus = 8;
+        wizard.key(press(KeyCode::Char(' ')));
+        wizard.focus = 4;
+        wizard.fields[4] = "catalog".into();
+        assert!(!wizard.catalogue_enabled());
+        assert_eq!(wizard.source_error().map(|(field, _)| field), Some(4));
+        wizard.fields[4] = "example.org".into();
+        wizard.focus = 8;
+        wizard.key(press(KeyCode::Char(' ')));
         wizard.focus = 9;
         wizard.key(press(KeyCode::Char(' ')));
         assert!(!wizard.visible_fields().contains(&4));
@@ -2239,6 +2250,7 @@ mod tests {
         wizard.fields[3] = "127.0.0.1".into();
         wizard.fields[4] = "first.example.org=93.184.216.2,second.example.org=93.184.216.3".into();
         wizard.custom_enabled = true;
+        wizard.catalogue = false;
         wizard.fields[5] = "device-a".into();
         let input =
             WizardInput::parse(path.clone(), Some(editor.saved_sha256()), &wizard.fields).unwrap();

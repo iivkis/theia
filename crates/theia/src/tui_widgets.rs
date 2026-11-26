@@ -1016,6 +1016,33 @@ mod tests {
     }
 
     #[test]
+    fn source_choice_rows_are_not_text_inputs_and_examples_are_visible() {
+        let area = Rect::new(0, 0, 108, 22);
+        let form = Form {
+            fields: vec![
+                Field { id: 8, label: "[x] Готовый каталог сайтов", value: "71 домен".into(), hint: "Пробел — выключить." },
+                Field { id: 9, label: "[ ] Добавить свои сайты", value: "Необязательно".into(), hint: "Пробел — включить." },
+                Field { id: 4, label: "Свои сайты", value: String::new(), hint: "Пример: example.org · Имена через запятую." },
+                Field { id: 5, label: "› Пользователи с доступом", value: "Никто не выбран".into(), hint: "Пробел — открыть список." },
+            ],
+            selected: 8,
+            lead: String::new(),
+            error: String::new(),
+        };
+        let geometry = form.geometry(area);
+        assert!(geometry.help.height < geometry.rows.height);
+        assert_eq!(form.hit(area, geometry.rows.x, geometry.rows.y), Some(8));
+        let mut terminal = Terminal::new(TestBackend::new(108, 22)).unwrap();
+        terminal.draw(|frame| form.render(frame, area, "")).unwrap();
+        let screen = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
+        assert!(screen.contains("☑"));
+        assert!(screen.contains("☐"));
+        assert!(screen.contains("example.org"));
+        assert!(screen.contains("› Пользователи с доступом"));
+        assert!(!screen.contains("▏"));
+    }
+
+    #[test]
     fn controls_keep_focus_and_hit_regions_in_sync() {
         let form = Form {
             fields: (0..7)
