@@ -41,6 +41,20 @@ impl NetworkScope {
         })
     }
 
+    /// A wildcard authorizes only the concrete unicast destination supplied
+    /// by the kernel on receive. It never authorizes an unspecified source.
+    pub(crate) fn listener(bind: IpAddr) -> Option<Self> {
+        if bind.is_unspecified() {
+            Some(Self { pins: None, server: Some(bind) })
+        } else {
+            Self::external_server(bind)
+        }
+    }
+
+    pub(crate) fn allows_bind(self, ip: IpAddr) -> bool {
+        self.server == Some(ip) || self.allows_local(ip)
+    }
+
     pub(crate) fn is_external_server(self) -> bool {
         self.server.is_some()
     }
@@ -51,7 +65,11 @@ impl NetworkScope {
 
     pub(crate) fn allows_local(self, ip: IpAddr) -> bool {
         if let Some(local) = self.server {
-            return ip == local;
+            return if local.is_unspecified() {
+                unicast(ip) && ip.is_ipv4() == local.is_ipv4()
+            } else {
+                ip == local
+            };
         }
         self.pins
             .map_or_else(|| ip.is_loopback(), |(local, _)| local.contains(&ip))
@@ -104,6 +122,21 @@ mod tests {
             "198.51.100.10:2000".parse().unwrap()
         ));
         assert!(NetworkScope::external_server("0.0.0.0".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn wildcard_requires_concrete_same_family_destination() {
+        for (bind, local, peer) in [
+            ("0.0.0.0:443", "127.0.0.2:443", "127.0.0.1:1234"),
+            ("[::]:443", "[::1]:443", "[::1]:1234"),
+        ] {
+            let bind: SocketAddr = bind.parse().unwrap();
+            let scope = NetworkScope::listener(bind.ip()).unwrap();
+            assert!(scope.allows_bind(bind.ip()));
+            assert!(!scope.allows_local(bind.ip()));
+            assert!(scope.permits(local.parse().unwrap(), peer.parse().unwrap()));
+            assert!(!scope.permits(bind, peer.parse().unwrap()));
+        }
     }
 
     #[test]

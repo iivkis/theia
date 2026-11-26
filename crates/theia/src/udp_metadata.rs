@@ -744,7 +744,10 @@ mod tests {
     #[tokio::test]
     async fn wildcard_reply_preserves_destination_on_both_families() {
         for (bind, target, client) in [
+            #[cfg(target_os = "linux")]
             ("0.0.0.0:0", "127.0.0.2:0", "127.0.0.1:0"),
+            #[cfg(target_os = "windows")]
+            ("0.0.0.0:0", "127.0.0.1:0", "127.0.0.1:0"),
             ("[::]:0", "[::1]:0", "[::1]:0"),
         ] {
             let server = UdpSocket::bind(bind).await.unwrap();

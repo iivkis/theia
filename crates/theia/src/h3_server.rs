@@ -32,13 +32,11 @@ impl<S: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static
 {
 }
 
-/// Prepared own-TLS material for both the migrated concrete-address listener
-/// and the remaining wildcard compatibility path. No keys are re-read on
-/// same-port rotation or rollback.
+/// Prepared own-TLS material for the native listener. No keys are re-read
+/// on same-port rotation or rollback.
 #[derive(Clone)]
 pub(crate) struct OwnTlsConfig {
     native: Arc<rustls::ServerConfig>,
-    legacy: quinn::ServerConfig,
 }
 
 impl OwnTlsConfig {
@@ -46,14 +44,12 @@ impl OwnTlsConfig {
         certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
         key: rustls::pki_types::PrivateKeyDer<'static>,
     ) -> Result<Self, crate::quic_transport::QuicError> {
-        let legacy = quic_transport::server_config(certificates.clone(), key.clone_key())?;
         let mut native = crate::transport_policy::Carrier::H3
             .server_tls(certificates, key)
             .map_err(|_| crate::quic_transport::QuicError::Configuration)?;
         native.send_tls13_tickets = 0;
         Ok(Self {
             native: Arc::new(native),
-            legacy,
         })
     }
 }
@@ -68,9 +64,6 @@ pub(crate) enum OwnTlsEndpoint {
         scope: crate::quic_core::scope::NetworkScope,
         local: SocketAddr,
     },
-    // Wildcard destination/source ancillary metadata is not yet implemented
-    // by the native socket layer. Do not silently change a wildcard bind.
-    Wildcard(quinn::Endpoint),
 }
 
 impl OwnTlsEndpoint {
@@ -79,11 +72,7 @@ impl OwnTlsEndpoint {
         tls: OwnTlsConfig,
     ) -> Result<Self, crate::quic_transport::QuicError> {
         use crate::quic_transport::QuicError;
-        if bind.ip().is_unspecified() {
-            return quic_transport::server_endpoint_with_config(bind, tls.legacy)
-                .map(Self::Wildcard);
-        }
-        let scope = crate::quic_core::scope::NetworkScope::external_server(bind.ip())
+        let scope = crate::quic_core::scope::NetworkScope::listener(bind.ip())
             .ok_or(QuicError::Configuration)?;
         let socket = std::net::UdpSocket::bind(bind).map_err(|_| QuicError::Bind)?;
         socket.set_nonblocking(true).map_err(|_| QuicError::Bind)?;
@@ -104,7 +93,6 @@ impl OwnTlsEndpoint {
                 // keep the exact immutable configuration they selected.
                 *config.write().unwrap_or_else(|e| e.into_inner()) = tls.native;
             }
-            Self::Wildcard(endpoint) => endpoint.set_server_config(Some(tls.legacy)),
         }
     }
 
@@ -122,7 +110,6 @@ impl OwnTlsEndpoint {
         mut phase: watch::Receiver<GenerationPhase>,
     ) -> Result<(), ServerError> {
         match self {
-            Self::Wildcard(endpoint) => serve_generation(endpoint, context, phase).await,
             Self::Native { socket, config, scope, local } => {
                 if !server::await_generation_activation(&mut phase).await {
                     return Ok(());
@@ -141,10 +128,6 @@ impl OwnTlsEndpoint {
         }
     }
 
-    #[cfg(test)]
-    fn is_native(&self) -> bool {
-        matches!(self, Self::Native { .. })
-    }
 }
 
 async fn serve_native_generation(
@@ -212,8 +195,7 @@ mod endpoint_tests {
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let config = OwnTlsConfig::new(vec![cert.cert.der().clone()], key.into()).unwrap();
         let endpoint = OwnTlsEndpoint::bind("127.0.0.1:0".parse().unwrap(), config.clone()).unwrap();
-        assert!(endpoint.is_native());
-        let OwnTlsEndpoint::Native { local, socket, .. } = &endpoint else { unreachable!() };
+        let OwnTlsEndpoint::Native { local, socket, .. } = &endpoint;
         let address = *local;
         assert!(std::net::UdpSocket::bind(address).is_err());
         endpoint.set_server_config(config);
