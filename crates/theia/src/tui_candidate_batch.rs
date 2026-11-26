@@ -309,10 +309,23 @@ impl CandidateBatchPanel {
     }
     pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
-        if !matches!(self.state, BatchState::Complete(Ok(_))) { return Vec::new(); }
-        vec![ActionItem { key: 'a', label: "Подробности результата" },
-            ActionItem { key: 'k', label: "Предыдущий результат" },
-            ActionItem { key: 'j', label: "Следующий результат" }]
+        if !matches!(self.state, BatchState::Complete(Ok(_))) {
+            return Vec::new();
+        }
+        vec![
+            ActionItem {
+                key: 'a',
+                label: "Подробности результата",
+            },
+            ActionItem {
+                key: 'k',
+                label: "Предыдущий результат",
+            },
+            ActionItem {
+                key: 'j',
+                label: "Следующий результат",
+            },
+        ]
     }
 
     pub(crate) fn body(&self) -> String {

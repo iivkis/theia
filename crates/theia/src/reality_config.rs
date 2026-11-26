@@ -648,22 +648,38 @@ fn status_saved_document(path: &Path, expected: [u8; 32]) -> Result<Config, Erro
     if actual != expected {
         return Err(Error::Approval);
     }
-    config::parse(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
-        .map_err(|_| Error::Format)
+    config::parse(std::str::from_utf8(&raw).map_err(|_| Error::Format)?).map_err(|_| Error::Format)
 }
 
 /// Human-facing status; the diagnostic CLI report remains unchanged.
 pub(crate) fn client_status_expected(
-    path: &Path, expected: [u8; 32], id: &str, now: u64,
+    path: &Path,
+    expected: [u8; 32],
+    id: &str,
+    now: u64,
 ) -> Result<String, Error> {
     let Config::Client(doc) = status_saved_document(path, expected)? else {
         return Err(Error::Format);
     };
-    let profile = doc.client.profiles.iter().find(|p| p.id == id).ok_or(Error::Scope)?;
+    let profile = doc
+        .client
+        .profiles
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or(Error::Scope)?;
     let enrollment = pinned_client(profile)?;
-    let value = enrollment.store()?.inspect(now).map_err(|_| Error::Descriptor)?;
+    let value = enrollment
+        .store()?
+        .inspect(now)
+        .map_err(|_| Error::Descriptor)?;
     let modes = value.effective_modes();
-    let yes = |v| if v { "доступен" } else { "недоступен" };
+    let yes = |v| {
+        if v {
+            "доступен"
+        } else {
+            "недоступен"
+        }
+    };
     let valid = value.check_time(now).is_ok();
     Ok(format!(
         "Сервер: {}\nЗащита: REALITY\nПрофиль выбран для запуска: {}\nРежим передачи: автоматически\nОписание сервера: версия {} · {}\nПоддержка: H2 {}, H3 {}\nРежимы XHTTP: stream-one {}, stream-up {}\n{}\nСвязь с сервером пока не проверена этим экраном.",
@@ -1111,7 +1127,9 @@ fn status_document(document: &Config, id: &str, now: u64) -> Result<(String, Str
             };
             let valid = value.check_time(now).is_ok();
             let checked = state.last_checked_at();
-            let next = state.next_active_check_at(signed, now).map_err(|_| Error::Health)?;
+            let next = state
+                .next_active_check_at(signed, now)
+                .map_err(|_| Error::Health)?;
             let brief = format!("Сервер: {}\nЗащита: REALITY\nОсновной референс: {} · {health_text}\nРезерв: {}\nОписание сервера: версия {} · {}\nПоследняя проверка: {} сек. назад · следующая {}\n{}",
                 scope.endpoint, signed.references[usize::from(signed.active_reference)].server_name,
                 if reserve.is_some() { "есть подходящий кандидат" } else { "нет подходящего кандидата" },
@@ -1258,7 +1276,9 @@ mod tests {
         let status = registered_status(&path, "reality-edge", 1000).unwrap();
         let saved_digest: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
         assert_eq!(
-            status_expected(&path, saved_digest, "reality-edge", 1000).unwrap().1,
+            status_expected(&path, saved_digest, "reality-edge", 1000)
+                .unwrap()
+                .1,
             status
         );
         assert_eq!(
@@ -1527,10 +1547,16 @@ mod tests {
         let user = server.server.users[0].id.clone();
         server.server.users[0].disabled = false;
         server.server.inbounds[0].allowed_user_ids = vec![user.clone()];
-        let issued =
-            bootstrap::Invitation::issued(&identity, &signed, &server, &user, &token,
-                &Secret::load(&scope, &admission).unwrap(), 1000)
-                .unwrap();
+        let issued = bootstrap::Invitation::issued(
+            &identity,
+            &signed,
+            &server,
+            &user,
+            &token,
+            &Secret::load(&scope, &admission).unwrap(),
+            1000,
+        )
+        .unwrap();
         // Credential-only refresh must not silently ignore a different
         // admission key, even with the exact same signer, scope and bearer.
         let different = Secret::generate().unwrap();

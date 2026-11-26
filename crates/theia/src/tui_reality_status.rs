@@ -14,7 +14,10 @@ use std::{
 
 enum Update {
     Report(String),
-    Observation { brief: String, details: Option<String> },
+    Observation {
+        brief: String,
+        details: Option<String>,
+    },
     Review(RotationReview),
     Trust(TrustReview),
     Expiry(ExpiryReview),
@@ -119,7 +122,8 @@ impl StatusPanel {
                 let mut details = None;
                 let mut report = if reality {
                     if server {
-                        let (brief, technical) = reality_config::status_expected(&path, digest, &id, now)?;
+                        let (brief, technical) =
+                            reality_config::status_expected(&path, digest, &id, now)?;
                         details = Some(technical);
                         brief
                     } else {
@@ -173,7 +177,10 @@ impl StatusPanel {
                     };
                     report.push_str("\n\n");
                     report.push_str(&live);
-                    if let Some(detail) = details.as_mut() { detail.push_str("\n\n"); detail.push_str(&technical); }
+                    if let Some(detail) = details.as_mut() {
+                        detail.push_str("\n\n");
+                        detail.push_str(&technical);
+                    }
                 } else {
                     use crate::management::{StatusCommand, StatusReply};
                     let response = tokio::runtime::Builder::new_current_thread()
@@ -196,7 +203,10 @@ impl StatusPanel {
                     report.push_str("\n\n");
                     report.push_str(&live);
                 }
-                Ok(Update::Observation { brief: report, details })
+                Ok(Update::Observation {
+                    brief: report,
+                    details,
+                })
             })();
             let _ = tx.send(result);
         });
@@ -396,7 +406,8 @@ impl StatusPanel {
         let (stop, rx) = tokio::sync::oneshot::channel();
         let (tx, done) = mpsc::channel();
         let report = std::sync::Arc::new(std::sync::Mutex::new(
-            "Проверяем доверие к серверу, ключ доступа и доступность двух локальных портов...".into(),
+            "Проверяем доверие к серверу, ключ доступа и доступность двух локальных портов..."
+                .into(),
         ));
         let monitor = report.clone();
         self.client_run = Some(ClientRun {
@@ -435,14 +446,31 @@ impl StatusPanel {
     }
 
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
-        if self.reopen_required || self.pending.is_some() || self.committing { return None; }
-        if self.credential_review.is_some() { return Some(('y', "Сохранить ключ")); }
-        if self.headless_review.is_some() { return Some(('y', "Применить")); }
-        if self.trust_review.is_some() { return Some(('y', "Подтвердить доверие")); }
-        if let Some(start) = self.client_confirm {
-            return Some(('y', if start { "Запустить" } else { "Остановить" }));
+        if self.reopen_required || self.pending.is_some() || self.committing {
+            return None;
         }
-        if self.expiry_review.is_some() || self.review.is_some() { return Some(('y', "Подтвердить запись")); }
+        if self.credential_review.is_some() {
+            return Some(('y', "Сохранить ключ"));
+        }
+        if self.headless_review.is_some() {
+            return Some(('y', "Применить"));
+        }
+        if self.trust_review.is_some() {
+            return Some(('y', "Подтвердить доверие"));
+        }
+        if let Some(start) = self.client_confirm {
+            return Some((
+                'y',
+                if start {
+                    "Запустить"
+                } else {
+                    "Остановить"
+                },
+            ));
+        }
+        if self.expiry_review.is_some() || self.review.is_some() {
+            return Some(('y', "Подтвердить запись"));
+        }
         None
     }
 
@@ -463,7 +491,10 @@ impl StatusPanel {
             return Vec::new();
         }
         if self.show_details && self.details.is_some() {
-            return vec![ActionItem { key: 'd', label: "К краткому состоянию" }];
+            return vec![ActionItem {
+                key: 'd',
+                label: "К краткому состоянию",
+            }];
         }
         if let Some(run) = &self.client_run {
             return if run.stop.is_some() {
@@ -522,7 +553,10 @@ impl StatusPanel {
             ]);
         }
         if self.details.is_some() {
-            items.push(ActionItem { key: 'd', label: "Технические подробности" });
+            items.push(ActionItem {
+                key: 'd',
+                label: "Технические подробности",
+            });
         }
         items
     }
@@ -546,7 +580,9 @@ impl StatusPanel {
 
     pub(crate) fn summary(&self) -> String {
         if self.show_details {
-            if let Some(details) = &self.details { return details.clone(); }
+            if let Some(details) = &self.details {
+                return details.clone();
+            }
         }
         if let Some(run) = &self.client_run {
             let status = run
@@ -793,31 +829,34 @@ impl StatusPanel {
         self.committing = false;
         self.details = None;
         self.show_details = false;
-        match result{
-            Ok(Update::Report(report))=>self.report=report,
-            Ok(Update::Observation { brief, details })=>{
-                self.report=brief;
-                self.details=details;
-            },
-            Ok(Update::Review(review))=>self.review=Some(review),
-            Ok(Update::Trust(review))=>self.trust_review=Some(review),
-            Ok(Update::Expiry(review))=>self.expiry_review=Some(review),
-            Ok(Update::HeadlessReview(revision))=>self.headless_review=Some(revision),
-            Ok(Update::CredentialReview(source, approval, revision))=>self.credential_review=Some((source, approval, revision)),
-            Ok(Update::CredentialSaved(editor))=>{
-                self.digest=editor.saved_sha256();
-                self.client_active=editor.selected_record_is_active();
-                self.refreshed_editor=Some(*editor);
+        match result {
+            Ok(Update::Report(report)) => self.report = report,
+            Ok(Update::Observation { brief, details }) => {
+                self.report = brief;
+                self.details = details;
+            }
+            Ok(Update::Review(review)) => self.review = Some(review),
+            Ok(Update::Trust(review)) => self.trust_review = Some(review),
+            Ok(Update::Expiry(review)) => self.expiry_review = Some(review),
+            Ok(Update::HeadlessReview(revision)) => self.headless_review = Some(revision),
+            Ok(Update::CredentialReview(source, approval, revision)) => {
+                self.credential_review = Some((source, approval, revision))
+            }
+            Ok(Update::CredentialSaved(editor)) => {
+                self.digest = editor.saved_sha256();
+                self.client_active = editor.selected_record_is_active();
+                self.refreshed_editor = Some(*editor);
                 self.report="Ключ доступа сохранён, доверие к серверу не изменено. Для новых соединений отдельно примените настройки или запустите прокси.".into();
             }
-            Err(Error::Indeterminate)=>{
-                self.reopen_required=true;
+            Err(Error::Indeterminate) => {
+                self.reopen_required = true;
                 self.report="Запись могла состояться. Закройте экран и перечитайте конфигурацию с диска, не повторяйте операцию вслепую.".into();
             }
-            Err(error)=>self.report=if self.server {
-                format!("Операция не подтверждена: {error}\nПри неопределённой записи сначала перечитайте сохранённый и runtime статус. Не повторяйте вслепую.")
-            } else {
-                let reason = match error {
+            Err(error) => {
+                self.report = if self.server {
+                    format!("Операция не подтверждена: {error}\nПри неопределённой записи сначала перечитайте сохранённый и runtime статус. Не повторяйте вслепую.")
+                } else {
+                    let reason = match error {
                     Error::Format | Error::Scope => "Неверный формат настроек или выбран не тот профиль.",
                     Error::Approval => "Настройки или подтверждение доверия не совпадают. Откройте настройки заново.",
                     Error::Identity | Error::Descriptor => "Не удалось подтвердить доверие к серверу. Обратитесь к администратору.",
@@ -827,13 +866,16 @@ impl StatusPanel {
                     Error::Indeterminate => "Результат записи неизвестен. Проверьте настройки перед повтором.",
                     Error::Clock => "Проверьте дату и время устройства.",
                 };
-                format!("Операция не подтверждена. {reason}")
-            },
+                    format!("Операция не подтверждена. {reason}")
+                }
+            }
         }
     }
     pub(crate) fn body(&self) -> String {
         if self.show_details {
-            if let Some(details) = &self.details { return format!("{details}\n\nEsc: к краткому состоянию"); }
+            if let Some(details) = &self.details {
+                return format!("{details}\n\nEsc: к краткому состоянию");
+            }
         }
         if self.reopen_required {
             return format!("{}\nEsc: закрыть", self.report);

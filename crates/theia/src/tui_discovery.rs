@@ -149,10 +149,23 @@ impl DiscoveryPanel {
 
     pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
-        if !self.may_review_probe() { return Vec::new(); }
-        vec![ActionItem { key: 'i', label: "Узнать внешний IP" },
-            ActionItem { key: 'r', label: "Посмотреть области поиска" },
-            ActionItem { key: 't', label: "Проверить назначенный IP" }]
+        if !self.may_review_probe() {
+            return Vec::new();
+        }
+        vec![
+            ActionItem {
+                key: 'i',
+                label: "Узнать внешний IP",
+            },
+            ActionItem {
+                key: 'r',
+                label: "Посмотреть области поиска",
+            },
+            ActionItem {
+                key: 't',
+                label: "Проверить назначенный IP",
+            },
+        ]
     }
 
     pub(crate) fn body(&self) -> String {
@@ -233,7 +246,7 @@ mod tests {
         let body = p.body();
         assert!(matches!(p.phase, Phase::Passive));
         assert!(body.contains("Пассивный"));
-        assert!(body.contains("14"));
+        assert!(body.contains(&POPULAR_HTTPS_DOMAINS.len().to_string()));
         assert!(body.contains(DEFAULT_EGRESS_SERVICE_URL));
         assert!(body.contains("Запрос пока НЕ отправлялся."));
         assert!(!p.is_consent_pending());

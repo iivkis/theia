@@ -327,7 +327,10 @@ impl Invitation {
                 .bearer
                 .as_ref()
                 .map(|value| URL_SAFE_NO_PAD.encode(&value[..])),
-            admission: self.admission.as_ref().map(|value| URL_SAFE_NO_PAD.encode(&value[..])),
+            admission: self
+                .admission
+                .as_ref()
+                .map(|value| URL_SAFE_NO_PAD.encode(&value[..])),
         }
     }
 
@@ -538,8 +541,12 @@ impl Profile {
             .map_err(|_| Error::Descriptor)?;
         current.check_time(now).map_err(|_| Error::Descriptor)?;
         let invite = Invitation::decode(uri, now)?;
-        if !bool::from(invite.embedded_admission()?.commitment().ct_eq(&current_admission.commitment()))
-            || invite.scope != current.descriptor().scope
+        if !bool::from(
+            invite
+                .embedded_admission()?
+                .commitment()
+                .ct_eq(&current_admission.commitment()),
+        ) || invite.scope != current.descriptor().scope
             || invite.public != current.signer()
             || invite.revision != current.descriptor().revision
         {
@@ -1440,8 +1447,16 @@ mod tests {
             panic!()
         };
         let admission = crate::reality_admission::Secret::generate().unwrap();
-        let invite =
-            Invitation::issued(&identity, &raw, &server, "device-a", &credential, &admission, NOW).unwrap();
+        let invite = Invitation::issued(
+            &identity,
+            &raw,
+            &server,
+            "device-a",
+            &credential,
+            &admission,
+            NOW,
+        )
+        .unwrap();
         assert!(!invite
             .preview(NOW)
             .unwrap()
@@ -1464,7 +1479,10 @@ mod tests {
         )
         .unwrap();
         let loaded = Profile::read(&profile).unwrap();
-        assert_eq!(loaded.admission().unwrap().commitment(), admission.commitment());
+        assert_eq!(
+            loaded.admission().unwrap().commitment(),
+            admission.commitment()
+        );
         let path = loaded.credential_reference().strip_prefix("file:").unwrap();
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
@@ -1474,8 +1492,15 @@ mod tests {
             .unwrap()
             .contains(&URL_SAFE_NO_PAD.encode(credential)));
         server.server.users[0].disabled = true;
-        assert!(
-            Invitation::issued(&identity, &raw, &server, "device-a", &credential, &admission, NOW).is_err()
-        );
+        assert!(Invitation::issued(
+            &identity,
+            &raw,
+            &server,
+            "device-a",
+            &credential,
+            &admission,
+            NOW
+        )
+        .is_err());
     }
 }

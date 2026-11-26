@@ -2096,8 +2096,14 @@ mod selector_tests {
                 let current = managed.generation().await.unwrap();
                 let report = managed.runtime_report().await;
                 assert!(report.contains("Сохранённое доверие: совпадает"));
-                assert!(report.contains("последнее подтверждённое соединение: пока нет подтверждённого соединения"));
-                assert!(report.contains(if socks_mode { "Режим передачи: h3" } else { "Режим передачи: h2" }));
+                assert!(report.contains(
+                    "последнее подтверждённое соединение: пока нет подтверждённого соединения"
+                ));
+                assert!(report.contains(if socks_mode {
+                    "Режим передачи: h3"
+                } else {
+                    "Режим передачи: h2"
+                }));
                 managed_clients.push(managed.clone());
                 if let Carrier::H3(h3) = &current.carrier {
                     // Use the production dispatcher and a real OPEN_OK

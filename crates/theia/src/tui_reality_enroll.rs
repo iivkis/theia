@@ -306,7 +306,8 @@ impl EnrollmentPanel {
         } else {
             crate::parse_restart_digest(&self.fields[4]).ok_or(Error::Approval)?
         };
-        let token = (!access_key_only && !self.fields[5].is_empty()).then(|| self.fields[5].clone());
+        let token =
+            (!access_key_only && !self.fields[5].is_empty()).then(|| self.fields[5].clone());
         Ok(Input {
             source: if self.fields[0].starts_with("theia://") {
                 PathBuf::new()
@@ -369,8 +370,12 @@ impl EnrollmentPanel {
     }
 
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
-        if self.browser.is_some() { return None; }
-        if let Some(panel) = &self.registration { return panel.confirmation_choice(); }
+        if self.browser.is_some() {
+            return None;
+        }
+        if let Some(panel) = &self.registration {
+            return panel.confirmation_choice();
+        }
         matches!(self.stage, Stage::Confirm(_)).then_some(('y', "Доверять и сохранить"))
     }
 
@@ -540,7 +545,10 @@ impl EnrollmentPanel {
                     "Нет файла допуска. Попросите его у администратора и выберите через F6.".into(),
                 );
             }
-            KeyCode::Enter if !self.managed_paths() && crate::parse_restart_digest(&self.fields[4]).is_none() => {
+            KeyCode::Enter
+                if !self.managed_paths()
+                    && crate::parse_restart_digest(&self.fields[4]).is_none() =>
+            {
                 self.focus = 4;
                 self.error=Some("Отпечаток должен состоять из 64 шестнадцатеричных символов. Сверьте его с администратором отдельно от приглашения.".into());
             }
@@ -587,7 +595,14 @@ impl EnrollmentPanel {
             Ok(stage) => {
                 if self.managed_paths() {
                     if let Stage::Confirm(review) = &stage {
-                        self.fields[4] = Zeroizing::new(review.approval.identity_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                        self.fields[4] = Zeroizing::new(
+                            review
+                                .approval
+                                .identity_sha256
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>(),
+                        );
                     }
                 }
                 self.stage = stage;
@@ -650,12 +665,14 @@ impl EnrollmentPanel {
             fields: LABELS
                 .iter()
                 .enumerate()
-                .filter(|(id, _)| {
-                    !self.managed_paths() || *id == 0
-                })
+                .filter(|(id, _)| !self.managed_paths() || *id == 0)
                 .map(|(id, label)| Field {
                     id,
-                    label: if self.managed_paths() && id == 0 { "Ключ подключения" } else { label },
+                    label: if self.managed_paths() && id == 0 {
+                        "Ключ подключения"
+                    } else {
+                        label
+                    },
                     hint: hints[id],
                     value: if self.fields[id].is_empty() {
                         String::new()
@@ -772,16 +789,16 @@ impl EnrollmentPanel {
                     ));
                 }
                 if self.managed_paths() {
-                    out.push_str("\nВставьте ключ от администратора. Enter: проверить; Esc: отменить.\n");
+                    out.push_str(
+                        "\nВставьте ключ от администратора. Enter: проверить; Esc: отменить.\n",
+                    );
                 } else {
                     out.push_str("\nFingerprint введите из отдельного доверенного канала. Bearer: только env:/file: ссылка, не значение.\nEnter: предпросмотр; Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
                 }
                 out.push_str(self.error.as_deref().unwrap_or(""));
                 out
             }
-            Stage::Loading(_) => {
-                "Проверяем ключ без сети и записи. Esc — отменить.".into()
-            }
+            Stage::Loading(_) => "Проверяем ключ без сети и записи. Esc — отменить.".into(),
             Stage::Confirm(review) => {
                 if let Some(path) = &self.new_config {
                     format!("{}\n\nФайл настроек: {}\nПервый профиль будет выбран для подключения. Системный прокси останется выключенным.", review.body, path.display())
@@ -929,7 +946,8 @@ mod tests {
 
     #[test]
     fn managed_key_import_has_no_extra_input_fields() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("key-import-ui").unwrap());
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("key-import-ui").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("client.toml");
         let mut panel = EnrollmentPanel::first(path.clone()).unwrap();

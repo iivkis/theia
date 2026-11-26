@@ -188,8 +188,15 @@ impl Reader<'_> {
 }
 
 fn raw_key<const N: usize>(value: &str) -> Result<Zeroizing<[u8; N]>, InviteError> {
-    let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(value).map_err(|_| InviteError::Invalid)?);
-    let result: [u8; N] = bytes.as_slice().try_into().map_err(|_| InviteError::Invalid)?;
+    let bytes = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| InviteError::Invalid)?,
+    );
+    let result: [u8; N] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| InviteError::Invalid)?;
     if Zeroizing::new(URL_SAFE_NO_PAD.encode(result)).as_str() != value {
         return Err(InviteError::Invalid);
     }
@@ -208,8 +215,12 @@ fn put_descriptor(
     out.extend_from_slice(&d.not_before.to_be_bytes());
     out.extend_from_slice(&d.not_after.to_be_bytes());
     out.push(d.active_reference);
-    out.push(u8::from(d.h3) | (u8::from(d.stream_one) << 1) | (u8::from(d.stream_up) << 2)
-        | (u8::from(d.next_identity.is_some()) << 3));
+    out.push(
+        u8::from(d.h3)
+            | (u8::from(d.stream_one) << 1)
+            | (u8::from(d.stream_up) << 2)
+            | (u8::from(d.next_identity.is_some()) << 3),
+    );
     if let Some(next) = &d.next_identity {
         out.extend_from_slice(&raw_key::<32>(next)?[..]);
     }
@@ -231,9 +242,14 @@ fn put_descriptor(
     Ok(())
 }
 
-fn get_descriptor(r: &mut Reader<'_>) -> Result<(crate::descriptor::Descriptor, String), InviteError> {
+fn get_descriptor(
+    r: &mut Reader<'_>,
+) -> Result<(crate::descriptor::Descriptor, String), InviteError> {
     use crate::descriptor::{Descriptor, Padding, Reference, Rotation, Scope, SecurityMode};
-    let scope = Scope { inbound: r.text()?, endpoint: r.text()? };
+    let scope = Scope {
+        inbound: r.text()?,
+        endpoint: r.text()?,
+    };
     let path_prefix = r.text()?;
     let revision = r.u64()?;
     let not_before = r.u64()?;
@@ -249,12 +265,16 @@ fn get_descriptor(r: &mut Reader<'_>) -> Result<(crate::descriptor::Descriptor, 
         None
     };
     let padding = Padding {
-        header_min: r.u16()?, header_max: r.u16()?,
-        frame_min: r.u32()?, frame_max: r.u32()?,
+        header_min: r.u16()?,
+        header_max: r.u16()?,
+        frame_min: r.u32()?,
+        frame_max: r.u32()?,
     };
     let rotation = Rotation {
-        lifetime_min_s: r.u32()?, lifetime_max_s: r.u32()?,
-        volume_min_bytes: r.u64()?, volume_max_bytes: r.u64()?,
+        lifetime_min_s: r.u32()?,
+        lifetime_max_s: r.u32()?,
+        volume_min_bytes: r.u64()?,
+        volume_max_bytes: r.u64()?,
     };
     let count = r.byte()?;
     if !(1..=3).contains(&count) {
@@ -262,16 +282,32 @@ fn get_descriptor(r: &mut Reader<'_>) -> Result<(crate::descriptor::Descriptor, 
     }
     let mut references = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
-        references.push(Reference { server_name: r.text()?, port: r.u16()?, h3: r.flag()? });
+        references.push(Reference {
+            server_name: r.text()?,
+            port: r.u16()?,
+            h3: r.flag()?,
+        });
     }
     let d = Descriptor {
-        schema_version: 1, wire_version: 1, security_mode: SecurityMode::SmartReality,
-        revision, not_before, not_after, active_reference,
-        h3: flags & 1 != 0, stream_one: flags & 2 != 0, stream_up: flags & 4 != 0,
-        path_prefix, next_identity, scope, padding, rotation, references,
+        schema_version: 1,
+        wire_version: 1,
+        security_mode: SecurityMode::SmartReality,
+        revision,
+        not_before,
+        not_after,
+        active_reference,
+        h3: flags & 1 != 0,
+        stream_one: flags & 2 != 0,
+        stream_up: flags & 4 != 0,
+        path_prefix,
+        next_identity,
+        scope,
+        padding,
+        rotation,
+        references,
     };
-    let document = crate::descriptor::invitation_document(&d, r.array()?)
-        .map_err(|_| InviteError::Invalid)?;
+    let document =
+        crate::descriptor::invitation_document(&d, r.array()?).map_err(|_| InviteError::Invalid)?;
     Ok((d, document))
 }
 
@@ -279,9 +315,20 @@ pub(crate) fn encode_wire(wire: &Wire) -> Result<Zeroizing<String>, InviteError>
     check_wire(wire)?;
     let mut bytes = Zeroizing::new(Vec::new());
     bytes.push(1);
-    bytes.push(match wire.security_mode { WireSecurity::OwnTls => 0, WireSecurity::SmartReality => 1 });
-    bytes.push(match wire.transport { Transport::Auto => 0, Transport::H2 => 1, Transport::H3 => 2 });
-    bytes.push(match wire.xhttp_mode { XhttpMode::Auto => 0, XhttpMode::StreamOne => 1, XhttpMode::StreamUp => 2 });
+    bytes.push(match wire.security_mode {
+        WireSecurity::OwnTls => 0,
+        WireSecurity::SmartReality => 1,
+    });
+    bytes.push(match wire.transport {
+        Transport::Auto => 0,
+        Transport::H2 => 1,
+        Transport::H3 => 2,
+    });
+    bytes.push(match wire.xhttp_mode {
+        XhttpMode::Auto => 0,
+        XhttpMode::StreamOne => 1,
+        XhttpMode::StreamUp => 2,
+    });
     bytes.push(u8::from(wire.token.is_some()) | (u8::from(wire.admission.is_some()) << 1));
     if let Some(token) = &wire.token {
         bytes.extend_from_slice(&raw_key::<32>(token)?[..]);
@@ -299,10 +346,13 @@ pub(crate) fn encode_wire(wire: &Wire) -> Result<Zeroizing<String>, InviteError>
         WireSecurity::SmartReality => {
             let public = raw_key::<32>(wire.public_key.as_deref().ok_or(InviteError::Invalid)?)?;
             let (d, signature) = crate::descriptor::invitation_parts(
-                wire.descriptor.as_deref().ok_or(InviteError::Invalid)?
-            ).map_err(|_| InviteError::Invalid)?;
-            if d.scope.inbound != wire.id || d.scope.endpoint != wire.endpoint
-                || d.path_prefix != wire.path_prefix || Some(d.revision) != wire.minimum_revision
+                wire.descriptor.as_deref().ok_or(InviteError::Invalid)?,
+            )
+            .map_err(|_| InviteError::Invalid)?;
+            if d.scope.inbound != wire.id
+                || d.scope.endpoint != wire.endpoint
+                || d.path_prefix != wire.path_prefix
+                || Some(d.revision) != wire.minimum_revision
                 || d.references[usize::from(d.active_reference)].server_name != wire.server_name
             {
                 return Err(InviteError::Invalid);
@@ -327,11 +377,21 @@ pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
         return Err(InviteError::Invalid);
     }
     let encoded = uri.strip_prefix(PREFIX).ok_or(InviteError::Invalid)?;
-    if encoded.is_empty() || encoded.bytes().any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_') {
+    if encoded.is_empty()
+        || encoded
+            .bytes()
+            .any(|c| !c.is_ascii_alphanumeric() && c != b'-' && c != b'_')
+    {
         return Err(InviteError::Invalid);
     }
-    let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded).map_err(|_| InviteError::Invalid)?);
-    if bytes.len() > MAX_DATA || Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice())).as_str() != encoded {
+    let bytes = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| InviteError::Invalid)?,
+    );
+    if bytes.len() > MAX_DATA
+        || Zeroizing::new(URL_SAFE_NO_PAD.encode(bytes.as_slice())).as_str() != encoded
+    {
         return Err(InviteError::Invalid);
     }
     let mut r = Reader(bytes.as_slice());
@@ -339,18 +399,37 @@ pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
         return Err(InviteError::Invalid);
     }
     let security_mode = match r.byte()? {
-        0 => WireSecurity::OwnTls, 1 => WireSecurity::SmartReality, _ => return Err(InviteError::Invalid),
+        0 => WireSecurity::OwnTls,
+        1 => WireSecurity::SmartReality,
+        _ => return Err(InviteError::Invalid),
     };
     let transport = match r.byte()? {
-        0 => Transport::Auto, 1 => Transport::H2, 2 => Transport::H3, _ => return Err(InviteError::Invalid),
+        0 => Transport::Auto,
+        1 => Transport::H2,
+        2 => Transport::H3,
+        _ => return Err(InviteError::Invalid),
     };
     let xhttp_mode = match r.byte()? {
-        0 => XhttpMode::Auto, 1 => XhttpMode::StreamOne, 2 => XhttpMode::StreamUp, _ => return Err(InviteError::Invalid),
+        0 => XhttpMode::Auto,
+        1 => XhttpMode::StreamOne,
+        2 => XhttpMode::StreamUp,
+        _ => return Err(InviteError::Invalid),
     };
     let mut wire = Wire {
-        version: 1, carrier: "smarttheia-xhttp".into(), security_mode, transport, xhttp_mode,
-        id: String::new(), endpoint: String::new(), server_name: String::new(), path_prefix: String::new(),
-        token: None, admission: None, public_key: None, minimum_revision: None, descriptor: None,
+        version: 1,
+        carrier: "smarttheia-xhttp".into(),
+        security_mode,
+        transport,
+        xhttp_mode,
+        id: String::new(),
+        endpoint: String::new(),
+        server_name: String::new(),
+        path_prefix: String::new(),
+        token: None,
+        admission: None,
+        public_key: None,
+        minimum_revision: None,
+        descriptor: None,
     };
     let flags = r.byte()?;
     if flags & !3 != 0 {
@@ -380,7 +459,9 @@ pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
             wire.id = d.scope.inbound;
             wire.endpoint = d.scope.endpoint;
             wire.path_prefix = d.path_prefix;
-            wire.server_name = d.references[usize::from(d.active_reference)].server_name.clone();
+            wire.server_name = d.references[usize::from(d.active_reference)]
+                .server_name
+                .clone();
             wire.minimum_revision = Some(d.revision);
             wire.descriptor = Some(document);
         }
@@ -907,28 +988,62 @@ mod tests {
         use crate::descriptor::{Descriptor, Padding, Reference, Rotation, Scope};
         use ring::signature::{Ed25519KeyPair, KeyPair};
         let key = Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
-        let dns = |c: char| [63, 63, 63, 61].into_iter().map(|n| c.to_string().repeat(n)).collect::<Vec<_>>().join(".");
+        let dns = |c: char| {
+            [63, 63, 63, 61]
+                .into_iter()
+                .map(|n| c.to_string().repeat(n))
+                .collect::<Vec<_>>()
+                .join(".")
+        };
         let d = Descriptor {
-            schema_version: 1, wire_version: 1,
+            schema_version: 1,
+            wire_version: 1,
             security_mode: crate::descriptor::SecurityMode::SmartReality,
-            revision: 1, not_before: 1, not_after: 100,
-            active_reference: 0, h3: true, stream_one: true, stream_up: true,
+            revision: 1,
+            not_before: 1,
+            not_after: 100,
+            active_reference: 0,
+            h3: true,
+            stream_one: true,
+            stream_up: true,
             path_prefix: format!("/v1/{}", "p".repeat(64)),
             next_identity: Some(URL_SAFE_NO_PAD.encode([8; 32])),
-            scope: Scope { inbound: "i".repeat(64), endpoint: format!("{}:65535", dns('d')) },
+            scope: Scope {
+                inbound: "i".repeat(64),
+                endpoint: format!("{}:65535", dns('d')),
+            },
             padding: Padding::default(),
-            rotation: Rotation { lifetime_min_s: 1, lifetime_max_s: 2, volume_min_bytes: 1, volume_max_bytes: 2 },
-            references: ['a', 'b', 'c'].into_iter().map(|c| Reference { server_name: dns(c), port: 443, h3: true }).collect(),
+            rotation: Rotation {
+                lifetime_min_s: 1,
+                lifetime_max_s: 2,
+                volume_min_bytes: 1,
+                volume_max_bytes: 2,
+            },
+            references: ['a', 'b', 'c']
+                .into_iter()
+                .map(|c| Reference {
+                    server_name: dns(c),
+                    port: 443,
+                    h3: true,
+                })
+                .collect(),
         };
         let signed = crate::descriptor::sign(&d, &key).unwrap();
         let wire = Wire {
-            version: 1, carrier: "smarttheia-xhttp".into(), security_mode: WireSecurity::SmartReality,
-            transport: Transport::Auto, xhttp_mode: XhttpMode::Auto,
-            id: d.scope.inbound.clone(), endpoint: d.scope.endpoint.clone(),
-            server_name: d.references[0].server_name.clone(), path_prefix: d.path_prefix.clone(),
+            version: 1,
+            carrier: "smarttheia-xhttp".into(),
+            security_mode: WireSecurity::SmartReality,
+            transport: Transport::Auto,
+            xhttp_mode: XhttpMode::Auto,
+            id: d.scope.inbound.clone(),
+            endpoint: d.scope.endpoint.clone(),
+            server_name: d.references[0].server_name.clone(),
+            path_prefix: d.path_prefix.clone(),
             public_key: Some(URL_SAFE_NO_PAD.encode(key.public_key().as_ref())),
-            minimum_revision: Some(d.revision), descriptor: Some(signed.clone()),
-            token: Some(URL_SAFE_NO_PAD.encode([7; 32])), admission: Some(URL_SAFE_NO_PAD.encode([6; 32])),
+            minimum_revision: Some(d.revision),
+            descriptor: Some(signed.clone()),
+            token: Some(URL_SAFE_NO_PAD.encode([7; 32])),
+            admission: Some(URL_SAFE_NO_PAD.encode([6; 32])),
         };
         let uri = encode_wire(&wire).unwrap();
         assert!(uri.len() <= 2048);
@@ -957,18 +1072,29 @@ mod tests {
         ] {
             assert!(Invitation::decode(bad).is_err());
         }
-        let bytes = URL_SAFE_NO_PAD.decode(uri.strip_prefix(PREFIX).unwrap()).unwrap();
+        let bytes = URL_SAFE_NO_PAD
+            .decode(uri.strip_prefix(PREFIX).unwrap())
+            .unwrap();
         for (offset, invalid) in [(0, 2), (1, 9), (2, 9), (3, 9), (4, 2)] {
             let mut changed = bytes.clone();
             changed[offset] = invalid;
-            assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(changed))).is_err());
+            assert!(
+                Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(changed)))
+                    .is_err()
+            );
         }
         for end in 0..bytes.len() {
-            assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(&bytes[..end]))).is_err());
+            assert!(Invitation::decode(&format!(
+                "{PREFIX}{}",
+                URL_SAFE_NO_PAD.encode(&bytes[..end])
+            ))
+            .is_err());
         }
         let mut trailing = bytes;
         trailing.push(0);
-        assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(trailing))).is_err());
+        assert!(
+            Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(trailing))).is_err()
+        );
         let text = toml::to_string(&decode_wire(&uri).unwrap()).unwrap();
         for altered in [
             text.replace("version = 1", "version = 2"),

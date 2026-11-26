@@ -215,10 +215,23 @@ impl CandidateReview {
 
     pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
-        if self.is_editing() || self.is_confirming() { return Vec::new(); }
-        vec![ActionItem { key: 'a', label: "Указать свой диапазон адресов (без сети)" },
-            ActionItem { key: 'b', label: "Выбрать IP для проверки" },
-            ActionItem { key: 'd', label: "Открыть каталог доменов" }]
+        if self.is_editing() || self.is_confirming() {
+            return Vec::new();
+        }
+        vec![
+            ActionItem {
+                key: 'a',
+                label: "Указать свой диапазон адресов (без сети)",
+            },
+            ActionItem {
+                key: 'b',
+                label: "Выбрать IP для проверки",
+            },
+            ActionItem {
+                key: 'd',
+                label: "Открыть каталог доменов",
+            },
+        ]
     }
 
     pub(crate) fn body(&self) -> String {
@@ -321,7 +334,7 @@ mod tests {
         assert!(body.contains("Добавленные вручную"));
         assert!(body.contains("93.184.216.10"));
         assert!(!body.contains("10.0.0.3"));
-        assert!(body.contains("14"));
+        assert!(body.contains(&POPULAR_HTTPS_DOMAINS.len().to_string()));
         assert!(body.contains("0/100"));
         assert!(body.contains("НЕ означает"));
         assert!(!panel.has_scope());
@@ -429,7 +442,7 @@ mod tests {
         let panel = CandidateReview::new(fixture());
         let (assigned, domains, manual) = panel.group_counts();
         assert_eq!(assigned, 1);
-        assert_eq!(domains, 14);
+        assert_eq!(domains, POPULAR_HTTPS_DOMAINS.len());
         assert_eq!(manual, 0);
         let evidence = crate::camouflage_discovery::TlsEvidence::default();
         let rating = evidence.suitability(crate::camouflage_discovery::Transport::H2);

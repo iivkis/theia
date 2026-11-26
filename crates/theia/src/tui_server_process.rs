@@ -171,7 +171,8 @@ impl ProcessPanel {
                         thread: Some(thread),
                         inbounds: None,
                     });
-                    self.notice = "Проверяем настройки, сертификаты, права и сетевые порты...".into();
+                    self.notice =
+                        "Проверяем настройки, сертификаты, права и сетевые порты...".into();
                 }
                 Err(_) => self.notice = "Не удалось запустить рабочий поток сервера.".into(),
             }
@@ -265,8 +266,7 @@ impl ProcessPanel {
                 {
                     self.confirm = Some(true);
                 } else {
-                    self.notice =
-                        "Сначала откройте и сохраните настройки сервера.".into();
+                    self.notice = "Сначала откройте и сохраните настройки сервера.".into();
                 }
                 false
             }
@@ -350,7 +350,7 @@ mod tests {
         ready_tx.send(2).unwrap();
         panel.poll();
         assert_eq!(panel.status(), "Запущен");
-        assert!(panel.body().contains("Inbound: 2"));
+        assert!(panel.body().contains("Подключений: 2"));
         assert!(panel.key(KeyCode::Esc, None));
         assert!(panel.running());
         assert!(!panel.key(KeyCode::Char('x'), None));
@@ -383,7 +383,9 @@ mod tests {
         assert!(panel.confirm.is_none());
         panel.confirm = Some(true);
         panel.key(KeyCode::Char('y'), None);
-        assert!(panel.body().contains("Сначала откройте файл настроек сервера"));
+        assert!(panel
+            .body()
+            .contains("Сначала откройте файл настроек сервера"));
         panel.worker = Some(Worker {
             endpoint: None,
             stop: Some(stop),
