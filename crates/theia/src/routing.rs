@@ -1,6 +1,7 @@
 //! Shared route matching primitives for server and client.
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
 pub mod snapshot;
+pub mod geodata;
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
