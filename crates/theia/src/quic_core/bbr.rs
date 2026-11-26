@@ -16,7 +16,17 @@ const INITIAL_RTT: Duration = Duration::from_millis(333);
 const MIN_RTT_TTL: Duration = Duration::from_secs(10);
 const PROBE_RTT_TIME: Duration = Duration::from_millis(200);
 const HIGH_GAIN: f64 = 2.885;
-const BW_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+// Four-phase bandwidth probing, following the phase structure in
+// draft-ietf-ccwg-bbr-07. The conservative bounded transitions below
+// are intentionally not a complete implementation of that draft.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbePhase { Down, Cruise, Refill, Up }
+
+impl ProbePhase {
+    fn gain(self) -> f64 {
+        match self { Self::Down => 0.90, Self::Cruise | Self::Refill => 1.0, Self::Up => 1.25 }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -60,8 +70,11 @@ pub struct Bbr {
     full_bw: u64,
     plateau: u8,
     full_pipe: bool,
-    cycle: usize,
-    cycle_at: Instant,
+    phase: ProbePhase,
+    phase_at: Instant,
+    phase_round: u64,
+    probe_wait: Duration,
+    bandwidth_cap: Option<u64>,
     probe_done: Option<(Instant, u64)>,
     probe_min: Option<Duration>,
     recovery_until: Option<u64>,
@@ -95,8 +108,11 @@ impl Bbr {
             full_bw: 0,
             plateau: 0,
             full_pipe: false,
-            cycle: 0,
-            cycle_at: now,
+            phase: ProbePhase::Down,
+            phase_at: now,
+            phase_round: 0,
+            probe_wait: Duration::from_secs(2),
+            bandwidth_cap: None,
             probe_done: None,
             probe_min: None,
             recovery_until: None,
@@ -118,12 +134,14 @@ impl Bbr {
 
     /// Conservative CE response, at most once per packet-timed round.
     /// This does not claim BBRv3 ECN/L4S conformance.
-    pub(crate) fn ecn_congestion(&mut self) {
+    pub(crate) fn ecn_congestion(&mut self, now: Instant) {
         if self.last_ecn_round == Some(self.round) { return; }
         self.last_ecn_round = Some(self.round);
         let bound = (self.cwnd.saturating_mul(7) / 10).max(4 * self.mtu);
         self.loss_ceiling = Some(self.loss_ceiling.map_or(bound, |old| old.min(bound)));
         self.cwnd = self.cwnd.min(bound);
+        self.bound_bandwidth();
+        if self.mode == Mode::ProbeBw { self.set_phase(ProbePhase::Down, now); }
         if self.mode == Mode::Startup {
             self.full_pipe = true;
             self.mode = Mode::Drain;
@@ -161,7 +179,7 @@ impl Bbr {
         match self.mode {
             Mode::Startup => HIGH_GAIN,
             Mode::Drain => 1.0 / HIGH_GAIN,
-            Mode::ProbeBw => BW_GAINS[self.cycle],
+            Mode::ProbeBw => self.phase.gain(),
             Mode::ProbeRtt => 1.0,
         }
     }
@@ -173,6 +191,7 @@ impl Bbr {
         } else {
             bw
         };
+        let base = base.min(self.bandwidth_cap.unwrap_or(MAX_RATE));
         ((base as f64 * self.gain()) as u64).clamp(1, MAX_RATE)
     }
 
@@ -315,6 +334,8 @@ impl Bbr {
         if observed >= 4 * self.mtu && u128::from(self.round_lost) * 50 > u128::from(observed) {
             let bound = (self.cwnd.saturating_mul(7) / 10).max(floor);
             self.loss_ceiling = Some(self.loss_ceiling.map_or(bound, |old| old.min(bound)));
+            self.bound_bandwidth();
+            if self.mode == Mode::ProbeBw { self.set_phase(ProbePhase::Down, now); }
             if self.mode == Mode::Startup {
                 self.full_pipe = true;
                 self.mode = Mode::Drain;
@@ -356,12 +377,8 @@ impl Bbr {
         }
         if self.mode == Mode::Drain && in_flight <= self.bdp() {
             self.enter_probe_bw(now);
-        } else if self.mode == Mode::ProbeBw
-            && round_start
-            && now.saturating_duration_since(self.cycle_at) >= self.rtt()
-        {
-            self.cycle = (self.cycle + 1) % BW_GAINS.len();
-            self.cycle_at = now;
+        } else if self.mode == Mode::ProbeBw {
+            self.advance_probe(now, in_flight, round_start, congestion_lost != 0);
         }
         if expired && self.min_stamp != now && sample.is_some() && self.mode != Mode::ProbeRtt {
             self.mode = Mode::ProbeRtt;
@@ -428,12 +445,50 @@ impl Bbr {
         Ok(())
     }
 
+    fn bound_bandwidth(&mut self) {
+        let bw = self.bandwidth();
+        if bw != 0 {
+            let old = self.bandwidth_cap.unwrap_or(bw);
+            let floor = rate(4 * self.mtu, self.rtt());
+            self.bandwidth_cap = Some((old.saturating_mul(7) / 10).max(floor).min(bw));
+        }
+    }
+
+    fn set_phase(&mut self, phase: ProbePhase, now: Instant) {
+        self.phase = phase;
+        self.phase_at = now;
+        self.phase_round = self.round;
+        if phase == ProbePhase::Down {
+            // Randomize the next probe wait across flows without relying on
+            // a global clock, with a conservative bounded RNG failure value.
+            use ring::rand::{SecureRandom, SystemRandom};
+            let mut random = [0; 2];
+            let jitter = if SystemRandom::new().fill(&mut random).is_ok() {
+                u16::from_ne_bytes(random) as u64 % 1001
+            } else { 500 };
+            self.probe_wait = Duration::from_millis(2000 + jitter);
+        }
+        if phase == ProbePhase::Refill {
+            self.bandwidth_cap = None;
+        }
+    }
+
+    fn advance_probe(&mut self, now: Instant, in_flight: u64, round_start: bool, lost: bool) {
+        let elapsed = now.saturating_duration_since(self.phase_at);
+        let new_round = round_start && self.round > self.phase_round;
+        match self.phase {
+            ProbePhase::Down if in_flight <= self.bdp() => self.set_phase(ProbePhase::Cruise, now),
+            ProbePhase::Cruise if new_round && !lost && elapsed >= self.probe_wait.max(self.rtt().saturating_mul(2)) => self.set_phase(ProbePhase::Refill, now),
+            ProbePhase::Refill if lost => self.set_phase(ProbePhase::Down, now),
+            ProbePhase::Refill if new_round => self.set_phase(ProbePhase::Up, now),
+            ProbePhase::Up if lost || (new_round && elapsed >= self.rtt()) => self.set_phase(ProbePhase::Down, now),
+            _ => {}
+        }
+    }
+
     fn enter_probe_bw(&mut self, now: Instant) {
         self.mode = Mode::ProbeBw;
-        // Start in neutral cruise. A future production controller should
-        // randomize the probe epoch and implement the current v3 loss bounds.
-        self.cycle = 2;
-        self.cycle_at = now;
+        self.set_phase(ProbePhase::Down, now);
     }
 }
 
@@ -485,6 +540,33 @@ mod tests {
         assert_eq!(bbr.bandwidth(), 12_000);
         assert!(bbr.cwnd() >= 4800);
         assert!(bbr.pacing_interval(1200) > Duration::ZERO);
+    }
+
+    #[test]
+    fn four_probe_phases_and_ecn_bound_pacing_once_per_round() {
+        let now = Instant::now();
+        let mut b = Bbr::new(1200, now).unwrap();
+        b.full_pipe = true;
+        b.bandwidth.push_back((0, 120_000));
+        b.min_rtt = Some(Duration::from_millis(100));
+        b.enter_probe_bw(now);
+        assert_eq!(b.phase, ProbePhase::Down);
+        b.advance_probe(now, 0, false, false);
+        assert_eq!(b.phase, ProbePhase::Cruise);
+        let refill = now + b.probe_wait;
+        b.round += 1;
+        b.advance_probe(refill, 0, true, false);
+        assert_eq!(b.phase, ProbePhase::Refill);
+        b.round += 1;
+        b.advance_probe(refill + Duration::from_millis(100), 0, true, false);
+        assert_eq!(b.phase, ProbePhase::Up);
+        let rate = b.pacing_rate();
+        b.ecn_congestion(refill + Duration::from_millis(200));
+        assert_eq!(b.phase, ProbePhase::Down);
+        assert!(b.pacing_rate() < rate);
+        let cwnd = b.cwnd();
+        b.ecn_congestion(refill + Duration::from_millis(201));
+        assert_eq!(b.cwnd(), cwnd);
     }
 
     #[test]

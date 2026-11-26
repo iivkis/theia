@@ -313,7 +313,7 @@ async fn run(
                     Ok(value) => value,
                     // Windows can surface ICMP Port Unreachable on an
                     // unconnected UDP socket. It is not a listener failure.
-                    Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused) || (cfg!(windows) && e.raw_os_error() == Some(10040)) => continue,
+                    Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused) || super::mtu::message_too_large(&e) => continue,
                     Err(e) => return Err(e),
                 };
                 if !scope.permits(local, peer) || n > MTU { continue; }
@@ -333,7 +333,7 @@ async fn run(
                             match socket.send_to(&reply, peer).await {
                                 Ok(written) if written == reply.len() => {},
                                 Ok(_) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-                                Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused | io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable) => {},
+                                Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused | io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable) || super::mtu::message_too_large(&e) => {},
                                 Err(e) => return Err(e),
                             }
                         }

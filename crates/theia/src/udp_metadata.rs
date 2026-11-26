@@ -23,6 +23,7 @@ impl Options {
         if self.ecn {
             return linux::receive(socket, out).await;
         }
+        let _ = self;
         let (n, peer) = socket.recv_from(out).await?;
         Ok((n, peer, Mark::NotEct))
     }

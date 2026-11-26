@@ -494,7 +494,7 @@ impl Scheduler {
         self.apply_loss(outcome, now)?;
         if let Some(at) = self.ecn.acknowledge(ack) {
             if let Some(bbr) = self.bbr.as_mut() {
-                bbr.ecn_congestion();
+                bbr.ecn_congestion(now);
                 self.window.set_target(bbr.cwnd()).map_err(|_| Error::Window)?;
             } else {
                 self.window.loss(at, now).map_err(|_| Error::Window)?;
@@ -556,7 +556,8 @@ impl Scheduler {
     }
 
     pub fn on_timer(&mut self, now: Instant) -> Result<(), Error> {
-        self.ecn.tick(now, self.base_pto());
+        let pto = self.base_pto();
+        self.ecn.tick(now, pto);
         let result = self
             .ledger
             .on_loss_timer(now, self.rtt.loss_delay())

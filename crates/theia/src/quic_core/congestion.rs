@@ -1,7 +1,7 @@
 //! Congestion-control building blocks for the future connection scheduler.
 //! CUBIC window growth, slow start and recovery for the isolated session.
-//! This remains a development controller: ECN, HyStart++, complete
-//! persistent-congestion evidence and full idle handling remain open.
+//! This remains a development controller: cross-space recovery, HyStart++,
+//! independent congestion fairness and full idle handling remain open.
 use std::time::{Duration, Instant};
 
 const MAX_CWND: u64 = 64 * 1024 * 1024;
