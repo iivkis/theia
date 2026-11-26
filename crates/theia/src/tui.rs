@@ -1256,7 +1256,7 @@ impl Interaction {
                     (self.workspace_action + 1).min(action_count.saturating_sub(1));
             }
             // There is no selectable area beyond the right edge.
-            (_, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down) => {}
+            (_, KeyCode::Left | KeyCode::Right) => {}
             _ => return false,
         }
         true
@@ -4328,9 +4328,8 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
             || line.starts_with("Отказ:")
         {
             Style::default().fg(ERROR).add_modifier(Modifier::BOLD)
-        } else if line.starts_with("✓ ") {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else if line.starts_with("ШАГ ")
+        } else if line.starts_with("✓ ")
+            || line.starts_with("ШАГ ")
             || line.starts_with("ПРЕДЛОЖЕННЫЙ ")
             || line.starts_with("ПУТЬ К TOML")
             || line.starts_with("ВЫБЕРИТЕ ")
@@ -6512,11 +6511,7 @@ fn draw_workspace(
     });
     frame.render_widget(
         List::new(categories.collect::<Vec<_>>()).block(tui_widgets::section(
-            if nav_focused {
-                " Разделы "
-            } else {
-                " Разделы "
-            },
+            " Разделы ",
             nav_focused,
         )),
         nav,

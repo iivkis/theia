@@ -350,7 +350,7 @@ mod tests {
         ready_tx.send(2).unwrap();
         panel.poll();
         assert_eq!(panel.status(), "Запущен");
-        assert!(panel.body().contains("Inbound: 2"));
+        assert!(panel.body().contains("Подключений: 2"));
         assert!(panel.key(KeyCode::Esc, None));
         assert!(panel.running());
         assert!(!panel.key(KeyCode::Char('x'), None));
