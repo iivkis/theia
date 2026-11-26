@@ -797,7 +797,11 @@ mod tests {
             None
         );
         assert!(matches!(
-            Policy::compile(&[rule(Action::Direct, &["geosite:google@cn"], &[])], &data, &[]),
+            Policy::compile(
+                &[rule(Action::Direct, &["geosite:google@cn"], &[])],
+                &data,
+                &[]
+            ),
             Err(RoutingError::InvalidCategory)
         ));
         assert!(matches!(

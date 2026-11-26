@@ -154,11 +154,14 @@ pub(crate) async fn response_data(
             .filter(|v| {
                 digest_count == 1
                     && v.len() == 64
-                    && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    && v.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             })
             .ok_or(StatusCode::BAD_REQUEST)?;
         if digest == digest_text(publication.snapshot.digest()) {
-            return Ok(Arc::from(unchanged_receipt(publication.snapshot.digest()).as_slice()));
+            return Ok(Arc::from(
+                unchanged_receipt(publication.snapshot.digest()).as_slice(),
+            ));
         }
         return Ok(publication.wire.clone());
     }
@@ -362,7 +365,10 @@ mod tests {
     #[tokio::test]
     async fn conditional_snapshot_is_exact_and_rejects_ambiguous_headers() {
         let (snapshot, wire) = snapshot::Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
-        let publication = Published { snapshot, wire: wire.into() };
+        let publication = Published {
+            snapshot,
+            wire: wire.into(),
+        };
         let mut request = http::Request::new(());
         let deadline = Duration::from_secs(1);
         request_digest(&mut request, publication.snapshot.digest()).unwrap();
@@ -372,17 +378,27 @@ mod tests {
         assert_eq!(&*receipt, &unchanged_receipt(publication.snapshot.digest()));
         request_digest(&mut request, [0; 32]).unwrap();
         assert_eq!(
-            response_data(&publication, request.headers(), false, deadline).await.unwrap(),
+            response_data(&publication, request.headers(), false, deadline)
+                .await
+                .unwrap(),
             publication.wire
         );
-        request.headers_mut().append(DIGEST_HEADER, "invalid".parse().unwrap());
+        request
+            .headers_mut()
+            .append(DIGEST_HEADER, "invalid".parse().unwrap());
         assert_eq!(
-            response_data(&publication, request.headers(), false, deadline).await.unwrap_err(),
+            response_data(&publication, request.headers(), false, deadline)
+                .await
+                .unwrap_err(),
             http::StatusCode::BAD_REQUEST
         );
-        request.headers_mut().insert(DIGEST_HEADER, "invalid".parse().unwrap());
+        request
+            .headers_mut()
+            .insert(DIGEST_HEADER, "invalid".parse().unwrap());
         assert_eq!(
-            response_data(&publication, request.headers(), false, deadline).await.unwrap_err(),
+            response_data(&publication, request.headers(), false, deadline)
+                .await
+                .unwrap_err(),
             http::StatusCode::BAD_REQUEST
         );
     }

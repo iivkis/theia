@@ -9,7 +9,10 @@ async fn real_xtls_pair_and_snapshot_cost() {
     let mut random = [0u8; 16];
     use ring::rand::SecureRandom;
     ring::rand::SystemRandom::new().fill(&mut random).unwrap();
-    let suffix = random.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let suffix = random
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let directory = std::env::temp_dir().join(format!("theia-routing-dat-{suffix}"));
     let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -43,7 +46,10 @@ async fn real_xtls_pair_and_snapshot_cost() {
         },
     ];
     let start = Instant::now();
-    let pair = store.refresh(&rules).await.expect("real XTLS pair, verified by production loader");
+    let pair = store
+        .refresh(&rules)
+        .await
+        .expect("real XTLS pair, verified by production loader");
     let refresh_ms = start.elapsed().as_millis();
     let manifest = pair.manifest();
     assert!(pair.geosite().len() <= 32 * 1024 * 1024);
@@ -59,17 +65,33 @@ async fn real_xtls_pair_and_snapshot_cost() {
     assert_eq!(pinned.geoip(), pair.geoip());
     for sample in 1..=3 {
         let start = Instant::now();
-        let (server, wire) = Snapshot::build("real-dat", 1, &rules, pair.geosite(), pair.geoip()).unwrap();
+        let (server, wire) =
+            Snapshot::build("real-dat", 1, &rules, pair.geosite(), pair.geoip()).unwrap();
         let build_us = start.elapsed().as_micros();
         let start = Instant::now();
         let client = Snapshot::decode(&wire, "real-dat").unwrap();
         let decode_us = start.elapsed().as_micros();
         assert_eq!(server.digest(), client.digest());
-        assert_eq!(client.policy().matching_action(Some("google.com"), None).unwrap(), Some(Action::Direct));
+        assert_eq!(
+            client
+                .policy()
+                .matching_action(Some("google.com"), None)
+                .unwrap(),
+            Some(Action::Direct)
+        );
         for address in ["127.0.0.1", "::1"] {
-            assert_eq!(client.policy().matching_action(None, Some(address.parse().unwrap())).unwrap(), Some(Action::Blocked));
+            assert_eq!(
+                client
+                    .policy()
+                    .matching_action(None, Some(address.parse().unwrap()))
+                    .unwrap(),
+                Some(Action::Blocked)
+            );
         }
-        println!("sample={sample} snapshot_bytes={} build_us={build_us} decode_us={decode_us}", wire.len());
+        println!(
+            "sample={sample} snapshot_bytes={} build_us={build_us} decode_us={decode_us}",
+            wire.len()
+        );
         let mut corrupt = wire;
         let last = corrupt.last_mut().unwrap();
         *last ^= 1;

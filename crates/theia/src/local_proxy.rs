@@ -1113,7 +1113,9 @@ impl ProxyClient {
             Self::Direct(c) => c.routing.get(|known| c.carrier.fetch_routing(known)).await,
             Self::Reality(c) => {
                 let generation = c.generation().await?;
-                c.routing.get(|known| generation.carrier.fetch_routing(known)).await
+                c.routing
+                    .get(|known| generation.carrier.fetch_routing(known))
+                    .await
             }
         }
     }

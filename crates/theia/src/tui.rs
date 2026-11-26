@@ -1005,13 +1005,16 @@ impl RoutingPanel {
     fn body(&self) -> String {
         let mut body = String::new();
         if let Some((_, fields, focus)) = &self.fields {
-            for (i, (label, value)) in
-                ["Имя", "Действие", "Домены / GeoSite", "IP / CIDR / GeoIP"]
-                    .iter()
-                    .zip(fields)
-                    .enumerate()
+            for (i, (label, value)) in ["Имя", "Действие", "Домены / GeoSite", "IP / CIDR / GeoIP"]
+                .iter()
+                .zip(fields)
+                .enumerate()
             {
-                let value = if i == 1 { Self::action_label(value) } else { value.as_str() };
+                let value = if i == 1 {
+                    Self::action_label(value)
+                } else {
+                    value.as_str()
+                };
                 body.push_str(&format!(
                     "{} {label}: {value}\n",
                     if i == *focus { "›" } else { " " }
@@ -6724,7 +6727,11 @@ fn page_layout_for(
     } else if role == Role::Client && page == 2 {
         7
     } else if role == Role::Client && page == 6 {
-        if area.width >= 76 { 10 } else { 14 }
+        if area.width >= 76 {
+            10
+        } else {
+            14
+        }
     } else if page == 5 {
         8
     } else if role == Role::Server && page == 3 {

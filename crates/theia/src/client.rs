@@ -327,7 +327,10 @@ impl H2Client {
     }
 
     /// Authenticated binary policy snapshot for this exact inbound path.
-    pub(crate) async fn fetch_routing(&self, known: Option<[u8; 32]>) -> Result<Vec<u8>, ClientError> {
+    pub(crate) async fn fetch_routing(
+        &self,
+        known: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, ClientError> {
         self.routing_resource(None, known).await
     }
 

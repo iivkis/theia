@@ -611,8 +611,14 @@ mod tests {
         assert_eq!(IP, "geoip-lite.dat");
         assert!(super::super::GEOSITE_URL.ends_with("/geosite.dat"));
         assert!(super::super::GEOIP_URL.ends_with("/geoip-lite.dat"));
-        assert!(asset_uri("20261126014317", SITE).unwrap().path().ends_with("/geosite.dat"));
-        assert!(asset_uri("20261126014317", IP).unwrap().path().ends_with("/geoip-lite.dat"));
+        assert!(asset_uri("20261126014317", SITE)
+            .unwrap()
+            .path()
+            .ends_with("/geosite.dat"));
+        assert!(asset_uri("20261126014317", IP)
+            .unwrap()
+            .path()
+            .ends_with("/geoip-lite.dat"));
         let digest = hash(b"test");
         let sum = format!("{}  {SITE}\n", hex(&digest));
         assert_eq!(checksum(sum.as_bytes(), SITE).unwrap(), digest);
@@ -743,16 +749,27 @@ mod tests {
         };
         let previous = toml::to_string(&old).unwrap();
         fs::write(dir.join("active.toml"), &previous).unwrap();
-        fs::write(store.data_path("geosite-expand.dat", &old.geosite_sha256), &site).unwrap();
+        fs::write(
+            store.data_path("geosite-expand.dat", &old.geosite_sha256),
+            &site,
+        )
+        .unwrap();
         fs::write(store.data_path("geoip-full.dat", &old.geoip_sha256), &ip).unwrap();
         assert!(store.load(&[]).unwrap().is_none());
         assert!(store.load_pinned(&old, &[]).is_err());
         let pair = Pair::verified(old.clone(), site, ip, &[]).unwrap();
         store.publish(&pair, None).unwrap();
         assert_eq!(store.load(&[]).unwrap().unwrap().manifest(), &old);
-        assert_eq!(fs::read_to_string(dir.join("active.toml")).unwrap(), previous);
-        assert!(store.data_path("geosite-expand.dat", &old.geosite_sha256).exists());
-        assert!(store.data_path("geoip-full.dat", &old.geoip_sha256).exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("active.toml")).unwrap(),
+            previous
+        );
+        assert!(store
+            .data_path("geosite-expand.dat", &old.geosite_sha256)
+            .exists());
+        assert!(store
+            .data_path("geoip-full.dat", &old.geoip_sha256)
+            .exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

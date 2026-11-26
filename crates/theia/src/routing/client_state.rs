@@ -337,26 +337,34 @@ mod tests {
         let cache = Cache::new("scope".into(), None);
         let (snapshot, wire) = Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
         let digest = snapshot.digest();
-        let old = cache.get(|known| async move {
-            assert!(known.is_none());
-            Ok(wire)
-        }).await.unwrap();
+        let old = cache
+            .get(|known| async move {
+                assert!(known.is_none());
+                Ok(wire)
+            })
+            .await
+            .unwrap();
         cache.state.lock().await.expires = None;
-        let fresh = cache.get(|known| async move {
-            assert_eq!(known, Some(digest));
-            Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
-        }).await.unwrap();
+        let fresh = cache
+            .get(|known| async move {
+                assert_eq!(known, Some(digest));
+                Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
+            })
+            .await
+            .unwrap();
         assert!(Arc::ptr_eq(&old, &fresh));
         assert_eq!(cache.observation(), (2, 1));
         cache.state.lock().await.expires = None;
-        assert!(cache.get(|_| async {
-            Ok(super::super::exchange::unchanged_receipt([0; 32]).to_vec())
-        }).await.is_err());
+        assert!(cache
+            .get(|_| async { Ok(super::super::exchange::unchanged_receipt([0; 32]).to_vec()) })
+            .await
+            .is_err());
         assert_eq!(cache.observation(), (2, 2));
         let empty = Cache::new("scope".into(), None);
-        assert!(empty.get(|_| async {
-            Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
-        }).await.is_err());
+        assert!(empty
+            .get(|_| async { Ok(super::super::exchange::unchanged_receipt(digest).to_vec()) })
+            .await
+            .is_err());
     }
 
     #[tokio::test]
