@@ -24,7 +24,7 @@ use std::{
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, watch, Notify};
 
 // Include HTTP/3 framing overhead for a 64 KiB application write.
 const SLOT_LIMIT: usize = 128 * 1024;
@@ -138,7 +138,11 @@ impl State {
         }
         wake(&mut self.uni_waker, wakes);
         wake(&mut self.bidi_waker, wakes);
+        self.accept_bidi.clear();
+        self.accept_uni.clear();
         for stream in self.streams.values_mut() {
+            stream.incoming = None;
+            stream.outgoing = None;
             wake(&mut stream.send_waker, wakes);
             wake(&mut stream.recv_waker, wakes);
         }
@@ -395,6 +399,7 @@ async fn drive(mut session: LabSession, weak: Weak<Bridge>, ready: Arc<Notify>) 
 
 pub struct NativeConnection {
     opener: Opener,
+    closed: watch::Receiver<()>,
 }
 
 impl NativeConnection {
@@ -409,14 +414,24 @@ impl NativeConnection {
             state: Mutex::new(State::default()),
             ready: ready.clone(),
         });
-        tokio::spawn(drive(session, Arc::downgrade(&shared), ready));
+        let (done, closed) = watch::channel(());
+        let weak = Arc::downgrade(&shared);
+        tokio::spawn(async move {
+            drive(session, weak, ready).await;
+            drop(done);
+        });
+        // Construct the opener before moving the last frontend reference into the worker.
+
         Ok((
             Self {
                 opener: Opener::new(shared),
+                closed,
             },
             key,
         ))
     }
+
+    pub(crate) fn closed_signal(&self) -> watch::Receiver<()> { self.closed.clone() }
 
     fn accept(&self, cx: &mut Context<'_>, bidi: bool) -> Poll<Result<u64, CE>> {
         let mut s = self.opener.shared.lock().expect("bridge mutex");

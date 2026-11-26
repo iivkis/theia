@@ -169,7 +169,7 @@ impl Ledger {
         for r in &ack.ranges {
             if r.first > r.last
                 || r.last >= self.next
-                || (r.first <= r.last && self.burned.range(r.first..=r.last).next().is_some())
+                || self.burned.range(r.first..=r.last).next().is_some()
                 || previous.is_some_and(|low| low.checked_sub(2).is_none_or(|bound| r.last > bound))
             {
                 return Err(Error::Ack);

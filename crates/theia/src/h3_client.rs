@@ -524,6 +524,7 @@ impl H3Client {
         {
             return Err(ClientError::Configuration);
         }
+        self.pool = crate::connection_pool::Pool::default();
         self.native_lab = Some(version);
         self.native_pins = None;
         Ok(self)
@@ -536,6 +537,7 @@ impl H3Client {
             || local.is_ipv4() != self.remote.is_ipv4() || self.identity_quic.is_some() || self.certificate_pin.is_some() {
             return Err(ClientError::Configuration);
         }
+        self.pool = crate::connection_pool::Pool::default();
         self.native_lab = Some(version);
         self.native_pins = Some((local, scope));
         Ok(self)

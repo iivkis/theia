@@ -104,7 +104,7 @@ impl PeerIds {
     /// Constant-time comparison of the trailing token against live peer
     /// CIDs. Caller must first rule out successful packet protection.
     pub(crate) fn matches_reset(&self, packet: &[u8]) -> bool {
-        if packet.len() < 21 || packet[0] & 0x80 != 0 {
+        if packet.len() < 21 || packet[0] & 0xc0 != 0x40 {
             return false;
         }
         let tail = &packet[packet.len() - 16..];
@@ -192,6 +192,7 @@ impl PeerIds {
 struct Candidate {
     address: SocketAddr,
     challenge: [u8; 8],
+    started: Instant,
     expires: Instant,
     budget: PathBudget,
     last_challenge: Option<Instant>,
@@ -224,6 +225,10 @@ impl Paths {
         received: u64,
         now: Instant,
     ) -> Result<[u8; 8], Error> {
+        self.begin_with_timeout(address, received, now, CHALLENGE_TTL)
+    }
+
+    pub(crate) fn begin_with_timeout(&mut self, address: SocketAddr, received: u64, now: Instant, timeout: Duration) -> Result<[u8; 8], Error> {
         if address == self.active || address.port() == 0 || received == 0 {
             return Err(Error::Path);
         }
@@ -240,12 +245,13 @@ impl Paths {
         SystemRandom::new()
             .fill(&mut challenge)
             .map_err(|_| Error::Random)?;
-        let expires = now.checked_add(CHALLENGE_TTL).ok_or(Error::Limit)?;
+        let expires = now.checked_add(timeout.clamp(CHALLENGE_TTL, Duration::from_secs(30))).ok_or(Error::Limit)?;
         let mut budget = PathBudget::default();
         budget.received(received);
         self.candidate = Some(Candidate {
             address,
             challenge,
+            started: now,
             expires,
             budget,
             last_challenge: None,
@@ -294,7 +300,7 @@ impl Paths {
         }
         let at = match c.last_challenge {
             Some(sent) => sent.checked_add(interval.max(Duration::from_millis(1)))?,
-            None => c.expires.checked_sub(CHALLENGE_TTL)?,
+            None => c.started,
         };
         (at < c.expires).then_some(at)
     }

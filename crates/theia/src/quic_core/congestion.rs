@@ -59,6 +59,10 @@ impl Window {
 
     pub(crate) fn set_mtu(&mut self, mtu: u64) {
         debug_assert!((1200..=super::mtu::MAX_UDP_PAYLOAD as u64).contains(&mtu));
+        let scale = self.mtu as f64 / mtu as f64;
+        self.last_max *= scale;
+        self.prior_cwnd *= scale;
+        self.friendly *= scale;
         self.mtu = mtu;
         self.cwnd = self.cwnd.max(2 * mtu);
         self.ssthresh = self.ssthresh.max(2 * mtu);
@@ -166,7 +170,7 @@ impl Window {
         rtt: Duration,
         cwnd_limited: bool,
     ) -> Result<(), Error> {
-        if sent > now || bytes == 0 || bytes > super::mtu::MAX_UDP_PAYLOAD as u64 {
+        if sent > now || bytes == 0 || bytes > self.mtu.max(super::mtu::MAX_UDP_PAYLOAD as u64) {
             return Err(Error::Accounting);
         }
         if !cwnd_limited {

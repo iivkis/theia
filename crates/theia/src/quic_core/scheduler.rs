@@ -27,6 +27,8 @@ pub enum Error {
     Timeout,
 }
 
+type Batch = (Vec<u64>, Vec<u8>, bool);
+
 struct Pending {
     bytes: Vec<u8>,
     queued: bool,
@@ -220,11 +222,11 @@ impl Scheduler {
     /// Coalesce length-delimited reliable application frames into the
     /// discovered packet size. Each original frame retains its own alias;
     /// after a path MTU reduction they can be retransmitted individually.
-    pub(crate) fn candidate_batch(&mut self, now: Instant, capacity: usize) -> Result<Option<(Vec<u64>, Vec<u8>, bool)>, Error> {
+    pub(crate) fn candidate_batch(&mut self, now: Instant, capacity: usize) -> Result<Option<Batch>, Error> {
         let Some((id, mut bytes, probe)) = self.candidate(now)? else { return Ok(None); };
         if bytes.len() > capacity { return Err(Error::Limit); }
         let mut ids = vec![id];
-        if !probe {
+        if !probe && !bytes.first().is_some_and(|ty| (8..=15).contains(ty) && ty & 2 == 0) {
             for &next in &self.queue {
                 if next == id { continue; }
                 let Some(frame) = self.frames.get(&next) else { continue; };
@@ -244,6 +246,12 @@ impl Scheduler {
     }
 
     pub(crate) fn current_mtu(&self) -> usize { self.mtu.current() }
+
+    pub(crate) fn reset_mtu(&mut self, now: Instant) {
+        let before = self.mtu.current();
+        self.mtu.reset_path(now);
+        self.apply_mtu(before);
+    }
 
     fn mtu_deadline(&self) -> Option<Instant> {
         let size = self.mtu.candidate()?;
@@ -487,7 +495,7 @@ impl Scheduler {
             self.window
                 .set_target(bbr.cwnd())
                 .map_err(|_| Error::Window)?;
-        } else if let Some(end) = self.first_rtt_at.and_then(|first| {
+        } else if let Some(end) = self.first_rtt_at.filter(|_| !outcome.lost.is_empty()).and_then(|first| {
             self.ledger.persistent_end(first, self.base_pto().saturating_mul(3))
         }) {
             if self.persistent_reported.is_none_or(|old| end > old) {

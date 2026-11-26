@@ -233,6 +233,7 @@ async fn run_native_session(
     let peer = session.peer_addr().ip();
     let (transport, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session)
         .map_err(|_| ServerError::Io)?;
+    let mut closed = transport.closed_signal();
     let binding = None;
     run_h3(
         transport,
@@ -240,7 +241,7 @@ async fn run_native_session(
         phase,
         peer,
         binding,
-        std::future::pending::<()>(),
+        async move { let _ = closed.changed().await; },
     )
     .await;
     Ok(())

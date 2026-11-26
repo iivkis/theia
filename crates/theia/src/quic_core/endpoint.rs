@@ -374,6 +374,8 @@ impl LabSession {
         }
         if cross_ip {
             self.scheduler.restart_path(now);
+        } else {
+            self.scheduler.reset_mtu(now);
         }
         self.socket = SessionIo::direct(socket, scope);
         let peer = self.paths.active();
@@ -390,13 +392,19 @@ impl LabSession {
         frame: &[u8],
         now: Instant,
     ) -> Result<(), Error> {
+        self.send_path_sized(peer, frame, MTU, now).await
+    }
+
+    async fn send_path_sized(&mut self, peer: SocketAddr, frame: &[u8], size: usize, now: Instant) -> Result<(), Error> {
         if !self.scheduler.can_send_path() {
             return Err(Error::Protocol);
         }
         let mut payload = frame.to_vec();
         // Fixed four-byte PN and the 16-byte AEAD tag used by this fixture.
         let cid_len = self.peer_ids.current().ok_or(Error::Protocol)?.len();
-        payload.resize(MTU - 1 - cid_len - 4 - 16, 0);
+        let capacity = size.checked_sub(1 + cid_len + 4 + 16).ok_or(Error::Protocol)?;
+        if capacity < frame.len() { return Err(Error::Protocol); }
+        payload.resize(capacity, 0);
         let (number, packet) = self.seal(&payload)?;
         self.scheduler
             .record_path(number, packet.len(), now)
@@ -910,6 +918,7 @@ impl LabSession {
                 incoming.await
             };
             match received {
+                Ok(Err(e)) if super::mtu::message_too_large(&e) => return Ok(false),
                 Ok(result) => result.map_err(Error::Io)?,
                 Err(_) => return Ok(false),
             }
@@ -995,7 +1004,7 @@ impl LabSession {
         let opened = match result {
             Ok(p) => p,
             Err(packet::Error::Reserved | packet::Error::Limit) => return Err(Error::Protocol),
-            Err(packet::Error::Crypto | packet::Error::Header | packet::Error::TooOld) => {
+            Err(packet::Error::Crypto | packet::Error::Header) => {
                 return self.receive_stateless_reset(packet, source, now)
             }
             Err(_) => return Ok(false),
@@ -1011,21 +1020,33 @@ impl LabSession {
             // Only authenticated 1-RTT packets can establish a candidate.
             // Never apply stream data, ACKs or close from an unvalidated path.
             let old_ip = self.paths.active().ip();
-            let Ok(challenge) = self.paths.begin(source, n as u64, now) else {
+            let pto = self.scheduler.base_pto();
+            let Ok(challenge) = self.paths.begin_with_timeout(source, n as u64, now, pto.saturating_mul(3)) else {
                 return Ok(false);
             };
-            let probing = parsed.iter().all(|f| {
-                matches!(
-                    f,
-                    Frame::Padding | Frame::Ping | Frame::PathChallenge(_) | Frame::PathResponse(_)
-                )
-            });
-            if !probing
-                || !parsed.iter().any(|f| {
-                    matches!(f, Frame::PathResponse(value)
-                if self.paths.response(source, *value, now))
-                })
-            {
+            if !parsed.iter().any(|f| {
+                matches!(f, Frame::PathResponse(value)
+                    if self.paths.response(source, *value, now))
+            }) {
+                // A peer may validate its own new path simultaneously. Answer
+                // only the first challenge, within this candidate's budget.
+                // No stream data, ACK or close is applied before validation.
+                if self.scheduler.can_send_path() {
+                    if let Some(Frame::PathChallenge(value)) = parsed.iter().find(|f| matches!(f, Frame::PathChallenge(_))) {
+                        let cid_len = self.peer_ids.current().ok_or(Error::Protocol)?.len();
+                        let minimum = 1 + cid_len + 4 + 16 + 9;
+                        let size = if self.paths.reserve_candidate_send(source, MTU as u64, now) {
+                            Some(MTU)
+                        } else if self.paths.reserve_candidate_send(source, minimum as u64, now) {
+                            Some(minimum)
+                        } else { None };
+                        if let Some(size) = size {
+                            let mut frame = vec![0x1b];
+                            frame.extend_from_slice(value);
+                            self.send_path_sized(source, &frame, size, now).await?;
+                        }
+                    }
+                }
                 if self.scheduler.can_send_path()
                     && self.paths.reserve_challenge(
                         source,
@@ -1044,6 +1065,8 @@ impl LabSession {
             // same-IP NAT rebinding may preserve the old estimates.
             if old_ip != source.ip() {
                 self.scheduler.restart_path(now);
+            } else {
+                self.scheduler.reset_mtu(now);
             }
         }
         self.idle.received(now);

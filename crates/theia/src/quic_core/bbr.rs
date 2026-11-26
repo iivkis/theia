@@ -176,7 +176,7 @@ impl Bbr {
         app_limited: bool,
     ) -> Result<(), Error> {
         if bytes == 0
-            || bytes > super::mtu::MAX_UDP_PAYLOAD as u64
+            || bytes > self.mtu.max(super::mtu::MAX_UDP_PAYLOAD as u64)
             || self.samples.len() >= MAX_SAMPLES
             || self.last_sent.is_some_and(|last| number <= last)
         {
