@@ -8,13 +8,17 @@ use tokio::net::UdpSocket;
 pub(crate) struct Options {
     pub(crate) df: bool,
     pub(crate) ecn: bool,
+    #[cfg(target_os = "windows")]
+    recvmsg: windows_sys::Win32::Networking::WinSock::LPFN_WSARECVMSG,
 }
 
 impl Options {
     pub(crate) fn configure(socket: &UdpSocket) -> Self {
         #[cfg(target_os = "linux")]
         { linux::configure(socket) }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        { windows::configure(socket) }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         { let _ = socket; Self::default() }
     }
 
@@ -22,6 +26,10 @@ impl Options {
         #[cfg(target_os = "linux")]
         if self.ecn {
             return linux::receive(socket, out).await;
+        }
+        #[cfg(target_os = "windows")]
+        if self.recvmsg.is_some() {
+            return windows::receive(socket, self.recvmsg, out).await;
         }
         let _ = self;
         let (n, peer) = socket.recv_from(out).await?;
@@ -36,6 +44,14 @@ impl Options {
                 // These errors reject the syscall without transmission.
                 // Other failures are not retried as they may be ambiguous.
                 Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOPROTOOPT | libc::EOPNOTSUPP)) => {},
+                Err(e) => return Err(e),
+            }
+        }
+        #[cfg(target_os = "windows")]
+        if self.ecn && ect {
+            match windows::send(socket, data, peer).await {
+                Ok(n) => return Ok((n, Mark::Ect0)),
+                Err(e) if matches!(e.raw_os_error(), Some(10022 | 10042 | 10045)) => {},
                 Err(e) => return Err(e),
             }
         }
@@ -200,7 +216,204 @@ mod linux {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::*;
+    use std::{mem::{size_of, size_of_val}, net::{Ipv4Addr, Ipv6Addr, SocketAddrV6}, os::windows::io::AsRawSocket, ptr};
+    use tokio::io::Interest;
+    use windows_sys::Win32::Networking::WinSock::{
+        getsockopt, setsockopt, WSAGetLastError, WSAIoctl, WSASendMsg, LPFN_WSARECVMSG,
+        WSAMSG, WSABUF, WSAID_WSARECVMSG, SIO_GET_EXTENSION_FUNCTION_POINTER,
+        IPPROTO_IP, IPPROTO_IPV6, IP_MTU_DISCOVER, IPV6_MTU_DISCOVER,
+        IP_PMTUDISC_DO, IP_RECVECN, IPV6_RECVECN, IP_ECN, IPV6_ECN,
+        SOCKADDR, SOCKET, AF_INET, AF_INET6,
+    };
+
+    // WSA_CMSG_* are C macros, not exported functions. Align the header
+    // and payload to SIZE_T exactly as the Winsock ABI does.
+    #[repr(C)]
+    struct Header { len: usize, level: i32, kind: i32 }
+    const fn align(n: usize) -> usize {
+        n.div_ceil(size_of::<usize>()) * size_of::<usize>()
+    }
+    const HEAD: usize = align(size_of::<Header>());
+
+    fn raw(socket: &UdpSocket) -> SOCKET { socket.as_raw_socket() as SOCKET }
+
+    fn set_verified(socket: &UdpSocket, level: i32, option: i32, value: i32) -> bool {
+        let mut readback = 0i32;
+        let mut len = size_of::<i32>() as i32;
+        // SAFETY: socket is live, both option buffers are exact DWORD sizes.
+        unsafe {
+            setsockopt(raw(socket), level, option, (&value as *const i32).cast(), len) == 0
+                && getsockopt(raw(socket), level, option, (&mut readback as *mut i32).cast(), &mut len) == 0
+                && len == size_of::<i32>() as i32 && value == readback
+        }
+    }
+
+    pub(super) fn configure(socket: &UdpSocket) -> Options {
+        let Ok(local) = socket.local_addr() else { return Options::default(); };
+        let (level, mtu, ecn) = if local.is_ipv4() {
+            (IPPROTO_IP, IP_MTU_DISCOVER, IP_RECVECN)
+        } else {
+            (IPPROTO_IPV6, IPV6_MTU_DISCOVER, IPV6_RECVECN)
+        };
+        let df = set_verified(socket, level, mtu, IP_PMTUDISC_DO as i32);
+        let mut recvmsg: LPFN_WSARECVMSG = None;
+        let mut written = 0u32;
+        // SAFETY: query this socket's provider for the documented function
+        // pointer. No overlapped operation is pending after this call.
+        let result = unsafe {
+            WSAIoctl(raw(socket), SIO_GET_EXTENSION_FUNCTION_POINTER,
+                (&WSAID_WSARECVMSG as *const _).cast(), size_of_val(&WSAID_WSARECVMSG) as u32,
+                (&mut recvmsg as *mut LPFN_WSARECVMSG).cast(), size_of::<LPFN_WSARECVMSG>() as u32,
+                &mut written, ptr::null_mut(), None)
+        };
+        let enabled = result == 0 && written as usize == size_of::<LPFN_WSARECVMSG>()
+            && recvmsg.is_some() && set_verified(socket, level, ecn, 1);
+        Options { df, ecn: enabled, recvmsg: if enabled { recvmsg } else { None } }
+    }
+
+    // Aligned storage, initialized before use. Encode only documented
+    // SOCKADDR_IN / SOCKADDR_IN6 fields; no pointer escapes a syscall.
+    #[repr(C, align(8))]
+    struct Address([u8; 128]);
+
+    impl Address {
+        fn from_peer(peer: SocketAddr) -> (Self, i32, i32, i32) {
+            let mut addr = Self([0; 128]);
+            addr.0[2..4].copy_from_slice(&peer.port().to_be_bytes());
+            match peer {
+                SocketAddr::V4(a) => {
+                    addr.0[..2].copy_from_slice(&AF_INET.to_ne_bytes());
+                    addr.0[4..8].copy_from_slice(&a.ip().octets());
+                    (addr, 16, IPPROTO_IP, IP_ECN)
+                }
+                SocketAddr::V6(a) => {
+                    addr.0[..2].copy_from_slice(&AF_INET6.to_ne_bytes());
+                    addr.0[4..8].copy_from_slice(&a.flowinfo().to_be_bytes());
+                    addr.0[8..24].copy_from_slice(&a.ip().octets());
+                    addr.0[24..28].copy_from_slice(&a.scope_id().to_ne_bytes());
+                    (addr, 28, IPPROTO_IPV6, IPV6_ECN)
+                }
+            }
+        }
+        fn peer(&self, len: i32) -> io::Result<SocketAddr> {
+            let family = u16::from_ne_bytes(self.0[..2].try_into().unwrap());
+            let port = u16::from_be_bytes(self.0[2..4].try_into().unwrap());
+            match family {
+                AF_INET if len >= 16 => Ok(SocketAddr::new(Ipv4Addr::from(<[u8; 4]>::try_from(&self.0[4..8]).unwrap()).into(), port)),
+                AF_INET6 if len >= 28 => Ok(SocketAddrV6::new(
+                    Ipv6Addr::from(<[u8; 16]>::try_from(&self.0[8..24]).unwrap()), port,
+                    u32::from_be_bytes(self.0[4..8].try_into().unwrap()),
+                    u32::from_ne_bytes(self.0[24..28].try_into().unwrap())).into()),
+                _ => Err(io::ErrorKind::InvalidData.into()),
+            }
+        }
+    }
+
+    fn last_error() -> io::Error {
+        // SAFETY: retrieves the thread-local Winsock error immediately.
+        io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    fn decode_control(control: &[usize], length: usize) -> io::Result<Mark> {
+        if length > size_of_val(control) { return Err(io::ErrorKind::InvalidData.into()); }
+        let mut offset = 0usize;
+        while length.saturating_sub(offset) >= HEAD {
+            // SAFETY: offset aligned, length bounded by initialized storage.
+            let p = unsafe { control.as_ptr().cast::<u8>().add(offset) };
+            let header = unsafe { &*p.cast::<Header>() };
+            if header.len < HEAD || header.len > length - offset {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            if ((header.level == IPPROTO_IP && header.kind == IP_ECN)
+                || (header.level == IPPROTO_IPV6 && header.kind == IPV6_ECN))
+                && header.len >= HEAD + size_of::<i32>() {
+                // SAFETY: checked complete integer inside this header.
+                let value = unsafe { ptr::read_unaligned(p.add(HEAD).cast::<i32>()) };
+                return match value {
+                    0 => Ok(Mark::NotEct), 1 => Ok(Mark::Ect1), 2 => Ok(Mark::Ect0), 3 => Ok(Mark::Ce),
+                    _ => Err(io::ErrorKind::InvalidData.into()),
+                };
+            }
+            offset += align(header.len);
+        }
+        Ok(Mark::NotEct)
+    }
+
+    fn receive_now(socket: &UdpSocket, recvmsg: LPFN_WSARECVMSG, out: &mut [u8]) -> io::Result<(usize, SocketAddr, Mark)> {
+        let recvmsg = recvmsg.ok_or(io::ErrorKind::Unsupported)?;
+        let mut addr = Address([0; 128]);
+        let mut control = [0usize; 16];
+        let mut buffer = WSABUF { len: out.len() as u32, buf: out.as_mut_ptr() };
+        let mut msg = WSAMSG {
+            name: addr.0.as_mut_ptr().cast::<SOCKADDR>(),
+            namelen: addr.0.len() as i32,
+            lpBuffers: &mut buffer, dwBufferCount: 1,
+            Control: WSABUF { len: size_of_val(&control) as u32, buf: control.as_mut_ptr().cast() },
+            dwFlags: 0,
+        };
+        let mut n = 0;
+        // SAFETY: nonblocking socket and initialized live buffers, no overlapped I/O.
+        if unsafe { recvmsg(raw(socket), &mut msg, &mut n, ptr::null_mut(), None) } != 0 {
+            return Err(last_error());
+        }
+        // MSG_TRUNC=0x100, MSG_CTRUNC=0x200 in Winsock.
+        if msg.dwFlags & 0x300 != 0 || n as usize > out.len() {
+            return Err(io::Error::from_raw_os_error(10040));
+        }
+        Ok((n as usize, addr.peer(msg.namelen)?, decode_control(&control, msg.Control.len as usize)?))
+    }
+
+    pub(super) async fn receive(socket: &UdpSocket, recvmsg: LPFN_WSARECVMSG, out: &mut [u8]) -> io::Result<(usize, SocketAddr, Mark)> {
+        loop {
+            socket.readable().await?;
+            match socket.try_io(Interest::READABLE, || receive_now(socket, recvmsg, out)) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn send_now(socket: &UdpSocket, data: &[u8], peer: SocketAddr) -> io::Result<usize> {
+        let (mut addr, len, level, kind) = Address::from_peer(peer);
+        let mut control = [0usize; 8];
+        let header = Header { len: HEAD + size_of::<i32>(), level, kind };
+        // SAFETY: aligned control buffer fits a header and one integer.
+        unsafe {
+            let p = control.as_mut_ptr().cast::<u8>();
+            ptr::write(p.cast::<Header>(), header);
+            ptr::write_unaligned(p.add(HEAD).cast::<i32>(), 2);
+        }
+        let mut buffer = WSABUF { len: data.len() as u32, buf: data.as_ptr().cast_mut() };
+        let mut msg = WSAMSG {
+            name: addr.0.as_mut_ptr().cast::<SOCKADDR>(), namelen: len,
+            lpBuffers: &mut buffer, dwBufferCount: 1,
+            Control: WSABUF { len: (HEAD + align(size_of::<i32>())) as u32, buf: control.as_mut_ptr().cast() },
+            dwFlags: 0,
+        };
+        let mut n = 0;
+        // SAFETY: synchronous nonblocking send, all buffers live throughout;
+        // Winsock reads the payload. No pending overlapped operation.
+        if unsafe { WSASendMsg(raw(socket), &mut msg, 0, &mut n, ptr::null_mut(), None) } != 0 {
+            return Err(last_error());
+        }
+        Ok(n as usize)
+    }
+
+    pub(super) async fn send(socket: &UdpSocket, data: &[u8], peer: SocketAddr) -> io::Result<usize> {
+        loop {
+            socket.writable().await?;
+            match socket.try_io(Interest::WRITABLE, || send_now(socket, data, peer)) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
 mod tests {
     use super::*;
     use std::time::Duration;
