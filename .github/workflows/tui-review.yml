@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: 837d34c427336dabfe02b7e19b75a66509627b34
+          ref: 902bceb366e07a2ff7f35831c81d8efa0fa6d47e
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -119,6 +119,9 @@ jobs:
             geodata_automatic_activation_preserves_pending_edit_and_rejects_rollback \
             client_status_requires_canonical_fields_and_exact_revision_cas \
             real_local_proxy_modes_validate_credentials_and_relay_over_both_transports \
+            pinned_sources_and_checksums \
+            compact_cache_never_reuses_old_full_edition \
+            unrelated_upstream_category_keys_do_not_break_selected_rules \
             conditional_snapshot_is_exact_and_rejects_ambiguous_headers \
             conditional_refresh_reuses_only_the_exact_verified_snapshot \
             cache_rejects_rollback_and_equivocation \
@@ -172,7 +175,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "837d34c427336dabfe02b7e19b75a66509627b34"
+          assert manifest["source_sha"] == "902bceb366e07a2ff7f35831c81d8efa0fa6d47e"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
@@ -219,7 +222,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 837d34c427336dabfe02b7e19b75a66509627b34
+          ref: 902bceb366e07a2ff7f35831c81d8efa0fa6d47e
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
