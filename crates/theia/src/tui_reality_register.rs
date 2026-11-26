@@ -69,6 +69,7 @@ pub(crate) struct RegistrationPanel {
     error: Option<String>,
     owned: Option<crate::tui_staged_material::StagedMaterial>,
     staged_save: Option<PathBuf>,
+    wizard_failure: Option<(PathBuf, Option<Error>, bool)>,
 }
 
 fn labels(role: Role) -> &'static [&'static str] {
@@ -178,6 +179,7 @@ impl RegistrationPanel {
             error: None,
             owned: None,
             staged_save: None,
+            wizard_failure: None,
         })
     }
 
@@ -209,6 +211,7 @@ impl RegistrationPanel {
             error: None,
             owned: None,
             staged_save: None,
+            wizard_failure: None,
         })
     }
 
@@ -240,6 +243,7 @@ impl RegistrationPanel {
             error: None,
             owned: None,
             staged_save: None,
+            wizard_failure: None,
         })
     }
 
@@ -459,6 +463,12 @@ impl RegistrationPanel {
         false
     }
 
+    // A staged wizard consumes this typed result; ordinary registration keeps its own report.
+    // The last flag means a write is known to have completed but reload failed.
+    pub(crate) fn take_wizard_failure(&mut self) -> Option<(PathBuf, Option<Error>, bool)> {
+        self.wizard_failure.take()
+    }
+
     pub(crate) fn poll(&mut self) -> Option<Editor> {
         match &self.stage {
             Stage::Preview(rx) => match rx.try_recv() {
@@ -481,13 +491,16 @@ impl RegistrationPanel {
                     }
                     Ok(Err(SaveError::Refused(Error::Indeterminate)))
                     | Err(TryRecvError::Disconnected) => {
+                        if let Some(root) = &self.staged_save { self.wizard_failure = Some((root.clone(), None, false)); }
                         self.stage = Stage::Done(format!("Запись не подтверждена. Проверьте файл настроек и подготовленный каталог, затем откройте конфигурацию заново. Повтор запрещён до проверки.\nФайл: {}\nКаталог: {:?}\nEsc: закрыть.", self.config.display(), self.staged_save));
                     }
                     Ok(Err(SaveError::SavedReloadFailed)) => {
+                        if let Some(root) = &self.staged_save { self.wizard_failure = Some((root.clone(), None, true)); }
                         self.stage = Stage::Done("TOML сохранён, перечитать редактор не удалось. Откройте заново; runtime не изменён.\nEsc: закрыть.".into());
                     }
                     Ok(Err(SaveError::Refused(error))) => {
-                        if self.staged_save.is_some() {
+                        if let Some(root) = &self.staged_save {
+                            self.wizard_failure = Some((root.clone(), Some(error), false));
                             self.stage = Stage::Done("Не удалось записать настройки. Подготовленные материалы удалены. Откройте сохранённую конфигурацию и новый мастер. Esc: закрыть.".into());
                         } else {
                             self.error = Some(format!("ОТКАЗ: {error}"));
@@ -712,6 +725,7 @@ mod tests {
             error: None,
             owned: None,
             staged_save: None,
+            wizard_failure: None,
         };
         let request = p.request().unwrap();
         assert!(matches!(&request, Request::ReplaceServer(r) if r.id == "selected"));

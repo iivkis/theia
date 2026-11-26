@@ -1498,6 +1498,14 @@ impl Wizard {
                 self.stage = WizardStage::Success;
                 return Some(editor);
             }
+            if let Some((root, error, saved_reload_failed)) = panel.take_wizard_failure() {
+                self.registration = None;
+                self.stage = if saved_reload_failed {
+                    WizardStage::SaveFailed { root, message: "Настройки записаны, но открыть их не удалось. Откройте файл заново. Не повторяйте запись.".into(), retry: false, inspected: false }
+                } else {
+                    save_failed(root, error)
+                };
+            }
             return None;
         }
         let result = match &self.stage {
@@ -1603,7 +1611,7 @@ impl Wizard {
             WizardStage::Resolving(_, _) => progress_text("Поиск сетевых адресов", self.progress.load(Ordering::Relaxed), self.total),
             WizardStage::ProbeConfirm(value) => {
                 let targets = value.1.plan.as_ref().map(|p| p.targets()).unwrap_or_default();
-                let mut text = format!("Theia проверит защищённые соединения с выбранными сайтами.\n\nАдресов для проверки: {} · не удалось найти адрес: {}\nТолько перечисленные IP и имена, порт 443, TLS 1.3, HTTP/2 и HTTP/3.\nПовторная сверка DNS, по две проверки без перенаправлений, ключей и тела запроса.\nНастройки не записываются. Лучшие сайты будут перепроверены.", targets.len(), value.1.unresolved.len());
+                let mut text = format!("Theia проверит защищённые соединения с выбранными сайтами.\n\nАдресов для проверки: {} · не удалось найти адрес: {}\nТолько перечисленные IP и имена, порт 443, TLS 1.3, HTTP/2 и HTTP/3.\nСверка DNS сервера и сайтов; по две проверки HTTPS HEAD без перенаправлений, ключей и тела запроса.\nНастройки не записываются. Лучшие сайты будут перепроверены.", targets.len(), value.1.unresolved.len());
                 if self.tls_details {
                     text.push_str("\n\nТочные цели проверки\n");
                     for target in targets {
