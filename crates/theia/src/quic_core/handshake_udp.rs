@@ -56,7 +56,7 @@ fn params(server: bool, local: &[u8; CID_LEN], original: &[u8; CID_LEN]) -> Resu
     let mut out = Vec::new();
     parameters::append(&mut out, 0x0f, local).map_err(|_| Error::Protocol)?;
     if server { parameters::append(&mut out, 0x00, original).map_err(|_| Error::Protocol)?; }
-    for (id, value) in [(0x03, MTU as u64), (0x04, CREDIT), (0x07, CREDIT), (0x09, STREAMS)] {
+    for (id, value) in [(0x03, MTU as u64), (0x04, CREDIT), (0x05, CREDIT), (0x06, CREDIT), (0x07, CREDIT), (0x08, STREAMS), (0x09, STREAMS)] {
         let mut scratch = [0; 8];
         let value = encode_varint(value, &mut scratch).ok_or(Error::Protocol)?;
         parameters::append(&mut out, id, value).map_err(|_| Error::Protocol)?;
@@ -250,8 +250,8 @@ pub async fn establish(socket: UdpSocket, peer: SocketAddr, version: Version,
     let limits = peer_params.validate(PeerContext { server: !server, initial_source: &remote,
         original_destination: &original, retry_source: None }).map_err(|_| Error::Protocol)?;
     if limits.max_data != CREDIT || limits.max_streams_uni != STREAMS
-        || limits.max_streams_bidi != 0 || limits.max_udp_payload != MTU as u64
-        || peer_params.integer(0x07).map_err(|_| Error::Protocol)? != Some(CREDIT) {
+        || limits.max_streams_bidi != STREAMS || limits.max_udp_payload != MTU as u64
+        || [0x05, 0x06, 0x07].into_iter().any(|id| peer_params.integer(id) != Ok(Some(CREDIT))) {
         return Err(Error::Protocol);
     }
     LabSession::connect(socket, peer, server, local, remote, handshake.application.take().ok_or(Error::Protocol)?)

@@ -13,6 +13,7 @@ pub struct ReceiveFlow {
     peer_bit: u64,
     max_bidi: u64,
     max_uni: u64,
+    max_local_bidi: u64,
     stream_limit: u64,
     window: usize,
     max_data: u64,
@@ -28,11 +29,33 @@ impl ReceiveFlow {
         if count > MAX_STREAMS || window == 0 || window > MAX_WINDOW
             || (count as usize).saturating_mul(window) > MAX_TOTAL_WINDOW
             || stream_limit > MAX_VARINT || max_data > MAX_VARINT { return Err(Error::Limit); }
-        Ok(Self { peer_bit: u64::from(!local_server), max_bidi, max_uni,
+        Ok(Self { peer_bit: u64::from(!local_server), max_bidi, max_uni, max_local_bidi: 0,
             stream_limit, window, max_data, used: 0, streams: BTreeMap::new() })
     }
 
+    pub fn enable_local_bidi(&mut self, limit: u64) -> Result<(), Error> {
+        let count = self.max_bidi.checked_add(self.max_uni).and_then(|n| n.checked_add(limit)).ok_or(Error::Limit)?;
+        if count > MAX_STREAMS || (count as usize).saturating_mul(self.window) > MAX_TOTAL_WINDOW
+            || limit < self.max_local_bidi { return Err(Error::Limit); }
+        self.max_local_bidi = limit;
+        Ok(())
+    }
+
+    pub fn register_local_bidi(&mut self, id: u64) -> Result<(), Error> {
+        if id > MAX_VARINT || id & 2 != 0 || id & 1 == self.peer_bit || id / 4 >= self.max_local_bidi {
+            return Err(Error::StreamId);
+        }
+        if !self.streams.contains_key(&id) {
+            let buffer = ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?;
+            self.streams.insert(id, buffer);
+        }
+        Ok(())
+    }
+
     fn check_id(&self, id: u64) -> Result<(), Error> {
+        if id & 1 != self.peer_bit && id & 2 == 0 && self.streams.contains_key(&id) {
+            return Ok(());
+        }
         let limit = if id & 2 == 0 { self.max_bidi } else { self.max_uni };
         if id > MAX_VARINT || id & 1 != self.peer_bit || id / 4 >= limit {
             Err(Error::StreamId)
@@ -68,6 +91,18 @@ impl ReceiveFlow {
 
     pub fn read(&mut self, id: u64, output: &mut [u8]) -> Result<usize, Error> {
         Ok(self.streams.get_mut(&id).ok_or(Error::StreamId)?.read(output))
+    }
+
+    /// Read and replenish only the consumed absolute credit. The caller must
+    /// queue both MAX_DATA and MAX_STREAM_DATA before exposing the new limits
+    /// to the peer. Neither duplicate nor out-of-order bytes grant credit.
+    pub fn read_replenish(&mut self, id: u64, output: &mut [u8]) -> Result<(usize, u64, u64), Error> {
+        let stream = self.streams.get_mut(&id).ok_or(Error::StreamId)?;
+        let n = stream.read(output);
+        let limit = stream.limit().saturating_add(n as u64).min(MAX_VARINT);
+        stream.extend_limit(limit).map_err(Error::Receive)?;
+        self.max_data = self.max_data.saturating_add(n as u64).min(MAX_VARINT);
+        Ok((n, self.max_data, limit))
     }
 
     pub fn finished(&self, id: u64) -> bool {

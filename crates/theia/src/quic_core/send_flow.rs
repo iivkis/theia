@@ -18,6 +18,10 @@ struct Stream {
 pub struct SendFlow {
     local_bit: u64,
     max_streams: u64,
+    max_bidi: u64,
+    peer_bidi: u64,
+    next_uni: u64,
+    next_bidi: u64,
     initial_limit: u64,
     max_data: u64,
     used: u64,
@@ -28,15 +32,50 @@ impl SendFlow {
     pub fn new(server: bool, max_streams: u64, stream_limit: u64, max_data: u64) -> Result<Self, Error> {
         if max_streams > (1 << 60) || stream_limit > MAX_VARINT || max_data > MAX_VARINT { return Err(Error::Limit); }
         Ok(Self { local_bit: u64::from(server), max_streams: max_streams.min(MAX_STREAMS),
+            max_bidi: 0, peer_bidi: 0, next_uni: 0, next_bidi: 0,
             initial_limit: stream_limit, max_data, used: 0, streams: BTreeMap::new() })
     }
 
     pub fn open(&mut self) -> Result<u64, Error> {
-        let n = self.streams.len() as u64;
+        let n = self.next_uni;
         if n >= self.max_streams { return Err(Error::Limit); }
         let id = n * 4 + 2 + self.local_bit;
         self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false });
+        self.next_uni += 1;
         Ok(id)
+    }
+
+    /// Fixed development cap for local and peer bidirectional directions.
+    pub fn enable_bidi(&mut self, local: u64, peer: u64) -> Result<(), Error> {
+        if local > MAX_STREAMS || peer > MAX_STREAMS || local < self.next_bidi || peer < self.peer_bidi {
+            return Err(Error::Limit);
+        }
+        self.max_bidi = local;
+        self.peer_bidi = peer;
+        Ok(())
+    }
+
+    pub fn open_bidi(&mut self) -> Result<u64, Error> {
+        if self.next_bidi >= self.max_bidi { return Err(Error::Limit); }
+        let id = self.next_bidi * 4 + self.local_bit;
+        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false });
+        self.next_bidi += 1;
+        Ok(id)
+    }
+
+    /// The receive side must first validate that the peer opened this stream.
+    pub fn register_peer_bidi(&mut self, id: u64) -> Result<(), Error> {
+        if id > MAX_VARINT || id & 2 != 0 || id & 1 == self.local_bit || id / 4 >= self.peer_bidi {
+            return Err(Error::Stream);
+        }
+        self.streams.entry(id).or_insert(Stream { offset: 0, limit: self.initial_limit, fin: false });
+        Ok(())
+    }
+
+    pub fn max_bidi(&mut self, value: u64) -> Result<(), Error> {
+        if value > (1 << 60) { return Err(Error::Limit); }
+        self.max_bidi = self.max_bidi.max(value.min(MAX_STREAMS));
+        Ok(())
     }
 
     pub fn max_data(&mut self, value: u64) -> Result<(), Error> {

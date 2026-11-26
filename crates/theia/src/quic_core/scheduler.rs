@@ -42,7 +42,11 @@ impl Default for Scheduler {
 }
 
 impl Scheduler {
-    pub fn can_queue(&self) -> bool { self.frames.len() < MAX_FRAMES && self.next_id < u64::MAX }
+    pub fn can_queue(&self) -> bool { self.can_queue_n(1) }
+
+    pub fn can_queue_n(&self, n: usize) -> bool {
+        n <= MAX_FRAMES.saturating_sub(self.frames.len()) && (n as u64) <= u64::MAX - self.next_id
+    }
 
     pub fn enqueue(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
         if !self.can_queue() || bytes.is_empty() || bytes.len() > 1100 { return Err(Error::Limit); }

@@ -105,6 +105,8 @@ impl ReceiveBuffer {
         self.final_size == Some(self.read_offset)
     }
 
+    pub fn limit(&self) -> u64 { self.limit }
+
     pub fn highest_offset(&self) -> u64 {
         self.highest
     }

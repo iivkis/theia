@@ -253,4 +253,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bidi_and_replenishment_respects_direction_and_consumption() {
+        use crate::quic_core::{flow::ReceiveFlow, send_flow::SendFlow};
+        let mut send = SendFlow::new(false, 1, 4, 4).unwrap();
+        send.enable_bidi(1, 1).unwrap();
+        let id = send.open_bidi().unwrap();
+        assert_eq!(id, 0);
+        let mut receive = ReceiveFlow::new(true, 1, 1, 4, 4, 4).unwrap();
+        receive.enable_local_bidi(1).unwrap();
+        assert!(receive.insert(1, 0, b"x", false).is_err());
+        receive.insert(id, 0, b"abcd", false).unwrap();
+        let mut bytes = [0; 2];
+        assert_eq!(receive.read_replenish(id, &mut bytes), Ok((2, 6, 6)));
+        assert_eq!(&bytes, b"ab");
+        receive.insert(id, 4, b"ef", true).unwrap();
+        assert_eq!(receive.used(), 6);
+        receive.register_local_bidi(1).unwrap();
+        assert!(receive.insert(3, 0, b"x", false).is_err());
+        send.register_peer_bidi(1).unwrap();
+        assert!(send.register_peer_bidi(3).is_err());
+        assert!(send.encode(1, b"ok", true).is_ok());
+    }
+
 }

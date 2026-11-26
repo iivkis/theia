@@ -36,6 +36,7 @@ pub struct LabSession {
     receive: ReceiveFlow,
     scheduler: Scheduler,
     closed: bool,
+    server: bool,
 }
 
 impl LabSession {
@@ -50,16 +51,30 @@ impl LabSession {
             || local == peer || local_cid == remote_cid || local_cid == [0; CID_LEN]
             || remote_cid == [0; CID_LEN] { return Err(Error::Scope); }
         socket.connect(peer).await.map_err(Error::Io)?;
+        let mut send = SendFlow::new(server, MAX_STREAMS, FLOW_LIMIT, FLOW_LIMIT).map_err(Error::Send)?;
+        send.enable_bidi(MAX_STREAMS, MAX_STREAMS).map_err(Error::Send)?;
+        let mut receive = ReceiveFlow::new(server, MAX_STREAMS, MAX_STREAMS, FLOW_LIMIT,
+            FLOW_LIMIT as usize, FLOW_LIMIT).map_err(Error::Receive)?;
+        receive.enable_local_bidi(MAX_STREAMS).map_err(Error::Receive)?;
         Ok(Self { socket, local_cid, remote_cid, reader: Reader::new(keys.remote),
             writer: Writer::new(keys.local), acknowledgments: History::default(),
-            send: SendFlow::new(server, MAX_STREAMS, FLOW_LIMIT, FLOW_LIMIT).map_err(Error::Send)?,
-            receive: ReceiveFlow::new(server, 0, MAX_STREAMS, FLOW_LIMIT, FLOW_LIMIT as usize, FLOW_LIMIT).map_err(Error::Receive)?,
-            scheduler: Scheduler::default(), closed: false })
+            send, receive,
+            scheduler: Scheduler::default(), closed: false, server })
     }
 
     pub fn open_uni(&mut self) -> Result<u64, Error> {
         if self.closed { return Err(Error::Closed); }
         self.send.open().map_err(Error::Send)
+    }
+
+    pub fn open_bidi(&mut self) -> Result<u64, Error> {
+        if self.closed { return Err(Error::Closed); }
+        let id = self.send.open_bidi().map_err(Error::Send)?;
+        if let Err(e) = self.receive.register_local_bidi(id) {
+            self.closed = true;
+            return Err(Error::Receive(e));
+        }
+        Ok(id)
     }
 
     pub fn queue(&mut self, id: u64, bytes: &[u8], fin: bool) -> Result<(), Error> {
@@ -74,6 +89,28 @@ impl LabSession {
     pub fn read(&mut self, id: u64, bytes: &mut [u8]) -> Result<usize, Error> {
         if self.closed { return Err(Error::Closed); }
         self.receive.read(id, bytes).map_err(Error::Receive)
+    }
+
+    /// Explicit window replenishment for streaming fixtures. Reserving queue
+    /// capacity first prevents granting credit without its reliable update.
+    pub fn read_replenish(&mut self, id: u64, bytes: &mut [u8]) -> Result<usize, Error> {
+        if self.closed { return Err(Error::Closed); }
+        if !self.scheduler.can_queue_n(2) { return Err(Error::Schedule(super::scheduler::Error::Limit)); }
+        let (n, connection, stream) = self.receive.read_replenish(id, bytes).map_err(Error::Receive)?;
+        if n != 0 {
+            for (ty, numbers) in [(0x10, vec![connection]), (0x11, vec![id, stream])] {
+                let mut frame = vec![ty];
+                for value in numbers {
+                    let mut scratch = [0; 8];
+                    frame.extend_from_slice(super::wire::encode_varint(value, &mut scratch).ok_or(Error::Protocol)?);
+                }
+                if let Err(e) = self.scheduler.enqueue(frame) {
+                    self.closed = true;
+                    return Err(Error::Schedule(e));
+                }
+            }
+        }
+        Ok(n)
     }
 
     pub fn finished(&self, id: u64) -> bool { !self.closed && self.receive.finished(id) }
@@ -140,11 +177,16 @@ impl LabSession {
             match frame {
                 Frame::Padding | Frame::Ping => {}
                 Frame::Ack(ack) => self.scheduler.acknowledge(&ack, now).map_err(Error::Schedule)?,
-                Frame::Stream { id, offset, data, fin } if id & 2 != 0 =>
-                    self.receive.insert(id, offset, data, fin).map_err(Error::Receive)?,
+                Frame::Stream { id, offset, data, fin } => {
+                    self.receive.insert(id, offset, data, fin).map_err(Error::Receive)?;
+                    if id & 2 == 0 && id & 1 != u64::from(self.server) {
+                        self.send.register_peer_bidi(id).map_err(Error::Send)?;
+                    }
+                }
                 Frame::MaxData(n) => self.send.max_data(n).map_err(Error::Send)?,
                 Frame::MaxStreamData { id, limit } => self.send.max_stream_data(id, limit).map_err(Error::Send)?,
                 Frame::MaxStreams { bidi: false, limit } => self.send.max_streams(limit).map_err(Error::Send)?,
+                Frame::MaxStreams { bidi: true, limit } => self.send.max_bidi(limit.min(MAX_STREAMS)).map_err(Error::Send)?,
                 Frame::Close { .. } => { self.closed = true; return Ok(true); }
                 _ => return Err(Error::Protocol),
             }
