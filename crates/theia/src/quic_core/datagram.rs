@@ -11,10 +11,23 @@ const MAX_ROUTES: usize = 16384;
 pub const CID_LEN: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error { Malformed, MixedCid, Limit, Collision, Owner, Unsupported }
+pub enum Error {
+    Malformed,
+    MixedCid,
+    Limit,
+    Collision,
+    Owner,
+    Unsupported,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PacketKind { Initial, Handshake, Application, Retry, VersionNegotiation }
+pub enum PacketKind {
+    Initial,
+    Handshake,
+    Application,
+    Retry,
+    VersionNegotiation,
+}
 
 #[derive(Debug)]
 pub struct Packet<'a> {
@@ -30,16 +43,27 @@ pub struct Packet<'a> {
 /// An Initial's 1200-byte minimum applies to the whole UDP datagram,
 /// not each individual packet.
 pub fn split(datagram: &[u8]) -> Result<Vec<Packet<'_>>, Error> {
-    if datagram.is_empty() || datagram.len() > MAX_DATAGRAM { return Err(Error::Limit); }
+    if datagram.is_empty() || datagram.len() > MAX_DATAGRAM {
+        return Err(Error::Limit);
+    }
     let mut out: Vec<Packet<'_>> = Vec::new();
     let mut remaining = datagram;
     while !remaining.is_empty() {
-        if out.len() == MAX_PACKETS { return Err(Error::Limit); }
+        if out.len() == MAX_PACKETS {
+            return Err(Error::Limit);
+        }
         let first = remaining[0];
         let packet = if first & 0x80 == 0 {
-            if first & 0x40 == 0 || remaining.len() < 1 + CID_LEN + 4 + 16 { return Err(Error::Malformed); }
-            Packet { kind: PacketKind::Application, version: None, destination: &remaining[1..1 + CID_LEN],
-                source: None, bytes: remaining }
+            if first & 0x40 == 0 || remaining.len() < 1 + CID_LEN + 4 + 16 {
+                return Err(Error::Malformed);
+            }
+            Packet {
+                kind: PacketKind::Application,
+                version: None,
+                destination: &remaining[1..1 + CID_LEN],
+                source: None,
+                bytes: remaining,
+            }
         } else {
             let h = long(remaining).ok_or(Error::Malformed)?;
             let kind = match h.kind {
@@ -50,20 +74,33 @@ pub fn split(datagram: &[u8]) -> Result<Vec<Packet<'_>>, Error> {
                 Kind::ZeroRtt => return Err(Error::Unsupported),
             };
             if (kind == PacketKind::Initial && !(8..=20).contains(&h.dcid.len()))
-                || (kind != PacketKind::Initial && h.dcid.len() != CID_LEN) || h.scid.len() > 20 {
+                || (kind != PacketKind::Initial && h.dcid.len() != CID_LEN)
+                || h.scid.len() > 20
+            {
                 return Err(Error::Malformed);
             }
-            if kind != PacketKind::VersionNegotiation && first & 0x40 == 0 { return Err(Error::Malformed); }
-            if kind == PacketKind::Initial && datagram.len() < 1200 { return Err(Error::Malformed); }
-            if matches!(kind, PacketKind::Retry | PacketKind::VersionNegotiation) && !out.is_empty() {
+            if kind != PacketKind::VersionNegotiation && first & 0x40 == 0 {
                 return Err(Error::Malformed);
             }
-            Packet { kind, version: Version::from_wire(h.version), destination: h.dcid,
-                source: Some(h.scid), bytes: &remaining[..h.end] }
+            if kind == PacketKind::Initial && datagram.len() < 1200 {
+                return Err(Error::Malformed);
+            }
+            if matches!(kind, PacketKind::Retry | PacketKind::VersionNegotiation) && !out.is_empty()
+            {
+                return Err(Error::Malformed);
+            }
+            Packet {
+                kind,
+                version: Version::from_wire(h.version),
+                destination: h.dcid,
+                source: Some(h.scid),
+                bytes: &remaining[..h.end],
+            }
         };
         if let Some(head) = out.first() {
             if packet.destination != head.destination
-                || (packet.version.is_some() && packet.version != head.version) {
+                || (packet.version.is_some() && packet.version != head.version)
+            {
                 return Err(Error::MixedCid);
             }
         }
@@ -74,7 +111,11 @@ pub fn split(datagram: &[u8]) -> Result<Vec<Packet<'_>>, Error> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Route { Existing(u64), NewInitial, Drop }
+pub enum Route {
+    Existing(u64),
+    NewInitial,
+    Drop,
+}
 
 /// The owner is a non-reused connection handle supplied by the listener.
 /// A CID collision cannot overwrite an existing connection, and retirement
@@ -86,21 +127,34 @@ pub struct Demux {
 
 impl Demux {
     pub fn new(limit: usize) -> Result<Self, Error> {
-        if limit == 0 || limit > MAX_ROUTES { return Err(Error::Limit); }
-        Ok(Self { limit, routes: BTreeMap::new() })
+        if limit == 0 || limit > MAX_ROUTES {
+            return Err(Error::Limit);
+        }
+        Ok(Self {
+            limit,
+            routes: BTreeMap::new(),
+        })
     }
 
     pub fn register(&mut self, cid: [u8; CID_LEN], owner: u64) -> Result<(), Error> {
         if let Some(old) = self.routes.get(&cid) {
-            return if *old == owner { Ok(()) } else { Err(Error::Collision) };
+            return if *old == owner {
+                Ok(())
+            } else {
+                Err(Error::Collision)
+            };
         }
-        if self.routes.len() >= self.limit { return Err(Error::Limit); }
+        if self.routes.len() >= self.limit {
+            return Err(Error::Limit);
+        }
         self.routes.insert(cid, owner);
         Ok(())
     }
 
     pub fn retire(&mut self, cid: [u8; CID_LEN], owner: u64) -> Result<(), Error> {
-        if self.routes.get(&cid) != Some(&owner) { return Err(Error::Owner); }
+        if self.routes.get(&cid) != Some(&owner) {
+            return Err(Error::Owner);
+        }
         self.routes.remove(&cid);
         Ok(())
     }
@@ -109,14 +163,18 @@ impl Demux {
         self.routes.retain(|_, value| *value != owner);
     }
 
-    pub fn owner(&self, cid: [u8; CID_LEN]) -> Option<u64> { self.routes.get(&cid).copied() }
+    pub fn owner(&self, cid: [u8; CID_LEN]) -> Option<u64> {
+        self.routes.get(&cid).copied()
+    }
 
     /// Unknown Initial is only a candidate, never an allocated connection.
     /// The caller applies Retry, admission and resource gates separately.
     pub fn classify(&self, datagram: &[u8]) -> Result<Route, Error> {
         let packets = split(datagram)?;
         let head = packets.first().ok_or(Error::Malformed)?;
-        let owner = <[u8; CID_LEN]>::try_from(head.destination).ok().and_then(|cid| self.owner(cid));
+        let owner = <[u8; CID_LEN]>::try_from(head.destination)
+            .ok()
+            .and_then(|cid| self.owner(cid));
         Ok(if let Some(owner) = owner {
             Route::Existing(owner)
         } else if head.kind == PacketKind::Initial {

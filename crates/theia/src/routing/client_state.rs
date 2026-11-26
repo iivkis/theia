@@ -85,7 +85,8 @@ impl LocalPolicy {
         match &self.floor {
             None => true,
             Some((path, scope)) => floor_bytes(path)
-                .ok().flatten()
+                .ok()
+                .flatten()
                 .and_then(|bytes| read_floor(&bytes, scope).ok())
                 .is_some_and(|floor| floor.checkpoint == self.checkpoint),
         }
@@ -93,7 +94,14 @@ impl LocalPolicy {
 
     #[cfg(test)]
     pub(super) fn fixture(digest: [u8; 32]) -> Self {
-        Self { checkpoint: Checkpoint { revision: 1, digest }, deadline: Instant::now() + TTL, floor: None }
+        Self {
+            checkpoint: Checkpoint {
+                revision: 1,
+                digest,
+            },
+            deadline: Instant::now() + TTL,
+            floor: None,
+        }
     }
 }
 
@@ -180,7 +188,10 @@ impl Cache {
         self.dpi.authorize_policy(Some(LocalPolicy {
             checkpoint: snapshot.checkpoint(),
             deadline,
-            floor: self.checkpoint.clone().map(|path| (path, self.scope.clone())),
+            floor: self
+                .checkpoint
+                .clone()
+                .map(|path| (path, self.scope.clone())),
         }));
     }
 
@@ -191,9 +202,13 @@ impl Cache {
     {
         let mut state = self.state.lock().await;
         let now = Instant::now();
-        if let (Some(deadline), Some(snapshot)) = (state.expires.filter(|until| now < *until), state.snapshot.as_ref()) {
+        if let (Some(deadline), Some(snapshot)) = (
+            state.expires.filter(|until| now < *until),
+            state.snapshot.as_ref(),
+        ) {
             let result = if let Some(path) = &self.checkpoint {
-                floor_bytes(path).and_then(|bytes| bytes.ok_or(ClientError::Configuration))
+                floor_bytes(path)
+                    .and_then(|bytes| bytes.ok_or(ClientError::Configuration))
                     .and_then(|bytes| read_floor(&bytes, &self.scope))
                     .map(|floor| floor.checkpoint == snapshot.checkpoint())
             } else {
@@ -322,7 +337,9 @@ impl ExchangeEvidence {
         use std::sync::atomic::Ordering;
         let bit = if upload { 1 } else { 2 };
         let previous = self.0.fetch_or(bit, Ordering::Relaxed);
-        if previous != 3 && (previous | bit) == 3 { crate::traffic::dpi_bidirectional(); }
+        if previous != 3 && (previous | bit) == 3 {
+            crate::traffic::dpi_bidirectional();
+        }
     }
 }
 
@@ -331,7 +348,12 @@ struct DirectRelayError {
     peer: bool,
 }
 impl DirectRelayError {
-    fn io(peer: bool) -> Self { Self { error: ClientError::Io, peer } }
+    fn io(peer: bool) -> Self {
+        Self {
+            error: ClientError::Io,
+            peer,
+        }
+    }
 }
 async fn copy_direction(
     mut input: impl AsyncRead + Unpin,
@@ -343,9 +365,15 @@ async fn copy_direction(
 ) -> Result<(), DirectRelayError> {
     let mut bytes = [0u8; 16 * 1024];
     loop {
-        let count = input.read(&mut bytes).await.map_err(|_| DirectRelayError::io(!upload))?;
+        let count = input
+            .read(&mut bytes)
+            .await
+            .map_err(|_| DirectRelayError::io(!upload))?;
         if count == 0 {
-            output.shutdown().await.map_err(|_| DirectRelayError::io(upload))?;
+            output
+                .shutdown()
+                .await
+                .map_err(|_| DirectRelayError::io(upload))?;
             activity.half_closed();
             return Ok(());
         }
@@ -354,7 +382,9 @@ async fn copy_direction(
             .await
             .map_err(|_| DirectRelayError::io(upload))?;
         activity.data(count);
-        if let Some(evidence) = evidence { evidence.wrote(upload); }
+        if let Some(evidence) = evidence {
+            evidence.wrote(upload);
+        }
         if upload {
             meter.upload(count);
         } else {
@@ -377,17 +407,22 @@ pub(crate) async fn relay_direct_after_first(
     meter.upload(upload);
     meter.download(download);
     let activity = crate::relay_liveness::Activity::new();
-    let evidence = (upload != 0 && download != 0).then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
+    let evidence = (upload != 0 && download != 0)
+        .then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
     let (cr, cw) = client.into_split();
     let (tr, tw) = target.into_split();
     let result = activity
         .run(
             copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref()),
             copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref()),
-            DirectRelayError { error: ClientError::Timeout, peer: false },
+            DirectRelayError {
+                error: ClientError::Timeout,
+                peer: false,
+            },
         )
         .await;
-    let exchanged = evidence.is_some_and(|value| value.0.load(std::sync::atomic::Ordering::Relaxed) == 3);
+    let exchanged =
+        evidence.is_some_and(|value| value.0.load(std::sync::atomic::Ordering::Relaxed) == 3);
     let peer_failure = result.as_ref().is_err_and(|error| error.peer);
     (result.map_err(|error| error.error), exchanged, peer_failure)
 }
@@ -411,7 +446,11 @@ mod tests {
         let second = cache.get(|_| async { Ok(wire) }).await.unwrap();
         assert!(!cache.dpi.policy_current(digest));
         assert!(cache.dpi.policy_current(second.digest()));
-        let expired = LocalPolicy { checkpoint: second.checkpoint(), deadline: Instant::now(), floor: None };
+        let expired = LocalPolicy {
+            checkpoint: second.checkpoint(),
+            deadline: Instant::now(),
+            floor: None,
+        };
         assert!(!expired.valid(second.digest()));
     }
 

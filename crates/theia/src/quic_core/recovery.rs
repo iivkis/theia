@@ -27,8 +27,13 @@ impl Default for Rtt {
 
 impl Rtt {
     /// ACK delay may only be subtracted after handshake confirmation.
-    pub fn update(&mut self, measured: Duration, ack_delay: Duration, max_ack_delay: Duration,
-                  handshake_confirmed: bool) {
+    pub fn update(
+        &mut self,
+        measured: Duration,
+        ack_delay: Duration,
+        max_ack_delay: Duration,
+        handshake_confirmed: bool,
+    ) {
         self.latest = measured;
         let Some(previous_min) = self.minimum else {
             self.minimum = Some(measured);
@@ -38,7 +43,11 @@ impl Rtt {
         };
         let minimum = previous_min.min(measured);
         self.minimum = Some(minimum);
-        let delay = if handshake_confirmed { ack_delay.min(max_ack_delay) } else { Duration::ZERO };
+        let delay = if handshake_confirmed {
+            ack_delay.min(max_ack_delay)
+        } else {
+            Duration::ZERO
+        };
         let adjusted = if measured.saturating_sub(minimum) >= delay {
             measured.saturating_sub(delay)
         } else {
@@ -87,8 +96,9 @@ impl PathBudget {
     }
 
     pub fn can_send(&self, bytes: u64) -> bool {
-        self.sent.checked_add(bytes).is_some_and(|total|
-            self.validated || total <= self.received.saturating_mul(3))
+        self.sent
+            .checked_add(bytes)
+            .is_some_and(|total| self.validated || total <= self.received.saturating_mul(3))
     }
 
     pub fn reserve_send(&mut self, bytes: u64) -> bool {
@@ -111,7 +121,9 @@ impl PathBudget {
 mod tests {
     use super::*;
 
-    fn ms(n: u64) -> Duration { Duration::from_millis(n) }
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
 
     #[test]
     fn rtt_minimum_and_pto_backoff() {

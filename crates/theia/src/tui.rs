@@ -573,7 +573,9 @@ fn page_actions_for(
                 }
                 (Role::Client, 'd') if editor.direct_dpi_allowed() => "Отключить Anti-DPI",
                 (Role::Client, 'd') => "Разрешить Anti-DPI",
-                (Role::Client, 'u') if editor.direct_dpi_stun_allowed() => "Отключить локальный STUN",
+                (Role::Client, 'u') if editor.direct_dpi_stun_allowed() => {
+                    "Отключить локальный STUN"
+                }
                 (Role::Client, 'u') => "Разрешить локальный STUN",
                 (Role::Client, 'V') if !active => "Состояние выбранного профиля",
                 (_, 'z') if advanced => "Скрыть расширенные настройки",
@@ -3271,9 +3273,16 @@ impl Interaction {
                                     }
                                     return false;
                                 }
-                                if matches!(ch, 'd' | 'u') && role == Role::Client && self.workspace_page == 6 {
+                                if matches!(ch, 'd' | 'u')
+                                    && role == Role::Client
+                                    && self.workspace_page == 6
+                                {
                                     if let Some(editor) = self.editor.as_mut() {
-                                        let review = if ch == 'd' { editor.review_direct_dpi_permission() } else { editor.review_direct_dpi_stun_permission() };
+                                        let review = if ch == 'd' {
+                                            editor.review_direct_dpi_permission()
+                                        } else {
+                                            editor.review_direct_dpi_stun_permission()
+                                        };
                                         match review {
                                             Ok(review) => {
                                                 self.records =
@@ -9024,7 +9033,8 @@ mod tests {
             routing_revision: 5,
             routing_state: 1,
             routing_totals: [
-                10, 20, 30, 40, 2, 1, 1, 3, 4, 5, 10, 20, 30, 40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                10, 20, 30, 40, 2, 1, 1, 3, 4, 5, 10, 20, 30, 40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             ],
         }))
         .unwrap();

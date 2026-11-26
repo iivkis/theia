@@ -76,7 +76,12 @@ pub(super) async fn read_server_hello(socket: &mut TcpStream) -> Result<ServerFl
     let mut handshake = Vec::new();
     for _ in 0..16 {
         let record = read_record(socket).await?;
-        if record[0] == 21 && raw.is_empty() && record[1] == 3 && (1..=3).contains(&record[2]) && record.len() == 7 {
+        if record[0] == 21
+            && raw.is_empty()
+            && record[1] == 3
+            && (1..=3).contains(&record[2])
+            && record.len() == 7
+        {
             return Ok(ServerFlight::Alert(record));
         }
         if record[0] != 22 || record[1] != 3 || !(1..=3).contains(&record[2]) {
@@ -91,12 +96,19 @@ pub(super) async fn read_server_hello(socket: &mut TcpStream) -> Result<ServerFl
             return Err(ClientError::Protocol);
         }
         if handshake.len() >= 4 {
-            let total = 4 + (usize::from(handshake[1]) << 16) + (usize::from(handshake[2]) << 8) + usize::from(handshake[3]);
+            let total = 4
+                + (usize::from(handshake[1]) << 16)
+                + (usize::from(handshake[2]) << 8)
+                + usize::from(handshake[3]);
             if !(42..=32 * 1024).contains(&total) {
                 return Err(ClientError::Protocol);
             }
             if handshake.len() >= total {
-                return if tls::server_hello(&handshake[..total]) { Ok(ServerFlight::Hello(raw)) } else { Err(ClientError::Protocol) };
+                return if tls::server_hello(&handshake[..total]) {
+                    Ok(ServerFlight::Hello(raw))
+                } else {
+                    Err(ClientError::Protocol)
+                };
             }
         }
     }
@@ -137,7 +149,8 @@ mod tests {
     #[tokio::test]
     async fn fragmented_server_hello_requires_complete_message_and_preserves_records() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (left, right) = tokio::join!(connect(listener.local_addr().unwrap()), listener.accept());
+        let (left, right) =
+            tokio::join!(connect(listener.local_addr().unwrap()), listener.accept());
         let mut client = left.unwrap();
         let (mut server, _) = right.unwrap();
         let mut message = vec![2, 0, 0, 38, 3, 3];
@@ -153,10 +166,14 @@ mod tests {
             wire.extend(part);
         }
         server.write_all(&wire).await.unwrap();
-        assert!(matches!(read_server_hello(&mut client).await.unwrap(), ServerFlight::Hello(response) if response == wire));
+        assert!(
+            matches!(read_server_hello(&mut client).await.unwrap(), ServerFlight::Hello(response) if response == wire)
+        );
         let alert = [21, 3, 3, 0, 2, 2, 40];
         server.write_all(&alert).await.unwrap();
-        assert!(matches!(read_server_hello(&mut client).await.unwrap(), ServerFlight::Alert(response) if response == alert));
+        assert!(
+            matches!(read_server_hello(&mut client).await.unwrap(), ServerFlight::Alert(response) if response == alert)
+        );
     }
 
     #[tokio::test]

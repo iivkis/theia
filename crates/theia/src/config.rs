@@ -697,8 +697,11 @@ impl ClientDocument {
             "unknown profile",
         )?;
         let proxy = &self.client.proxy;
-        ensure(proxy.direct_dpi_stun != Some(true) || proxy.direct_dpi == Some(true),
-            "client.proxy.direct_dpi_stun", "requires explicit direct_dpi consent")?;
+        ensure(
+            proxy.direct_dpi_stun != Some(true) || proxy.direct_dpi == Some(true),
+            "client.proxy.direct_dpi_stun",
+            "requires explicit direct_dpi consent",
+        )?;
         let http = listen(&proxy.http_listen, "client.proxy.http_listen")?;
         let socks = listen(&proxy.socks5_listen, "client.proxy.socks5_listen")?;
         for (address, field) in [
@@ -1094,13 +1097,28 @@ mod tests {
     #[test]
     fn local_stun_requires_separate_explicit_consent() {
         let original = client();
-        let Config::Client(default) = parse(&original).unwrap() else { panic!("client"); };
+        let Config::Client(default) = parse(&original).unwrap() else {
+            panic!("client");
+        };
         assert_ne!(default.client.proxy.direct_dpi_stun, Some(true));
-        let stun_only = original.replacen("system_proxy = \"off\"", "system_proxy = \"off\"\ndirect_dpi_stun = true", 1);
-        assert_eq!(parse(&stun_only).unwrap_err().field, "client.proxy.direct_dpi_stun");
-        let consent = original.replacen("system_proxy = \"off\"", "system_proxy = \"off\"\ndirect_dpi = true\ndirect_dpi_stun = true", 1);
+        let stun_only = original.replacen(
+            "system_proxy = \"off\"",
+            "system_proxy = \"off\"\ndirect_dpi_stun = true",
+            1,
+        );
+        assert_eq!(
+            parse(&stun_only).unwrap_err().field,
+            "client.proxy.direct_dpi_stun"
+        );
+        let consent = original.replacen(
+            "system_proxy = \"off\"",
+            "system_proxy = \"off\"\ndirect_dpi = true\ndirect_dpi_stun = true",
+            1,
+        );
         let accepted = parse(&consent).unwrap();
-        let Config::Client(doc) = &accepted else { panic!("client"); };
+        let Config::Client(doc) = &accepted else {
+            panic!("client");
+        };
         assert_eq!(doc.client.proxy.direct_dpi_stun, Some(true));
         assert_eq!(parse(&accepted.to_toml().unwrap()).unwrap(), accepted);
     }

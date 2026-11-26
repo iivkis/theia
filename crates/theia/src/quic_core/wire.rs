@@ -88,8 +88,14 @@ mod tests {
     fn varint_roundtrips_boundaries_and_rejects_overflow() {
         let mut bytes = [0; 8];
         for (value, width) in [
-            (0, 1), (63, 1), (64, 2), (16383, 2), (16384, 4),
-            (1073741823, 4), (1073741824, 8), (MAX_VARINT, 8),
+            (0, 1),
+            (63, 1),
+            (64, 2),
+            (16383, 2),
+            (16384, 4),
+            (1073741823, 4),
+            (1073741824, 8),
+            (MAX_VARINT, 8),
         ] {
             let encoded = encode_varint(value, &mut bytes).unwrap();
             assert_eq!(encoded.len(), width);

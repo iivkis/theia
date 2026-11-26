@@ -20,7 +20,9 @@ pub(super) enum Strategy {
 
 impl Strategy {
     pub(super) const ALL: [Self; 3] = [Self::Header, Self::Middle, Self::Balanced];
-    fn index(self) -> usize { self as usize }
+    fn index(self) -> usize {
+        self as usize
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -48,7 +50,12 @@ struct Sample {
     failures: u32,
 }
 impl Default for Sample {
-    fn default() -> Self { Self { millis: 1000, failures: 0 } }
+    fn default() -> Self {
+        Self {
+            millis: 1000,
+            failures: 0,
+        }
+    }
 }
 struct History {
     key: Key,
@@ -65,7 +72,10 @@ impl Cache {
             if let Some(entry) = history.iter().find(|entry| &entry.key == key) {
                 order.sort_by_key(|strategy| {
                     let sample = entry.samples[strategy.index()];
-                    sample.failures.saturating_mul(2000).saturating_add(sample.millis)
+                    sample
+                        .failures
+                        .saturating_mul(2000)
+                        .saturating_add(sample.millis)
                 });
             }
         }
@@ -77,12 +87,18 @@ impl Cache {
         }
     }
     fn sample(&self, key: &Key, strategy: Strategy, good: bool, elapsed: Duration) {
-        let Ok(mut history) = self.1.lock() else { return; };
+        let Ok(mut history) = self.1.lock() else {
+            return;
+        };
         let now = Instant::now();
         history.retain(|entry| entry.expires > now);
         let mut entry = match history.iter().position(|entry| &entry.key == key) {
             Some(index) => history.remove(index).expect("position exists"),
-            None => History { key: key.clone(), samples: [Sample::default(); 3], expires: now + HISTORY_TTL },
+            None => History {
+                key: key.clone(),
+                samples: [Sample::default(); 3],
+                expires: now + HISTORY_TTL,
+            },
         };
         let sample = &mut entry.samples[strategy.index()];
         if good {
@@ -93,7 +109,9 @@ impl Cache {
             sample.failures = sample.failures.saturating_add(1).min(8);
         }
         entry.expires = now + HISTORY_TTL;
-        if history.len() >= CACHE_LIMIT { history.pop_front(); }
+        if history.len() >= CACHE_LIMIT {
+            history.pop_front();
+        }
         history.push_back(entry);
     }
     pub(super) fn cached(&self, key: &Key) -> Option<Verdict> {
@@ -145,14 +163,19 @@ impl Cache {
     }
 
     fn invalidate_strategy(&self, key: &Key, strategy: Strategy) {
-        let Ok(mut cache) = self.0.lock() else { return; };
+        let Ok(mut cache) = self.0.lock() else {
+            return;
+        };
         let now = Instant::now();
         cache.retain(|entry| entry.expires > now);
         if let Some(entry) = cache.iter_mut().find(|entry| &entry.key == key) {
             // Late results from a previous stream must not invalidate an
             // independently verified different strategy or extend a cooldown.
             if entry.verdict == Verdict::Verified(strategy) {
-                entry.verdict = Verdict::Avoid { strategy, until: now + NEGATIVE_TTL };
+                entry.verdict = Verdict::Avoid {
+                    strategy,
+                    until: now + NEGATIVE_TTL,
+                };
                 entry.expires = now + POSITIVE_TTL;
             }
         }
@@ -165,10 +188,18 @@ mod tests {
     fn ranking_uses_scoped_observed_latency_and_failures() {
         let cache = Cache::default();
         let address = "127.0.0.1:443".parse().unwrap();
-        let mut key = Key { name: "example.org".into(), address, policy: [1; 32], network: network_scope::Scope::fixture(address, 0) };
+        let mut key = Key {
+            name: "example.org".into(),
+            address,
+            policy: [1; 32],
+            network: network_scope::Scope::fixture(address, 0),
+        };
         cache.sample(&key, Strategy::Header, false, Duration::ZERO);
         cache.sample(&key, Strategy::Balanced, true, Duration::from_millis(50));
-        assert_eq!(cache.ranked(&key), [Strategy::Balanced, Strategy::Middle, Strategy::Header]);
+        assert_eq!(
+            cache.ranked(&key),
+            [Strategy::Balanced, Strategy::Middle, Strategy::Header]
+        );
         key.policy = [2; 32];
         assert_eq!(cache.ranked(&key), Strategy::ALL);
     }
@@ -177,10 +208,18 @@ mod tests {
     fn late_failure_preserves_other_strategy_and_original_cooldown() {
         let cache = Cache::default();
         let address = "127.0.0.1:443".parse().unwrap();
-        let key = Key { name: "example.org".into(), address, policy: [1; 32], network: network_scope::Scope::fixture(address, 0) };
+        let key = Key {
+            name: "example.org".into(),
+            address,
+            policy: [1; 32],
+            network: network_scope::Scope::fixture(address, 0),
+        };
         cache.insert(&key, Verdict::Verified(Strategy::Middle));
         cache.invalidate_strategy(&key, Strategy::Header);
-        assert!(matches!(cache.cached(&key), Some(Verdict::Verified(Strategy::Middle))));
+        assert!(matches!(
+            cache.cached(&key),
+            Some(Verdict::Verified(Strategy::Middle))
+        ));
         cache.invalidate_strategy(&key, Strategy::Middle);
         let first = cache.0.lock().unwrap().front().unwrap().verdict;
         assert!(matches!(cache.cached(&key), Some(Verdict::Unavailable)));

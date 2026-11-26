@@ -8,8 +8,8 @@ use ring::{aead, hkdf};
 pub(crate) type Cid = Vec<u8>;
 pub(crate) const MAX_DATAGRAM: usize = 65527;
 pub(crate) const MIN_INITIAL: usize = 1200;
-pub(crate) use crate::quic_core::wire::{V1, V2};
 use crate::quic_core::wire::{decode_number, varint};
+pub(crate) use crate::quic_core::wire::{V1, V2};
 const MAX_CRYPTO: usize = crate::reality_admission::MAX_HELLO;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,8 +182,12 @@ pub(crate) fn short_matches(bytes: &[u8], cid: &[u8]) -> bool {
 /// address or of the reference's TLS identity. Token bytes remain opaque.
 pub(crate) fn retry_valid(bytes: &[u8], original: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
-    let Some(header) = long(bytes) else { return false; };
-    if header.kind != Kind::Retry { return false; }
+    let Some(header) = long(bytes) else {
+        return false;
+    };
+    if header.kind != Kind::Retry {
+        return false;
+    }
     let split = bytes.len() - 16;
     retry_integrity_tag(header.version, &bytes[..split], original)
         .is_some_and(|tag| bool::from(tag.as_slice().ct_eq(&bytes[split..])))
@@ -191,8 +195,14 @@ pub(crate) fn retry_valid(bytes: &[u8], original: &[u8]) -> bool {
 
 /// Public Retry integrity tag, not authentication. Use only for the
 /// standardized Retry pseudo-packet with the RFC fixed key and nonce.
-pub(crate) fn retry_integrity_tag(version: u32, packet: &[u8], original: &[u8]) -> Option<[u8; 16]> {
-    if original.len() > 20 || packet.len() > MAX_DATAGRAM - 16 { return None; }
+pub(crate) fn retry_integrity_tag(
+    version: u32,
+    packet: &[u8],
+    original: &[u8],
+) -> Option<[u8; 16]> {
+    if original.len() > 20 || packet.len() > MAX_DATAGRAM - 16 {
+        return None;
+    }
     const KEY: [u8; 16] = [
         0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8,
         0x4e,
@@ -218,11 +228,13 @@ pub(crate) fn retry_integrity_tag(version: u32, packet: &[u8], original: &[u8]) 
     aad.extend_from_slice(original);
     aad.extend_from_slice(packet);
     let key = aead::UnboundKey::new(&aead::AES_128_GCM, &key).ok()?;
-    let tag = aead::LessSafeKey::new(key).seal_in_place_separate_tag(
-        aead::Nonce::assume_unique_for_key(nonce),
-        aead::Aad::from(aad),
-        &mut [],
-    ).ok()?;
+    let tag = aead::LessSafeKey::new(key)
+        .seal_in_place_separate_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(aad),
+            &mut [],
+        )
+        .ok()?;
     tag.as_ref().try_into().ok()
 }
 
@@ -472,7 +484,10 @@ pub(crate) fn test_initial_parts(version: u32, hello: &[u8]) -> [Vec<u8>; 2] {
         second.extend(((rest.len() as u16) | 0x4000).to_be_bytes());
     }
     second.extend(rest);
-    [tests::initial_packet(0, &first, version), tests::initial_packet(1, &second, version)]
+    [
+        tests::initial_packet(0, &first, version),
+        tests::initial_packet(1, &second, version),
+    ]
 }
 
 #[cfg(test)]

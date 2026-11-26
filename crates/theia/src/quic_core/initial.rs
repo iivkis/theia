@@ -25,7 +25,9 @@ fn append_number(out: &mut Vec<u8>, value: u64) -> Result<(), PacketError> {
 /// CRYPTO frame serialization for Initial/Handshake bytes, not application data.
 pub fn crypto_frame(offset: u64, data: &[u8]) -> Result<Vec<u8>, PacketError> {
     if data.len() > MAX_DATAGRAM
-        || offset.checked_add(data.len() as u64).is_none_or(|n| n > super::wire::MAX_VARINT)
+        || offset
+            .checked_add(data.len() as u64)
+            .is_none_or(|n| n > super::wire::MAX_VARINT)
     {
         return Err(PacketError::Limit);
     }
@@ -54,22 +56,33 @@ impl Writer {
         if !(8..=20).contains(&initial_dcid.len()) {
             return Err(PacketError::InvalidCid);
         }
-        let suite = TLS13_AES_128_GCM_SHA256.tls13()
-            .and_then(|s| s.quic_suite()).ok_or(PacketError::Crypto)?;
+        let suite = TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .and_then(|s| s.quic_suite())
+            .ok_or(PacketError::Crypto)?;
         let version_tls = match version {
             Version::V1 => quic::Version::V1,
             Version::V2 => quic::Version::V2,
         };
         let server = matches!(side, Side::Server);
         let keys = suite.keys(initial_dcid, side, version_tls).local;
-        Ok(Self { version, server, keys, next: 0 })
+        Ok(Self {
+            version,
+            server,
+            keys,
+            next: 0,
+        })
     }
 
     /// Serialize one complete, padded Initial datagram. The caller supplies
     /// only frames legal in the Initial packet space. No UDP send occurs.
-    pub fn seal(&mut self, dcid: &[u8], scid: &[u8], token: &[u8], frames: &[u8])
-        -> Result<Vec<u8>, PacketError>
-    {
+    pub fn seal(
+        &mut self,
+        dcid: &[u8],
+        scid: &[u8],
+        token: &[u8],
+        frames: &[u8],
+    ) -> Result<Vec<u8>, PacketError> {
         if dcid.len() > 20 || scid.len() > 20 || (!self.server && dcid.len() < 8) {
             return Err(PacketError::InvalidCid);
         }
@@ -80,7 +93,10 @@ impl Writer {
         if self.next > u64::from(u32::MAX) || frames.len() > MAX_DATAGRAM {
             return Err(PacketError::Limit);
         }
-        let mut out = vec![match self.version { Version::V1 => 0xc3, Version::V2 => 0xd3 }];
+        let mut out = vec![match self.version {
+            Version::V1 => 0xc3,
+            Version::V2 => 0xd3,
+        }];
         out.extend_from_slice(&self.version.wire().to_be_bytes());
         out.push(dcid.len() as u8);
         out.extend_from_slice(dcid);
@@ -116,13 +132,18 @@ impl Writer {
         out.extend_from_slice(frames);
         out.resize(payload_offset + payload_len, 0);
         let (header, payload) = out.split_at_mut(payload_offset);
-        let tag = self.keys.packet.encrypt_in_place(pn, header, payload)
+        let tag = self
+            .keys
+            .packet
+            .encrypt_in_place(pn, header, payload)
             .map_err(|_| PacketError::Crypto)?;
         out.extend_from_slice(tag.as_ref());
         let (header, ciphertext) = out.split_at_mut(payload_offset);
         let sample = ciphertext.get(..sample_len).ok_or(PacketError::Crypto)?;
         let (first, rest) = header.split_first_mut().ok_or(PacketError::Crypto)?;
-        self.keys.header.encrypt_in_place(sample, first, &mut rest[pn_offset - 1..])
+        self.keys
+            .header
+            .encrypt_in_place(sample, first, &mut rest[pn_offset - 1..])
             .map_err(|_| PacketError::Crypto)?;
         Ok(out)
     }
@@ -140,8 +161,12 @@ mod tests {
         hello.resize(38, 0);
         for v in [Version::V1, Version::V2] {
             let mut writer = Writer::new(v, &cid, Side::Client).unwrap();
-            let first = writer.seal(&cid, &[9], &[], &crypto_frame(0, &hello[..16]).unwrap()).unwrap();
-            let second = writer.seal(&cid, &[9], &[], &crypto_frame(16, &hello[16..]).unwrap()).unwrap();
+            let first = writer
+                .seal(&cid, &[9], &[], &crypto_frame(0, &hello[..16]).unwrap())
+                .unwrap();
+            let second = writer
+                .seal(&cid, &[9], &[], &crypto_frame(16, &hello[16..]).unwrap())
+                .unwrap();
             assert!(first.len() >= MIN_DATAGRAM);
             assert!(second.len() >= MIN_DATAGRAM);
             let header = reality_quic_wire::long(&first).unwrap();
@@ -160,12 +185,27 @@ mod tests {
     #[test]
     fn writer_bounds_and_server_token() {
         let cid = [0; 8];
-        assert!(matches!(Writer::new(Version::V1, &[], Side::Client), Err(PacketError::InvalidCid)));
+        assert!(matches!(
+            Writer::new(Version::V1, &[], Side::Client),
+            Err(PacketError::InvalidCid)
+        ));
         let mut writer = Writer::new(Version::V2, &cid, Side::Server).unwrap();
-        assert_eq!(writer.seal(&[], &cid, &[1], &[]), Err(PacketError::InvalidToken));
-        assert_eq!(writer.seal(&[0; 21], &cid, &[], &[]), Err(PacketError::InvalidCid));
-        assert_eq!(writer.seal(&[], &cid, &[], &vec![0; MAX_DATAGRAM]), Err(PacketError::Limit));
-        assert_eq!(crypto_frame(super::super::wire::MAX_VARINT, &[1]), Err(PacketError::Limit));
+        assert_eq!(
+            writer.seal(&[], &cid, &[1], &[]),
+            Err(PacketError::InvalidToken)
+        );
+        assert_eq!(
+            writer.seal(&[0; 21], &cid, &[], &[]),
+            Err(PacketError::InvalidCid)
+        );
+        assert_eq!(
+            writer.seal(&[], &cid, &[], &vec![0; MAX_DATAGRAM]),
+            Err(PacketError::Limit)
+        );
+        assert_eq!(
+            crypto_frame(super::super::wire::MAX_VARINT, &[1]),
+            Err(PacketError::Limit)
+        );
         let result = writer.seal(&[], &cid, &[], &[1]).unwrap();
         assert!(result.len() >= MIN_DATAGRAM);
         writer.next = u64::from(u32::MAX) + 1;

@@ -2,8 +2,17 @@
 //! Address validation is NOT TLS identity or Theia admission. The listener
 //! owns CID routes, not application authorization. A full production
 //! connection driver and external acceptance remain mandatory.
-use super::{ingress::{Action, Ingress}, negotiation::Binding};
-use std::{collections::BTreeMap, io, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use super::{
+    ingress::{Action, Ingress},
+    negotiation::Binding,
+};
+use std::{
+    collections::BTreeMap,
+    io,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
 
 const MTU: usize = 1200;
@@ -13,16 +22,24 @@ type Datagram = (Vec<u8>, SocketAddr);
 
 pub(crate) enum SessionIo {
     Direct(UdpSocket),
-    Routed { socket: Arc<UdpSocket>, incoming: mpsc::Receiver<Datagram> },
+    Routed {
+        socket: Arc<UdpSocket>,
+        incoming: mpsc::Receiver<Datagram>,
+    },
 }
 
 impl From<UdpSocket> for SessionIo {
-    fn from(socket: UdpSocket) -> Self { Self::Direct(socket) }
+    fn from(socket: UdpSocket) -> Self {
+        Self::Direct(socket)
+    }
 }
 
 impl SessionIo {
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
-        match self { Self::Direct(s) => s.local_addr(), Self::Routed { socket, .. } => socket.local_addr() }
+        match self {
+            Self::Direct(s) => s.local_addr(),
+            Self::Routed { socket, .. } => socket.local_addr(),
+        }
     }
 
     pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
@@ -36,7 +53,9 @@ impl SessionIo {
         match self {
             Self::Direct(s) => s.send_to(bytes, peer).await,
             Self::Routed { socket, incoming } => {
-                if incoming.is_closed() { return Err(io::Error::from(io::ErrorKind::BrokenPipe)); }
+                if incoming.is_closed() {
+                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                }
                 socket.send_to(bytes, peer).await
             }
         }
@@ -79,28 +98,45 @@ pub struct Listener {
 impl Listener {
     pub fn new(socket: UdpSocket, limit: usize) -> io::Result<Self> {
         let local = socket.local_addr()?;
-        if !local.ip().is_loopback() || socket.peer_addr().is_ok() || !(1..=MAX_CONNECTIONS).contains(&limit) {
+        if !local.ip().is_loopback()
+            || socket.peer_addr().is_ok()
+            || !(1..=MAX_CONNECTIONS).contains(&limit)
+        {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         let ingress = Ingress::new(limit).map_err(|_| io::ErrorKind::InvalidInput)?;
         let (tx, candidates) = mpsc::channel(limit);
         let worker = tokio::spawn(run(Arc::new(socket), ingress, tx));
-        Ok(Self { local, candidates, worker })
+        Ok(Self {
+            local,
+            candidates,
+            worker,
+        })
     }
 
-    pub fn local_addr(&self) -> SocketAddr { self.local }
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
 
     pub async fn accept(&mut self) -> io::Result<Candidate> {
-        self.candidates.recv().await.ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
+        self.candidates
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
     }
 }
 
 impl Drop for Listener {
-    fn drop(&mut self) { self.worker.abort(); }
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
 }
 
-async fn run(socket: Arc<UdpSocket>, mut ingress: Ingress,
-    accepts: mpsc::Sender<Candidate>) -> io::Result<()> {
+async fn run(
+    socket: Arc<UdpSocket>,
+    mut ingress: Ingress,
+    accepts: mpsc::Sender<Candidate>,
+) -> io::Result<()> {
     let clock = Instant::now();
     let mut routes: BTreeMap<u64, mpsc::Sender<Datagram>> = BTreeMap::new();
     let mut buffer = [0; MTU + 1];

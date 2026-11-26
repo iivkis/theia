@@ -4,7 +4,11 @@ use super::packet::{Error, ReplayWindow};
 use super::wire::MAX_VARINT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Space { Initial, Handshake, Application }
+pub enum Space {
+    Initial,
+    Handshake,
+    Application,
+}
 
 #[derive(Default)]
 struct State {
@@ -19,12 +23,18 @@ pub struct Spaces([State; 3]);
 impl Spaces {
     fn get(&mut self, space: Space) -> Result<&mut State, Error> {
         let state = &mut self.0[space as usize];
-        if state.discarded { Err(Error::Limit) } else { Ok(state) }
+        if state.discarded {
+            Err(Error::Limit)
+        } else {
+            Ok(state)
+        }
     }
 
     pub fn allocate(&mut self, space: Space) -> Result<u64, Error> {
         let state = self.get(space)?;
-        if state.next > MAX_VARINT { return Err(Error::Limit); }
+        if state.next > MAX_VARINT {
+            return Err(Error::Limit);
+        }
         let n = state.next;
         state.next += 1;
         Ok(n)
@@ -41,7 +51,10 @@ impl Spaces {
     }
 
     pub fn discard(&mut self, space: Space) {
-        self.0[space as usize] = State { discarded: true, ..State::default() };
+        self.0[space as usize] = State {
+            discarded: true,
+            ..State::default()
+        };
     }
 }
 

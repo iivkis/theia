@@ -98,30 +98,72 @@ static UDP_QUEUE_DROP: AtomicU64 = AtomicU64::new(0);
 static UDP_STUN_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static UDP_STUN_LOCAL: AtomicU64 = AtomicU64::new(0);
 static UDP_STUN_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
-pub(crate) fn udp_stun_fingerprint() { UDP_STUN_FINGERPRINT.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn udp_stun_fingerprint() {
+    UDP_STUN_FINGERPRINT.fetch_add(1, Ordering::Relaxed);
+}
 static UDP_STUN_PROBE_OK: AtomicU64 = AtomicU64::new(0);
 static UDP_STUN_PROBE_FAILED: AtomicU64 = AtomicU64::new(0);
 static UDP_QUIC_V2_FALLBACK: AtomicU64 = AtomicU64::new(0);
-pub(crate) fn udp_stun_local() { UDP_STUN_LOCAL.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn udp_stun_probe(good: bool) { (if good { &UDP_STUN_PROBE_OK } else { &UDP_STUN_PROBE_FAILED }).fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn udp_quic_v2_fallback() { UDP_QUIC_V2_FALLBACK.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn udp_stun_local() {
+    UDP_STUN_LOCAL.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_stun_probe(good: bool) {
+    (if good {
+        &UDP_STUN_PROBE_OK
+    } else {
+        &UDP_STUN_PROBE_FAILED
+    })
+    .fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_quic_v2_fallback() {
+    UDP_QUIC_V2_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
 static DPI_BIDIRECTIONAL: AtomicU64 = AtomicU64::new(0);
 static UDP_PEER_REPLY: AtomicU64 = AtomicU64::new(0);
 static UDP_PEER_FAILURE: AtomicU64 = AtomicU64::new(0);
 static DPI_POLICY_STALE: AtomicU64 = AtomicU64::new(0);
 static DPI_POST_HELLO_FAILURE: AtomicU64 = AtomicU64::new(0);
-pub(crate) fn udp_peer_failure() { UDP_PEER_FAILURE.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn dpi_policy_stale() { DPI_POLICY_STALE.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn dpi_post_hello_failure() { DPI_POST_HELLO_FAILURE.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn dpi_bidirectional() { DPI_BIDIRECTIONAL.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn udp_peer_reply() { UDP_PEER_REPLY.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn dpi_cache_hit() { DPI_CACHE_HIT.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn dpi_probe(good: bool) { (if good { &DPI_PROBE_OK } else { &DPI_PROBE_FAILED }).fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn dpi_tls_alert() { DPI_TLS_ALERT.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn dpi_timeout() { DPI_TIMEOUT.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn udp_verified_local() { UDP_VERIFIED_LOCAL.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn udp_queue_drop() { UDP_QUEUE_DROP.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn udp_stun_fallback() { UDP_STUN_FALLBACK.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn udp_peer_failure() {
+    UDP_PEER_FAILURE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_policy_stale() {
+    DPI_POLICY_STALE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_post_hello_failure() {
+    DPI_POST_HELLO_FAILURE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_bidirectional() {
+    DPI_BIDIRECTIONAL.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_peer_reply() {
+    UDP_PEER_REPLY.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_cache_hit() {
+    DPI_CACHE_HIT.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_probe(good: bool) {
+    (if good {
+        &DPI_PROBE_OK
+    } else {
+        &DPI_PROBE_FAILED
+    })
+    .fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_tls_alert() {
+    DPI_TLS_ALERT.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_timeout() {
+    DPI_TIMEOUT.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_verified_local() {
+    UDP_VERIFIED_LOCAL.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_queue_drop() {
+    UDP_QUEUE_DROP.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_stun_fallback() {
+    UDP_STUN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
 pub(crate) fn enter_udp(role: Role, h3: bool, direct: bool) -> Relay<'static> {
     if direct {
         return UDP_DIRECT.enter();
@@ -149,8 +191,10 @@ pub(crate) fn udp_dpi_fallback() {
 #[cfg(test)]
 #[test]
 fn udp_routing_summary_reports_independent_counters() {
-    let report =
-        routing_summary_from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]);
+    let report = routing_summary_from([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+        18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    ]);
     assert!(report.contains("UDP VPS:"));
     assert!(report.contains("QUIC Initial 7 · STUN 8 · совпавший ответ 9"));
     assert!(report.contains("QUIC отправлен локально 16 · ответ peer 20 · резерв VPS 10"));

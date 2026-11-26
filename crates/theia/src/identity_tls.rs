@@ -863,15 +863,27 @@ mod tests {
                 let mut sc = identity.server_tls(name, Branch::H3).unwrap();
                 sc.send_tls13_tickets = 0;
                 let cc = client_tls(&scope(), key, Branch::H3).unwrap();
-                let mut listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2).unwrap();
+                let mut listener =
+                    Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2).unwrap();
                 let addr = listener.local_addr();
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
                 let (client, server) = timeout(StdDuration::from_secs(15), async {
                     tokio::join!(
-                        handshake_udp::connect(socket, addr, version, Arc::new(cc), ServerName::try_from(name).unwrap()),
-                        async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await },
+                        handshake_udp::connect(
+                            socket,
+                            addr,
+                            version,
+                            Arc::new(cc),
+                            ServerName::try_from(name).unwrap()
+                        ),
+                        async {
+                            handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc))
+                                .await
+                        },
                     )
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 if valid {
                     let mut client = client.unwrap();
                     let mut server = server.unwrap();

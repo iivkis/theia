@@ -383,7 +383,9 @@ impl RealityClient {
         let generation = self.generation().await?;
         let mut result = routed_open(&generation.carrier, &self.routing, address, port).await;
         if let Ok(tunnel) = &mut result {
-            if let ProxyTunnel::Dpi(route) = tunnel { route.observed = Some(generation.last_open.clone()); }
+            if let ProxyTunnel::Dpi(route) = tunnel {
+                route.observed = Some(generation.last_open.clone());
+            }
             if tunnel.open_code() != 0 {
                 generation
                     .last_open
@@ -1137,9 +1139,11 @@ async fn routed_open(
                             Err(error) => return Err(error),
                         },
                     };
-                    let permitted = !ips.is_empty() && ips.iter().all(|ip| {
-                        policy.matching_action(Some(name), Some(*ip)) == Ok(Some(Action::DirectDpi))
-                    });
+                    let permitted = !ips.is_empty()
+                        && ips.iter().all(|ip| {
+                            policy.matching_action(Some(name), Some(*ip))
+                                == Ok(Some(Action::DirectDpi))
+                        });
                     if permitted {
                         if let Some(tunnel) =
                             cache.dpi.open(name, port, &ips, snapshot.digest()).await
@@ -1156,7 +1160,9 @@ async fn routed_open(
                 }
             }
             // A changed local policy does not authorize an older fallback.
-            if !cache.dpi.policy_current(snapshot.digest()) { return Err(crate::routing::dpi::stale_policy()); }
+            if !cache.dpi.policy_current(snapshot.digest()) {
+                return Err(crate::routing::dpi::stale_policy());
+            }
             // Failed local probe/dial or unsupported traffic uses the same
             // authenticated VPS carrier. No silent unprotected direct route.
             let tunnel = carrier.open(address, port).await?;
@@ -1194,41 +1200,64 @@ async fn routed_udp(
             // Never treat a v1 handshake as evidence for v2.
             let stun = matches!(candidate, Candidate::StunBinding);
             let local_candidate = match (&address, candidate) {
-                (Address::Dns(name), Candidate::QuicH3(sni)) if port == 443 && cache.dpi.enabled() =>
-                    crate::routing::domain_name(name).as_deref() == Ok(sni.as_str()),
-                (Address::Dns(_), Candidate::StunBinding) if port == 3478 && cache.dpi.stun_enabled() => true,
+                (Address::Dns(name), Candidate::QuicH3(sni))
+                    if port == 443 && cache.dpi.enabled() =>
+                {
+                    crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
+                }
+                (Address::Dns(_), Candidate::StunBinding)
+                    if port == 3478 && cache.dpi.stun_enabled() =>
+                {
+                    true
+                }
                 _ => false,
             };
             if local_candidate {
                 if let Address::Dns(name) = &address {
-                        let ips = match pinned {
-                            Some(ips) => ips,
-                            None => match carrier.resolve_routing(name, snapshot.digest()).await {
-                                Ok(ips) => ips,
-                                Err(ClientError::Rejected(502 | 504)) => Vec::new(),
-                                Err(error) => return Err(error),
-                            },
+                    let ips = match pinned {
+                        Some(ips) => ips,
+                        None => match carrier.resolve_routing(name, snapshot.digest()).await {
+                            Ok(ips) => ips,
+                            Err(ClientError::Rejected(502 | 504)) => Vec::new(),
+                            Err(error) => return Err(error),
+                        },
+                    };
+                    if !ips.is_empty()
+                        && ips.iter().all(|ip| {
+                            snapshot.policy().matching_action(Some(name), Some(*ip))
+                                == Ok(Some(Action::DirectDpi))
+                        })
+                    {
+                        let verified = if stun {
+                            cache
+                                .dpi
+                                .open_stun_udp(name, port, &ips, snapshot.digest())
+                                .await
+                        } else {
+                            cache
+                                .dpi
+                                .open_quic_udp(name, port, &ips, snapshot.digest())
+                                .await
                         };
-                        if !ips.is_empty() && ips.iter().all(|ip| snapshot.policy().matching_action(Some(name), Some(*ip)) == Ok(Some(Action::DirectDpi))) {
-                            let verified = if stun {
-                                cache.dpi.open_stun_udp(name, port, &ips, snapshot.digest()).await
-                            } else {
-                                cache.dpi.open_quic_udp(name, port, &ips, snapshot.digest()).await
-                            };
-                            if let Some(verified) = verified {
-                                let carrier = carrier.clone();
-                                let target = address.clone();
-                                let observed = observed.clone();
-                                let fallback = Box::pin(async move {
-                                    let tunnel = carrier.open_udp(target, port).await?;
-                                    tunnel.record_transport(&observed);
-                                    crate::traffic::udp_dpi_fallback();
-                                    if stun { crate::traffic::udp_stun_fallback(); }
-                                    Ok(tunnel)
-                                });
-                                return Ok(crate::udp_relay::Tunnel::VerifiedLocal(Box::new(verified), fallback));
-                            }
+                        if let Some(verified) = verified {
+                            let carrier = carrier.clone();
+                            let target = address.clone();
+                            let observed = observed.clone();
+                            let fallback = Box::pin(async move {
+                                let tunnel = carrier.open_udp(target, port).await?;
+                                tunnel.record_transport(&observed);
+                                crate::traffic::udp_dpi_fallback();
+                                if stun {
+                                    crate::traffic::udp_stun_fallback();
+                                }
+                                Ok(tunnel)
+                            });
+                            return Ok(crate::udp_relay::Tunnel::VerifiedLocal(
+                                Box::new(verified),
+                                fallback,
+                            ));
                         }
+                    }
                 }
             }
             if !cache.dpi.policy_current(snapshot.digest()) {
@@ -1237,8 +1266,12 @@ async fn routed_udp(
             let tunnel = carrier.open_udp(address, port).await?;
             cache.dpi.check_policy(snapshot.digest())?;
             crate::traffic::udp_dpi_fallback();
-            if matches!(candidate, Candidate::Stun | Candidate::StunBinding) { crate::traffic::udp_stun_fallback(); }
-            if matches!(candidate, Candidate::QuicV2H3(_)) { crate::traffic::udp_quic_v2_fallback(); }
+            if matches!(candidate, Candidate::Stun | Candidate::StunBinding) {
+                crate::traffic::udp_stun_fallback();
+            }
+            if matches!(candidate, Candidate::QuicV2H3(_)) {
+                crate::traffic::udp_quic_v2_fallback();
+            }
             Ok(tunnel)
         }
     }
@@ -1315,13 +1348,29 @@ impl ProxyClient {
     ) -> Result<crate::udp_relay::Tunnel, ClientError> {
         match self {
             Self::Direct(c) => {
-                let tunnel = routed_udp(&c.carrier, &c.routing, address, port, candidate, &c.last_open).await?;
+                let tunnel = routed_udp(
+                    &c.carrier,
+                    &c.routing,
+                    address,
+                    port,
+                    candidate,
+                    &c.last_open,
+                )
+                .await?;
                 tunnel.record_transport(&c.last_open);
                 Ok(tunnel)
             }
             Self::Reality(c) => {
                 let generation = c.generation().await?;
-                let tunnel = routed_udp(&generation.carrier, &c.routing, address, port, candidate, &generation.last_open).await?;
+                let tunnel = routed_udp(
+                    &generation.carrier,
+                    &c.routing,
+                    address,
+                    port,
+                    candidate,
+                    &generation.last_open,
+                )
+                .await?;
                 tunnel.record_transport(&generation.last_open);
                 Ok(tunnel)
             }
@@ -1338,8 +1387,11 @@ impl ProxyClient {
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
             Self::Direct(client) => {
-                let mut tunnel = routed_open(&client.carrier, &client.routing, address, port).await?;
-                if let ProxyTunnel::Dpi(route) = &mut tunnel { route.observed = Some(client.last_open.clone()); }
+                let mut tunnel =
+                    routed_open(&client.carrier, &client.routing, address, port).await?;
+                if let ProxyTunnel::Dpi(route) = &mut tunnel {
+                    route.observed = Some(client.last_open.clone());
+                }
                 if tunnel.open_code() != 0 {
                     client
                         .last_open
@@ -1406,7 +1458,8 @@ impl ProxyTunnel {
                         let tunnel = carrier.open(address, port).await?;
                         authorization.check()?;
                         if let Some(observed) = observed {
-                            observed.store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
+                            observed
+                                .store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
                         }
                         let local = crate::reality_tcp::Prefixed::new(client, prefix.into());
                         crate::traffic::dpi_fallback_open();
@@ -1568,7 +1621,10 @@ impl ClientRuntime {
             .routing_cache()
             .dpi
             .set_enabled(candidate.client.proxy.direct_dpi.unwrap_or(false));
-        client.routing_cache().dpi.set_stun_enabled(candidate.client.proxy.direct_dpi_stun.unwrap_or(false));
+        client
+            .routing_cache()
+            .dpi
+            .set_stun_enabled(candidate.client.proxy.direct_dpi_stun.unwrap_or(false));
         Box::pin(client.routing_policy()).await?;
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
@@ -1720,7 +1776,10 @@ async fn prepare_proxy(
         .routing_cache()
         .dpi
         .set_enabled(document.client.proxy.direct_dpi.unwrap_or(false));
-    client.routing_cache().dpi.set_stun_enabled(document.client.proxy.direct_dpi_stun.unwrap_or(false));
+    client
+        .routing_cache()
+        .dpi
+        .set_stun_enabled(document.client.proxy.direct_dpi_stun.unwrap_or(false));
     client.routing_policy().await?;
     crate::diag!(Info, "client.proxy", "transport_preflight_passed");
     // All startup validation and both binds must succeed before accepting.
@@ -2301,7 +2360,9 @@ async fn udp_association(
     }
     struct Completion(Arc<std::sync::atomic::AtomicBool>);
     impl Drop for Completion {
-        fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
     let mut flows = std::collections::HashMap::<(Address, u16), Flow>::new();
     let mut tasks = tokio::task::JoinSet::new();
@@ -2394,12 +2455,16 @@ async fn udp_revoked_fallback_fixture(client: &ProxyClient) {
     use tokio::sync::mpsc;
     let local_origin = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let verified = crate::routing::dpi::VerifiedUdp::disabled_fixture(
-        udp_relay::connect(local_origin.local_addr().unwrap()).await.unwrap(),
+        udp_relay::connect(local_origin.local_addr().unwrap())
+            .await
+            .unwrap(),
     );
     let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let port = target.local_addr().unwrap().port();
     let authorization = verified.fallback_policy();
-    let ProxyClient::Direct(client) = client else { panic!("own TLS fixture"); };
+    let ProxyClient::Direct(client) = client else {
+        panic!("own TLS fixture");
+    };
     let carrier = client.carrier.clone();
     let fallback = Box::pin(async move {
         // A successful OPEN is insufficient if the local routing lease
@@ -2414,11 +2479,24 @@ async fn udp_revoked_fallback_fixture(client: &ProxyClient) {
     let result = timeout(
         Duration::from_secs(5),
         Tunnel::VerifiedLocal(Box::new(verified), fallback).relay(rx, down),
-    ).await.unwrap();
-    assert!(matches!(result, Err(ClientError::Open(ErrorCode::PolicyDenied))));
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        Err(ClientError::Open(ErrorCode::PolicyDenied))
+    ));
     let mut buf = [0; 32];
-    assert!(timeout(Duration::from_millis(50), local_origin.recv_from(&mut buf)).await.is_err());
-    assert!(timeout(Duration::from_millis(50), target.recv_from(&mut buf)).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(50), local_origin.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
+    assert!(
+        timeout(Duration::from_millis(50), target.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
 }
 
 #[cfg(test)]
@@ -2427,13 +2505,18 @@ async fn udp_prewrite_fallback_fixture(client: &ProxyClient) {
     use tokio::sync::mpsc;
     let local_origin = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let verified = crate::routing::dpi::VerifiedUdp::disabled_fixture(
-        udp_relay::connect(local_origin.local_addr().unwrap()).await.unwrap(),
+        udp_relay::connect(local_origin.local_addr().unwrap())
+            .await
+            .unwrap(),
     );
     let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let port = target.local_addr().unwrap().port();
-    let ProxyClient::Direct(client) = client else { panic!("own TLS fixture"); };
+    let ProxyClient::Direct(client) = client else {
+        panic!("own TLS fixture");
+    };
     let carrier = client.carrier.clone();
-    let fallback = Box::pin(async move { carrier.open_udp(Address::V4([127, 0, 0, 1]), port).await });
+    let fallback =
+        Box::pin(async move { carrier.open_udp(Address::V4([127, 0, 0, 1]), port).await });
     let (up, rx) = mpsc::channel(QUEUE);
     let (down, mut responses) = mpsc::channel(QUEUE);
     up.send(b"first".to_vec()).await.unwrap();
@@ -2441,12 +2524,25 @@ async fn udp_prewrite_fallback_fixture(client: &ProxyClient) {
     let task = tokio::spawn(Tunnel::VerifiedLocal(Box::new(verified), fallback).relay(rx, down));
     let mut buf = [0; 32];
     for data in [b"first".as_slice(), b"".as_slice()] {
-        let (n, source) = timeout(Duration::from_secs(3), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        let (n, source) = timeout(Duration::from_secs(3), target.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&buf[..n], data);
         target.send_to(data, source).await.unwrap();
-        assert_eq!(timeout(Duration::from_secs(3), responses.recv()).await.unwrap().unwrap(), data);
+        assert_eq!(
+            timeout(Duration::from_secs(3), responses.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            data
+        );
     }
-    assert!(timeout(Duration::from_millis(50), local_origin.recv_from(&mut buf)).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(50), local_origin.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
     drop(up);
     task.await.unwrap().unwrap();
 }
@@ -2462,7 +2558,11 @@ async fn udp_socks_fixture(client: &ProxyClient) {
     let client = (*client).clone();
     assert!(matches!(
         client
-            .open_udp(Address::Dns("blocked.invalid".into()), 443, &crate::routing::dpi::udp::Candidate::Other)
+            .open_udp(
+                Address::Dns("blocked.invalid".into()),
+                443,
+                &crate::routing::dpi::udp::Candidate::Other
+            )
             .await,
         Err(ClientError::Open(ErrorCode::PolicyDenied))
     ));

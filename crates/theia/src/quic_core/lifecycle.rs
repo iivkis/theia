@@ -2,10 +2,20 @@
 //! transport parameter validation and Theia admission are distinct events.
 //! This state object does not itself establish identity or validate a path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Phase { Handshaking, TransportReady, Admitted, Closing, Draining, Closed }
+pub enum Phase {
+    Handshaking,
+    TransportReady,
+    Admitted,
+    Closing,
+    Draining,
+    Closed,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error { State, Validation }
+pub enum Error {
+    State,
+    Validation,
+}
 
 pub struct Lifecycle {
     phase: Phase,
@@ -13,17 +23,31 @@ pub struct Lifecycle {
 }
 
 impl Default for Lifecycle {
-    fn default() -> Self { Self { phase: Phase::Handshaking, handshake_confirmed: false } }
+    fn default() -> Self {
+        Self {
+            phase: Phase::Handshaking,
+            handshake_confirmed: false,
+        }
+    }
 }
 
 impl Lifecycle {
-    pub fn phase(&self) -> Phase { self.phase }
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
 
     /// Called by the TLS/transport owner only after real TLS completion,
     /// validated peer parameters and the required ALPN/identity checks.
-    pub fn transport_ready(&mut self, tls_complete: bool, parameters_valid: bool,
-                           identity_valid: bool, alpn_valid: bool) -> Result<(), Error> {
-        if self.phase != Phase::Handshaking { return Err(Error::State); }
+    pub fn transport_ready(
+        &mut self,
+        tls_complete: bool,
+        parameters_valid: bool,
+        identity_valid: bool,
+        alpn_valid: bool,
+    ) -> Result<(), Error> {
+        if self.phase != Phase::Handshaking {
+            return Err(Error::State);
+        }
         if !(tls_complete && parameters_valid && identity_valid && alpn_valid) {
             self.phase = Phase::Closing;
             return Err(Error::Validation);
@@ -33,7 +57,9 @@ impl Lifecycle {
     }
 
     pub fn confirm_handshake(&mut self) -> Result<(), Error> {
-        if !matches!(self.phase, Phase::TransportReady | Phase::Admitted) { return Err(Error::State); }
+        if !matches!(self.phase, Phase::TransportReady | Phase::Admitted) {
+            return Err(Error::State);
+        }
         self.handshake_confirmed = true;
         Ok(())
     }
@@ -41,28 +67,44 @@ impl Lifecycle {
     /// Theia admission/grants are checked by the existing application layer;
     /// transport readiness cannot alone grant a user tunnel.
     pub fn admit(&mut self, authorized: bool) -> Result<(), Error> {
-        if self.phase != Phase::TransportReady { return Err(Error::State); }
-        if !authorized { self.phase = Phase::Closing; return Err(Error::Validation); }
+        if self.phase != Phase::TransportReady {
+            return Err(Error::State);
+        }
+        if !authorized {
+            self.phase = Phase::Closing;
+            return Err(Error::Validation);
+        }
         self.phase = Phase::Admitted;
         Ok(())
     }
 
-    pub fn can_relay(&self) -> bool { self.phase == Phase::Admitted }
-    pub fn handshake_confirmed(&self) -> bool { self.handshake_confirmed }
+    pub fn can_relay(&self) -> bool {
+        self.phase == Phase::Admitted
+    }
+    pub fn handshake_confirmed(&self) -> bool {
+        self.handshake_confirmed
+    }
 
     pub fn close(&mut self) {
-        if matches!(self.phase, Phase::Handshaking | Phase::TransportReady | Phase::Admitted) {
+        if matches!(
+            self.phase,
+            Phase::Handshaking | Phase::TransportReady | Phase::Admitted
+        ) {
             self.phase = Phase::Closing;
         }
     }
 
     pub fn peer_closed(&mut self) {
-        if self.phase != Phase::Closed { self.phase = Phase::Draining; }
+        if self.phase != Phase::Closed {
+            self.phase = Phase::Draining;
+        }
     }
 
     /// The endpoint owner must enforce the closing/draining deadline.
     pub fn expire(&mut self) -> Result<(), Error> {
-        if !matches!(self.phase, Phase::Closing | Phase::Draining) { return Err(Error::State); }
+        if !matches!(self.phase, Phase::Closing | Phase::Draining) {
+            return Err(Error::State);
+        }
         self.phase = Phase::Closed;
         Ok(())
     }
@@ -74,7 +116,13 @@ impl Lifecycle {
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ShutdownPhase { #[default] Open, Closing, Draining, Closed }
+pub enum ShutdownPhase {
+    #[default]
+    Open,
+    Closing,
+    Draining,
+    Closed,
+}
 
 #[derive(Default)]
 pub struct Shutdown {
@@ -86,17 +134,27 @@ pub struct Shutdown {
 }
 
 impl Shutdown {
-    pub fn phase(&self) -> ShutdownPhase { self.phase }
-    pub fn deadline(&self) -> Option<Instant> { self.deadline }
-    pub fn is_open(&self) -> bool { self.phase == ShutdownPhase::Open }
+    pub fn phase(&self) -> ShutdownPhase {
+        self.phase
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+    pub fn is_open(&self) -> bool {
+        self.phase == ShutdownPhase::Open
+    }
 
     fn duration(pto: Duration) -> Duration {
         pto.max(Duration::from_millis(1)).saturating_mul(3)
     }
 
     pub fn local(&mut self, now: Instant, pto: Duration, code: u64) -> Result<(), Error> {
-        if code > super::wire::MAX_VARINT { return Err(Error::Validation); }
-        if self.phase != ShutdownPhase::Open { return Err(Error::State); }
+        if code > super::wire::MAX_VARINT {
+            return Err(Error::Validation);
+        }
+        if self.phase != ShutdownPhase::Open {
+            return Err(Error::State);
+        }
         self.deadline = Some(now.checked_add(Self::duration(pto)).ok_or(Error::State)?);
         self.phase = ShutdownPhase::Closing;
         self.pending = true;
@@ -123,7 +181,8 @@ impl Shutdown {
     pub fn authenticated_packet(&mut self, now: Instant) {
         if self.phase == ShutdownPhase::Closing
             && self.deadline.is_some_and(|end| now < end)
-            && self.next_send.is_none_or(|next| now >= next) {
+            && self.next_send.is_none_or(|next| now >= next)
+        {
             self.pending = true;
         }
     }
@@ -138,7 +197,9 @@ impl Shutdown {
     }
 
     pub fn expire(&mut self, now: Instant) -> bool {
-        if self.deadline.is_some_and(|end| now >= end) { self.abort(); }
+        if self.deadline.is_some_and(|end| now >= end) {
+            self.abort();
+        }
         self.phase == ShutdownPhase::Closed
     }
 
@@ -164,7 +225,10 @@ mod tests {
         assert_eq!(state.deadline(), Some(start + pto * 3));
         assert_eq!(state.take_close(start, pto), Some(42));
         state.authenticated_packet(start + Duration::from_millis(99));
-        assert_eq!(state.take_close(start + Duration::from_millis(99), pto), None);
+        assert_eq!(
+            state.take_close(start + Duration::from_millis(99), pto),
+            None
+        );
         state.authenticated_packet(start + pto);
         assert_eq!(state.take_close(start + pto, pto), Some(42));
         assert_eq!(state.local(start + pto, pto, 7), Err(Error::State));
@@ -202,19 +266,26 @@ mod tests {
 
     #[test]
     fn failures_are_terminal() {
-        for values in [(false,true,true,true),(true,false,true,true),(true,true,false,true),(true,true,true,false)] {
+        for values in [
+            (false, true, true, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, false),
+        ] {
             let mut l = Lifecycle::default();
-            assert_eq!(l.transport_ready(values.0, values.1, values.2, values.3), Err(Error::Validation));
-            assert_eq!(l.transport_ready(true,true,true,true), Err(Error::State));
+            assert_eq!(
+                l.transport_ready(values.0, values.1, values.2, values.3),
+                Err(Error::Validation)
+            );
+            assert_eq!(l.transport_ready(true, true, true, true), Err(Error::State));
             assert_eq!(l.phase(), Phase::Closing);
         }
         let mut l = Lifecycle::default();
-        l.transport_ready(true,true,true,true).unwrap();
+        l.transport_ready(true, true, true, true).unwrap();
         assert_eq!(l.admit(false), Err(Error::Validation));
         assert!(!l.can_relay());
     }
 }
-
 
 /// RFC 9000 idle timer: authenticated receive or the first ack-eliciting
 /// send following receive may refresh it; repeated sends cannot keep a
@@ -227,7 +298,11 @@ pub struct Idle {
 
 impl Idle {
     pub fn new(now: Instant, timeout: Duration) -> Self {
-        Self { last: now, timeout, sent_since_receive: false }
+        Self {
+            last: now,
+            timeout,
+            sent_since_receive: false,
+        }
     }
 
     pub fn received(&mut self, now: Instant) {
@@ -243,8 +318,11 @@ impl Idle {
     }
 
     pub fn deadline(&self, pto: Duration) -> Option<Instant> {
-        if self.timeout.is_zero() { return None; }
-        self.last.checked_add(self.timeout.max(pto.saturating_mul(3)))
+        if self.timeout.is_zero() {
+            return None;
+        }
+        self.last
+            .checked_add(self.timeout.max(pto.saturating_mul(3)))
     }
 }
 
@@ -261,7 +339,10 @@ mod idle_tests {
         assert_eq!(idle.deadline(pto), Some(start + Duration::from_secs(31)));
         idle.received(start + Duration::from_secs(26));
         assert_eq!(idle.deadline(pto), Some(start + Duration::from_secs(56)));
-        assert_eq!(idle.deadline(Duration::from_secs(20)), Some(start + Duration::from_secs(86)));
+        assert_eq!(
+            idle.deadline(Duration::from_secs(20)),
+            Some(start + Duration::from_secs(86))
+        );
         assert!(Idle::new(start, Duration::ZERO).deadline(pto).is_none());
     }
 }

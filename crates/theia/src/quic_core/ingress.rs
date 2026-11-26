@@ -30,7 +30,12 @@ pub enum Action {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error { Limit, Owner, Clock, Random }
+pub enum Error {
+    Limit,
+    Owner,
+    Clock,
+    Random,
+}
 
 pub struct Ingress {
     routes: Demux,
@@ -58,7 +63,9 @@ impl Ingress {
     }
 
     fn tick(&mut self, now: u64) -> Result<(), Error> {
-        if now < self.now { return Err(Error::Clock); }
+        if now < self.now {
+            return Err(Error::Clock);
+        }
         self.now = now;
         let before = self.retired.len();
         self.retired.retain(|_, until| now <= *until);
@@ -85,7 +92,9 @@ impl Ingress {
     pub fn issue_local_cid(&mut self, owner: u64, now: u64) -> Result<Cid, Error> {
         self.tick(now)?;
         let ids = self.owners.get(&owner).ok_or(Error::Owner)?;
-        if ids.len() >= MAX_OWNER_CIDS || self.occupied >= self.limit { return Err(Error::Limit); }
+        if ids.len() >= MAX_OWNER_CIDS || self.occupied >= self.limit {
+            return Err(Error::Limit);
+        }
         let cid = self.fresh_cid(&[])?;
         self.routes.register(cid, owner).map_err(|_| Error::Limit)?;
         self.owners.get_mut(&owner).ok_or(Error::Owner)?.insert(cid);
@@ -98,7 +107,9 @@ impl Ingress {
         self.tick(now)?;
         let until = now.checked_add(TOKEN_TTL).ok_or(Error::Clock)?;
         let ids = self.owners.get_mut(&owner).ok_or(Error::Owner)?;
-        if ids.len() <= 1 || !ids.contains(&cid) { return Err(Error::Owner); }
+        if ids.len() <= 1 || !ids.contains(&cid) {
+            return Err(Error::Owner);
+        }
         self.routes.retire(cid, owner).map_err(|_| Error::Owner)?;
         ids.remove(&cid);
         self.retired.insert(cid, until);
@@ -112,31 +123,51 @@ impl Ingress {
         let until = now.checked_add(TOKEN_TTL).ok_or(Error::Clock)?;
         let ids = self.owners.remove(&owner).ok_or(Error::Owner)?;
         self.routes.remove_owner(owner);
-        for cid in ids { self.retired.insert(cid, until); }
+        for cid in ids {
+            self.retired.insert(cid, until);
+        }
         Ok(())
     }
 
-    pub fn process(&mut self, peer: SocketAddr, datagram: &[u8], now: u64) -> Result<Action, Error> {
+    pub fn process(
+        &mut self,
+        peer: SocketAddr,
+        datagram: &[u8],
+        now: u64,
+    ) -> Result<Action, Error> {
         self.tick(now)?;
         if peer.port() == 0 || datagram.is_empty() || datagram.len() > MAX_DATAGRAM {
             return Ok(Action::Drop);
         }
         if let Some((version, dcid, scid)) = unsupported_header(datagram) {
-            if version != 0 && Version::from_wire(version).is_none()
-                && <Cid>::try_from(dcid).ok().is_none_or(|cid| self.available(cid)) {
+            if version != 0
+                && Version::from_wire(version).is_none()
+                && <Cid>::try_from(dcid)
+                    .ok()
+                    .is_none_or(|cid| self.available(cid))
+            {
                 let mut reply = vec![0x80];
                 reply.extend([0; 4]);
                 reply.push(scid.len() as u8);
                 reply.extend_from_slice(scid);
                 reply.push(dcid.len() as u8);
                 reply.extend_from_slice(dcid);
-                for v in [Version::V1, Version::V2] { reply.extend(v.wire().to_be_bytes()); }
+                for v in [Version::V1, Version::V2] {
+                    reply.extend(v.wire().to_be_bytes());
+                }
                 return Ok(Action::Reply(reply));
             }
         }
-        let Ok(packets) = datagram::split(datagram) else { return Ok(Action::Drop); };
-        let Some(head) = packets.first() else { return Ok(Action::Drop); };
-        if matches!(head.kind, PacketKind::Retry | PacketKind::VersionNegotiation) {
+        let Ok(packets) = datagram::split(datagram) else {
+            return Ok(Action::Drop);
+        };
+        let Some(head) = packets.first() else {
+            return Ok(Action::Drop);
+        };
+        if matches!(
+            head.kind,
+            PacketKind::Retry | PacketKind::VersionNegotiation
+        ) {
             return Ok(Action::Drop);
         }
         let cid = <Cid>::try_from(head.destination).ok();
@@ -146,21 +177,43 @@ impl Ingress {
         if head.kind != PacketKind::Initial || self.occupied >= self.limit {
             return Ok(Action::Drop);
         }
-        if cid.is_some_and(|id| self.retired.contains_key(&id)) { return Ok(Action::Drop); }
-        let Some(header) = long(head.bytes) else { return Ok(Action::Drop); };
-        let Some(version) = head.version else { return Ok(Action::Drop); };
+        if cid.is_some_and(|id| self.retired.contains_key(&id)) {
+            return Ok(Action::Drop);
+        }
+        let Some(header) = long(head.bytes) else {
+            return Ok(Action::Drop);
+        };
+        let Some(version) = head.version else {
+            return Ok(Action::Drop);
+        };
         if header.token.is_empty() {
             let retry = self.fresh_cid(header.dcid)?;
             let binding = Binding {
-                version, original: header.dcid.to_vec(), retry, client: header.scid.to_vec(),
+                version,
+                original: header.dcid.to_vec(),
+                retry,
+                client: header.scid.to_vec(),
             };
-            let token = self.tokens.issue(peer, &binding, now).map_err(|_| Error::Random)?;
-            return Ok(Action::Reply(make_retry(&binding, &token).ok_or(Error::Limit)?));
+            let token = self
+                .tokens
+                .issue(peer, &binding, now)
+                .map_err(|_| Error::Random)?;
+            return Ok(Action::Reply(
+                make_retry(&binding, &token).ok_or(Error::Limit)?,
+            ));
         }
-        let Some(cid) = cid else { return Ok(Action::Drop); };
-        let Ok(binding) = self.tokens.verify(header.token, peer, version, cid, header.scid, now)
-            else { return Ok(Action::Drop); };
-        if !self.available(cid) { return Ok(Action::Drop); }
+        let Some(cid) = cid else {
+            return Ok(Action::Drop);
+        };
+        let Ok(binding) = self
+            .tokens
+            .verify(header.token, peer, version, cid, header.scid, now)
+        else {
+            return Ok(Action::Drop);
+        };
+        if !self.available(cid) {
+            return Ok(Action::Drop);
+        }
         let owner = self.next_owner;
         let next = owner.checked_add(1).ok_or(Error::Limit)?;
         self.routes.register(cid, owner).map_err(|_| Error::Limit)?;
@@ -174,20 +227,31 @@ impl Ingress {
 /// QUIC invariant header only. No type interpretation for unknown
 /// versions. Bounded by the native endpoint's supported CID lengths.
 fn unsupported_header(bytes: &[u8]) -> Option<(u32, &[u8], &[u8])> {
-    if bytes.len() < 1200 || bytes.first()? & 0x80 == 0 { return None; }
+    if bytes.len() < 1200 || bytes.first()? & 0x80 == 0 {
+        return None;
+    }
     let version = u32::from_be_bytes(bytes.get(1..5)?.try_into().ok()?);
-    if version == 0 || Version::from_wire(version).is_some() { return None; }
+    if version == 0 || Version::from_wire(version).is_some() {
+        return None;
+    }
     let dlen = usize::from(*bytes.get(5)?);
-    if !(8..=20).contains(&dlen) { return None; }
-    let dcid = bytes.get(6..6+dlen)?;
-    let slen = usize::from(*bytes.get(6+dlen)?);
-    if slen > 20 { return None; }
-    let scid = bytes.get(7+dlen..7+dlen+slen)?;
+    if !(8..=20).contains(&dlen) {
+        return None;
+    }
+    let dcid = bytes.get(6..6 + dlen)?;
+    let slen = usize::from(*bytes.get(6 + dlen)?);
+    if slen > 20 {
+        return None;
+    }
+    let scid = bytes.get(7 + dlen..7 + dlen + slen)?;
     Some((version, dcid, scid))
 }
 
 fn make_retry(binding: &Binding, token: &[u8]) -> Option<Vec<u8>> {
-    let first = match binding.version { Version::V1 => 0xf0, Version::V2 => 0xc0 };
+    let first = match binding.version {
+        Version::V1 => 0xf0,
+        Version::V2 => 0xc0,
+    };
     let mut packet = vec![first];
     packet.extend(binding.version.wire().to_be_bytes());
     packet.push(binding.client.len() as u8);
@@ -201,12 +265,20 @@ fn make_retry(binding: &Binding, token: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[derive(Debug)]
-pub enum UdpError { Io(io::Error), Ingress(Error), Scope }
+pub enum UdpError {
+    Io(io::Error),
+    Ingress(Error),
+    Scope,
+}
 #[derive(Debug)]
 pub enum Event {
     Dropped,
     Replied,
-    Datagram { peer: SocketAddr, bytes: Vec<u8>, action: Action },
+    Datagram {
+        peer: SocketAddr,
+        bytes: Vec<u8>,
+        action: Action,
+    },
 }
 
 /// One real UDP socket and one serialized owner of the CID routing table.
@@ -221,11 +293,20 @@ pub struct UdpIngress {
 
 impl UdpIngress {
     pub fn new(socket: UdpSocket, limit: usize) -> Result<Self, UdpError> {
-        if !socket.local_addr().map_err(UdpError::Io)?.ip().is_loopback() {
+        if !socket
+            .local_addr()
+            .map_err(UdpError::Io)?
+            .ip()
+            .is_loopback()
+        {
             return Err(UdpError::Scope);
         }
-        Ok(Self { socket, ingress: Ingress::new(limit).map_err(UdpError::Ingress)?,
-            clock: Instant::now(), buffer: vec![0; MAX_DATAGRAM + 1] })
+        Ok(Self {
+            socket,
+            ingress: Ingress::new(limit).map_err(UdpError::Ingress)?,
+            clock: Instant::now(),
+            buffer: vec![0; MAX_DATAGRAM + 1],
+        })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, UdpError> {
@@ -233,26 +314,51 @@ impl UdpIngress {
     }
 
     pub fn close(&mut self, owner: u64) -> Result<(), UdpError> {
-        self.ingress.close(owner, self.clock.elapsed().as_secs()).map_err(UdpError::Ingress)
+        self.ingress
+            .close(owner, self.clock.elapsed().as_secs())
+            .map_err(UdpError::Ingress)
     }
 
     pub async fn receive(&mut self) -> Result<Event, UdpError> {
-        let (n, peer) = self.socket.recv_from(&mut self.buffer).await.map_err(UdpError::Io)?;
-        if !peer.ip().is_loopback() { return Ok(Event::Dropped); }
-        let action = self.ingress.process(peer, &self.buffer[..n], self.clock.elapsed().as_secs())
+        let (n, peer) = self
+            .socket
+            .recv_from(&mut self.buffer)
+            .await
+            .map_err(UdpError::Io)?;
+        if !peer.ip().is_loopback() {
+            return Ok(Event::Dropped);
+        }
+        let action = self
+            .ingress
+            .process(peer, &self.buffer[..n], self.clock.elapsed().as_secs())
             .map_err(UdpError::Ingress)?;
         match action {
             Action::Drop => Ok(Event::Dropped),
             Action::Reply(bytes) => {
                 // Both stateless responses are smaller than the triggering
                 // datagram. Never amplify unvalidated traffic.
-                if bytes.len() > n { return Ok(Event::Dropped); }
-                if self.socket.send_to(&bytes, peer).await.map_err(UdpError::Io)? != bytes.len() {
-                    return Err(UdpError::Io(io::Error::new(io::ErrorKind::WriteZero, "short UDP send")));
+                if bytes.len() > n {
+                    return Ok(Event::Dropped);
+                }
+                if self
+                    .socket
+                    .send_to(&bytes, peer)
+                    .await
+                    .map_err(UdpError::Io)?
+                    != bytes.len()
+                {
+                    return Err(UdpError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short UDP send",
+                    )));
                 }
                 Ok(Event::Replied)
             }
-            action => Ok(Event::Datagram { peer, bytes: self.buffer[..n].to_vec(), action }),
+            action => Ok(Event::Datagram {
+                peer,
+                bytes: self.buffer[..n].to_vec(),
+                action,
+            }),
         }
     }
 }
@@ -265,7 +371,10 @@ mod tests {
     use std::time::Duration;
 
     fn initial(version: Version, dst: &[u8], src: &[u8], token: &[u8]) -> Vec<u8> {
-        Writer::new(version, dst, Side::Client).unwrap().seal(dst, src, token, &[1]).unwrap()
+        Writer::new(version, dst, Side::Client)
+            .unwrap()
+            .seal(dst, src, token, &[1])
+            .unwrap()
     }
     fn short(cid: Cid) -> Vec<u8> {
         let mut bytes = vec![0x43];
@@ -282,24 +391,44 @@ mod tests {
             let other = "127.0.0.1:1001".parse().unwrap();
             let original = [1; 12];
             let client = [2; 8];
-            let Action::Reply(retry) = ingress.process(peer, &initial(version, &original, &client, &[]), 0).unwrap()
-                else { panic!("Retry required") };
-            let (new, token) = negotiation::retry_token(&retry, version, &client, &original, false, false).unwrap();
+            let Action::Reply(retry) = ingress
+                .process(peer, &initial(version, &original, &client, &[]), 0)
+                .unwrap()
+            else {
+                panic!("Retry required")
+            };
+            let (new, token) =
+                negotiation::retry_token(&retry, version, &client, &original, false, false)
+                    .unwrap();
             let cid: Cid = new.try_into().unwrap();
             let packet = initial(version, &cid, &client, token);
             assert_eq!(ingress.process(other, &packet, 1), Ok(Action::Drop));
-            assert_eq!(ingress.process(peer, &initial(version, &cid, &[3;8], token), 1), Ok(Action::Drop));
+            assert_eq!(
+                ingress.process(peer, &initial(version, &cid, &[3; 8], token), 1),
+                Ok(Action::Drop)
+            );
             let Action::Accepted { owner, binding } = ingress.process(peer, &packet, 1).unwrap()
-                else { panic!("valid address token") };
+            else {
+                panic!("valid address token")
+            };
             assert_eq!(binding.original, original);
             let mut joined = packet.clone();
             joined.extend(short(cid));
-            assert_eq!(ingress.process(peer, &joined, 1), Ok(Action::Existing(owner)));
+            assert_eq!(
+                ingress.process(peer, &joined, 1),
+                Ok(Action::Existing(owner))
+            );
             let alias = ingress.issue_local_cid(owner, 1).unwrap();
             assert_eq!(ingress.issue_local_cid(owner, 1), Err(Error::Limit));
             // Routing new tuple does not validate migration.
-            assert_eq!(ingress.process(other, &short(alias), 1), Ok(Action::Existing(owner)));
-            assert_eq!(ingress.retire_local_cid(owner+1, alias, 1), Err(Error::Owner));
+            assert_eq!(
+                ingress.process(other, &short(alias), 1),
+                Ok(Action::Existing(owner))
+            );
+            assert_eq!(
+                ingress.retire_local_cid(owner + 1, alias, 1),
+                Err(Error::Owner)
+            );
             ingress.retire_local_cid(owner, alias, 1).unwrap();
             assert_eq!(ingress.process(peer, &short(alias), 1), Ok(Action::Drop));
             assert_eq!(ingress.issue_local_cid(owner, 1), Err(Error::Limit));
@@ -314,15 +443,16 @@ mod tests {
     fn unknown_version_gets_bounded_vn_with_swapped_ids() {
         let mut ingress = Ingress::new(1).unwrap();
         let peer = "127.0.0.1:1000".parse().unwrap();
-        let mut packet = initial(Version::V1, &[1;8], &[2;8], &[]);
+        let mut packet = initial(Version::V1, &[1; 8], &[2; 8], &[]);
         packet[1..5].copy_from_slice(&0x11223344u32.to_be_bytes());
-        let Action::Reply(vn) = ingress.process(peer, &packet, 0).unwrap()
-            else { panic!("VN required") };
+        let Action::Reply(vn) = ingress.process(peer, &packet, 0).unwrap() else {
+            panic!("VN required")
+        };
         let h = long(&vn).unwrap();
         assert_eq!(h.version, 0);
-        assert_eq!(h.dcid, &[2;8]);
-        assert_eq!(h.scid, &[1;8]);
-        assert_eq!(&vn[vn.len()-8..], &[0,0,0,1,0x6b,0x33,0x43,0xcf]);
+        assert_eq!(h.dcid, &[2; 8]);
+        assert_eq!(h.scid, &[1; 8]);
+        assert_eq!(&vn[vn.len() - 8..], &[0, 0, 0, 1, 0x6b, 0x33, 0x43, 0xcf]);
         assert_eq!(ingress.process(peer, &packet[..1199], 0), Ok(Action::Drop));
         assert_eq!(ingress.process(peer, &vn, 0), Ok(Action::Drop));
     }
@@ -334,8 +464,8 @@ mod tests {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dst = ingress.local_addr().unwrap();
         let version = Version::V2;
-        let original = [7;8];
-        let client = [8;8];
+        let original = [7; 8];
+        let client = [8; 8];
         tokio::time::timeout(Duration::from_secs(2), async {
             peer.send_to(&initial(version, &original, &client, &[]), dst).await.unwrap();
             assert!(matches!(ingress.receive().await.unwrap(), Event::Replied));

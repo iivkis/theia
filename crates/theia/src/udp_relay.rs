@@ -122,7 +122,8 @@ pub(crate) async fn direct(
     .await
     .map_err(|_| ClientError::Open(ErrorCode::DialTimeout))?
 }
-type Fallback = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Tunnel, ClientError>> + Send>>;
+type Fallback =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Tunnel, ClientError>> + Send>>;
 const FIRST_RESPONSE: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -132,7 +133,9 @@ enum LocalRelayError {
 }
 impl LocalRelayError {
     fn into_client(self) -> ClientError {
-        match self { Self::Peer(error) | Self::Application(error) => error }
+        match self {
+            Self::Peer(error) | Self::Application(error) => error,
+        }
     }
 }
 
@@ -149,7 +152,10 @@ impl Tunnel {
             Self::H3(tunnel) => (3, tunnel.opened_stream_up()),
             Self::Direct(_) | Self::VerifiedLocal(..) => return,
         };
-        observed.store((transport << 2) | if up { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+        observed.store(
+            (transport << 2) | if up { 2 } else { 1 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub(crate) async fn relay(
@@ -159,12 +165,18 @@ impl Tunnel {
     ) -> Result<(), ClientError> {
         match self {
             Self::VerifiedLocal(verified, fallback) => {
-                let Some(first) = upload.recv().await else { return Ok(()); };
+                let Some(first) = upload.recv().await else {
+                    return Ok(());
+                };
                 let stun = match verified.strategy {
                     crate::routing::dpi::UdpStrategy::StunBinding(strategy) => Some(strategy),
                     crate::routing::dpi::UdpStrategy::QuicV1 => None,
                 };
-                if !verified.admissible()? || stun.is_some_and(|strategy| crate::routing::dpi::udp::prepare_binding(&first, strategy).is_none()) {
+                if !verified.admissible()?
+                    || stun.is_some_and(|strategy| {
+                        crate::routing::dpi::udp::prepare_binding(&first, strategy).is_none()
+                    })
+                {
                     let authorization = verified.fallback_policy();
                     drop(verified);
                     authorization.check()?;
@@ -181,7 +193,14 @@ impl Tunnel {
                 let result = if let Some(strategy) = stun {
                     relay_stun(&verified.socket, strategy, first, upload, download).await
                 } else {
-                    relay_local(&verified.socket, Some(FIRST_RESPONSE), Some(first), upload, download).await
+                    relay_local(
+                        &verified.socket,
+                        Some(FIRST_RESPONSE),
+                        Some(first),
+                        upload,
+                        download,
+                    )
+                    .await
                 };
                 if matches!(&result, Err(LocalRelayError::Peer(_))) {
                     verified.failed();
@@ -202,14 +221,23 @@ impl Tunnel {
         match self {
             Self::H2(t) => t.relay_udp(first, upload, download).await,
             Self::H3(t) => t.relay_udp(first, upload, download).await,
-            Self::Direct(socket) => relay_local(&socket, None, first, upload, download).await.map_err(LocalRelayError::into_client),
+            Self::Direct(socket) => relay_local(&socket, None, first, upload, download)
+                .await
+                .map_err(LocalRelayError::into_client),
             Self::VerifiedLocal(..) => Err(ClientError::Protocol),
         }
     }
 }
 
-pub(crate) async fn next_datagram(first: &mut Option<Vec<u8>>, upload: &mut mpsc::Receiver<Vec<u8>>) -> Option<Vec<u8>> {
-    if let Some(data) = first.take() { Some(data) } else { upload.recv().await }
+pub(crate) async fn next_datagram(
+    first: &mut Option<Vec<u8>>,
+    upload: &mut mpsc::Receiver<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if let Some(data) = first.take() {
+        Some(data)
+    } else {
+        upload.recv().await
+    }
 }
 
 async fn relay_local(
@@ -224,8 +252,11 @@ async fn relay_local(
     // For verified QUIC, start the receive deadline only after a successful
     // first application write. No server response is assumed authenticated.
     if let Some(deadline) = verification_deadline {
-        let data = first.take().ok_or(LocalRelayError::Application(ClientError::Protocol))?;
-        timeout(deadline, send_datagram(socket, &data)).await
+        let data = first
+            .take()
+            .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+        timeout(deadline, send_datagram(socket, &data))
+            .await
             .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
             .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
         traffic.upload(data.len());
@@ -234,7 +265,9 @@ async fn relay_local(
     }
     let send = async {
         while let Some(data) = next_datagram(&mut first, &mut upload).await {
-            send_datagram(socket, &data).await.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+            send_datagram(socket, &data)
+                .await
+                .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
             traffic.upload(data.len());
             activity.touch();
         }
@@ -245,11 +278,16 @@ async fn relay_local(
         let mut waiting = verification_deadline.map(|duration| Instant::now() + duration);
         loop {
             let n = if let Some(deadline) = waiting {
-                timeout_at(deadline, socket.recv(&mut buf)).await.map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
+                timeout_at(deadline, socket.recv(&mut buf))
+                    .await
+                    .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
             } else {
                 socket.recv(&mut buf).await
-            }.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
-            if n > protocol::MAX_DATAGRAM { continue; }
+            }
+            .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+            if n > protocol::MAX_DATAGRAM {
+                continue;
+            }
             if waiting.take().is_some() {
                 crate::traffic::udp_peer_reply();
             }
@@ -277,26 +315,43 @@ async fn relay_stun(
     let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
     let activity = Activity::new();
     let requests = Mutex::new(BindingTransactions::default());
-    if !requests.lock().unwrap_or_else(|e| e.into_inner()).admit(&first) {
+    if !requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .admit(&first)
+    {
         return Err(LocalRelayError::Application(ClientError::Protocol));
     }
-    let packet = prepare_binding(&first, strategy).ok_or(LocalRelayError::Application(ClientError::Protocol))?;
-    timeout(FIRST_RESPONSE, send_datagram(socket, &packet)).await
+    let packet = prepare_binding(&first, strategy)
+        .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+    timeout(FIRST_RESPONSE, send_datagram(socket, &packet))
+        .await
         .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
         .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
-    if packet.len() != first.len() { crate::traffic::udp_stun_fingerprint(); }
+    if packet.len() != first.len() {
+        crate::traffic::udp_stun_fingerprint();
+    }
     traffic.upload(first.len());
     activity.touch();
     crate::traffic::udp_stun_local();
     let send = async {
         while let Some(data) = upload.recv().await {
-            if !requests.lock().unwrap_or_else(|e| e.into_inner()).admit(&data) {
+            if !requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .admit(&data)
+            {
                 // No switch or replay once the local flow was used.
                 return Err(LocalRelayError::Application(ClientError::Protocol));
             }
-            let packet = prepare_binding(&data, strategy).ok_or(LocalRelayError::Application(ClientError::Protocol))?;
-            send_datagram(socket, &packet).await.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
-            if packet.len() != data.len() { crate::traffic::udp_stun_fingerprint(); }
+            let packet = prepare_binding(&data, strategy)
+                .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+            send_datagram(socket, &packet)
+                .await
+                .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+            if packet.len() != data.len() {
+                crate::traffic::udp_stun_fingerprint();
+            }
             traffic.upload(data.len());
             activity.touch();
         }
@@ -307,12 +362,22 @@ async fn relay_stun(
         let mut waiting = Some(Instant::now() + FIRST_RESPONSE);
         loop {
             let n = match waiting {
-                Some(deadline) => timeout_at(deadline, socket.recv(&mut buf)).await
+                Some(deadline) => timeout_at(deadline, socket.recv(&mut buf))
+                    .await
                     .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?,
                 None => socket.recv(&mut buf).await,
-            }.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
-            if !requests.lock().unwrap_or_else(|e| e.into_inner()).accept(&buf[..n]) { continue; }
-            if waiting.take().is_some() { crate::traffic::udp_peer_reply(); }
+            }
+            .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+            if !requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .accept(&buf[..n])
+            {
+                continue;
+            }
+            if waiting.take().is_some() {
+                crate::traffic::udp_peer_reply();
+            }
             if deliver(&download, || buf[..n].to_vec()).map_err(LocalRelayError::Application)? {
                 traffic.download(n);
                 activity.touch();
@@ -326,10 +391,19 @@ async fn relay_stun(
 
 /// UDP overload drops rather than blocking the entire incoming stream.
 /// Do not allocate/copy a datagram unless the bounded queue accepts it.
-pub(crate) fn deliver(download: &mpsc::Sender<Vec<u8>>, data: impl FnOnce() -> Vec<u8>) -> Result<bool, ClientError> {
+pub(crate) fn deliver(
+    download: &mpsc::Sender<Vec<u8>>,
+    data: impl FnOnce() -> Vec<u8>,
+) -> Result<bool, ClientError> {
     match download.try_reserve() {
-        Ok(permit) => { permit.send(data()); Ok(true) }
-        Err(mpsc::error::TrySendError::Full(_)) => { crate::traffic::udp_queue_drop(); Ok(false) }
+        Ok(permit) => {
+            permit.send(data());
+            Ok(true)
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            crate::traffic::udp_queue_drop();
+            Ok(false)
+        }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(ClientError::Io),
     }
 }
@@ -385,16 +459,24 @@ pub(crate) fn parse_socks(bytes: &[u8]) -> Option<(Address, u16, &[u8])> {
     };
     let port = u16::from_be_bytes(bytes.get(end..end + 2)?.try_into().ok()?);
     let data = bytes.get(end + 2..)?;
-    if data.len() > protocol::MAX_DATAGRAM || port == 0
+    if data.len() > protocol::MAX_DATAGRAM
+        || port == 0
         || matches!(&address, Address::Dns(name) if !protocol::valid_dns(name))
     {
         return None;
     }
     Some((address, port, data))
 }
-pub(crate) fn encode_socks_into(out: &mut Vec<u8>, address: &Address, port: u16, data: &[u8]) -> bool {
+pub(crate) fn encode_socks_into(
+    out: &mut Vec<u8>,
+    address: &Address,
+    port: u16,
+    data: &[u8],
+) -> bool {
     out.clear();
-    if port == 0 || matches!(address, Address::Dns(name) if !protocol::valid_dns(name)) { return false; }
+    if port == 0 || matches!(address, Address::Dns(name) if !protocol::valid_dns(name)) {
+        return false;
+    }
     out.extend([0, 0, 0]);
     encode_address(out, address, port);
     if data.len() > protocol::MAX_DATAGRAM.saturating_sub(out.len()) {
@@ -445,17 +527,28 @@ mod tests {
         assert!(encode_socks_into(&mut packet, &address, 443, b"previous"));
         let capacity = packet.capacity();
         assert!(encode_socks_into(&mut packet, &address, 443, b""));
-        assert_eq!(parse_socks(&packet), Some((address.clone(), 443, b"".as_slice())));
+        assert_eq!(
+            parse_socks(&packet),
+            Some((address.clone(), 443, b"".as_slice()))
+        );
         assert_eq!(packet.capacity(), capacity);
         assert!(!encode_socks_into(&mut packet, &address, 0, b"bad"));
         assert!(packet.is_empty());
-        assert!(!encode_socks_into(&mut packet, &address, 443, &vec![0; protocol::MAX_DATAGRAM]));
+        assert!(!encode_socks_into(
+            &mut packet,
+            &address,
+            443,
+            &vec![0; protocol::MAX_DATAGRAM]
+        ));
         assert!(packet.is_empty());
     }
 
     #[tokio::test]
     async fn active_flow_renews_idle_and_queue_overload_drops_without_replay() {
-        let activity = Activity { last: Mutex::new(Instant::now()), idle: IDLE };
+        let activity = Activity {
+            last: Mutex::new(Instant::now()),
+            idle: IDLE,
+        };
         let initial = activity.deadline();
         tokio::time::sleep(Duration::from_millis(2)).await;
         activity.touch();
@@ -477,15 +570,34 @@ mod tests {
         let (up, rx) = mpsc::channel(QUEUE);
         let (down, mut responses) = mpsc::channel(QUEUE);
         let task = tokio::spawn(async move {
-            relay_local(&socket, Some(FIRST_RESPONSE), Some(b"first".to_vec()), rx, down).await
+            relay_local(
+                &socket,
+                Some(FIRST_RESPONSE),
+                Some(b"first".to_vec()),
+                rx,
+                down,
+            )
+            .await
         });
         let mut buf = [0; 32];
-        let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&buf[..n], b"first");
         target.send_to(b"response", peer).await.unwrap();
-        assert_eq!(timeout(Duration::from_secs(2), responses.recv()).await.unwrap().unwrap(), b"response");
+        assert_eq!(
+            timeout(Duration::from_secs(2), responses.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"response"
+        );
         up.send(Vec::new()).await.unwrap();
-        let (n, _) = timeout(Duration::from_secs(2), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        let (n, _) = timeout(Duration::from_secs(2), target.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(n, 0);
         drop(up);
         assert!(task.await.unwrap().is_ok());
@@ -498,30 +610,52 @@ mod tests {
         let (_up, rx) = mpsc::channel(QUEUE);
         let (down, _responses) = mpsc::channel(QUEUE);
         let task = tokio::spawn(async move {
-            relay_local(&socket, Some(Duration::from_millis(50)), Some(b"first".to_vec()), rx, down).await
+            relay_local(
+                &socket,
+                Some(Duration::from_millis(50)),
+                Some(b"first".to_vec()),
+                rx,
+                down,
+            )
+            .await
         });
         let mut buf = [0; 32];
-        let (n, _) = timeout(Duration::from_secs(2), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        let (n, _) = timeout(Duration::from_secs(2), target.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&buf[..n], b"first");
-        assert!(matches!(task.await.unwrap(), Err(LocalRelayError::Peer(ClientError::Timeout))));
-        assert!(timeout(Duration::from_millis(30), target.recv_from(&mut buf)).await.is_err());
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(LocalRelayError::Peer(ClientError::Timeout))
+        ));
+        assert!(
+            timeout(Duration::from_millis(30), target.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn stun_relay_uses_selected_strategy_and_rejects_other_payload() {
-        use crate::routing::dpi::udp::{BindingStrategy, prepare_binding};
+        use crate::routing::dpi::udp::{prepare_binding, BindingStrategy};
         let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket = connect(target.local_addr().unwrap()).await.unwrap();
         let (up, rx) = mpsc::channel(QUEUE);
         let (down, mut responses) = mpsc::channel(QUEUE);
         let mut first = vec![0, 1, 0, 0, 0x21, 0x12, 0xa4, 0x42];
         first.extend([7; 12]);
-        let expected = prepare_binding(&first, BindingStrategy::Fingerprint).unwrap().into_owned();
+        let expected = prepare_binding(&first, BindingStrategy::Fingerprint)
+            .unwrap()
+            .into_owned();
         let task = tokio::spawn(async move {
             relay_stun(&socket, BindingStrategy::Fingerprint, first, rx, down).await
         });
         let mut buf = [0; 512];
-        let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&buf[..n], expected.as_slice());
         let mut response = expected[..20].to_vec();
         response[0] = 1;
@@ -531,10 +665,23 @@ mod tests {
         wrong[19] ^= 1;
         target.send_to(&wrong, peer).await.unwrap();
         target.send_to(&response, peer).await.unwrap();
-        assert_eq!(timeout(Duration::from_secs(2), responses.recv()).await.unwrap().unwrap(), response);
+        assert_eq!(
+            timeout(Duration::from_secs(2), responses.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            response
+        );
         up.send(b"not Binding".to_vec()).await.unwrap();
-        assert!(matches!(task.await.unwrap(), Err(LocalRelayError::Application(ClientError::Protocol))));
-        assert!(timeout(Duration::from_millis(50), target.recv_from(&mut buf)).await.is_err());
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(LocalRelayError::Application(ClientError::Protocol))
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), target.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -7,7 +7,11 @@ const MAX_STREAMS: u64 = 64;
 pub const MAX_CHUNK: usize = 1000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error { Limit, Stream, Finished }
+pub enum Error {
+    Limit,
+    Stream,
+    Finished,
+}
 
 struct Stream {
     offset: u64,
@@ -30,25 +34,55 @@ pub struct SendFlow {
 }
 
 impl SendFlow {
-    pub fn new(server: bool, max_streams: u64, stream_limit: u64, max_data: u64) -> Result<Self, Error> {
-        if max_streams > (1 << 60) || stream_limit > MAX_VARINT || max_data > MAX_VARINT { return Err(Error::Limit); }
-        Ok(Self { local_bit: u64::from(server), max_streams: max_streams.min(MAX_STREAMS),
-            max_bidi: 0, peer_bidi: 0, next_uni: 0, next_bidi: 0,
-            initial_limit: stream_limit, max_data, used: 0, streams: BTreeMap::new() })
+    pub fn new(
+        server: bool,
+        max_streams: u64,
+        stream_limit: u64,
+        max_data: u64,
+    ) -> Result<Self, Error> {
+        if max_streams > (1 << 60) || stream_limit > MAX_VARINT || max_data > MAX_VARINT {
+            return Err(Error::Limit);
+        }
+        Ok(Self {
+            local_bit: u64::from(server),
+            max_streams: max_streams.min(MAX_STREAMS),
+            max_bidi: 0,
+            peer_bidi: 0,
+            next_uni: 0,
+            next_bidi: 0,
+            initial_limit: stream_limit,
+            max_data,
+            used: 0,
+            streams: BTreeMap::new(),
+        })
     }
 
     pub fn open(&mut self) -> Result<u64, Error> {
         let n = self.next_uni;
-        if n >= self.max_streams { return Err(Error::Limit); }
+        if n >= self.max_streams {
+            return Err(Error::Limit);
+        }
         let id = n * 4 + 2 + self.local_bit;
-        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false, reset: None });
+        self.streams.insert(
+            id,
+            Stream {
+                offset: 0,
+                limit: self.initial_limit,
+                fin: false,
+                reset: None,
+            },
+        );
         self.next_uni += 1;
         Ok(id)
     }
 
     /// Fixed development cap for local and peer bidirectional directions.
     pub fn enable_bidi(&mut self, local: u64, peer: u64) -> Result<(), Error> {
-        if local > MAX_STREAMS || peer > MAX_STREAMS || local < self.next_bidi || peer < self.peer_bidi {
+        if local > MAX_STREAMS
+            || peer > MAX_STREAMS
+            || local < self.next_bidi
+            || peer < self.peer_bidi
+        {
             return Err(Error::Limit);
         }
         self.max_bidi = local;
@@ -57,9 +91,19 @@ impl SendFlow {
     }
 
     pub fn open_bidi(&mut self) -> Result<u64, Error> {
-        if self.next_bidi >= self.max_bidi { return Err(Error::Limit); }
+        if self.next_bidi >= self.max_bidi {
+            return Err(Error::Limit);
+        }
         let id = self.next_bidi * 4 + self.local_bit;
-        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false, reset: None });
+        self.streams.insert(
+            id,
+            Stream {
+                offset: 0,
+                limit: self.initial_limit,
+                fin: false,
+                reset: None,
+            },
+        );
         self.next_bidi += 1;
         Ok(id)
     }
@@ -69,30 +113,43 @@ impl SendFlow {
         if id > MAX_VARINT || id & 2 != 0 || id & 1 == self.local_bit || id / 4 >= self.peer_bidi {
             return Err(Error::Stream);
         }
-        self.streams.entry(id).or_insert(Stream { offset: 0, limit: self.initial_limit, fin: false, reset: None });
+        self.streams.entry(id).or_insert(Stream {
+            offset: 0,
+            limit: self.initial_limit,
+            fin: false,
+            reset: None,
+        });
         Ok(())
     }
 
     pub fn max_bidi(&mut self, value: u64) -> Result<(), Error> {
-        if value > (1 << 60) { return Err(Error::Limit); }
+        if value > (1 << 60) {
+            return Err(Error::Limit);
+        }
         self.max_bidi = self.max_bidi.max(value.min(MAX_STREAMS));
         Ok(())
     }
 
     pub fn max_data(&mut self, value: u64) -> Result<(), Error> {
-        if value > MAX_VARINT { return Err(Error::Limit); }
+        if value > MAX_VARINT {
+            return Err(Error::Limit);
+        }
         self.max_data = self.max_data.max(value);
         Ok(())
     }
 
     pub fn max_streams(&mut self, value: u64) -> Result<(), Error> {
-        if value > (1 << 60) { return Err(Error::Limit); }
+        if value > (1 << 60) {
+            return Err(Error::Limit);
+        }
         self.max_streams = self.max_streams.max(value.min(MAX_STREAMS));
         Ok(())
     }
 
     pub fn max_stream_data(&mut self, id: u64, value: u64) -> Result<(), Error> {
-        if value > MAX_VARINT { return Err(Error::Limit); }
+        if value > MAX_VARINT {
+            return Err(Error::Limit);
+        }
         let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
         stream.limit = stream.limit.max(value);
         Ok(())
@@ -107,8 +164,12 @@ impl SendFlow {
 
     pub fn reset(&mut self, id: u64, code: u64) -> Result<Option<Vec<u8>>, Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
-        if code > MAX_VARINT { return Err(Error::Limit); }
-        if stream.reset.is_some() { return Ok(None); }
+        if code > MAX_VARINT {
+            return Err(Error::Limit);
+        }
+        if stream.reset.is_some() {
+            return Ok(None);
+        }
         let mut frame = vec![4];
         for value in [id, code, stream.offset] {
             let mut scratch = [0; 8];
@@ -123,12 +184,18 @@ impl SendFlow {
     /// must reserve queue capacity first; failed encoding leaves credit intact.
     pub fn encode(&mut self, id: u64, bytes: &[u8], fin: bool) -> Result<Vec<u8>, Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
-        if stream.fin { return Err(Error::Finished); }
-        if bytes.len() > MAX_CHUNK || (bytes.is_empty() && !fin) { return Err(Error::Limit); }
+        if stream.fin {
+            return Err(Error::Finished);
+        }
+        if bytes.len() > MAX_CHUNK || (bytes.is_empty() && !fin) {
+            return Err(Error::Limit);
+        }
         let n = bytes.len() as u64;
         let end = stream.offset.checked_add(n).ok_or(Error::Limit)?;
         let total = self.used.checked_add(n).ok_or(Error::Limit)?;
-        if end > stream.limit || total > self.max_data { return Err(Error::Limit); }
+        if end > stream.limit || total > self.max_data {
+            return Err(Error::Limit);
+        }
         let mut out = vec![0x0e | u8::from(fin)];
         for value in [id, stream.offset, n] {
             let mut scratch = [0; 8];
@@ -145,7 +212,10 @@ impl SendFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quic_core::{frames::{decode, Frame}, spaces::Space};
+    use crate::quic_core::{
+        frames::{decode, Frame},
+        spaces::Space,
+    };
 
     #[test]
     fn credit_and_fin() {
@@ -155,7 +225,15 @@ mod tests {
         assert_eq!(f.open(), Err(Error::Limit));
         assert_eq!(f.encode(id, b"abcd", false), Err(Error::Limit));
         let bytes = f.encode(id, b"ab", false).unwrap();
-        assert_eq!(decode(&bytes, Space::Application).unwrap(), [Frame::Stream { id, offset: 0, data: b"ab", fin: false }]);
+        assert_eq!(
+            decode(&bytes, Space::Application).unwrap(),
+            [Frame::Stream {
+                id,
+                offset: 0,
+                data: b"ab",
+                fin: false
+            }]
+        );
         f.max_stream_data(id, 4).unwrap();
         f.max_stream_data(id, 1).unwrap();
         f.encode(id, b"cd", true).unwrap();
@@ -172,10 +250,15 @@ mod tests {
         let id = f.open().unwrap();
         f.encode(id, b"abc", false).unwrap();
         let frame = f.reset(id, 17).unwrap().unwrap();
-        assert_eq!(decode(&frame, Space::Application).unwrap(),
-            [Frame::ResetStream { id, code: 17, final_size: 3 }]);
+        assert_eq!(
+            decode(&frame, Space::Application).unwrap(),
+            [Frame::ResetStream {
+                id,
+                code: 17,
+                final_size: 3
+            }]
+        );
         assert_eq!(f.reset(id, 17), Ok(None));
         assert_eq!(f.encode(id, b"x", false), Err(Error::Finished));
     }
-
 }

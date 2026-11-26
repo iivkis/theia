@@ -8,7 +8,10 @@ const MAX_CWND: u64 = 64 * 1024 * 1024;
 const BETA: f64 = 0.7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error { Limit, Accounting }
+pub enum Error {
+    Limit,
+    Accounting,
+}
 
 /// RFC 9438 cubic target in packets. This function does not grant send credit
 /// or implement the TCP-friendly region, pacing or recovery transitions.
@@ -34,27 +37,45 @@ pub struct Window {
 
 impl Window {
     pub fn new(mtu: u64) -> Result<Self, Error> {
-        if !(1200..=65527).contains(&mtu) { return Err(Error::Limit); }
+        if !(1200..=65527).contains(&mtu) {
+            return Err(Error::Limit);
+        }
         let cwnd = (10 * mtu).min((2 * mtu).max(14720));
-        Ok(Self { mtu, cwnd, in_flight: 0, recovery: None, ssthresh: MAX_CWND,
-            last_max: 0.0, epoch: None, growth_credit: 0.0 })
+        Ok(Self {
+            mtu,
+            cwnd,
+            in_flight: 0,
+            recovery: None,
+            ssthresh: MAX_CWND,
+            last_max: 0.0,
+            epoch: None,
+            growth_credit: 0.0,
+        })
     }
 
-    pub fn cwnd(&self) -> u64 { self.cwnd }
-    pub fn in_flight(&self) -> u64 { self.in_flight }
+    pub fn cwnd(&self) -> u64 {
+        self.cwnd
+    }
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight
+    }
 
     /// Ordinary in-flight packets only. RFC PTO probes require a separate
     /// bounded exception and anti-amplification check, not this method.
     pub fn reserve(&mut self, bytes: u64) -> Result<(), Error> {
         let next = self.in_flight.checked_add(bytes).ok_or(Error::Limit)?;
-        if bytes == 0 || bytes > self.mtu || next > self.cwnd { return Err(Error::Limit); }
+        if bytes == 0 || bytes > self.mtu || next > self.cwnd {
+            return Err(Error::Limit);
+        }
         self.in_flight = next;
         Ok(())
     }
 
     /// At most one MTU per PTO probe; caller enforces timer and probe count.
     pub fn reserve_probe(&mut self, bytes: u64) -> Result<(), Error> {
-        if bytes == 0 || bytes > self.mtu { return Err(Error::Limit); }
+        if bytes == 0 || bytes > self.mtu {
+            return Err(Error::Limit);
+        }
         self.in_flight = self.in_flight.checked_add(bytes).ok_or(Error::Limit)?;
         Ok(())
     }
@@ -67,13 +88,21 @@ impl Window {
     /// Apply a single congestion event for packets sent before the same
     /// recovery boundary. Uses CUBIC's beta=0.7, not a full controller.
     pub fn loss(&mut self, sent: Instant, now: Instant) -> Result<bool, Error> {
-        if sent > now { return Err(Error::Accounting); }
-        if self.recovery.is_some_and(|start| sent <= start) { return Ok(false); }
+        if sent > now {
+            return Err(Error::Accounting);
+        }
+        if self.recovery.is_some_and(|start| sent <= start) {
+            return Ok(false);
+        }
         self.recovery = Some(now);
         let packets = self.cwnd as f64 / self.mtu as f64;
         // Fast convergence: when another flow joins, reduce the remembered
         // maximum more aggressively than the actual window reduction.
-        self.last_max = if packets < self.last_max { packets * (1.0 + BETA) / 2.0 } else { packets };
+        self.last_max = if packets < self.last_max {
+            packets * (1.0 + BETA) / 2.0
+        } else {
+            packets
+        };
         self.cwnd = (self.cwnd.saturating_mul(7) / 10).max(2 * self.mtu);
         self.ssthresh = self.cwnd;
         self.epoch = None;
@@ -96,17 +125,31 @@ impl Window {
     /// on app-limited ACKs or packets sent before a congestion event.
     /// The future production scheduler must track cwnd-limited periods
     /// more precisely across all packet-number spaces.
-    pub fn on_ack(&mut self, sent: Instant, now: Instant, bytes: u64,
-                  rtt: Duration, cwnd_limited: bool) -> Result<(), Error> {
-        if sent > now || bytes == 0 || bytes > self.mtu { return Err(Error::Accounting); }
+    pub fn on_ack(
+        &mut self,
+        sent: Instant,
+        now: Instant,
+        bytes: u64,
+        rtt: Duration,
+        cwnd_limited: bool,
+    ) -> Result<(), Error> {
+        if sent > now || bytes == 0 || bytes > self.mtu {
+            return Err(Error::Accounting);
+        }
         if !cwnd_limited {
             self.epoch = None;
             self.growth_credit = 0.0;
             return Ok(());
         }
-        if self.recovery.is_some_and(|start| sent <= start) { return Ok(()); }
+        if self.recovery.is_some_and(|start| sent <= start) {
+            return Ok(());
+        }
         if self.cwnd < self.ssthresh {
-            self.cwnd = self.cwnd.saturating_add(bytes).min(self.ssthresh).min(MAX_CWND);
+            self.cwnd = self
+                .cwnd
+                .saturating_add(bytes)
+                .min(self.ssthresh)
+                .min(MAX_CWND);
             return Ok(());
         }
         let current = self.cwnd as f64 / self.mtu as f64;
@@ -114,9 +157,10 @@ impl Window {
         let elapsed = now.checked_duration_since(start).ok_or(Error::Accounting)?;
         let rtt = rtt.max(Duration::from_micros(1));
         let w_max = self.last_max.max(initial);
-        let cubic = cubic_target(w_max, initial, elapsed.saturating_add(rtt)).ok_or(Error::Accounting)?;
-        let friendly = initial + 3.0 * (1.0 - BETA) / (1.0 + BETA)
-            * (elapsed.as_secs_f64() / rtt.as_secs_f64());
+        let cubic =
+            cubic_target(w_max, initial, elapsed.saturating_add(rtt)).ok_or(Error::Accounting)?;
+        let friendly = initial
+            + 3.0 * (1.0 - BETA) / (1.0 + BETA) * (elapsed.as_secs_f64() / rtt.as_secs_f64());
         // Limit ACK-driven growth to a bounded target; use fractional byte
         // credit rather than rounding every small ACK up to a whole MTU.
         let target = cubic.max(friendly).min(current * 1.5);
@@ -131,7 +175,9 @@ impl Window {
     /// The future scheduler chooses a validated controller's target.
     /// This window only bounds the size and preserves in-flight accounting.
     pub fn set_target(&mut self, bytes: u64) -> Result<(), Error> {
-        if bytes < 2 * self.mtu || bytes > MAX_CWND { return Err(Error::Limit); }
+        if bytes < 2 * self.mtu || bytes > MAX_CWND {
+            return Err(Error::Limit);
+        }
         self.cwnd = bytes;
         Ok(())
     }
@@ -148,7 +194,9 @@ mod tests {
         assert!(cubic_target(f64::NAN, 70.0, Duration::ZERO).is_none());
         let mut w = Window::new(1200).unwrap();
         assert_eq!(w.cwnd(), 12000);
-        for _ in 0..10 { w.reserve(1200).unwrap(); }
+        for _ in 0..10 {
+            w.reserve(1200).unwrap();
+        }
         assert_eq!(w.reserve(1), Err(Error::Limit));
         let now = Instant::now();
         assert!(w.loss(now, now).unwrap());
@@ -186,5 +234,4 @@ mod tests {
         assert!(w.cwnd() > reduced);
         assert!(w.cwnd() <= MAX_CWND);
     }
-
 }

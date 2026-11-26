@@ -7,10 +7,20 @@ use rustls::quic::{Connection, KeyChange};
 const MAX_CRYPTO: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Level { Initial, Handshake, Application }
+pub enum Level {
+    Initial,
+    Handshake,
+    Application,
+}
 
 #[derive(Debug)]
-pub enum Error { Level, Limit, Receive(ReceiveError), Tls(rustls::Error), Failed }
+pub enum Error {
+    Level,
+    Limit,
+    Receive(ReceiveError),
+    Tls(rustls::Error),
+    Failed,
+}
 
 pub struct Flight {
     pub level: Level,
@@ -31,37 +41,64 @@ pub struct Driver {
 impl Driver {
     pub fn new(tls: Connection) -> Self {
         Self {
-            tls, level: Level::Initial,
-            receive: std::array::from_fn(|_| ReceiveBuffer::new(MAX_CRYPTO, MAX_CRYPTO as u64).expect("valid fixed bounds")),
-            sent: [0; 3], failed: false,
+            tls,
+            level: Level::Initial,
+            receive: std::array::from_fn(|_| {
+                ReceiveBuffer::new(MAX_CRYPTO, MAX_CRYPTO as u64).expect("valid fixed bounds")
+            }),
+            sent: [0; 3],
+            failed: false,
         }
     }
 
-    pub fn tls_complete(&self) -> bool { !self.failed && !self.tls.is_handshaking() }
+    pub fn tls_complete(&self) -> bool {
+        !self.failed && !self.tls.is_handshaking()
+    }
 
     pub fn peer_parameters(&self) -> Option<&[u8]> {
-        if self.tls_complete() { self.tls.quic_transport_parameters() } else { None }
+        if self.tls_complete() {
+            self.tls.quic_transport_parameters()
+        } else {
+            None
+        }
     }
 
     pub(crate) fn channel_binding(&self) -> Result<zeroize::Zeroizing<[u8; 32]>, Error> {
-        if !self.tls_complete() { return Err(Error::Failed); }
+        if !self.tls_complete() {
+            return Err(Error::Failed);
+        }
         let mut key = zeroize::Zeroizing::new([0u8; 32]);
-        self.tls.export_keying_material(&mut key[..], crate::channel_binding::LABEL,
-            Some(crate::channel_binding::H3)).map_err(Error::Tls)?;
+        self.tls
+            .export_keying_material(
+                &mut key[..],
+                crate::channel_binding::LABEL,
+                Some(crate::channel_binding::H3),
+            )
+            .map_err(Error::Tls)?;
         Ok(key)
     }
 
     pub fn negotiated_alpn(&self) -> Option<&[u8]> {
-        if self.tls_complete() { self.tls.alpn_protocol() } else { None }
+        if self.tls_complete() {
+            self.tls.alpn_protocol()
+        } else {
+            None
+        }
     }
 
     /// Consume reassembled TLS bytes at one encryption level. A future
     /// endpoint may buffer packets from an unavailable level separately.
     pub fn receive(&mut self, level: Level, offset: u64, data: &[u8]) -> Result<(), Error> {
-        if self.failed { return Err(Error::Failed); }
-        if level as usize > self.level as usize { return Err(Error::Level); }
+        if self.failed {
+            return Err(Error::Failed);
+        }
+        if level as usize > self.level as usize {
+            return Err(Error::Level);
+        }
         let result = self.receive_inner(level, offset, data);
-        if result.is_err() { self.failed = true; }
+        if result.is_err() {
+            self.failed = true;
+        }
         result
     }
 
@@ -71,7 +108,9 @@ impl Driver {
         let mut scratch = [0; 4096];
         loop {
             let n = buffer.read(&mut scratch);
-            if n == 0 { return Ok(()); }
+            if n == 0 {
+                return Ok(());
+            }
             // Once TLS has changed levels, only previously consumed
             // retransmissions are accepted at an older level.
             if (level as usize) < self.level as usize && level == Level::Initial {
@@ -82,9 +121,13 @@ impl Driver {
     }
 
     pub fn poll_output(&mut self) -> Result<Option<Flight>, Error> {
-        if self.failed { return Err(Error::Failed); }
+        if self.failed {
+            return Err(Error::Failed);
+        }
         let result = self.output_inner();
-        if result.is_err() { self.failed = true; }
+        if result.is_err() {
+            self.failed = true;
+        }
         result
     }
 
@@ -94,15 +137,28 @@ impl Driver {
         let keys = self.tls.write_hs(&mut data);
         let offset = self.sent[level as usize];
         let end = offset.checked_add(data.len() as u64).ok_or(Error::Limit)?;
-        if end > MAX_CRYPTO as u64 { return Err(Error::Limit); }
+        if end > MAX_CRYPTO as u64 {
+            return Err(Error::Limit);
+        }
         self.sent[level as usize] = end;
         match &keys {
-            Some(KeyChange::Handshake { .. }) if level == Level::Initial => self.level = Level::Handshake,
-            Some(KeyChange::OneRtt { .. }) if level == Level::Handshake => self.level = Level::Application,
+            Some(KeyChange::Handshake { .. }) if level == Level::Initial => {
+                self.level = Level::Handshake
+            }
+            Some(KeyChange::OneRtt { .. }) if level == Level::Handshake => {
+                self.level = Level::Application
+            }
             Some(_) => return Err(Error::Level),
             None => {}
         }
-        if data.is_empty() && keys.is_none() { return Ok(None); }
-        Ok(Some(Flight { level, offset, data, keys }))
+        if data.is_empty() && keys.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Flight {
+            level,
+            offset,
+            data,
+            keys,
+        }))
     }
 }

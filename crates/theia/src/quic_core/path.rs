@@ -3,13 +3,23 @@
 //! receive/challenge methods; Initial AEAD alone is not authentication.
 use super::recovery::PathBudget;
 use ring::rand::{SecureRandom, SystemRandom};
-use std::{collections::BTreeMap, net::SocketAddr, time::{Duration, Instant}};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 const MAX_CIDS: usize = 8;
 const CHALLENGE_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error { Limit, Conflict, Invalid, Random, Path }
+pub enum Error {
+    Limit,
+    Conflict,
+    Invalid,
+    Random,
+    Path,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionId {
@@ -26,36 +36,61 @@ pub struct PeerIds {
 
 impl PeerIds {
     pub fn new(limit: usize) -> Result<Self, Error> {
-        if !(2..=MAX_CIDS).contains(&limit) { return Err(Error::Limit); }
-        Ok(Self { entries: BTreeMap::new(), floor: 0, limit })
+        if !(2..=MAX_CIDS).contains(&limit) {
+            return Err(Error::Limit);
+        }
+        Ok(Self {
+            entries: BTreeMap::new(),
+            floor: 0,
+            limit,
+        })
     }
 
     /// Accept one authenticated NEW_CONNECTION_ID. Return sequences that
     /// the caller must acknowledge with RETIRE_CONNECTION_ID. No mutation
     /// on invalid input or excessive active count.
     pub fn insert(&mut self, id: ConnectionId, retire_prior_to: u64) -> Result<Vec<u64>, Error> {
-        if id.cid.is_empty() || id.cid.len() > 20 || id.sequence > super::wire::MAX_VARINT
-            || retire_prior_to > id.sequence { return Err(Error::Invalid); }
-        if let Some(old) = self.entries.get(&id.sequence) {
-            if old != &id { return Err(Error::Conflict); }
+        if id.cid.is_empty()
+            || id.cid.len() > 20
+            || id.sequence > super::wire::MAX_VARINT
+            || retire_prior_to > id.sequence
+        {
+            return Err(Error::Invalid);
         }
-        if self.entries.values().any(|old| old.sequence != id.sequence
-            && (old.cid == id.cid || old.reset_token == id.reset_token)) { return Err(Error::Conflict); }
+        if let Some(old) = self.entries.get(&id.sequence) {
+            if old != &id {
+                return Err(Error::Conflict);
+            }
+        }
+        if self.entries.values().any(|old| {
+            old.sequence != id.sequence && (old.cid == id.cid || old.reset_token == id.reset_token)
+        }) {
+            return Err(Error::Conflict);
+        }
         let floor = self.floor.max(retire_prior_to);
         if id.sequence < floor {
             return Ok(vec![id.sequence]);
         }
         let count = self.entries.keys().filter(|&&n| n >= floor).count()
             + usize::from(!self.entries.contains_key(&id.sequence));
-        if count > self.limit { return Err(Error::Limit); }
-        let retired: Vec<u64> = self.entries.keys().copied().filter(|n| *n < floor).collect();
+        if count > self.limit {
+            return Err(Error::Limit);
+        }
+        let retired: Vec<u64> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|n| *n < floor)
+            .collect();
         self.entries.retain(|n, _| *n >= floor);
         self.floor = floor;
         self.entries.insert(id.sequence, id);
         Ok(retired)
     }
 
-    pub fn get(&self, sequence: u64) -> Option<&ConnectionId> { self.entries.get(&sequence) }
+    pub fn get(&self, sequence: u64) -> Option<&ConnectionId> {
+        self.entries.get(&sequence)
+    }
 }
 
 struct Candidate {
@@ -75,39 +110,80 @@ pub struct Paths {
 }
 
 impl Paths {
-    pub fn new_validated(active: SocketAddr) -> Self { Self { active, candidate: None } }
-    pub fn active(&self) -> SocketAddr { self.active }
+    pub fn new_validated(active: SocketAddr) -> Self {
+        Self {
+            active,
+            candidate: None,
+        }
+    }
+    pub fn active(&self) -> SocketAddr {
+        self.active
+    }
 
     /// Start a candidate after an authenticated packet on a new address.
     /// Existing unexpired candidates cannot be replaced by another path.
-    pub fn begin(&mut self, address: SocketAddr, received: u64, now: Instant) -> Result<[u8; 8], Error> {
-        if address == self.active || address.port() == 0 || received == 0 { return Err(Error::Path); }
+    pub fn begin(
+        &mut self,
+        address: SocketAddr,
+        received: u64,
+        now: Instant,
+    ) -> Result<[u8; 8], Error> {
+        if address == self.active || address.port() == 0 || received == 0 {
+            return Err(Error::Path);
+        }
         if let Some(c) = self.candidate.as_mut() {
             if now < c.expires {
-                if address != c.address { return Err(Error::Path); }
+                if address != c.address {
+                    return Err(Error::Path);
+                }
                 c.budget.received(received);
                 return Ok(c.challenge);
             }
         }
         let mut challenge = [0; 8];
-        SystemRandom::new().fill(&mut challenge).map_err(|_| Error::Random)?;
+        SystemRandom::new()
+            .fill(&mut challenge)
+            .map_err(|_| Error::Random)?;
         let expires = now.checked_add(CHALLENGE_TTL).ok_or(Error::Limit)?;
         let mut budget = PathBudget::default();
         budget.received(received);
-        self.candidate = Some(Candidate { address, challenge, expires, budget, last_challenge: None });
+        self.candidate = Some(Candidate {
+            address,
+            challenge,
+            expires,
+            budget,
+            last_challenge: None,
+        });
         Ok(challenge)
     }
 
-    pub fn reserve_candidate_send(&mut self, address: SocketAddr, bytes: u64, now: Instant) -> bool {
-        self.candidate.as_mut().is_some_and(|c| address == c.address && now < c.expires
-            && c.budget.reserve_send(bytes))
+    pub fn reserve_candidate_send(
+        &mut self,
+        address: SocketAddr,
+        bytes: u64,
+        now: Instant,
+    ) -> bool {
+        self.candidate.as_mut().is_some_and(|c| {
+            address == c.address && now < c.expires && c.budget.reserve_send(bytes)
+        })
     }
 
-    pub fn reserve_challenge(&mut self, address: SocketAddr, bytes: u64, now: Instant,
-                             interval: Duration) -> bool {
-        let Some(c) = self.candidate.as_mut() else { return false; };
-        if c.address != address || now >= c.expires || c.last_challenge.is_some_and(|sent|
-            now.saturating_duration_since(sent) < interval) || !c.budget.reserve_send(bytes) {
+    pub fn reserve_challenge(
+        &mut self,
+        address: SocketAddr,
+        bytes: u64,
+        now: Instant,
+        interval: Duration,
+    ) -> bool {
+        let Some(c) = self.candidate.as_mut() else {
+            return false;
+        };
+        if c.address != address
+            || now >= c.expires
+            || c.last_challenge
+                .is_some_and(|sent| now.saturating_duration_since(sent) < interval)
+            || !c.budget.reserve_send(bytes)
+        {
             return false;
         }
         c.last_challenge = Some(now);
@@ -117,26 +193,47 @@ impl Paths {
     /// Return a timer only while a retry fits the candidate amplification budget.
     pub fn challenge_deadline(&self, bytes: u64, interval: Duration) -> Option<Instant> {
         let c = self.candidate.as_ref()?;
-        if !c.budget.can_send(bytes) { return None; }
-        let at = c.last_challenge?.checked_add(interval.max(Duration::from_millis(1)))?;
+        if !c.budget.can_send(bytes) {
+            return None;
+        }
+        let at = c
+            .last_challenge?
+            .checked_add(interval.max(Duration::from_millis(1)))?;
         (at < c.expires).then_some(at)
     }
 
-    pub fn due_challenge(&self, bytes: u64, now: Instant, interval: Duration) -> Option<(SocketAddr, [u8; 8])> {
+    pub fn due_challenge(
+        &self,
+        bytes: u64,
+        now: Instant,
+        interval: Duration,
+    ) -> Option<(SocketAddr, [u8; 8])> {
         let c = self.candidate.as_ref()?;
-        if now >= c.expires || now < self.challenge_deadline(bytes, interval)? { return None; }
+        if now >= c.expires || now < self.challenge_deadline(bytes, interval)? {
+            return None;
+        }
         Some((c.address, c.challenge))
     }
 
-    pub fn deadline(&self) -> Option<Instant> { self.candidate.as_ref().map(|c| c.expires) }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.candidate.as_ref().map(|c| c.expires)
+    }
 
     pub fn expire(&mut self, now: Instant) {
-        if self.deadline().is_some_and(|at| now >= at) { self.candidate = None; }
+        if self.deadline().is_some_and(|at| now >= at) {
+            self.candidate = None;
+        }
     }
 
     pub fn response(&mut self, address: SocketAddr, response: [u8; 8], now: Instant) -> bool {
-        if !self.candidate.as_ref().is_some_and(|c| address == c.address && now < c.expires
-            && c.last_challenge.is_some() && response == c.challenge) { return false; }
+        if !self.candidate.as_ref().is_some_and(|c| {
+            address == c.address
+                && now < c.expires
+                && c.last_challenge.is_some()
+                && response == c.challenge
+        }) {
+            return false;
+        }
         self.active = address;
         self.candidate = None;
         true
@@ -148,7 +245,11 @@ mod tests {
     use super::*;
 
     fn cid(n: u64) -> ConnectionId {
-        ConnectionId { sequence: n, cid: vec![n as u8; 8], reset_token: [n as u8; 16] }
+        ConnectionId {
+            sequence: n,
+            cid: vec![n as u8; 8],
+            reset_token: [n as u8; 16],
+        }
     }
 
     #[test]

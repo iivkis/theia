@@ -336,7 +336,7 @@ impl Editor {
                     socks5_listen: "127.0.0.1:7891".into(),
                     system_proxy: config::SystemProxy::Off,
                     direct_dpi: None,
-                direct_dpi_stun: None,
+                    direct_dpi_stun: None,
                 },
             },
         });
@@ -1329,7 +1329,9 @@ impl Editor {
             return Err("Требуется клиентская конфигурация.");
         };
         doc.client.proxy.direct_dpi = Some(enable);
-        if !enable { doc.client.proxy.direct_dpi_stun = Some(false); }
+        if !enable {
+            doc.client.proxy.direct_dpi_stun = Some(false);
+        }
         candidate
             .validate()
             .map_err(|_| "Настройки клиента не прошли проверку.")?;
@@ -1353,19 +1355,31 @@ impl Editor {
 
     pub(crate) fn review_direct_dpi_stun_permission(&self) -> Result<RecordReview, &'static str> {
         self.require_clean_records()?;
-        if self.write_uncertain { return Err("Откройте настройки заново."); }
-        if !self.direct_dpi_allowed() { return Err("Сначала разрешите и сохраните Anti-DPI."); }
+        if self.write_uncertain {
+            return Err("Откройте настройки заново.");
+        }
+        if !self.direct_dpi_allowed() {
+            return Err("Сначала разрешите и сохраните Anti-DPI.");
+        }
         let enable = !self.direct_dpi_stun_allowed();
         let mut candidate = self.original.clone();
-        let Config::Client(doc) = &mut candidate else { return Err("Требуется клиентская конфигурация."); };
+        let Config::Client(doc) = &mut candidate else {
+            return Err("Требуется клиентская конфигурация.");
+        };
         doc.client.proxy.direct_dpi_stun = Some(enable);
-        candidate.validate().map_err(|_| "Настройки клиента не прошли проверку.")?;
+        candidate
+            .validate()
+            .map_err(|_| "Настройки клиента не прошли проверку.")?;
         Ok(RecordReview {
             source: self.saved_sha256(),
             selected: self.selected_record_id().to_owned(),
             candidate,
             next_selection: self.selected_record,
-            confirmation_label: if enable { "Разрешить STUN" } else { "Отключить STUN" },
+            confirmation_label: if enable {
+                "Разрешить STUN"
+            } else {
+                "Отключить STUN"
+            },
             body: if enable {
                 "Разрешить экспериментальный локальный STUN Binding?\n\nТолько direct_dpi, публичный домен и UDP/3478. Сервер STUN увидит IP устройства. Независимый ответ подтверждает доступность, но не удостоверяет сервер. Возможен дополнительный FINGERPRINT без изменения защищённых полей. ICE/TURN и прочий UDP остаются через VPS.\nСохраните настройки и перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
             } else {

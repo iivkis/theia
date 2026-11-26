@@ -4,13 +4,26 @@
 //! The worker serializes all packet/stream state. Synchronous trait calls
 //! never hold the state mutex across UDP I/O. Each direction has one bounded
 //! handoff slot and one waker. There is no task per stream or per datagram.
-use super::{endpoint::{Error as NativeError, LabSession}, flow, lifecycle::ShutdownPhase,
-    scheduler, send_flow, stream::ReceiveError};
+use super::{
+    endpoint::{Error as NativeError, LabSession},
+    flow,
+    lifecycle::ShutdownPhase,
+    scheduler, send_flow,
+    stream::ReceiveError,
+};
 use bytes::{Buf, Bytes};
-use h3::{error::Code, quic::{self, ConnectionErrorIncoming as CE, StreamErrorIncoming as SE,
-    StreamId, WriteBuf}};
-use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin,
-    sync::{Arc, Mutex, Weak}, task::{Context, Poll, Waker}, time::{Duration, Instant}};
+use h3::{
+    error::Code,
+    quic::{self, ConnectionErrorIncoming as CE, StreamErrorIncoming as SE, StreamId, WriteBuf},
+};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex, Weak},
+    task::{Context, Poll, Waker},
+    time::{Duration, Instant},
+};
 use tokio::sync::oneshot;
 
 // Include HTTP/3 framing overhead for a 64 KiB application write.
@@ -19,14 +32,29 @@ const OPEN_LIMIT: usize = 16;
 const TICK: Duration = Duration::from_millis(2);
 const CANCEL: u64 = 0x10c;
 
-fn internal() -> CE { CE::InternalError("native QUIC bridge closed".into()) }
-fn connection(error: CE) -> SE { SE::ConnectionErrorIncoming { connection_error: error } }
-fn invalid() -> SE { connection(CE::InternalError("native QUIC bridge state or bound".into())) }
-fn terminated(code: u64) -> SE { SE::StreamTerminated { error_code: code } }
+fn internal() -> CE {
+    CE::InternalError("native QUIC bridge closed".into())
+}
+fn connection(error: CE) -> SE {
+    SE::ConnectionErrorIncoming {
+        connection_error: error,
+    }
+}
+fn invalid() -> SE {
+    connection(CE::InternalError(
+        "native QUIC bridge state or bound".into(),
+    ))
+}
+fn terminated(code: u64) -> SE {
+    SE::StreamTerminated { error_code: code }
+}
 
 type Shared = Arc<Mutex<State>>;
 type OpenResult = Result<u64, CE>;
-struct OpenRequest { bidi: bool, result: oneshot::Sender<OpenResult> }
+struct OpenRequest {
+    bidi: bool,
+    result: oneshot::Sender<OpenResult>,
+}
 
 #[derive(Default)]
 struct StreamState {
@@ -48,7 +76,13 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new(tx: bool, rx: bool) -> Self { Self { tx, rx, ..Self::default() } }
+    fn new(tx: bool, rx: bool) -> Self {
+        Self {
+            tx,
+            rx,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -64,15 +98,25 @@ struct State {
 }
 
 fn wake(slot: &mut Option<Waker>, wakes: &mut Vec<Waker>) {
-    if let Some(waker) = slot.take() { wakes.push(waker); }
+    if let Some(waker) = slot.take() {
+        wakes.push(waker);
+    }
 }
-fn notify(wakes: Vec<Waker>) { for waker in wakes { waker.wake(); } }
+fn notify(wakes: Vec<Waker>) {
+    for waker in wakes {
+        waker.wake();
+    }
+}
 
 impl State {
     fn fail(&mut self, error: CE, wakes: &mut Vec<Waker>) {
-        if self.error.is_some() { return; }
+        if self.error.is_some() {
+            return;
+        }
         self.error = Some(error.clone());
-        for request in self.open.drain(..) { let _ = request.result.send(Err(error.clone())); }
+        for request in self.open.drain(..) {
+            let _ = request.result.send(Err(error.clone()));
+        }
         wake(&mut self.uni_waker, wakes);
         wake(&mut self.bidi_waker, wakes);
         for stream in self.streams.values_mut() {
@@ -83,7 +127,9 @@ impl State {
 
     fn discover(&mut self, session: &LabSession, wakes: &mut Vec<Waker>) {
         for id in session.peer_streams() {
-            if self.streams.contains_key(&id) { continue; }
+            if self.streams.contains_key(&id) {
+                continue;
+            }
             let bidi = id & 2 == 0;
             self.streams.insert(id, StreamState::new(bidi, true));
             if bidi {
@@ -98,38 +144,61 @@ impl State {
 }
 
 fn blocked(error: &NativeError) -> bool {
-    matches!(error, NativeError::Send(send_flow::Error::Limit) | NativeError::Schedule(scheduler::Error::Limit))
+    matches!(
+        error,
+        NativeError::Send(send_flow::Error::Limit) | NativeError::Schedule(scheduler::Error::Limit)
+    )
 }
 
-fn progress(session: &mut LabSession, state: &mut State, wakes: &mut Vec<Waker>) -> Result<(), NativeError> {
+fn progress(
+    session: &mut LabSession,
+    state: &mut State,
+    wakes: &mut Vec<Waker>,
+) -> Result<(), NativeError> {
     state.discover(session, wakes);
     while let Some(request) = state.open.pop_front() {
-        if request.result.is_closed() { continue; }
-        match if request.bidi { session.open_bidi() } else { session.open_uni() } {
+        if request.result.is_closed() {
+            continue;
+        }
+        match if request.bidi {
+            session.open_bidi()
+        } else {
+            session.open_uni()
+        } {
             Ok(id) => {
                 let mut stream = StreamState::new(true, request.bidi);
                 if request.result.send(Ok(id)).is_err() {
                     stream.reset = Some(CANCEL);
-                    if request.bidi { stream.stop = Some(CANCEL); }
+                    if request.bidi {
+                        stream.stop = Some(CANCEL);
+                    }
                 }
                 state.streams.insert(id, stream);
             }
             Err(_) => {
                 // Fixed lifetime cap, no false promise of dynamic MAX_STREAMS.
-                let _ = request.result.send(Err(CE::InternalError("native stream limit".into())));
+                let _ = request
+                    .result
+                    .send(Err(CE::InternalError("native stream limit".into())));
             }
         }
     }
     for (&id, s) in &mut state.streams {
         if s.tx && !s.reset_sent {
             if let Some(code) = session.send_reset_code(id) {
-                if s.reset.is_none() { s.peer_reset = Some(code); }
+                if s.reset.is_none() {
+                    s.peer_reset = Some(code);
+                }
                 s.outgoing = None;
                 s.reset_sent = true;
                 wake(&mut s.send_waker, wakes);
             } else if let Some(code) = s.reset {
                 match session.reset_stream(id, code) {
-                    Ok(()) => { s.reset_sent = true; s.outgoing = None; wake(&mut s.send_waker, wakes); }
+                    Ok(()) => {
+                        s.reset_sent = true;
+                        s.outgoing = None;
+                        wake(&mut s.send_waker, wakes);
+                    }
                     Err(e) if blocked(&e) => {}
                     Err(e) => return Err(e),
                 }
@@ -138,14 +207,20 @@ fn progress(session: &mut LabSession, state: &mut State, wakes: &mut Vec<Waker>)
                 match session.queue(id, &data[..n], false) {
                     Ok(()) => {
                         data.advance(n);
-                        if data.is_empty() { s.outgoing = None; wake(&mut s.send_waker, wakes); }
+                        if data.is_empty() {
+                            s.outgoing = None;
+                            wake(&mut s.send_waker, wakes);
+                        }
                     }
                     Err(e) if blocked(&e) => {}
                     Err(e) => return Err(e),
                 }
             } else if s.finish && !s.fin_queued {
                 match session.queue(id, &[], true) {
-                    Ok(()) => { s.fin_queued = true; wake(&mut s.send_waker, wakes); }
+                    Ok(()) => {
+                        s.fin_queued = true;
+                        wake(&mut s.send_waker, wakes);
+                    }
                     Err(e) if blocked(&e) => {}
                     Err(e) => return Err(e),
                 }
@@ -155,7 +230,12 @@ fn progress(session: &mut LabSession, state: &mut State, wakes: &mut Vec<Waker>)
             if let Some(code) = s.stop {
                 if !s.stop_sent {
                     match session.stop_sending(id, code) {
-                        Ok(()) => { s.stop_sent = true; s.incoming = None; s.eof = true; wake(&mut s.recv_waker, wakes); }
+                        Ok(()) => {
+                            s.stop_sent = true;
+                            s.incoming = None;
+                            s.eof = true;
+                            wake(&mut s.recv_waker, wakes);
+                        }
                         Err(e) if blocked(&e) => {}
                         Err(e) => return Err(e),
                     }
@@ -164,9 +244,13 @@ fn progress(session: &mut LabSession, state: &mut State, wakes: &mut Vec<Waker>)
                 let mut data = [0; send_flow::MAX_CHUNK];
                 match session.read_replenish(id, &mut data) {
                     Ok(n) => {
-                        if n != 0 { s.incoming = Some(Bytes::copy_from_slice(&data[..n])); }
+                        if n != 0 {
+                            s.incoming = Some(Bytes::copy_from_slice(&data[..n]));
+                        }
                         s.eof = session.finished(id);
-                        if n != 0 || s.eof { wake(&mut s.recv_waker, wakes); }
+                        if n != 0 || s.eof {
+                            wake(&mut s.recv_waker, wakes);
+                        }
                     }
                     Err(NativeError::Receive(flow::Error::Receive(ReceiveError::Reset(code)))) => {
                         s.recv_reset = Some(code);
@@ -197,28 +281,53 @@ async fn drive(mut session: LabSession, weak: Weak<Mutex<State>>) {
         let result = if let Some(shared) = weak.upgrade() {
             let mut state = shared.lock().expect("bridge mutex");
             if phase == ShutdownPhase::Open {
-                if let Some(code) = state.close.take() { session.close(code, Instant::now()) }
-                else if state.error.is_none() { progress(&mut session, &mut state, &mut wakes) }
-                else { Ok(()) }
+                if let Some(code) = state.close.take() {
+                    session.close(code, Instant::now())
+                } else if state.error.is_none() {
+                    progress(&mut session, &mut state, &mut wakes)
+                } else {
+                    Ok(())
+                }
             } else {
-                let error = session.peer_application_close().map_or_else(internal, |error_code| CE::ApplicationClose { error_code });
+                let error = session
+                    .peer_application_close()
+                    .map_or_else(internal, |error_code| CE::ApplicationClose { error_code });
                 state.fail(error, &mut wakes);
                 Ok(())
             }
         } else {
             // Last frontend dropped. Close the transport, keeping the route
             // until the normal shutdown timer, even without frontend state.
-            if phase == ShutdownPhase::Open { session.close(0x100, Instant::now()) } else { Ok(()) }
+            if phase == ShutdownPhase::Open {
+                session.close(0x100, Instant::now())
+            } else {
+                Ok(())
+            }
         };
         notify(wakes);
-        if result.is_err() { fail(&weak, internal()); return; }
-        if session.shutdown_phase() == ShutdownPhase::Closed { fail(&weak, internal()); return; }
+        if result.is_err() {
+            fail(&weak, internal());
+            return;
+        }
+        if session.shutdown_phase() == ShutdownPhase::Closed {
+            fail(&weak, internal());
+            return;
+        }
         match session.flush(Instant::now()).await {
             Ok(_) => {}
-            Err(_) => { fail(&weak, internal()); return; }
+            Err(_) => {
+                fail(&weak, internal());
+                return;
+            }
         }
-        if session.shutdown_phase() == ShutdownPhase::Closed { fail(&weak, internal()); return; }
-        if session.recv(TICK).await.is_err() { fail(&weak, internal()); return; }
+        if session.shutdown_phase() == ShutdownPhase::Closed {
+            fail(&weak, internal());
+            return;
+        }
+        if session.recv(TICK).await.is_err() {
+            fail(&weak, internal());
+            return;
+        }
     }
 }
 
@@ -234,16 +343,32 @@ impl NativeConnection {
         let key = session.take_channel_binding().ok_or_else(internal)?;
         let shared = Arc::new(Mutex::new(State::default()));
         tokio::spawn(drive(session, Arc::downgrade(&shared)));
-        Ok((Self { opener: Opener::new(shared) }, key))
+        Ok((
+            Self {
+                opener: Opener::new(shared),
+            },
+            key,
+        ))
     }
 
     fn accept(&self, cx: &mut Context<'_>, bidi: bool) -> Poll<Result<u64, CE>> {
         let mut s = self.opener.shared.lock().expect("bridge mutex");
-        if let Some(error) = &s.error { return Poll::Ready(Err(error.clone())); }
-        let id = if bidi { s.accept_bidi.pop_front() } else { s.accept_uni.pop_front() };
-        if let Some(id) = id { return Poll::Ready(Ok(id)); }
-        if bidi { s.bidi_waker = Some(cx.waker().clone()); }
-        else { s.uni_waker = Some(cx.waker().clone()); }
+        if let Some(error) = &s.error {
+            return Poll::Ready(Err(error.clone()));
+        }
+        let id = if bidi {
+            s.accept_bidi.pop_front()
+        } else {
+            s.accept_uni.pop_front()
+        };
+        if let Some(id) = id {
+            return Poll::Ready(Ok(id));
+        }
+        if bidi {
+            s.bidi_waker = Some(cx.waker().clone());
+        } else {
+            s.uni_waker = Some(cx.waker().clone());
+        }
         Poll::Pending
     }
 }
@@ -255,18 +380,30 @@ pub struct Opener {
 }
 
 impl Clone for Opener {
-    fn clone(&self) -> Self { Self::new(self.shared.clone()) }
+    fn clone(&self) -> Self {
+        Self::new(self.shared.clone())
+    }
 }
 
 impl Opener {
-    fn new(shared: Shared) -> Self { Self { shared, uni: None, bidi: None } }
+    fn new(shared: Shared) -> Self {
+        Self {
+            shared,
+            uni: None,
+            bidi: None,
+        }
+    }
 
     fn open(&mut self, cx: &mut Context<'_>, bidi: bool) -> Poll<Result<u64, SE>> {
         let slot = if bidi { &mut self.bidi } else { &mut self.uni };
         if slot.is_none() {
             let mut state = self.shared.lock().expect("bridge mutex");
-            if let Some(e) = &state.error { return Poll::Ready(Err(connection(e.clone()))); }
-            if state.open.len() >= OPEN_LIMIT { return Poll::Ready(Err(invalid())); }
+            if let Some(e) = &state.error {
+                return Poll::Ready(Err(connection(e.clone())));
+            }
+            if state.open.len() >= OPEN_LIMIT {
+                return Poll::Ready(Err(invalid()));
+            }
             let (result, rx) = oneshot::channel();
             state.open.push_back(OpenRequest { bidi, result });
             *slot = Some(rx);
@@ -275,7 +412,11 @@ impl Opener {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
                 *slot = None;
-                Poll::Ready(result.unwrap_or_else(|_| Err(internal())).map_err(connection))
+                Poll::Ready(
+                    result
+                        .unwrap_or_else(|_| Err(internal()))
+                        .map_err(connection),
+                )
             }
         }
     }
@@ -298,12 +439,16 @@ impl quic::OpenStreams<Bytes> for Opener {
     type BidiStream = Bidi;
     type SendStream = SendSide;
     fn poll_open_bidi(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bidi, SE>> {
-        self.open(cx, true).map(|r| r.map(|id| Bidi::new(self.shared.clone(), id)))
+        self.open(cx, true)
+            .map(|r| r.map(|id| Bidi::new(self.shared.clone(), id)))
     }
     fn poll_open_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<SendSide, SE>> {
-        self.open(cx, false).map(|r| r.map(|id| SendSide::new(self.shared.clone(), id)))
+        self.open(cx, false)
+            .map(|r| r.map(|id| SendSide::new(self.shared.clone(), id)))
     }
-    fn close(&mut self, code: Code, _: &[u8]) { self.close_inner(code); }
+    fn close(&mut self, code: Code, _: &[u8]) {
+        self.close_inner(code);
+    }
 }
 
 impl quic::OpenStreams<Bytes> for NativeConnection {
@@ -315,32 +460,51 @@ impl quic::OpenStreams<Bytes> for NativeConnection {
     fn poll_open_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<SendSide, SE>> {
         quic::OpenStreams::poll_open_send(&mut self.opener, cx)
     }
-    fn close(&mut self, code: Code, _: &[u8]) { self.opener.close_inner(code); }
+    fn close(&mut self, code: Code, _: &[u8]) {
+        self.opener.close_inner(code);
+    }
 }
 
 impl quic::Connection<Bytes> for NativeConnection {
     type RecvStream = RecvSide;
     type OpenStreams = Opener;
     fn poll_accept_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<RecvSide, CE>> {
-        self.accept(cx, false).map(|r| r.map(|id| RecvSide::new(self.opener.shared.clone(), id)))
+        self.accept(cx, false)
+            .map(|r| r.map(|id| RecvSide::new(self.opener.shared.clone(), id)))
     }
     fn poll_accept_bidi(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bidi, CE>> {
-        self.accept(cx, true).map(|r| r.map(|id| Bidi::new(self.opener.shared.clone(), id)))
+        self.accept(cx, true)
+            .map(|r| r.map(|id| Bidi::new(self.opener.shared.clone(), id)))
     }
-    fn opener(&self) -> Opener { Opener::new(self.opener.shared.clone()) }
+    fn opener(&self) -> Opener {
+        Opener::new(self.opener.shared.clone())
+    }
 }
 
-pub struct SendSide { shared: Shared, id: u64 }
+pub struct SendSide {
+    shared: Shared,
+    id: u64,
+}
 impl SendSide {
-    fn new(shared: Shared, id: u64) -> Self { Self { shared, id } }
+    fn new(shared: Shared, id: u64) -> Self {
+        Self { shared, id }
+    }
 
     fn put(&mut self, bytes: Bytes) -> Result<(), SE> {
         let mut state = self.shared.lock().expect("bridge mutex");
-        if let Some(error) = &state.error { return Err(connection(error.clone())); }
+        if let Some(error) = &state.error {
+            return Err(connection(error.clone()));
+        }
         let s = state.streams.get_mut(&self.id).ok_or_else(invalid)?;
-        if let Some(code) = s.peer_reset { return Err(terminated(code)); }
-        if bytes.len() > SLOT_LIMIT || s.outgoing.is_some() || s.finish || s.reset.is_some() { return Err(invalid()); }
-        if !bytes.is_empty() { s.outgoing = Some(bytes); }
+        if let Some(code) = s.peer_reset {
+            return Err(terminated(code));
+        }
+        if bytes.len() > SLOT_LIMIT || s.outgoing.is_some() || s.finish || s.reset.is_some() {
+            return Err(invalid());
+        }
+        if !bytes.is_empty() {
+            s.outgoing = Some(bytes);
+        }
         Ok(())
     }
 
@@ -354,16 +518,30 @@ impl SendSide {
         }
     }
 }
-impl Drop for SendSide { fn drop(&mut self) { self.cancel(CANCEL); } }
+impl Drop for SendSide {
+    fn drop(&mut self) {
+        self.cancel(CANCEL);
+    }
+}
 
 impl quic::SendStream<Bytes> for SendSide {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SE>> {
         let mut state = self.shared.lock().expect("bridge mutex");
-        if let Some(error) = &state.error { return Poll::Ready(Err(connection(error.clone()))); }
-        let Some(s) = state.streams.get_mut(&self.id) else { return Poll::Ready(Err(invalid())); };
-        if let Some(code) = s.peer_reset { return Poll::Ready(Err(terminated(code))); }
-        if s.reset.is_some() { return Poll::Ready(Err(invalid())); }
-        if s.outgoing.is_none() { return Poll::Ready(Ok(())); }
+        if let Some(error) = &state.error {
+            return Poll::Ready(Err(connection(error.clone())));
+        }
+        let Some(s) = state.streams.get_mut(&self.id) else {
+            return Poll::Ready(Err(invalid()));
+        };
+        if let Some(code) = s.peer_reset {
+            return Poll::Ready(Err(terminated(code)));
+        }
+        if s.reset.is_some() {
+            return Poll::Ready(Err(invalid()));
+        }
+        if s.outgoing.is_none() {
+            return Poll::Ready(Ok(()));
+        }
         s.send_waker = Some(cx.waker().clone());
         Poll::Pending
     }
@@ -371,24 +549,40 @@ impl quic::SendStream<Bytes> for SendSide {
     fn send_data<T: Into<WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), SE> {
         let mut data = data.into();
         let n = data.remaining();
-        if n > SLOT_LIMIT { return Err(invalid()); }
+        if n > SLOT_LIMIT {
+            return Err(invalid());
+        }
         self.put(data.copy_to_bytes(n))
     }
 
     fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SE>> {
         let mut state = self.shared.lock().expect("bridge mutex");
-        if let Some(error) = &state.error { return Poll::Ready(Err(connection(error.clone()))); }
-        let Some(s) = state.streams.get_mut(&self.id) else { return Poll::Ready(Err(invalid())); };
-        if let Some(code) = s.peer_reset { return Poll::Ready(Err(terminated(code))); }
-        if s.reset.is_some() { return Poll::Ready(Err(invalid())); }
-        if s.fin_queued { return Poll::Ready(Ok(())); }
+        if let Some(error) = &state.error {
+            return Poll::Ready(Err(connection(error.clone())));
+        }
+        let Some(s) = state.streams.get_mut(&self.id) else {
+            return Poll::Ready(Err(invalid()));
+        };
+        if let Some(code) = s.peer_reset {
+            return Poll::Ready(Err(terminated(code)));
+        }
+        if s.reset.is_some() {
+            return Poll::Ready(Err(invalid()));
+        }
+        if s.fin_queued {
+            return Poll::Ready(Ok(()));
+        }
         s.finish = true;
         s.send_waker = Some(cx.waker().clone());
         Poll::Pending
     }
 
-    fn reset(&mut self, code: u64) { self.cancel(code); }
-    fn send_id(&self) -> StreamId { StreamId::try_from(self.id).expect("native stream ID") }
+    fn reset(&mut self, code: u64) {
+        self.cancel(code);
+    }
+    fn send_id(&self) -> StreamId {
+        StreamId::try_from(self.id).expect("native stream ID")
+    }
 }
 
 impl quic::SendStreamUnframed<Bytes> for SendSide {
@@ -404,56 +598,106 @@ impl quic::SendStreamUnframed<Bytes> for SendSide {
     }
 }
 
-pub struct RecvSide { shared: Shared, id: u64 }
+pub struct RecvSide {
+    shared: Shared,
+    id: u64,
+}
 impl RecvSide {
-    fn new(shared: Shared, id: u64) -> Self { Self { shared, id } }
+    fn new(shared: Shared, id: u64) -> Self {
+        Self { shared, id }
+    }
     fn stop(&self, code: u64) {
         let mut state = self.shared.lock().expect("bridge mutex");
         if let Some(s) = state.streams.get_mut(&self.id) {
-            if !s.eof && s.stop.is_none() { s.stop = Some(code); s.incoming = None; }
+            if !s.eof && s.stop.is_none() {
+                s.stop = Some(code);
+                s.incoming = None;
+            }
         }
     }
 }
-impl Drop for RecvSide { fn drop(&mut self) { self.stop(CANCEL); } }
+impl Drop for RecvSide {
+    fn drop(&mut self) {
+        self.stop(CANCEL);
+    }
+}
 impl quic::RecvStream for RecvSide {
     type Buf = Bytes;
     fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, SE>> {
         let mut state = self.shared.lock().expect("bridge mutex");
-        if let Some(error) = &state.error { return Poll::Ready(Err(connection(error.clone()))); }
-        let Some(s) = state.streams.get_mut(&self.id) else { return Poll::Ready(Err(invalid())); };
-        if let Some(code) = s.recv_reset { return Poll::Ready(Err(terminated(code))); }
-        if let Some(data) = s.incoming.take() { return Poll::Ready(Ok(Some(data))); }
-        if s.eof || s.stop.is_some() { return Poll::Ready(Ok(None)); }
+        if let Some(error) = &state.error {
+            return Poll::Ready(Err(connection(error.clone())));
+        }
+        let Some(s) = state.streams.get_mut(&self.id) else {
+            return Poll::Ready(Err(invalid()));
+        };
+        if let Some(code) = s.recv_reset {
+            return Poll::Ready(Err(terminated(code)));
+        }
+        if let Some(data) = s.incoming.take() {
+            return Poll::Ready(Ok(Some(data)));
+        }
+        if s.eof || s.stop.is_some() {
+            return Poll::Ready(Ok(None));
+        }
         s.recv_waker = Some(cx.waker().clone());
         Poll::Pending
     }
-    fn stop_sending(&mut self, code: u64) { self.stop(code); }
-    fn recv_id(&self) -> StreamId { StreamId::try_from(self.id).expect("native stream ID") }
+    fn stop_sending(&mut self, code: u64) {
+        self.stop(code);
+    }
+    fn recv_id(&self) -> StreamId {
+        StreamId::try_from(self.id).expect("native stream ID")
+    }
 }
 
-pub struct Bidi { send: SendSide, recv: RecvSide }
+pub struct Bidi {
+    send: SendSide,
+    recv: RecvSide,
+}
 impl Bidi {
     fn new(shared: Shared, id: u64) -> Self {
-        Self { send: SendSide::new(shared.clone(), id), recv: RecvSide::new(shared, id) }
+        Self {
+            send: SendSide::new(shared.clone(), id),
+            recv: RecvSide::new(shared, id),
+        }
     }
 }
 impl quic::SendStream<Bytes> for Bidi {
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SE>> { quic::SendStream::poll_ready(&mut self.send, cx) }
-    fn send_data<T: Into<WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), SE> { quic::SendStream::send_data(&mut self.send, data) }
-    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SE>> { quic::SendStream::poll_finish(&mut self.send, cx) }
-    fn reset(&mut self, code: u64) { quic::SendStream::reset(&mut self.send, code); }
-    fn send_id(&self) -> StreamId { quic::SendStream::send_id(&self.send) }
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SE>> {
+        quic::SendStream::poll_ready(&mut self.send, cx)
+    }
+    fn send_data<T: Into<WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), SE> {
+        quic::SendStream::send_data(&mut self.send, data)
+    }
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SE>> {
+        quic::SendStream::poll_finish(&mut self.send, cx)
+    }
+    fn reset(&mut self, code: u64) {
+        quic::SendStream::reset(&mut self.send, code);
+    }
+    fn send_id(&self) -> StreamId {
+        quic::SendStream::send_id(&self.send)
+    }
 }
 impl quic::RecvStream for Bidi {
     type Buf = Bytes;
-    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, SE>> { quic::RecvStream::poll_data(&mut self.recv, cx) }
-    fn stop_sending(&mut self, code: u64) { quic::RecvStream::stop_sending(&mut self.recv, code); }
-    fn recv_id(&self) -> StreamId { quic::RecvStream::recv_id(&self.recv) }
+    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, SE>> {
+        quic::RecvStream::poll_data(&mut self.recv, cx)
+    }
+    fn stop_sending(&mut self, code: u64) {
+        quic::RecvStream::stop_sending(&mut self.recv, code);
+    }
+    fn recv_id(&self) -> StreamId {
+        quic::RecvStream::recv_id(&self.recv)
+    }
 }
 impl quic::BidiStream<Bytes> for Bidi {
     type SendStream = SendSide;
     type RecvStream = RecvSide;
-    fn split(self) -> (SendSide, RecvSide) { (self.send, self.recv) }
+    fn split(self) -> (SendSide, RecvSide) {
+        (self.send, self.recv)
+    }
 }
 impl quic::SendStreamUnframed<Bytes> for Bidi {
     fn poll_send<D: Buf>(&mut self, cx: &mut Context<'_>, buf: &mut D) -> Poll<Result<usize, SE>> {

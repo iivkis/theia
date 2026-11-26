@@ -33,8 +33,7 @@ pub fn server(
     if config.max_early_data_size != 0 {
         return Err(Error::General("Theia QUIC forbids 0-RTT".into()));
     }
-    quic::ServerConnection::new(config, version(wire_version), params)
-        .map(quic::Connection::Server)
+    quic::ServerConnection::new(config, version(wire_version), params).map(quic::Connection::Server)
 }
 
 #[cfg(test)]
@@ -48,13 +47,18 @@ mod tests {
         let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut server = ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
-            .with_no_client_auth().with_single_cert(vec![der.clone()], key).unwrap();
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![der.clone()], key)
+            .unwrap();
         let mut roots = RootCertStore::empty();
         roots.add(der).unwrap();
         let mut client = ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
-            .with_root_certificates(roots).with_no_client_auth();
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         server.alpn_protocols = vec![b"h3".to_vec()];
         client.alpn_protocols = vec![b"h3".to_vec()];
         (client, server)
@@ -81,12 +85,20 @@ mod tests {
     fn tls13_v1_v2_and_hostname_verification() {
         for v in [Version::V1, Version::V2] {
             let (cc, sc) = configs();
-            let mut c = client(Arc::new(cc), v, ServerName::try_from("localhost").unwrap(), vec![1, 1, 1]).unwrap();
+            let mut c = client(
+                Arc::new(cc),
+                v,
+                ServerName::try_from("localhost").unwrap(),
+                vec![1, 1, 1],
+            )
+            .unwrap();
             let mut s = server(Arc::new(sc), v, vec![1, 1, 2]).unwrap();
             for _ in 0..16 {
                 let outgoing = transfer(&mut c, &mut s).unwrap();
                 let incoming = transfer(&mut s, &mut c).unwrap();
-                if !outgoing && !incoming { break; }
+                if !outgoing && !incoming {
+                    break;
+                }
             }
             assert!(!c.is_handshaking());
             assert!(!s.is_handshaking());
@@ -100,7 +112,13 @@ mod tests {
             );
 
             let (cc, sc) = configs();
-            let mut c = client(Arc::new(cc), v, ServerName::try_from("wrong.invalid").unwrap(), vec![]).unwrap();
+            let mut c = client(
+                Arc::new(cc),
+                v,
+                ServerName::try_from("wrong.invalid").unwrap(),
+                vec![],
+            )
+            .unwrap();
             let mut s = server(Arc::new(sc), v, vec![]).unwrap();
             transfer(&mut c, &mut s).unwrap();
             assert!(transfer(&mut s, &mut c).is_err());
@@ -112,7 +130,13 @@ mod tests {
         let (mut cc, mut sc) = configs();
         cc.enable_early_data = true;
         sc.max_early_data_size = u32::MAX;
-        assert!(client(Arc::new(cc), Version::V1, ServerName::try_from("localhost").unwrap(), vec![]).is_err());
+        assert!(client(
+            Arc::new(cc),
+            Version::V1,
+            ServerName::try_from("localhost").unwrap(),
+            vec![]
+        )
+        .is_err());
         assert!(server(Arc::new(sc), Version::V2, vec![]).is_err());
     }
     #[test]
@@ -120,29 +144,46 @@ mod tests {
         use crate::quic_core::handshake::{Driver, Level};
         for v in [Version::V1, Version::V2] {
             let (cc, sc) = configs();
-            let mut c = Driver::new(client(Arc::new(cc), v, ServerName::try_from("localhost").unwrap(), vec![1, 1, 1]).unwrap());
+            let mut c = Driver::new(
+                client(
+                    Arc::new(cc),
+                    v,
+                    ServerName::try_from("localhost").unwrap(),
+                    vec![1, 1, 1],
+                )
+                .unwrap(),
+            );
             let mut s = Driver::new(server(Arc::new(sc), v, vec![1, 1, 2]).unwrap());
             let first = c.poll_output().unwrap().unwrap();
             assert_eq!(first.level, Level::Initial);
             let split = first.data.len() / 2;
-            s.receive(first.level, split as u64, &first.data[split..]).unwrap();
+            s.receive(first.level, split as u64, &first.data[split..])
+                .unwrap();
             assert!(s.poll_output().unwrap().is_none());
             s.receive(first.level, 0, &first.data[..split]).unwrap();
             // Synchronize each side's key transitions before passing the
             // next level's data, as a real packet engine must do.
             for _ in 0..16 {
                 while let Some(f) = s.poll_output().unwrap() {
-                    if !f.data.is_empty() { c.receive(f.level, f.offset, &f.data).unwrap(); }
+                    if !f.data.is_empty() {
+                        c.receive(f.level, f.offset, &f.data).unwrap();
+                    }
                     if f.keys.is_some() {
                         while let Some(reply) = c.poll_output().unwrap() {
-                            if !reply.data.is_empty() { s.receive(reply.level, reply.offset, &reply.data).unwrap(); }
+                            if !reply.data.is_empty() {
+                                s.receive(reply.level, reply.offset, &reply.data).unwrap();
+                            }
                         }
                     }
                 }
                 while let Some(f) = c.poll_output().unwrap() {
-                    if !f.data.is_empty() { s.receive(f.level, f.offset, &f.data).unwrap(); }
+                    if !f.data.is_empty() {
+                        s.receive(f.level, f.offset, &f.data).unwrap();
+                    }
                 }
-                if c.tls_complete() && s.tls_complete() { break; }
+                if c.tls_complete() && s.tls_complete() {
+                    break;
+                }
             }
             assert!(c.tls_complete() && s.tls_complete());
             assert_eq!(c.negotiated_alpn(), Some(b"h3".as_slice()));
@@ -157,38 +198,60 @@ mod tests {
         use std::time::{Duration, Instant};
         use tokio::net::UdpSocket;
 
-        fn move_hs(source: &mut quic::Connection, target: &mut quic::Connection,
-                   application: &mut Option<Keys>) -> bool {
+        fn move_hs(
+            source: &mut quic::Connection,
+            target: &mut quic::Connection,
+            application: &mut Option<Keys>,
+        ) -> bool {
             let mut activity = false;
             for _ in 0..8 {
                 let mut bytes = Vec::new();
                 let change = source.write_hs(&mut bytes);
                 let changed = change.is_some();
-                if let Some(KeyChange::OneRtt { keys, .. }) = change { *application = Some(keys); }
-                if !bytes.is_empty() { target.read_hs(&bytes).unwrap(); activity = true; }
-                if !changed && bytes.is_empty() { break; }
+                if let Some(KeyChange::OneRtt { keys, .. }) = change {
+                    *application = Some(keys);
+                }
+                if !bytes.is_empty() {
+                    target.read_hs(&bytes).unwrap();
+                    activity = true;
+                }
+                if !changed && bytes.is_empty() {
+                    break;
+                }
             }
             activity
         }
 
         for version in [Version::V1, Version::V2] {
             let (cc, sc) = configs();
-            let mut c = client(Arc::new(cc), version, ServerName::try_from("localhost").unwrap(), vec![1, 1, 1]).unwrap();
+            let mut c = client(
+                Arc::new(cc),
+                version,
+                ServerName::try_from("localhost").unwrap(),
+                vec![1, 1, 1],
+            )
+            .unwrap();
             let mut s = server(Arc::new(sc), version, vec![1, 1, 2]).unwrap();
             let mut ck = None;
             let mut sk = None;
             for _ in 0..16 {
                 let a = move_hs(&mut c, &mut s, &mut ck);
                 let b = move_hs(&mut s, &mut c, &mut sk);
-                if !a && !b { break; }
+                if !a && !b {
+                    break;
+                }
             }
             assert!(!c.is_handshaking() && !s.is_handshaking());
             let ca = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let sa = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let caddr = ca.local_addr().unwrap();
             let saddr = sa.local_addr().unwrap();
-            let mut c = LabSession::connect(ca, saddr, false, [1; 8], [2; 8], ck.unwrap()).await.unwrap();
-            let mut s = LabSession::connect(sa, caddr, true, [2; 8], [1; 8], sk.unwrap()).await.unwrap();
+            let mut c = LabSession::connect(ca, saddr, false, [1; 8], [2; 8], ck.unwrap())
+                .await
+                .unwrap();
+            let mut s = LabSession::connect(sa, caddr, true, [2; 8], [1; 8], sk.unwrap())
+                .await
+                .unwrap();
             let ci = c.open_uni().unwrap();
             let si = s.open_uni().unwrap();
             c.queue(ci, b"client stream", true).unwrap();
@@ -228,22 +291,42 @@ mod tests {
             let caddr = ca.local_addr().unwrap();
             let saddr = sa.local_addr().unwrap();
             let (c, s) = tokio::join!(
-                establish(ca, saddr, version, [1; 8], [2; 8], Config::Client {
-                    tls: Arc::new(cc), name: ServerName::try_from("localhost").unwrap(),
-                }),
-                establish(sa, caddr, version, [2; 8], [1; 8], Config::Server(Arc::new(sc))),
+                establish(
+                    ca,
+                    saddr,
+                    version,
+                    [1; 8],
+                    [2; 8],
+                    Config::Client {
+                        tls: Arc::new(cc),
+                        name: ServerName::try_from("localhost").unwrap(),
+                    }
+                ),
+                establish(
+                    sa,
+                    caddr,
+                    version,
+                    [2; 8],
+                    [1; 8],
+                    Config::Server(Arc::new(sc))
+                ),
             );
             let mut c = c.unwrap();
             let mut s = s.unwrap();
             assert!(s.handshake_confirmed());
             assert!(!c.handshake_confirmed());
             assert!(c.update_keys().is_err());
-            async fn pump(from: &mut crate::quic_core::endpoint::LabSession, to: &mut crate::quic_core::endpoint::LabSession) {
+            async fn pump(
+                from: &mut crate::quic_core::endpoint::LabSession,
+                to: &mut crate::quic_core::endpoint::LabSession,
+            ) {
                 for _ in 0..50 {
                     if from.flush(Instant::now()).await.unwrap() {
                         // Allow for stale handshake packets before the next 1-RTT.
                         for _ in 0..8 {
-                            if to.recv(Duration::from_millis(100)).await.unwrap() { return; }
+                            if to.recv(Duration::from_millis(100)).await.unwrap() {
+                                return;
+                            }
                         }
                         panic!("no protected application packet received");
                     }
@@ -334,18 +417,37 @@ mod tests {
         let b_addr = b.local_addr().unwrap();
         let (a, b, servers) = tokio::time::timeout(Duration::from_secs(12), async {
             tokio::join!(
-                handshake_udp::connect(a, addr, Version::V1, cc.clone(), ServerName::try_from("localhost").unwrap()),
-                handshake_udp::connect(b, addr, Version::V2, cc.clone(), ServerName::try_from("localhost").unwrap()),
+                handshake_udp::connect(
+                    a,
+                    addr,
+                    Version::V1,
+                    cc.clone(),
+                    ServerName::try_from("localhost").unwrap()
+                ),
+                handshake_udp::connect(
+                    b,
+                    addr,
+                    Version::V2,
+                    cc.clone(),
+                    ServerName::try_from("localhost").unwrap()
+                ),
                 async {
                     let x = listener.accept().await.unwrap();
                     let y = listener.accept().await.unwrap();
-                    tokio::join!(handshake_udp::accept(x, sc.clone()), handshake_udp::accept(y, sc.clone()))
+                    tokio::join!(
+                        handshake_udp::accept(x, sc.clone()),
+                        handshake_udp::accept(y, sc.clone())
+                    )
                 },
             )
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let (mut a, mut b) = (a.unwrap(), b.unwrap());
         let (mut x, mut y) = (servers.0.unwrap(), servers.1.unwrap());
-        if x.peer_addr() != a_addr { std::mem::swap(&mut x, &mut y); }
+        if x.peer_addr() != a_addr {
+            std::mem::swap(&mut x, &mut y);
+        }
         assert_eq!(x.peer_addr(), a_addr);
         assert_eq!(y.peer_addr(), b_addr);
         assert!(x.handshake_confirmed() && y.handshake_confirmed());
@@ -356,7 +458,11 @@ mod tests {
             assert!(c.flush(Instant::now()).await.unwrap());
         }
         for (s, expected) in [(&mut x, b"alpha".as_slice()), (&mut y, b"bravo".as_slice())] {
-            for _ in 0..8 { if s.recv(Duration::from_millis(100)).await.unwrap() { break; } }
+            for _ in 0..8 {
+                if s.recv(Duration::from_millis(100)).await.unwrap() {
+                    break;
+                }
+            }
             let mut out = [0; 5];
             assert_eq!(s.read(2, &mut out).unwrap(), 5);
             assert_eq!(out.as_slice(), expected);
@@ -372,49 +478,81 @@ mod tests {
         for version in [Version::V1, Version::V2] {
             let (cc, mut sc) = configs();
             sc.send_tls13_tickets = 0;
-            let mut listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2).unwrap();
+            let mut listener =
+                Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2).unwrap();
             let addr = listener.local_addr();
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             tokio::time::timeout(Duration::from_secs(15), async {
                 let (client, server) = tokio::join!(
-                    handshake_udp::connect(socket, addr, version, Arc::new(cc), ServerName::try_from("localhost").unwrap()),
-                    async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await },
+                    handshake_udp::connect(
+                        socket,
+                        addr,
+                        version,
+                        Arc::new(cc),
+                        ServerName::try_from("localhost").unwrap()
+                    ),
+                    async {
+                        handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await
+                    },
                 );
                 let (client, ck) = NativeConnection::start(client.unwrap()).unwrap();
                 let (server, sk) = NativeConnection::start(server.unwrap()).unwrap();
                 assert_eq!(&ck[..], &sk[..]);
-                let (client, server) = tokio::join!(
-                    h3::client::new(client),
-                    async { h3::server::builder().build::<_, Bytes>(server).await },
-                );
+                let (client, server) = tokio::join!(h3::client::new(client), async {
+                    h3::server::builder().build::<_, Bytes>(server).await
+                },);
                 let (mut driver, mut sender) = client.unwrap();
                 let mut server = server.unwrap();
-                let driver = tokio::spawn(async move { let _ = poll_fn(|cx| driver.poll_close(cx)).await; });
-                let ((), ()) = tokio::join!(async {
-                    let mut request = sender.send_request(http::Request::builder().uri("https://localhost/native").body(()).unwrap()).await.unwrap();
-                    request.send_data(Bytes::from_static(b"native request")).await.unwrap();
-                    request.finish().await.unwrap();
-                    assert_eq!(request.recv_response().await.unwrap().status(), 200);
-                    let mut data = Vec::new();
-                    while let Some(mut buf) = request.recv_data().await.unwrap() {
-                        data.extend_from_slice(&buf.copy_to_bytes(buf.remaining()));
-                    }
-                    assert_eq!(data, b"native response");
-                }, async {
-                    let resolver = server.accept().await.unwrap().unwrap();
-                    let (req, mut stream) = resolver.resolve_request().await.unwrap();
-                    assert_eq!(req.uri().path(), "/native");
-                    let mut data = Vec::new();
-                    while let Some(mut buf) = stream.recv_data().await.unwrap() {
-                        data.extend_from_slice(&buf.copy_to_bytes(buf.remaining()));
-                    }
-                    assert_eq!(data, b"native request");
-                    stream.send_response(http::Response::builder().status(200).body(()).unwrap()).await.unwrap();
-                    stream.send_data(Bytes::from_static(b"native response")).await.unwrap();
-                    stream.finish().await.unwrap();
+                let driver = tokio::spawn(async move {
+                    let _ = poll_fn(|cx| driver.poll_close(cx)).await;
                 });
+                let ((), ()) = tokio::join!(
+                    async {
+                        let mut request = sender
+                            .send_request(
+                                http::Request::builder()
+                                    .uri("https://localhost/native")
+                                    .body(())
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        request
+                            .send_data(Bytes::from_static(b"native request"))
+                            .await
+                            .unwrap();
+                        request.finish().await.unwrap();
+                        assert_eq!(request.recv_response().await.unwrap().status(), 200);
+                        let mut data = Vec::new();
+                        while let Some(mut buf) = request.recv_data().await.unwrap() {
+                            data.extend_from_slice(&buf.copy_to_bytes(buf.remaining()));
+                        }
+                        assert_eq!(data, b"native response");
+                    },
+                    async {
+                        let resolver = server.accept().await.unwrap().unwrap();
+                        let (req, mut stream) = resolver.resolve_request().await.unwrap();
+                        assert_eq!(req.uri().path(), "/native");
+                        let mut data = Vec::new();
+                        while let Some(mut buf) = stream.recv_data().await.unwrap() {
+                            data.extend_from_slice(&buf.copy_to_bytes(buf.remaining()));
+                        }
+                        assert_eq!(data, b"native request");
+                        stream
+                            .send_response(http::Response::builder().status(200).body(()).unwrap())
+                            .await
+                            .unwrap();
+                        stream
+                            .send_data(Bytes::from_static(b"native response"))
+                            .await
+                            .unwrap();
+                        stream.finish().await.unwrap();
+                    }
+                );
                 driver.abort();
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         }
     }
 
@@ -443,34 +581,55 @@ mod tests {
 
     #[test]
     fn application_key_update_retains_packet_numbers_and_reordered_old_keys() {
-        use crate::quic_core::{key_update::{Receiver, Sender}, packet::Error};
+        use crate::quic_core::{
+            key_update::{Receiver, Sender},
+            packet::Error,
+        };
         use rustls::quic::{KeyChange, Keys, Secrets};
         use std::time::{Duration, Instant};
 
-        fn move_hs(source: &mut quic::Connection, target: &mut quic::Connection,
-                   application: &mut Option<(Keys, Secrets)>) -> bool {
+        fn move_hs(
+            source: &mut quic::Connection,
+            target: &mut quic::Connection,
+            application: &mut Option<(Keys, Secrets)>,
+        ) -> bool {
             let mut activity = false;
             for _ in 0..8 {
                 let mut bytes = Vec::new();
                 let change = source.write_hs(&mut bytes);
                 let changed = change.is_some();
-                if let Some(KeyChange::OneRtt { keys, next }) = change { *application = Some((keys, next)); }
-                if !bytes.is_empty() { target.read_hs(&bytes).unwrap(); activity = true; }
-                if !changed && bytes.is_empty() { break; }
+                if let Some(KeyChange::OneRtt { keys, next }) = change {
+                    *application = Some((keys, next));
+                }
+                if !bytes.is_empty() {
+                    target.read_hs(&bytes).unwrap();
+                    activity = true;
+                }
+                if !changed && bytes.is_empty() {
+                    break;
+                }
             }
             activity
         }
 
         for version in [Version::V1, Version::V2] {
             let (cc, sc) = configs();
-            let mut c = client(Arc::new(cc), version, ServerName::try_from("localhost").unwrap(), vec![1, 1, 1]).unwrap();
+            let mut c = client(
+                Arc::new(cc),
+                version,
+                ServerName::try_from("localhost").unwrap(),
+                vec![1, 1, 1],
+            )
+            .unwrap();
             let mut s = server(Arc::new(sc), version, vec![1, 1, 2]).unwrap();
             let mut ck = None;
             let mut sk = None;
             for _ in 0..16 {
                 let a = move_hs(&mut c, &mut s, &mut ck);
                 let b = move_hs(&mut s, &mut c, &mut sk);
-                if !a && !b { break; }
+                if !a && !b {
+                    break;
+                }
             }
             assert!(!c.is_handshaking() && !s.is_handshaking());
             let (ck, cn) = ck.unwrap();
@@ -503,8 +662,12 @@ mod tests {
             tx.update(true).unwrap();
             let (pn, next) = tx.seal(&cid, b"next").unwrap();
             assert_eq!(pn, 3);
-            assert_eq!(rx.open(&cid, &next, end, end + Duration::from_secs(3), true).unwrap().payload, b"next");
+            assert_eq!(
+                rx.open(&cid, &next, end, end + Duration::from_secs(3), true)
+                    .unwrap()
+                    .payload,
+                b"next"
+            );
         }
     }
-
 }

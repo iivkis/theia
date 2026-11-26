@@ -82,10 +82,14 @@ pub(super) fn hello_metadata(mut data: &[u8]) -> Option<(String, bool)> {
                 name = Some(super::super::domain_name(raw).ok()?);
             }
             16 => {
-                if word(&mut value)? != value.len() || value.is_empty() { return None; }
+                if word(&mut value)? != value.len() || value.is_empty() {
+                    return None;
+                }
                 while !value.is_empty() {
                     let n = byte(&mut value)?;
-                    if n == 0 { return None; }
+                    if n == 0 {
+                        return None;
+                    }
                     h3 |= take(&mut value, n)? == b"h3";
                 }
             }
@@ -212,22 +216,41 @@ pub(super) fn server_hello(mut message: &[u8]) -> bool {
     if byte(&mut message) != Some(2) {
         return false;
     }
-    let Some(length) = take(&mut message, 3) else { return false; };
-    let length = (usize::from(length[0]) << 16) | (usize::from(length[1]) << 8) | usize::from(length[2]);
-    let Some(mut body) = take(&mut message, length) else { return false; };
+    let Some(length) = take(&mut message, 3) else {
+        return false;
+    };
+    let length =
+        (usize::from(length[0]) << 16) | (usize::from(length[1]) << 8) | usize::from(length[2]);
+    let Some(mut body) = take(&mut message, length) else {
+        return false;
+    };
     if take(&mut body, 2) != Some(&[3, 3][..]) || take(&mut body, 32).is_none() {
         return false;
     }
-    let Some(session) = byte(&mut body) else { return false; };
-    if session > 32 || take(&mut body, session).is_none() || word(&mut body).is_none() || byte(&mut body) != Some(0) {
+    let Some(session) = byte(&mut body) else {
+        return false;
+    };
+    if session > 32
+        || take(&mut body, session).is_none()
+        || word(&mut body).is_none()
+        || byte(&mut body) != Some(0)
+    {
         return false;
     }
-    if body.is_empty() { return true; }
-    if word(&mut body) != Some(body.len()) { return false; }
+    if body.is_empty() {
+        return true;
+    }
+    if word(&mut body) != Some(body.len()) {
+        return false;
+    }
     let mut seen = HashSet::new();
     while !body.is_empty() {
-        let Some(kind) = word(&mut body) else { return false; };
-        let Some(len) = word(&mut body) else { return false; };
+        let Some(kind) = word(&mut body) else {
+            return false;
+        };
+        let Some(len) = word(&mut body) else {
+            return false;
+        };
         if seen.len() >= 128 || !seen.insert(kind) || take(&mut body, len).is_none() {
             return false;
         }
@@ -274,7 +297,13 @@ pub(super) async fn probe(
     let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).ok()?;
     let mut tls = rustls::ClientConnection::new(config, server_name).ok()?;
     let mut socket = super::tcp::connect(address).await.ok()?;
-    if scope.is_some_and(|scope| !socket.local_addr().is_ok_and(|local| scope.matches_local(local))) { return None; }
+    if scope.is_some_and(|scope| {
+        !socket
+            .local_addr()
+            .is_ok_and(|local| scope.matches_local(local))
+    }) {
+        return None;
+    }
     let mut first = true;
     let mut input = [0; RECORD_LIMIT];
     loop {

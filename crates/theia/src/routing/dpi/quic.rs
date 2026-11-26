@@ -2,7 +2,11 @@
 use crate::reality_quic_wire::{self as wire, Flight, Inspection, Kind};
 pub(super) enum Result {
     Pending,
-    Hello { name: String, version: u32, h3: bool },
+    Hello {
+        name: String,
+        version: u32,
+        h3: bool,
+    },
     Unsupported,
 }
 #[derive(Default)]
@@ -51,7 +55,11 @@ impl Observer {
                 self.done = true;
                 self.flight = None;
                 match super::tls::hello_metadata(&message) {
-                    Some((name, h3)) => Result::Hello { name, version: header.version, h3 },
+                    Some((name, h3)) => Result::Hello {
+                        name,
+                        version: header.version,
+                        h3,
+                    },
                     None => Result::Unsupported,
                 }
             }
@@ -72,7 +80,9 @@ mod tests {
             let packet =
                 wire::test_initial(version, &super::super::tls::fixture("example.org")[5..]);
             let mut observer = Observer::default();
-            assert!(matches!(observer.observe(&packet), Result::Hello { version: v, .. } if v == version));
+            assert!(
+                matches!(observer.observe(&packet), Result::Hello { version: v, .. } if v == version)
+            );
             assert!(matches!(observer.observe(&packet), Result::Unsupported));
             let mut bad = packet;
             *bad.last_mut().unwrap() ^= 1;

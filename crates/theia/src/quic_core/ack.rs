@@ -35,7 +35,10 @@ impl Ack {
             return None;
         }
         let mut ranges = Vec::with_capacity(count as usize + 1);
-        ranges.push(Range { first, last: largest });
+        ranges.push(Range {
+            first,
+            last: largest,
+        });
         let mut low = first;
         for _ in 0..count {
             let last = low.checked_sub(varint(bytes, &mut at)?.checked_add(2)?)?;
@@ -44,7 +47,11 @@ impl Ack {
             low = first;
         }
         let ecn = if with_ecn {
-            Some([varint(bytes, &mut at)?, varint(bytes, &mut at)?, varint(bytes, &mut at)?])
+            Some([
+                varint(bytes, &mut at)?,
+                varint(bytes, &mut at)?,
+                varint(bytes, &mut at)?,
+            ])
         } else {
             None
         };
@@ -53,7 +60,9 @@ impl Ack {
     }
 
     pub fn acknowledges(&self, number: u64) -> bool {
-        self.ranges.iter().any(|range| (range.first..=range.last).contains(&number))
+        self.ranges
+            .iter()
+            .any(|range| (range.first..=range.last).contains(&number))
     }
 }
 
@@ -67,7 +76,10 @@ mod tests {
         let mut pos = 1;
         let a = Ack::decode(&data, &mut pos, true).unwrap();
         assert_eq!(a.delay, 2);
-        assert_eq!(a.ranges, [Range { first: 8, last: 10 }, Range { first: 4, last: 5 }]);
+        assert_eq!(
+            a.ranges,
+            [Range { first: 8, last: 10 }, Range { first: 4, last: 5 }]
+        );
         assert_eq!(a.ecn, Some([3, 4, 5]));
         assert_eq!(pos, 10);
         assert!(a.acknowledges(4));
@@ -86,7 +98,12 @@ mod tests {
 
     #[test]
     fn rejects_underflow_and_excessive_range_count() {
-        for bytes in [&[1, 0, 0, 2][..], &[2, 0, 1, 1, 0, 0], &[2, 0, 1, 0, 0, 1], &[0, 0, 0x41, 1, 0]] {
+        for bytes in [
+            &[1, 0, 0, 2][..],
+            &[2, 0, 1, 1, 0, 0],
+            &[2, 0, 1, 0, 0, 1],
+            &[0, 0, 0x41, 1, 0],
+        ] {
             let mut pos = 0;
             assert!(Ack::decode(bytes, &mut pos, false).is_none());
             assert_eq!(pos, 0);

@@ -51,21 +51,30 @@ impl ReceiveBuffer {
     /// Insert out-of-order data atomically. Already consumed bytes are ignored;
     /// overlapping buffered bytes must agree. FIN fixes the final offset.
     pub fn insert(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<(), ReceiveError> {
-        let end = offset.checked_add(data.len() as u64).ok_or(ReceiveError::Limit)?;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(ReceiveError::Limit)?;
         if end > self.limit {
             return Err(ReceiveError::Limit);
         }
-        if self.final_size.is_some_and(|size| end > size || (fin && end != size))
+        if self
+            .final_size
+            .is_some_and(|size| end > size || (fin && end != size))
             || (fin && end < self.highest)
         {
             return Err(ReceiveError::FinalSize);
         }
-        if self.reset_code.is_some() { return Ok(()); }
+        if self.reset_code.is_some() {
+            return Ok(());
+        }
         if end.saturating_sub(self.read_offset) > self.window as u64 {
             return Err(ReceiveError::Limit);
         }
 
-        let skip = self.read_offset.saturating_sub(offset).min(data.len() as u64) as usize;
+        let skip = self
+            .read_offset
+            .saturating_sub(offset)
+            .min(data.len() as u64) as usize;
         let remaining = &data[skip..];
         let start = offset.saturating_sub(self.read_offset) as usize;
         for (i, &byte) in remaining.iter().enumerate() {
@@ -94,12 +103,16 @@ impl ReceiveBuffer {
     /// RESET_STREAM fixes final size even if bytes are missing. Credit is
     /// checked by the owner before this mutation; do not allocate gaps.
     pub fn reset(&mut self, final_size: u64, code: u64) -> Result<(), ReceiveError> {
-        if final_size > self.limit || code > MAX_VARINT { return Err(ReceiveError::Limit); }
+        if final_size > self.limit || code > MAX_VARINT {
+            return Err(ReceiveError::Limit);
+        }
         if final_size < self.highest || self.final_size.is_some_and(|size| size != final_size) {
             return Err(ReceiveError::FinalSize);
         }
         // Already fully consumed FIN wins; late RESET cannot revoke it.
-        if self.finished() { return Ok(()); }
+        if self.finished() {
+            return Ok(());
+        }
         self.final_size = Some(final_size);
         self.highest = final_size;
         self.reset_code.get_or_insert(code);
@@ -107,7 +120,9 @@ impl ReceiveBuffer {
         Ok(())
     }
 
-    pub fn reset_code(&self) -> Option<u64> { self.reset_code }
+    pub fn reset_code(&self) -> Option<u64> {
+        self.reset_code
+    }
 
     pub fn read(&mut self, output: &mut [u8]) -> usize {
         let mut written = 0;
@@ -127,7 +142,9 @@ impl ReceiveBuffer {
         self.reset_code.is_none() && self.final_size == Some(self.read_offset)
     }
 
-    pub fn limit(&self) -> u64 { self.limit }
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
 
     pub fn highest_offset(&self) -> u64 {
         self.highest

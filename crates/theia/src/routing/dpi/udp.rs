@@ -1,6 +1,9 @@
 //! UDP classification and independent reachability probes. No application-payload mutation.
 use super::quic;
-use std::{collections::VecDeque, time::{Duration, Instant}};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 const STUN_LIMIT: usize = 16;
 const STUN_TTL: Duration = Duration::from_secs(30);
 const CLASSIFY_BUDGET: Duration = Duration::from_millis(30);
@@ -47,7 +50,9 @@ impl Stun {
 /// unknown attributes are never admitted by the local Binding strategy.
 pub(crate) fn plain_binding(data: &[u8]) -> Option<Stun> {
     let message = stun(data)?;
-    if message.method != 1 || message.class != 0 || data.len() > 512 { return None; }
+    if message.method != 1 || message.class != 0 || data.len() > 512 {
+        return None;
+    }
     let mut rest = &data[20..];
     let mut software = false;
     while !rest.is_empty() {
@@ -56,7 +61,7 @@ pub(crate) fn plain_binding(data: &[u8]) -> Option<Stun> {
         let end = 4 + ((len + 3) & !3);
         match kind {
             0x8022 if !software && len <= 128 => software = true,
-            0x8028 if len == 4 && end == rest.len() && fingerprint(data) => {},
+            0x8028 if len == 4 && end == rest.len() && fingerprint(data) => {}
             _ => return None,
         }
         rest = &rest[end..];
@@ -65,8 +70,12 @@ pub(crate) fn plain_binding(data: &[u8]) -> Option<Stun> {
 }
 
 fn fingerprint(data: &[u8]) -> bool {
-    let Some(end) = data.len().checked_sub(8) else { return false; };
-    if data[end..end + 4] != [0x80, 0x28, 0, 4] { return false; }
+    let Some(end) = data.len().checked_sub(8) else {
+        return false;
+    };
+    if data[end..end + 4] != [0x80, 0x28, 0, 4] {
+        return false;
+    }
     let mut crc = flate2::Crc::new();
     crc.update(&data[..end]);
     (crc.sum() ^ 0x5354554e).to_be_bytes() == data[end + 4..]
@@ -74,25 +83,32 @@ fn fingerprint(data: &[u8]) -> bool {
 
 fn binding_success(data: &[u8]) -> Option<Stun> {
     let message = stun(data)?;
-    if message.method != 1 || message.class != 2 || data.len() > 512 { return None; }
+    if message.method != 1 || message.class != 2 || data.len() > 512 {
+        return None;
+    }
     let mut rest = &data[20..];
     let mut mapped = false;
     while !rest.is_empty() {
         let kind = u16::from_be_bytes(rest[..2].try_into().ok()?);
         let len = usize::from(u16::from_be_bytes(rest[2..4].try_into().ok()?));
         let end = 4 + ((len + 3) & !3);
-        let value = &rest[4..4+len];
+        let value = &rest[4..4 + len];
         match kind {
-            0x0020 if !mapped && ((len == 8 && value.starts_with(&[0, 1]))
-                || (len == 20 && value.starts_with(&[0, 2]))) => {
-                if (u16::from_be_bytes(value[2..4].try_into().ok()?) ^ 0x2112) == 0 { return None; }
+            0x0020
+                if !mapped
+                    && ((len == 8 && value.starts_with(&[0, 1]))
+                        || (len == 20 && value.starts_with(&[0, 2]))) =>
+            {
+                if (u16::from_be_bytes(value[2..4].try_into().ok()?) ^ 0x2112) == 0 {
+                    return None;
+                }
                 mapped = true;
             }
-            0x8028 if len == 4 && end == rest.len() && fingerprint(data) => {},
+            0x8028 if len == 4 && end == rest.len() && fingerprint(data) => {}
             // Unknown comprehension-required attributes or integrity fields
             // cannot be validated by this deliberately credential-free mode.
             0x0000..=0x7fff | 0x8028 => return None,
-            _ => {},
+            _ => {}
         }
         rest = &rest[end..];
     }
@@ -100,12 +116,18 @@ fn binding_success(data: &[u8]) -> Option<Stun> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BindingStrategy { Fingerprint, Plain }
+pub(crate) enum BindingStrategy {
+    Fingerprint,
+    Plain,
+}
 
 /// RFC 8489 optional FINGERPRINT on an otherwise unprotected Binding request.
 /// Existing attributes, transaction ID, and already-present FINGERPRINT are
 /// preserved. No MESSAGE-INTEGRITY, TURN or ICE messages can enter this path.
-pub(crate) fn prepare_binding(data: &[u8], strategy: BindingStrategy) -> Option<std::borrow::Cow<'_, [u8]>> {
+pub(crate) fn prepare_binding(
+    data: &[u8],
+    strategy: BindingStrategy,
+) -> Option<std::borrow::Cow<'_, [u8]>> {
     plain_binding(data)?;
     // Walk validated TLVs: a SOFTWARE value can contain arbitrary bytes
     // resembling the final attribute header, but is not a FINGERPRINT.
@@ -121,7 +143,9 @@ pub(crate) fn prepare_binding(data: &[u8], strategy: BindingStrategy) -> Option<
         return Some(std::borrow::Cow::Borrowed(data));
     }
     let len = u16::try_from(data.len().checked_sub(20)?.checked_add(8)?).ok()?;
-    if usize::from(len) + 20 > 512 { return None; }
+    if usize::from(len) + 20 > 512 {
+        return None;
+    }
     let mut result = Vec::with_capacity(data.len() + 8);
     result.extend_from_slice(data);
     result[2..4].copy_from_slice(&len.to_be_bytes());
@@ -134,7 +158,10 @@ pub(crate) fn prepare_binding(data: &[u8], strategy: BindingStrategy) -> Option<
 
 /// One independent CSPRNG Binding request to the connected peer. This is
 /// reachability evidence only; no STUN MESSAGE-INTEGRITY key is available.
-pub(super) async fn probe_stun(socket: &tokio::net::UdpSocket, strategy: BindingStrategy) -> Option<()> {
+pub(super) async fn probe_stun(
+    socket: &tokio::net::UdpSocket,
+    strategy: BindingStrategy,
+) -> Option<()> {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut request = [0u8; 20];
     request[1] = 1;
@@ -142,7 +169,9 @@ pub(super) async fn probe_stun(socket: &tokio::net::UdpSocket, strategy: Binding
     SystemRandom::new().fill(&mut request[8..]).ok()?;
     let expected = plain_binding(&request)?;
     let packet = prepare_binding(&request, strategy)?;
-    crate::udp_relay::send_datagram(socket, &packet).await.ok()?;
+    crate::udp_relay::send_datagram(socket, &packet)
+        .await
+        .ok()?;
     let mut response = [0; 513];
     // The caller imposes the absolute time budget. Also bound invalid input.
     for _ in 0..8 {
@@ -160,11 +189,17 @@ pub(super) async fn probe_stun(socket: &tokio::net::UdpSocket, strategy: Binding
 pub(crate) struct BindingTransactions(VecDeque<(Stun, Instant)>);
 impl BindingTransactions {
     pub(crate) fn admit(&mut self, data: &[u8]) -> bool {
-        let Some(message) = plain_binding(data) else { return false; };
+        let Some(message) = plain_binding(data) else {
+            return false;
+        };
         let now = Instant::now();
         self.0.retain(|(_, expires)| *expires > now);
-        if self.0.iter().any(|(old, _)| *old == message) { return true; }
-        if self.0.len() >= STUN_LIMIT { return false; }
+        if self.0.iter().any(|(old, _)| *old == message) {
+            return true;
+        }
+        if self.0.len() >= STUN_LIMIT {
+            return false;
+        }
         self.0.push_back((message, now + STUN_TTL));
         true
     }
@@ -172,8 +207,16 @@ impl BindingTransactions {
     pub(crate) fn accept(&mut self, data: &[u8]) -> bool {
         let now = Instant::now();
         self.0.retain(|(_, expires)| *expires > now);
-        let Some(response) = binding_success(data) else { return false; };
-        let Some(index) = self.0.iter().position(|(request, _)| request.matches_response(response)) else { return false; };
+        let Some(response) = binding_success(data) else {
+            return false;
+        };
+        let Some(index) = self
+            .0
+            .iter()
+            .position(|(request, _)| request.matches_response(response))
+        else {
+            return false;
+        };
         self.0.remove(index);
         true
     }
@@ -200,19 +243,27 @@ pub(crate) struct Observer {
 }
 impl Observer {
     fn request(&mut self, message: Stun) {
-        if message.class != 0 { return; }
+        if message.class != 0 {
+            return;
+        }
         let now = Instant::now();
-        self.requests.retain(|(old, expires)| *old != message && *expires > now);
-        if self.requests.len() >= STUN_LIMIT { self.requests.pop_front(); }
+        self.requests
+            .retain(|(old, expires)| *old != message && *expires > now);
+        if self.requests.len() >= STUN_LIMIT {
+            self.requests.pop_front();
+        }
         self.requests.push_back((message, now + STUN_TTL));
     }
     pub(crate) fn classification_deadline(&self) -> tokio::time::Instant {
-        self.classification_deadline.unwrap_or_else(tokio::time::Instant::now)
+        self.classification_deadline
+            .unwrap_or_else(tokio::time::Instant::now)
     }
 
     pub(crate) fn outgoing(&mut self, data: &[u8]) -> Candidate {
         if self.stun_flow {
-            if let Some(message) = stun(data) { self.request(message); }
+            if let Some(message) = stun(data) {
+                self.request(message);
+            }
             return Candidate::Stun;
         }
         if self.done {
@@ -223,11 +274,15 @@ impl Observer {
             self.stun_flow = true;
             self.done = true;
             crate::traffic::udp_stun_flow();
-            return if plain_binding(data).is_some() { Candidate::StunBinding } else { Candidate::Stun };
+            return if plain_binding(data).is_some() {
+                Candidate::StunBinding
+            } else {
+                Candidate::Stun
+            };
         }
-        let deadline = *self.classification_deadline.get_or_insert_with(
-            || tokio::time::Instant::now() + CLASSIFY_BUDGET,
-        );
+        let deadline = *self
+            .classification_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + CLASSIFY_BUDGET);
         if tokio::time::Instant::now() >= deadline {
             self.done = true;
             return Candidate::Other;
@@ -255,10 +310,17 @@ impl Observer {
         }
     }
     pub(crate) fn incoming(&mut self, data: &[u8]) {
-        if !self.stun_flow { return; }
-        self.requests.retain(|(_, expires)| *expires > Instant::now());
+        if !self.stun_flow {
+            return;
+        }
+        self.requests
+            .retain(|(_, expires)| *expires > Instant::now());
         if let Some(response) = stun(data) {
-            if let Some(index) = self.requests.iter().position(|(request, _)| request.matches_response(response)) {
+            if let Some(index) = self
+                .requests
+                .iter()
+                .position(|(request, _)| request.matches_response(response))
+            {
                 self.requests.remove(index);
                 crate::traffic::udp_stun_response();
             }
@@ -276,9 +338,17 @@ pub(crate) async fn await_candidate(
     // A complete candidate published within the observer's deadline remains
     // valid even if the worker is scheduled late. Pending input gets no
     // fresh classification budget when the worker starts.
-    if initial != Candidate::Pending { return initial; }
-    if tokio::time::Instant::now() >= deadline { return Candidate::Other; }
-    let ready = tokio::time::timeout_at(deadline, classification.wait_for(|value| *value != Candidate::Pending)).await;
+    if initial != Candidate::Pending {
+        return initial;
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Candidate::Other;
+    }
+    let ready = tokio::time::timeout_at(
+        deadline,
+        classification.wait_for(|value| *value != Candidate::Pending),
+    )
+    .await;
     match ready {
         Ok(Ok(value)) => value.clone(),
         _ => Candidate::Other,
@@ -300,11 +370,19 @@ pub(super) async fn probe_quic(
     config.transport_config(crate::quic_transport::transport_config());
     let bind = match scope {
         Some(scope) => scope.bind_address(),
-        None => (if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).parse().ok()?,
+        None => (if address.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })
+        .parse()
+        .ok()?,
     };
     let mut endpoint = quinn::Endpoint::client(bind).ok()?;
     endpoint.set_default_client_config(config);
-    let connection = crate::quic_transport::connect(&endpoint, address, name).await.ok()?;
+    let connection = crate::quic_transport::connect(&endpoint, address, name)
+        .await
+        .ok()?;
     connection.close(quinn::VarInt::from_u32(0), b"");
     Some(())
 }
@@ -320,22 +398,39 @@ mod tests {
         roots.add(der.clone()).unwrap();
         let config = super::super::tls::tls_config(roots).unwrap();
         let endpoint = crate::quic_transport::server_endpoint(
-            "127.0.0.1:0".parse().unwrap(), vec![der],
+            "127.0.0.1:0".parse().unwrap(),
+            vec![der],
             rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
-        ).unwrap();
+        )
+        .unwrap();
         let addr = endpoint.local_addr().unwrap();
         let serving = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 if let Ok(connection) = incoming.await {
                     // Keep the fixture alive until the independently
                     // authenticated client closes; avoid handshake-close races.
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connection.closed()).await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        connection.closed(),
+                    )
+                    .await;
                 }
             }
         });
         let deadline = std::time::Duration::from_secs(5);
-        assert!(tokio::time::timeout(deadline, probe_quic("localhost", addr, None, config.clone())).await.unwrap().is_some());
-        assert!(tokio::time::timeout(deadline, probe_quic("wrong.invalid", addr, None, config)).await.unwrap().is_none());
+        assert!(tokio::time::timeout(
+            deadline,
+            probe_quic("localhost", addr, None, config.clone())
+        )
+        .await
+        .unwrap()
+        .is_some());
+        assert!(
+            tokio::time::timeout(deadline, probe_quic("wrong.invalid", addr, None, config))
+                .await
+                .unwrap()
+                .is_none()
+        );
         serving.abort();
     }
 
@@ -357,22 +452,30 @@ mod tests {
     #[tokio::test]
     async fn fragmented_classification_is_bounded_and_sticky() {
         let hello = h3_hello();
-        let packets = crate::reality_quic_wire::test_initial_parts(crate::reality_quic_wire::V1, &hello);
+        let packets =
+            crate::reality_quic_wire::test_initial_parts(crate::reality_quic_wire::V1, &hello);
         let mut observer = Observer::default();
         assert_eq!(observer.outgoing(&packets[0]), Candidate::Pending);
         let (tx, rx) = tokio::sync::watch::channel(Candidate::Pending);
         let complete = observer.outgoing(&packets[1]);
         assert_eq!(complete, Candidate::QuicH3("example.org".into()));
         tx.send(complete.clone()).unwrap();
-        assert_eq!(await_candidate(rx, observer.classification_deadline()).await, complete);
+        assert_eq!(
+            await_candidate(rx, observer.classification_deadline()).await,
+            complete
+        );
         let (_tx, rx) = tokio::sync::watch::channel(Candidate::Pending);
-        assert_eq!(await_candidate(rx, tokio::time::Instant::now()).await, Candidate::Other);
+        assert_eq!(
+            await_candidate(rx, tokio::time::Instant::now()).await,
+            Candidate::Other
+        );
     }
 
     #[tokio::test]
     async fn late_initial_fragment_cannot_authorize_local_candidate() {
         let hello = h3_hello();
-        let packets = crate::reality_quic_wire::test_initial_parts(crate::reality_quic_wire::V1, &hello);
+        let packets =
+            crate::reality_quic_wire::test_initial_parts(crate::reality_quic_wire::V1, &hello);
         let mut observer = Observer::default();
         assert_eq!(observer.outgoing(&packets[0]), Candidate::Pending);
         observer.classification_deadline = Some(tokio::time::Instant::now());
@@ -385,11 +488,16 @@ mod tests {
         let hello = h3_hello();
         for version in [crate::reality_quic_wire::V1, crate::reality_quic_wire::V2] {
             let packet = crate::reality_quic_wire::test_initial(version, &hello);
-            let expected = if version == crate::reality_quic_wire::V1 { Candidate::QuicH3("example.org".into()) } else { Candidate::QuicV2H3("example.org".into()) };
+            let expected = if version == crate::reality_quic_wire::V1 {
+                Candidate::QuicH3("example.org".into())
+            } else {
+                Candidate::QuicV2H3("example.org".into())
+            };
             assert_eq!(Observer::default().outgoing(&packet), expected);
         }
         let plain = super::super::tls::fixture("example.org");
-        let packet = crate::reality_quic_wire::test_initial(crate::reality_quic_wire::V1, &plain[5..]);
+        let packet =
+            crate::reality_quic_wire::test_initial(crate::reality_quic_wire::V1, &plain[5..]);
         assert_eq!(Observer::default().outgoing(&packet), Candidate::Other);
     }
 
@@ -403,7 +511,14 @@ mod tests {
             bytes
         };
         for id in 0..=STUN_LIMIT as u8 {
-            assert_eq!(observer.outgoing(&request(id)), if id == 0 { Candidate::StunBinding } else { Candidate::Stun });
+            assert_eq!(
+                observer.outgoing(&request(id)),
+                if id == 0 {
+                    Candidate::StunBinding
+                } else {
+                    Candidate::Stun
+                }
+            );
         }
         assert_eq!(observer.requests.len(), STUN_LIMIT);
         observer.outgoing(&request(1));
@@ -413,7 +528,10 @@ mod tests {
         observer.incoming(&response);
         observer.incoming(&response);
         assert_eq!(observer.requests.len(), STUN_LIMIT - 1);
-        observer.requests.iter_mut().for_each(|(_, expiry)| *expiry = Instant::now());
+        observer
+            .requests
+            .iter_mut()
+            .for_each(|(_, expiry)| *expiry = Instant::now());
         observer.incoming(&response);
         assert!(observer.requests.is_empty());
     }
@@ -435,8 +553,16 @@ mod tests {
         assert_eq!(packet.len(), request.len() + 8);
         assert_eq!(plain_binding(&packet), plain_binding(&request));
         assert!(fingerprint(&packet));
-        assert!(matches!(prepare_binding(&packet, BindingStrategy::Fingerprint), Some(std::borrow::Cow::Borrowed(_))));
-        assert_eq!(prepare_binding(&request, BindingStrategy::Plain).unwrap().as_ref(), request.as_slice());
+        assert!(matches!(
+            prepare_binding(&packet, BindingStrategy::Fingerprint),
+            Some(std::borrow::Cow::Borrowed(_))
+        ));
+        assert_eq!(
+            prepare_binding(&request, BindingStrategy::Plain)
+                .unwrap()
+                .as_ref(),
+            request.as_slice()
+        );
         let mut bad = packet.into_owned();
         *bad.last_mut().unwrap() ^= 1;
         assert!(prepare_binding(&bad, BindingStrategy::Fingerprint).is_none());
@@ -467,7 +593,9 @@ mod tests {
     #[tokio::test]
     async fn active_binding_probe_ignores_wrong_transaction_and_malformed_mapping() {
         let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let socket = crate::udp_relay::connect(target.local_addr().unwrap()).await.unwrap();
+        let socket = crate::udp_relay::connect(target.local_addr().unwrap())
+            .await
+            .unwrap();
         let server = async {
             let mut buf = [0; 512];
             let (n, peer) = target.recv_from(&mut buf).await.unwrap();
@@ -483,14 +611,18 @@ mod tests {
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(probe_stun(&socket, BindingStrategy::Fingerprint), server)
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(result.is_some());
     }
 
     #[tokio::test]
     async fn plain_probe_is_independent_and_invalid_responses_do_not_pass() {
         let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let socket = crate::udp_relay::connect(target.local_addr().unwrap()).await.unwrap();
+        let socket = crate::udp_relay::connect(target.local_addr().unwrap())
+            .await
+            .unwrap();
         let server = async {
             let mut buf = [0; 512];
             let (n, peer) = target.recv_from(&mut buf).await.unwrap();
@@ -498,11 +630,15 @@ mod tests {
             assert!(plain_binding(&buf[..n]).is_some());
             let mut wrong = binding_response(&buf[..n]);
             wrong[19] ^= 1;
-            for _ in 0..8 { target.send_to(&wrong, peer).await.unwrap(); }
+            for _ in 0..8 {
+                target.send_to(&wrong, peer).await.unwrap();
+            }
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(probe_stun(&socket, BindingStrategy::Plain), server)
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(result.is_none());
     }
 
