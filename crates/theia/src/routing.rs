@@ -4,6 +4,9 @@ pub(crate) mod client_state;
 pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub(crate) mod flow;
+pub mod packet;
+#[cfg(target_os = "linux")]
+pub mod nfqueue;
 pub mod geodata;
 mod settings;
 pub mod snapshot;
