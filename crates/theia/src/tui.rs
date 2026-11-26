@@ -1110,7 +1110,7 @@ impl RoutingObservation {
                         3 => "Синхронизация выполняется".into(),
                         _ => "Правила ещё не подтверждены".into(),
                     };
-                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP-байты.", crate::traffic::routing_summary_from(routing_totals));
+                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP/UDP-байты.", crate::traffic::routing_summary_from(routing_totals));
                     self.observed = Some(std::time::Instant::now());
                 }
                 Err(TryRecvError::Empty) => return,
@@ -7189,7 +7189,7 @@ fn draw_page(
             (Role::Client,6) => {
                 let observation = if editor.dirty() || editor.write_uncertain() { "Сохранённые настройки изменились. Состояние выбранного файла не подтверждено.".into() }
                 else if let Some(local) = ui.and_then(|u| u.client_background.as_ref()).and_then(|p| p.routing_observation(editor.saved_sha256())) {
-                    format!("Источник: локальный процесс этой панели\n{local}\nСчётчики с запуска процесса, полезные TCP-байты.")
+                    format!("Источник: локальный процесс этой панели\n{local}\nСчётчики с запуска процесса, полезные TCP/UDP-байты.")
                 } else {
                     ui.and_then(|u| u.routing_observation.as_ref()).filter(|o| o.digest == editor.saved_sha256()).map_or_else(|| "Проверяем состояние клиента…".into(), RoutingObservation::body)
                 };
@@ -9014,7 +9014,7 @@ mod tests {
             fallback: false,
             routing_revision: 5,
             routing_state: 1,
-            routing_totals: [10, 20, 30, 40, 2, 1, 1, 3, 4, 5],
+            routing_totals: [10,20,30,40,2,1,1,3,4,5,10,20,30,40,1,2,3,4,5,6],
         }))
         .unwrap();
         observation.poll();

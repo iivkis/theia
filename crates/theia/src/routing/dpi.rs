@@ -3,6 +3,8 @@
 mod strategy;
 mod tcp;
 mod tls;
+pub(crate) mod udp;
+mod quic;
 
 use crate::{client::ClientError, network_scope};
 use std::{net::{IpAddr,SocketAddr},sync::{atomic::{AtomicBool,Ordering},Arc},time::Duration};
@@ -235,3 +237,6 @@ mod tests {
         }).await.unwrap();
     }
 }
+
+#[cfg(test)]
+pub(crate) fn test_hello()->Vec<u8>{tls::fixture("example.org")}

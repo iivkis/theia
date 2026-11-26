@@ -1122,7 +1122,8 @@ async fn routed_udp(carrier:&Carrier,cache:&Cache,address:Address,port:u16)->Res
     match action {
         Action::Blocked=>{ crate::traffic::blocked(); Err(ClientError::Open(ErrorCode::PolicyDenied)) },
         Action::Direct=>crate::udp_relay::direct(address,port,pinned).await.map(crate::udp_relay::Tunnel::Direct),
-        Action::Allowed|Action::DirectDpi=>carrier.open_udp(address,port).await,
+        Action::Allowed=>carrier.open_udp(address,port).await,
+        Action::DirectDpi=>{ let tunnel=carrier.open_udp(address,port).await?; crate::traffic::udp_dpi_fallback(); Ok(tunnel) },
     }
 }
 
@@ -1323,7 +1324,7 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 10]) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 20]) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -3015,7 +3016,7 @@ mod selector_tests {
         );
     }
 
-    async fn paired() -> (TcpStream, TcpStream) {
+    pub(super) async fn paired() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (left, right) = tokio::join!(TcpStream::connect(address), listener.accept());
@@ -3335,6 +3336,7 @@ mod selector_tests {
                         Err(ClientError::Open(ErrorCode::PolicyDenied))
                     ));
                 }
+                udp_socks_fixture(&proxy_client).await;
                 let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = target.local_addr().unwrap().port();
                 let echo = tokio::spawn(async move {
@@ -3400,7 +3402,8 @@ async fn udp_association(mut control:TcpStream,client:&ProxyClient,requested:Add
     let bound=socket.local_addr().map_err(|_|ClientError::Io)?;
     timeout(REPLY_TIMEOUT,control.write_all(&udp_relay::associate_reply(bound))).await.map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
     let mut pinned=if port==0 {None} else {Some(SocketAddr::new(peer.ip(),port))};
-    let mut flows=std::collections::HashMap::<(Address,u16),mpsc::Sender<Vec<u8>>>::new();
+    type Observer=Arc<std::sync::Mutex<crate::routing::dpi::udp::Observer>>;
+    let mut flows=std::collections::HashMap::<(Address,u16),(mpsc::Sender<Vec<u8>>,Observer)>::new();
     let mut tasks=tokio::task::JoinSet::new();
     let mut buf=vec![0;65536];
     let mut control_byte=[0;1];
@@ -3409,22 +3412,27 @@ async fn udp_association(mut control:TcpStream,client:&ProxyClient,requested:Add
             result=control.read(&mut control_byte)=>{
                 return match result { Ok(0)=>Ok(()), Ok(_)=>Err(ClientError::Protocol), Err(_)=>Err(ClientError::Io) };
             }
-            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,tx|!tx.is_closed()); }
+            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,(tx,_)|!tx.is_closed()); }
             result=socket.recv_from(&mut buf)=>{
                 let (n,source)=result.map_err(|_|ClientError::Io)?;
                 if source.ip()!=peer.ip() || pinned.is_some_and(|old|old!=source) { continue; }
                 let Some((address,port,data))=udp_relay::parse_socks(&buf[..n]) else { continue; };
                 if pinned.is_none() { pinned=Some(source); }
                 let key=(address,port);
-                if let Some(tx)=flows.get(&key) {
+                if let Some((tx,observer))=flows.get(&key) {
                     // Full queue drops the datagram, never replays it.
-                    if !tx.is_closed() { let _=tx.try_send(data.to_vec()); continue; }
+                    if !tx.is_closed() {
+                        if tx.try_send(data.to_vec()).is_ok(){observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);}
+                        continue;
+                    }
                 }
-                flows.retain(|_,tx|!tx.is_closed());
+                flows.retain(|_,(tx,_)|!tx.is_closed());
                 if tasks.len()>=MAX_FLOWS { continue; }
                 let (tx,rx)=mpsc::channel(QUEUE);
                 let _=tx.try_send(data.to_vec());
-                flows.insert(key.clone(),tx);
+                let observer=Arc::new(std::sync::Mutex::new(crate::routing::dpi::udp::Observer::default()));
+                observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
+                flows.insert(key.clone(),(tx,observer.clone()));
                 let socket=socket.clone();
                 let proxy=client.clone();
                 tasks.spawn(async move {
@@ -3434,6 +3442,7 @@ async fn udp_association(mut control:TcpStream,client:&ProxyClient,requested:Add
                     let relay=tunnel.relay(rx,down_tx);
                     let deliver=async {
                         while let Some(data)=down_rx.recv().await {
+                            observer.lock().unwrap_or_else(|e|e.into_inner()).incoming(&data);
                             let Some(packet)=udp_relay::encode_socks(&address,port,&data) else { continue; };
                             let _=socket.send_to(&packet,source).await.map_err(|_|ClientError::Io)?;
                         }
@@ -3444,4 +3453,42 @@ async fn udp_association(mut control:TcpStream,client:&ProxyClient,requested:Add
             }
         }
     }
+}
+
+#[cfg(test)]
+async fn udp_socks_fixture(client:&ProxyClient) {
+    use crate::udp_relay::{encode_socks,parse_socks};
+    let target=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port=target.local_addr().unwrap().port();
+    let app=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let app_port=app.local_addr().unwrap().port();
+    let (mut control,local)=tests::paired().await;
+    let client=client.clone();
+    assert!(matches!(client.open_udp(Address::Dns("blocked.invalid".into()),443).await,Err(ClientError::Open(ErrorCode::PolicyDenied))));
+    let task=tokio::spawn(async move {handle(local,false,&client,1).await});
+    let mut greeting=vec![5,1,0,5,3,0,1,127,0,0,1];greeting.extend(app_port.to_be_bytes());
+    control.write_all(&greeting).await.unwrap();
+    let mut reply=[0;12];control.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply[..6],&[5,0,5,0,0,1]);
+    let relay=SocketAddr::from(([reply[6],reply[7],reply[8],reply[9]],u16::from_be_bytes([reply[10],reply[11]])));
+    let address=Address::V4([127,0,0,1]);
+    let attacker=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    attacker.send_to(&encode_socks(&address,port,b"wrong source").unwrap(),relay).await.unwrap();
+    let mut buf=vec![0;65536];
+    assert!(timeout(Duration::from_millis(40),target.recv_from(&mut buf)).await.is_err());
+    let mut stun=vec![0,1,0,0,0x21,0x12,0xa4,0x42];stun.extend([7;12]);
+    let hello=crate::routing::dpi::test_hello();
+    let quic=crate::reality_quic_wire::test_initial(crate::reality_quic_wire::V1,&hello[5..]);
+    for data in [stun,quic,vec![],b"last".to_vec()] {
+        let packet=encode_socks(&address,port,&data).unwrap();
+        app.send_to(&packet,relay).await.unwrap();
+        let (n,peer)=timeout(Duration::from_secs(3),target.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n],data);
+        target.send_to(&data,peer).await.unwrap();
+        let (n,source)=timeout(Duration::from_secs(3),app.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(source,relay);
+        assert_eq!(parse_socks(&buf[..n]),Some((address.clone(),port,data.as_slice())));
+    }
+    control.shutdown().await.unwrap();
+    timeout(Duration::from_secs(3),task).await.unwrap().unwrap().unwrap();
 }

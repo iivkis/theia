@@ -899,16 +899,22 @@ pub struct H3Tunnel {
 impl H3Tunnel {
     pub(crate) async fn relay_udp(mut self, mut upload: tokio::sync::mpsc::Receiver<Vec<u8>>, download: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<(),ClientError> {
         if !self.state.udp() { return Err(ClientError::Protocol); }
+        let traffic=crate::traffic::enter_udp(crate::Role::Client,true,false);
         let tx=&mut self.tx; let rx=&mut self.rx;
         let decoder=&mut self.decoder;
         let mut tx_state=self.state.clone();
         let mut rx_state=self.state.clone();
         let activity=crate::udp_relay::Activity::new();
+    let writing=std::sync::atomic::AtomicBool::new(false);
         let send_loop=async {
             while let Some(data)=upload.recv().await {
+                let size=data.len();
                 let frame=Frame::Datagram(data);
                 tx_state.apply(Direction::Send,&frame).map_err(|_|ClientError::Protocol)?;
+                writing.store(true,std::sync::atomic::Ordering::Relaxed);
                 send(tx,&frame).await?;
+                writing.store(false,std::sync::atomic::Ordering::Relaxed);
+                traffic.upload(size);
                 activity.touch();
             }
             Ok::<(),ClientError>(())
@@ -918,7 +924,7 @@ impl H3Tunnel {
                 let frame=decoder.next(rx).await?.ok_or(ClientError::Protocol)?;
                 rx_state.apply(Direction::Receive,&frame).map_err(|_|ClientError::Protocol)?;
                 match frame {
-                    Frame::Datagram(data)=>{ download.send(data).await.map_err(|_|ClientError::Io)?; activity.touch(); }
+                    Frame::Datagram(data)=>{ let size=data.len(); download.send(data).await.map_err(|_|ClientError::Io)?; traffic.download(size); activity.touch(); }
                     Frame::Padding(_)=>tokio::task::yield_now().await,
                     Frame::Fin=>return Ok::<(),ClientError>(()),
                     Frame::Abort(code)=>return Err(ClientError::Open(code)),
@@ -926,7 +932,12 @@ impl H3Tunnel {
                 }
             }
         };
-        tokio::select! { result=send_loop=>result, result=receive_loop=>result, ()=activity.expire()=>Ok(()) }?;
+        let result=tokio::select! { result=send_loop=>result, result=receive_loop=>result, ()=activity.expire()=>Ok(()) };
+        if writing.load(std::sync::atomic::Ordering::Relaxed) || result.is_err() {
+            tx.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+            rx.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+            return result.and(Err(ClientError::Timeout));
+        }
         send(tx,&Frame::Fin).await?;
         timeout(IO_TIMEOUT,tx.finish()).await.map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Http3)?;
         Ok(())

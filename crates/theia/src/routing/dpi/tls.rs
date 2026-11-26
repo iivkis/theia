@@ -17,7 +17,7 @@ fn word(data: &mut &[u8]) -> Option<usize> {
     Some(usize::from(u16::from_be_bytes(take(data, 2)?.try_into().ok()?)))
 }
 
-fn hello_name(mut data: &[u8]) -> Option<String> {
+pub(super) fn hello_name(mut data: &[u8]) -> Option<String> {
     if byte(&mut data)? != 1 { return None; }
     let len = take(&mut data, 3)?;
     let length = (usize::from(len[0]) << 16) | (usize::from(len[1]) << 8) | usize::from(len[2]);

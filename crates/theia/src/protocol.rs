@@ -1,6 +1,6 @@
 //! SmartTheia v1 framing and per-HTTP-stream state machine.
 //! Pure Rust: no network, TLS, async runtime, or global mutable state.
-//! One HTTP/2 or HTTP/3 stream carries one independent TCP tunnel.
+//! One HTTP/2 or HTTP/3 stream carries one independent TCP or UDP tunnel.
 use std::net::IpAddr;
 
 pub const HEADER_LEN: usize = 6;
@@ -221,7 +221,7 @@ fn checked_header(header: &[u8]) -> Result<usize, ProtocolError> {
         return Err(ProtocolError::Truncated);
     }
     let length = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
-    if length > MAX_PAYLOAD {
+    if length > MAX_PAYLOAD || (header[0] == 0x14 && length > MAX_DATAGRAM) {
         return Err(ProtocolError::FrameTooLarge);
     }
     if header[1] != 0 {
@@ -557,6 +557,12 @@ mod udp_tests {
    s.apply(recv,&Frame::Datagram(vec![])).unwrap();
    s.apply(send,&Frame::Fin).unwrap(); assert!(s.apply(send,&Frame::Datagram(vec![])).is_err());
    s.apply(recv,&Frame::Fin).unwrap(); s.finish().unwrap();
+   let mut tcp=Session::new(role);
+   tcp.apply(hello,&Frame::Hello{version:VERSION,capabilities:0}).unwrap();
+   tcp.apply(ack,&Frame::HelloAck{version:VERSION,accepted_capabilities:0}).unwrap();
+   tcp.apply(send,&Frame::OpenTcp{address:Address::V4([127,0,0,1]),port:443}).unwrap();
+   tcp.apply(recv,&Frame::OpenOk).unwrap();
+   assert!(tcp.apply(send,&Frame::Datagram(vec![1])).is_err());
   }
  }
 }

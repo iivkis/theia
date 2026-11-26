@@ -52,10 +52,12 @@ impl Tunnel {
             Self::H2(t)=>t.relay_udp(upload,download).await,
             Self::H3(t)=>t.relay_udp(upload,download).await,
             Self::Direct(socket)=>{
+                let traffic=crate::traffic::enter_udp(crate::Role::Client,false,true);
                 let activity=Activity::new();
                 let send=async {
                     while let Some(data)=upload.recv().await {
                         send_datagram(&socket,&data).await.map_err(|_|ClientError::Io)?;
+                        traffic.upload(data.len());
                         activity.touch();
                     }
                     Ok::<(),ClientError>(())
@@ -66,6 +68,7 @@ impl Tunnel {
                         let n=socket.recv(&mut buf).await.map_err(|_|ClientError::Io)?;
                         if n>protocol::MAX_DATAGRAM {continue;}
                         download.send(buf[..n].to_vec()).await.map_err(|_|ClientError::Io)?;
+                        traffic.download(n);
                         activity.touch();
                     }
                     #[allow(unreachable_code)]
