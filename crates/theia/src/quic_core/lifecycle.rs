@@ -214,3 +214,54 @@ mod tests {
         assert!(!l.can_relay());
     }
 }
+
+
+/// RFC 9000 idle timer: authenticated receive or the first ack-eliciting
+/// send following receive may refresh it; repeated sends cannot keep a
+/// dead peer alive. Idle termination is silent, not CONNECTION_CLOSE.
+pub struct Idle {
+    last: Instant,
+    timeout: Duration,
+    sent_since_receive: bool,
+}
+
+impl Idle {
+    pub fn new(now: Instant, timeout: Duration) -> Self {
+        Self { last: now, timeout, sent_since_receive: false }
+    }
+
+    pub fn received(&mut self, now: Instant) {
+        self.last = self.last.max(now);
+        self.sent_since_receive = false;
+    }
+
+    pub fn sent(&mut self, now: Instant) {
+        if !self.sent_since_receive {
+            self.last = self.last.max(now);
+            self.sent_since_receive = true;
+        }
+    }
+
+    pub fn deadline(&self, pto: Duration) -> Option<Instant> {
+        if self.timeout.is_zero() { return None; }
+        self.last.checked_add(self.timeout.max(pto.saturating_mul(3)))
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    #[test]
+    fn only_first_send_and_authenticated_receive_extend_idle() {
+        let start = Instant::now();
+        let mut idle = Idle::new(start, Duration::from_secs(30));
+        let pto = Duration::from_secs(1);
+        idle.sent(start + Duration::from_secs(1));
+        idle.sent(start + Duration::from_secs(25));
+        assert_eq!(idle.deadline(pto), Some(start + Duration::from_secs(31)));
+        idle.received(start + Duration::from_secs(26));
+        assert_eq!(idle.deadline(pto), Some(start + Duration::from_secs(56)));
+        assert_eq!(idle.deadline(Duration::from_secs(20)), Some(start + Duration::from_secs(86)));
+        assert!(Idle::new(start, Duration::ZERO).deadline(pto).is_none());
+    }
+}

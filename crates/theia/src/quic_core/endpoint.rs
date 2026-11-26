@@ -5,7 +5,7 @@
 use super::{ack_tx::History, flow::ReceiveFlow, frames::{self, Frame}, packet::{self, Reader, Writer},
     scheduler::Scheduler, send_flow::SendFlow, spaces::Space};
 use rustls::quic::{Keys, Secrets};
-use super::{key_update, lifecycle::{Shutdown, ShutdownPhase}, path::Paths};
+use super::{key_update, lifecycle::{Idle, Shutdown, ShutdownPhase}, path::Paths};
 use std::{io, net::SocketAddr, time::{Duration, Instant}};
 use tokio::net::UdpSocket;
 use super::listener::SessionIo;
@@ -46,6 +46,8 @@ pub struct LabSession {
     shutdown: Shutdown,
     server: bool,
     confirmed: bool,
+    idle: Idle,
+    binding: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
 
 impl LabSession {
@@ -64,13 +66,16 @@ impl LabSession {
     /// authenticated HANDSHAKE_DONE frame.
     pub(crate) async fn after_handshake(socket: SessionIo, peer: SocketAddr, server: bool,
                          local_cid: [u8; CID_LEN], remote_cid: [u8; CID_LEN],
-                         keys: Keys, secrets: Secrets) -> Result<Self, Error> {
+                         keys: Keys, secrets: Secrets, idle_timeout: Duration,
+                         binding: zeroize::Zeroizing<[u8; 32]>) -> Result<Self, Error> {
         let mut session = Self::connect_inner(socket, peer, server, local_cid, remote_cid,
             Protection::Rotating { reader: key_update::Receiver::new(keys.remote, secrets.clone()),
                 writer: key_update::Sender::new(keys.local, secrets) }, server)?;
         // Application-space native laboratory defaults to BBR; the
         // fixed-key codec fixture keeps the CUBIC scheduler for comparison.
         session.scheduler = Scheduler::with_bbr(Instant::now());
+        session.idle = Idle::new(Instant::now(), idle_timeout);
+        session.binding = Some(binding);
         if server { session.scheduler.enqueue(vec![0x1e]).map_err(Error::Schedule)?; }
         Ok(session)
     }
@@ -90,10 +95,21 @@ impl LabSession {
         receive.enable_local_bidi(MAX_STREAMS).map_err(Error::Receive)?;
         Ok(Self { socket, paths: Paths::new_validated(peer), local_cid, remote_cid, protection: Some(protection), acknowledgments: History::default(),
             send, receive,
-            scheduler: Scheduler::default(), closed: false, shutdown: Shutdown::default(), server, confirmed })
+            scheduler: Scheduler::default(), closed: false, shutdown: Shutdown::default(), server, confirmed,
+            idle: Idle::new(Instant::now(), Duration::from_secs(30)), binding: None })
     }
 
     pub fn handshake_confirmed(&self) -> bool { self.confirmed }
+
+    /// Only TLS-established laboratory sessions have exporter material.
+    /// Taking it is not an admission decision; the HTTP layer must verify it.
+    pub(crate) fn take_channel_binding(&mut self) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+        if self.active() { self.binding.take() } else { None }
+    }
+
+    pub(crate) fn peer_streams(&self) -> Vec<u64> { self.receive.peer_streams() }
+
+    pub(crate) fn send_reset_code(&self, id: u64) -> Option<u64> { self.send.reset_code(id) }
 
     pub fn peer_addr(&self) -> SocketAddr { self.paths.active() }
 
@@ -126,6 +142,7 @@ impl LabSession {
         if self.socket.send_to(&packet, peer).await.map_err(Error::Io)? != packet.len() {
             return Err(Error::Protocol);
         }
+        self.idle.sent(now);
         Ok(())
     }
 
@@ -214,12 +231,23 @@ impl LabSession {
 
     pub fn finished(&self, id: u64) -> bool { self.active() && self.receive.finished(id) }
 
+    fn register_implicit(&mut self, id: u64) -> Result<(), Error> {
+        self.receive.register_implicit(id).map_err(Error::Receive)?;
+        if id & 2 == 0 && id & 1 != u64::from(self.server) {
+            for prior in ((id & 3)..=id).step_by(4) {
+                self.send.register_peer_bidi(prior).map_err(Error::Send)?;
+            }
+        }
+        Ok(())
+    }
+
     fn active(&self) -> bool { !self.closed && self.shutdown.is_open() }
 
     fn abort(&mut self) {
         self.closed = true;
         self.shutdown.abort();
         self.protection = None;
+        self.binding = None;
     }
 
     /// No new streams, data or key changes after local closing begins.
@@ -232,6 +260,10 @@ impl LabSession {
 
     fn tick(&mut self, now: Instant) {
         self.paths.expire(now);
+        if self.active() && self.idle.deadline(self.scheduler.base_pto()).is_some_and(|at| now >= at) {
+            self.abort();
+            return;
+        }
         if self.shutdown.expire(now) {
             self.abort();
         } else if let Some(Protection::Rotating { reader, .. }) = &mut self.protection {
@@ -245,7 +277,11 @@ impl LabSession {
             _ => None,
         };
         let recovery = if self.active() { self.scheduler.deadline() } else { None };
-        [self.shutdown.deadline(), old_keys, recovery, self.paths.deadline()].into_iter().flatten().min()
+        let idle = if self.active() { self.idle.deadline(self.scheduler.base_pto()) } else { None };
+        let path_retry = if self.active() && self.scheduler.can_send_path() {
+            self.paths.challenge_deadline(MTU as u64, self.scheduler.base_pto())
+        } else { None };
+        [self.shutdown.deadline(), old_keys, recovery, self.paths.deadline(), idle, path_retry].into_iter().flatten().min()
     }
 
     /// Send at most one datagram per call, ACKs first. The caller owns the
@@ -288,6 +324,17 @@ impl LabSession {
 
     async fn flush_inner(&mut self, now: Instant) -> Result<bool, Error> {
         self.scheduler.on_timer(now).map_err(Error::Schedule)?;
+        if self.scheduler.can_send_path() {
+            let pto = self.scheduler.base_pto();
+            if let Some((peer, challenge)) = self.paths.due_challenge(MTU as u64, now, pto) {
+                if self.paths.reserve_challenge(peer, MTU as u64, now, pto) {
+                    let mut frame = vec![0x1a];
+                    frame.extend_from_slice(&challenge);
+                    self.send_path(peer, &frame, now).await?;
+                    return Ok(true);
+                }
+            }
+        }
         let ack = self.acknowledgments.encode();
         let (payload, frame) = if let Some(ack) = ack {
             (ack, None)
@@ -299,7 +346,7 @@ impl LabSession {
         if self.socket.send_to(&packet, self.paths.active()).await.map_err(Error::Io)? != packet.len() {
             return Err(Error::Protocol);
         }
-        if frame.is_none() { self.acknowledgments.sent(); }
+        if frame.is_none() { self.acknowledgments.sent(); } else { self.idle.sent(now); }
         Ok(true)
     }
 
@@ -310,7 +357,7 @@ impl LabSession {
         let now = Instant::now();
         self.tick(now);
         if self.closed { return Ok(false); }
-        let wait = self.shutdown.deadline().map_or(wait, |at| wait.min(at.saturating_duration_since(now)));
+        let wait = self.deadline().map_or(wait, |at| wait.min(at.saturating_duration_since(now)));
         let result = self.recv_inner(wait).await;
         if result.is_err() { self.abort(); } else { self.tick(Instant::now()); }
         result
@@ -368,11 +415,13 @@ impl LabSession {
             // Same-IP NAT rebinding may retain congestion and RTT state.
             // Cross-IP path changes require independent recovery state.
         }
+        self.idle.received(now);
         if parsed.iter().any(|frame| matches!(frame, Frame::Close { .. })) {
             self.shutdown.peer(now, self.scheduler.base_pto()).map_err(|_| Error::Protocol)?;
             // Draining is silent. Drop keys now; retain the connection
             // object/route until the shutdown deadline.
             self.protection = None;
+            self.binding = None;
             return Ok(true);
         }
         if self.shutdown.phase() == ShutdownPhase::Closing {
@@ -402,15 +451,11 @@ impl LabSession {
                 }
                 Frame::Stream { id, offset, data, fin } => {
                     self.receive.insert(id, offset, data, fin).map_err(Error::Receive)?;
-                    if id & 2 == 0 && id & 1 != u64::from(self.server) {
-                        self.send.register_peer_bidi(id).map_err(Error::Send)?;
-                    }
+                    self.register_implicit(id)?;
                 }
                 Frame::ResetStream { id, code, final_size } => {
                     self.receive.reset(id, final_size, code).map_err(Error::Receive)?;
-                    if id & 2 == 0 && id & 1 != u64::from(self.server) {
-                        self.send.register_peer_bidi(id).map_err(Error::Send)?;
-                    }
+                    self.register_implicit(id)?;
                 }
                 Frame::StopSending { id, code } => self.reset_stream(id, code)?,
                 Frame::MaxData(n) => self.send.max_data(n).map_err(Error::Send)?,

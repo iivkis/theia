@@ -60,7 +60,7 @@ fn params(server: bool, local: &[u8; CID_LEN], original: &[u8; CID_LEN], retry: 
     if server {
         if let Some(cid) = retry { parameters::append(&mut out, 0x10, cid).map_err(|_| Error::Protocol)?; }
     }
-    for (id, value) in [(0x03, MTU as u64), (0x04, CREDIT), (0x05, CREDIT), (0x06, CREDIT), (0x07, CREDIT), (0x08, STREAMS), (0x09, STREAMS)] {
+    for (id, value) in [(0x01, 30_000), (0x03, MTU as u64), (0x04, CREDIT), (0x05, CREDIT), (0x06, CREDIT), (0x07, CREDIT), (0x08, STREAMS), (0x09, STREAMS)] {
         let mut scratch = [0; 8];
         let value = encode_varint(value, &mut scratch).ok_or(Error::Protocol)?;
         parameters::append(&mut out, id, value).map_err(|_| Error::Protocol)?;
@@ -363,7 +363,10 @@ async fn establish_inner(mut socket: SessionIo, peer: SocketAddr, version: Versi
         || [0x05, 0x06, 0x07].into_iter().any(|id| peer_params.integer(id) != Ok(Some(CREDIT))) {
         return Err(Error::Protocol);
     }
+    let peer_idle = peer_params.integer(0x01).map_err(|_| Error::Protocol)?.unwrap_or(0);
+    let idle_timeout = Duration::from_millis(if peer_idle == 0 { 30_000 } else { peer_idle.min(30_000) });
+    let binding = handshake.driver.channel_binding().map_err(Error::Driver)?;
     let (keys, secrets) = handshake.application.take().ok_or(Error::Protocol)?;
-    LabSession::after_handshake(socket, peer, server, local, handshake.remote, keys, secrets)
+    LabSession::after_handshake(socket, peer, server, local, handshake.remote, keys, secrets, idle_timeout, binding)
         .await.map_err(Error::Endpoint)
 }

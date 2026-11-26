@@ -70,6 +70,23 @@ impl ReceiveFlow {
 
     pub fn used(&self) -> u64 { self.used }
 
+    pub(crate) fn peer_streams(&self) -> Vec<u64> {
+        self.streams.keys().copied().filter(|id| id & 1 == self.peer_bit).collect()
+    }
+
+    /// Receiving a higher peer stream ID implicitly opens all lower IDs
+    /// of that type. Allocate only after the actual frame was validated.
+    pub(crate) fn register_implicit(&mut self, id: u64) -> Result<(), Error> {
+        self.check_id(id)?;
+        if id & 1 != self.peer_bit { return Ok(()); }
+        for prior in ((id & 3)..id).step_by(4) {
+            if !self.streams.contains_key(&prior) {
+                self.streams.insert(prior, ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?);
+            }
+        }
+        Ok(())
+    }
+
     /// Charge the increase in highest offset, including gaps, once only.
     /// Failed insertions never change the aggregate credit or create streams.
     pub fn insert(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<(), Error> {

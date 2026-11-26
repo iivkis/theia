@@ -13,7 +13,7 @@ struct Stream {
     offset: u64,
     limit: u64,
     fin: bool,
-    reset: bool,
+    reset: Option<u64>,
 }
 
 pub struct SendFlow {
@@ -41,7 +41,7 @@ impl SendFlow {
         let n = self.next_uni;
         if n >= self.max_streams { return Err(Error::Limit); }
         let id = n * 4 + 2 + self.local_bit;
-        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false, reset: false });
+        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false, reset: None });
         self.next_uni += 1;
         Ok(id)
     }
@@ -59,7 +59,7 @@ impl SendFlow {
     pub fn open_bidi(&mut self) -> Result<u64, Error> {
         if self.next_bidi >= self.max_bidi { return Err(Error::Limit); }
         let id = self.next_bidi * 4 + self.local_bit;
-        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false, reset: false });
+        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false, reset: None });
         self.next_bidi += 1;
         Ok(id)
     }
@@ -69,7 +69,7 @@ impl SendFlow {
         if id > MAX_VARINT || id & 2 != 0 || id & 1 == self.local_bit || id / 4 >= self.peer_bidi {
             return Err(Error::Stream);
         }
-        self.streams.entry(id).or_insert(Stream { offset: 0, limit: self.initial_limit, fin: false, reset: false });
+        self.streams.entry(id).or_insert(Stream { offset: 0, limit: self.initial_limit, fin: false, reset: None });
         Ok(())
     }
 
@@ -101,16 +101,20 @@ impl SendFlow {
     /// STOP_SENDING or a local reset terminates the send direction. The
     /// final offset includes all bytes already committed to send credit.
     /// The caller cancels queued STREAM frames and reliably sends RESET.
+    pub(crate) fn reset_code(&self, id: u64) -> Option<u64> {
+        self.streams.get(&id).and_then(|stream| stream.reset)
+    }
+
     pub fn reset(&mut self, id: u64, code: u64) -> Result<Option<Vec<u8>>, Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
         if code > MAX_VARINT { return Err(Error::Limit); }
-        if stream.reset { return Ok(None); }
+        if stream.reset.is_some() { return Ok(None); }
         let mut frame = vec![4];
         for value in [id, code, stream.offset] {
             let mut scratch = [0; 8];
             frame.extend_from_slice(encode_varint(value, &mut scratch).ok_or(Error::Limit)?);
         }
-        stream.reset = true;
+        stream.reset = Some(code);
         stream.fin = true;
         Ok(Some(frame))
     }

@@ -114,6 +114,20 @@ impl Paths {
         true
     }
 
+    /// Return a timer only while a retry fits the candidate amplification budget.
+    pub fn challenge_deadline(&self, bytes: u64, interval: Duration) -> Option<Instant> {
+        let c = self.candidate.as_ref()?;
+        if !c.budget.can_send(bytes) { return None; }
+        let at = c.last_challenge?.checked_add(interval.max(Duration::from_millis(1)))?;
+        (at < c.expires).then_some(at)
+    }
+
+    pub fn due_challenge(&self, bytes: u64, now: Instant, interval: Duration) -> Option<(SocketAddr, [u8; 8])> {
+        let c = self.candidate.as_ref()?;
+        if now >= c.expires || now < self.challenge_deadline(bytes, interval)? { return None; }
+        Some((c.address, c.challenge))
+    }
+
     pub fn deadline(&self) -> Option<Instant> { self.candidate.as_ref().map(|c| c.expires) }
 
     pub fn expire(&mut self, now: Instant) {

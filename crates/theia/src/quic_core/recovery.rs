@@ -86,6 +86,11 @@ impl PathBudget {
         self.received = self.received.saturating_add(bytes);
     }
 
+    pub fn can_send(&self, bytes: u64) -> bool {
+        self.sent.checked_add(bytes).is_some_and(|total|
+            self.validated || total <= self.received.saturating_mul(3))
+    }
+
     pub fn reserve_send(&mut self, bytes: u64) -> bool {
         let Some(total) = self.sent.checked_add(bytes) else {
             return false;

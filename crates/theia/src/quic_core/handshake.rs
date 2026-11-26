@@ -43,6 +43,14 @@ impl Driver {
         if self.tls_complete() { self.tls.quic_transport_parameters() } else { None }
     }
 
+    pub(crate) fn channel_binding(&self) -> Result<zeroize::Zeroizing<[u8; 32]>, Error> {
+        if !self.tls_complete() { return Err(Error::Failed); }
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        self.tls.export_keying_material(&mut key[..], crate::channel_binding::LABEL,
+            Some(crate::channel_binding::H3)).map_err(Error::Tls)?;
+        Ok(key)
+    }
+
     pub fn negotiated_alpn(&self) -> Option<&[u8]> {
         if self.tls_complete() { self.tls.alpn_protocol() } else { None }
     }
