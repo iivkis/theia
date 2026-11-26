@@ -20,14 +20,17 @@ impl Published {
     pub(crate) fn prepare(inbound: &Inbound, policy: &ServerPolicy) -> Result<Self, ()> {
         // Own-TLS profiles already pin the configured unique path prefix.
         // REALITY profiles pin the signed inbound ID.
-        let scope = if inbound.security_mode.is_plain() {
+        Self::for_scope(Self::scope(inbound), policy)
+    }
+
+    pub(crate) fn scope(inbound: &Inbound) -> &str {
+        if inbound.security_mode.is_plain() {
             inbound.path_prefix.as_deref()
                 .and_then(|p| p.strip_prefix("/v1/"))
                 .unwrap_or(&inbound.id)
         } else {
             &inbound.id
-        };
-        Self::for_scope(scope, policy)
+        }
     }
 
     pub(crate) fn for_scope(scope: &str, policy: &ServerPolicy) -> Result<Self, ()> {

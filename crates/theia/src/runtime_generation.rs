@@ -176,6 +176,7 @@ impl State {
         candidate: &ServerDocument,
         expected: u64,
     ) -> Result<u64, LiveAuthError> {
+        let stage = self.stage_managed_auth(view, candidate, expected)?;
         let mut guard = self
             .current
             .write()
@@ -187,8 +188,8 @@ impl State {
             .auth_rollback
             .write()
             .map_err(|_| LiveAuthError::Unavailable)?;
-        let revision = self.publish_managed_auth(view, candidate, expected)?;
-        *rollback = if view
+        let revision = self.publish_managed_auth(view, candidate, stage)?;
+        *rollback = if view.document.server.policy.routing == candidate.server.policy.routing && view
             .document
             .server
             .inbounds
@@ -215,18 +216,29 @@ impl State {
         Ok(revision)
     }
 
-    // Caller owns the runtime writer lock. No live auth or quota change
-    // occurs until the entire candidate and occupancy transition are staged.
-    fn publish_managed_auth(
+    fn stage_managed_auth(
         &self,
         view: &Arc<View>,
         candidate: &ServerDocument,
         expected: u64,
-    ) -> Result<u64, LiveAuthError> {
-        if let Some(ledger) = &self.reality_ledger {
+    ) -> Result<StagedAuthorization, LiveAuthError> {
+        if self.reality_ledger.is_some() {
             crate::reload_preflight::assess_managed_reload(&view.document, candidate)
                 .map_err(|_| LiveAuthError::RequiresRestart)?;
-            let (_, stage) = view.live.prepare_tls_rebase(candidate, expected)?;
+            view.live.prepare_tls_rebase(candidate, expected).map(|(_, stage)| stage)
+        } else {
+            view.live.stage(candidate, expected)
+        }
+    }
+
+    // Caller owns the runtime writer lock; all routing data was prepared outside it.
+    fn publish_managed_auth(
+        &self,
+        view: &Arc<View>,
+        candidate: &ServerDocument,
+        stage: StagedAuthorization,
+    ) -> Result<u64, LiveAuthError> {
+        if let Some(ledger) = &self.reality_ledger {
             let roster = ledger
                 .prepare_roster(&candidate.server.users)
                 .map_err(|_| LiveAuthError::Unavailable)?;
@@ -234,9 +246,7 @@ impl State {
             roster.commit();
             Ok(revision)
         } else {
-            view.live
-                .stage(candidate, expected)
-                .and_then(|stage| view.live.publish(stage))
+            view.live.publish(stage)
         }
     }
 
@@ -284,6 +294,7 @@ impl State {
         candidate: &Arc<ServerDocument>,
         expected: u64,
     ) -> Result<u64, LiveAuthError> {
+        let stage = self.stage_managed_auth(view, candidate, expected)?;
         let mut current = self
             .current
             .write()
@@ -304,7 +315,7 @@ impl State {
         {
             return Err(LiveAuthError::StaleRevision);
         }
-        let next = self.publish_managed_auth(view, candidate, expected)?;
+        let next = self.publish_managed_auth(view, candidate, stage)?;
         *current = Arc::new(View {
             document: candidate.clone(),
             inbounds: view.inbounds,

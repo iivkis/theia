@@ -34,6 +34,15 @@ impl From<snapshot::SnapshotError> for Error {
 }
 
 impl Settings {
+    pub(crate) fn transition(before: Option<&Self>, after: Option<&Self>) -> Result<(), Error> {
+        match (before, after) {
+            (Some(old), Some(new)) => old.accepts_replacement(new),
+            (None, Some(new)) => new.validate(),
+            (Some(_), None) => Err(Error::Invalid),
+            (None, None) => Ok(()),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), Error> {
         // Revision 1 is the implicit empty baseline. An explicitly emptied
         // policy must retain its revision, not reset to that baseline.

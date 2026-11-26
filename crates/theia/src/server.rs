@@ -141,7 +141,6 @@ pub struct ServerContext {
     identity_gate: Option<Arc<RwLock<bool>>>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
-    routing: Result<Arc<crate::routing::exchange::Published>, ServerError>,
     global_streams: Arc<Semaphore>,
     user_streams: Arc<HashMap<String, Arc<Semaphore>>>,
     connection_slots: Arc<Semaphore>,
@@ -172,6 +171,7 @@ impl IdentityRoutePolicy {
 }
 
 pub struct SessionPermit {
+    routing: Arc<crate::routing::exchange::Published>,
     _global: Option<OwnedSemaphorePermit>,
     _user: Option<OwnedSemaphorePermit>,
     _live: Option<crate::quota::Lease>,
@@ -196,7 +196,7 @@ impl ServerContext {
         Self::with_limits(
             inbound,
             policy,
-            AuthCell::isolated(inbound, users),
+            AuthCell::isolated(inbound, users, policy, None),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
             Arc::new(all_users),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
@@ -225,7 +225,6 @@ impl ServerContext {
             identity_gate: None,
             authorization,
             policy: policy.clone(),
-            routing: crate::routing::exchange::Published::prepare(inbound, policy).map(Arc::new).map_err(|_| ServerError::Config),
             global_streams,
             user_streams,
             connection_slots,
@@ -284,8 +283,9 @@ impl ServerContext {
         }
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
-        self.routing = crate::routing::exchange::Published::for_scope(&inbound.id, &self.policy).map(Arc::new).map_err(|_| ServerError::Config);
-        self.routing.as_ref().map_err(|_| ServerError::Config)?;
+        let users = self.authorization.load().map_err(|_| ServerError::Config)?.users.clone();
+        self.authorization = AuthCell::isolated(inbound, &users, &self.policy, Some(&inbound.id));
+        self.routing_publication()?;
         self.padding = d.padding.clone();
         self.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
             paths,
@@ -339,7 +339,6 @@ impl ServerContext {
             identity_gate: Some(gate),
             authorization: self.authorization.clone(),
             policy: self.policy.clone(),
-            routing: self.routing.clone(),
             global_streams: self.global_streams.clone(),
             user_streams: self.user_streams.clone(),
             connection_slots: self.connection_slots.clone(),
@@ -456,8 +455,12 @@ impl ServerContext {
         }
         let permit = self.authorize(request.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()))
             .map_err(AuthFailure::status)?;
-        let publication = self.routing.as_ref().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        Ok((permit, publication.clone()))
+        let publication = permit.routing.clone();
+        Ok((permit, publication))
+    }
+
+    fn routing_publication(&self) -> Result<Arc<crate::routing::exchange::Published>, ServerError> {
+        self.authorization.load().map_err(|_| ServerError::Config)?.routing.get(&self.inbound_id).cloned().ok_or(ServerError::Config)
     }
 
     pub(crate) async fn routing_response(
@@ -551,7 +554,7 @@ impl ServerContext {
         address: &Address,
         port: u16,
     ) -> Result<TcpStream, ErrorCode> {
-        let routing = self.routing.as_ref().map_err(|_| ErrorCode::PolicyDenied)?;
+        let routing = self.routing_publication().map_err(|_| ErrorCode::PolicyDenied)?;
         connect_target(address, port, &self.policy, routing.snapshot.policy()).await
     }
 
@@ -725,6 +728,7 @@ impl ServerContext {
         {
             return Err(AuthFailure::Forbidden);
         }
+        let routing = snapshot.routing.get(&self.inbound_id).cloned().ok_or(AuthFailure::Forbidden)?;
         // Admission and quota resize serialize through a single short
         // occupancy lock across old/new H2 and QUIC listener generations.
         if let Some(ledger) = &self.live_quota {
@@ -736,6 +740,7 @@ impl ServerContext {
                 })
                 .ok_or(AuthFailure::Busy)?;
             return Ok(SessionPermit {
+                routing,
                 _global: None,
                 _user: None,
                 _live: Some(permit),
@@ -755,6 +760,7 @@ impl ServerContext {
             .try_acquire_owned()
             .map_err(|_| AuthFailure::Busy)?;
         Ok(SessionPermit {
+            routing,
             _global: Some(global),
             _user: Some(per_user),
             _live: None,
@@ -2196,7 +2202,7 @@ async fn prepare_selected_listeners_inner(
                 limits.connections.clone(),
                 limits.peer_budget.clone(),
             );
-            context.routing.as_ref().map_err(|_| ServerError::Config)?;
+            context.routing_publication()?;
             context.live_quota = Some(limits.ledger.clone());
             #[cfg(test)]
             let carrier = if let Some(start) = guard_start {
@@ -2270,7 +2276,7 @@ async fn prepare_selected_listeners_inner(
             limits.connections.clone(),
             limits.peer_budget.clone(),
         );
-        context.routing.as_ref().map_err(|_| ServerError::Config)?;
+        context.routing_publication()?;
         context.live_quota = Some(limits.ledger.clone());
         context.apply_own_tls_policy();
         listeners.push(ReadyListener::Plain(
@@ -3601,7 +3607,7 @@ async fn run_reality_document_inner(
             connections.clone(),
             peers.clone(),
         );
-        context.routing.as_ref().map_err(|_| ServerError::Config)?;
+        context.routing_publication()?;
         context.live_quota = Some(ledger.clone());
         context.apply_own_tls_policy();
         if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
@@ -3853,7 +3859,7 @@ async fn run_document_with_config(
             connections.clone(),
             peer_budget.clone(),
         );
-        context.routing.as_ref().map_err(|_| ServerError::Config)?;
+        context.routing_publication()?;
         context.apply_own_tls_policy();
         prepared.push((listener, acceptor, endpoint, Arc::new(context)));
     }
