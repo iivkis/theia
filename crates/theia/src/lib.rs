@@ -58,6 +58,7 @@ mod relay_liveness;
 pub mod reload_preflight;
 pub mod restart_guard;
 pub mod routing;
+mod udp_relay;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
 pub mod security_profile;

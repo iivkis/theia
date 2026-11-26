@@ -645,6 +645,14 @@ impl H2Client {
     /// encoded verbatim as OPEN_TCP and are never resolved by this client.
     /// A successful return is possible only after a valid OPEN_OK.
     pub async fn open(&self, address: Address, port: u16) -> Result<Tunnel, ClientError> {
+        self.open_frame(Frame::OpenTcp { address, port }).await
+    }
+
+    pub(crate) async fn open_udp(&self, address: Address, port: u16) -> Result<Tunnel, ClientError> {
+        self.open_frame(Frame::OpenUdp { address, port }).await
+    }
+
+    async fn open_frame(&self, open: Frame) -> Result<Tunnel, ClientError> {
         let operation = diagnostics::next_id();
         crate::diag!(
             Debug,
@@ -652,7 +660,6 @@ impl H2Client {
             "open_begin",
             "op" = Value::Count(operation)
         );
-        let open = Frame::OpenTcp { address, port };
         protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
         let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation))
             .await
@@ -1088,6 +1095,40 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    pub(crate) async fn relay_udp(mut self, mut upload: tokio::sync::mpsc::Receiver<Vec<u8>>, download: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<(),ClientError> {
+        if !self.state.udp() { return Err(ClientError::Protocol); }
+        let outgoing=&mut self.outgoing; let incoming=&mut self.incoming;
+        let decoder=&mut self.decoder;
+        let mut tx_state=self.state.clone();
+        let mut rx_state=self.state.clone();
+        let activity=crate::udp_relay::Activity::new();
+        let send_loop=async {
+            while let Some(data)=upload.recv().await {
+                let frame=Frame::Datagram(data);
+                tx_state.apply(Direction::Send,&frame).map_err(|_|ClientError::Protocol)?;
+                timeout(IO_TIMEOUT,send_frame(outgoing,&frame,false)).await.map_err(|_|ClientError::Timeout)??;
+                activity.touch();
+            }
+            Ok::<(),ClientError>(())
+        };
+        let receive_loop=async {
+            loop {
+                let frame=decoder.next(incoming).await?.ok_or(ClientError::Protocol)?;
+                rx_state.apply(Direction::Receive,&frame).map_err(|_|ClientError::Protocol)?;
+                match frame {
+                    Frame::Datagram(data)=>{ download.send(data).await.map_err(|_|ClientError::Io)?; activity.touch(); }
+                    Frame::Padding(_)=>tokio::task::yield_now().await,
+                    Frame::Fin=>return Ok::<(),ClientError>(()),
+                    Frame::Abort(code)=>return Err(ClientError::Open(code)),
+                    _=>return Err(ClientError::Protocol),
+                }
+            }
+        };
+        tokio::select! { result=send_loop=>result, result=receive_loop=>result, ()=activity.expire()=>Ok(()) }?;
+        timeout(IO_TIMEOUT,send_frame(outgoing,&Frame::Fin,true)).await.map_err(|_|ClientError::Timeout)??;
+        Ok(())
+    }
+
     pub(crate) fn opened_stream_up(&self) -> bool {
         self.stream_up
     }
@@ -1103,6 +1144,7 @@ impl Tunnel {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        if self.state.udp() { return Err(ClientError::Protocol); }
         let traffic = crate::traffic::enter(crate::Role::Client, false);
         let operation = self.operation;
         crate::diag!(

@@ -850,6 +850,15 @@ impl AutoClient {
         self.h2.fetch_identity_document(successor).await
     }
 
+    async fn open_udp(&self,address:Address,port:u16)->Result<crate::udp_relay::Tunnel,ClientError> {
+        let (generation,cached)=self.prepare().await?;
+        if !cached {
+            if let Some(tunnel)=self.attempt_h3(generation,||self.h3.open_udp(address.clone(),port)).await? { return Ok(crate::udp_relay::Tunnel::H3(Box::new(tunnel))); }
+        }
+        if !self.same_scope(generation)? { return Err(ClientError::QuicUnreachable); }
+        self.h2.open_udp(address,port).await.map(Box::new).map(crate::udp_relay::Tunnel::H2)
+    }
+
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let (generation, cached) = self.prepare().await?;
         crate::diag!(
@@ -981,6 +990,14 @@ impl Carrier {
         }
     }
 
+    async fn open_udp(&self,address:Address,port:u16)->Result<crate::udp_relay::Tunnel,ClientError> {
+        match self {
+            Self::H2(c)=>c.open_udp(address,port).await.map(Box::new).map(crate::udp_relay::Tunnel::H2),
+            Self::H3(c)=>c.open_udp(address,port).await.map(Box::new).map(crate::udp_relay::Tunnel::H3),
+            Self::Auto(c)=>c.open_udp(address,port).await,
+        }
+    }
+
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
             Self::H2(client) => client
@@ -1013,17 +1030,12 @@ impl Carrier {
     }
 }
 
-async fn routed_open(
-    carrier: &Carrier,
-    cache: &Cache,
-    address: Address,
-    port: u16,
-) -> Result<ProxyTunnel, ClientError> {
+async fn route_decision(carrier:&Carrier,cache:&Cache,address:&Address)->Result<(Arc<Snapshot>,Action,Option<Vec<IpAddr>>),ClientError> {
     let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
     let mut pinned = None;
-    let action = match &address {
+    let action = match address {
         Address::V4(ip) => policy
             .matching_action(None, Some(IpAddr::V4(Ipv4Addr::from(*ip))))
             .map_err(|_| denied())?
@@ -1058,6 +1070,13 @@ async fn routed_open(
             }
         },
     };
+    Ok((snapshot,action,pinned))
+}
+
+async fn routed_open(carrier:&Carrier,cache:&Cache,address:Address,port:u16)->Result<ProxyTunnel,ClientError> {
+    let (snapshot,action,pinned)=route_decision(carrier,cache,&address).await?;
+    let policy=snapshot.policy();
+    let denied=||ClientError::Open(ErrorCode::PolicyDenied);
     match action {
         Action::Blocked => {
             crate::traffic::blocked();
@@ -1095,6 +1114,15 @@ async fn routed_open(
         Action::Direct => client_state::dial_direct(address, port, pinned)
             .await
             .map(ProxyTunnel::Direct),
+    }
+}
+
+async fn routed_udp(carrier:&Carrier,cache:&Cache,address:Address,port:u16)->Result<crate::udp_relay::Tunnel,ClientError> {
+    let (_,action,pinned)=route_decision(carrier,cache,&address).await?;
+    match action {
+        Action::Blocked=>{ crate::traffic::blocked(); Err(ClientError::Open(ErrorCode::PolicyDenied)) },
+        Action::Direct=>crate::udp_relay::direct(address,port,pinned).await.map(crate::udp_relay::Tunnel::Direct),
+        Action::Allowed|Action::DirectDpi=>carrier.open_udp(address,port).await,
     }
 }
 
@@ -1154,6 +1182,13 @@ impl ProxyClient {
                     .get(|known| generation.carrier.fetch_routing(known))
                     .await
             }
+        }
+    }
+
+    async fn open_udp(&self,address:Address,port:u16)->Result<crate::udp_relay::Tunnel,ClientError> {
+        match self {
+            Self::Direct(c)=>routed_udp(&c.carrier,&c.routing,address,port).await,
+            Self::Reality(c)=>{ let generation=c.generation().await?; routed_udp(&generation.carrier,&c.routing,address,port).await }
         }
     }
 
@@ -1850,7 +1885,9 @@ async fn socks_reply(socket: &mut TcpStream, code: u8) -> Result<(), ClientError
         .map_err(|_| ClientError::Io)
 }
 
-async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientError> {
+enum SocksRequest { Connect(Address,u16), Associate(Address,u16) }
+
+async fn socks_request(socket: &mut TcpStream) -> Result<SocksRequest, ClientError> {
     let mut greeting = [0; 2];
     socket
         .read_exact(&mut greeting)
@@ -1885,7 +1922,7 @@ async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientEr
         socks_reply(socket, 1).await?;
         return Err(ClientError::Protocol);
     }
-    if request[1] != 1 {
+    if !matches!(request[1],1|3) {
         socks_reply(socket, 7).await?;
         return Err(ClientError::Protocol);
     }
@@ -1927,8 +1964,9 @@ async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientEr
         }
     };
     let port = socket.read_u16().await.map_err(|_| ClientError::Io)?;
+    if request[1]==3 { return Ok(SocksRequest::Associate(address,port)); }
     match validate_target(address, port) {
-        Ok(target) => Ok(target),
+        Ok((address,port)) => Ok(SocksRequest::Connect(address,port)),
         Err(error) => {
             socks_reply(socket, 8).await?;
             Err(error)
@@ -1964,9 +2002,10 @@ async fn handle(
             Err(_) => return Err(ClientError::Timeout),
         }
     } else {
-        timeout(NEGOTIATE_TIMEOUT, socks_target(&mut socket))
-            .await
-            .map_err(|_| ClientError::Timeout)??
+        match timeout(NEGOTIATE_TIMEOUT,socks_request(&mut socket)).await.map_err(|_|ClientError::Timeout)?? {
+            SocksRequest::Connect(address,port)=>(address,port),
+            SocksRequest::Associate(address,port)=>return udp_association(socket,client,address,port).await,
+        }
     };
     crate::diag!(
         Debug,
@@ -3342,5 +3381,67 @@ mod selector_tests {
         .unwrap();
         h2.abort();
         h3.abort();
+    }
+}
+
+#[cfg(test)]
+async fn socks_target(socket:&mut TcpStream)->Result<(Address,u16),ClientError>{ match socks_request(socket).await? { SocksRequest::Connect(a,p)=>Ok((a,p)), _=>Err(ClientError::Protocol) } }
+
+async fn udp_association(mut control:TcpStream,client:&ProxyClient,requested:Address,port:u16)->Result<(),ClientError> {
+    use crate::udp_relay::{self, MAX_FLOWS, QUEUE};
+    use tokio::sync::mpsc;
+    let peer=control.peer_addr().map_err(|_|ClientError::Io)?;
+    let local=control.local_addr().map_err(|_|ClientError::Io)?;
+    if !peer.ip().is_loopback() || !local.ip().is_loopback() || !udp_relay::valid_associate(&requested,peer.ip()) {
+        socks_reply(&mut control,2).await?;
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let socket=Arc::new(tokio::net::UdpSocket::bind(SocketAddr::new(local.ip(),0)).await.map_err(|_|ClientError::Io)?);
+    let bound=socket.local_addr().map_err(|_|ClientError::Io)?;
+    timeout(REPLY_TIMEOUT,control.write_all(&udp_relay::associate_reply(bound))).await.map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
+    let mut pinned=if port==0 {None} else {Some(SocketAddr::new(peer.ip(),port))};
+    let mut flows=std::collections::HashMap::<(Address,u16),mpsc::Sender<Vec<u8>>>::new();
+    let mut tasks=tokio::task::JoinSet::new();
+    let mut buf=vec![0;65536];
+    let mut control_byte=[0;1];
+    loop {
+        tokio::select! {
+            result=control.read(&mut control_byte)=>{
+                return match result { Ok(0)=>Ok(()), Ok(_)=>Err(ClientError::Protocol), Err(_)=>Err(ClientError::Io) };
+            }
+            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,tx|!tx.is_closed()); }
+            result=socket.recv_from(&mut buf)=>{
+                let (n,source)=result.map_err(|_|ClientError::Io)?;
+                if source.ip()!=peer.ip() || pinned.is_some_and(|old|old!=source) { continue; }
+                let Some((address,port,data))=udp_relay::parse_socks(&buf[..n]) else { continue; };
+                if pinned.is_none() { pinned=Some(source); }
+                let key=(address,port);
+                if let Some(tx)=flows.get(&key) {
+                    // Full queue drops the datagram, never replays it.
+                    if !tx.is_closed() { let _=tx.try_send(data.to_vec()); continue; }
+                }
+                flows.retain(|_,tx|!tx.is_closed());
+                if tasks.len()>=MAX_FLOWS { continue; }
+                let (tx,rx)=mpsc::channel(QUEUE);
+                let _=tx.try_send(data.to_vec());
+                flows.insert(key.clone(),tx);
+                let socket=socket.clone();
+                let proxy=client.clone();
+                tasks.spawn(async move {
+                    let (address,port)=key;
+                    let tunnel=proxy.open_udp(address.clone(),port).await?;
+                    let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
+                    let relay=tunnel.relay(rx,down_tx);
+                    let deliver=async {
+                        while let Some(data)=down_rx.recv().await {
+                            let Some(packet)=udp_relay::encode_socks(&address,port,&data) else { continue; };
+                            let _=socket.send_to(&packet,source).await.map_err(|_|ClientError::Io)?;
+                        }
+                        Ok::<(),ClientError>(())
+                    };
+                    tokio::select! { result=relay=>result, result=deliver=>result }
+                });
+            }
+        }
     }
 }

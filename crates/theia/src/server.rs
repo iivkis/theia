@@ -598,6 +598,11 @@ impl ServerContext {
         connect_target(address, port, &self.policy, routing.snapshot.policy()).await
     }
 
+    pub(crate) async fn dial_udp_target(&self, address: &Address, port: u16) -> Result<tokio::net::UdpSocket, ErrorCode> {
+        let routing = self.routing_publication().map_err(|_| ErrorCode::PolicyDenied)?;
+        connect_target_with(address, port, &self.policy, routing.snapshot.policy(), crate::udp_relay::connect).await
+    }
+
     /// Identical admission, route, content type, credential and user quota
     /// policy for H2 and H3. The listener context, never Host, chooses grants.
     pub(crate) fn authorize_request<T>(
@@ -882,6 +887,11 @@ async fn connect_target(
     policy: &ServerPolicy,
     routing: &crate::routing::Policy,
 ) -> Result<TcpStream, ErrorCode> {
+    connect_target_with(address, port, policy, routing, TcpStream::connect).await
+}
+
+async fn connect_target_with<T, F, Fut>(address: &Address, port: u16, policy: &ServerPolicy, routing: &crate::routing::Policy, dial: F) -> Result<T, ErrorCode>
+where F: FnMut(SocketAddr) -> Fut, Fut: std::future::Future<Output=std::io::Result<T>> {
     let domain = match address {
         Address::Dns(name) => Some(name.as_str()),
         _ => None,
@@ -925,7 +935,7 @@ async fn connect_target(
         }
         // Pin each ACL-checked SocketAddr. Share the remaining deadline
         // between candidates so an unresponsive IPv6 route cannot starve IPv4.
-        dial_candidates(&routed, deadline, TcpStream::connect).await
+        dial_candidates(&routed, deadline, dial).await
     })
     .await
     .map_err(|_| ErrorCode::DialTimeout)?
@@ -1668,10 +1678,10 @@ async fn handle_frames(
             }
             break frame;
         };
-        let Frame::OpenTcp { address, port } = open else {
-            return Err(ServerError::Protocol);
-        };
-        Ok::<_, ServerError>((address, port))
+        match open {
+            Frame::OpenTcp { address, port } | Frame::OpenUdp { address, port } => Ok::<_, ServerError>((address, port)),
+            _ => Err(ServerError::Protocol),
+        }
     })
     .await
     .map_err(|_| ServerError::TimedOut)??;
@@ -1682,6 +1692,7 @@ async fn handle_frames(
         "hello_and_open_validated",
         "session" = Value::Count(session_id)
     );
+    let udp = state.udp();
     let dial = tokio::select! {
         biased;
         next = async {
@@ -1698,7 +1709,10 @@ async fn handle_frames(
             next?;
             return Err(ServerError::Protocol);
         }
-        result = context.dial_target(&address, port) => result,
+        result = async {
+            if udp { context.dial_udp_target(&address, port).await.map(crate::udp_relay::Target::Udp) }
+            else { context.dial_target(&address, port).await.map(crate::udp_relay::Target::Tcp) }
+        } => result,
         _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
             return Err(ServerError::Http2);
         }
@@ -1735,7 +1749,10 @@ async fn handle_frames(
         "open_ok_sent",
         "session" = Value::Count(session_id)
     );
-    relay_tcp(tcp, incoming, outgoing, decoder, state, session_id).await
+    match tcp {
+        crate::udp_relay::Target::Tcp(tcp) => relay_tcp(tcp, incoming, outgoing, decoder, state, session_id).await,
+        crate::udp_relay::Target::Udp(udp) => relay_udp(udp, incoming, outgoing, decoder, state).await,
+    }
 }
 
 /// Drive the two TCP directions independently. In particular, lack of H2
@@ -5159,4 +5176,44 @@ mod hardening_tests {
         // dropping the test-owned group cancels every listener task.
         running.tasks.shutdown().await;
     }
+}
+
+async fn relay_udp(socket: tokio::net::UdpSocket, incoming: &mut h2::RecvStream, outgoing: &mut h2::SendStream<Bytes>, mut decoder: IncomingFrames, state: Session) -> Result<(), ServerError> {
+    let mut rx_state=state.clone();
+    let mut tx_state=state;
+    let activity=crate::udp_relay::Activity::new();
+    let upload=async {
+        loop {
+            let frame=decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
+            rx_state.apply(Direction::Receive,&frame).map_err(|_|ServerError::Protocol)?;
+            match frame {
+                Frame::Datagram(data)=>{
+                    crate::udp_relay::send_datagram(&socket,&data).await.map_err(|_|ServerError::Io)?;
+                    activity.touch();
+                }
+                Frame::Padding(_)=>tokio::task::yield_now().await,
+                Frame::Fin=>return Ok::<(),ServerError>(()),
+                _=>return Err(ServerError::Protocol),
+            }
+        }
+    };
+    let download=async {
+        let mut buf=vec![0;crate::protocol::MAX_DATAGRAM+1];
+        loop {
+            let n=socket.recv(&mut buf).await.map_err(|_|ServerError::Io)?;
+            if n>crate::protocol::MAX_DATAGRAM { continue; }
+            let frame=Frame::Datagram(buf[..n].to_vec());
+            tx_state.apply(Direction::Send,&frame).map_err(|_|ServerError::Protocol)?;
+            timeout(FRAME_IDLE_TIMEOUT,send_frame(outgoing,&frame)).await.map_err(|_|ServerError::TimedOut)??;
+            activity.touch();
+        }
+        #[allow(unreachable_code)]
+        Ok::<(),ServerError>(())
+    };
+    // UDP FIN terminates the association (no TCP-style half close).
+    let result=tokio::select! { result=upload=>result, result=download=>result, ()=activity.expire()=>Ok(()) };
+    result?;
+    let frame=Frame::Fin;
+    timeout(FRAME_IDLE_TIMEOUT,send_frame(outgoing,&frame)).await.map_err(|_|ServerError::TimedOut)??;
+    Ok(())
 }
