@@ -314,6 +314,13 @@ fn visual_review_gallery() {
             let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
             ui.select_workspace_page(role, page);
             ui.workspace_focus = ui.workspace_content_focus(role);
+            let screen = rendered_interaction(120, 40, &model, &ui);
+            if page == 4 {
+                assert!(screen.contains("H2") && screen.contains("H3") && ui.workspace_monitor.is_some());
+            }
+            if page == 5 {
+                assert!(screen.contains(path.to_str().unwrap()));
+            }
             review_capture(&format!("{prefix}-page-{label}"), &model, &ui);
         }
         let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
@@ -385,7 +392,7 @@ fn visual_review_gallery() {
         // not through a separate command catalog or direct letter shortcuts.
         let actions: &[(usize, char, &str)] = if role == Role::Server {
             &[(1,'N',"new-connection"),(2,'G',"grant-picker"),(2,'u',"new-user"),
-              (2,'t',"rotate-token"),(2,'x',"disable-user"),(2,'U',"delete-user"),
+              (2,'t',"rotate-token"),(2,'x',"disable-user"),
               (5,'Q',"limits"),(1,'E',"certificate"),(3,'s',"server-process"),
               (3,'v',"runtime-status"),(6,'p',"network-diagnostics"),
               (3,'a',"apply-rights"),(3,'R',"restart-preflight")]
@@ -419,8 +426,59 @@ fn visual_review_gallery() {
                 review_capture("server-action-reality-wizard", &model, &ui);
             }
         }
+        // Advanced actions are deliberately hidden until the user expands
+        // the canonical section. Never execute a technical operation here.
+        {
+            let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
+            ui.select_workspace_page(role, 1);
+            ui.workspace_focus = WorkspaceFocus::Actions;
+            let items = page_actions(role, 1, ui.editor.as_ref());
+            assert!(!items.iter().any(|a| a.key == 'M'));
+            ui.workspace_action = items.iter().position(|a| a.key == 'z').unwrap();
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(ui.workspace_advanced && ui.workspace_visible());
+            assert!(!ui.owned_running(role));
+            review_capture(&format!("{prefix}-page-advanced"), &model, &ui);
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(!ui.workspace_advanced);
+        }
+        if role == Role::Client {
+            let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
+            ui.select_workspace_page(role, 2);
+            ui.update(&mut model, press(KeyCode::Enter));
+            ui.paste_workspace_import(&model, "theia://v1/synthetic-review");
+            assert!(ui.inline_import());
+            let view = rendered_interaction(120, 40, &model, &ui);
+            assert!(view.contains("скрыто") && view.contains("Разделы"));
+            assert!(!view.contains("synthetic-review"));
+            review_capture("client-page-import-masked", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(ui.importing.is_none());
+            assert!(!ui.owned_running(role));
+        }
         // Keep guarded shortcut-only failure cases explicitly marked as such.
         if role == Role::Server {
+            let ungranted = root.join("server-ungranted.toml");
+            let original = server_issuance_fixture().replace("[server.policy]", &format!("[[server.users]]\nid = \"review-ungranted\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]", "22".repeat(32)));
+            std::fs::write(&ungranted, &original).unwrap();
+            let mut ui = Interaction::new(Some(Editor::load(role, &ungranted).unwrap()));
+            ui.select_workspace_page(role, 2);
+            ui.workspace_user = 1;
+            ui.workspace_focus = WorkspaceFocus::Actions;
+            let items = page_actions_for(role, 2, ui.editor.as_ref(), 1, false);
+            assert!(!items.iter().any(|a| matches!(a.key, 'b' | 't' | 'x')));
+            ui.workspace_action = items.iter().position(|a| a.key == 'U').unwrap();
+            review_capture("server-page-users-ungranted", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(matches!(&ui.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) if fields[0] == "review-ungranted"));
+            review_capture("server-action-delete-user", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert_eq!(ui.confirmation_choice(), Some(('y', "Удалить пользователя")));
+            assert!(!ui.confirm_selected);
+            review_capture("server-action-delete-user-confirm", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert_eq!(std::fs::read_to_string(&ungranted).unwrap(), original);
+            assert!(!ui.owned_running(role));
             for (key, label) in [('D',"delete-connection"),('V',"reality-status-unavailable")] {
                 let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
                 ui.update(&mut model, press(KeyCode::Char(key)));
@@ -569,6 +627,8 @@ fn visual_review_gallery() {
     ui.revocation = Some(DisableFlow::Confirm("device-a".into()));
     review_capture("state-disable-confirm", &model, &ui);
     ui.revocation = Some(DisableFlow::SaveFailed);
+    let screen = rendered_interaction(120, 40, &model, &ui);
+    assert!(screen.contains("Повторить сохранение") && !screen.contains("Что это значит") && !screen.contains("Адрес UDP"));
     review_capture("state-disable-failed", &model, &ui);
     ui.revocation = Some(DisableFlow::Done);
     review_capture("state-disable-done", &model, &ui);

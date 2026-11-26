@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: 9f3821dcf70b7a5e8a6b46e1dd4e69ebb3f2ac70
+          ref: 6ec5d20203dbc796c5c101685145b28e42d93d5d
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -80,6 +80,9 @@ jobs:
             compact_reality_with_three_maximum_dns_references_fits_access_key_limit \
             workspace_navigation_mouse_and_keyboard_never_commit_or_start \
             workspace_has_single_owner_for_every_visible_operation \
+            workspace_import_and_monitor_are_inline_and_read_only \
+            workspace_selected_user_and_advanced_actions_are_contextual \
+            revocation_failure_replaces_entire_workspace \
             configured_sections_shortcut_uses_navigation_not_second_menu \
             server_overview_opens_recommended_workflow_without_starting \
             review_client_import_opens_directly_from_page_without_writing \
@@ -161,7 +164,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "9f3821dcf70b7a5e8a6b46e1dd4e69ebb3f2ac70"
+          assert manifest["source_sha"] == "6ec5d20203dbc796c5c101685145b28e42d93d5d"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
@@ -179,6 +182,7 @@ jobs:
           assert required_wizard <= expected, f"missing REALITY wizard screenshots: {required_wizard - expected}"
           required_navigation = set(["server-page-overview.png","server-page-connections.png","server-page-users.png","server-page-users-disabled.png","server-page-management.png","server-page-traffic.png","server-page-settings.png","server-page-diagnostics.png","client-page-overview.png","client-page-profiles.png","client-page-import.png","client-page-proxy.png","client-page-traffic.png","client-page-settings.png","server-overview-next-step.png","client-overview-next-step.png","server-sections-focus.png","client-sections-focus.png","client-action-invitation-import.png","server-action-recover-user.png","server-action-apply-rights.png","server-action-restart-preflight.png"])
           obsolete_navigation = set(["server-page-invitations.png","client-page-diagnostics.png","client-action-reality-import.png","server-command-menu.png","client-command-menu.png","server-focus-actions.png","client-focus-actions.png"])
+          required_navigation.update(["server-page-advanced.png","client-page-advanced.png","client-page-import-masked.png","server-page-users-ungranted.png","server-action-delete-user-confirm.png"])
           assert required_navigation <= expected, f"missing navigation screenshots: {required_navigation - expected}"
           assert not obsolete_navigation & expected, "obsolete duplicate navigation screenshots"
           assert len(expected) >= 52

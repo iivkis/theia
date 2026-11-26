@@ -88,6 +88,7 @@ def main():
     obsolete = set(["server-page-invitations","client-page-diagnostics","client-action-reality-import","server-command-menu","client-command-menu","server-focus-actions","client-focus-actions"])
     actual = {e["scenario"] for e in entries}
     assert not obsolete & actual, f"obsolete duplicate screens: {sorted(obsolete & actual)}"
+    required.update(["server-page-advanced","client-page-advanced","client-page-import-masked","server-page-users-ungranted","server-action-delete-user-confirm"])
     missing = required - actual
     assert not missing, f"missing required screens: {sorted(missing)}"
     hashes = {e["scenario"]: e["sha256"] for e in entries}

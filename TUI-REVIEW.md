@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (9f3821dcf70b7a5e8a6b46e1dd4e69ebb3f2ac70) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (6ec5d20203dbc796c5c101685145b28e42d93d5d) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -37,3 +37,5 @@ The gallery also requires the multi-line domain editor, the bottom of the 40-can
 ## Single-owner navigation
 
 The gallery enumerates the actual seven server and six client sections, checks unique visible action keys, and opens ordinary operations by selecting the section action and pressing Enter. Overview routes to management/connection without starting anything; F2 focuses the existing navigation rather than a second command catalog. The disabled-user fixture captures recovery separately. The separate REALITY import, invitations page, client diagnostics page and duplicate command-menu screenshots are no longer generated. The last successful gallery remains intact until replacement passes the required-screen and obsolete-screen checks.
+
+The inline import and process-local traffic monitor are rendered within their sections. Required screenshots include masked existing-profile import, expanded settings, a user with no grants and the explicit delete confirmation; the revoke-save failure must not contain the underlying workspace. No screenshot implies successful external-runtime access.
