@@ -79,6 +79,9 @@ pub struct Bbr {
     phase_at: Instant,
     phase_round: u64,
     cycle: u64,
+    cycle_nonlimited: bool,
+    probe_full_bw: u64,
+    probe_plateau: u8,
     probe_wait: Duration,
     bandwidth_cap: Option<u64>,
     inflight_longterm: Option<u64>,
@@ -130,6 +133,9 @@ impl Bbr {
             phase_at: now,
             phase_round: 0,
             cycle: 0,
+            cycle_nonlimited: false,
+            probe_full_bw: 0,
+            probe_plateau: 0,
             probe_wait: Duration::from_secs(2),
             bandwidth_cap: None,
             inflight_longterm: None,
@@ -409,6 +415,7 @@ impl Bbr {
                     }
                 }
                 if !sample.app_limited {
+                    self.cycle_nonlimited = true;
                     nonlimited_rate = Some(measured);
                 }
             }
@@ -479,7 +486,19 @@ impl Bbr {
         if self.mode == Mode::Drain && in_flight <= self.bdp() {
             self.enter_probe_bw(now);
         } else if self.mode == Mode::ProbeBw {
-            if self.phase == ProbePhase::Up { self.probe_up_acked = self.probe_up_acked.saturating_add(outcome.acknowledged_bytes); }
+            if self.phase == ProbePhase::Up {
+                self.probe_up_acked = self.probe_up_acked.saturating_add(outcome.acknowledged_bytes);
+                if round_start {
+                    if let Some(measured) = nonlimited_rate {
+                        if self.probe_full_bw == 0 || u128::from(measured) * 4 >= u128::from(self.probe_full_bw) * 5 {
+                            self.probe_full_bw = measured;
+                            self.probe_plateau = 0;
+                        } else {
+                            self.probe_plateau = self.probe_plateau.saturating_add(1);
+                        }
+                    }
+                }
+            }
             self.advance_probe(now, in_flight, round_start, congestion_lost != 0);
         }
         if expired && self.probe_rtt_stamp != now && sample.is_some() && self.mode != Mode::ProbeRtt {
@@ -593,10 +612,11 @@ impl Bbr {
     }
 
     fn set_phase(&mut self, phase: ProbePhase, now: Instant) {
-        if self.phase == ProbePhase::Up && phase == ProbePhase::Down {
+        if self.phase == ProbePhase::Up && phase == ProbePhase::Down && self.cycle_nonlimited {
             self.cycle = self.cycle.saturating_add(1);
             let cycle = self.cycle;
             self.bandwidth.retain(|(old, _)| cycle.saturating_sub(*old) < 2);
+            self.cycle_nonlimited = false;
         }
         self.phase = phase;
         self.phase_at = now;
@@ -609,7 +629,7 @@ impl Bbr {
             let jitter = if SystemRandom::new().fill(&mut random).is_ok() {
                 u16::from_ne_bytes(random) as u64 % 1001
             } else { 500 };
-            self.probe_wait = Duration::from_millis(2000 + jitter.saturating_mul(3));
+            self.probe_wait = Duration::from_millis(2000 + jitter);
         }
         if phase == ProbePhase::Refill {
             self.bandwidth_cap = None;
@@ -618,6 +638,8 @@ impl Bbr {
         if phase == ProbePhase::Up {
             self.probe_up_rounds = 0;
             self.probe_up_acked = 0;
+            self.probe_full_bw = self.bandwidth();
+            self.probe_plateau = 0;
         }
     }
 
@@ -640,7 +662,7 @@ impl Bbr {
             ProbePhase::Cruise if new_round && !lost && (elapsed >= self.probe_wait || self.round.saturating_sub(self.phase_round) >= (self.bdp() / self.mtu).clamp(2, 63)) => self.set_phase(ProbePhase::Refill, now),
             ProbePhase::Refill if lost => self.set_phase(ProbePhase::Down, now),
             ProbePhase::Refill if new_round => self.set_phase(ProbePhase::Up, now),
-            ProbePhase::Up if lost || (new_round && elapsed >= self.rtt() && in_flight >= self.bdp().saturating_mul(5) / 4) => self.set_phase(ProbePhase::Down, now),
+            ProbePhase::Up if lost || self.probe_plateau >= 3 || (new_round && elapsed >= self.rtt() && in_flight >= self.bdp().saturating_mul(5) / 4) => self.set_phase(ProbePhase::Down, now),
             _ => {}
         }
     }
@@ -729,6 +751,26 @@ mod tests {
         b.persistent_congestion(refill + Duration::from_secs(1));
         assert_eq!(b.cwnd(), 4800);
         assert_eq!(b.loss_ceiling, Some(4800));
+    }
+
+    #[test]
+    fn application_limited_probe_does_not_age_out_bandwidth() {
+        let now = Instant::now();
+        let mut b = Bbr::new(1200, now).unwrap();
+        b.bandwidth.push_back((0, 100_000));
+        b.mode = Mode::ProbeBw;
+        for _ in 0..4 {
+            b.set_phase(ProbePhase::Up, now);
+            b.set_phase(ProbePhase::Down, now);
+        }
+        assert_eq!(b.bandwidth(), 100_000);
+        assert_eq!(b.cycle, 0);
+        b.set_phase(ProbePhase::Up, now);
+        b.cycle_nonlimited = true;
+        b.probe_plateau = 3;
+        b.advance_probe(now, 0, false, false);
+        assert_eq!(b.phase, ProbePhase::Down);
+        assert_eq!(b.cycle, 1);
     }
 
     #[test]
