@@ -2202,7 +2202,7 @@ async fn prepare_selected_listeners_inner(
                 limits.connections.clone(),
                 limits.peer_budget.clone(),
             );
-            context.routing_publication()?;
+            // The staged AuthCell may not contain a newly added inbound until CAS.
             context.live_quota = Some(limits.ledger.clone());
             #[cfg(test)]
             let carrier = if let Some(start) = guard_start {
@@ -2276,7 +2276,6 @@ async fn prepare_selected_listeners_inner(
             limits.connections.clone(),
             limits.peer_budget.clone(),
         );
-        context.routing_publication()?;
         context.live_quota = Some(limits.ledger.clone());
         context.apply_own_tls_policy();
         listeners.push(ReadyListener::Plain(
@@ -3197,20 +3196,26 @@ async fn run_supervised_file(
     let _geodata_refresh = SupervisorTask(tokio::spawn({
         let runtime = runtime.clone();
         async move {
+            let mut next_refresh = tokio::time::Instant::now();
+            let mut last_directory = None;
             loop {
                 let settings = runtime.snapshot().ok().and_then(|view| view.document.server.policy.routing.clone());
                 if let Some(settings) = settings {
                     if let Some(directory) = settings.geodata_directory {
-                        if let Ok(store) = crate::routing::geodata::Store::new(directory.into()) {
+                        if last_directory.as_ref() != Some(&directory) || tokio::time::Instant::now() >= next_refresh {
+                            last_directory = Some(directory.clone());
+                            next_refresh = tokio::time::Instant::now() + crate::routing::geodata::REFRESH_INTERVAL;
+                            if let Ok(store) = crate::routing::geodata::Store::new(directory.into()) {
                             if store.refresh(&settings.rules).await.is_err() {
                                 crate::diag!(Warn, "server", "geodata_refresh_failed");
                             } else {
                                 crate::diag!(Info, "server", "geodata_candidate_ready");
                             }
+                            }
                         }
                     }
                 }
-                tokio::time::sleep(crate::routing::geodata::REFRESH_INTERVAL).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
     }));

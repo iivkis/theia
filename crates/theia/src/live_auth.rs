@@ -342,6 +342,11 @@ mod tests {
         let (_, staged_routing) = live.prepare_tls_rebase(&routed, 1).unwrap();
         assert_eq!(live.shared().load().unwrap().routing["alpha"].snapshot.manifest().revision, 1);
         drop(staged_routing);
+        let isolated = LiveAuthorization::new(doc.clone()).unwrap();
+        let (_, publication) = isolated.prepare_tls_rebase(&routed, 1).unwrap();
+        assert_eq!(isolated.publish(publication), Ok(2));
+        assert_eq!(isolated.shared().load().unwrap().routing["alpha"].snapshot.manifest().revision, 2);
+        assert!(isolated.prepare_tls_rebase(&doc, 2).is_err());
         let mut changed = doc;
         changed.server.users[0].disabled = true;
         let staged = live.stage(&changed, 1).unwrap();

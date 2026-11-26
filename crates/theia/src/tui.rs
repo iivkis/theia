@@ -756,13 +756,13 @@ impl RoutingPanel {
             Err(TryRecvError::Empty) => {}
         }
     }
-    fn refresh(&mut self) {
+    fn refresh(&mut self, download: bool) {
         let directory = self.directory.clone();
         let rules = self.settings.rules.clone();
         let (tx, rx) = mpsc::channel();
         self.download = Some(rx);
         self.message = "Загрузка XTLS и проверка SHA-256. Действующие правила не изменены.".into();
-        std::thread::spawn(move || {
+        let _worker = std::thread::spawn(move || {
             let work = || -> Result<(String, crate::routing::geodata::Manifest), String> {
                 if !directory.exists() {
                     let mut builder = std::fs::DirBuilder::new();
@@ -775,7 +775,11 @@ impl RoutingPanel {
                 let directory = directory.canonicalize().map_err(|_| "Некорректный каталог баз.".to_owned())?;
                 let store = crate::routing::geodata::Store::new(directory.clone()).map_err(|e| format!("GeoData: {e:?}"))?;
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| "Не удалось запустить загрузчик.".to_owned())?;
-                let pair = runtime.block_on(store.refresh(&rules)).map_err(|e| format!("GeoData: {e:?}"))?;
+                let pair = if download {
+                    runtime.block_on(store.refresh(&rules)).map_err(|e| format!("GeoData: {e:?}"))?
+                } else {
+                    store.load(&rules).map_err(|e| format!("GeoData: {e:?}"))?.ok_or("Загруженных баз нет.")?
+                };
                 let path = directory.to_str().ok_or("Путь не UTF-8.")?.to_owned();
                 Ok((path, pair.manifest().clone()))
             };
@@ -791,6 +795,12 @@ impl RoutingPanel {
                 KeyCode::Up | KeyCode::BackTab => *focus = focus.saturating_sub(1),
                 KeyCode::Down | KeyCode::Tab => *focus = (*focus + 1).min(3),
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => fields[*focus].clear(),
+                KeyCode::Left | KeyCode::Right if *focus == 1 => {
+                    let options = ["allowed", "direct", "blocked"];
+                    let index = options.iter().position(|a| *a == fields[1]).unwrap_or(0);
+                    let next = if key.code == KeyCode::Right { (index + 1) % 3 } else { (index + 2) % 3 };
+                    fields[1] = options[next].into();
+                }
                 KeyCode::Backspace => { fields[*focus].pop(); }
                 KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && !c.is_control() && fields[*focus].len() + c.len_utf8() <= 8192 => fields[*focus].push(c),
                 KeyCode::Enter => {
@@ -824,7 +834,8 @@ impl RoutingPanel {
             KeyCode::Delete if self.selected < len => { self.settings.rules.remove(self.selected); self.selected = self.selected.min(self.settings.rules.len().saturating_sub(1)); }
             KeyCode::Char('[') if self.selected > 0 && self.selected < len => { self.settings.rules.swap(self.selected, self.selected - 1); self.selected -= 1; }
             KeyCode::Char(']') if self.selected + 1 < len => { self.settings.rules.swap(self.selected, self.selected + 1); self.selected += 1; }
-            KeyCode::Char('g') => self.refresh(),
+            KeyCode::Char('g') => self.refresh(true),
+            KeyCode::Char('l') => self.refresh(false),
             KeyCode::Char('s') => {
                 if let Some(editor) = editor {
                     match editor.stage_routing(self.settings.clone()) {
@@ -843,7 +854,7 @@ impl RoutingPanel {
             for (i, (label, value)) in ["Имя", "Действие", "Домены / geosite:", "IP / CIDR / geoip:"].iter().zip(fields).enumerate() {
                 body.push_str(&format!("{} {label}: {value}\n", if i == *focus { "›" } else { " " }));
             }
-            body.push_str("\n↑↓ / Tab: поле · Ctrl+U: очистить · Enter: принять · Esc: отменить");
+            body.push_str("\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять · Esc: отменить");
         } else {
             body.push_str(&format!("GeoData: {}\nПервое совпадение; иначе allowed.\n", self.settings.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str())));
             let start = self.selected.saturating_sub(3);
@@ -851,7 +862,7 @@ impl RoutingPanel {
                 body.push_str(&format!("{} {}. {} · {}\n", if i == self.selected { "›" } else { " " }, i+1, rule.name, Self::action_name(rule.action)));
             }
             if self.settings.rules.is_empty() { body.push_str("Нет правил.\n"); }
-            body.push_str("\n↑↓ выбрать · n создать · Enter изменить · Delete удалить\n[ / ] переместить · g загрузить базы XTLS · s принять черновик · Esc отменить");
+            body.push_str("\n↑↓ выбрать · n создать · Enter изменить · Delete удалить\n[ / ] переместить · g загрузить XTLS · l выбрать загруженные базы\ns принять черновик · Esc отменить");
         }
         if !self.message.is_empty() { body.push_str(&format!("\n\n{}", self.message)); }
         body
