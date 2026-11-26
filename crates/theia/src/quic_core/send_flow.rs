@@ -3,7 +3,8 @@
 use super::wire::{encode_varint, MAX_VARINT};
 use std::collections::BTreeMap;
 
-const MAX_STREAMS: u64 = 64;
+const MAX_STREAM_COUNT: u64 = 1 << 60;
+const MAX_ACTIVE_PER_TYPE: usize = 64;
 pub const MAX_CHUNK: usize = 1000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +28,7 @@ pub struct SendFlow {
     peer_bidi: u64,
     next_uni: u64,
     next_bidi: u64,
+    peer_opened: u64,
     initial_limit: u64,
     local_bidi_limit: u64,
     peer_bidi_limit: u64,
@@ -47,11 +49,12 @@ impl SendFlow {
         }
         Ok(Self {
             local_bit: u64::from(server),
-            max_streams: max_streams.min(MAX_STREAMS),
+            max_streams,
             max_bidi: 0,
             peer_bidi: 0,
             next_uni: 0,
             next_bidi: 0,
+            peer_opened: 0,
             initial_limit: stream_limit,
             local_bidi_limit: stream_limit,
             peer_bidi_limit: stream_limit,
@@ -65,7 +68,7 @@ impl SendFlow {
     /// A peer-local bidi stream is remote-initiated from our perspective.
     pub(crate) fn from_peer(server: bool, limits: super::parameters::Limits, peer_bidi: u64) -> Result<Self, Error> {
         let mut flow = Self::new(server, limits.max_streams_uni, limits.initial_uni, limits.max_data)?;
-        flow.enable_bidi(limits.max_streams_bidi.min(MAX_STREAMS), peer_bidi)?;
+        flow.enable_bidi(limits.max_streams_bidi, peer_bidi)?;
         flow.local_bidi_limit = limits.initial_bidi_remote;
         flow.peer_bidi_limit = limits.initial_bidi_local;
         Ok(flow)
@@ -73,7 +76,7 @@ impl SendFlow {
 
     pub fn open(&mut self) -> Result<u64, Error> {
         let n = self.next_uni;
-        if n >= self.max_streams {
+        if n >= self.max_streams || self.active_type(2 + self.local_bit) >= MAX_ACTIVE_PER_TYPE {
             return Err(Error::Limit);
         }
         let id = n * 4 + 2 + self.local_bit;
@@ -90,10 +93,14 @@ impl SendFlow {
         Ok(id)
     }
 
-    /// Fixed development cap for local and peer bidirectional directions.
+    fn active_type(&self, kind: u64) -> usize {
+        self.streams.keys().filter(|id| **id & 3 == kind).count()
+    }
+
+    /// Cumulative peer credit is independent of the local active cap.
     pub fn enable_bidi(&mut self, local: u64, peer: u64) -> Result<(), Error> {
-        if local > MAX_STREAMS
-            || peer > MAX_STREAMS
+        if local > MAX_STREAM_COUNT
+            || peer > MAX_STREAM_COUNT
             || local < self.next_bidi
             || peer < self.peer_bidi
         {
@@ -105,7 +112,7 @@ impl SendFlow {
     }
 
     pub fn open_bidi(&mut self) -> Result<u64, Error> {
-        if self.next_bidi >= self.max_bidi {
+        if self.next_bidi >= self.max_bidi || self.active_type(self.local_bit) >= MAX_ACTIVE_PER_TYPE {
             return Err(Error::Limit);
         }
         let id = self.next_bidi * 4 + self.local_bit;
@@ -127,6 +134,9 @@ impl SendFlow {
         if id > MAX_VARINT || id & 2 != 0 || id & 1 == self.local_bit || id / 4 >= self.peer_bidi {
             return Err(Error::Stream);
         }
+        if id / 4 < self.peer_opened { return Ok(()); }
+        if id / 4 != self.peer_opened || self.active_type(1 - self.local_bit) >= MAX_ACTIVE_PER_TYPE { return Err(Error::Limit); }
+        self.peer_opened += 1;
         self.streams.entry(id).or_insert(Stream {
             offset: 0,
             limit: self.peer_bidi_limit,
@@ -137,7 +147,7 @@ impl SendFlow {
     }
 
     pub(crate) fn grant_peer_bidi(&mut self, value: u64) {
-        self.peer_bidi = self.peer_bidi.max(value.min(MAX_STREAMS));
+        self.peer_bidi = self.peer_bidi.max(value.min(MAX_STREAM_COUNT));
     }
 
     pub(crate) fn terminal(&self, id: u64) -> bool {
@@ -145,14 +155,29 @@ impl SendFlow {
     }
 
     pub(crate) fn lifetime_exhausted(&self, bidi: bool) -> bool {
-        (if bidi { self.next_bidi } else { self.next_uni }) >= MAX_STREAMS
+        (if bidi { self.next_bidi } else { self.next_uni }) >= MAX_STREAM_COUNT
+    }
+
+    pub(crate) fn retire(&mut self, id: u64) {
+        self.streams.remove(&id);
+    }
+
+    pub(crate) fn is_closed(&self, id: u64) -> bool {
+        if id > MAX_VARINT || self.streams.contains_key(&id) { return false; }
+        let next = match (id & 1 == self.local_bit, id & 2 == 0) {
+            (true, true) => self.next_bidi,
+            (true, false) => self.next_uni,
+            (false, true) => self.peer_opened,
+            (false, false) => 0,
+        };
+        id / 4 < next
     }
 
     pub fn max_bidi(&mut self, value: u64) -> Result<(), Error> {
         if value > (1 << 60) {
             return Err(Error::Limit);
         }
-        self.max_bidi = self.max_bidi.max(value.min(MAX_STREAMS));
+        self.max_bidi = self.max_bidi.max(value);
         Ok(())
     }
 
@@ -174,7 +199,7 @@ impl SendFlow {
         if value > (1 << 60) {
             return Err(Error::Limit);
         }
-        self.max_streams = self.max_streams.max(value.min(MAX_STREAMS));
+        self.max_streams = self.max_streams.max(value);
         Ok(())
     }
 
@@ -182,6 +207,7 @@ impl SendFlow {
         if value > MAX_VARINT {
             return Err(Error::Limit);
         }
+        if self.is_closed(id) { return Ok(()); }
         let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
         stream.limit = stream.limit.max(value);
         Ok(())
@@ -195,6 +221,7 @@ impl SendFlow {
     }
 
     pub fn reset(&mut self, id: u64, code: u64) -> Result<Option<Vec<u8>>, Error> {
+        if self.is_closed(id) { return Ok(None); }
         let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
         if code > MAX_VARINT {
             return Err(Error::Limit);
@@ -258,6 +285,26 @@ mod tests {
         flow.register_peer_bidi(1).unwrap();
         assert_eq!((flow.available(uni), flow.available(bidi), flow.available(1)), (7,5,3));
         assert_eq!(flow.open_bidi(), Err(Error::Limit));
+    }
+
+    #[test]
+    fn send_metadata_is_bounded_across_many_streams() {
+        let mut f = SendFlow::new(false, 1024, 8, 8).unwrap();
+        let control = f.open().unwrap();
+        for n in 1..1024 {
+            let id = f.open().unwrap();
+            assert_eq!(id, 4 * n + 2);
+            f.encode(id, b"", true).unwrap();
+            f.retire(id);
+            assert!(f.is_closed(id));
+            assert_eq!(f.max_stream_data(id, 8), Ok(()));
+            assert_eq!(f.reset(id, 7), Ok(None));
+        }
+        assert_eq!(f.streams.len(), 1);
+        assert!(!f.is_closed(control));
+        assert_eq!(f.open(), Err(Error::Limit));
+        f.max_streams(1025).unwrap();
+        assert_eq!(f.open().unwrap(), 4098);
     }
 
     #[test]

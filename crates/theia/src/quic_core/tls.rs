@@ -700,14 +700,14 @@ mod tests {
             let mut server = server.unwrap();
             let driver = tokio::spawn(async move { let _ = poll_fn(|cx| driver.poll_close(cx)).await; });
             tokio::join!(async {
-                for n in 0..12 {
+                for n in 0..96 {
                     let mut stream = sender.send_request(http::Request::builder().uri(format!("https://localhost/{n}")).body(()).unwrap()).await.unwrap();
                     stream.finish().await.unwrap();
                     assert_eq!(stream.recv_response().await.unwrap().status(), 204);
                     assert!(stream.recv_data().await.unwrap().is_none());
                 }
             }, async {
-                for n in 0..12 {
+                for n in 0..96 {
                     let resolver = server.accept().await.unwrap().unwrap();
                     let (req, mut stream) = resolver.resolve_request().await.unwrap();
                     assert_eq!(req.uri().path(), format!("/{n}"));

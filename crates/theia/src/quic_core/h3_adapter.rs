@@ -1,6 +1,6 @@
 //! Experimental h3 0.0.8 transport bridge, using only the TLS-established
-//! native loopback session. Not a product carrier: fixed lifetime stream
-//! caps, no external interoperability, no independent admission or acceptance.
+//! native loopback session. Not a product carrier: no external
+//! interoperability, independent admission or acceptance.
 //! The worker serializes all packet/stream state. Synchronous trait calls
 //! never hold the state mutex across UDP I/O. Each direction has one bounded
 //! handoff slot and one waker. There is no task per stream or per datagram.
@@ -85,7 +85,6 @@ struct StreamState {
     recv_reset: Option<u64>,
     send_dropped: bool,
     recv_dropped: bool,
-    retired: bool,
     send_waker: Option<Waker>,
     recv_waker: Option<Waker>,
 }
@@ -200,7 +199,7 @@ fn progress(
                 state.open.push_back(request);
             }
             Err(_) => {
-                // The lifetime metadata cap remains a deliberate laboratory bound.
+                // Only exhaustion of the protocol ID space is permanent.
                 let _ = request
                     .result
                     .send(Err(CE::InternalError("native stream limit".into())));
@@ -215,7 +214,6 @@ fn progress(
     state.cursor = ids.first().copied();
     for id in ids {
         let s = state.streams.get_mut(&id).expect("known stream");
-        if s.retired { continue; }
         if s.tx && !s.reset_sent {
             if let Some(code) = session.send_reset_code(id) {
                 if s.reset.is_none() {
@@ -296,12 +294,8 @@ fn progress(
             }
         }
         if (!s.tx || s.send_dropped) && (!s.rx || s.recv_dropped) && session.retire_stream(id, s.tx, s.rx)? {
-            s.retired = true;
+            state.streams.remove(&id);
             ready.notify_one();
-            s.outgoing = None;
-            s.incoming = None;
-            s.send_waker = None;
-            s.recv_waker = None;
         }
     }
     Ok(())

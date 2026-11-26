@@ -4,9 +4,11 @@ use super::{
     stream::{ReceiveBuffer, ReceiveError, MAX_WINDOW},
     wire::MAX_VARINT,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 const MAX_STREAMS: u64 = 64;
+const MAX_STREAM_COUNT: u64 = 1 << 60;
+const RECENT_CLOSED: usize = 64;
 const MAX_TOTAL_WINDOW: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,7 +28,10 @@ pub struct ReceiveFlow {
     max_data: u64,
     used: u64,
     streams: BTreeMap<u64, ReceiveBuffer>,
-    retired: BTreeSet<u64>,
+    // Exclusive high-water mark by stream type. Every lower ID is either
+    // active or closed, never reopened. Peer IDs are opened implicitly.
+    opened: [u64; 4],
+    recent_closed: BTreeMap<u64, ReceiveBuffer>,
 }
 
 impl ReceiveFlow {
@@ -59,7 +64,8 @@ impl ReceiveFlow {
             max_data,
             used: 0,
             streams: BTreeMap::new(),
-            retired: BTreeSet::new(),
+            opened: [0; 4],
+            recent_closed: BTreeMap::new(),
         })
     }
 
@@ -80,14 +86,14 @@ impl ReceiveFlow {
     }
 
     pub(crate) fn can_open_local_bidi(&self) -> bool {
-        self.streams.keys().filter(|id| **id & 1 != self.peer_bit && !self.retired.contains(*id)).count() < self.max_local_bidi as usize
+        self.streams.keys().filter(|id| **id & 1 != self.peer_bit).count() < self.max_local_bidi as usize
     }
 
     pub fn register_local_bidi(&mut self, id: u64) -> Result<(), Error> {
         if id > MAX_VARINT
             || id & 2 != 0
             || id & 1 == self.peer_bit
-            || id / 4 >= MAX_STREAMS
+            || id / 4 != self.opened[(id & 3) as usize]
         {
             return Err(Error::StreamId);
         }
@@ -96,12 +102,13 @@ impl ReceiveFlow {
             let buffer =
                 ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?;
             self.streams.insert(id, buffer);
+            self.opened[(id & 3) as usize] += 1;
         }
         Ok(())
     }
 
     fn check_id(&self, id: u64) -> Result<(), Error> {
-        if id & 1 != self.peer_bit && id & 2 == 0 && self.streams.contains_key(&id) {
+        if id <= MAX_VARINT && id & 1 != self.peer_bit && id & 2 == 0 && id / 4 < self.opened[(id & 3) as usize] {
             return Ok(());
         }
         let limit = if id & 2 == 0 {
@@ -132,7 +139,7 @@ impl ReceiveFlow {
         self.streams
             .keys()
             .copied()
-            .filter(|id| id & 1 == self.peer_bit && !self.retired.contains(id))
+            .filter(|id| id & 1 == self.peer_bit)
             .collect()
     }
 
@@ -143,21 +150,36 @@ impl ReceiveFlow {
         if id & 1 != self.peer_bit {
             return Ok(());
         }
-        for prior in ((id & 3)..id).step_by(4) {
-            if !self.streams.contains_key(&prior) {
-                self.streams.insert(
-                    prior,
-                    ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?,
-                );
+        let kind = (id & 3) as usize;
+        let end = id / 4 + 1;
+        // Work is bounded by the advertised concurrent stream allowance,
+        // not by the connection's cumulative stream number.
+        for n in self.opened[kind]..end {
+            let prior = n * 4 + kind as u64;
+            if let std::collections::btree_map::Entry::Vacant(slot) = self.streams.entry(prior) {
+                slot.insert(ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?);
             }
         }
+        self.opened[kind] = self.opened[kind].max(end);
         Ok(())
+    }
+
+    pub(crate) fn is_closed(&self, id: u64) -> bool {
+        id <= MAX_VARINT && id / 4 < self.opened[(id & 3) as usize] && !self.streams.contains_key(&id)
     }
 
     /// Charge the increase in highest offset, including gaps, once only.
     /// Failed insertions never change the aggregate credit or create streams.
     pub fn insert(&mut self, id: u64, offset: u64, data: &[u8], fin: bool) -> Result<(), Error> {
         self.check_id(id)?;
+        if self.is_closed(id) {
+            // RFC 9000 permits forgetting final size after stream closure.
+            // Keep a bounded recent cache for stricter duplicate checks.
+            return match self.recent_closed.get_mut(&id) {
+                Some(stream) => stream.insert(offset, data, fin).map_err(Error::Receive),
+                None => Ok(()),
+            };
+        }
         let end = offset.checked_add(data.len() as u64).ok_or(Error::Limit)?;
         let old = self
             .streams
@@ -179,11 +201,17 @@ impl ReceiveFlow {
             self.streams.insert(id, stream);
         }
         self.used = used;
-        Ok(())
+        self.register_implicit(id)
     }
 
     pub fn reset(&mut self, id: u64, final_size: u64, code: u64) -> Result<(), Error> {
         self.check_id(id)?;
+        if self.is_closed(id) {
+            return match self.recent_closed.get_mut(&id) {
+                Some(stream) => stream.reset(final_size, code).map_err(Error::Receive),
+                None => Ok(()),
+            };
+        }
         let old = self
             .streams
             .get(&id)
@@ -204,7 +232,7 @@ impl ReceiveFlow {
             self.streams.insert(id, stream);
         }
         self.used = used;
-        Ok(())
+        self.register_implicit(id)
     }
 
     pub fn check_stop(&self, id: u64) -> Result<(), Error> {
@@ -245,15 +273,17 @@ impl ReceiveFlow {
 
     /// Return cumulative peer stream credit and connection credit only once,
     /// after the application has released a terminal receive direction.
-    /// Lifetime IDs remain capped at 64 per direction; no ID is reused.
+    /// Active allocation stays bounded while cumulative IDs grow to the
+    /// protocol maximum. Closed streams cannot be reopened by late frames.
     pub(crate) fn retire(&mut self, id: u64) -> Option<(Option<u64>, Option<u64>)> {
-        if self.retired.contains(&id) { return None; }
         let released = self.streams.get_mut(&id)?.release_terminal()?;
-        self.retired.insert(id);
+        let terminal = self.streams.remove(&id)?;
+        self.recent_closed.insert(id, terminal);
+        if self.recent_closed.len() > RECENT_CLOSED { self.recent_closed.pop_first(); }
         self.max_data = self.max_data.saturating_add(released).min(MAX_VARINT);
         let grant = if id & 1 == self.peer_bit {
             let limit = if id & 2 == 0 { &mut self.max_bidi } else { &mut self.max_uni };
-            if *limit < MAX_STREAMS { *limit += 1; Some(*limit) } else { None }
+            if *limit < MAX_STREAM_COUNT { *limit += 1; Some(*limit) } else { None }
         } else { None };
         Some((grant, (released != 0).then_some(self.max_data)))
     }
@@ -311,6 +341,27 @@ mod tests {
         f.insert(10, 3, b"z", true).unwrap();
         assert_eq!(f.retire(10), Some((Some(4), Some(28))));
     }
+    #[test]
+    fn cumulative_stream_credit_reuses_memory_not_identifiers() {
+        let mut f = ReceiveFlow::new(true, 1, 2, 16, 16, 16).unwrap();
+        // Keep the first uni stream open (as H3 control streams do).
+        f.insert(2, 0, b"", false).unwrap();
+        for n in 1..=1024u64 {
+            let id = n * 4 + 2;
+            f.reset(id, 1, 7).unwrap();
+            assert_eq!(f.retire(id).unwrap().0, Some(n + 2));
+            assert_eq!(f.streams.len(), 1);
+            assert!(f.recent_closed.len() <= RECENT_CLOSED);
+        }
+        let used = f.used();
+        f.insert(6, 0, b"x", true).unwrap();
+        f.reset(6, 1, 7).unwrap();
+        assert_eq!(f.used(), used);
+        assert!(f.is_closed(6));
+        assert_eq!(f.peer_streams(), vec![2]);
+        assert!(f.insert(4 * 1026 + 2, 0, b"x", false).is_err());
+    }
+
     #[test]
     fn reset_charges_final_size_once_and_discards_buffer() {
         let mut f = ReceiveFlow::new(true, 1, 1, 16, 8, 12).unwrap();

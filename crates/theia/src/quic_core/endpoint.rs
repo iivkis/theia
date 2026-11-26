@@ -396,6 +396,7 @@ impl LabSession {
         if !self.active() {
             return Err(Error::Closed);
         }
+        if self.send.is_closed(id) { return Ok(()); }
         if !self.scheduler.can_queue() {
             return Err(Error::Schedule(super::scheduler::Error::Limit));
         }
@@ -433,7 +434,10 @@ impl LabSession {
     /// terminate and reliable STREAM/RESET frames are acknowledged.
     pub(crate) fn retire_stream(&mut self, id: u64, tx: bool, rx: bool) -> Result<bool, Error> {
         if tx && (!self.send.terminal(id) || self.scheduler.stream_pending(id)) { return Ok(false); }
-        if !rx { return Ok(true); }
+        if !rx {
+            if tx { self.send.retire(id); }
+            return Ok(true);
+        }
         if !self.scheduler.can_queue_n(2) { return Ok(false); }
         let Some((grant, data)) = self.receive.retire(id) else { return Ok(false); };
         if let Some(limit) = grant {
@@ -442,6 +446,7 @@ impl LabSession {
             self.queue_credit(if bidi { 0x12 } else { 0x13 }, limit)?;
         }
         if let Some(limit) = data { self.queue_credit(0x10, limit)?; }
+        if tx { self.send.retire(id); }
         Ok(true)
     }
 
@@ -505,7 +510,7 @@ impl LabSession {
     fn register_implicit(&mut self, id: u64) -> Result<(), Error> {
         self.receive.register_implicit(id).map_err(Error::Receive)?;
         if id & 2 == 0 && id & 1 != u64::from(self.server) {
-            for prior in ((id & 3)..=id).step_by(4) {
+            for prior in self.receive.peer_streams().into_iter().filter(|id| id & 2 == 0) {
                 self.send.register_peer_bidi(prior).map_err(Error::Send)?;
             }
         }
