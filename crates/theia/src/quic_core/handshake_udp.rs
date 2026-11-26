@@ -87,6 +87,7 @@ fn params(
     local: &[u8; CID_LEN],
     original: &[u8],
     retry: Option<&[u8]>,
+    initial_reset: Option<[u8; 16]>,
 ) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     parameters::append(&mut out, 0x11, &versions.information(version, server))
@@ -94,6 +95,7 @@ fn params(
     parameters::append(&mut out, 0x0f, local).map_err(|_| Error::Protocol)?;
     if server {
         parameters::append(&mut out, 0x00, original).map_err(|_| Error::Protocol)?;
+        if let Some(token) = initial_reset { parameters::append(&mut out, 0x02, &token).map_err(|_| Error::Protocol)?; }
     }
     if server {
         if let Some(cid) = retry {
@@ -769,6 +771,7 @@ pub async fn establish(
             remote: remote.to_vec(),
             original: original.to_vec(),
             retry: None,
+            initial_reset: None,
             token: Vec::new(),
             versions: if server {
                 VersionPolicy::both()
@@ -813,10 +816,22 @@ pub async fn connect_versions(
     tls: Arc<ClientConfig>,
     name: ServerName<'static>,
 ) -> Result<(Version, LabSession), Error> {
+    connect_versions_scoped(local, peer, versions, tls, name, super::scope::NetworkScope::loopback()).await
+}
+
+/// Explicit pinned-interface client for controlled non-loopback acceptance.
+pub async fn connect_versions_scoped(
+    local: SocketAddr,
+    peer: SocketAddr,
+    versions: VersionPolicy,
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    scope: super::scope::NetworkScope,
+) -> Result<(Version, LabSession), Error> {
     let mut version = versions.preferred();
     for restarted in [false, true] {
         let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
-        if !super::loopback_pair(socket.local_addr().map_err(Error::Io)?, peer) {
+        if !scope.permits(socket.local_addr().map_err(Error::Io)?, peer) {
             return Err(Error::Scope);
         }
         let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
@@ -830,12 +845,13 @@ pub async fn connect_versions(
             remote: original.to_vec(),
             original: original.to_vec(),
             retry: None,
+            initial_reset: None,
             token: Vec::new(),
             versions: versions.clone(),
             restarted,
         };
         match establish_inner(
-            socket.into(),
+            SessionIo::direct(socket, scope),
             peer,
             route,
             Config::Client {
@@ -860,7 +876,7 @@ pub async fn connect_versions(
 /// The candidate is created exclusively after the listener validates Retry.
 /// TLS and CID parameters must still authenticate before returning a session.
 pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabSession, Error> {
-    let (socket, peer, binding, token, versions) = candidate.into_parts();
+    let (socket, peer, binding, token, initial_reset, versions) = candidate.into_parts();
     let original = binding.original;
     let remote = binding.client;
     if !(8..=20).contains(&original.len())
@@ -881,6 +897,7 @@ pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabS
             remote,
             original,
             retry: Some(binding.retry.to_vec()),
+            initial_reset: Some(initial_reset),
             token,
             versions,
             restarted: false,
@@ -912,6 +929,7 @@ struct InitialRoute {
     remote: Vec<u8>,
     original: Vec<u8>,
     retry: Option<Vec<u8>>,
+    initial_reset: Option<[u8; 16]>,
     token: Vec<u8>,
     versions: VersionPolicy,
     restarted: bool,
@@ -929,10 +947,12 @@ async fn establish_inner(
         remote,
         original,
         retry,
+        initial_reset,
         token,
         versions,
         restarted,
     } = route;
+    if !socket.scope().permits(socket.local_addr().map_err(Error::Io)?, peer) { return Err(Error::Scope); }
     let server = matches!(&config, Config::Server(_));
     let parameters = params(
         server,
@@ -941,6 +961,7 @@ async fn establish_inner(
         &local,
         &original,
         retry.as_deref(),
+        initial_reset,
     )?;
     let connection = match config {
         Config::Client { tls: config, name } => tls::client(config, version, name, parameters),
@@ -1065,6 +1086,7 @@ async fn establish_inner(
             binding,
             peer_limits: limits,
             peer_reset_token,
+            peer_disable_migration: peer_params.get(0x0c).is_some(),
             tail,
             early_application: handshake.early_application,
         },

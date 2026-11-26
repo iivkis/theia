@@ -169,10 +169,71 @@ pub async fn run_native_lab(
         return Err(ServerError::Io);
     }
     let _slot = context.connection_slot().ok_or(ServerError::Io)?;
+    let (_owner, phase) = watch::channel(GenerationPhase::Active);
+    run_native_session(session, context, phase).await
+}
+
+/// Explicit pinned-address own-TLS trial, not wired to runtime selection.
+/// The common context enforces connection and request quotas before relay.
+/// On shutdown refuse new connections and drain existing H3 streams.
+pub async fn serve_native_pinned<F>(
+    socket: tokio::net::UdpSocket,
+    scope: crate::quic_core::scope::NetworkScope,
+    tls: Arc<rustls::ServerConfig>,
+    context: Arc<ServerContext>,
+    shutdown: F,
+) -> Result<(), ServerError>
+where F: std::future::Future<Output = ()> + Send,
+{
+    use crate::quic_core::{handshake_udp, listener::Listener, negotiation::VersionPolicy};
+    if !scope.is_pinned() || !context.allows_native_lab() || tls.send_tls13_tickets != 0 {
+        return Err(ServerError::Io);
+    }
+    let mut listener = Listener::with_scope(socket, 128, VersionPolicy::both(), scope).map_err(|_| ServerError::Io)?;
+    let (owner, phase) = watch::channel(GenerationPhase::Active);
+    let mut connections = JoinSet::new();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = connections.join_next(), if !connections.is_empty() => {},
+            incoming = listener.accept() => {
+                let candidate = incoming.map_err(|_| ServerError::Io)?;
+                let Some(slot) = context.connection_slot() else { continue; };
+                let context = context.clone();
+                let tls = tls.clone();
+                let phase = phase.clone();
+                connections.spawn(async move {
+                    let _slot = slot;
+                    if let Ok(session) = handshake_udp::accept(candidate, tls).await {
+                        let _ = run_native_session(session, context, phase).await;
+                    }
+                });
+            }
+        }
+    }
+    listener.stop_accepting().await.map_err(|_| ServerError::Io)?;
+    let _ = owner.send(GenerationPhase::Drain);
+    let _ = timeout(server::GENERATION_DRAIN, async {
+        while !connections.is_empty() {
+            tokio::select! {
+                _ = connections.join_next() => {},
+                incoming = listener.accept() => { if incoming.is_err() { break; } }
+            }
+        }
+    }).await;
+    Ok(())
+}
+
+async fn run_native_session(
+    session: crate::quic_core::endpoint::LabSession,
+    context: Arc<ServerContext>,
+    phase: watch::Receiver<GenerationPhase>,
+) -> Result<(), ServerError> {
+    let peer = session.peer_addr().ip();
     let (transport, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session)
         .map_err(|_| ServerError::Io)?;
     let binding = None;
-    let (_owner, phase) = watch::channel(GenerationPhase::Active);
     run_h3(
         transport,
         context,

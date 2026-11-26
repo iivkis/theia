@@ -62,6 +62,7 @@ pub(crate) struct Established {
     pub binding: zeroize::Zeroizing<[u8; 32]>,
     pub peer_limits: super::parameters::Limits,
     pub peer_reset_token: Option<[u8; 16]>,
+    pub peer_disable_migration: bool,
     pub tail: Option<HandshakeTail>,
     pub early_application: Vec<Vec<u8>>,
 }
@@ -72,6 +73,7 @@ pub struct LabSession {
     local_ids: BTreeMap<u64, [u8; CID_LEN]>,
     next_local_sequence: u64,
     peer_cid_limit: usize,
+    peer_disable_migration: bool,
     auto_cids: bool,
     cid_retry_at: Option<Instant>,
     peer_ids: PeerIds,
@@ -135,6 +137,7 @@ impl LabSession {
             binding,
             peer_limits,
             peer_reset_token,
+            peer_disable_migration,
             tail,
             early_application,
         } = established;
@@ -155,6 +158,7 @@ impl LabSession {
         session.peer_ids =
             PeerIds::with_initial(remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
         session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
+        session.peer_disable_migration = peer_disable_migration;
         session.send =
             SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
         session.receive.enable_autotune().map_err(Error::Receive)?;
@@ -187,7 +191,7 @@ impl LabSession {
         confirmed: bool,
     ) -> Result<Self, Error> {
         let local = socket.local_addr().map_err(Error::Io)?;
-        if !super::loopback_pair(local, peer)
+        if !socket.scope().permits(local, peer)
             || local_cid.as_slice() == remote_cid
             || local_cid == [0; CID_LEN]
             || remote_cid.is_empty()
@@ -221,6 +225,7 @@ impl LabSession {
             local_ids: BTreeMap::from([(0, local_cid)]),
             next_local_sequence: 1,
             peer_cid_limit: 2,
+            peer_disable_migration: false,
             auto_cids: false,
             cid_retry_at: None,
             peer_ids: PeerIds::with_initial(remote_cid, None, 2).map_err(|_| Error::Protocol)?,
@@ -344,15 +349,15 @@ impl LabSession {
     /// CID and recovery reset. This does not enable public addresses.
     /// Existing streams and cryptographic packet numbers remain intact.
     pub async fn rebind(&mut self, socket: UdpSocket, now: Instant) -> Result<(), Error> {
-        if self.server || !self.confirmed || !self.active() {
+        if self.server || self.peer_disable_migration || !self.confirmed || !self.active() {
             return Err(Error::Scope);
         }
         let previous = self.socket.local_addr().map_err(Error::Io)?;
         let next = socket.local_addr().map_err(Error::Io)?;
         let cross_ip = next.ip() != previous.ip();
         let rotate = self.peer_ids.has_spare();
-        if !next.ip().is_loopback()
-            || next.is_ipv4() != self.paths.active().is_ipv4()
+        let scope = self.socket.scope();
+        if !scope.permits(next, self.paths.active())
             || (cross_ip && !rotate)
             || (rotate && !self.scheduler.can_queue())
             || next == previous
@@ -369,7 +374,7 @@ impl LabSession {
         if cross_ip {
             self.scheduler.restart_path(now);
         }
-        self.socket = socket.into();
+        self.socket = SessionIo::direct(socket, scope);
         let peer = self.paths.active();
         if let Err(e) = self.send_path(peer, &[1], now).await {
             self.abort();
@@ -900,7 +905,7 @@ impl LabSession {
         }
         let new_path = source != self.paths.active();
         if new_path
-            && (!self.server || !self.confirmed || !self.active() || !source.ip().is_loopback())
+            && (!self.server || !self.confirmed || !self.active() || !self.socket.scope().permits(self.socket.local_addr().map_err(Error::Io)?, source))
         {
             return Ok(false);
         }

@@ -26,6 +26,7 @@ pub mod parameters;
 pub mod path;
 pub mod recovery;
 pub mod scheduler;
+pub mod scope;
 pub mod send_flow;
 pub mod spaces;
 pub mod stream;
