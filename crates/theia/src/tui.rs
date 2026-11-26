@@ -7186,7 +7186,41 @@ mod tests {
                 let area = Rect::new(0, 0, 160, 42);
                 let records = workspace_columns(shell_layout(area)[1]).unwrap()[1];
                 ui.select_workspace_page(role, 3);
-                ui.mouse(&mut model, click_at(records.x + 2, records.y + 2), area);
+                // The compact sidebar wraps the active address (including '*').
+                // A physical row is not a profile index. Click every visible row
+                // of the second profile and verify selection without activation.
+                let rows = record_rows(ui.editor.as_ref().unwrap(), records);
+                let active_rows: Vec<_> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, (index, _))| (*index == 0).then_some(row))
+                    .collect();
+                let backup_rows: Vec<_> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, (index, _))| (*index == 1).then_some(row))
+                    .collect();
+                assert!(active_rows.len() > 1, "fixture must wrap the active label");
+                assert!(!backup_rows.is_empty());
+                for row in active_rows {
+                    ui.mouse(
+                        &mut model,
+                        click_at(records.x + 2, records.y + 1 + row as u16),
+                        area,
+                    );
+                    assert_eq!(ui.editor.as_ref().unwrap().selected_record_id(), "home");
+                }
+                for row in backup_rows {
+                    ui.mouse(
+                        &mut model,
+                        click_at(records.x + 2, records.y + 1 + row as u16),
+                        area,
+                    );
+                    assert_eq!(ui.editor.as_ref().unwrap().selected_record_id(), "backup");
+                    assert!(!ui.editor.as_ref().unwrap().selected_record_is_active());
+                    assert!(!ui.owned_running(role));
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+                }
                 let editor = ui.editor.as_ref().unwrap();
                 assert_eq!(editor.selected_record_id(), "backup");
                 assert!(!editor.selected_record_is_active());
@@ -7694,6 +7728,27 @@ mod tests {
             label,
             "№2 long-label-for-testing-profile-address.example.org:443"
         );
+        // Both narrow and wide terminal layouts must map continuation rows
+        // to the same profile. Re-select the first profile before each click
+        // so this also checks that mouse selection actually changes focus.
+        for area in [Rect::new(0, 0, 70, 34), Rect::new(0, 0, 120, 40), Rect::new(0, 0, 160, 42)] {
+            let body = shell_layout(area)[1];
+            let records = workspace_columns(body).map_or(body, |columns| columns[1]);
+            ui.editor.as_mut().unwrap().workspace_select(0);
+            ui.workspace_focus = WorkspaceFocus::Records;
+            let rows = record_rows(ui.editor.as_ref().unwrap(), records);
+            let row = rows.iter().rposition(|(index, _)| *index == 1).unwrap();
+            ui.mouse(
+                &mut model,
+                click_at(records.x + 2, records.y + 1 + row as u16),
+                area,
+            );
+            assert_eq!(ui.editor.as_ref().unwrap().selected_record_id(), "backup");
+            assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
+            assert!(!ui.editor.as_ref().unwrap().selected_record_is_active());
+            assert!(!ui.owned_running(Role::Client));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
         ui.update(&mut model, press(KeyCode::F(7)));
         assert!(ui
             .preview_text
