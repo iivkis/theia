@@ -1,0 +1,108 @@
+//! Bounded send-side credit for locally opened unidirectional streams.
+//! Retransmissions use existing frame references and never reserve credit again.
+use super::wire::{encode_varint, MAX_VARINT};
+use std::collections::BTreeMap;
+
+const MAX_STREAMS: u64 = 64;
+pub const MAX_CHUNK: usize = 1000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error { Limit, Stream, Finished }
+
+struct Stream {
+    offset: u64,
+    limit: u64,
+    fin: bool,
+}
+
+pub struct SendFlow {
+    local_bit: u64,
+    max_streams: u64,
+    initial_limit: u64,
+    max_data: u64,
+    used: u64,
+    streams: BTreeMap<u64, Stream>,
+}
+
+impl SendFlow {
+    pub fn new(server: bool, max_streams: u64, stream_limit: u64, max_data: u64) -> Result<Self, Error> {
+        if max_streams > (1 << 60) || stream_limit > MAX_VARINT || max_data > MAX_VARINT { return Err(Error::Limit); }
+        Ok(Self { local_bit: u64::from(server), max_streams: max_streams.min(MAX_STREAMS),
+            initial_limit: stream_limit, max_data, used: 0, streams: BTreeMap::new() })
+    }
+
+    pub fn open(&mut self) -> Result<u64, Error> {
+        let n = self.streams.len() as u64;
+        if n >= self.max_streams { return Err(Error::Limit); }
+        let id = n * 4 + 2 + self.local_bit;
+        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false });
+        Ok(id)
+    }
+
+    pub fn max_data(&mut self, value: u64) -> Result<(), Error> {
+        if value > MAX_VARINT { return Err(Error::Limit); }
+        self.max_data = self.max_data.max(value);
+        Ok(())
+    }
+
+    pub fn max_streams(&mut self, value: u64) -> Result<(), Error> {
+        if value > (1 << 60) { return Err(Error::Limit); }
+        self.max_streams = self.max_streams.max(value.min(MAX_STREAMS));
+        Ok(())
+    }
+
+    pub fn max_stream_data(&mut self, id: u64, value: u64) -> Result<(), Error> {
+        if value > MAX_VARINT { return Err(Error::Limit); }
+        let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
+        stream.limit = stream.limit.max(value);
+        Ok(())
+    }
+
+    /// Encode one STREAM frame and commit newly sent byte offsets. The caller
+    /// must reserve queue capacity first; failed encoding leaves credit intact.
+    pub fn encode(&mut self, id: u64, bytes: &[u8], fin: bool) -> Result<Vec<u8>, Error> {
+        let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
+        if stream.fin { return Err(Error::Finished); }
+        if bytes.len() > MAX_CHUNK || (bytes.is_empty() && !fin) { return Err(Error::Limit); }
+        let n = bytes.len() as u64;
+        let end = stream.offset.checked_add(n).ok_or(Error::Limit)?;
+        let total = self.used.checked_add(n).ok_or(Error::Limit)?;
+        if end > stream.limit || total > self.max_data { return Err(Error::Limit); }
+        let mut out = vec![0x0e | u8::from(fin)];
+        for value in [id, stream.offset, n] {
+            let mut scratch = [0; 8];
+            out.extend_from_slice(encode_varint(value, &mut scratch).ok_or(Error::Limit)?);
+        }
+        out.extend_from_slice(bytes);
+        stream.offset = end;
+        stream.fin = fin;
+        self.used = total;
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quic_core::{frames::{decode, Frame}, spaces::Space};
+
+    #[test]
+    fn credit_and_fin() {
+        let mut f = SendFlow::new(false, 1, 3, 4).unwrap();
+        let id = f.open().unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(f.open(), Err(Error::Limit));
+        assert_eq!(f.encode(id, b"abcd", false), Err(Error::Limit));
+        let bytes = f.encode(id, b"ab", false).unwrap();
+        assert_eq!(decode(&bytes, Space::Application).unwrap(), [Frame::Stream { id, offset: 0, data: b"ab", fin: false }]);
+        f.max_stream_data(id, 4).unwrap();
+        f.max_stream_data(id, 1).unwrap();
+        f.encode(id, b"cd", true).unwrap();
+        assert_eq!(f.encode(id, b"", true), Err(Error::Finished));
+        f.max_streams(2).unwrap();
+        let second = f.open().unwrap();
+        assert_eq!(f.encode(second, b"x", false), Err(Error::Limit));
+        f.max_data(5).unwrap();
+        f.encode(second, b"x", true).unwrap();
+    }
+}

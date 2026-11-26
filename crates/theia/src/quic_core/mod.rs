@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ack;
+pub mod ack_tx;
 pub mod congestion;
 pub mod flow;
 pub mod frames;
@@ -13,6 +14,7 @@ pub mod loss;
 pub mod packet;
 pub mod parameters;
 pub mod recovery;
+pub mod send_flow;
 pub mod spaces;
 pub mod stream;
 pub mod tls;
