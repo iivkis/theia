@@ -137,14 +137,25 @@ impl Cache {
     }
 
     pub(super) fn failed(&self, key: &Key, strategy: Strategy) {
-        self.observe(key, strategy, false, Duration::ZERO);
-        self.remember(
-            key,
-            Verdict::Avoid {
-                strategy,
-                until: Instant::now() + NEGATIVE_TTL,
-            },
-        );
+        if network_scope::observe(key.address) != Some(key.network) {
+            return;
+        }
+        self.sample(key, strategy, false, Duration::ZERO);
+        self.invalidate_strategy(key, strategy);
+    }
+
+    fn invalidate_strategy(&self, key: &Key, strategy: Strategy) {
+        let Ok(mut cache) = self.0.lock() else { return; };
+        let now = Instant::now();
+        cache.retain(|entry| entry.expires > now);
+        if let Some(entry) = cache.iter_mut().find(|entry| &entry.key == key) {
+            // Late results from a previous stream must not invalidate an
+            // independently verified different strategy or extend a cooldown.
+            if entry.verdict == Verdict::Verified(strategy) {
+                entry.verdict = Verdict::Avoid { strategy, until: now + NEGATIVE_TTL };
+                entry.expires = now + POSITIVE_TTL;
+            }
+        }
     }
 }
 #[cfg(test)]
@@ -160,6 +171,21 @@ mod tests {
         assert_eq!(cache.ranked(&key), [Strategy::Balanced, Strategy::Middle, Strategy::Header]);
         key.policy = [2; 32];
         assert_eq!(cache.ranked(&key), Strategy::ALL);
+    }
+
+    #[test]
+    fn late_failure_preserves_other_strategy_and_original_cooldown() {
+        let cache = Cache::default();
+        let address = "127.0.0.1:443".parse().unwrap();
+        let key = Key { name: "example.org".into(), address, policy: [1; 32], network: network_scope::Scope::fixture(address, 0) };
+        cache.insert(&key, Verdict::Verified(Strategy::Middle));
+        cache.invalidate_strategy(&key, Strategy::Header);
+        assert!(matches!(cache.cached(&key), Some(Verdict::Verified(Strategy::Middle))));
+        cache.invalidate_strategy(&key, Strategy::Middle);
+        let first = cache.0.lock().unwrap().front().unwrap().verdict;
+        assert!(matches!(cache.cached(&key), Some(Verdict::Unavailable)));
+        cache.invalidate_strategy(&key, Strategy::Middle);
+        assert!(cache.0.lock().unwrap().front().unwrap().verdict == first);
     }
 
     #[test]

@@ -55,6 +55,10 @@ impl VerifiedUdp {
         self.engine.check_policy(self.key.policy)
     }
 
+    pub(crate) fn fallback_policy(&self) -> FallbackPolicy {
+        FallbackPolicy { engine: self.engine.clone(), digest: self.key.policy }
+    }
+
     pub(crate) fn admissible(&self) -> Result<bool, ClientError> {
         self.check_policy()?;
         Ok(self.engine.enabled()
@@ -254,7 +258,7 @@ impl Engine {
                             key,
                         });
                     }
-                    _ => self.cache.remember(&key, Verdict::Unavailable),
+                    _ => self.cache.failed(&key, strategy),
                 }
             }
             None

@@ -2351,9 +2351,13 @@ async fn udp_association(
                     let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
                     let relay=tunnel.relay(rx,down_tx);
                     let deliver=async {
+                        let mut packet = Vec::new();
                         while let Some(data)=down_rx.recv().await {
                             observer.lock().unwrap_or_else(|e|e.into_inner()).incoming(&data);
-                            let Some(packet)=udp_relay::encode_socks(&address,port,&data) else { continue; };
+                            if !udp_relay::encode_socks_into(&mut packet, &address, port, &data) {
+                                crate::traffic::udp_queue_drop();
+                                continue;
+                            }
                             let n=timeout(REPLY_TIMEOUT,socket.send_to(&packet,source)).await
                                 .map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
                             if n!=packet.len(){return Err(ClientError::Io);}

@@ -161,9 +161,11 @@ impl Tunnel {
             Self::VerifiedQuic(verified, fallback) => {
                 let Some(first) = upload.recv().await else { return Ok(()); };
                 if !verified.admissible()? {
-                    let tunnel = fallback.await?;
-                    verified.check_policy()?;
+                    let authorization = verified.fallback_policy();
                     drop(verified);
+                    authorization.check()?;
+                    let tunnel = fallback.await?;
+                    authorization.check()?;
                     if !matches!(tunnel, Self::H2(_) | Self::H3(_)) {
                         return Err(ClientError::Protocol);
                     }
@@ -322,15 +324,23 @@ pub(crate) fn parse_socks(bytes: &[u8]) -> Option<(Address, u16, &[u8])> {
     }
     Some((address, port, data))
 }
-pub(crate) fn encode_socks(address: &Address, port: u16, data: &[u8]) -> Option<Vec<u8>> {
-    if port == 0 || matches!(address, Address::Dns(name) if !protocol::valid_dns(name)) { return None; }
-    let mut out = vec![0, 0, 0];
-    encode_address(&mut out, address, port);
-    if out.len() + data.len() > protocol::MAX_DATAGRAM {
-        return None;
+pub(crate) fn encode_socks_into(out: &mut Vec<u8>, address: &Address, port: u16, data: &[u8]) -> bool {
+    out.clear();
+    if port == 0 || matches!(address, Address::Dns(name) if !protocol::valid_dns(name)) { return false; }
+    out.extend([0, 0, 0]);
+    encode_address(out, address, port);
+    if data.len() > protocol::MAX_DATAGRAM.saturating_sub(out.len()) {
+        out.clear();
+        return false;
     }
     out.extend(data);
-    Some(out)
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn encode_socks(address: &Address, port: u16, data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_socks_into(&mut out, address, port, data).then_some(out)
 }
 #[cfg(test)]
 mod tests {
@@ -360,6 +370,21 @@ mod tests {
             "127.0.0.1".parse().unwrap()
         ));
     }
+    #[test]
+    fn reusable_socks_buffer_never_keeps_previous_datagram() {
+        let address = Address::V4([127, 0, 0, 1]);
+        let mut packet = Vec::new();
+        assert!(encode_socks_into(&mut packet, &address, 443, b"previous"));
+        let capacity = packet.capacity();
+        assert!(encode_socks_into(&mut packet, &address, 443, b""));
+        assert_eq!(parse_socks(&packet), Some((address.clone(), 443, b"".as_slice())));
+        assert_eq!(packet.capacity(), capacity);
+        assert!(!encode_socks_into(&mut packet, &address, 0, b"bad"));
+        assert!(packet.is_empty());
+        assert!(!encode_socks_into(&mut packet, &address, 443, &vec![0; protocol::MAX_DATAGRAM]));
+        assert!(packet.is_empty());
+    }
+
     #[tokio::test]
     async fn active_flow_renews_idle_and_queue_overload_drops_without_replay() {
         let activity = Activity { last: Mutex::new(Instant::now()), idle: IDLE };
