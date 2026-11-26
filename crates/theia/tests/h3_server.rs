@@ -762,6 +762,26 @@ async fn pinned_native_h3_non_loopback_interface() {
     timeout(Duration::from_secs(60), exercise_pinned_native_endpoint(ip, true)).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_version_specific_probe_rejects_bad_trust_and_unapproved_endpoint() {
+    use theia::{camouflage_h3_probe::{probe_quic_h3_native, H3ProbeError}, camouflage_probe::{ProbeApproval, ProbeRequest}, quic_core::wire::Version};
+    let (remote, server, roots) = native_fixture(true).await;
+    let request = ProbeRequest { address: remote, server_name: "localhost".into(), deadline: Duration::from_secs(5) };
+    let source = remote.ip();
+    let approval = ProbeApproval::isolated_loopback_fixture(remote);
+    assert!(matches!(probe_quic_h3_native(request.clone(), roots.clone(), ProbeApproval::Denied, source, Version::V2).await, Err(H3ProbeError::NotApproved)));
+    for version in [Version::V1, Version::V2] {
+        let report = probe_quic_h3_native(request.clone(), roots.clone(), approval, source, version).await.unwrap();
+        assert_eq!(report.version, version);
+        assert_eq!(report.source, source);
+        assert_eq!(report.transport.connected_ip, remote.ip());
+    }
+    let mut wrong = request.clone();
+    wrong.server_name = "wrong.invalid".into();
+    assert!(matches!(probe_quic_h3_native(wrong, roots, approval, source, Version::V2).await, Err(H3ProbeError::HandshakeRejected)));
+    server.abort();
+}
+
 /// Manual matched loopback workload: raw samples, no performance claim.
 /// Run in release mode on a quiet machine; independent network/CPU/RSS
 /// measurements remain separate acceptance requirements.

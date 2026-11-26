@@ -625,7 +625,13 @@ impl H3Client {
     /// Dropping the endpoint closes this probe; it never opens a tunnel.
     pub(crate) async fn probe(&self) -> Result<(), ClientError> {
         if let Some(version) = self.native_lab {
-            return self.native_connection(version).await.map(|_| ());
+            return timeout(self.connect_timeout, async {
+                let mut session = self.native_connection(version).await?;
+                crate::camouflage_h3_probe::finish_native_handshake(&mut session).await.map_err(|_| ClientError::Tls)?;
+                session.close(0x100, std::time::Instant::now()).map_err(|_| ClientError::Tls)?;
+                session.flush(std::time::Instant::now()).await.map_err(|_| ClientError::Tls)?;
+                Ok(())
+            }).await.map_err(|_| ClientError::Timeout)?;
         }
         self.verified_connection().await.map(|_| ())
     }
