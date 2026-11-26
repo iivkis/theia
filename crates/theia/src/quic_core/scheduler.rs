@@ -151,7 +151,7 @@ impl Scheduler {
     pub(crate) fn permits_flight(&self, ordinary: u64, probe: u64, now: Instant) -> bool {
         let path = self.path.lock().expect("path lock");
         probe <= MTU && (ordinary == 0 || (path.next_send.is_none_or(|at| now >= at)
-            && path.window.in_flight().saturating_add(ordinary) <= path.window.cwnd()))
+            && path.window.in_flight().saturating_add(ordinary).saturating_add(probe) <= path.window.cwnd()))
     }
 
     /// Cross-IP migration occurs only after Handshake discard. Reset model
@@ -695,7 +695,7 @@ impl Scheduler {
         if path.undo.as_ref().is_some_and(|undo| undo.pending.is_empty()) {
             let undo = path.undo.take().expect("checked undo");
             if let (Some(bbr), Some(old)) = (path.bbr.as_mut(), undo.bbr) {
-                bbr.undo_loss(old);
+                bbr.undo_loss(old, now);
                 let target = bbr.cwnd();
                 path.window.set_target(target).map_err(|_| Error::Window)?;
             } else if path.bbr.is_none() {
@@ -755,6 +755,7 @@ impl Drop for Scheduler {
     fn drop(&mut self) {
         let Ok(mut path) = self.path.lock() else { return; };
         if path.undo.as_ref().is_some_and(|undo| self.lost_tx.values().any(|id| undo.pending.contains(id))) { path.undo = None; }
+        if self.ledger.bytes_in_flight() != 0 { path.pto_count = 0; }
         let _ = path.window.retire(self.ledger.bytes_in_flight());
         if let Some(bbr) = path.bbr.as_mut() {
             for id in self.active_tx.values().chain(self.lost_tx.values()) {

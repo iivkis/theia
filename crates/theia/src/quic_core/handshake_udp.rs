@@ -424,7 +424,7 @@ impl Handshake {
         }
         let ordinary: u64 = packets.iter().filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
         let probes: u64 = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
-        if !self.application_schedule.permits_flight(ordinary, probes, now) {
+        if packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() > 1 || !self.application_schedule.permits_flight(ordinary, probes, now) {
             return Ok(false);
         }
         if self.server && !self.budget.reserve_send(total as u64) {
@@ -528,7 +528,7 @@ impl Handshake {
             if !self.server || self.budget.can_send(MTU as u64) {
                 let ordinary = packets.iter().filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
                 let probes = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
-                if self.application_schedule.permits_flight(ordinary, probes, now) {
+                if packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() <= 1 && self.application_schedule.permits_flight(ordinary, probes, now) {
                     return self.emit(socket, peer, packets, now).await;
                 }
             }
