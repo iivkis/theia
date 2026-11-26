@@ -9,6 +9,7 @@ use super::{
     frames::{self, Frame},
     handshake::{Driver, Level},
     initial::crypto_frame,
+    negotiation::VersionPolicy,
     packet::{self, Reader, Writer},
     parameters::{self, Parameters, PeerContext},
     recovery::PathBudget,
@@ -43,6 +44,7 @@ pub enum Error {
     Scope,
     Protocol,
     Timeout,
+    VersionNegotiation(Version),
     Io(io::Error),
     Tls(rustls::Error),
     Driver(super::handshake::Error),
@@ -79,11 +81,14 @@ impl Epoch {
 
 fn params(
     server: bool,
+    version: Version,
+    versions: &VersionPolicy,
     local: &[u8; CID_LEN],
     original: &[u8; CID_LEN],
     retry: Option<&[u8; CID_LEN]>,
 ) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
+    parameters::append(&mut out, 0x11, &versions.information(version, server)).map_err(|_| Error::Protocol)?;
     parameters::append(&mut out, 0x0f, local).map_err(|_| Error::Protocol)?;
     if server {
         parameters::append(&mut out, 0x00, original).map_err(|_| Error::Protocol)?;
@@ -208,6 +213,8 @@ struct Handshake {
     token: Vec<u8>,
     peer_progress: bool,
     initial_frames: Vec<Vec<u8>>,
+    versions: VersionPolicy,
+    restarted: bool,
 }
 
 impl Handshake {
@@ -351,6 +358,14 @@ impl Handshake {
             return Ok(());
         };
         for packet in packets {
+            if packet.kind == super::datagram::PacketKind::VersionNegotiation {
+                if !self.server && !self.restarted && self.retry.is_none() {
+                    if let Ok(offered) = super::negotiation::version_candidates(packet.bytes, self.version, &self.local, &self.original, self.peer_progress) {
+                        if let Some(version) = self.versions.choose(&offered) { return Err(Error::VersionNegotiation(version)); }
+                    }
+                }
+                continue;
+            }
             if packet.kind == super::datagram::PacketKind::Retry {
                 self.apply_retry(packet.bytes)?;
                 continue;
@@ -481,6 +496,8 @@ pub async fn establish(
             original,
             retry: None,
             token: Vec::new(),
+            versions: if server { VersionPolicy::both() } else { VersionPolicy::exact(version) },
+            restarted: false,
         },
         config,
     )
@@ -508,10 +525,33 @@ pub async fn connect(
     .await
 }
 
+/// Explicit version preference, one fresh retry only after a context-valid VN.
+/// The second attempt authenticates server version information before exporter
+/// material is returned. TLS failures and ordinary timeouts never select another version.
+pub async fn connect_versions(local: SocketAddr, peer: SocketAddr, versions: VersionPolicy,
+    tls: Arc<ClientConfig>, name: ServerName<'static>) -> Result<(Version, LabSession), Error> {
+    let mut version = versions.preferred();
+    for restarted in [false, true] {
+        let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
+        if !super::loopback_pair(socket.local_addr().map_err(Error::Io)?, peer) { return Err(Error::Scope); }
+        let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
+        let original = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
+        if cid == original || cid == [0; CID_LEN] || original == [0; CID_LEN] { return Err(Error::Protocol); }
+        let route = InitialRoute { version, local: cid, remote: original, original, retry: None,
+            token: Vec::new(), versions: versions.clone(), restarted };
+        match establish_inner(socket.into(), peer, route, Config::Client { tls: tls.clone(), name: name.clone() }).await {
+            Ok(session) => return Ok((version, session)),
+            Err(Error::VersionNegotiation(next)) if !restarted && next != version && versions.supports(next) => version = next,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::Protocol)
+}
+
 /// The candidate is created exclusively after the listener validates Retry.
 /// TLS and CID parameters must still authenticate before returning a session.
 pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabSession, Error> {
-    let (socket, peer, binding, token) = candidate.into_parts();
+    let (socket, peer, binding, token, versions) = candidate.into_parts();
     let original =
         <[u8; CID_LEN]>::try_from(binding.original.as_slice()).map_err(|_| Error::Protocol)?;
     let remote =
@@ -529,6 +569,8 @@ pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabS
             original,
             retry: Some(binding.retry),
             token,
+            versions,
+            restarted: false,
         },
         Config::Server(tls),
     )
@@ -558,6 +600,8 @@ struct InitialRoute {
     original: [u8; CID_LEN],
     retry: Option<[u8; CID_LEN]>,
     token: Vec<u8>,
+    versions: VersionPolicy,
+    restarted: bool,
 }
 
 async fn establish_inner(
@@ -573,9 +617,11 @@ async fn establish_inner(
         original,
         retry,
         token,
+        versions,
+        restarted,
     } = route;
     let server = matches!(&config, Config::Server(_));
-    let parameters = params(server, &local, &original, retry.as_ref())?;
+    let parameters = params(server, version, &versions, &local, &original, retry.as_ref())?;
     let connection = match config {
         Config::Client { tls: config, name } => tls::client(config, version, name, parameters),
         Config::Server(config) => {
@@ -602,6 +648,8 @@ async fn establish_inner(
         token,
         peer_progress: false,
         initial_frames: Vec::new(),
+        versions,
+        restarted,
     };
     if server && retry.is_some() {
         handshake.budget.validate();
@@ -636,6 +684,7 @@ async fn establish_inner(
     }
     let peer_params = Parameters::parse(handshake.driver.peer_parameters().ok_or(Error::Protocol)?)
         .map_err(|_| Error::Protocol)?;
+    handshake.versions.validate_information(peer_params.get(0x11), version, !server, restarted).map_err(|_| Error::Protocol)?;
     let limits = peer_params
         .validate(PeerContext {
             server: !server,

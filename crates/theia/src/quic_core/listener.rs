@@ -4,7 +4,7 @@
 //! connection driver and external acceptance remain mandatory.
 use super::{
     ingress::{Action, Ingress},
-    negotiation::Binding,
+    negotiation::{Binding, VersionPolicy},
 };
 use std::{
     collections::BTreeMap,
@@ -81,11 +81,12 @@ pub struct Candidate {
     peer: SocketAddr,
     binding: Binding,
     token: Vec<u8>,
+    versions: VersionPolicy,
 }
 
 impl Candidate {
-    pub(crate) fn into_parts(self) -> (SessionIo, SocketAddr, Binding, Vec<u8>) {
-        (self.io, self.peer, self.binding, self.token)
+    pub(crate) fn into_parts(self) -> (SessionIo, SocketAddr, Binding, Vec<u8>, VersionPolicy) {
+        (self.io, self.peer, self.binding, self.token, self.versions)
     }
 }
 
@@ -97,6 +98,10 @@ pub struct Listener {
 
 impl Listener {
     pub fn new(socket: UdpSocket, limit: usize) -> io::Result<Self> {
+        Self::with_versions(socket, limit, VersionPolicy::both())
+    }
+
+    pub fn with_versions(socket: UdpSocket, limit: usize, versions: VersionPolicy) -> io::Result<Self> {
         let local = socket.local_addr()?;
         if !local.ip().is_loopback()
             || socket.peer_addr().is_ok()
@@ -104,9 +109,9 @@ impl Listener {
         {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
-        let ingress = Ingress::new(limit).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let ingress = Ingress::with_versions(limit, versions.clone()).map_err(|_| io::ErrorKind::InvalidInput)?;
         let (tx, candidates) = mpsc::channel(limit);
-        let worker = tokio::spawn(run(Arc::new(socket), ingress, tx));
+        let worker = tokio::spawn(run(Arc::new(socket), ingress, tx, versions));
         Ok(Self {
             local,
             candidates,
@@ -136,6 +141,7 @@ async fn run(
     socket: Arc<UdpSocket>,
     mut ingress: Ingress,
     accepts: mpsc::Sender<Candidate>,
+    versions: VersionPolicy,
 ) -> io::Result<()> {
     let clock = Instant::now();
     let mut routes: BTreeMap<u64, mpsc::Sender<Datagram>> = BTreeMap::new();
@@ -176,7 +182,7 @@ async fn run(
                             tx.try_send((bytes.to_vec(), peer)).map_err(|_| io::ErrorKind::InvalidData)?;
                             routes.insert(owner, tx);
                             permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), incoming },
-                                peer, binding, token });
+                                peer, binding, token, versions: versions.clone() });
                         } else {
                             ingress.close(owner, now).map_err(|_| io::ErrorKind::InvalidData)?;
                         }

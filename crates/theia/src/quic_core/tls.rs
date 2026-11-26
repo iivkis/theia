@@ -470,6 +470,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_negotiation_restarts_with_fresh_connection_and_authenticated_choice() {
+        use crate::quic_core::{handshake_udp, listener::Listener, negotiation::VersionPolicy};
+        use tokio::net::UdpSocket;
+        let (cc, mut sc) = configs();
+        sc.send_tls13_tickets = 0;
+        let mut listener = Listener::with_versions(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2,
+            VersionPolicy::exact(Version::V1)).unwrap();
+        let addr = listener.local_addr();
+        let (client, server) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(handshake_udp::connect_versions("127.0.0.1:0".parse().unwrap(), addr,
+                VersionPolicy::new(&[Version::V2, Version::V1]).unwrap(), Arc::new(cc), ServerName::try_from("localhost").unwrap()),
+                async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await })
+        }).await.unwrap();
+        let (version, mut client) = client.unwrap();
+        let mut server = server.unwrap();
+        assert_eq!(version, Version::V1);
+        assert_eq!(&client.take_channel_binding().unwrap()[..], &server.take_channel_binding().unwrap()[..]);
+    }
+
+    #[tokio::test]
     async fn native_h3_request_response_and_exporter_v1_v2() {
         use crate::quic_core::{h3_adapter::NativeConnection, handshake_udp, listener::Listener};
         use bytes::{Buf, Bytes};

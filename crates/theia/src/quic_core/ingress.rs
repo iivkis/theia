@@ -5,7 +5,7 @@
 //! connection driver and its security/interop gates are integrated.
 use super::{
     datagram::{self, Demux, PacketKind, CID_LEN},
-    negotiation::{self, Binding, Tokens, TOKEN_TTL},
+    negotiation::{self, Binding, Tokens, VersionPolicy, TOKEN_TTL},
     wire::Version,
 };
 use crate::reality_quic_wire::{long, retry_integrity_tag};
@@ -46,10 +46,15 @@ pub struct Ingress {
     limit: usize,
     occupied: usize,
     now: u64,
+    versions: VersionPolicy,
 }
 
 impl Ingress {
     pub fn new(limit: usize) -> Result<Self, Error> {
+        Self::with_versions(limit, VersionPolicy::both())
+    }
+
+    pub fn with_versions(limit: usize, versions: VersionPolicy) -> Result<Self, Error> {
         Ok(Self {
             routes: Demux::new(limit).map_err(|_| Error::Limit)?,
             owners: BTreeMap::new(),
@@ -59,6 +64,7 @@ impl Ingress {
             limit,
             occupied: 0,
             now: 0,
+            versions,
         })
     }
 
@@ -139,9 +145,9 @@ impl Ingress {
         if peer.port() == 0 || datagram.is_empty() || datagram.len() > MAX_DATAGRAM {
             return Ok(Action::Drop);
         }
-        if let Some((version, dcid, scid)) = unsupported_header(datagram) {
+        if let Some((version, dcid, scid)) = invariant_header(datagram) {
             if version != 0
-                && Version::from_wire(version).is_none()
+                && Version::from_wire(version).is_none_or(|v| !self.versions.supports(v))
                 && <Cid>::try_from(dcid)
                     .ok()
                     .is_none_or(|cid| self.available(cid))
@@ -152,7 +158,7 @@ impl Ingress {
                 reply.extend_from_slice(scid);
                 reply.push(dcid.len() as u8);
                 reply.extend_from_slice(dcid);
-                for v in [Version::V1, Version::V2] {
+                for v in self.versions.versions() {
                     reply.extend(v.wire().to_be_bytes());
                 }
                 return Ok(Action::Reply(reply));
@@ -183,7 +189,7 @@ impl Ingress {
         let Some(header) = long(head.bytes) else {
             return Ok(Action::Drop);
         };
-        let Some(version) = head.version else {
+        let Some(version) = head.version.filter(|v| self.versions.supports(*v)) else {
             return Ok(Action::Drop);
         };
         if header.token.is_empty() {
@@ -226,12 +232,12 @@ impl Ingress {
 
 /// QUIC invariant header only. No type interpretation for unknown
 /// versions. Bounded by the native endpoint's supported CID lengths.
-fn unsupported_header(bytes: &[u8]) -> Option<(u32, &[u8], &[u8])> {
+fn invariant_header(bytes: &[u8]) -> Option<(u32, &[u8], &[u8])> {
     if bytes.len() < 1200 || bytes.first()? & 0x80 == 0 {
         return None;
     }
     let version = u32::from_be_bytes(bytes.get(1..5)?.try_into().ok()?);
-    if version == 0 || Version::from_wire(version).is_some() {
+    if version == 0 {
         return None;
     }
     let dlen = usize::from(*bytes.get(5)?);
