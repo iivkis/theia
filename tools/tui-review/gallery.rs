@@ -217,6 +217,21 @@ fn visual_review_gallery() {
         assert!(ui.config_dialog.is_some());
         review_capture(&format!("{prefix}-first-run-{}", if role == Role::Server { "reality" } else { "key-import" }), &model, &ui);
         assert!(!new_path.exists());
+        if role == Role::Server {
+            let dialog = ui.config_dialog.as_mut().unwrap();
+            dialog.select_field(2);
+            dialog.paste("93.184.216.1");
+            dialog.select_field(5);
+            dialog.paste("phone");
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(ui.config_dialog.as_ref().unwrap().guide().is_some_and(|g| g.2 == "Источники поиска"));
+            review_capture("server-first-reality-sources", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(ui.config_dialog.as_ref().unwrap().guide().is_some_and(|g| g.2 == "Поиск адресов сайтов"));
+            review_capture("server-first-reality-dns-consent", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(!new_path.exists());
+        }
 
         let labels = if role == Role::Server {
             ["overview", "connections", "users", "invitations", "traffic", "settings", "diagnostics"]

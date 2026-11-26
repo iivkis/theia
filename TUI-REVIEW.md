@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (8ea9f17a47d147ace551dee09f5c7f1f68be653b) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (abd7ffe3206cce3ff4d474c4130a272ea5b71fde) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -25,3 +25,5 @@ The navigation review captures both horizontal role selections and the section, 
 This review pins the unified vertical action layout and explicit confirmation choices (cancel selected initially), tests confirmation focus versus execution, direct profile selection and wrapped long addresses, and checks opt-in technical server status. The gallery captures actual keyboard-driven choices without starting real network listeners.
 
 Review captures compact report-aligned choices, no single-step progress marker, safe save recovery, a separate private-link reveal confirmation, arrow-driven passive diagnostics, and actual registered REALITY server summary/technical views. All network consent is cancelled; status observation does not start listeners.
+
+The gallery includes the revised first-run server wizard source selection and DNS consent screen; no external probes are approved.
