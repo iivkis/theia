@@ -93,6 +93,7 @@ impl Fixture {
             disabled: false,
         };
         let policy = ServerPolicy {
+            routing: None,
             allow_private_ips: true,
             max_connections_per_user: 8,
             max_connections_total: 8,

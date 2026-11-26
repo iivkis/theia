@@ -4168,6 +4168,7 @@ mod hardening_tests {
                     },
                 ],
                 policy: ServerPolicy {
+                    routing: None,
                     allow_private_ips: false,
                     max_connections_per_user: 1,
                     max_connections_total: 3,

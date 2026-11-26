@@ -69,6 +69,7 @@ fn fixture_with_roots(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask
         },
     ];
     let policy = ServerPolicy {
+        routing: None,
         allow_private_ips: private,
         max_connections_per_user: 8,
         max_connections_total: 8,

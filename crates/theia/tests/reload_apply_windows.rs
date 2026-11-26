@@ -134,6 +134,7 @@ async fn atomic_apply_rotates_h2_and_h3_without_dropping_open_tunnels_or_quotas(
                     disabled: false,
                 }],
                 policy: ServerPolicy {
+                    routing: None,
                     allow_private_ips: true,
                     max_connections_per_user: 5,
                     max_connections_total: 12,

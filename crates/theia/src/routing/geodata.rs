@@ -8,7 +8,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -321,6 +321,11 @@ impl Store {
         ).map_err(|_| Error::Io)?;
         Pair::verified(manifest, site.to_vec(), ip.to_vec(), rules)
     }
+    /// Prepare exact content-addressed files, not the mutable active pointer.
+    pub fn load_pinned(&self, manifest: &Manifest, rules: &[Rule]) -> Result<Pair, Error> {
+        let text = toml::to_string(manifest).map_err(|_| Error::Format)?;
+        self.load_bytes(text.as_bytes(), rules)
+    }
     pub fn load(&self, rules: &[Rule]) -> Result<Option<Pair>, Error> {
         self.current_bytes()?.map(|b| self.load_bytes(&b, rules)).transpose()
     }
@@ -396,7 +401,7 @@ fn new_file(path: &Path) -> std::io::Result<File> {
     { crate::client_import::new_private_file(path) }
     #[cfg(not(windows))]
     {
-        let mut options = OpenOptions::new();
+        let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         {

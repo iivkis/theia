@@ -2,6 +2,8 @@
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
 pub mod snapshot;
 pub mod geodata;
+mod settings;
+pub use settings::Settings;
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -367,51 +369,65 @@ pub struct Policy {
     ips: HashMap<String, IpCategory>,
 }
 
+type Selectors = (Vec<CompiledRule>, HashSet<String>, HashSet<String>);
+
+fn compile_selectors(rules: &[Rule]) -> Result<Selectors, RoutingError> {
+    if rules.len() > MAX_RULES { return Err(RoutingError::Limit); }
+    let mut site_codes = HashSet::new();
+    let mut ip_codes = HashSet::new();
+    let mut compiled = Vec::new();
+    let mut selectors = 0usize;
+    for rule in rules {
+        if rule.name.trim().is_empty() || rule.name.len() > 128
+            || rule.name.chars().any(char::is_control)
+            || (rule.domains.is_empty() && rule.ips.is_empty())
+        {
+            return Err(RoutingError::InvalidRule);
+        }
+        selectors = selectors.saturating_add(rule.domains.len()).saturating_add(rule.ips.len());
+        if selectors > MAX_SELECTORS {
+            return Err(RoutingError::Limit);
+        }
+        let mut domains = Vec::new();
+        let mut ips = Vec::new();
+        for selector in &rule.domains {
+            domains.push(if let Some(value) = selector.strip_prefix("geosite:") {
+                let code = category(value)?;
+                site_codes.insert(code.clone());
+                DomainSelector::Category(code)
+            } else if let Some(value) = selector.strip_prefix("full:") {
+                DomainSelector::Literal(DomainPattern::Full(domain_name(value)?))
+            } else {
+                let value = selector.strip_prefix("domain:").unwrap_or(selector);
+                DomainSelector::Literal(DomainPattern::Suffix(domain_name(value)?))
+            });
+        }
+        for selector in &rule.ips {
+            ips.push(if let Some(value) = selector.strip_prefix("geoip:") {
+                let code = category(value)?;
+                ip_codes.insert(code.clone());
+                IpSelector::Category(code)
+            } else {
+                IpSelector::Literal(Cidr::parse(selector)?)
+            });
+        }
+        compiled.push(CompiledRule { action: rule.action, domains, ips });
+    }
+
+    Ok((compiled, site_codes, ip_codes))
+}
+
 impl Policy {
+    /// Syntactic validation; category existence is checked against pinned DAT at prepare time.
+    pub fn validate_rules(rules: &[Rule]) -> Result<(), RoutingError> {
+        compile_selectors(rules).map(|_| ())
+    }
+
     pub fn compile(rules: &[Rule], geosite: &[u8], geoip: &[u8]) -> Result<Self, RoutingError> {
         if rules.len() > MAX_RULES || geosite.len() > MAX_DAT || geoip.len() > MAX_DAT {
             return Err(RoutingError::Limit);
         }
-        let mut site_codes = HashSet::new();
-        let mut ip_codes = HashSet::new();
-        let mut compiled = Vec::new();
-        let mut selectors = 0usize;
-        for rule in rules {
-            if rule.name.trim().is_empty() || rule.name.len() > 128
-                || rule.name.chars().any(char::is_control)
-                || (rule.domains.is_empty() && rule.ips.is_empty())
-            {
-                return Err(RoutingError::InvalidRule);
-            }
-            selectors = selectors.saturating_add(rule.domains.len()).saturating_add(rule.ips.len());
-            if selectors > MAX_SELECTORS {
-                return Err(RoutingError::Limit);
-            }
-            let mut domains = Vec::new();
-            let mut ips = Vec::new();
-            for selector in &rule.domains {
-                domains.push(if let Some(value) = selector.strip_prefix("geosite:") {
-                    let code = category(value)?;
-                    site_codes.insert(code.clone());
-                    DomainSelector::Category(code)
-                } else if let Some(value) = selector.strip_prefix("full:") {
-                    DomainSelector::Literal(DomainPattern::Full(domain_name(value)?))
-                } else {
-                    let value = selector.strip_prefix("domain:").unwrap_or(selector);
-                    DomainSelector::Literal(DomainPattern::Suffix(domain_name(value)?))
-                });
-            }
-            for selector in &rule.ips {
-                ips.push(if let Some(value) = selector.strip_prefix("geoip:") {
-                    let code = category(value)?;
-                    ip_codes.insert(code.clone());
-                    IpSelector::Category(code)
-                } else {
-                    IpSelector::Literal(Cidr::parse(selector)?)
-                });
-            }
-            compiled.push(CompiledRule { action: rule.action, domains, ips });
-        }
+        let (compiled, site_codes, ip_codes) = compile_selectors(rules)?;
         let mut count = 0usize;
         let mut regex_count = 0usize;
         let mut sites = HashMap::new();

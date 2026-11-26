@@ -117,6 +117,7 @@ fn listener_with_pem_bound_mode(
         disabled: false,
     };
     let policy = ServerPolicy {
+        routing: None,
         allow_private_ips: private,
         max_connections_per_user: 8,
         max_connections_total: 8,
@@ -814,6 +815,7 @@ async fn client_binary_chromium_socks5_over_h3() {
         disabled: false,
     };
     let policy = ServerPolicy {
+        routing: None,
         allow_private_ips: true,
         max_connections_per_user: 8,
         max_connections_total: 8,
@@ -1289,6 +1291,7 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
             disabled: false,
         };
         let policy = ServerPolicy {
+            routing: None,
             allow_private_ips: true,
             max_connections_per_user: 8,
             max_connections_total: 8,

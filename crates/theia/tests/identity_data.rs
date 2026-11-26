@@ -34,6 +34,7 @@ const DEADLINE: Duration = Duration::from_secs(25);
 
 fn policy(allow_private_ips: bool) -> ServerPolicy {
     ServerPolicy {
+        routing: None,
         allow_private_ips,
         max_connections_per_user: 8,
         max_connections_total: 8,

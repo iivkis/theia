@@ -1731,6 +1731,7 @@ impl FirstSetup {
                             disabled: true,
                         }],
                         policy: config::ServerPolicy {
+                            routing: None,
                             allow_private_ips: false,
                             max_connections_per_user: 64,
                             max_connections_total: 1024,

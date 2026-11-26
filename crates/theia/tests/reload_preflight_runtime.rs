@@ -97,6 +97,7 @@ async fn live_binary_preflight_accepts_safe_delta_rejects_identity_drift_and_nev
                 disabled: false,
             }],
             policy: ServerPolicy {
+                routing: None,
                 allow_private_ips: true,
                 max_connections_per_user: 2,
                 max_connections_total: 8,

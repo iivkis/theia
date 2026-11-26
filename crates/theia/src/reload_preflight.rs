@@ -492,6 +492,7 @@ mod tests {
                     disabled: false,
                 }],
                 policy: ServerPolicy {
+                    routing: None,
                     allow_private_ips: false,
                     max_connections_per_user: 2,
                     max_connections_total: 8,
