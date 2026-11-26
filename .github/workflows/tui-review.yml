@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: b91cd4d5ab1af44a8a8e12804182dd315af7e396
+          ref: 837d34c427336dabfe02b7e19b75a66509627b34
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -119,6 +119,8 @@ jobs:
             geodata_automatic_activation_preserves_pending_edit_and_rejects_rollback \
             client_status_requires_canonical_fields_and_exact_revision_cas \
             real_local_proxy_modes_validate_credentials_and_relay_over_both_transports \
+            conditional_snapshot_is_exact_and_rejects_ambiguous_headers \
+            conditional_refresh_reuses_only_the_exact_verified_snapshot \
             cache_rejects_rollback_and_equivocation \
             direct_dial_and_relay \
             visual_review_gallery
@@ -170,7 +172,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "b91cd4d5ab1af44a8a8e12804182dd315af7e396"
+          assert manifest["source_sha"] == "837d34c427336dabfe02b7e19b75a66509627b34"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
@@ -209,3 +211,39 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -m "Publish Linux TUI visual review [skip ci]"
           git push origin HEAD:refs/heads/build/tui-review
+
+  real-dat-diagnostic:
+    # Separate online evidence; does not block gallery publishing.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 837d34c427336dabfe02b7e19b75a66509627b34
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: routing-real-dat-release
+      - name: Install native build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake clang libclang-dev pkg-config
+      - name: Verify real upstream DAT and measure local snapshot costs
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            git rev-parse HEAD
+            uname -a
+            lscpu
+            cargo test --locked -p theia --release --test routing_real_dat -- --ignored --nocapture
+          } 2>&1 | tee "$RUNNER_TEMP/routing-real-dat.log"
+          grep -Eq 'test result: ok\. 1 passed; 0 failed' "$RUNNER_TEMP/routing-real-dat.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: routing-real-dat-diagnostic
+          path: ${{ runner.temp }}/routing-real-dat.log
+          if-no-files-found: error
+          retention-days: 14
