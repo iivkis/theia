@@ -158,6 +158,35 @@ const CLIENT: &[Group] = &[
     },
 ];
 
+const STARTUP_SERVER: &[Group] = &[
+    Group {
+        title: "Состояние сервера",
+        entries: &[
+            always("Запуск / остановка локального сервера", Action::ServerProcess),
+            always("Проверить сервер", key('v')),
+            always("Монитор трафика", Action::Traffic),
+            always("Проверить готовность к перезапуску", key('R')),
+        ],
+    },
+    Group {
+        title: "Дополнительно",
+        entries: &[
+            always("Сетевая диагностика", key('p')),
+            always("Комплект по готовому плану", key('w')),
+            always("Открыть конфигурацию", Action::Config),
+        ],
+    },
+];
+const STARTUP_CLIENT: &[Group] = &[
+    Group {
+        title: "Дополнительно",
+        entries: &[
+            always("Монитор трафика", Action::Traffic),
+            always("Открыть сохранённые настройки", Action::Config),
+        ],
+    },
+];
+
 pub(crate) struct Menu {
     role: Role,
     group: usize,
@@ -177,9 +206,11 @@ impl Menu {
     }
 
     fn groups(&self) -> &'static [Group] {
-        match self.role {
-            Role::Server => SERVER,
-            Role::Client => CLIENT,
+        match (self.role, self.configured) {
+            (Role::Server, true) => SERVER,
+            (Role::Client, true) => CLIENT,
+            (Role::Server, false) => STARTUP_SERVER,
+            (Role::Client, false) => STARTUP_CLIENT,
         }
     }
 
@@ -2111,7 +2142,11 @@ mod tests {
         for role in [Role::Server, Role::Client] {
             for configured in [false, true] {
                 let mut menu = Menu::new(role, configured);
-                assert_eq!(Menu::categories(role).len(), menu.groups().len());
+                if configured {
+                    assert_eq!(Menu::categories(role).len(), menu.groups().len());
+                } else {
+                    assert!(menu.groups().iter().flat_map(|group| group.entries).all(|entry| !entry.requires_config));
+                }
                 let group_count = menu.groups().len();
                 for group in 0..group_count {
                     menu.click(area, 2, 1 + group as u16);
@@ -2162,16 +2197,12 @@ mod tests {
     fn unconfigured_actions_do_not_mutate_and_selection_is_visible() {
         let mut m = Menu::new(Role::Client, false);
         m.key(KeyCode::Enter);
-        assert_eq!(m.key(KeyCode::Enter), Some(key('V')));
-        m.key(KeyCode::Down);
         assert_eq!(m.key(KeyCode::Enter), Some(Action::Traffic));
-        m.key(KeyCode::End);
-        assert_eq!(m.key(KeyCode::Enter), None);
-        assert!(m.body(10).contains("Сначала откройте"));
-        assert!(m.body(6).contains("Режим подключения (прокси / TUN)"));
-        m.key(KeyCode::Esc);
-        m.key(KeyCode::End);
-        m.key(KeyCode::Enter);
+        assert!(m.body(10).contains("Монитор трафика"));
+        m.key(KeyCode::Down);
         assert_eq!(m.key(KeyCode::Enter), Some(Action::Config));
+        assert!(!m.body(10).contains("Импорт"));
+        m.key(KeyCode::Esc);
+        assert_eq!(m.key(KeyCode::Esc), Some(Action::Close));
     }
 }

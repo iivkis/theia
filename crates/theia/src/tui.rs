@@ -452,7 +452,7 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
         (_, 0) => &[('>', "Перейти к следующему шагу")],
         (Role::Server, 1) => &[
             ('N', "Создать подключение"),
-            ('G', "Разрешить доступ пользователям"),
+            ('l', "Публичная ссылка (без ключа доступа)"),
             ('V', "Состояние REALITY"),
             ('E', "Свой TLS-сертификат"),
             ('K', "Заменить доверие REALITY"),
@@ -465,8 +465,8 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
             ('b', "Восстановить доступ и выдать ключ"),
             ('t', "Заменить ключ пользователя"),
             ('x', "Отключить пользователя"),
+            ('G', "Изменить права доступа"),
             ('U', "Удалить пользователя"),
-            ('l', "Публичная ссылка (без ключа доступа)"),
         ],
         (Role::Server, 3) => &[
             ('s', "Запуск / остановка"),
@@ -482,17 +482,14 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
         ],
         (Role::Server, 6) => &[('p', "Сетевая диагностика")],
         (Role::Client, 1) => &[
-            ('N', "Создать профиль вручную"),
+            ('N', "Добавить профиль вручную (Own-TLS)"),
             ('E', "Доверенный сертификат и ключ"),
             ('K', "Подтвердить доверие REALITY"),
             ('M', "Регистрация материалов"),
             ('l', "Публичная ссылка (без ключа доступа)"),
             ('D', "Удалить профиль"),
         ],
-        (Role::Client, 2) => &[
-            ('i', "Импорт ключа, файла или QR"),
-            ('I', "Расширенный импорт REALITY"),
-        ],
+        (Role::Client, 2) => &[('i', "Импорт ключа, файла или QR")],
         (Role::Client, 3) if cfg!(windows) => &[
             ('p', "Включить / выключить системный прокси"),
             ('V', "Запустить / остановить локальный прокси"),
@@ -545,8 +542,8 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
 fn recommendation_page(role: Role, key: char) -> (usize, char) {
     match (role, key) {
         (_, 'o' | 'S') => (5, key),
-        (Role::Server, 'N' | 'G') => (1, key),
-        (Role::Server, 'u' | 'b') => (2, key),
+        (Role::Server, 'N') => (1, key),
+        (Role::Server, 'u' | 'b' | 'G') => (2, key),
         (Role::Server, _) => (3, key),
         (Role::Client, 'i') => (2, key),
         (Role::Client, 'A') => (3, key),
@@ -1046,9 +1043,15 @@ impl Interaction {
         let Some(editor) = self.editor_for(role) else { return; };
         let (key, _) = recommended_step(editor, self.owned_running(role));
         let (page, key) = recommendation_page(role, key);
+        let user = if role == Role::Server && key == 'b' {
+            editor.workspace_users().iter().position(|(_, disabled, granted)| *disabled && *granted)
+        } else {
+            None
+        };
         let action = page_actions(role, page, Some(editor)).iter()
             .position(|item| item.key == key).unwrap_or(0);
         self.select_workspace_page(role, page);
+        if let Some(user) = user { self.workspace_user = user; }
         self.workspace_action = action;
         self.workspace_focus = WorkspaceFocus::Actions;
     }
@@ -2700,7 +2703,7 @@ impl Interaction {
                         }
                     }
                     if self.workspace_page != 1
-                        && !(page_has_users(role, self.workspace_page))
+                        && !page_has_users(role, self.workspace_page)
                         && self.workspace_focus == WorkspaceFocus::Fields
                         && !page_actions(role, self.workspace_page, self.editor_for(role))
                             .is_empty()
@@ -2765,11 +2768,7 @@ impl Interaction {
             if model.screen == Screen::Client && matches!(key.code, KeyCode::Char('i' | 'I')) {
                 self.open_config(Role::Client);
                 if let Some(dialog) = self.config_dialog.as_mut() {
-                    if key.code == KeyCode::Char('i') {
-                        dialog.begin_client_import();
-                    } else {
-                        dialog.prefer_reality();
-                    }
+                    dialog.begin_client_import();
                 }
                 return false;
             }
@@ -2847,9 +2846,10 @@ impl Interaction {
                             Err(message) => editor.error = Some(message.into()),
                         }
                     }
-                    KeyCode::Char('2') => match EnrollmentPanel::bound(editor) {
-                        Ok(panel) => self.reality_enrollment = Some(panel),
-                        Err(message) => editor.error = Some(message.into()),
+                    KeyCode::Char('2') => {
+                        self.workspace_page = 2;
+                        self.workspace_focus = WorkspaceFocus::Actions;
+                        self.workspace_action = 0;
                     },
                     KeyCode::Esc => {}
                     _ => self.records = Some(RecordFlow::ChooseMode(role, selected)),
@@ -3739,7 +3739,17 @@ impl Interaction {
                 && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
             {
                 match editor.require_clean_records() {
-                    Ok(()) => self.records = Some(RecordFlow::ChooseMode(editor.role(), 1)),
+                    Ok(()) if editor.role() == Role::Server => {
+                        self.records = Some(RecordFlow::ChooseMode(Role::Server, 1));
+                    }
+                    Ok(()) => match editor.record_fields(RecordAction::NewProfile) {
+                        Ok(fields) => self.records = Some(RecordFlow::Input {
+                            action: RecordAction::NewProfile,
+                            fields,
+                            focus: 0,
+                        }),
+                        Err(message) => editor.error = Some(message.into()),
+                    },
                     Err(message) => editor.error = Some(message.into()),
                 }
                 return false;
@@ -3973,22 +3983,7 @@ impl Interaction {
                 }
                 return false;
             }
-            if editor.role() == Role::Client && key.code == KeyCode::Char('I') {
-                if editor.dirty() {
-                    editor.error =
-                        Some("Сохраните или отмените черновик перед импортом REALITY.".into());
-                } else {
-                    match EnrollmentPanel::bound(editor) {
-                        Ok(panel) => {
-                            editor.error = None;
-                            self.reality_enrollment = Some(panel);
-                        }
-                        Err(message) => editor.error = Some(message.into()),
-                    }
-                }
-                return false;
-            }
-            if editor.role() == Role::Client && key.code == KeyCode::Char('i') {
+            if editor.role() == Role::Client && matches!(key.code, KeyCode::Char('i' | 'I')) {
                 if editor.dirty() {
                     editor.error = Some("Сохраните или отмените черновик перед импортом.".into());
                 } else {
@@ -5446,7 +5441,7 @@ fn draw_issuance(
                 "Заменить личный ключ"
             };
             let message = if recovering {
-                "В этом подключении нет отключённых пользователей с правом доступа.\nЕсли нужен новый ключ для включённого пользователя, выберите «Заменить приглашение»."
+                "В этом подключении нет отключённых пользователей с правом доступа.\nЕсли нужен новый ключ для включённого пользователя, выберите «Заменить ключ пользователя»."
             } else {
                 "В этом подключении нет включённых пользователей с правом доступа.\nДобавьте пользователя или восстановите его доступ."
             };
@@ -6005,7 +6000,7 @@ fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> 
         editor.map_or(6, |e| {
             (e.workspace_users().len() as u16)
                 .saturating_add(3)
-                .clamp(6, 12)
+                .clamp(9, 12)
         })
     } else if page == 0 {
         10
@@ -6369,7 +6364,7 @@ fn draw_page(
             focus == WorkspaceFocus::Actions
                 || (focus == WorkspaceFocus::Fields
                     && page != 1
-                    && !(page_has_users(role, page))),
+                    && !page_has_users(role, page)),
         );
     } else if focus == WorkspaceFocus::Actions && !items.is_empty() {
         Actions {
@@ -6664,25 +6659,21 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
     } else {
         "Enter — изменить выбранное поле"
     };
-    let actions = if server {
-        "Создайте подключение или запустите сервер"
-    } else {
-        "i Импорт приглашения · N Новый профиль · V Подключение"
-    };
+    let actions = "Другие операции находятся в соответствующих разделах.";
     let next = if editor.record_count() == 0 {
         if server {
-            "Создайте первое подключение (W или N)."
+            "Создайте первое подключение."
         } else {
-            "Импортируйте приглашение (i) или создайте профиль (N)."
+            "Откройте раздел «Импорт ключа» или добавьте профиль вручную."
         }
     } else if editor.write_uncertain() {
         "Откройте конфигурацию заново, прежде чем продолжать."
     } else if editor.dirty() {
         "Сохраните изменения (Ctrl+S). Это не изменяет работающий процесс."
     } else if server {
-        "Запустите сервер или выдайте доступ пользователю."
+        "Права доступа и ключи находятся в разделе «Пользователи и ключи»."
     } else {
-        "V — открыть подключение и проверить его состояние."
+        "Для запуска и проверки откройте раздел «Подключение»."
     };
     let title = if editor.editing {
         "Изменение параметра"
@@ -7971,6 +7962,10 @@ mod tests {
             assert!(!page_has_records(role, 5));
         }
         assert_eq!(recommendation_page(Role::Server, 'b'), (2, 'b'));
+        assert_eq!(recommendation_page(Role::Server, 'G'), (2, 'G'));
+        let imports = page_actions(Role::Client, 2, None);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].key, 'i');
         assert_eq!(recommendation_page(Role::Client, 'i'), (2, 'i'));
         assert_eq!(recommendation_page(Role::Client, 'A'), (3, 'A'));
         assert_eq!(recommendation_page(Role::Server, 'S'), (5, 'S'));
@@ -8068,6 +8063,13 @@ mod tests {
         ui.workspace_focus = WorkspaceFocus::Fields;
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(matches!(ui.importing, Some(ImportFlow::Input(_))));
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Char('I')));
+        assert!(matches!(ui.importing, Some(ImportFlow::Input(_))));
+        assert!(ui.reality_enrollment.is_none());
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Char('N')));
+        assert!(matches!(ui.records, Some(RecordFlow::Input { action: RecordAction::NewProfile, .. })));
         ui.update(&mut model, press(KeyCode::Esc));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!ui.editor.as_ref().unwrap().dirty());
