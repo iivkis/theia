@@ -530,43 +530,44 @@ impl H3Client {
     fn native_connection(
         &self,
         version: crate::quic_core::wire::Version,
-    ) -> impl std::future::Future<Output = Result<crate::quic_core::endpoint::LabSession, ClientError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<crate::quic_core::endpoint::LabSession, ClientError>>
+           + Send
+           + '_ {
         Box::pin(async move {
-        if !self.remote.ip().is_loopback()
-            || self.identity_quic.is_some()
-            || self.certificate_pin.is_some()
-        {
-            return Err(ClientError::Configuration);
-        }
-        let tls = crate::transport_policy::Carrier::H3
-            .client_tls(self.roots.clone())
-            .map_err(|_| ClientError::Tls)?;
-        let name =
-            ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
-        let bind = if self.remote.is_ipv4() {
-            "127.0.0.1:0"
-        } else {
-            "[::1]:0"
-        };
-        let socket = tokio::net::UdpSocket::bind(bind)
+            if !self.remote.ip().is_loopback()
+                || self.identity_quic.is_some()
+                || self.certificate_pin.is_some()
+            {
+                return Err(ClientError::Configuration);
+            }
+            let tls = crate::transport_policy::Carrier::H3
+                .client_tls(self.roots.clone())
+                .map_err(|_| ClientError::Tls)?;
+            let name =
+                ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
+            let bind = if self.remote.is_ipv4() {
+                "127.0.0.1:0"
+            } else {
+                "[::1]:0"
+            };
+            let socket = tokio::net::UdpSocket::bind(bind)
+                .await
+                .map_err(|_| ClientError::Io)?;
+            timeout(
+                self.connect_timeout,
+                crate::quic_core::handshake_udp::connect(
+                    socket,
+                    self.remote,
+                    version,
+                    Arc::new(tls),
+                    name,
+                ),
+            )
             .await
-            .map_err(|_| ClientError::Io)?;
-        timeout(
-            self.connect_timeout,
-            crate::quic_core::handshake_udp::connect(
-                socket,
-                self.remote,
-                version,
-                Arc::new(tls),
-                name,
-            ),
-        )
-        .await
-        .map_err(|_| ClientError::Timeout)?
-        .map_err(|_| ClientError::Tls)
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::Tls)
         })
     }
-
 
     async fn verified_connection(
         &self,

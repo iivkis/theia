@@ -56,7 +56,8 @@ pub fn split(datagram: &[u8]) -> Result<Vec<Packet<'_>>, Error> {
         // protected packet. Never interpret a terminal zero suffix as a
         // packet or as authenticated bytes.
         if out.first().is_some_and(|p| p.kind == PacketKind::Initial)
-            && remaining.iter().all(|&b| b == 0) {
+            && remaining.iter().all(|&b| b == 0)
+        {
             break;
         }
         let first = remaining[0];

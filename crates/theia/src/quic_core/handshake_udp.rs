@@ -577,9 +577,12 @@ impl Handshake {
         for frame in self.initial_frames.drain(..) {
             let parsed = frames::decode(&frame, Space::Initial).map_err(|_| Error::Protocol)?;
             for item in parsed {
-                let Frame::Crypto { offset, data } = item else { return Err(Error::Protocol); };
+                let Frame::Crypto { offset, data } = item else {
+                    return Err(Error::Protocol);
+                };
                 for (i, part) in data.chunks(chunk).enumerate() {
-                    let frame = crypto_frame(offset + (i * chunk) as u64, part).map_err(|_| Error::Protocol)?;
+                    let frame = crypto_frame(offset + (i * chunk) as u64, part)
+                        .map_err(|_| Error::Protocol)?;
                     epoch.schedule.enqueue(frame).map_err(Error::Schedule)?;
                 }
             }
