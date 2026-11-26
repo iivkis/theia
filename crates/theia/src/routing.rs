@@ -72,7 +72,7 @@ impl std::fmt::Display for RoutingError {
 }
 impl std::error::Error for RoutingError {}
 
-fn domain_name(value: &str) -> Result<String, RoutingError> {
+pub(crate) fn domain_name(value: &str) -> Result<String, RoutingError> {
     let value = value.strip_suffix('.').unwrap_or(value);
     if value.is_empty()
         || value.len() > 253
