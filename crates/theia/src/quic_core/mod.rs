@@ -49,6 +49,9 @@ mod scope_tests {
         assert!(!loopback_pair(local, "127.0.0.1:0".parse().unwrap()));
         assert!(!loopback_pair(local, "192.0.2.1:443".parse().unwrap()));
         assert!(!loopback_pair("0.0.0.0:1234".parse().unwrap(), peer));
-        assert!(loopback_pair("[::1]:1234".parse().unwrap(), "[::1]:4321".parse().unwrap()));
+        assert!(loopback_pair(
+            "[::1]:1234".parse().unwrap(),
+            "[::1]:4321".parse().unwrap()
+        ));
     }
 }
