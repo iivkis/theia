@@ -26,6 +26,23 @@ fn visual_review_gallery() {
     let client = root.join("client.toml");
     std::fs::write(&server, server_issuance_fixture()).unwrap();
     std::fs::write(&client, include_str!("../../../examples/client.toml")).unwrap();
+    // Capture otherwise nondeterministic asynchronous wizard stages using
+    // the real renderer and offline test-only state fixtures.
+    {
+        let path = root.join("wizard-review-only.toml");
+        let model = Model::new(Some(Role::Server));
+        for (name, panel) in ProvisionPanel::review_wizard_stages(path.clone()) {
+            let mut ui = Interaction::new(None);
+            ui.reality_provision = Some(panel);
+            review_capture(name, &model, &ui);
+            if name == "state-reality-step5-ranked-review" {
+                let screen = rendered_interaction(120, 40, &model, &ui);
+                assert!(screen.contains("Основной") && screen.contains("Резерв"));
+                assert!(screen.contains("Конфигурация к сохранению"));
+            }
+            assert!(!path.exists());
+        }
+    }
     // Real first-run import through the production state machine, using a synthetic invitation.
     first_key_import_fixture(&root.join("first-own-tls"), review_capture);
     // Exercise a self-contained REALITY key through the actual first-run UI.
@@ -229,6 +246,10 @@ fn visual_review_gallery() {
             ui.update(&mut model, press(KeyCode::Enter));
             assert!(ui.config_dialog.as_ref().unwrap().guide().is_some_and(|g| g.2 == "Поиск адресов сайтов"));
             review_capture("server-first-reality-dns-consent", &model, &ui);
+            ui.update(&mut model, press(KeyCode::F(2)));
+            assert!(ui.config_dialog.as_ref().unwrap().guide().is_some_and(|g| g.2 == "Полный список целей"));
+            review_capture("server-first-reality-dns-expanded", &model, &ui);
+            ui.update(&mut model, press(KeyCode::Esc));
             ui.update(&mut model, press(KeyCode::Esc));
             assert!(!new_path.exists());
         }

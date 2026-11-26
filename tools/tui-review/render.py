@@ -81,7 +81,9 @@ def main():
     required = {"home-role-selection","help","server-page-overview","server-page-connections","server-page-users",
                 "client-page-overview","client-page-profiles","client-action-invitation-import","server-action-reality-wizard"}
     required.update({"client-first-key-input", "client-first-key-trust", "client-first-key-save-review", "client-first-key-saved", "client-first-key-connect"})
-    assert required <= {e["scenario"] for e in entries}
+    required.update(["server-first-reality-dns-expanded","state-reality-step4-tls-consent","state-reality-step4-tls-progress","state-reality-step4-tls-recheck","state-reality-step5-ranked-review","state-reality-step5-no-eligible","state-reality-step6-saving","state-reality-step6-save-error","state-reality-step6-save-uncertain"])
+    missing = required - {e["scenario"] for e in entries}
+    assert not missing, f"missing required screens: {sorted(missing)}"
     hashes = {e["scenario"]: e["sha256"] for e in entries}
     assert hashes["server-action-server-process"] != hashes["server-page-connections"], "server process screenshot duplicates connections"
     assert len(entries) >= 50, f"unexpectedly incomplete gallery: {len(entries)}"
