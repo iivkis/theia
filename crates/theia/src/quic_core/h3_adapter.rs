@@ -383,6 +383,7 @@ impl NativeConnection {
     /// enter this API. This is intentionally not selectable in product config.
     pub fn start(mut session: LabSession) -> Result<(Self, zeroize::Zeroizing<[u8; 32]>), CE> {
         let key = session.take_channel_binding().ok_or_else(internal)?;
+        session.enable_auto_cids();
         let ready = Arc::new(Notify::new());
         let shared = Arc::new(Bridge { state: Mutex::new(State::default()), ready: ready.clone() });
         tokio::spawn(drive(session, Arc::downgrade(&shared), ready));

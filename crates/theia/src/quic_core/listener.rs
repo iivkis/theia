@@ -146,7 +146,7 @@ impl Listener {
         {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
-        let ingress = Ingress::with_versions(limit, versions.clone()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let ingress = Ingress::for_listener(limit, versions.clone()).map_err(|_| io::ErrorKind::InvalidInput)?;
         let (tx, candidates) = mpsc::channel(limit);
         let (commands, requests) = mpsc::channel(limit);
         let worker = tokio::spawn(run(Arc::new(socket), ingress, tx, versions, commands, requests));
@@ -219,13 +219,20 @@ async fn run(
                     Ok(value) => value,
                     // Windows can surface ICMP Port Unreachable on an
                     // unconnected UDP socket. It is not a listener failure.
-                    Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused) => continue,
+                    Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused) || (cfg!(windows) && e.raw_os_error() == Some(10040)) => continue,
                     Err(e) => return Err(e),
                 };
                 if !peer.ip().is_loopback() || n > MTU { continue; }
                 let bytes = &buffer[..n];
                 let now = clock.elapsed().as_secs();
-                match ingress.process(peer, bytes, now).map_err(|_| io::ErrorKind::InvalidData)? {
+                let action = match ingress.process(peer, bytes, now) {
+                    Ok(action) => action,
+                    // A saturated route table or failed CID allocation is
+                    // not permission to stop unrelated established sessions.
+                    Err(super::ingress::Error::Limit | super::ingress::Error::Random) => continue,
+                    Err(_) => return Err(io::Error::from(io::ErrorKind::InvalidData)),
+                };
+                match action {
                     Action::Drop => {}
                     Action::Reply(reply) => {
                         if reply.len() <= n {

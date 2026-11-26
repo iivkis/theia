@@ -71,6 +71,8 @@ pub struct LabSession {
     local_ids: BTreeMap<u64, [u8; CID_LEN]>,
     next_local_sequence: u64,
     peer_cid_limit: usize,
+    auto_cids: bool,
+    cid_retry_at: Option<Instant>,
     peer_ids: PeerIds,
     protection: Option<Protection>,
     handshake_tail: Option<HandshakeTail>,
@@ -206,6 +208,8 @@ impl LabSession {
             local_ids: BTreeMap::from([(0, local_cid)]),
             next_local_sequence: 1,
             peer_cid_limit: 2,
+            auto_cids: false,
+            cid_retry_at: None,
             peer_ids: PeerIds::with_initial(&remote_cid, None, 2).map_err(|_| Error::Protocol)?,
             protection: Some(protection),
             handshake_tail: None,
@@ -251,6 +255,29 @@ impl LabSession {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.paths.active()
+    }
+
+    pub(crate) fn enable_auto_cids(&mut self) {
+        self.auto_cids = true;
+    }
+
+    fn needs_cid(&self) -> bool {
+        self.auto_cids && self.confirmed && self.active()
+            && self.local_ids.len() < self.peer_cid_limit.min(2)
+            && self.next_local_sequence <= super::wire::MAX_VARINT
+    }
+
+    async fn replenish_cids(&mut self, now: Instant) -> Result<(), Error> {
+        if !self.needs_cid() || !self.scheduler.can_queue()
+            || self.cid_retry_at.is_some_and(|at| now < at) { return Ok(()); }
+        match self.advertise_connection_id().await {
+            Ok(_) => self.cid_retry_at = None,
+            Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.cid_retry_at = now.checked_add(Duration::from_secs(1));
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(())
     }
 
     /// Advertise one fresh, registered local CID over authenticated 1-RTT.
@@ -584,6 +611,7 @@ impl LabSession {
         };
         [
             self.shutdown.deadline(),
+            self.cid_retry_at.filter(|_| self.needs_cid() && self.scheduler.can_queue()),
             self.handshake_tail.as_ref().map(HandshakeTail::deadline).filter(|_| self.active()),
             old_keys,
             recovery,
@@ -662,6 +690,7 @@ impl LabSession {
             }
         }
         self.scheduler.on_timer(now).map_err(Error::Schedule)?;
+        self.replenish_cids(now).await?;
         if self.scheduler.can_send_path() {
             let pto = self.scheduler.base_pto();
             if let Some((peer, challenge)) = self.paths.due_challenge(MTU as u64, now, pto) {

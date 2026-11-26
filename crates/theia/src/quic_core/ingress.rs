@@ -47,6 +47,7 @@ pub struct Ingress {
     resettable: BTreeSet<Cid>,
     next_owner: u64,
     limit: usize,
+    connection_limit: usize,
     occupied: usize,
     now: u64,
     versions: VersionPolicy,
@@ -58,6 +59,17 @@ impl Ingress {
     }
 
     pub fn with_versions(limit: usize, versions: VersionPolicy) -> Result<Self, Error> {
+        Self::with_limits(limit, limit, versions)
+    }
+
+    /// Separate active connections from the bounded CID/tombstone budget.
+    /// A spare CID must not consume another connection's admission slot.
+    pub(crate) fn for_listener(connections: usize, versions: VersionPolicy) -> Result<Self, Error> {
+        let routes = connections.checked_mul(MAX_OWNER_CIDS).ok_or(Error::Limit)?;
+        Self::with_limits(connections, routes, versions)
+    }
+
+    fn with_limits(connection_limit: usize, limit: usize, versions: VersionPolicy) -> Result<Self, Error> {
         Ok(Self {
             routes: Demux::new(limit).map_err(|_| Error::Limit)?,
             owners: BTreeMap::new(),
@@ -67,6 +79,7 @@ impl Ingress {
             resettable: BTreeSet::new(),
             next_owner: 1,
             limit,
+            connection_limit,
             occupied: 0,
             now: 0,
             versions,
@@ -211,7 +224,7 @@ impl Ingress {
         if head.kind == PacketKind::Application {
             return match cid { Some(cid) => self.retired_reset(cid, datagram.len()), None => Ok(Action::Drop) };
         }
-        if head.kind != PacketKind::Initial || self.occupied >= self.limit {
+        if head.kind != PacketKind::Initial || self.occupied >= self.limit || self.owners.len() >= self.connection_limit {
             return Ok(Action::Drop);
         }
         if cid.is_some_and(|id| self.retired.contains_key(&id)) {
@@ -479,6 +492,30 @@ mod tests {
             assert_eq!(ingress.process(peer, &packet, 33), Ok(Action::Drop));
             assert_eq!(ingress.process(peer, &packet, 32), Err(Error::Clock));
         }
+    }
+
+    #[test]
+    fn listener_connection_limit_is_independent_of_cid_slots() {
+        let version = Version::V1;
+        let mut ingress = Ingress::for_listener(2, VersionPolicy::both()).unwrap();
+        let peer = "127.0.0.1:1000".parse().unwrap();
+        let mut owners = Vec::new();
+        for n in 1..=2u8 {
+            let original = [n; 8];
+            let client = [n + 10; 8];
+            let Action::Reply(retry) = ingress.process(peer, &initial(version, &original, &client, &[]), 0).unwrap() else { panic!("Retry"); };
+            let (cid, token) = negotiation::retry_token(&retry, version, &client, &original, false, false).unwrap();
+            let Action::Accepted { owner, .. } = ingress.process(peer, &initial(version, cid, &client, token), 0).unwrap() else { panic!("accept"); };
+            owners.push(owner);
+            ingress.issue_local_cid(owner, 0).unwrap();
+        }
+        assert_eq!(ingress.owners.len(), 2);
+        assert_eq!(ingress.occupied, 4);
+        assert_eq!(ingress.process(peer, &initial(version, &[7; 8], &[8; 8], &[]), 0), Ok(Action::Drop));
+        ingress.close(owners[0], 1).unwrap();
+        assert_eq!(ingress.owners.len(), 1);
+        assert_eq!(ingress.occupied, 4); // replay tombstones are still charged
+        assert!(matches!(ingress.process(peer, &initial(version, &[7; 8], &[8; 8], &[]), 1), Ok(Action::Reply(_))));
     }
 
     #[test]
