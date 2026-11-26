@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "837d34c427336dabfe02b7e19b75a66509627b34",
+  "source_sha": "902bceb366e07a2ff7f35831c81d8efa0fa6d47e",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -36,7 +36,7 @@
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "da642cdc292388f0e83343ca63e90d4b877b7de6e3ed072cb0360401f718200b",
+      "sha256": "34d318fcecbc46648e7351fabfb1058ead4a4c2e669cd33e2a639deb39ea6570",
       "state_fixture": false
     },
     {
@@ -570,7 +570,7 @@
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "497ffa4889b1e1d557bc75b0ca06e676f5cb7bf23a290085f6dfe45f354cf9bf",
+      "sha256": "f4e743a5cb5cd05857244221941546e44a72c54531169fd1441d3a87b9302948",
       "state_fixture": false
     },
     {
@@ -588,13 +588,13 @@
     {
       "scenario": "server-routing-edit",
       "file": "server-routing-edit.png",
-      "sha256": "87732c71e5a1c6116318a40ab29b59c066f6ad5fffe07e4d75bb184b88534247",
+      "sha256": "1e9529953797b952e2c19e833e940fd09aa0695c522e5574126289fedd404d1f",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-rules",
       "file": "server-routing-rules.png",
-      "sha256": "a02a0dca857ccf06a19cc47d1d1d1a941054a404eea6f5b8cc54e02964b9eddc",
+      "sha256": "a98e5bf9c54498d79c37f496b3323fb21bd003c1b4a9dbcd542352e5af44275a",
       "state_fixture": false
     },
     {
@@ -846,7 +846,7 @@
     {
       "scenario": "state-reality-step6-save-inspection",
       "file": "state-reality-step6-save-inspection.png",
-      "sha256": "ae3972e1d99242338dded7dea6694e674dd294bd4aaad766a63d57ede0bc1775",
+      "sha256": "9f37ea7cf370fa41536ccc2b178e503b9c299d3835ebd8fb30b20f353af259c1",
       "state_fixture": true
     },
     {
