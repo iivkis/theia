@@ -889,6 +889,7 @@ pub async fn establish(
         },
         config,
         Congestion::Bbr,
+        None,
     )
     .await
 }
@@ -965,6 +966,32 @@ pub async fn connect_versions_scoped_with_congestion(
     scope: super::scope::NetworkScope,
     congestion: Congestion,
 ) -> Result<(Version, LabSession), Error> {
+    connect_scoped(local, peer, versions, tls, name, scope, (congestion, None)).await
+}
+
+/// Keep the same observation across version negotiation and the caller's deadline.
+pub(crate) async fn connect_versions_observed(
+    local: SocketAddr,
+    peer: SocketAddr,
+    versions: VersionPolicy,
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    scope: super::scope::NetworkScope,
+    observation: &super::dial::Observation,
+) -> Result<(Version, LabSession), Error> {
+    connect_scoped(local, peer, versions, tls, name, scope, (Congestion::Bbr, Some(observation))).await
+}
+
+async fn connect_scoped(
+    local: SocketAddr,
+    peer: SocketAddr,
+    versions: VersionPolicy,
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    scope: super::scope::NetworkScope,
+    options: (Congestion, Option<&super::dial::Observation>),
+) -> Result<(Version, LabSession), Error> {
+    let (congestion, observation) = options;
     let mut version = versions.preferred();
     for restarted in [false, true] {
         let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
@@ -996,6 +1023,7 @@ pub async fn connect_versions_scoped_with_congestion(
                 name: name.clone(),
             },
             congestion,
+            observation,
         )
         .await
         {
@@ -1050,6 +1078,7 @@ pub async fn accept_with_congestion(
         },
         Config::Server(tls),
         congestion,
+        None,
     )
     .await
 }
@@ -1088,6 +1117,7 @@ async fn establish_inner(
     route: InitialRoute,
     config: Config,
     congestion: Congestion,
+    observation: Option<&super::dial::Observation>,
 ) -> Result<LabSession, Error> {
     let InitialRoute {
         version,
@@ -1162,7 +1192,23 @@ async fn establish_inner(
         let mut buffer = [0; super::mtu::MAX_UDP_PAYLOAD + 1];
         loop {
             handshake.collect()?;
-            let sent = handshake.flush(&socket, peer).await?;
+            let sent = match handshake.flush(&socket, peer).await {
+                Ok(sent) => {
+                    if sent {
+                        if let Some(observation) = observation {
+                            observation.sent();
+                        }
+                    }
+                    sent
+                }
+                Err(error) => {
+                    if let (Some(observation), Error::Io(io)) = (observation, &error) {
+                        // flush's only I/O is send_to the exact peer.
+                        observation.send_error(io.kind());
+                    }
+                    return Err(error);
+                }
+            };
             if handshake.done() {
                 break;
             }
@@ -1171,13 +1217,22 @@ async fn establish_inner(
                 tokio::task::yield_now().await;
             }
             match tokio::time::timeout(wait, socket.recv_from(&mut buffer)).await {
-                Ok(Ok((n, source, _mark)))
-                    if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD =>
-                {
-                    handshake.receive_datagram(&buffer[..n])?
+                Ok(Ok((n, source, _mark))) => {
+                    // Even malformed, oversized or wrong-source UDP is
+                    // evidence against a no-response fallback on this socket.
+                    if let Some(observation) = observation {
+                        observation.received();
+                    }
+                    if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD {
+                        handshake.receive_datagram(&buffer[..n])?;
+                    }
                 }
-                Ok(Ok(_)) | Err(_) => {}
-                Ok(Err(e)) if super::mtu::message_too_large(&e) => {}
+                Err(_) => {}
+                Ok(Err(e)) if super::mtu::message_too_large(&e) => {
+                    if let Some(observation) = observation {
+                        observation.received();
+                    }
+                }
                 Ok(Err(e)) => return Err(Error::Io(e)),
             }
         }

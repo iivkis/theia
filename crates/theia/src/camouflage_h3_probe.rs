@@ -7,7 +7,7 @@
 use crate::{
     camouflage_discovery::{Observation, TlsEvidence},
     camouflage_probe::{ProbeApproval, ProbeRequest},
-    quic_transport::{ObservedEndpoint, QuicError},
+    quic_core::{dial, negotiation::VersionPolicy, wire::Version},
 };
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{
@@ -41,21 +41,18 @@ pub struct H3ProbeReport {
     pub evidence: TlsEvidence,
 }
 
-fn map_error(error: QuicError) -> H3ProbeError {
+fn map_error(error: dial::Error) -> H3ProbeError {
     match error {
-        QuicError::Bind => H3ProbeError::BindFailed,
-        QuicError::Unreachable | QuicError::EndpointNetworkRefused => H3ProbeError::UdpUnavailable,
-        QuicError::Timeout => H3ProbeError::TimedOut,
-        QuicError::Configuration
-        | QuicError::Handshake
-        | QuicError::Alpn
-        | QuicError::CongestionController => H3ProbeError::HandshakeRejected,
+        dial::Error::Bind => H3ProbeError::BindFailed,
+        dial::Error::Unreachable | dial::Error::EndpointNetworkRefused => H3ProbeError::UdpUnavailable,
+        dial::Error::Timeout => H3ProbeError::TimedOut,
+        dial::Error::Configuration | dial::Error::Handshake => H3ProbeError::HandshakeRejected,
     }
 }
 
 /// Actively negotiate QUIC/TLS1.3 ALPN=h3 with one explicitly approved exact
-/// UDP socket address. Uses the production Quinn/rustls H3 verifier:
-/// authentic CA chain, SNI/SAN/expiry, TLS1.3, negotiated h3 and active BBR.
+/// UDP socket address. Uses Theia's native QUIC/rustls H3 verifier:
+/// authentic CA chain, SNI/SAN/expiry, TLS1.3, negotiated h3 and BBR.
 /// No HTTP request, arbitrary DNS, retry, redirect or transport fallback.
 /// Deadline includes queue wait, UDP bind and handshake; max 5 seconds.
 /// Return zero evidence on any failure.
@@ -87,23 +84,18 @@ pub async fn probe_quic_h3(
             .acquire()
             .await
             .map_err(|_| H3ProbeError::BindFailed)?;
-        let bind = if request.address.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
-        } else {
-            SocketAddr::from(([0u16; 8], 0))
-        };
-        let endpoint = ObservedEndpoint::new(bind, roots).map_err(map_error)?;
-        let connection = endpoint
-            .connect(request.address, &request.server_name, deadline)
-            .await
-            .map_err(map_error)?;
-        if connection.remote_address() != request.address {
-            connection.close(0u32.into(), b"wrong peer");
+        let name = ServerName::try_from(request.server_name)
+            .map_err(|_| H3ProbeError::InvalidServerName)?;
+        let tls = crate::transport_policy::Carrier::H3.client_tls(roots)
+            .map_err(|_| H3ProbeError::HandshakeRejected)?;
+        let (_, session) = dial::connect(
+            request.address, name, std::sync::Arc::new(tls), None,
+            VersionPolicy::exact(Version::V1), deadline,
+        ).await.map_err(map_error)?;
+        if session.peer_addr() != request.address {
             return Err(H3ProbeError::WrongPeer);
         }
-        // The production verifier already checked full PKI, h3 ALPN and BBR.
-        // Quinn's TLS engine negotiates TLS1.3 for QUIC. Do not claim that
-        // HTTP/3 SETTINGS, request behavior or camouflage was verified.
+        // No HTTP/3 SETTINGS, request behavior or camouflage was verified.
         let report = H3ProbeReport {
             connected_ip: request.address.ip(),
             handshake_elapsed: start.elapsed(),
@@ -118,7 +110,7 @@ pub async fn probe_quic_h3(
                 theia_fingerprint_match: Observation::Unknown,
             },
         };
-        connection.close(0u32.into(), b"probe finished");
+        dial::close_probe(session).await.map_err(map_error)?;
         Ok(report)
     })
     .await
@@ -144,8 +136,7 @@ pub async fn probe_quic_h3_native(
     source: IpAddr,
     version: crate::quic_core::wire::Version,
 ) -> Result<NativeH3ProbeReport, H3ProbeError> {
-    use crate::quic_core::{handshake_udp, negotiation::VersionPolicy, scope::NetworkScope};
-    if !approval.allows(request.address) {
+     if !approval.allows(request.address) {
         return Err(H3ProbeError::NotApproved);
     }
     if request.deadline.is_zero() {
@@ -159,8 +150,6 @@ pub async fn probe_quic_h3_native(
     if !matches!(&name, ServerName::DnsName(_)) {
         return Err(H3ProbeError::InvalidServerName);
     }
-    let scope = NetworkScope::pinned([source; 2], [request.address.ip(); 2])
-        .ok_or(H3ProbeError::BindFailed)?;
     let start = Instant::now();
     timeout(request.deadline.min(MAX_HANDSHAKE_DEADLINE), async move {
         let _permit = ACTIVE_H3_PROBES
@@ -170,24 +159,13 @@ pub async fn probe_quic_h3_native(
         let tls = crate::transport_policy::Carrier::H3
             .client_tls(roots)
             .map_err(|_| H3ProbeError::HandshakeRejected)?;
-        let (actual, mut session) = handshake_udp::connect_versions_scoped(
-            SocketAddr::new(source, 0),
-            request.address,
-            VersionPolicy::exact(version),
-            std::sync::Arc::new(tls),
-            name,
-            scope,
-        )
-        .await
-        .map_err(|error| match error {
-            handshake_udp::Error::Timeout => H3ProbeError::TimedOut,
-            // A native I/O error is not sufficient evidence for fallback.
-            _ => H3ProbeError::HandshakeRejected,
-        })?;
+        let (actual, session) = dial::connect(
+            request.address, name, std::sync::Arc::new(tls), Some(SocketAddr::new(source, 0)),
+            VersionPolicy::exact(version), request.deadline.min(MAX_HANDSHAKE_DEADLINE),
+        ).await.map_err(map_error)?;
         if actual != version || session.peer_addr() != request.address {
             return Err(H3ProbeError::WrongPeer);
         }
-        finish_native_handshake(&mut session).await?;
         let report = NativeH3ProbeReport {
             version: actual,
             source,
@@ -206,14 +184,7 @@ pub async fn probe_quic_h3_native(
                 },
             },
         };
-        // Close only after authenticated confirmation, with no HTTP bytes.
-        session
-            .close(0x100, Instant::now())
-            .map_err(|_| H3ProbeError::HandshakeRejected)?;
-        session
-            .flush(Instant::now())
-            .await
-            .map_err(|_| H3ProbeError::HandshakeRejected)?;
+        dial::close_probe(session).await.map_err(map_error)?;
         Ok(report)
     })
     .await
@@ -223,24 +194,7 @@ pub async fn probe_quic_h3_native(
 pub(crate) async fn finish_native_handshake(
     session: &mut crate::quic_core::endpoint::LabSession,
 ) -> Result<(), H3ProbeError> {
-    while !session.handshake_confirmed() {
-        if session.shutdown_phase() != crate::quic_core::lifecycle::ShutdownPhase::Open {
-            return Err(H3ProbeError::HandshakeRejected);
-        }
-        session
-            .flush(Instant::now())
-            .await
-            .map_err(|_| H3ProbeError::HandshakeRejected)?;
-        let wait = session.deadline().map_or(Duration::from_millis(100), |at| {
-            at.saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(100))
-        });
-        session
-            .recv(wait)
-            .await
-            .map_err(|_| H3ProbeError::HandshakeRejected)?;
-    }
-    Ok(())
+    dial::confirm(session).await.map_err(map_error)
 }
 
 #[cfg(test)]
@@ -250,16 +204,16 @@ mod tests {
     #[test]
     fn network_refusal_is_unavailable_without_handshake_evidence() {
         assert_eq!(
-            map_error(QuicError::EndpointNetworkRefused),
+            map_error(dial::Error::EndpointNetworkRefused),
             H3ProbeError::UdpUnavailable
         );
         assert_eq!(
-            map_error(QuicError::Unreachable),
+            map_error(dial::Error::Unreachable),
             H3ProbeError::UdpUnavailable
         );
-        assert_eq!(map_error(QuicError::Timeout), H3ProbeError::TimedOut);
+        assert_eq!(map_error(dial::Error::Timeout), H3ProbeError::TimedOut);
         assert_eq!(
-            map_error(QuicError::Handshake),
+            map_error(dial::Error::Handshake),
             H3ProbeError::HandshakeRejected
         );
     }

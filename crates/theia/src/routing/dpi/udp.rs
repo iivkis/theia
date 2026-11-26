@@ -363,28 +363,18 @@ pub(super) async fn probe_quic(
     scope: Option<crate::network_scope::Scope>,
     config: std::sync::Arc<rustls::ClientConfig>,
 ) -> Option<()> {
+    use crate::quic_core::{dial, negotiation::VersionPolicy, wire::Version};
     let mut tls = (*config).clone();
     tls.alpn_protocols = vec![b"h3".to_vec()];
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).ok()?;
-    let mut config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
-    config.transport_config(crate::quic_transport::transport_config());
-    let bind = match scope {
-        Some(scope) => scope.bind_address(),
-        None => (if address.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        })
-        .parse()
-        .ok()?,
-    };
-    let mut endpoint = quinn::Endpoint::client(bind).ok()?;
-    endpoint.set_default_client_config(config);
-    let connection = crate::quic_transport::connect(&endpoint, address, name)
-        .await
-        .ok()?;
-    connection.close(quinn::VarInt::from_u32(0), b"");
-    Some(())
+    tls.enable_early_data = false;
+    let name = rustls::pki_types::ServerName::try_from(name.to_owned()).ok()?;
+    let (_, session) = dial::connect(
+        address, name, std::sync::Arc::new(tls),
+        scope.map(|scope| scope.bind_address()), VersionPolicy::exact(Version::V1),
+        Duration::from_secs(5),
+    ).await.ok()?;
+    dial::close_probe(session).await.ok()
+
 }
 
 #[cfg(test)]
