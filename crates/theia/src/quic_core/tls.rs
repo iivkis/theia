@@ -276,4 +276,70 @@ mod tests {
         assert!(send.encode(1, b"ok", true).is_ok());
     }
 
+    #[test]
+    fn application_key_update_retains_packet_numbers_and_reordered_old_keys() {
+        use crate::quic_core::{key_update::{Receiver, Sender}, packet::Error};
+        use rustls::quic::{KeyChange, Keys, Secrets};
+        use std::time::{Duration, Instant};
+
+        fn move_hs(source: &mut quic::Connection, target: &mut quic::Connection,
+                   application: &mut Option<(Keys, Secrets)>) -> bool {
+            let mut activity = false;
+            for _ in 0..8 {
+                let mut bytes = Vec::new();
+                let change = source.write_hs(&mut bytes);
+                let changed = change.is_some();
+                if let Some(KeyChange::OneRtt { keys, next }) = change { *application = Some((keys, next)); }
+                if !bytes.is_empty() { target.read_hs(&bytes).unwrap(); activity = true; }
+                if !changed && bytes.is_empty() { break; }
+            }
+            activity
+        }
+
+        for version in [Version::V1, Version::V2] {
+            let (cc, sc) = configs();
+            let mut c = client(Arc::new(cc), version, ServerName::try_from("localhost").unwrap(), vec![1, 1, 1]).unwrap();
+            let mut s = server(Arc::new(sc), version, vec![1, 1, 2]).unwrap();
+            let mut ck = None;
+            let mut sk = None;
+            for _ in 0..16 {
+                let a = move_hs(&mut c, &mut s, &mut ck);
+                let b = move_hs(&mut s, &mut c, &mut sk);
+                if !a && !b { break; }
+            }
+            assert!(!c.is_handshaking() && !s.is_handshaking());
+            let (ck, cn) = ck.unwrap();
+            let (sk, sn) = sk.unwrap();
+            let mut tx = Sender::new(ck.local, cn);
+            let mut rx = Receiver::new(sk.remote, sn);
+            let cid = [7; 8];
+            let now = Instant::now();
+            let end = now + Duration::from_secs(3);
+            let (pn, first) = tx.seal(&cid, b"a").unwrap();
+            assert_eq!(pn, 0);
+            assert_eq!(rx.open(&cid, &first, now, end, true).unwrap().payload, b"a");
+            assert!(tx.update(true).is_err());
+            tx.acknowledged(pn);
+            assert!(tx.update(false).is_err());
+            let (_, old) = tx.seal(&cid, b"old").unwrap();
+            tx.update(true).unwrap();
+            assert!(tx.update(true).is_err());
+            let (pn, new) = tx.seal(&cid, b"new").unwrap();
+            assert_eq!(pn, 2);
+            let mut corrupt = new.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            assert_eq!(rx.open(&cid, &corrupt, now, end, true), Err(Error::Crypto));
+            assert_eq!(rx.open(&cid, &new, now, end, true).unwrap().number, 2);
+            assert_eq!(rx.open(&cid, &old, now, end, true).unwrap().payload, b"old");
+            assert_eq!(rx.open(&cid, &old, now, end, true), Err(Error::Duplicate));
+            rx.expire(end);
+            assert_eq!(rx.open(&cid, &old, end, end, true), Err(Error::TooOld));
+            tx.acknowledged(pn);
+            tx.update(true).unwrap();
+            let (pn, next) = tx.seal(&cid, b"next").unwrap();
+            assert_eq!(pn, 3);
+            assert_eq!(rx.open(&cid, &next, end, end + Duration::from_secs(3), true).unwrap().payload, b"next");
+        }
+    }
+
 }

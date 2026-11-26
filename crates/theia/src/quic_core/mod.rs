@@ -11,6 +11,7 @@ pub mod frames;
 pub mod handshake;
 pub mod handshake_udp;
 pub mod initial;
+pub mod key_update;
 pub mod lifecycle;
 pub mod loss;
 pub mod packet;
