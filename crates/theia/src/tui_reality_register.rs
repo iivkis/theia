@@ -481,7 +481,7 @@ impl RegistrationPanel {
                     }
                     Ok(Err(SaveError::Refused(Error::Indeterminate)))
                     | Err(TryRecvError::Disconnected) => {
-                        self.stage = Stage::Done(format!("Неопределённая запись. Проверьте файл и заново откройте редактор, не повторяйте автоматически.\nПодготовленный каталог: {:?}\nEsc: закрыть.", self.staged_save));
+                        self.stage = Stage::Done(format!("Запись не подтверждена. Проверьте файл настроек и подготовленный каталог, затем откройте конфигурацию заново. Повтор запрещён до проверки.\nФайл: {}\nКаталог: {:?}\nEsc: закрыть.", self.config.display(), self.staged_save));
                     }
                     Ok(Err(SaveError::SavedReloadFailed)) => {
                         self.stage = Stage::Done("TOML сохранён, перечитать редактор не удалось. Откройте заново; runtime не изменён.\nEsc: закрыть.".into());

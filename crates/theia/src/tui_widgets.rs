@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn reference_review_keeps_rejected_rows_and_long_values_visible() {
-        let review = ReferenceReview {
+        let mut review = ReferenceReview {
             rows: vec![
                 ReferenceRow {
                     name: "example.org".into(),
@@ -942,7 +942,7 @@ mod tests {
             ],
             details: vec![("TOML", "a".repeat(150))],
             note: "Сервер не запускается.".into(),
-        expanded: true,
+            expanded: true,
         };
         for width in [32, 80, 120] {
             let lines = review.lines(width);
@@ -956,7 +956,7 @@ mod tests {
                 "example.org",
                 "Основной",
                 "Резерв 1",
-                "Исключён",
+                "Нет H2",
                 "100",
                 "80",
                 "Сервер не запускается.",
@@ -967,6 +967,10 @@ mod tests {
             assert!(text.find("Сервер не запускается.").unwrap() < text.find("failed.example.org").unwrap());
             assert!(text.find("Конфигурация к сохранению").unwrap() < text.find("failed.example.org").unwrap());
         }
+        review.expanded = false;
+        let compact = review.lines(120).iter().flat_map(|line| line.spans.iter()).map(|span| span.content.as_ref()).collect::<String>();
+        assert!(compact.contains("Основной") && compact.contains("F2:"));
+        assert!(!compact.contains("failed.example.org") && !compact.contains("Конфигурация к сохранению"));
     }
 
     #[test]

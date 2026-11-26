@@ -785,8 +785,10 @@ fn save_failed(root: PathBuf, error: Option<Error>) -> WizardStage {
     let retry = error.as_ref().is_some_and(|error| !matches!(error, Error::Indeterminate | Error::Approval));
     let message = if retry {
         "Не удалось сохранить настройки. Проверьте права на папку и свободное место. Повтор возможен только после проверки исходного файла и отсутствия незавершённых материалов."
+    } else if matches!(error, Some(Error::Approval)) {
+        "Исходная конфигурация изменилась. Откройте её заново перед новой попыткой."
     } else {
-        "Запись не подтверждена или исходный файл изменился. Проверьте файлы, затем откройте конфигурацию заново. Автоматический повтор запрещён."
+        "Запись не подтверждена. Проверьте файлы, затем откройте конфигурацию заново. Автоматический повтор запрещён."
     };
     WizardStage::SaveFailed { root, message: message.into(), retry, inspected: false }
 }
@@ -1505,6 +1507,7 @@ impl Wizard {
                         self.tls_details = false;
                         WizardStage::ProbeConfirm(Box::new((input, resolved)))
                     } else {
+                        self.result_details = false;
                         WizardStage::NoEligible(RankedReview {
                             text: "DNS/PTR не подтвердил ни одного кандидата. TLS не выполнялся. Esc: назад.".into(),
                             rows: resolved.unresolved,
@@ -1632,7 +1635,7 @@ impl Wizard {
             },
             WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => "Сохраняем защищённые файлы и настройки…\nДождитесь подтверждения. Работающий сервер не изменяется.".into(),
             WizardStage::SaveFailed { root, message, retry, inspected } => format!("{}\n\nФайл: {}\nКаталог: {}\nСервер не запущен этой операцией.\n{}", message, self.config.display(), root.display(), if *inspected { "Esc: закрыть и открыть конфигурацию заново." } else if *retry { "F2: проверить наличие файлов. Повторить настройку — вернуться к источникам без записи." } else { "F2: проверить наличие файлов. Повтор недоступен." }),
-            WizardStage::Success => "Подключение REALITY создано.\nНастройки сохранены и успешно открыты. Сервер не запущен этой операцией.\n\nЧто дальше:\n1. На странице пользователей выпустите ключ доступа.\n2. На обзоре сервера отдельно запустите сервер.\n3. Импортируйте ключ в клиент Theia.\n\nEnter или Esc — перейти к обзору.".into(),
+            WizardStage::Success => "Подключение REALITY создано.\nНастройки сохранены и успешно открыты. Сервер не запущен этой операцией.\n\nЧто дальше:\n1. На странице пользователей выпустите ключ доступа.\n2. На обзоре сервера отдельно запустите сервер.\n3. Импортируйте ключ в клиент Theia.".into(),
         }
     }
 }
@@ -1955,7 +1958,11 @@ impl ProvisionPanel {
             return Some(crate::tui_widgets::ReferenceReview {
                 rows: report.rows.clone(),
                 details: Vec::new(),
-                note: "Подходящих сайтов не найдено. Ничего не сохранено. Проверьте доступ к DNS/HTTPS, затем измените источники. Не отключайте проверку сертификатов. F2 — полный отчёт.".into(),
+                note: if report.rows.iter().all(|row| row.address.parse::<SocketAddr>().is_err()) {
+                    "Не найдено подтверждённых адресов. Проверьте DNS и имена сайтов. TLS-проверка не выполнялась. Ничего не сохранено."
+                } else {
+                    "Подходящих сайтов не найдено. Проверьте доступ сервера к HTTPS и правильность времени; затем измените источники. Ничего не сохранено."
+                }.into(),
                 expanded: wizard.result_details,
             });
         }
@@ -1980,7 +1987,7 @@ impl ProvisionPanel {
         } else {
             "Сначала создаются защищённые файлы. Запись настроек подтверждается отдельно; сервер не запускается.".to_owned()
         };
-        note.push_str("\nВыбранные сайты перепроверены. Остальные оценки предварительные. F2 — все результаты и параметры.");
+        note.push_str("\nВыбранные сайты перепроверены; остальные оценки предварительные.");
         if input
             .endpoint
             .parse::<SocketAddr>()
@@ -2048,6 +2055,7 @@ impl ProvisionPanel {
             WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => {
                 (6, 6, "Сохранение", "")
             }
+            WizardStage::SaveFailed { inspected: true, .. } => (6, 6, "Результат проверки файлов", "Esc закрыть"),
             WizardStage::SaveFailed { .. } => (6, 6, "Сохранение не подтверждено", "F2 проверить файлы · Esc закрыть"),
             WizardStage::Success => (6, 6, "REALITY создан", "Enter к обзору · Esc закрыть"),
         })
@@ -2236,6 +2244,73 @@ mod tests {
     }
 
     #[test]
+    fn save_recovery_does_not_retry_uncertain_or_changed_paths() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-recovery").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut wizard = Wizard::first(path.clone()).unwrap();
+        wizard.fields[2] = "93.184.216.1".into();
+        wizard.suggest_own_ip();
+        wizard.fields[5] = "phone".into();
+        let input = WizardInput::parse(path.clone(), None, &wizard.effective_fields()).unwrap();
+        let root = input.health.parent().unwrap().to_owned();
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        wizard.stage = save_failed(root.clone(), None);
+        wizard.key(press(KeyCode::Char('y')));
+        assert!(matches!(wizard.stage, WizardStage::SaveFailed { retry: false, .. }));
+        wizard.key(press(KeyCode::F(2)));
+        assert!(matches!(wizard.stage, WizardStage::SaveFailed { inspected: true, .. }));
+        assert!(!path.exists() && !root.exists());
+        wizard.stage = save_failed(root.clone(), Some(Error::Storage));
+        wizard.key(press(KeyCode::Char('y')));
+        assert!(matches!(wizard.stage, WizardStage::Input));
+        assert!(wizard.sources && !path.exists() && !root.exists());
+        std::fs::create_dir(&root).unwrap();
+        wizard.stage = save_failed(root.clone(), Some(Error::Storage));
+        wizard.key(press(KeyCode::Char('y')));
+        assert!(matches!(wizard.stage, WizardStage::SaveFailed { retry: false, .. }));
+        assert!(root.is_dir() && !path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn expanded_tls_and_result_views_never_approve_and_progress_is_bounded() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-details").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut panel = ProvisionPanel::first(path.clone()).unwrap();
+        let wizard = panel.wizard.as_mut().unwrap();
+        wizard.fields[2] = "93.184.216.1".into();
+        wizard.suggest_own_ip();
+        wizard.fields[5] = "phone".into();
+        let input = WizardInput::parse(path.clone(), None, &wizard.effective_fields()).unwrap();
+        let target = Target { server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap() };
+        wizard.stage = WizardStage::ProbeConfirm(Box::new((input.clone(), ResolvedSearch {
+            plan: Some(input.search_plan(vec![target.clone()]).unwrap()), unresolved: Vec::new(),
+        })));
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        panel.key(press(KeyCode::F(2)));
+        assert!(panel.confirmation_choice().is_none());
+        assert!(panel.body().contains("reference.example.org"));
+        panel.key(press(KeyCode::Char('y')));
+        assert!(panel.confirmation_choice().is_none());
+        panel.key(press(KeyCode::Enter));
+        assert!(panel.confirmation_choice().is_some());
+        let (state, review) = rank_checked(&input, vec![target], vec![Evidence { h2_status: Some(200), h3_status: None }], reference_health::unix_now().unwrap(), Vec::new()).unwrap();
+        panel.wizard.as_mut().unwrap().stage = WizardStage::CreateConfirm(Box::new((input, state.unwrap(), review)));
+        panel.key(press(KeyCode::F(2)));
+        assert!(panel.reference_review().unwrap().expanded);
+        panel.key(press(KeyCode::Char('y')));
+        assert!(panel.confirmation_choice().is_none());
+        panel.key(press(KeyCode::Esc));
+        assert!(panel.confirmation_choice().is_some());
+        assert!(progress_text("Проверка", 3, 6).contains("50%"));
+        assert!(progress_text("Проверка", 8, 6).contains("100%"));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn novice_errors_focus_the_missing_field_without_creating_files() {
         let dir =
             std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-errors").unwrap());
@@ -2330,6 +2405,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert!(editor.selected_reality());
+        assert!(matches!(wizard.stage, WizardStage::Success));
+        assert!(wizard.body().contains("Подключение REALITY создано"));
         let before = std::fs::read(&path).unwrap();
         let Config::Server(doc) = config::parse(std::str::from_utf8(&before).unwrap()).unwrap()
         else {
