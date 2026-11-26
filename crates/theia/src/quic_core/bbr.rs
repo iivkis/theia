@@ -755,12 +755,11 @@ impl Bbr {
 
     fn longterm_limit(&self) -> u64 {
         let bound = self.inflight_longterm.unwrap_or(MAX_CWND);
-        if self.mode == Mode::ProbeRtt
-            || (self.mode == Mode::ProbeBw && self.phase == ProbePhase::Cruise)
+        if (self.mode == Mode::ProbeRtt
+            || (self.mode == Mode::ProbeBw && self.phase == ProbePhase::Cruise))
+            && self.inflight_longterm.is_some()
         {
-            if self.inflight_longterm.is_some() {
-                return (bound.saturating_mul(85) / 100).max(4 * self.mtu);
-            }
+            return (bound.saturating_mul(85) / 100).max(4 * self.mtu);
         }
         bound
     }
