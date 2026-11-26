@@ -1105,6 +1105,9 @@ async fn route_decision(
             }
         },
     };
+    // DNS preflight may have awaited network I/O; never return a superseded
+    // policy as authorization to initiate an egress.
+    cache.dpi.check_policy(snapshot.digest())?;
     Ok((snapshot, action, pinned))
 }
 
@@ -1117,13 +1120,18 @@ async fn routed_open(
     let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
-    match action {
-        Action::Blocked => {
+    match action.packet_action() {
+        crate::routing::PacketAction::Drop => {
             crate::traffic::blocked();
             Err(denied())
         }
-        Action::Allowed => carrier.open(address, port).await,
-        Action::DirectDpi => {
+        crate::routing::PacketAction::Redirect => {
+            cache.dpi.check_policy(snapshot.digest())?;
+            let tunnel = carrier.open(address, port).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
+            Ok(tunnel)
+        }
+        crate::routing::PacketAction::Modify => {
             // Initial native backend supports domain HTTPS TCP only. Resolve
             // via the authenticated policy endpoint, never the local resolver.
             if cache.dpi.enabled() && matches!(port, 443 | 8443) {
@@ -1170,9 +1178,12 @@ async fn routed_open(
             crate::traffic::dpi_fallback_open();
             Ok(tunnel)
         }
-        Action::Direct => client_state::dial_direct(address, port, pinned)
-            .await
-            .map(ProxyTunnel::Direct),
+        crate::routing::PacketAction::Pass => {
+            cache.dpi.check_policy(snapshot.digest())?;
+            let target = client_state::dial_direct(address, port, pinned).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
+            Ok(ProxyTunnel::Direct(target))
+        }
     }
 }
 
@@ -1185,16 +1196,24 @@ async fn routed_udp(
     observed: &Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<crate::udp_relay::Tunnel, ClientError> {
     let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
-    match action {
-        Action::Blocked => {
+    match action.packet_action() {
+        crate::routing::PacketAction::Drop => {
             crate::traffic::blocked();
             Err(ClientError::Open(ErrorCode::PolicyDenied))
         }
-        Action::Direct => crate::udp_relay::direct(address, port, pinned)
-            .await
-            .map(crate::udp_relay::Tunnel::Direct),
-        Action::Allowed => carrier.open_udp(address, port).await,
-        Action::DirectDpi => {
+        crate::routing::PacketAction::Pass => {
+            cache.dpi.check_policy(snapshot.digest())?;
+            let target = crate::udp_relay::direct(address, port, pinned).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
+            Ok(crate::udp_relay::Tunnel::Direct(target))
+        }
+        crate::routing::PacketAction::Redirect => {
+            cache.dpi.check_policy(snapshot.digest())?;
+            let tunnel = carrier.open_udp(address, port).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
+            Ok(tunnel)
+        }
+        crate::routing::PacketAction::Modify => {
             use crate::routing::dpi::udp::Candidate;
             // The locked Quinn backend cannot authenticate QUIC v2.
             // Never treat a v1 handshake as evidence for v2.

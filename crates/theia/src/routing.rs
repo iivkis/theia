@@ -36,7 +36,51 @@ pub enum Action {
     DirectDpi,
 }
 
+/// Actual engine action, independent of the configured rule name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketAction {
+    Pass,
+    Modify,
+    Redirect,
+    Drop,
+}
+
+/// Missing evidence is not the same as a proven absent attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence<T> {
+    Known(T),
+    Absent,
+    Unknown,
+}
+
+/// The ordered policy may need more evidence before any egress is authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Classification {
+    Matched(Action),
+    Default,
+    Unresolved,
+}
+
+impl Classification {
+    pub fn action(self) -> Option<Action> {
+        match self {
+            Self::Matched(action) => Some(action),
+            Self::Default => Some(Action::Allowed),
+            Self::Unresolved => None,
+        }
+    }
+}
+
 impl Action {
+    pub fn packet_action(self) -> PacketAction {
+        match self {
+            Self::Direct => PacketAction::Pass,
+            Self::DirectDpi => PacketAction::Modify,
+            Self::Allowed => PacketAction::Redirect,
+            Self::Blocked => PacketAction::Drop,
+        }
+    }
+
     /// Server fallback is allowed only for a route that explicitly permits it.
     pub(crate) fn permits_server_egress(self) -> bool {
         matches!(self, Self::Allowed | Self::DirectDpi)
@@ -598,57 +642,71 @@ impl Policy {
         })
     }
 
-    /// First matching rule, with OR between all selectors in a rule.
-    /// An absent result is not an authorization: the transport still needs ACL.
-    /// A DNS name may be evaluated without resolving it; a caller can supply
-    /// an independently pinned IP in a second evaluation.
-    /// A DNS name is not enough to choose a route if an earlier rule can
-    /// match a resolved IP. Never assume that an unknown IP is a non-match.
-    pub fn domain_decision(&self, domain: &str) -> Result<Option<Action>, RoutingError> {
-        let host = domain_name(domain)?;
+    /// One ordered classifier. A known OR match wins within a rule, but an
+    /// earlier unresolved rule cannot be skipped in favor of a later rule.
+    pub fn classify(
+        &self,
+        domain: Evidence<&str>,
+        ip: Evidence<IpAddr>,
+    ) -> Result<Classification, RoutingError> {
+        let domain = match domain {
+            Evidence::Known(host) => Evidence::Known(domain_name(host)?),
+            Evidence::Absent => Evidence::Absent,
+            Evidence::Unknown => Evidence::Unknown,
+        };
+        let ip = match ip {
+            Evidence::Known(IpAddr::V6(v6)) => Evidence::Known(
+                v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            ),
+            other => other,
+        };
         for rule in &self.rules {
-            let matched = rule.domains.iter().any(|selector| match selector {
-                DomainSelector::Literal(pattern) => pattern.matches(&host),
-                DomainSelector::Category(code) => self.sites[code].matches(&host),
-            });
-            if matched {
-                return Ok(Some(rule.action));
+            let domain_match = match &domain {
+                Evidence::Known(host) => rule.domains.iter().any(|selector| match selector {
+                    DomainSelector::Literal(pattern) => pattern.matches(host),
+                    DomainSelector::Category(code) => self.sites[code].matches(host),
+                }),
+                Evidence::Absent | Evidence::Unknown => false,
+            };
+            let ip_match = match ip {
+                Evidence::Known(ip) => rule.ips.iter().any(|selector| match selector {
+                    IpSelector::Literal(cidr) => cidr.matches(ip),
+                    IpSelector::Category(code) => self.ips[code].matches(ip),
+                }),
+                Evidence::Absent | Evidence::Unknown => false,
+            };
+            if domain_match || ip_match {
+                return Ok(Classification::Matched(rule.action));
             }
-            if !rule.ips.is_empty() {
-                return Ok(None);
+            if (matches!(domain, Evidence::Unknown) && !rule.domains.is_empty())
+                || (matches!(ip, Evidence::Unknown) && !rule.ips.is_empty())
+            {
+                return Ok(Classification::Unresolved);
             }
         }
-        Ok(Some(Action::Allowed))
+        Ok(Classification::Default)
     }
 
+    /// Explicit DNS ingress: unresolved IP selectors require protected DNS.
+    pub fn domain_decision(&self, domain: &str) -> Result<Option<Action>, RoutingError> {
+        Ok(self.classify(Evidence::Known(domain), Evidence::Unknown)?.action())
+    }
+
+    /// Match the explicit target attributes supplied by existing CONNECT,
+    /// SOCKS and server adapters. Transparent interception must instead call
+    /// classify with Unknown for attributes it has not reliably determined.
     pub fn matching_action(
         &self,
         domain: Option<&str>,
         ip: Option<IpAddr>,
     ) -> Result<Option<Action>, RoutingError> {
-        let domain = domain.map(domain_name).transpose()?;
-        let ip = ip.map(|ip| match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-            _ => ip,
-        });
-        for rule in &self.rules {
-            let domain_match = domain.as_ref().is_some_and(|host| {
-                rule.domains.iter().any(|selector| match selector {
-                    DomainSelector::Literal(pattern) => pattern.matches(host),
-                    DomainSelector::Category(code) => self.sites[code].matches(host),
-                })
-            });
-            let ip_match = ip.is_some_and(|ip| {
-                rule.ips.iter().any(|selector| match selector {
-                    IpSelector::Literal(cidr) => cidr.matches(ip),
-                    IpSelector::Category(code) => self.ips[code].matches(ip),
-                })
-            });
-            if domain_match || ip_match {
-                return Ok(Some(rule.action));
-            }
+        match self.classify(
+            domain.map_or(Evidence::Absent, Evidence::Known),
+            ip.map_or(Evidence::Absent, Evidence::Known),
+        )? {
+            Classification::Matched(action) => Ok(Some(action)),
+            Classification::Default | Classification::Unresolved => Ok(None),
         }
-        Ok(None)
     }
 }
 
@@ -686,6 +744,35 @@ mod tests {
             entry.extend([24, 1]);
         }
         field(1, &entry)
+    }
+
+    #[test]
+    fn unknown_earlier_rule_blocks_later_egress_but_known_or_match_wins() {
+        let ip = "192.0.2.1".parse().unwrap();
+        let p = Policy::compile(
+            &[
+                rule(Action::Blocked, &["blocked.example"], &[]),
+                rule(Action::Direct, &[], &["192.0.2.0/24"]),
+            ],
+            &[],
+            &[],
+        ).unwrap();
+        assert_eq!(p.classify(Evidence::Unknown, Evidence::Known(ip)).unwrap(), Classification::Unresolved);
+        assert_eq!(p.classify(Evidence::Absent, Evidence::Known(ip)).unwrap(), Classification::Matched(Action::Direct));
+        assert_eq!(p.classify(Evidence::Known("blocked.example"), Evidence::Unknown).unwrap(), Classification::Matched(Action::Blocked));
+        assert_eq!(p.classify(Evidence::Known("other.example"), Evidence::Unknown).unwrap(), Classification::Unresolved);
+        let or = Policy::compile(
+            &[rule(Action::DirectDpi, &["example.com"], &["192.0.2.0/24"])],
+            &[], &[],
+        ).unwrap();
+        assert_eq!(or.classify(Evidence::Unknown, Evidence::Known(ip)).unwrap().action(), Some(Action::DirectDpi));
+        assert_eq!(or.classify(Evidence::Absent, Evidence::Absent).unwrap(), Classification::Default);
+        assert_eq!(Classification::Default.action(), Some(Action::Allowed));
+        assert_eq!(Classification::Unresolved.action(), None);
+        assert_eq!(Action::Direct.packet_action(), PacketAction::Pass);
+        assert_eq!(Action::DirectDpi.packet_action(), PacketAction::Modify);
+        assert_eq!(Action::Allowed.packet_action(), PacketAction::Redirect);
+        assert_eq!(Action::Blocked.packet_action(), PacketAction::Drop);
     }
 
     #[test]
