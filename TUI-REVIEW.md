@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (c1969af760283d16c6de239aa00088864ff123f2) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (c338da46ed998bb5de77fd5d4a90e4b2bef54da3) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -29,3 +29,5 @@ Review captures compact report-aligned choices, no single-step progress marker, 
 The gallery includes the revised first-run server wizard source selection and DNS consent screen; no external probes are approved.
 
 The REALITY wizard gallery includes collapsed/expanded DNS consent, exact TLS target consent, partial checking, final recheck, ranked result with selected/reserve/rejected candidates, no eligible candidates, saving, storage error and uncertain publication. state-reality-* uses the production ranker and renderer with explicitly synthetic observations and channel outcomes; no external network or configuration save is started. Required screenshot names are checked before publishing.
+
+The updated wizard adds required DNS progress, expanded TLS consent, compact and expanded ranking, a 40-candidate long report, expanded no-match results, read-only file inspection, success, extra source fields and the user picker. Success is a presentation fixture; the actual offline save/poll regression is run separately. The gallery does not contact reference sites.

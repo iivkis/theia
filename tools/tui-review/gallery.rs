@@ -38,10 +38,23 @@ fn visual_review_gallery() {
             if name == "state-reality-step5-ranked-review" {
                 let screen = rendered_interaction(120, 40, &model, &ui);
                 assert!(screen.contains("Основной") && screen.contains("Резерв"));
+                assert!(screen.contains("F2") && !screen.contains("Конфигурация к сохранению"));
+            }
+            if name == "state-reality-step5-ranked-expanded" {
+                let screen = rendered_interaction(120, 40, &model, &ui);
                 assert!(screen.contains("Конфигурация к сохранению"));
+            }
+            if name == "state-reality-step6-success" {
+                let screen = rendered_interaction(120, 40, &model, &ui);
+                assert!(screen.contains("Подключение REALITY создано"));
             }
             assert!(!path.exists());
         }
+        let editor = Editor::load(Role::Server, &server).unwrap();
+        let panel = ProvisionPanel::review_grant_picker(&editor);
+        let mut ui = Interaction::new(Some(editor));
+        ui.reality_provision = Some(panel);
+        review_capture("state-reality-step1-grant-picker", &model, &ui);
     }
     // Real first-run import through the production state machine, using a synthetic invitation.
     first_key_import_fixture(&root.join("first-own-tls"), review_capture);
