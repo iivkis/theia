@@ -167,6 +167,28 @@ mod tests {
     }
 
     #[test]
+    fn lost_challenge_retries_until_amplification_budget_exhausted() {
+        let active = "127.0.0.1:1000".parse().unwrap();
+        let next = "127.0.0.1:1001".parse().unwrap();
+        let now = Instant::now();
+        let pto = Duration::from_millis(100);
+        let mut paths = Paths::new_validated(active);
+        let challenge = paths.begin(next, 1200, now).unwrap();
+        assert!(paths.reserve_challenge(next, 1200, now, pto));
+        assert_eq!(paths.challenge_deadline(1200, pto), Some(now + pto));
+        assert_eq!(paths.due_challenge(1200, now, pto), None);
+        for at in [now + pto, now + 2 * pto] {
+            assert_eq!(paths.due_challenge(1200, at, pto), Some((next, challenge)));
+            assert!(paths.reserve_challenge(next, 1200, at, pto));
+        }
+        assert_eq!(paths.challenge_deadline(1200, pto), None);
+        assert!(!paths.reserve_challenge(next, 1200, now + 3 * pto, pto));
+        assert_eq!(paths.active(), active);
+        assert!(paths.response(next, challenge, now + 3 * pto));
+        assert_eq!(paths.active(), next);
+    }
+
+    #[test]
     fn challenge_is_bound_to_address_and_budget() {
         let active = "127.0.0.1:1000".parse().unwrap();
         let next = "127.0.0.1:1001".parse().unwrap();

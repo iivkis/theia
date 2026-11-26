@@ -384,7 +384,7 @@ mod tests {
                 let (server, sk) = NativeConnection::start(server.unwrap()).unwrap();
                 assert_eq!(&ck[..], &sk[..]);
                 let (client, server) = tokio::join!(
-                    h3::client::new::<_, _, Bytes>(client),
+                    h3::client::new(client),
                     async { h3::server::builder().build::<_, Bytes>(server).await },
                 );
                 let (mut driver, mut sender) = client.unwrap();

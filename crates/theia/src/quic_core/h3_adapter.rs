@@ -13,7 +13,8 @@ use std::{collections::{BTreeMap, VecDeque}, future::Future, pin::Pin,
     sync::{Arc, Mutex, Weak}, task::{Context, Poll, Waker}, time::{Duration, Instant}};
 use tokio::sync::oneshot;
 
-const SLOT_LIMIT: usize = 64 * 1024;
+// Include HTTP/3 framing overhead for a 64 KiB application write.
+const SLOT_LIMIT: usize = 128 * 1024;
 const OPEN_LIMIT: usize = 16;
 const TICK: Duration = Duration::from_millis(2);
 const CANCEL: u64 = 0x10c;
@@ -229,7 +230,7 @@ impl NativeConnection {
     /// Returns exporter material separately so admission remains the
     /// existing caller's responsibility. The raw fixed-key fixture cannot
     /// enter this API. This is intentionally not selectable in product config.
-    pub(crate) fn start(mut session: LabSession) -> Result<(Self, crate::channel_binding::Key), CE> {
+    pub fn start(mut session: LabSession) -> Result<(Self, zeroize::Zeroizing<[u8; 32]>), CE> {
         let key = session.take_channel_binding().ok_or_else(internal)?;
         let shared = Arc::new(Mutex::new(State::default()));
         tokio::spawn(drive(session, Arc::downgrade(&shared)));
@@ -251,6 +252,10 @@ pub struct Opener {
     shared: Shared,
     uni: Option<oneshot::Receiver<OpenResult>>,
     bidi: Option<oneshot::Receiver<OpenResult>>,
+}
+
+impl Clone for Opener {
+    fn clone(&self) -> Self { Self::new(self.shared.clone()) }
 }
 
 impl Opener {
