@@ -130,6 +130,19 @@ max_connections_per_user = 32
 max_connections_total = 64
 connect_timeout_ms = 2000
 
+[server.policy.routing]
+revision = 2
+
+[[server.policy.routing.rules]]
+name = "local direct"
+action = "direct"
+domains = ["full:localhost"]
+
+[[server.policy.routing.rules]]
+name = "blocked test name"
+action = "blocked"
+domains = ["full:blocked.invalid"]
+
 [management]
 ipc = "auto"
 log_level = "error"

@@ -8536,7 +8536,50 @@ mod tests {
         assert_eq!(recommendation_page(Role::Client, 'A'), (3, 'A'));
         assert_eq!(recommendation_page(Role::Server, 'S'), (5, 'S'));
         assert!(!page_has_users(Role::Server, 3));
-        assert_eq!(pages(Role::Client).len(), 6);
+        assert_eq!(pages(Role::Client).len(), 7);
+        assert_eq!(pages(Role::Server).len(), 8);
+    }
+
+    #[test]
+    fn routing_workspace_reports_verified_ipc_and_stages_only_draft() {
+        let client_path = std::env::temp_dir().join(crate::tui_editor::generated_id("routing-client").unwrap());
+        let client_source = include_str!("../../../examples/client.toml");
+        std::fs::write(&client_path, client_source).unwrap();
+        let editor = Editor::load(Role::Client, &client_path).unwrap();
+        let digest = editor.saved_sha256();
+        let mut client = Interaction::new(Some(editor));
+        client.select_workspace_page(Role::Client, 6);
+        client.workspace_focus = WorkspaceFocus::Actions;
+        let mut observation = RoutingObservation::new(digest);
+        let (tx, rx) = mpsc::channel();
+        observation.pending = Some(rx);
+        tx.send(Ok(crate::management::StatusReply::ClientRunning {
+            revision: 1, config_sha256: digest, descriptor_revision: 0,
+            transport: 2, xhttp: 1, fallback: false, routing_revision: 5,
+            routing_state: 1, routing_totals: [10,20,30,40,2,1,1],
+        })).unwrap();
+        observation.poll();
+        client.routing_observation = Some(observation);
+        let screen = rendered_interaction(120, 40, &Model::new(Some(Role::Client)), &client);
+        assert!(screen.contains("ревизия 5"));
+        assert!(screen.contains("IPC"));
+        assert_eq!(std::fs::read_to_string(&client_path).unwrap(), client_source);
+        std::fs::remove_file(client_path).unwrap();
+
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("routing-server").unwrap());
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        panel.edit(None);
+        let (_, fields, _) = panel.fields.as_mut().unwrap();
+        *fields = ["local".into(), "direct".into(), "full:localhost".into(), String::new()];
+        assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
+        assert_eq!(panel.settings.rules.len(), 1);
+        assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
+        assert!(editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

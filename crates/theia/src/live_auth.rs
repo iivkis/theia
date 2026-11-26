@@ -353,6 +353,10 @@ mod tests {
         let (_, staged_routing) = live.prepare_tls_rebase(&routed, 1).unwrap();
         assert_eq!(live.shared().load().unwrap().routing["alpha"].snapshot.manifest().revision, 1);
         drop(staged_routing);
+        let (_, failed) = live.prepare_tls_rebase(&routed, 1).unwrap();
+        assert_eq!(live.publish_with(failed, || Err(LiveAuthError::Unavailable)), Err(LiveAuthError::Unavailable));
+        assert_eq!(live.revision(), Ok(1));
+        assert_eq!(live.shared().load().unwrap().routing["alpha"].snapshot.manifest().revision, 1);
         let isolated = LiveAuthorization::new(doc.clone()).unwrap();
         let (_, publication) = isolated.prepare_tls_rebase(&routed, 1).unwrap();
         assert_eq!(isolated.publish(publication), Ok(2));

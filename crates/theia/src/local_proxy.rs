@@ -1249,6 +1249,7 @@ impl ClientRuntime {
         } else {
             load_client_with_budget(next, crate::connection_pool::profile_budget(), Some(&self.path)).await?
         };
+        client.routing_policy().await?;
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
     }

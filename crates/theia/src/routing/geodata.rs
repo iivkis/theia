@@ -460,6 +460,59 @@ mod tests {
         assert!(decompress(&gz[..gz.len()-2], hash(b"test data")).is_err());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn geodata_automatic_activation_preserves_pending_edit_and_rejects_rollback() {
+        use crate::{config::{self, Config}, live_auth::LiveAuthorization, reload_preflight::ReloadPreflight, runtime_generation::{State, View}};
+        let mut random = [0; 16];
+        SystemRandom::new().fill(&mut random).unwrap();
+        let dir = std::env::temp_dir().join(format!("theia-geodata-activation-{}", hex(&random)));
+        fs::create_dir(&dir).unwrap();
+        let store = Store::new(dir.clone()).unwrap();
+        let pair = |release: &str, code: u8| {
+            let site = dat(code);
+            let ip = ip();
+            Pair::verified(Manifest { release: release.into(), geosite_sha256: hash(&site), geoip_sha256: hash(&ip) }, site, ip, &[]).unwrap()
+        };
+        let old = pair("20261126014317", b'X');
+        let next = pair("20261127014317", b'Y');
+        store.publish(&old, None).unwrap();
+        store.publish(&next, store.current_bytes().unwrap().as_deref()).unwrap();
+        let Config::Server(mut doc) = config::parse(&include_str!("../../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))).unwrap() else { panic!() };
+        doc.server.policy.routing = Some(crate::routing::Settings {
+            revision: 2, geodata_directory: Some(dir.to_str().unwrap().into()),
+            rules: vec![], datasets: Some(old.manifest().clone()),
+        });
+        let path = dir.join("server.toml");
+        config::atomic_write(&path, &Config::Server(doc.clone())).unwrap();
+        let live = Arc::new(LiveAuthorization::new(doc.clone()).unwrap());
+        let state = State::new(View {
+            document: Arc::new(doc.clone()), inbounds: doc.server.inbounds.len(),
+            preflight: Arc::new(ReloadPreflight::new(path.clone(), doc.clone(), vec![])),
+            live: live.clone(),
+        }).with_reality_ledger(Arc::new(crate::quota::Ledger::new(&doc.server.policy, &doc.server.users)));
+        let view = state.snapshot().unwrap();
+        let stage = state.prepare_geodata(&view, &path, next.manifest().clone()).unwrap().unwrap();
+        let mut edit = doc.clone();
+        edit.server.users[0].disabled = true;
+        config::atomic_write(&path, &Config::Server(edit.clone())).unwrap();
+        assert!(state.activate_geodata(stage).is_err());
+        assert_eq!(config::read_file(&path).unwrap(), Config::Server(edit));
+        assert_eq!(live.revision(), Ok(1));
+        config::atomic_write(&path, &Config::Server(doc.clone())).unwrap();
+        let stage = state.prepare_geodata(&view, &path, next.manifest().clone()).unwrap().unwrap();
+        state.activate_geodata(stage).unwrap();
+        let current = state.snapshot().unwrap();
+        assert_eq!(current.live.revision(), Ok(2));
+        let routing = current.document.server.policy.routing.as_ref().unwrap();
+        assert_eq!(routing.revision, 3);
+        assert_eq!(routing.datasets.as_ref(), Some(next.manifest()));
+        assert_eq!(config::read_file(&path).unwrap(), Config::Server(current.document.as_ref().clone()));
+        assert!(state.prepare_geodata(&current, &path, old.manifest().clone()).is_err());
+        assert!(state.prepare_geodata(&current, &path, next.manifest().clone()).unwrap().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn publication_is_cas_and_preserves_old_pair() {
         let mut random = [0; 16];

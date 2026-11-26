@@ -1919,6 +1919,9 @@ mod strict_wire_matrix_tests {
             );
         }
         for response in [
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt=0,0,0,0,0,0,0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,01\n"),
             format!("theia-client-v1 r=07 sha256={hex} d=0 t=0 x=0 f=0\n"),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=3 x=0 f=0\n"),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=1 f=1\n"),

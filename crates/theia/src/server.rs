@@ -3211,10 +3211,14 @@ async fn run_supervised_file(
                                     let pair = store.refresh(&settings.rules).await.map_err(|_| ())?;
                                     let manifest = pair.manifest().clone();
                                     drop(pair);
-                                    let runtime = runtime.clone();
+                                    let prepare = runtime.clone();
                                     let path = path.clone();
-                                    tokio::task::spawn_blocking(move || runtime.activate_geodata(&view, &path, manifest))
-                                        .await.map_err(|_| ())?.map_err(|_| ())
+                                    let stage = tokio::task::spawn_blocking(move || prepare.prepare_geodata(&view, &path, manifest))
+                                        .await.map_err(|_| ())?.map_err(|_| ())?;
+                                    match stage {
+                                        Some(stage) => { runtime.activate_geodata(stage).map_err(|_| ())?; Ok(true) }
+                                        None => Ok(false),
+                                    }
                                 }.await;
                                 match result {
                                     Ok(true) => crate::diag!(Info, "server", "geodata_activated"),
