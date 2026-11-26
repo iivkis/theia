@@ -217,8 +217,9 @@ impl Listener {
         {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
-        let ingress = Ingress::for_listener(limit, versions.clone())
+        let mut ingress = Ingress::for_listener(limit, versions.clone())
             .map_err(|_| io::ErrorKind::InvalidInput)?;
+        if scope.is_external_server() { ingress.set_source_limit(16); }
         let (tx, candidates) = mpsc::channel(limit);
         let (commands, requests) = mpsc::channel(limit);
         let worker = tokio::spawn(run(

@@ -84,6 +84,8 @@ pub struct Ingress {
     versions: VersionPolicy,
     accepting: bool,
     reply_budget: ReplyBudget,
+    source_limit: Option<usize>,
+    owner_sources: BTreeMap<u64, IpAddr>,
 }
 
 impl Ingress {
@@ -125,6 +127,8 @@ impl Ingress {
             versions,
             accepting: true,
             reply_budget: ReplyBudget::default(),
+            source_limit: None,
+            owner_sources: BTreeMap::new(),
         })
     }
 
@@ -169,6 +173,10 @@ impl Ingress {
         self.occupied += 1;
         self.resettable.insert(cid);
         Ok(cid)
+    }
+
+    pub(crate) fn set_source_limit(&mut self, limit: usize) {
+        self.source_limit = Some(limit.max(1));
     }
 
     pub(crate) fn stop_accepting(&mut self) { self.accepting = false; }
@@ -225,6 +233,7 @@ impl Ingress {
         let until = now.checked_add(TOKEN_TTL).ok_or(Error::Clock)?;
         let ids = self.owners.remove(&owner).ok_or(Error::Owner)?;
         self.routes.remove_owner(owner);
+        self.owner_sources.remove(&owner);
         for cid in ids {
             self.retired.insert(cid, until);
         }
@@ -327,10 +336,16 @@ impl Ingress {
         if !self.available(cid) {
             return Ok(Action::Drop);
         }
+        // Only address-validated attempts may occupy this bounded table.
+        // New addresses cannot evict the quota held by an existing owner.
+        if self.source_limit.is_some_and(|limit| self.owner_sources.values().filter(|&&ip| ip == peer.ip()).count() >= limit) {
+            return Ok(Action::Drop);
+        }
         let owner = self.next_owner;
         let next = owner.checked_add(1).ok_or(Error::Limit)?;
         self.routes.register(cid, owner).map_err(|_| Error::Limit)?;
         self.owners.insert(owner, BTreeSet::from([cid]));
+        self.owner_sources.insert(owner, peer.ip());
         self.next_owner = next;
         self.occupied += 1;
         Ok(Action::Accepted { owner, binding })
@@ -494,6 +509,29 @@ mod tests {
         bytes.extend(cid);
         bytes.extend([0; 20]);
         bytes
+    }
+
+    #[test]
+    fn validated_source_quota_does_not_evict_existing_routes() {
+        let mut ingress = Ingress::for_listener(4, VersionPolicy::both()).unwrap();
+        ingress.set_source_limit(1);
+        let a = "192.0.2.1:4000".parse::<SocketAddr>().unwrap();
+        let b = "192.0.2.2:4001".parse::<SocketAddr>().unwrap();
+        let version = Version::V1;
+        let accept = |ingress: &mut Ingress, peer, seed: u8| {
+            let original = [seed; 8];
+            let client = [seed + 1; 8];
+            let Action::Reply(retry) = ingress.process(peer, &initial(version, &original, &client, &[]), 0).unwrap() else { panic!("Retry"); };
+            let (cid, token) = negotiation::retry_token(&retry, version, &client, &original, false, false).unwrap();
+            let cid: Cid = cid.try_into().unwrap();
+            (cid, ingress.process(peer, &initial(version, &cid, &client, token), 0).unwrap())
+        };
+        let (cid, Action::Accepted { owner, .. }) = accept(&mut ingress, a, 1) else { panic!("first"); };
+        assert_eq!(accept(&mut ingress, a, 3).1, Action::Drop);
+        assert!(matches!(accept(&mut ingress, b, 5).1, Action::Accepted { .. }));
+        assert_eq!(ingress.process(a, &short(cid), 0), Ok(Action::Existing(owner)));
+        ingress.close(owner, 0).unwrap();
+        assert!(matches!(accept(&mut ingress, a, 7).1, Action::Accepted { .. }));
     }
 
     #[test]

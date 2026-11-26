@@ -1,15 +1,16 @@
-//! Explicit socket scope for controlled non-loopback QUIC trials. There is
-//! deliberately no wildcard or arbitrary peer mode before production parity.
+//! Explicit socket scope. A server may accept unpinned unicast peers only
+//! through the explicit own-TLS server entry point, on a concrete local IP.
 use std::net::{IpAddr, SocketAddr};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetworkScope {
     pins: Option<([IpAddr; 2], [IpAddr; 2])>,
+    server: Option<IpAddr>,
 }
 
 impl NetworkScope {
     pub(crate) const fn loopback() -> Self {
-        Self { pins: None }
+        Self { pins: None, server: None }
     }
 
     /// The caller explicitly authorizes one or two local and peer addresses.
@@ -21,18 +22,26 @@ impl NetworkScope {
         {
             return None;
         }
-        Some(Self { pins: Some((local, peer)) })
+        Some(Self { pins: Some((local, peer)), server: None })
     }
+
+    pub(crate) fn external_server(local: IpAddr) -> Option<Self> {
+        unicast(local).then_some(Self { pins: None, server: Some(local) })
+    }
+
+    pub(crate) fn is_external_server(self) -> bool { self.server.is_some() }
 
     pub(crate) fn is_pinned(self) -> bool {
         self.pins.is_some()
     }
 
     pub(crate) fn allows_local(self, ip: IpAddr) -> bool {
+        if let Some(local) = self.server { return ip == local; }
         self.pins.map_or_else(|| ip.is_loopback(), |(local, _)| local.contains(&ip))
     }
 
     pub(crate) fn allows_peer(self, ip: IpAddr) -> bool {
+        if let Some(local) = self.server { return unicast(ip) && ip.is_ipv4() == local.is_ipv4(); }
         self.pins.map_or_else(|| ip.is_loopback(), |(_, peer)| peer.contains(&ip))
     }
 
@@ -54,6 +63,21 @@ fn unicast(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_server_scope_has_one_local_ip_and_rejects_nonunicast() {
+        let local = "192.0.2.1:443".parse::<SocketAddr>().unwrap();
+        let scope = NetworkScope::external_server(local.ip()).unwrap();
+        assert!(scope.is_external_server());
+        assert!(!scope.is_pinned());
+        assert!(scope.permits(local, "198.51.100.10:2000".parse().unwrap()));
+        assert!(scope.permits(local, "203.0.113.11:3000".parse().unwrap()));
+        assert!(!scope.permits(local, "224.0.0.1:2000".parse().unwrap()));
+        assert!(!scope.permits(local, "0.0.0.0:2000".parse().unwrap()));
+        assert!(!scope.permits(local, "[::1]:2000".parse().unwrap()));
+        assert!(!scope.permits("192.0.2.2:443".parse().unwrap(), "198.51.100.10:2000".parse().unwrap()));
+        assert!(NetworkScope::external_server("0.0.0.0".parse().unwrap()).is_none());
+    }
+
     #[test]
     fn exact_dual_path_scope_rejects_wildcards_and_unapproved_peers() {
         let local: IpAddr = "192.0.2.1".parse().unwrap();

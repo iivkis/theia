@@ -185,8 +185,37 @@ pub async fn serve_native_pinned<F>(
 ) -> Result<(), ServerError>
 where F: std::future::Future<Output = ()> + Send,
 {
+    if !scope.is_pinned() { return Err(ServerError::Io); }
+    serve_native_scoped(socket, scope, tls, context, shutdown).await
+}
+
+/// Explicit own-TLS external listener, bound to one concrete IP. Clients
+/// are not restricted to a predeclared IP. This is not yet a runtime
+/// backend selector; callers must opt in and perform independent acceptance.
+pub async fn serve_native_external<F>(
+    socket: tokio::net::UdpSocket,
+    tls: Arc<rustls::ServerConfig>,
+    context: Arc<ServerContext>,
+    shutdown: F,
+) -> Result<(), ServerError>
+where F: std::future::Future<Output = ()> + Send,
+{
+    let local = socket.local_addr().map_err(|_| ServerError::Io)?;
+    let scope = crate::quic_core::scope::NetworkScope::external_server(local.ip()).ok_or(ServerError::Io)?;
+    serve_native_scoped(socket, scope, tls, context, shutdown).await
+}
+
+async fn serve_native_scoped<F>(
+    socket: tokio::net::UdpSocket,
+    scope: crate::quic_core::scope::NetworkScope,
+    tls: Arc<rustls::ServerConfig>,
+    context: Arc<ServerContext>,
+    shutdown: F,
+) -> Result<(), ServerError>
+where F: std::future::Future<Output = ()> + Send,
+{
     use crate::quic_core::{handshake_udp, listener::Listener, negotiation::VersionPolicy};
-    if !scope.is_pinned() || !context.allows_native_lab() || tls.send_tls13_tickets != 0 {
+    if !context.allows_native_lab() || tls.send_tls13_tickets != 0 || tls.max_early_data_size != 0 {
         return Err(ServerError::Io);
     }
     let mut listener = Listener::with_scope(socket, 128, VersionPolicy::both(), scope).map_err(|_| ServerError::Io)?;
@@ -234,6 +263,7 @@ async fn run_native_session(
     let (transport, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session)
         .map_err(|_| ServerError::Io)?;
     let mut closed = transport.closed_signal();
+    let mut drained = closed.clone();
     let binding = None;
     run_h3(
         transport,
@@ -244,6 +274,9 @@ async fn run_native_session(
         async move { let _ = closed.changed().await; },
     )
     .await;
+    // Keep the connection quota and listener ownership during the native
+    // driver's closing/draining period, not merely until H3 drops.
+    let _ = timeout(server::GENERATION_DRAIN, drained.changed()).await;
     Ok(())
 }
 

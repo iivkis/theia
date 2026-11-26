@@ -706,7 +706,7 @@ async fn native_xhttp_loopback_preserves_grants_and_both_stream_modes() {
     .unwrap();
 }
 
-async fn exercise_pinned_native_endpoint(ip: std::net::IpAddr) {
+async fn exercise_pinned_native_endpoint(ip: std::net::IpAddr, external: bool) {
     use theia::quic_core::{scope::NetworkScope, wire::Version};
     let (tls, roots) = native_tls_fixture();
     let local = SocketAddr::new(ip, 0);
@@ -714,9 +714,14 @@ async fn exercise_pinned_native_endpoint(ip: std::net::IpAddr) {
     let remote = socket.local_addr().unwrap();
     let scope = NetworkScope::pinned([ip; 2], [ip; 2]).unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(h3_server::serve_native_pinned(socket, scope, tls, context(true), async move {
-        let _ = stopped.await;
-    }));
+    let server = tokio::spawn(async move {
+        let shutdown = async move { let _ = stopped.await; };
+        if external {
+            h3_server::serve_native_external(socket, tls, context(true), shutdown).await
+        } else {
+            h3_server::serve_native_pinned(socket, scope, tls, context(true), shutdown).await
+        }
+    });
     for version in [Version::V1, Version::V2] {
         let client = H3Client::new(remote, "localhost", &token(), roots.clone())
             .unwrap().with_native_pinned(version, local, scope).unwrap()
@@ -742,8 +747,8 @@ async fn exercise_pinned_native_endpoint(ip: std::net::IpAddr) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pinned_native_h3_ipv4_ipv6_pool_auth_and_drain() {
     timeout(Duration::from_secs(90), async {
-        exercise_pinned_native_endpoint("127.0.0.1".parse().unwrap()).await;
-        exercise_pinned_native_endpoint("::1".parse().unwrap()).await;
+        exercise_pinned_native_endpoint("127.0.0.1".parse().unwrap(), false).await;
+        exercise_pinned_native_endpoint("::1".parse().unwrap(), true).await;
     }).await.unwrap();
 }
 
@@ -754,7 +759,7 @@ async fn pinned_native_h3_ipv4_ipv6_pool_auth_and_drain() {
 async fn pinned_native_h3_non_loopback_interface() {
     let ip: std::net::IpAddr = std::env::var("THEIA_QUIC_TEST_LOCAL").unwrap().parse().unwrap();
     assert!(!ip.is_loopback());
-    timeout(Duration::from_secs(60), exercise_pinned_native_endpoint(ip)).await.unwrap();
+    timeout(Duration::from_secs(60), exercise_pinned_native_endpoint(ip, true)).await.unwrap();
 }
 
 /// Manual matched loopback workload: raw samples, no performance claim.

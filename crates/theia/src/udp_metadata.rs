@@ -265,7 +265,7 @@ mod windows {
         // pointer. No overlapped operation is pending after this call.
         let result = unsafe {
             WSAIoctl(raw(socket), SIO_GET_EXTENSION_FUNCTION_POINTER,
-                (&WSAID_WSARECVMSG as *const _).cast(), size_of_val(&WSAID_WSARECVMSG) as u32,
+                (&WSAID_WSARECVMSG as *const windows_sys::core::GUID).cast(), size_of_val(&WSAID_WSARECVMSG) as u32,
                 (&mut recvmsg as *mut LPFN_WSARECVMSG).cast(), size_of::<LPFN_WSARECVMSG>() as u32,
                 &mut written, ptr::null_mut(), None)
         };
