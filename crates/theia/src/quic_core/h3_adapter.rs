@@ -1,6 +1,5 @@
-//! Experimental h3 0.0.8 transport bridge, using only the TLS-established
-//! native loopback session. Not a product carrier: no external
-//! interoperability, independent admission or acceptance.
+//! h3 0.0.8 transport bridge, using only TLS-established native sessions.
+//! Runtime admission remains at the common H3 application boundary.
 //! The worker serializes all packet/stream state. Synchronous trait calls
 //! never hold the state mutex across UDP I/O. Each direction has one bounded
 //! handoff slot and one waker. There is no task per stream or per datagram.
@@ -28,7 +27,7 @@ use tokio::sync::{oneshot, watch, Notify};
 
 // Include HTTP/3 framing overhead for a 64 KiB application write.
 const SLOT_LIMIT: usize = 128 * 1024;
-const OPEN_LIMIT: usize = 16;
+const OPEN_LIMIT: usize = crate::transport_policy::MAX_BIDI_STREAMS as usize + crate::transport_policy::MAX_QUIC_UNI_STREAMS as usize;
 const MAX_BURST: usize = 32;
 const IDLE_WAIT: Duration = Duration::from_secs(60);
 const CANCEL: u64 = 0x10c;

@@ -15,6 +15,8 @@ use std::{
 };
 
 const MAX_FRAMES: usize = 128;
+// Count encoded bytes conservatively at their maximum per frame.
+const APPLICATION_FRAMES: usize = crate::transport_policy::QUIC_SEND_WINDOW_BYTES as usize / 1100;
 const MAX_ALIASES: usize = 4096;
 const MAX_PTO: u32 = 8;
 const MAX_HISTORY: usize = 8192;
@@ -151,6 +153,7 @@ pub struct Scheduler {
     max_ack_delay: Duration,
     confirmed: bool,
     frames: BTreeMap<u64, Pending>,
+    frame_limit: usize,
     queue: VecDeque<u64>,
     aliases: BTreeMap<u64, Vec<u64>>,
     next_id: u64,
@@ -178,6 +181,7 @@ impl Scheduler {
             max_ack_delay: Duration::ZERO,
             confirmed: false,
             frames: BTreeMap::new(),
+            frame_limit: MAX_FRAMES,
             queue: VecDeque::new(),
             aliases: BTreeMap::new(),
             next_id: 0,
@@ -261,12 +265,16 @@ impl Scheduler {
         self.last_eliciting = None;
     }
 
+    pub(crate) fn enable_application_buffer(&mut self) {
+        self.frame_limit = APPLICATION_FRAMES;
+    }
+
     pub fn can_queue(&self) -> bool {
         self.can_queue_n(1)
     }
 
     pub fn can_queue_n(&self, n: usize) -> bool {
-        n <= MAX_FRAMES.saturating_sub(self.frames.len()) && (n as u64) <= u64::MAX - self.next_id
+        n <= self.frame_limit.saturating_sub(self.frames.len()) && (n as u64) <= u64::MAX - self.next_id
     }
 
     pub fn enqueue(&mut self, bytes: Vec<u8>) -> Result<(), Error> {

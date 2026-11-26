@@ -7,7 +7,7 @@ use rustls::{pki_types::ServerName, ClientConfig};
 use std::{
     io,
     net::SocketAddr,
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
+    sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc},
     time::{Duration, Instant},
 };
 
@@ -23,14 +23,14 @@ pub(crate) enum Error {
 
 #[derive(Default)]
 pub(crate) struct Observation {
-    sent: AtomicBool,
+    sent: AtomicU32,
     received: AtomicBool,
     refused: AtomicBool,
 }
 
 impl Observation {
     pub(crate) fn sent(&self) {
-        self.sent.store(true, Ordering::SeqCst);
+        let _ = self.sent.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_add(1)));
     }
 
     pub(crate) fn received(&self) {
@@ -48,7 +48,7 @@ impl Observation {
             if self.refused.load(Ordering::SeqCst) {
                 return Error::EndpointNetworkRefused;
             }
-            if timeout && self.sent.load(Ordering::SeqCst) {
+            if timeout && self.sent.load(Ordering::SeqCst) >= 1 {
                 return Error::Unreachable;
             }
         }

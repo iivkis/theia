@@ -164,8 +164,14 @@ impl LabSession {
             PeerIds::with_initial(remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
         session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
         session.peer_disable_migration = peer_disable_migration;
-        session.send =
-            SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
+        use crate::transport_policy as policy;
+        let bidi = u64::from(policy::MAX_BIDI_STREAMS);
+        let uni = u64::from(policy::MAX_QUIC_UNI_STREAMS);
+        let window = u64::from(policy::QUIC_STREAM_RECEIVE_BYTES);
+        session.send = SendFlow::from_peer(server, peer_limits, bidi).map_err(Error::Send)?;
+        session.receive = ReceiveFlow::new(server, bidi, uni, window, window as usize,
+            u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES)).map_err(Error::Receive)?;
+        session.receive.enable_local_bidi(bidi).map_err(Error::Receive)?;
         session.receive.enable_autotune().map_err(Error::Receive)?;
         session.scheduler = scheduler;
         let options = session.socket.options();

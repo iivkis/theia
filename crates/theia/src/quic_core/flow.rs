@@ -10,11 +10,12 @@ use std::{
 };
 
 const MAX_STREAMS: u64 = 64;
+const MAX_RECEIVE_DIRECTIONS: u64 = 72;
 const MAX_STREAM_COUNT: u64 = 1 << 60;
 const RECENT_CLOSED: usize = 64;
-const MAX_TOTAL_WINDOW: usize = 8 * 1024 * 1024;
+const MAX_TOTAL_WINDOW: usize = 18 * 1024 * 1024;
 const MAX_ADAPTIVE_STREAM: usize = 256 * 1024;
-const MAX_ADAPTIVE_CONNECTION: u64 = 2 * 1024 * 1024;
+const MAX_ADAPTIVE_CONNECTION: u64 = crate::transport_policy::QUIC_CONNECTION_RECEIVE_BYTES as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -88,7 +89,7 @@ impl ReceiveFlow {
             .checked_add(self.max_uni)
             .and_then(|n| n.checked_add(limit))
             .ok_or(Error::Limit)?;
-        if count > MAX_STREAMS
+        if count > MAX_RECEIVE_DIRECTIONS
             || (count as usize).saturating_mul(self.window) > MAX_TOTAL_WINDOW
             || self.adaptive_cap.is_some()
             || limit < self.max_local_bidi
@@ -392,6 +393,28 @@ impl ReceiveFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_receive_limits_allow_all_concurrent_directions() {
+        use crate::transport_policy as policy;
+        let bidi = u64::from(policy::MAX_BIDI_STREAMS);
+        let uni = u64::from(policy::MAX_QUIC_UNI_STREAMS);
+        let window = u64::from(policy::QUIC_STREAM_RECEIVE_BYTES);
+        let mut f = ReceiveFlow::new(true, bidi, uni, window, window as usize,
+            u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES)).unwrap();
+        f.enable_local_bidi(bidi).unwrap();
+        f.enable_autotune().unwrap();
+        for n in 0..bidi {
+            f.register_local_bidi(4*n+1).unwrap();
+            f.insert(4*n, 0, b"x", false).unwrap();
+        }
+        for n in 0..uni {
+            f.insert(4*n+2, 0, b"x", false).unwrap();
+        }
+        assert!(!f.can_open_local_bidi());
+        assert_eq!(f.insert(4*bidi, 0, b"x", false), Err(Error::StreamId));
+        assert_eq!(f.streams.len(), (2*bidi+uni) as usize);
+    }
 
     #[test]
     fn fast_consumption_grows_windows_but_retirement_does_not_multiply_budget() {

@@ -37,8 +37,7 @@ const CHUNK: usize = 900;
 const MAX_RETRY_TOKEN: usize = 512;
 const DEADLINE: Duration = Duration::from_secs(8);
 const CID_LEN: usize = 8;
-const CREDIT: u64 = 64 * 1024;
-const STREAMS: u64 = 8;
+use crate::transport_policy as policy;
 
 #[derive(Debug)]
 pub enum Error {
@@ -122,12 +121,12 @@ fn params(
     for (id, value) in [
         (0x01, 30_000),
         (0x03, super::mtu::MAX_UDP_PAYLOAD as u64),
-        (0x04, CREDIT),
-        (0x05, CREDIT),
-        (0x06, CREDIT),
-        (0x07, CREDIT),
-        (0x08, STREAMS),
-        (0x09, STREAMS),
+        (0x04, u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES)),
+        (0x05, u64::from(policy::QUIC_STREAM_RECEIVE_BYTES)),
+        (0x06, u64::from(policy::QUIC_STREAM_RECEIVE_BYTES)),
+        (0x07, u64::from(policy::QUIC_STREAM_RECEIVE_BYTES)),
+        (0x08, u64::from(policy::MAX_BIDI_STREAMS)),
+        (0x09, u64::from(policy::MAX_QUIC_UNI_STREAMS)),
     ] {
         let mut scratch = [0; 8];
         let value = encode_varint(value, &mut scratch).ok_or(Error::Protocol)?;
@@ -1169,7 +1168,8 @@ async fn establish_inner(
         Congestion::Bbr => Scheduler::with_bbr(Instant::now()),
         Congestion::Cubic => Scheduler::default(),
     };
-    let application_schedule = initial.fork_space();
+    let mut application_schedule = initial.fork_space();
+    application_schedule.enable_application_buffer();
     let mut handshake = Handshake {
         driver: Driver::new(connection),
         epochs: [Some(Epoch::with_schedule(keys, initial)), None],

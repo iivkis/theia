@@ -768,8 +768,13 @@ impl PreparedQuic {
                         header.as_ref().is_some_and(|h| ingress.known(h.dcid))
                     };
                     let alias = header.as_ref().filter(|h| h.kind == Kind::Initial).and_then(|h| {
-                        admitted.get(&(peer, h.dcid.to_vec())).filter(|a| a.client.as_slice() == h.scid && a.version == h.version && a.local == local)
+                        admitted.get(&(peer, h.dcid.to_vec()))
                     });
+                    if let (Some(a), Some(h)) = (alias, header.as_ref()) {
+                        if a.client.as_slice() != h.scid || a.version != h.version || a.local != local {
+                            continue;
+                        }
+                    }
                     let existing_local = alias.is_some();
                     if !local_known && !existing_local && retired.iter().any(|s| s.blocks(peer, data, now)) {
                         continue;
