@@ -28,6 +28,8 @@ pub(crate) struct Engine {
     enabled: AtomicBool,
     cache: strategy::Cache,
     probes: Semaphore,
+    // Bounded lock stripes coalesce simultaneous probes without an unbounded map.
+    probe_slots: [tokio::sync::Mutex<()>; 32],
 }
 
 impl Default for Engine {
@@ -36,6 +38,7 @@ impl Default for Engine {
             enabled: AtomicBool::new(false),
             cache: strategy::Cache::default(),
             probes: Semaphore::new(4),
+            probe_slots: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -49,6 +52,13 @@ impl Engine {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    fn probe_slot(&self, name: &str, address: SocketAddr, policy: [u8; 32]) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (name, address, policy).hash(&mut hash);
+        (hash.finish() as usize) % self.probe_slots.len()
+    }
+
     pub(crate) async fn open(
         self: &Arc<Self>,
         name: &str,
@@ -57,7 +67,7 @@ impl Engine {
         policy: [u8; 32],
     ) -> Option<Tunnel> {
         if !self.enabled()
-            || port != 443
+            || !matches!(port, 443 | 8443)
             || ips.is_empty()
             || ips.len() > 64
             || !ips
@@ -67,7 +77,6 @@ impl Engine {
             return None;
         }
         let name = super::domain_name(name).ok()?;
-        let _permit = self.probes.try_acquire().ok()?;
         timeout(OPEN_BUDGET, async {
             for ip in ips.iter().take(2) {
                 let address = SocketAddr::new(*ip, port);
@@ -75,10 +84,13 @@ impl Engine {
                     continue;
                 };
                 let key = Key { name: name.clone(), address, policy, network };
+                let slot = self.probe_slot(&key.name, address, policy);
+                let guard = self.probe_slots[slot].lock().await;
                 let strategy = match self.cache.cached(&key) {
                     Some(Verdict::Verified(strategy)) => strategy,
                     Some(Verdict::Unavailable) => continue,
                     previous => {
+                        let _permit = self.probes.try_acquire().ok()?;
                         let config = tokio::task::spawn_blocking(tls::native_config).await.ok()??;
                         let mut verified = None;
                         for strategy in Strategy::ALL {
@@ -101,7 +113,8 @@ impl Engine {
                         strategy
                     }
                 };
-                if network_scope::observe(address) != Some(network) {
+                drop(guard);
+                if !self.enabled() || network_scope::observe(address) != Some(network) {
                     continue;
                 }
                 match timeout(ATTEMPT, tcp::connect(address)).await {
@@ -171,15 +184,7 @@ impl Tunnel {
                 .write_all(&transformed)
                 .await
                 .map_err(|_| ClientError::Io)?;
-            let response = tcp::read_record(&mut self.target).await?;
-            if response[0] != 22
-                || response[1] != 3
-                || !(1..=3).contains(&response[2])
-                || response[5] != 2
-            {
-                return Err(ClientError::Protocol);
-            }
-            Ok(response)
+            tcp::read_server_hello(&mut self.target).await
         })
         .await;
         let response = match response {
@@ -282,6 +287,7 @@ mod tests {
             for (name, strategy, expected) in [
                 ("localhost", Strategy::Header, true),
                 ("localhost", Strategy::Middle, true),
+                ("localhost", Strategy::Balanced, true),
                 ("wrong.invalid", Strategy::Header, false),
             ] {
                 let server = async {

@@ -14,10 +14,11 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(20);
 pub(super) enum Strategy {
     Header,
     Middle,
+    Balanced,
 }
 
 impl Strategy {
-    pub(super) const ALL: [Self; 2] = [Self::Header, Self::Middle];
+    pub(super) const ALL: [Self; 3] = [Self::Header, Self::Middle, Self::Balanced];
 }
 
 #[derive(Clone, PartialEq, Eq)]

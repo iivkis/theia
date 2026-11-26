@@ -1122,13 +1122,20 @@ async fn routed_open(
         Action::DirectDpi => {
             // Initial native backend supports domain HTTPS TCP only. Resolve
             // via the authenticated policy endpoint, never the local resolver.
-            if cache.dpi.enabled() && port == 443 {
+            if cache.dpi.enabled() && matches!(port, 443 | 8443) {
                 if let Address::Dns(name) = &address {
                     let ips = match pinned {
                         Some(ips) => ips,
-                        None => carrier.resolve_routing(name, snapshot.digest()).await?,
+                        None => match carrier.resolve_routing(name, snapshot.digest()).await {
+                            Ok(ips) => ips,
+                            // Only a conclusive domain rule can fall back on a
+                            // transient DNS server error. Auth/policy/digest
+                            // errors must not be hidden by a fallback.
+                            Err(ClientError::Rejected(502 | 504)) => Vec::new(),
+                            Err(error) => return Err(error),
+                        },
                     };
-                    let permitted = ips.iter().all(|ip| {
+                    let permitted = !ips.is_empty() && ips.iter().all(|ip| {
                         policy.matching_action(Some(name), Some(*ip)) == Ok(Some(Action::DirectDpi))
                     });
                     if permitted {

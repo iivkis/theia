@@ -170,12 +170,17 @@ pub(super) fn transform(bytes: &[u8], expected_name: &str, strategy: Strategy) -
     if name != expected_name {
         return None;
     }
-    let cut = match strategy {
-        Strategy::Header => 4,
-        Strategy::Middle => message.len() / 2,
+    let middle = message.len() / 2;
+    let cuts: &[usize] = match strategy {
+        Strategy::Header => &[4],
+        Strategy::Middle => &[middle],
+        Strategy::Balanced => &[message.len() / 4, middle, message.len() * 3 / 4],
     };
-    let mut output = Vec::with_capacity(bytes.len() + 15);
-    for part in [&message[..cut], &message[cut..]] {
+    let mut output = Vec::with_capacity(bytes.len() + 30);
+    let mut start = 0;
+    for end in cuts.iter().copied().chain(std::iter::once(message.len())) {
+        let part = &message[start..end];
+        start = end;
         for chunk in part.chunks(RECORD_LIMIT) {
             output.push(22);
             output.extend_from_slice(&version);
@@ -185,6 +190,36 @@ pub(super) fn transform(bytes: &[u8], expected_name: &str, strategy: Strategy) -
     }
     output.extend_from_slice(&bytes[consumed..]);
     Some(output)
+}
+
+/// Strict structural observation of a complete plaintext ServerHello.
+/// This is not certificate or Finished authentication: the application owns TLS.
+/// Permit a valid HelloRetryRequest, and preserve any coalesced later handshake.
+pub(super) fn server_hello(mut message: &[u8]) -> bool {
+    if byte(&mut message) != Some(2) {
+        return false;
+    }
+    let Some(length) = take(&mut message, 3) else { return false; };
+    let length = (usize::from(length[0]) << 16) | (usize::from(length[1]) << 8) | usize::from(length[2]);
+    let Some(mut body) = take(&mut message, length) else { return false; };
+    if take(&mut body, 2) != Some(&[3, 3][..]) || take(&mut body, 32).is_none() {
+        return false;
+    }
+    let Some(session) = byte(&mut body) else { return false; };
+    if session > 32 || take(&mut body, session).is_none() || word(&mut body).is_none() || byte(&mut body) != Some(0) {
+        return false;
+    }
+    if body.is_empty() { return true; }
+    if word(&mut body) != Some(body.len()) { return false; }
+    let mut seen = HashSet::new();
+    while !body.is_empty() {
+        let Some(kind) = word(&mut body) else { return false; };
+        let Some(len) = word(&mut body) else { return false; };
+        if seen.len() >= 128 || !seen.insert(kind) || take(&mut body, len).is_none() {
+            return false;
+        }
+    }
+    true
 }
 
 pub(super) fn tls_config(roots: rustls::RootCertStore) -> Option<Arc<rustls::ClientConfig>> {
