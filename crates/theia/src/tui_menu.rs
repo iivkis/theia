@@ -1642,7 +1642,7 @@ struct FirstSetup {
 enum SetupAction {
     Continue,
     Back,
-    Create(Config),
+    Create(Box<Config>),
 }
 
 impl FirstSetup {
@@ -1782,7 +1782,7 @@ impl FirstSetup {
                 }
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if let Some(candidate) = self.review.take() {
-                        return SetupAction::Create(candidate);
+                        return SetupAction::Create(Box::new(candidate));
                     }
                 }
                 _ => {}
@@ -1948,8 +1948,11 @@ mod tests {
         setup.key(press(KeyCode::Char('n')));
         assert!(setup.review.is_none());
         setup.key(press(KeyCode::Enter));
-        let SetupAction::Create(Config::Server(doc)) = setup.key(press(KeyCode::Char('Y'))) else {
+        let SetupAction::Create(config) = setup.key(press(KeyCode::Char('Y'))) else {
             panic!("expected reviewed server config");
+        };
+        let Config::Server(doc) = *config else {
+            panic!("expected server document");
         };
         assert!(doc.server.users[0].disabled);
         assert_eq!(doc.server.users[0].token_sha256.len(), 64);

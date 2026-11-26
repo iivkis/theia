@@ -367,7 +367,7 @@ impl H2Client {
             let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
             let mut parts = self.uri.clone().into_parts();
             parts.path_and_query = Some(
-                (&routes.routing)
+                routes.routing
                     .parse()
                     .map_err(|_| ClientError::Configuration)?,
             );

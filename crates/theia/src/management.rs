@@ -1272,7 +1272,7 @@ where
                     "3" => 3,
                     _ => return None,
                 };
-                if ((routing_state == 1 || routing_state == 2) != (routing_revision != 0)) {
+                if (routing_state == 1 || routing_state == 2) != (routing_revision != 0) {
                     return None;
                 }
                 let mut counters = fields.next()?.strip_prefix("rt=")?.split(',');
