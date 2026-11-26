@@ -781,6 +781,7 @@ struct Wizard {
     fields: [String; 8],
     focus: usize,
     advanced: bool,
+    sources: bool,
     users: String,
     available_users: Vec<String>,
     grant_picker: Option<GrantPicker>,
@@ -812,8 +813,9 @@ impl Wizard {
                 "auto".into(),
                 String::new(),
             ],
-            focus: 1,
+            focus: 2,
             advanced: false,
+            sources: false,
             users: editor
                 .record_user_catalog(crate::tui_editor::RecordAction::NewInbound)
                 .unwrap_or_default(),
@@ -851,8 +853,9 @@ impl Wizard {
                 "auto".into(),
                 String::new(),
             ],
-            focus: 1,
+            focus: 2,
             advanced: false,
+            sources: false,
             users: "Введите ID первого пользователя. Он будет отключён до явного выпуска токена."
                 .into(),
             available_users: Vec::new(),
@@ -864,6 +867,105 @@ impl Wizard {
             registration: None,
         })
     }
+    // A literal endpoint can be copied to the own-address field. Never
+    // infer public ownership from a local interface or provider range.
+    fn suggest_own_ip(&mut self) {
+        if self.fields[3].trim().is_empty() {
+            if let Ok(ip) = self.fields[2].trim_matches(['[', ']']).parse::<IpAddr>() {
+                self.fields[3] = ip.to_string();
+            }
+        }
+    }
+
+    fn catalogue_enabled(&self) -> bool {
+        self.fields[4].split(',').any(|item| item.trim() == "catalog")
+    }
+
+    fn custom_domains(&self) -> String {
+        self.fields[4].split(',').filter(|item| item.trim() != "catalog").collect::<Vec<_>>().join(",")
+    }
+
+    fn set_custom_domains(&mut self, custom: String, catalogue: bool) {
+        self.fields[4] = if catalogue {
+            if custom.is_empty() { "catalog".into() } else { format!("catalog,{custom}") }
+        } else { custom };
+    }
+
+    fn display_value(&self, id: usize) -> String {
+        match id {
+            8 => format!("{} · {} сайтов", if self.catalogue_enabled() { "Включён" } else { "Выключен" }, crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len()),
+            4 => self.custom_domains(),
+            6 => if self.fields[6] == "auto" { "Автоматически (рекомендуется)".into() } else { "Ручной порядок".into() },
+            5 if self.source.is_some() && self.fields[5].is_empty() => "Никто не выбран".into(),
+            _ => self.fields[id].clone(),
+        }
+    }
+
+    fn editable(&self) -> bool {
+        self.focus < self.fields.len() && self.focus != 6
+            && !(self.focus == 5 && self.source.is_some() && !self.available_users.is_empty())
+    }
+
+    fn edit_value(&self) -> String {
+        if self.focus == 4 { self.custom_domains() } else { self.fields[self.focus].clone() }
+    }
+
+    fn put_value(&mut self, value: String) {
+        if self.focus == 4 {
+            self.set_custom_domains(value, self.catalogue_enabled());
+        } else {
+            self.fields[self.focus] = value;
+        }
+        self.error.clear();
+    }
+
+    fn open_grants(&mut self) {
+        if !self.available_users.is_empty() {
+            self.grant_picker = Some(GrantPicker {
+                selected: self.available_users.iter().map(|id| self.fields[5].split(',').any(|s| s.trim() == id)).collect(),
+                focus: 0,
+            });
+        }
+    }
+
+    fn source_error(&self) -> Option<(usize, &'static str)> {
+        if self.fields[4].trim().is_empty() && self.fields[7].trim().is_empty() {
+            return Some((8, "Выберите хотя бы один источник: каталог, свои домены или разрешённые IP-диапазоны."));
+        }
+        if self.fields[6] == "manual" && (self.catalogue_enabled() || !self.fields[7].trim().is_empty() || self.custom_domains().split(',').count() > 3) {
+            return Some((6, "Ручной порядок: только 1–3 своих домена без каталога и IP-диапазонов. Выберите автоматический подбор."));
+        }
+        for item in self.custom_domains().split(',').filter(|s| !s.trim().is_empty()) {
+            let item = item.trim();
+            let (name, pin) = item.split_once('=').map_or((item, None), |(name, pin)| (name, Some(pin)));
+            if crate::camouflage_domain_dns::validate_manual_dns_request(name, crate::camouflage_domain_dns::DnsConsent::Approved).is_err()
+                || pin.is_some_and(|pin| pin.parse::<IpAddr>().is_err()) {
+                return Some((4, "Введите имя сайта без https://, пути и порта. Несколько имён разделяйте запятыми."));
+            }
+        }
+        if !self.fields[7].trim().is_empty() {
+            let own: Vec<IpAddr> = self.fields[3].split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            if range_targets(&self.fields[7], &own).is_err() {
+                return Some((7, "Диапазон не принят. Укажите разрешённую назначенную публичную IPv4-подсеть (до 32 дополнительных IP) или оставьте поле пустым."));
+            }
+        }
+        None
+    }
+
+    fn explain_error(error: Error) -> &'static str {
+        match error {
+            Error::Format => "Проверьте формат параметров.",
+            Error::Scope => "Проверьте адрес, порт, имена сайтов и разрешённые диапазоны. Порт не должен пересекаться с другим подключением.",
+            Error::Approval => "Конфигурация изменилась. Закройте мастер, откройте сохранённую конфигурацию и повторите.",
+            Error::Grant => "Выберите действующего пользователя. Для первого сервера укажите имя нового пользователя.",
+            Error::Health => "Не удалось завершить проверку сайтов. Проверьте доступ сервера к интернету, DNS и HTTPS.",
+            Error::Clock => "Проверьте дату и время сервера.",
+            Error::Storage => "Не удалось подготовить файлы. Проверьте права, путь и свободное место.",
+            Error::Indeterminate => "Результат записи неизвестен. Проверьте файлы и конфигурацию перед повтором.",
+            _ => "Проверка безопасности не пройдена. Настройки не применены.",
+        }
+    }
+
     /// Explain common form mistakes before the shared validator; never replace it.
     fn basic_error(&self) -> Option<(usize, &'static str)> {
         let port = self.fields[1]
@@ -889,7 +991,7 @@ impl Wizard {
                 if self.source.is_none() {
                     "Придумайте имя первого пользователя, например phone. Доступ появится только после выдачи приглашения."
                 } else {
-                    "Выберите хотя бы одного активного пользователя с помощью F6. Если их нет, создайте пользователя отдельно."
+                    "Выберите хотя бы одного активного пользователя. Enter на поле открывает список. Если пользователей нет, создайте пользователя отдельно."
                 },
             ));
         }
@@ -900,13 +1002,15 @@ impl Wizard {
     }
 
     fn visible_fields(&self) -> &[usize] {
-        if self.advanced {
-            &[0, 1, 2, 3, 4, 5, 6, 7]
-        } else {
-            &[1, 2, 3, 5, 4, 7]
+        match (self.sources, self.advanced) {
+            (false, false) => &[2, 1, 3, 5],
+            (false, true) => &[2, 1, 3, 5, 0],
+            (true, false) => &[8, 4, 7],
+            (true, true) => &[8, 4, 7, 6],
         }
     }
     fn move_focus(&mut self, forward: bool) {
+        if self.focus == 2 { self.suggest_own_ip(); }
         let fields = self.visible_fields();
         let index = fields
             .iter()
@@ -919,13 +1023,12 @@ impl Wizard {
             panel.paste(text);
             return;
         }
-        if self.grant_picker.is_none() && matches!(self.stage, WizardStage::Input) {
-            let field = &mut self.fields[self.focus];
+        if self.grant_picker.is_none() && matches!(self.stage, WizardStage::Input) && self.editable() {
+            let mut field = self.edit_value();
             let value = text.trim_end_matches(['\r', '\n']);
-            if !value.chars().any(char::is_control)
-                && field.len().saturating_add(value.len()) <= LIMIT
-            {
+            if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= LIMIT {
                 field.push_str(value);
+                self.put_value(field);
             }
         }
     }
@@ -963,46 +1066,64 @@ impl Wizard {
         self.stage = match old {
             WizardStage::Input => {
                 match key.code {
+                    KeyCode::Esc if self.sources => {
+                        self.sources = false;
+                        self.focus = 5;
+                        self.error.clear();
+                    }
                     KeyCode::Esc => return true,
                     KeyCode::F(2) => {
                         self.advanced = !self.advanced;
                         if !self.visible_fields().contains(&self.focus) {
-                            self.focus = 1;
+                            self.focus = self.visible_fields()[0];
                         }
                     }
-                    KeyCode::F(3) if self.focus == 3 && self.fields[3].is_empty() => {
-                        if let Ok(ip) = self.fields[2].trim_matches(['[', ']']).parse::<IpAddr>() {
-                            self.fields[3] = ip.to_string();
-                            self.error.clear();
-                        } else {
-                            self.error="Адрес для клиентов не является IP. Укажите все IP своего сервера вручную.".into();
-                        }
+                    KeyCode::F(3) if self.focus == 3 => {
+                        self.suggest_own_ip();
+                        if self.fields[3].is_empty() {
+                            self.error = "Укажите IP из панели хостинга.".into();
+                        } else { self.error.clear(); }
                     }
-                    KeyCode::F(6) if self.focus == 5 && !self.available_users.is_empty() => {
-                        self.grant_picker = Some(GrantPicker {
-                            selected: self
-                                .available_users
-                                .iter()
-                                .map(|id| self.fields[5].split(',').any(|s| s.trim() == id))
-                                .collect(),
-                            focus: 0,
-                        });
-                    }
+                    KeyCode::F(6) if !self.sources && self.focus == 5 => self.open_grants(),
                     KeyCode::Tab | KeyCode::Down => self.move_focus(true),
                     KeyCode::BackTab | KeyCode::Up => self.move_focus(false),
-                    KeyCode::Backspace => {
-                        self.fields[self.focus].pop();
+                    KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if self.focus == 8 => {
+                        self.set_custom_domains(self.custom_domains(), !self.catalogue_enabled());
                         self.error.clear();
                     }
-                    KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-                        self.fields[self.focus].clear();
+                    KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if self.focus == 6 => {
+                        self.fields[6] = if self.fields[6] == "auto" { "manual".into() } else { "auto".into() };
                         self.error.clear();
                     }
+                    KeyCode::Char(' ') if !self.sources && self.focus == 5 && self.source.is_some() => self.open_grants(),
+                    KeyCode::Backspace if self.editable() => {
+                        let mut value = self.edit_value();
+                        value.pop();
+                        self.put_value(value);
+                    }
+                    KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL && self.editable() => self.put_value(String::new()),
                     KeyCode::Enter => {
+                        self.suggest_own_ip();
+                        if !self.sources && self.focus == 5 && self.source.is_some() && self.fields[5].is_empty() && !self.available_users.is_empty() {
+                            self.open_grants();
+                            return false;
+                        }
                         if let Some((field, message)) = self.basic_error() {
+                            self.sources = false;
                             self.focus = field;
                             self.error = message.into();
-                            self.stage = WizardStage::Input;
+                            return false;
+                        }
+                        if !self.sources {
+                            self.sources = true;
+                            self.focus = 8;
+                            self.error.clear();
+                            return false;
+                        }
+                        if let Some((field, message)) = self.source_error() {
+                            self.focus = field;
+                            if field == 6 { self.advanced = true; }
+                            self.error = message.into();
                             return false;
                         }
                         match WizardInput::parse(self.config.clone(), self.source, &self.fields) {
@@ -1011,15 +1132,15 @@ impl Wizard {
                                 self.stage = WizardStage::DnsConfirm(Box::new(input));
                                 return false;
                             }
-                            Err(error) => self.error = format!("ОТКАЗ: {error}"),
+                            Err(error) => self.error = Self::explain_error(error).into(),
                         }
                     }
-                    KeyCode::Char(ch)
-                        if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-                            && !ch.is_control()
-                            && self.fields[self.focus].len() + ch.len_utf8() <= LIMIT =>
-                    {
-                        self.fields[self.focus].push(ch)
+                    KeyCode::Char(ch) if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) && !ch.is_control() && self.editable() => {
+                        let mut value = self.edit_value();
+                        if value.len() + ch.len_utf8() <= LIMIT {
+                            value.push(ch);
+                            self.put_value(value);
+                        }
                     }
                     _ => {}
                 }
@@ -1183,6 +1304,7 @@ impl Wizard {
             {
                 WizardStage::Input
             }
+            WizardStage::NoEligible(_) if key.code == KeyCode::Enter => WizardStage::Input,
             WizardStage::Checking(_, cancel) if key.code == KeyCode::Esc => {
                 let _ = cancel.send(());
                 WizardStage::Input
@@ -1238,7 +1360,7 @@ impl Wizard {
         self.stage = match result {
             Ok(stage) => stage,
             Err(error) => {
-                self.error = format!("ОТКАЗ: {error}");
+                self.error = Self::explain_error(error).into();
                 WizardStage::Input
             }
         };
@@ -1250,27 +1372,30 @@ impl Wizard {
         }
         match &self.stage {
             WizardStage::Input => {
-                let mut out = String::from("СЕТЬ · без собственного TLS-сертификата\n\n");
-                for &i in self.visible_fields() {
-                    if i == 5 { out.push_str("\nДОСТУП\n"); }
-                    let label = match i {
-                        1 if !self.advanced => "Порт TCP/UDP",
-                        2 => "Адрес сервера для клиентов (домен/IP без порта)",
-                        3 => "Собственные IP сервера (через запятую)",
-                        5 if self.source.is_none() => "ID первого пользователя",
-                        5 => "Пользователи с доступом (ID через запятую)",
-                        _ => WIZARD_LABELS[i],
+                let mut out = if self.sources { "ИСТОЧНИКИ ПОИСКА\n".to_owned() } else { "НАСТРОЙКА СЕРВЕРА\n".to_owned() };
+                for &id in self.visible_fields() {
+                    let label = match id {
+                        8 => "Готовый каталог сайтов",
+                        1 => "Порт подключения",
+                        2 => "Адрес сервера для клиентов",
+                        3 => "IP-адреса вашего сервера",
+                        4 => "Свои домены (необязательно)",
+                        5 if self.source.is_none() => "Имя первого пользователя",
+                        5 => "Пользователи с доступом",
+                        7 => "Разрешённые IP-диапазоны",
+                        _ => WIZARD_LABELS[id],
                     };
-                    let value = if self.fields[i].is_empty() { "[введите значение]" } else { self.fields[i].as_str() };
-                    out.push_str(&format!("{} {label}: {value}\n", if i == self.focus { ">" } else { " " }));
+                    out.push_str(&format!("{} {label}: {}\n", if id == self.focus { ">" } else { " " }, self.display_value(id)));
                 }
-                out.push_str(if self.advanced { "auto: подобрать по оценкам; manual: сохранить порядок.\nF2: скрыть расширенные.\n" } else { "ID создаётся автоматически; референсы подбираются из каталога.\nУкажите все собственные IP, включая публичный/NAT: это обязательная защита от self-reference.\nF2: расширенные (ID, домены/IP, manual).\n" });
-                out.push_str(&self.users);
-                if !self.available_users.is_empty() {
-                    out.push_str("\nF6 на поле доступа: выбрать пользователей из списка.");
+                if self.sources {
+                    out.push_str("Готовый каталог рекомендуется. Enter: продолжить; Esc: настройки сервера.\n");
+                } else {
+                    out.push_str("Адрес и IP возьмите из панели хостинга. Порт обычно 443. Enter: выбрать источники.\n");
+                    out.push_str(&self.users);
                 }
-                out.push_str("\nEnter: проверить и подобрать; ↑↓ / Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
-                out.push_str(&self.error); out
+                out.push_str("\nF2: расширенные параметры.\n");
+                out.push_str(&self.error);
+                out
             }
             WizardStage::DnsConfirm(input) => {
                 let mut body = format!("Поиск: {} доменов, {} IP из разрешённых CIDR.\nDNS и обратный DNS; без TLS и записи. Только адреса с подтверждённым SNI попадут в следующий этап.\nCIDR: подтверждайте только адреса, на проверку которых у вас есть разрешение.\ny: разрешить DNS; n/Esc: отменить.\n\nДОМЕНЫ\n", input.candidates.len(), input.range_targets.len());
@@ -1560,15 +1685,16 @@ impl ProvisionPanel {
         }
         let first = wizard.source.is_none();
         let labels = [
-            ("ID подключения", "Уникальное имя подключения, создаётся автоматически."),
-            ("Порт TCP/UDP", "Оставьте 443, если не знаете, зачем менять. Порт должен быть доступен на сервере."),
-            ("Адрес сервера для клиентов", "Введите IP или домен VPS из панели хостинга, без https:// и порта. Не адрес стороннего сайта."),
-            ("IP-адреса вашего сервера", "IP указаны в панели хостинга. F3 — перенести IP из поля выше. Если IP несколько, перечислите их через запятую."),
-            ("Поиск по доменам", "catalog — весь каталог; свои домены или домен=IP через запятую. Можно очистить для поиска только по CIDR."),
-            (if first { "Имя первого пользователя" } else { "Пользователи с доступом (F6)" },
-             if first { "Придумайте имя, например phone. После создания выдайте личный ключ через «Восстановить доступ» на обзоре." } else { "Нажмите F6 и отметьте нужных пользователей. Никому не выдаётся доступ автоматически." }),
-            ("Режим подбора", "auto — лучшие 3; manual — до трёх явных доменов в заданном порядке."),
-            ("Разрешённые CIDR", "Необязательно: CIDR или SNI@CIDR, до 32 IP в назначенной подсети. PTR и прямой DNS обязательны; только с разрешением."),
+            ("ID подключения", "Уникальное имя, создаётся автоматически."),
+            ("Порт подключения", "Обычно 443. Порт должен быть доступен на сервере."),
+            ("Адрес сервера для клиентов", "IP или домен VPS из панели хостинга, без https:// и порта."),
+            ("IP-адреса вашего сервера", "Если адрес выше — IP, он подставится. Проверьте все IP сервера, включая публичные/NAT. Разделяйте запятыми."),
+            ("Свои домены (необязательно)", "Имена сайтов через запятую, без https://. Допустимо имя=IP. Можно оставить пустым."),
+            (if first { "Имя первого пользователя" } else { "Пользователи с доступом" },
+             if first { "Например phone. После создания выдайте личный ключ через «Восстановить доступ»." } else { "Пробел — открыть список. Enter откроет его, если никто не выбран. Доступ не выдаётся автоматически." }),
+            ("Порядок выбора", "Пробел — изменить. Автоматический подбор рекомендуется."),
+            ("Разрешённые IP-диапазоны", "Необязательно: разрешённая назначенная публичная подсеть. Формат CIDR или имя@CIDR. Не знаете диапазон? Оставьте пустым."),
+            ("Готовый каталог сайтов", "Рекомендуется. Пробел или ←/→ — включить или выключить. Сеть только после подтверждения."),
         ];
         Some(Form {
             fields: wizard
@@ -1578,14 +1704,14 @@ impl ProvisionPanel {
                     id,
                     label: labels[id].0,
                     hint: labels[id].1,
-                    value: wizard.fields[id].clone(),
+                    value: wizard.display_value(id),
                 })
                 .collect(),
             selected: wizard.focus,
-            lead: if wizard.advanced {
-                "Расширенные параметры · F2 скрыть".into()
+            lead: if wizard.sources {
+                "Готовый каталог — рекомендуемый вариант. Остальные источники необязательны.".into()
             } else {
-                "Данные сервера возьмите из панели хостинга. Порт обычно 443. Выберите пользователя. F2 — расширенные настройки.".into()
+                "Введите адрес VPS из панели хостинга. Если это IP, он подставится ниже; проверьте все IP сервера.".into()
             },
             error: wizard.error.clone(),
         })
@@ -1607,6 +1733,7 @@ impl ProvisionPanel {
                 && matches!(wizard.stage, WizardStage::Input)
                 && wizard.visible_fields().contains(&id)
             {
+                if wizard.focus == 2 { wizard.suggest_own_ip(); }
                 wizard.focus = id;
             }
         }
@@ -1667,8 +1794,8 @@ impl ProvisionPanel {
         let wizard = self.wizard.as_ref()?;
         if wizard.registration.is_some() {
             return Some((
-                5,
-                5,
+                6,
+                6,
                 "Сохранение TOML",
                 "Enter предпросмотр · Y подтвердить · Esc назад",
             ));
@@ -1676,33 +1803,29 @@ impl ProvisionPanel {
         if wizard.grant_picker.is_some() {
             return Some((
                 1,
-                5,
+                6,
                 "Выбор пользователей",
                 "↑↓ пользователь · Пробел отметить · Enter готово · Esc отменить",
             ));
         }
         Some(match &wizard.stage {
-            WizardStage::Input => (
-                1,
-                5,
-                "Настройка сервера",
-                "↑↓ поле · Enter проверить и подобрать · F2 расширенные · Esc назад",
-            ),
+            WizardStage::Input if wizard.sources => (2, 6, "Источники поиска", "↑↓ поле · Пробел выбрать · Enter продолжить · F2 настройки · Esc назад"),
+            WizardStage::Input => (1, 6, "Настройка сервера", "↑↓ поле · Enter продолжить · F2 настройки · Esc назад"),
             WizardStage::DnsConfirm(_) => {
-                (2, 5, "Разрешение DNS", "Y разрешить DNS · N / Esc назад")
+                (3, 6, "Поиск адресов сайтов", "Y найти адреса · N / Esc назад")
             }
-            WizardStage::Resolving(_, _) => (2, 5, "Получение адресов", "Esc отменить"),
+            WizardStage::Resolving(_, _) => (3, 6, "Получение адресов", "Esc отменить"),
             WizardStage::ProbeConfirm(_) => (
-                3,
-                5,
-                "Проверка референсов",
+                4,
+                6,
+                "Проверка сайтов",
                 "Y проверить перечисленные адреса · N / Esc назад",
             ),
-            WizardStage::Checking(_, _) => (3, 5, "Проверка TLS / QUIC", "Esc отменить"),
-            WizardStage::NoEligible(_) => (4, 5, "Нет подходящих референсов", "Esc изменить источники"),
+            WizardStage::Checking(_, _) => (4, 6, "Проверка сайтов", "Esc отменить"),
+            WizardStage::NoEligible(_) => (5, 6, "Нет подходящих сайтов", "Enter / Esc изменить источники"),
             WizardStage::CreateConfirm(value) => (
-                4,
                 5,
+                6,
                 "Результат подбора",
                 if value.0.source.is_none() {
                     "Y создать TOML · N / Esc назад"
@@ -1711,9 +1834,9 @@ impl ProvisionPanel {
                 },
             ),
             WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => {
-                (5, 5, "Сохранение", "Идёт запись; сервер не запускается")
+                (6, 6, "Сохранение", "Идёт запись; сервер не запускается")
             }
-            WizardStage::Done(_) => (5, 5, "Результат записи", "Esc закрыть"),
+            WizardStage::Done(_) => (6, 6, "Результат записи", "Esc закрыть"),
         })
     }
 
@@ -1819,6 +1942,43 @@ mod tests {
             ..ServerSnapshot::default()
         };
         assert!(range_targets_for_snapshot("93.184.216.8/29", &own, &narrow).is_err());
+    }
+
+    #[test]
+    fn novice_setup_and_source_choices_do_not_start_network_or_write() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-novice").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut wizard = Wizard::first(path.clone()).unwrap();
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(wizard.focus, 2);
+        assert!(!wizard.visible_fields().contains(&8));
+        wizard.paste("93.184.216.1");
+        wizard.key(press(KeyCode::Tab));
+        assert_eq!(wizard.fields[3], "93.184.216.1");
+        wizard.fields[5] = "phone".into();
+        wizard.key(press(KeyCode::Enter));
+        assert!(wizard.sources && matches!(wizard.stage, WizardStage::Input));
+        assert_eq!(wizard.focus, 8);
+        wizard.key(press(KeyCode::Char(' ')));
+        assert!(!wizard.catalogue_enabled());
+        wizard.key(press(KeyCode::Enter));
+        assert!(wizard.error.contains("хотя бы один"));
+        wizard.key(press(KeyCode::Char(' ')));
+        wizard.key(press(KeyCode::Down));
+        wizard.paste("example.org");
+        assert_eq!(wizard.custom_domains(), "example.org");
+        assert!(wizard.catalogue_enabled());
+        wizard.key(press(KeyCode::Esc));
+        assert!(!wizard.sources);
+        assert_eq!(wizard.fields[5], "phone");
+        wizard.key(press(KeyCode::Enter));
+        wizard.key(press(KeyCode::Enter));
+        assert!(matches!(wizard.stage, WizardStage::DnsConfirm(_)));
+        wizard.key(press(KeyCode::Esc));
+        assert!(wizard.sources);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1948,10 +2108,12 @@ mod tests {
         let mut wizard = Wizard::new(&editor).unwrap();
         assert_eq!(wizard.fields[1], "443");
         assert!(!wizard.body().contains("Выбор: auto / manual"));
+        wizard.sources = true;
         wizard.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
         assert!(wizard.body().contains("Выбор: auto / manual"));
         wizard.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
         assert!(!wizard.body().contains("Выбор: auto / manual"));
+        wizard.sources = false;
         wizard.fields[1] = "127.0.0.1:9443".into();
         wizard.fields[2] = "127.0.0.1".into();
         wizard.fields[3] = "127.0.0.1".into();
@@ -2018,6 +2180,8 @@ mod tests {
         assert_eq!(report.rows[0].score, 100);
         assert_eq!(report.rows[1].selected, Some(1));
         assert!(!input.bundle.exists() && !input.health.exists());
+        wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(wizard.sources && matches!(wizard.stage, WizardStage::Input));
         wizard.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(wizard.stage, WizardStage::DnsConfirm(_)));
         wizard.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
