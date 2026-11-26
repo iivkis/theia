@@ -28,6 +28,8 @@ pub struct SendFlow {
     next_uni: u64,
     next_bidi: u64,
     initial_limit: u64,
+    local_bidi_limit: u64,
+    peer_bidi_limit: u64,
     max_data: u64,
     used: u64,
     streams: BTreeMap<u64, Stream>,
@@ -51,10 +53,22 @@ impl SendFlow {
             next_uni: 0,
             next_bidi: 0,
             initial_limit: stream_limit,
+            local_bidi_limit: stream_limit,
+            peer_bidi_limit: stream_limit,
             max_data,
             used: 0,
             streams: BTreeMap::new(),
         })
+    }
+
+    /// Authenticated peer limits apply before the first stream is opened.
+    /// A peer-local bidi stream is remote-initiated from our perspective.
+    pub(crate) fn from_peer(server: bool, limits: super::parameters::Limits, peer_bidi: u64) -> Result<Self, Error> {
+        let mut flow = Self::new(server, limits.max_streams_uni, limits.initial_uni, limits.max_data)?;
+        flow.enable_bidi(limits.max_streams_bidi.min(MAX_STREAMS), peer_bidi)?;
+        flow.local_bidi_limit = limits.initial_bidi_remote;
+        flow.peer_bidi_limit = limits.initial_bidi_local;
+        Ok(flow)
     }
 
     pub fn open(&mut self) -> Result<u64, Error> {
@@ -99,7 +113,7 @@ impl SendFlow {
             id,
             Stream {
                 offset: 0,
-                limit: self.initial_limit,
+                limit: self.local_bidi_limit,
                 fin: false,
                 reset: None,
             },
@@ -115,7 +129,7 @@ impl SendFlow {
         }
         self.streams.entry(id).or_insert(Stream {
             offset: 0,
-            limit: self.initial_limit,
+            limit: self.peer_bidi_limit,
             fin: false,
             reset: None,
         });
@@ -234,6 +248,17 @@ mod tests {
         frames::{decode, Frame},
         spaces::Space,
     };
+
+    #[test]
+    fn authenticated_asymmetric_credit_uses_peer_direction() {
+        let limits = super::super::parameters::Limits { max_udp_payload: 1400, max_data: 30, initial_bidi_local: 3, initial_bidi_remote: 5, initial_uni: 7, max_streams_bidi: 1, max_streams_uni: 1, ack_delay_exponent: 3, max_ack_delay_ms: 25, active_cid_limit: 2 };
+        let mut flow = SendFlow::from_peer(false, limits, 8).unwrap();
+        let uni = flow.open().unwrap();
+        let bidi = flow.open_bidi().unwrap();
+        flow.register_peer_bidi(1).unwrap();
+        assert_eq!((flow.available(uni), flow.available(bidi), flow.available(1)), (7,5,3));
+        assert_eq!(flow.open_bidi(), Err(Error::Limit));
+    }
 
     #[test]
     fn credit_and_fin() {

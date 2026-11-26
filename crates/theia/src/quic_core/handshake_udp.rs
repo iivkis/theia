@@ -720,16 +720,7 @@ async fn establish_inner(
             },
         })
         .map_err(|_| Error::Protocol)?;
-    if limits.max_data != CREDIT
-        || limits.max_streams_uni != STREAMS
-        || limits.max_streams_bidi != STREAMS
-        || limits.max_udp_payload != MTU as u64
-        || [0x05, 0x06, 0x07]
-            .into_iter()
-            .any(|id| peer_params.integer(id) != Ok(Some(CREDIT)))
-    {
-        return Err(Error::Protocol);
-    }
+    // Keep our local receive and MTU bounds; honor the authenticated peer's independent send credits.
     let peer_idle = peer_params
         .integer(0x01)
         .map_err(|_| Error::Protocol)?
@@ -752,6 +743,7 @@ async fn establish_inner(
             secrets,
             idle_timeout,
             binding,
+            peer_limits: limits,
         },
     )
     .await

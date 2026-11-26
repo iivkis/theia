@@ -165,6 +165,9 @@ pub enum SemanticError {
 pub struct Limits {
     pub max_udp_payload: u64,
     pub max_data: u64,
+    pub initial_bidi_local: u64,
+    pub initial_bidi_remote: u64,
+    pub initial_uni: u64,
     pub max_streams_bidi: u64,
     pub max_streams_uni: u64,
     pub ack_delay_exponent: u64,
@@ -220,10 +223,10 @@ impl Parameters<'_> {
         let ack_delay_exponent = get(0x0a, 3)?;
         let max_ack_delay_ms = get(0x0b, 25)?;
         let active_cid_limit = get(0x0e, 2)?;
-        // Check encoding even for values not returned by this projection.
-        for id in [0x01, 0x05, 0x06, 0x07] {
-            get(id, 0)?;
-        }
+        get(0x01, 0)?;
+        let initial_bidi_local = get(0x05, 0)?;
+        let initial_bidi_remote = get(0x06, 0)?;
+        let initial_uni = get(0x07, 0)?;
         if max_udp_payload < 1200
             || max_streams_bidi > (1u64 << 60)
             || max_streams_uni > (1u64 << 60)
@@ -236,6 +239,9 @@ impl Parameters<'_> {
         Ok(Limits {
             max_udp_payload,
             max_data,
+            initial_bidi_local,
+            initial_bidi_remote,
+            initial_uni,
             max_streams_bidi,
             max_streams_uni,
             ack_delay_exponent,

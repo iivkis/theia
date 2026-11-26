@@ -58,6 +58,7 @@ pub(crate) struct Established {
     pub secrets: Secrets,
     pub idle_timeout: Duration,
     pub binding: zeroize::Zeroizing<[u8; 32]>,
+    pub peer_limits: super::parameters::Limits,
 }
 
 pub struct LabSession {
@@ -121,6 +122,7 @@ impl LabSession {
             secrets,
             idle_timeout,
             binding,
+            peer_limits,
         } = established;
         let mut session = Self::connect_inner(
             socket,
@@ -136,6 +138,7 @@ impl LabSession {
         )?;
         // Application-space native laboratory defaults to BBR; the
         // fixed-key codec fixture keeps the CUBIC scheduler for comparison.
+        session.send = SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
         session.scheduler = Scheduler::with_bbr(Instant::now());
         session.idle = Idle::new(Instant::now(), idle_timeout);
         session.binding = Some(binding);
