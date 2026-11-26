@@ -721,6 +721,7 @@ fn validate_profile(profile: Profile) -> Result<Profile, InviteError> {
                 http_listen: "127.0.0.1:7890".into(),
                 socks5_listen: "127.0.0.1:7891".into(),
                 system_proxy: SystemProxy::Off,
+                direct_dpi: None,
             },
         },
         management: Management {
