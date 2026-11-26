@@ -122,9 +122,12 @@ pub(crate) async fn direct(
     .await
     .map_err(|_| ClientError::Open(ErrorCode::DialTimeout))?
 }
+type Fallback = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Tunnel, ClientError>> + Send>>;
+const FIRST_RESPONSE: Duration = Duration::from_secs(5);
+
 pub(crate) enum Tunnel {
     Direct(UdpSocket),
-    VerifiedQuic(UdpSocket, std::sync::Arc<crate::routing::dpi::Engine>, SocketAddr, crate::network_scope::Scope),
+    VerifiedQuic(Box<crate::routing::dpi::VerifiedUdp>, Fallback),
     H2(Box<crate::client::Tunnel>),
     H3(Box<crate::h3_client::H3Tunnel>),
 }
@@ -135,60 +138,99 @@ impl Tunnel {
         download: mpsc::Sender<Vec<u8>>,
     ) -> Result<(), ClientError> {
         match self {
-            Self::H2(t) => t.relay_udp(upload, download).await,
-            Self::H3(t) => t.relay_udp(upload, download).await,
-            local @ (Self::Direct(_) | Self::VerifiedQuic(..)) => {
-                let (socket, verified) = match local {
-                    Self::Direct(socket) => (socket, None),
-                    Self::VerifiedQuic(socket, engine, address, scope) => (socket, Some((engine, address, scope))),
-                    _ => unreachable!(),
-                };
-                let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
-                let activity = Activity::new();
-                let send = async {
-                    let mut first = true;
-                    while let Some(data) = upload.recv().await {
-                        if first {
-                            if let Some((engine, address, scope)) = &verified {
-                                if !engine.enabled() || crate::network_scope::observe(*address) != Some(*scope) {
-                                    return Err(ClientError::Open(ErrorCode::PolicyDenied));
-                                }
-                            }
-                        }
-                        send_datagram(&socket, &data)
-                            .await
-                            .map_err(|_| ClientError::Io)?;
-                        if first && verified.is_some() { crate::traffic::udp_verified_local(); }
-                        first = false;
-                        traffic.upload(data.len());
-                        activity.touch();
-                    }
-                    Ok::<(), ClientError>(())
-                };
-                let receive = async {
-                    let mut buf = vec![0; protocol::MAX_DATAGRAM + 1];
-                    loop {
-                        let n = socket.recv(&mut buf).await.map_err(|_| ClientError::Io)?;
-                        if n > protocol::MAX_DATAGRAM {
-                            continue;
-                        }
-                        if deliver(&download, &buf[..n])? {
-                            traffic.download(n);
-                            activity.touch();
-                        }
-                    }
-                    #[allow(unreachable_code)]
-                    Ok::<(), ClientError>(())
-                };
-                tokio::select! { result=send=>result, result=receive=>result, ()=activity.expire()=>Ok(()) }
+            Self::VerifiedQuic(verified, fallback) => {
+                let Some(first) = upload.recv().await else { return Ok(()); };
+                if !verified.admissible() {
+                    drop(verified);
+                    let tunnel = fallback.await?;
+                    return tunnel.relay_selected(Some(first), upload, download).await;
+                }
+                // Once a send is attempted no fallback or replay is legal.
+                drop(fallback);
+                let result = relay_local(&verified.socket, Some(verified.as_ref()), Some(first), upload, download).await;
+                if result.is_err() { verified.failed(); }
+                result
             }
+            other => other.relay_selected(None, upload, download).await,
+        }
+    }
+
+    async fn relay_selected(
+        self,
+        first: Option<Vec<u8>>,
+        upload: mpsc::Receiver<Vec<u8>>,
+        download: mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), ClientError> {
+        match self {
+            Self::H2(t) => t.relay_udp(first, upload, download).await,
+            Self::H3(t) => t.relay_udp(first, upload, download).await,
+            Self::Direct(socket) => relay_local(&socket, None, first, upload, download).await,
+            Self::VerifiedQuic(..) => Err(ClientError::Protocol),
         }
     }
 }
+
+pub(crate) async fn next_datagram(first: &mut Option<Vec<u8>>, upload: &mut mpsc::Receiver<Vec<u8>>) -> Option<Vec<u8>> {
+    if let Some(data) = first.take() { Some(data) } else { upload.recv().await }
+}
+
+async fn relay_local(
+    socket: &UdpSocket,
+    verified: Option<&crate::routing::dpi::VerifiedUdp>,
+    mut first: Option<Vec<u8>>,
+    mut upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+) -> Result<(), ClientError> {
+    let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
+    let activity = Activity::new();
+    // For verified QUIC, start the receive deadline only after a successful
+    // first application write. No server response is assumed authenticated.
+    if verified.is_some() {
+        let data = first.take().ok_or(ClientError::Protocol)?;
+        timeout(FIRST_RESPONSE, send_datagram(socket, &data)).await
+            .map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Io)?;
+        traffic.upload(data.len());
+        crate::traffic::udp_verified_local();
+        activity.touch();
+    }
+    let send = async {
+        while let Some(data) = next_datagram(&mut first, &mut upload).await {
+            send_datagram(socket, &data).await.map_err(|_| ClientError::Io)?;
+            traffic.upload(data.len());
+            activity.touch();
+        }
+        Ok::<(), ClientError>(())
+    };
+    let receive = async {
+        let mut buf = vec![0; protocol::MAX_DATAGRAM + 1];
+        let mut waiting = verified.is_some();
+        loop {
+            let n = if waiting {
+                timeout(FIRST_RESPONSE, socket.recv(&mut buf)).await.map_err(|_| ClientError::Timeout)?
+            } else {
+                socket.recv(&mut buf).await
+            }.map_err(|_| ClientError::Io)?;
+            if n > protocol::MAX_DATAGRAM { continue; }
+            if waiting {
+                crate::traffic::udp_peer_reply();
+                waiting = false;
+            }
+            if deliver(&download, || buf[..n].to_vec())? {
+                traffic.download(n);
+                activity.touch();
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), ClientError>(())
+    };
+    tokio::select! { result=send=>result, result=receive=>result, ()=activity.expire()=>Ok(()) }
+}
+
 /// UDP overload drops rather than blocking the entire incoming stream.
-pub(crate) fn deliver(download: &mpsc::Sender<Vec<u8>>, data: &[u8]) -> Result<bool, ClientError> {
+/// Do not allocate/copy a datagram unless the bounded queue accepts it.
+pub(crate) fn deliver(download: &mpsc::Sender<Vec<u8>>, data: impl FnOnce() -> Vec<u8>) -> Result<bool, ClientError> {
     match download.try_reserve() {
-        Ok(permit) => { permit.send(data.to_vec()); Ok(true) }
+        Ok(permit) => { permit.send(data()); Ok(true) }
         Err(mpsc::error::TrySendError::Full(_)) => { crate::traffic::udp_queue_drop(); Ok(false) }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(ClientError::Io),
     }
@@ -297,13 +339,13 @@ mod tests {
         activity.touch();
         assert!(activity.deadline() > Instant::now());
         let (tx, mut rx) = mpsc::channel(1);
-        assert!(deliver(&tx, b"one").unwrap());
-        assert!(!deliver(&tx, b"drop").unwrap());
+        assert!(deliver(&tx, || b"one".to_vec()).unwrap());
+        assert!(!deliver(&tx, || panic!("full queue must not allocate")).unwrap());
         assert_eq!(rx.recv().await.unwrap(), b"one");
-        assert!(deliver(&tx, b"").unwrap());
+        assert!(deliver(&tx, Vec::new).unwrap());
         assert!(rx.recv().await.unwrap().is_empty());
         drop(rx);
-        assert!(deliver(&tx, b"closed").is_err());
+        assert!(deliver(&tx, || b"closed".to_vec()).is_err());
     }
 
     #[tokio::test]

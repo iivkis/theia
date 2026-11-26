@@ -270,12 +270,23 @@ pub(crate) async fn dial_direct(
     .map_err(|_| ClientError::Open(ErrorCode::DialTimeout))?
 }
 
+struct ExchangeEvidence(std::sync::atomic::AtomicU8);
+impl ExchangeEvidence {
+    fn wrote(&self, upload: bool) {
+        use std::sync::atomic::Ordering;
+        let bit = if upload { 1 } else { 2 };
+        let previous = self.0.fetch_or(bit, Ordering::Relaxed);
+        if previous != 3 && (previous | bit) == 3 { crate::traffic::dpi_bidirectional(); }
+    }
+}
+
 async fn copy_direction(
     mut input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
     activity: &crate::relay_liveness::Activity,
     meter: &crate::traffic::Relay<'_>,
     upload: bool,
+    evidence: Option<&ExchangeEvidence>,
 ) -> Result<(), ClientError> {
     let mut bytes = [0u8; 16 * 1024];
     loop {
@@ -290,6 +301,7 @@ async fn copy_direction(
             .await
             .map_err(|_| ClientError::Io)?;
         activity.data(count);
+        if let Some(evidence) = evidence { evidence.wrote(upload); }
         if upload {
             meter.upload(count);
         } else {
@@ -312,12 +324,13 @@ pub(crate) async fn relay_direct_after_first(
     meter.upload(upload);
     meter.download(download);
     let activity = crate::relay_liveness::Activity::new();
+    let evidence = (upload != 0 && download != 0).then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
     let (cr, cw) = client.into_split();
     let (tr, tw) = target.into_split();
     activity
         .run(
-            copy_direction(cr, tw, &activity, &meter, true),
-            copy_direction(tr, cw, &activity, &meter, false),
+            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref()),
+            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref()),
             ClientError::Timeout,
         )
         .await

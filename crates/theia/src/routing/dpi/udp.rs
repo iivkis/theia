@@ -111,6 +111,52 @@ pub(super) async fn probe_quic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn independent_quic_probe_verifies_name_and_h3() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let config = super::super::tls::tls_config(roots).unwrap();
+        let endpoint = crate::quic_transport::server_endpoint(
+            "127.0.0.1:0".parse().unwrap(), vec![der],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        ).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let _ = incoming.await;
+            }
+        });
+        let deadline = std::time::Duration::from_secs(5);
+        assert!(tokio::time::timeout(deadline, probe_quic("localhost", addr, config.clone())).await.unwrap().is_some());
+        assert!(tokio::time::timeout(deadline, probe_quic("wrong.invalid", addr, config)).await.unwrap().is_none());
+        serving.abort();
+    }
+
+    #[test]
+    fn quic_candidate_requires_v1_h3_and_complete_initial() {
+        let mut hello = super::super::tls::fixture("example.org");
+        // Fixture has exactly one extension block containing SNI. Add h3 ALPN.
+        let ext = [0, 16, 0, 5, 0, 3, 2, b'h', b'3'];
+        let ext_len = 5 + 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1;
+        let n = u16::from_be_bytes([hello[ext_len], hello[ext_len + 1]]) + ext.len() as u16;
+        hello[ext_len..ext_len + 2].copy_from_slice(&n.to_be_bytes());
+        hello.extend(ext);
+        let record_len = (hello.len() - 5) as u16;
+        hello[3..5].copy_from_slice(&record_len.to_be_bytes());
+        let body_len = (hello.len() - 9) as u32;
+        hello[6..9].copy_from_slice(&body_len.to_be_bytes()[1..]);
+        for version in [crate::reality_quic_wire::V1, crate::reality_quic_wire::V2] {
+            let packet = crate::reality_quic_wire::test_initial(version, &hello[5..]);
+            let expected = if version == crate::reality_quic_wire::V1 { Candidate::QuicH3("example.org".into()) } else { Candidate::Other };
+            assert_eq!(Observer::default().outgoing(&packet), expected);
+        }
+        let plain = super::super::tls::fixture("example.org");
+        let packet = crate::reality_quic_wire::test_initial(crate::reality_quic_wire::V1, &plain[5..]);
+        assert_eq!(Observer::default().outgoing(&packet), Candidate::Other);
+    }
+
     #[test]
     fn stun_lengths_padding_and_transaction() {
         let mut req = vec![0, 1, 0, 0];

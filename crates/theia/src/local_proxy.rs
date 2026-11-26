@@ -1200,8 +1200,15 @@ async fn routed_udp(
                             },
                         };
                         if !ips.is_empty() && ips.iter().all(|ip| snapshot.policy().matching_action(Some(name), Some(*ip)) == Ok(Some(Action::DirectDpi))) {
-                            if let Some(tunnel) = cache.dpi.open_quic_udp(name, port, &ips, snapshot.digest()).await {
-                                return Ok(tunnel);
+                            if let Some(verified) = cache.dpi.open_quic_udp(name, port, &ips, snapshot.digest()).await {
+                                let carrier = carrier.clone();
+                                let target = address.clone();
+                                let fallback = Box::pin(async move {
+                                    let tunnel = carrier.open_udp(target, port).await?;
+                                    crate::traffic::udp_dpi_fallback();
+                                    Ok(tunnel)
+                                });
+                                return Ok(crate::udp_relay::Tunnel::VerifiedQuic(Box::new(verified), fallback));
                             }
                         }
                     }
@@ -1434,7 +1441,7 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 28]) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 30]) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {

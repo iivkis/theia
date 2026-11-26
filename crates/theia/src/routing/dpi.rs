@@ -27,10 +27,31 @@ const FIRST_FLIGHT: Duration = Duration::from_secs(5);
 pub(crate) struct Engine {
     enabled: AtomicBool,
     cache: strategy::Cache,
-    udp_cache: std::sync::Mutex<std::collections::VecDeque<(Key, bool, std::time::Instant)>>,
+    udp_cache: std::sync::Mutex<std::collections::VecDeque<UdpEvidence>>,
     probes: Semaphore,
     // Bounded lock stripes coalesce simultaneous probes without an unbounded map.
     probe_slots: [tokio::sync::Mutex<()>; 32],
+}
+
+struct UdpEvidence {
+    key: Key,
+    good: bool,
+    expiry: std::time::Instant,
+}
+
+pub(crate) struct VerifiedUdp {
+    pub(crate) socket: tokio::net::UdpSocket,
+    engine: Arc<Engine>,
+    key: Key,
+}
+impl VerifiedUdp {
+    pub(crate) fn admissible(&self) -> bool {
+        self.engine.enabled() && network_scope::observe(self.key.address) == Some(self.key.network)
+            && self.engine.cached_udp(&self.key) == Some(true)
+    }
+    pub(crate) fn failed(&self) {
+        self.engine.remember_udp(self.key.clone(), false);
+    }
 }
 
 impl Default for Engine {
@@ -63,16 +84,16 @@ impl Engine {
 
     fn cached_udp(&self, key: &Key) -> Option<bool> {
         let mut cache = self.udp_cache.lock().ok()?;
-        cache.retain(|(_, _, expiry)| *expiry > std::time::Instant::now());
-        cache.iter().find(|(k, _, _)| k == key).map(|(_, good, _)| *good)
+        cache.retain(|entry| entry.expiry > std::time::Instant::now());
+        cache.iter().find(|entry| &entry.key == key).map(|entry| entry.good)
     }
 
     fn remember_udp(&self, key: Key, good: bool) {
         if network_scope::observe(key.address) != Some(key.network) { return; }
         if let Ok(mut cache) = self.udp_cache.lock() {
-            cache.retain(|(k, _, expiry)| k != &key && *expiry > std::time::Instant::now());
+            cache.retain(|entry| entry.key != key && entry.expiry > std::time::Instant::now());
             if cache.len() >= 128 { cache.pop_front(); }
-            cache.push_back((key, good, std::time::Instant::now() + Duration::from_secs(if good { 60 } else { 20 })));
+            cache.push_back(UdpEvidence { key, good, expiry: std::time::Instant::now() + Duration::from_secs(if good { 60 } else { 20 }) });
         }
     }
 
@@ -84,7 +105,7 @@ impl Engine {
         port: u16,
         ips: &[IpAddr],
         policy: [u8; 32],
-    ) -> Option<crate::udp_relay::Tunnel> {
+    ) -> Option<VerifiedUdp> {
         if !self.enabled() || port != 443 || ips.is_empty() || ips.len() > 64
             || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
             return None;
@@ -97,6 +118,7 @@ impl Engine {
                 let key = Key { name: name.clone(), address, policy, network };
                 let slot = self.probe_slot(&name, address, policy);
                 let guard = self.probe_slots[slot].lock().await;
+                if !self.enabled() || network_scope::observe(address) != Some(network) { continue; }
                 let good = if let Some(good) = self.cached_udp(&key) {
                     crate::traffic::dpi_cache_hit();
                     good
@@ -112,7 +134,7 @@ impl Engine {
                 if !good || !self.enabled() || network_scope::observe(address) != Some(network) { continue; }
                 if let Ok(socket) = crate::udp_relay::connect(address).await {
                     if self.enabled() && network_scope::observe(address) == Some(network) {
-                        return Some(crate::udp_relay::Tunnel::VerifiedQuic(socket, self.clone(), address, network));
+                        return Some(VerifiedUdp { socket, engine: self.clone(), key });
                     }
                 }
                 self.remember_udp(key, false);
@@ -148,6 +170,7 @@ impl Engine {
                 let key = Key { name: name.clone(), address, policy, network };
                 let slot = self.probe_slot(&key.name, address, policy);
                 let guard = self.probe_slots[slot].lock().await;
+                if !self.enabled() || network_scope::observe(address) != Some(network) { continue; }
                 let strategy = match self.cache.cached(&key) {
                     Some(Verdict::Verified(strategy)) => { crate::traffic::dpi_cache_hit(); strategy },
                     Some(Verdict::Unavailable) => continue,
@@ -155,10 +178,13 @@ impl Engine {
                         let _permit = self.probes.try_acquire().ok()?;
                         let config = tokio::task::spawn_blocking(tls::native_config).await.ok()??;
                         let mut verified = None;
-                        for strategy in Strategy::ALL {
+                        for strategy in self.cache.ranked(&key) {
+                            if !self.enabled() || network_scope::observe(address) != Some(network) { break; }
                             if matches!(previous, Some(Verdict::Avoid { strategy: failed, .. }) if failed == strategy) { continue; }
+                            let started = std::time::Instant::now();
                             let good = timeout(ATTEMPT, tls::probe(&name, address, strategy, config.clone()))
                                 .await.ok().flatten().is_some();
+                            self.cache.observe(&key, strategy, good, started.elapsed());
                             crate::traffic::dpi_probe(good);
                             if good {
                                 verified = Some(strategy);
@@ -239,6 +265,7 @@ impl Tunnel {
         }
         // From the first attempted write onward, even a partial write or
         // timeout is terminal for this stream. Never replay it over the VPS.
+        let started = std::time::Instant::now();
         let response = timeout(FIRST_FLIGHT, async {
             self.target
                 .write_all(&transformed)
@@ -266,6 +293,7 @@ impl Tunnel {
             .await
             .map_err(|_| ClientError::Timeout)?
             .map_err(|_| ClientError::Io)?;
+        self.engine.cache.observe(&self.key, self.strategy, true, started.elapsed());
         crate::traffic::dpi_first_response();
         super::client_state::relay_direct_after_first(
             client,
