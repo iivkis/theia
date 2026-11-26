@@ -48,9 +48,16 @@ enum Protection {
         writer: Writer,
     },
     Rotating {
-        reader: key_update::Receiver,
+        reader: Box<key_update::Receiver>,
         writer: key_update::Sender,
     },
+}
+
+pub(crate) struct Established {
+    pub keys: Keys,
+    pub secrets: Secrets,
+    pub idle_timeout: Duration,
+    pub binding: zeroize::Zeroizing<[u8; 32]>,
 }
 
 pub struct LabSession {
@@ -107,11 +114,9 @@ impl LabSession {
         server: bool,
         local_cid: [u8; CID_LEN],
         remote_cid: [u8; CID_LEN],
-        keys: Keys,
-        secrets: Secrets,
-        idle_timeout: Duration,
-        binding: zeroize::Zeroizing<[u8; 32]>,
+        established: Established,
     ) -> Result<Self, Error> {
+        let Established { keys, secrets, idle_timeout, binding } = established;
         let mut session = Self::connect_inner(
             socket,
             peer,
@@ -119,7 +124,7 @@ impl LabSession {
             local_cid,
             remote_cid,
             Protection::Rotating {
-                reader: key_update::Receiver::new(keys.remote, secrets.clone()),
+                reader: Box::new(key_update::Receiver::new(keys.remote, secrets.clone())),
                 writer: key_update::Sender::new(keys.local, secrets),
             },
             server,
@@ -642,8 +647,7 @@ impl LabSession {
         {
             return Ok(false);
         }
-        if n > MTU
-            || n < 1 + CID_LEN + 4 + 16
+        if !(1 + CID_LEN + 4 + 16..=MTU).contains(&n)
             || buf[0] & 0xc0 != 0x40
             || buf[1..1 + CID_LEN] != self.local_cid
         {

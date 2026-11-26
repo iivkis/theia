@@ -202,8 +202,8 @@ pub fn version_candidates(
         return Err(Error::Invalid);
     }
     let mut result = Vec::new();
-    for bytes in versions.chunks_exact(4) {
-        let number = u32::from_be_bytes(bytes.try_into().map_err(|_| Error::Invalid)?);
+    for bytes in versions.as_chunks::<4>().0 {
+        let number = u32::from_be_bytes(*bytes);
         if number == offered.wire() {
             return Err(Error::Context);
         }

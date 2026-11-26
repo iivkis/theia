@@ -1119,7 +1119,7 @@ impl RoutingObservation {
                         3 => "Синхронизация выполняется".into(),
                         _ => "Правила ещё не подтверждены".into(),
                     };
-                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP/UDP-байты.", crate::traffic::routing_summary_from(routing_totals));
+                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP/UDP-байты.", crate::traffic::routing_summary_from(*routing_totals));
                     self.observed = Some(std::time::Instant::now());
                 }
                 Err(TryRecvError::Empty) => return,
@@ -9032,10 +9032,10 @@ mod tests {
             fallback: false,
             routing_revision: 5,
             routing_state: 1,
-            routing_totals: [
+            routing_totals: Box::new([
                 10, 20, 30, 40, 2, 1, 1, 3, 4, 5, 10, 20, 30, 40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
                 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            ],
+            ]),
         }))
         .unwrap();
         observation.poll();

@@ -145,7 +145,7 @@ pub enum StatusCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusReply {
     ClientRunning {
         revision: u64,
@@ -156,7 +156,7 @@ pub enum StatusReply {
         fallback: bool,
         routing_revision: u64,
         routing_state: u8,
-        routing_totals: [u64; 38],
+        routing_totals: Box<[u64; 38]>,
     },
     ClientReady {
         revision: u64,
@@ -1295,7 +1295,7 @@ where
                     fallback,
                     routing_revision,
                     routing_state,
-                    routing_totals,
+                    routing_totals: Box::new(routing_totals),
                 })
             }
             StatusCommand::ClientPreview {
@@ -1942,10 +1942,10 @@ mod strict_wire_matrix_tests {
                     fallback: f,
                     routing_revision: 2,
                     routing_state: 1,
-                    routing_totals: [
+                    routing_totals: Box::new([
                         10, 20, 30, 40, 5, 1, 2, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
                         21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38
-                    ],
+                    ]),
                 })
             );
         }
@@ -1964,7 +1964,7 @@ mod strict_wire_matrix_tests {
         assert!(max_response.len() as u64 <= MAX_RESPONSE_BYTES);
         assert!(
             matches!(peer(status, "client-status\n", max_response.as_bytes()).await,
-            Ok(StatusReply::ClientRunning { routing_totals, .. }) if routing_totals == [u64::MAX; 38])
+            Ok(StatusReply::ClientRunning { routing_totals, .. }) if *routing_totals == [u64::MAX; 38])
         );
         let zeros = ["0"; 38].join(",");
         let noncanonical = format!("{},01", ["0"; 37].join(","));
