@@ -84,6 +84,7 @@ struct StreamState {
     reset: Option<u64>,
     reset_sent: bool,
     peer_reset: Option<u64>,
+    send_interrupted: bool,
     stop: Option<u64>,
     stop_sent: bool,
     recv_reset: Option<u64>,
@@ -100,6 +101,15 @@ impl StreamState {
             rx,
             ..Self::default()
         }
+    }
+
+    fn peer_stopped(&mut self, code: u64) {
+        if self.reset.is_none() {
+            self.peer_reset = Some(code);
+            self.send_interrupted = self.outgoing.is_some();
+        }
+        self.outgoing = None;
+        self.reset_sent = true;
     }
 }
 
@@ -228,11 +238,7 @@ fn progress(
         let s = state.streams.get_mut(&id).expect("known stream");
         if s.tx && !s.reset_sent {
             if let Some(code) = session.send_reset_code(id) {
-                if s.reset.is_none() {
-                    s.peer_reset = Some(code);
-                }
-                s.outgoing = None;
-                s.reset_sent = true;
+                s.peer_stopped(code);
                 wake(&mut s.send_waker, wakes);
             } else if let Some(code) = s.reset {
                 match session.reset_stream(id, code) {
@@ -658,7 +664,11 @@ impl quic::SendStream<Bytes> for SendSide {
         let Some(s) = state.streams.get_mut(&self.id) else {
             return Poll::Ready(Err(invalid()));
         };
-        if let Some(code) = s.peer_reset {
+        // A peer may reject a request immediately after receiving its headers.
+        // Do not turn a completed handoff into a failed write: H3 must be
+        // able to read the response on the independent receive half.
+        // New writes and unfinished handoffs still fail after STOP_SENDING.
+        if let Some(code) = s.peer_reset.filter(|_| s.send_interrupted) {
             return Poll::Ready(Err(terminated(code)));
         }
         if s.reset.is_some() {
@@ -840,5 +850,67 @@ impl quic::BidiStream<Bytes> for Bidi {
 impl quic::SendStreamUnframed<Bytes> for Bidi {
     fn poll_send<D: Buf>(&mut self, cx: &mut Context<'_>, buf: &mut D) -> Poll<Result<usize, SE>> {
         quic::SendStreamUnframed::poll_send(&mut self.send, cx, buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_stop_preserves_completed_handoff_and_rejects_interrupted_write() {
+        for handed_off in [false, true] {
+            let shared = Arc::new(Bridge {
+                state: Mutex::new(State::default()),
+                ready: Arc::new(Notify::new()),
+            });
+            shared
+                .lock()
+                .unwrap()
+                .streams
+                .insert(0, StreamState::new(true, true));
+            let mut send = SendSide::new(shared.clone(), 0);
+            let mut recv = RecvSide::new(shared.clone(), 0);
+            let mut cx = Context::from_waker(Waker::noop());
+            send.put(Bytes::from_static(b"headers")).unwrap();
+            assert!(quic::SendStream::poll_ready(&mut send, &mut cx).is_pending());
+
+            {
+                let mut state = shared.lock().unwrap();
+                let stream = state.streams.get_mut(&0).unwrap();
+                if handed_off {
+                    stream.outgoing = None;
+                }
+                stream.peer_stopped(CANCEL);
+                stream.incoming = Some(Bytes::from_static(b"response"));
+                stream.eof = true;
+            }
+
+            let ready = quic::SendStream::poll_ready(&mut send, &mut cx);
+            if handed_off {
+                assert!(matches!(ready, Poll::Ready(Ok(()))));
+            } else {
+                assert!(matches!(
+                    ready,
+                    Poll::Ready(Err(SE::StreamTerminated { error_code: CANCEL }))
+                ));
+            }
+            assert!(matches!(
+                send.put(Bytes::from_static(b"body")),
+                Err(SE::StreamTerminated { error_code: CANCEL })
+            ));
+            assert!(matches!(
+                quic::SendStream::poll_finish(&mut send, &mut cx),
+                Poll::Ready(Err(SE::StreamTerminated { error_code: CANCEL }))
+            ));
+            assert!(matches!(
+                quic::RecvStream::poll_data(&mut recv, &mut cx),
+                Poll::Ready(Ok(Some(bytes))) if bytes == Bytes::from_static(b"response")
+            ));
+            assert!(matches!(
+                quic::RecvStream::poll_data(&mut recv, &mut cx),
+                Poll::Ready(Ok(None))
+            ));
+        }
     }
 }
