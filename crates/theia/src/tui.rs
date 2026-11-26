@@ -745,7 +745,7 @@ fn invitation_actions(flow: &IssueFlow) -> Vec<ActionItem> {
 struct RoutingPanel {
     settings: crate::routing::Settings,
     selected: usize,
-    fields: Option<(Option<usize>, [String; 4], usize)>,
+    fields: Option<(Option<usize>, [String; 5], usize)>,
     message: String,
     directory: PathBuf,
     download: Option<mpsc::Receiver<Result<(String, crate::routing::geodata::Manifest), String>>>,
@@ -803,12 +803,14 @@ impl RoutingPanel {
                     Self::action_name(r.action).into(),
                     r.domains.join(", "),
                     r.ips.join(", "),
+                    r.applications.join(", "),
                 ]
             })
             .unwrap_or_else(|| {
                 [
                     String::new(),
                     crate::routing::Action::Allowed.name().into(),
+                    String::new(),
                     String::new(),
                     String::new(),
                 ]
@@ -908,7 +910,7 @@ impl RoutingPanel {
                     self.fields = None;
                 }
                 KeyCode::Up | KeyCode::BackTab => *focus = focus.saturating_sub(1),
-                KeyCode::Down | KeyCode::Tab => *focus = (*focus + 1).min(3),
+                KeyCode::Down | KeyCode::Tab => *focus = (*focus + 1).min(4),
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     fields[*focus].clear()
                 }
@@ -950,6 +952,7 @@ impl RoutingPanel {
                         action,
                         domains: split(&fields[2]),
                         ips: split(&fields[3]),
+                        applications: split(&fields[4]),
                     };
                     if crate::routing::Policy::validate_rules(std::slice::from_ref(&rule)).is_err()
                     {
@@ -1008,7 +1011,7 @@ impl RoutingPanel {
     fn body(&self) -> String {
         let mut body = String::new();
         if let Some((_, fields, focus)) = &self.fields {
-            for (i, (label, value)) in ["Имя", "Действие", "Домены / GeoSite", "IP / CIDR / GeoIP"]
+            for (i, (label, value)) in ["Имя", "Действие", "Домены / GeoSite", "IP / CIDR / GeoIP", "Приложения"]
                 .iter()
                 .zip(fields)
                 .enumerate()
@@ -1023,7 +1026,7 @@ impl RoutingPanel {
                     if i == *focus { "›" } else { " " }
                 ));
             }
-            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · через запятую\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
+            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · через запятую\nПриложение: sha256: + 64 строчных hex-символа\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
         } else {
             body.push_str(&format!(
                 "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
@@ -9062,6 +9065,7 @@ mod tests {
             "direct_via_client".into(),
             "full:localhost".into(),
             String::new(),
+            String::new(),
         ];
         assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
         assert_eq!(panel.settings.rules.len(), 1);
@@ -9075,6 +9079,7 @@ mod tests {
             "DPI".into(),
             "direct_via_client_anti_dpi".into(),
             "example.org".into(),
+            String::new(),
             String::new(),
         ];
         assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));

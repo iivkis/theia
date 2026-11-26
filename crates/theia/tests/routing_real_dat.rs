@@ -37,12 +37,14 @@ async fn real_xtls_pair_and_snapshot_cost() {
             action: Action::Direct,
             domains: vec!["geosite:google".into()],
             ips: vec![],
+            applications: vec![],
         },
         Rule {
             name: "private".into(),
             action: Action::Blocked,
             domains: vec![],
             ips: vec!["geoip:private".into()],
+            applications: vec![],
         },
     ];
     let start = Instant::now();

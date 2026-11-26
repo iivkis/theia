@@ -1093,17 +1093,16 @@ async fn route_decision(
     let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+    use crate::routing::Evidence;
     let mut pinned = None;
     let action = match address {
         Address::V4(ip) => policy
-            .matching_action(None, Some(IpAddr::V4(Ipv4Addr::from(*ip))))
-            .map_err(|_| denied())?
-            .unwrap_or(Action::Allowed),
+            .classify(Evidence::Absent, Evidence::Known(IpAddr::V4(Ipv4Addr::from(*ip))))
+            .map_err(|_| denied())?.action().ok_or_else(denied)?,
         Address::V6(ip) => policy
-            .matching_action(None, Some(IpAddr::V6(Ipv6Addr::from(*ip))))
-            .map_err(|_| denied())?
-            .unwrap_or(Action::Allowed),
-        Address::Dns(name) => match policy.domain_decision(name).map_err(|_| denied())? {
+            .classify(Evidence::Absent, Evidence::Known(IpAddr::V6(Ipv6Addr::from(*ip))))
+            .map_err(|_| denied())?.action().ok_or_else(denied)?,
+        Address::Dns(name) => match policy.classify(Evidence::Known(name), Evidence::Unknown).map_err(|_| denied())?.action() {
             Some(action) => action,
             None => {
                 // Resolve only over the verified control channel when an IP
@@ -1113,9 +1112,8 @@ async fn route_decision(
                 let mut action = None;
                 for ip in &ips {
                     let selected = policy
-                        .matching_action(Some(name), Some(*ip))
-                        .map_err(|_| denied())?
-                        .unwrap_or(Action::Allowed);
+                        .classify(Evidence::Known(name), Evidence::Known(*ip))
+                        .map_err(|_| denied())?.action().ok_or_else(denied)?;
                     if action.is_some_and(|old| old != selected) {
                         // Mixed route decisions are ambiguous; do not silently
                         // downgrade to direct or proxy one of the blocked IPs.
@@ -1191,9 +1189,12 @@ async fn routed_open_selected(
                     };
                     let permitted = !ips.is_empty()
                         && ips.iter().all(|ip| {
-                            policy.matching_action(Some(name), Some(*ip))
-                                == Ok(Some(Action::DirectDpi))
+                            policy.classify(crate::routing::Evidence::Known(name), crate::routing::Evidence::Known(*ip))
+                                == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
                         });
+                    if !ips.is_empty() && !permitted {
+                        return Err(denied());
+                    }
                     if permitted {
                         if let Some(tunnel) =
                             cache.dpi.open(name, port, &ips, snapshot.digest()).await
@@ -1304,12 +1305,14 @@ async fn routed_udp_selected(
                             Err(error) => return Err(error),
                         },
                     };
-                    if !ips.is_empty()
-                        && ips.iter().all(|ip| {
-                            snapshot.policy().matching_action(Some(name), Some(*ip))
-                                == Ok(Some(Action::DirectDpi))
-                        })
-                    {
+                    let permitted = ips.iter().all(|ip| {
+                        snapshot.policy().classify(crate::routing::Evidence::Known(name), crate::routing::Evidence::Known(*ip))
+                            == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
+                    });
+                    if !permitted {
+                        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                    }
+                    if !ips.is_empty() {
                         let verified = if stun {
                             cache
                                 .dpi
@@ -3934,18 +3937,21 @@ mod selector_tests {
                         action: Action::Direct,
                         domains: vec!["full:localhost".into()],
                         ips: vec![],
+                        applications: vec![],
                     },
                     crate::routing::Rule {
                         name: "blocked".into(),
                         action: Action::Blocked,
                         domains: vec!["full:blocked.invalid".into()],
                         ips: vec![],
+                        applications: vec![],
                     },
                     crate::routing::Rule {
                         name: "dpi fallback".into(),
                         action: Action::DirectDpi,
                         domains: vec![],
                         ips: vec!["127.0.0.1/32".into()],
+                        applications: vec![],
                     },
                 ],
             }),

@@ -273,6 +273,7 @@ mod tests {
             action: Action::Direct,
             domains: vec!["geosite:TEST".into()],
             ips: vec![],
+            applications: vec![],
         }
     }
 

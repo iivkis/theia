@@ -533,11 +533,6 @@ impl Tunnel {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn relay(self, client: TcpStream) -> Result<RelayOutcome, ClientError> {
-        self.relay_guarded(client, None).await
-    }
-
     pub(crate) async fn relay_guarded(
         mut self,
         mut client: TcpStream,
