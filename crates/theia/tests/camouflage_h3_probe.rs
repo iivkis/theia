@@ -71,12 +71,20 @@ async fn pinned_loopback_h3_requires_real_quic_tls13_ca_sni_and_alpn() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_hostname_and_untrusted_ca_never_produce_positive_h3_evidence() {
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(15), async {
         let (server, address, roots) = server();
         let worker = tokio::spawn(async move {
+            let mut handshakes = tokio::task::JoinSet::new();
             for _ in 0..2 {
                 let incoming = server.accept().await.unwrap();
-                let _ = quic_transport::accept(incoming).await;
+                handshakes.spawn(async move {
+                    assert!(quic_transport::accept(incoming).await.is_err());
+                });
+            }
+            // The native peer may drop its socket immediately after a fatal
+            // TLS alert; don't serially wait for the reference peer's timer.
+            while let Some(result) = handshakes.join_next().await {
+                result.unwrap();
             }
         });
         let wrong_name = probe_quic_h3(

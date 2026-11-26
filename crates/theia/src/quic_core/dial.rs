@@ -133,8 +133,19 @@ mod tests {
     fn fallback_requires_observed_send_or_exact_send_error_and_no_response() {
         let observation = Observation::default();
         assert_eq!(observation.failure(true), Error::Timeout);
-        observation.send_error(io::ErrorKind::PermissionDenied);
-        assert_eq!(observation.failure(false), Error::Handshake);
+        use io::ErrorKind::*;
+        for error in [PermissionDenied, AddrNotAvailable, WouldBlock, Interrupted,
+            OutOfMemory, ConnectionReset, TimedOut, Other, InvalidInput] {
+            observation.send_error(error);
+            assert_eq!(observation.failure(false), Error::Handshake);
+        }
+        for error in [NetworkUnreachable, HostUnreachable, ConnectionRefused] {
+            let refused = Observation::default();
+            refused.send_error(error);
+            assert_eq!(refused.failure(false), Error::EndpointNetworkRefused);
+            refused.received();
+            assert_eq!(refused.failure(true), Error::Timeout);
+        }
         observation.sent();
         assert_eq!(observation.failure(true), Error::Unreachable);
         assert_eq!(observation.failure(false), Error::Handshake);

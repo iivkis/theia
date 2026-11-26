@@ -53,7 +53,7 @@ fn map_error(error: dial::Error) -> H3ProbeError {
 /// Actively negotiate QUIC/TLS1.3 ALPN=h3 with one explicitly approved exact
 /// UDP socket address. Uses Theia's native QUIC/rustls H3 verifier:
 /// authentic CA chain, SNI/SAN/expiry, TLS1.3, negotiated h3 and BBR.
-/// No HTTP request, arbitrary DNS, retry, redirect or transport fallback.
+/// No HTTP request, arbitrary DNS, application retry, redirect or transport fallback.
 /// Deadline includes queue wait, UDP bind and handshake; max 5 seconds.
 /// Return zero evidence on any failure.
 pub async fn probe_quic_h3(
@@ -128,7 +128,7 @@ pub struct NativeH3ProbeReport {
 
 /// Explicit source/peer pinned probe, no bearer, OPEN, HTTP, DNS or fallback.
 /// In particular a v1 handshake cannot satisfy a v2 probe. This entry point
-/// remains separate from the accepted production probe until parity gates.
+/// also pins the source address and selected wire version explicitly.
 pub async fn probe_quic_h3_native(
     request: ProbeRequest,
     roots: RootCertStore,

@@ -113,6 +113,9 @@ impl StreamState {
     }
 }
 
+#[cfg(test)]
+type RebindRequest = (tokio::net::UdpSocket, oneshot::Sender<Result<(), NativeError>>);
+
 #[derive(Default)]
 struct State {
     streams: BTreeMap<u64, StreamState>,
@@ -125,7 +128,7 @@ struct State {
     close: Option<u64>,
     cursor: Option<u64>,
     #[cfg(test)]
-    rebind: Option<(tokio::net::UdpSocket, oneshot::Sender<Result<(), NativeError>>)>,
+    rebind: Option<RebindRequest>,
 }
 
 fn wake(slot: &mut Option<Waker>, wakes: &mut Vec<Waker>) {
@@ -440,7 +443,7 @@ impl Drop for DriverGuard {
 impl NativeConnection {
     /// Returns exporter material separately so admission remains the
     /// existing caller's responsibility. The raw fixed-key fixture cannot
-    /// enter this API. This is intentionally not selectable in product config.
+    /// enter this API. The caller retains the existing admission policy.
     pub fn start(mut session: LabSession) -> Result<(Self, zeroize::Zeroizing<[u8; 32]>), CE> {
         let key = session.take_channel_binding().ok_or_else(internal)?;
         session.enable_auto_cids();
