@@ -74,6 +74,19 @@ static SERVER_H2: Counters = Counters::new();
 static SERVER_H3: Counters = Counters::new();
 static CLIENT_H2: Counters = Counters::new();
 static CLIENT_H3: Counters = Counters::new();
+static CLIENT_DIRECT: Counters = Counters::new();
+static CLIENT_BLOCKED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn enter_direct() -> Relay<'static> { CLIENT_DIRECT.enter() }
+pub(crate) fn blocked() { CLIENT_BLOCKED.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn routing_summary() -> String {
+    let direct = CLIENT_DIRECT.snapshot();
+    let proxied = snapshot(Role::Client);
+    format!("Маршрутизация: через VPS ↑ {} ↓ {} · напрямую ↑ {} ↓ {} · блокировок {}",
+        bytes(proxied[0].upload.saturating_add(proxied[1].upload)),
+        bytes(proxied[0].download.saturating_add(proxied[1].download)),
+        bytes(direct.upload), bytes(direct.download), CLIENT_BLOCKED.load(Ordering::Relaxed))
+}
 
 fn counters(role: Role, h3: bool) -> &'static Counters {
     match (role, h3) {

@@ -3,6 +3,7 @@
 pub mod snapshot;
 pub mod geodata;
 pub(crate) mod exchange;
+pub(crate) mod client_state;
 mod settings;
 pub use settings::Settings;
 

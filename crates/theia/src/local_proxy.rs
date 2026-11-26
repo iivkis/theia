@@ -1,5 +1,5 @@
 //! Local loopback-only CONNECT and SOCKS5 listeners for H2, H3 or conservative QUIC-first auto mode.
-//! No system proxy changes, destination DNS lookups or live tunnel migration.
+//! Local direct destinations use bounded DNS only after explicit routing authorization.
 use crate::{
     client::{error_kind, ClientError, H2Client, Tunnel},
     config::{self, Config, Profile, Transport, XhttpMode},
@@ -7,6 +7,7 @@ use crate::{
     h3_client::{H3Client, H3Tunnel},
     protocol::{self, Address, ErrorCode, Frame},
     security_profile::SecurityMode,
+    routing::{Action, client_state::{self, Cache}, snapshot::Snapshot},
 };
 use rustls::RootCertStore;
 use std::{
@@ -69,19 +70,23 @@ fn read_token(profile: &Profile) -> Result<zeroize::Zeroizing<String>, ClientErr
     Ok(token)
 }
 
+#[cfg(test)]
 async fn load_client(profile: &Profile) -> Result<ProxyClient, ClientError> {
-    load_client_with_budget(profile, crate::connection_pool::profile_budget()).await
+    load_client_with_budget(profile, crate::connection_pool::profile_budget(), None).await
 }
 
 async fn load_client_with_budget(
     profile: &Profile,
     budget: Arc<Semaphore>,
+    config_path: Option<&Path>,
 ) -> Result<ProxyClient, ClientError> {
     match profile.security_mode {
         SecurityMode::SmartReality
             if profile.reality_profile.is_some() && profile.tls_ca.is_none() =>
         {
-            return RealityClient::prepare_with_budget(profile, budget)
+            let identity = profile.reality_profile.as_ref().ok_or(ClientError::Configuration)?.identity_sha256;
+            let checkpoint = client_state::checkpoint_path(config_path, profile, identity)?;
+            return RealityClient::prepare_with_budget(profile, budget, checkpoint)
                 .await
                 .map(Arc::new)
                 .map(ProxyClient::Reality);
@@ -101,6 +106,8 @@ async fn load_client_with_budget(
         CA_LIMIT,
         false,
     )?;
+    use sha2::{Digest, Sha256};
+    let checkpoint = client_state::checkpoint_path(config_path, profile, Sha256::digest(cert.as_slice()).into())?;
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut BufReader::new(cert.as_slice())) {
         roots
@@ -127,12 +134,12 @@ async fn load_client_with_budget(
             } else {
                 client
             };
-            Ok(ProxyClient::direct(Carrier::from_options(
+            Ok(ProxyClient::direct_with_checkpoint(Carrier::from_options(
                 Some(Arc::new(client.with_connection_pool())),
                 None,
                 ttl,
                 budget,
-            )?))
+            )?, checkpoint))
         }
         Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
@@ -151,12 +158,12 @@ async fn load_client_with_budget(
                 h3
             });
             if profile.transport == Transport::H3 {
-                return Ok(ProxyClient::direct(Carrier::from_options(
+                return Ok(ProxyClient::direct_with_checkpoint(Carrier::from_options(
                     None,
                     Some(h3),
                     ttl,
                     budget,
-                )?));
+                )?, checkpoint));
             }
             // Both carriers use the same resolved endpoint. Do not resolve
             // the hostname again during fallback; retain the configured SNI,
@@ -171,12 +178,12 @@ async fn load_client_with_budget(
             } else {
                 h2
             });
-            Ok(ProxyClient::direct(Carrier::from_options(
+            Ok(ProxyClient::direct_with_checkpoint(Carrier::from_options(
                 Some(h2),
                 Some(h3),
                 ttl,
                 budget,
-            )?))
+            )?, checkpoint))
         }
     }
 }
@@ -208,6 +215,7 @@ enum Carrier {
 }
 struct DirectClient {
     carrier: Carrier,
+    routing: Cache,
     last_open: std::sync::atomic::AtomicU8,
 }
 impl DirectClient {
@@ -240,6 +248,7 @@ pub(crate) struct RealityClient {
     remote: SocketAddr,
     budget: Arc<Semaphore>,
     current: tokio::sync::Mutex<Arc<RealityGeneration>>,
+    routing: Cache,
     changed: Notify,
 }
 impl RealityClient {
@@ -249,6 +258,7 @@ impl RealityClient {
     async fn prepare_with_budget(
         profile: &Profile,
         budget: Arc<Semaphore>,
+        checkpoint: Option<std::path::PathBuf>,
     ) -> Result<Self, ClientError> {
         // No DNS/credential use before the enrollment and independent trust
         // anchor have been checked.
@@ -259,11 +269,13 @@ impl RealityClient {
             .map_err(|_| ClientError::Tls)?;
         let remote = resolve_server(profile).await?;
         let first = Self::build(profile, remote, &enrollment, value, None, budget.clone())?;
+        let routing = Cache::new(first.value.descriptor().scope.inbound.clone(), checkpoint);
         Ok(Self {
             profile: profile.clone(),
             remote,
             budget,
             current: tokio::sync::Mutex::new(Arc::new(first)),
+            routing,
             changed: Notify::new(),
         })
     }
@@ -358,11 +370,13 @@ impl RealityClient {
     }
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let generation = self.generation().await?;
-        let result = generation.carrier.open(address, port).await;
+        let result = routed_open(&generation.carrier, &self.routing, address, port).await;
         if let Ok(tunnel) = &result {
+            if tunnel.open_code() != 0 {
             generation
                 .last_open
                 .store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
+            }
         }
         result
     }
@@ -773,6 +787,24 @@ impl AutoClient {
         }
     }
 
+    async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
+        let (generation, cached) = self.prepare().await?;
+        if !cached {
+            if let Some(value) = self.attempt_h3(generation, || self.h3.fetch_routing()).await? { return Ok(value); }
+        }
+        if !self.same_scope(generation)? { return Err(ClientError::QuicUnreachable); }
+        self.h2.fetch_routing().await
+    }
+
+    async fn resolve_routing(&self, name: &str, digest: [u8; 32]) -> Result<Vec<IpAddr>, ClientError> {
+        let (generation, cached) = self.prepare().await?;
+        if !cached {
+            if let Some(value) = self.attempt_h3(generation, || self.h3.resolve_routing(name, digest)).await? { return Ok(value); }
+        }
+        if !self.same_scope(generation)? { return Err(ClientError::QuicUnreachable); }
+        self.h2.resolve_routing(name, digest).await
+    }
+
     async fn fetch_identity_document(&self, successor: bool) -> Result<String, ClientError> {
         let (generation, cached) = self.prepare().await?;
         if !cached {
@@ -842,11 +874,27 @@ impl AutoClient {
 }
 
 enum ProxyTunnel {
+    Direct(TcpStream),
     H2(Box<Tunnel>),
     H3(Box<H3Tunnel>),
 }
 
 impl Carrier {
+    fn own_routing_scope(&self) -> Option<&str> {
+        match self {
+            Self::H2(c) => c.own_routing_scope(), Self::H3(c) => c.own_routing_scope(), Self::Auto(c) => c.h2.own_routing_scope(),
+        }
+    }
+    async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
+        match self {
+            Self::H2(c) => c.fetch_routing().await, Self::H3(c) => c.fetch_routing().await, Self::Auto(c) => c.fetch_routing().await,
+        }
+    }
+    async fn resolve_routing(&self, name: &str, digest: [u8; 32]) -> Result<Vec<IpAddr>, ClientError> {
+        match self {
+            Self::H2(c) => c.resolve_routing(name, digest).await, Self::H3(c) => c.resolve_routing(name, digest).await, Self::Auto(c) => c.resolve_routing(name, digest).await,
+        }
+    }
     fn profile_budget(&self) -> Arc<Semaphore> {
         match self {
             Self::H2(client) => client.profile_budget(),
@@ -918,16 +966,63 @@ impl Carrier {
     }
 }
 
+
+async fn routed_open(carrier: &Carrier, cache: &Cache, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+    let snapshot = cache.get(|| carrier.fetch_routing()).await?;
+    let policy = snapshot.policy();
+    let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+    let mut pinned = None;
+    let action = match &address {
+        Address::V4(ip) => policy.matching_action(None, Some(IpAddr::V4(Ipv4Addr::from(*ip))))
+            .map_err(|_| denied())?.unwrap_or(Action::Allowed),
+        Address::V6(ip) => policy.matching_action(None, Some(IpAddr::V6(Ipv6Addr::from(*ip))))
+            .map_err(|_| denied())?.unwrap_or(Action::Allowed),
+        Address::Dns(name) => match policy.domain_decision(name).map_err(|_| denied())? {
+            Some(action) => action,
+            None => {
+                // Resolve only over the verified control channel when an IP
+                // rule can precede the domain decision. Never locally resolve
+                // a potentially proxied hostname.
+                let ips = carrier.resolve_routing(name, snapshot.digest()).await?;
+                let mut action = None;
+                for ip in &ips {
+                    let selected = policy.matching_action(Some(name), Some(*ip))
+                        .map_err(|_| denied())?.unwrap_or(Action::Allowed);
+                    if action.is_some_and(|old| old != selected) {
+                        // Mixed route decisions are ambiguous; do not silently
+                        // downgrade to direct or proxy one of the blocked IPs.
+                        action = Some(Action::Blocked);
+                        break;
+                    }
+                    action = Some(selected);
+                }
+                pinned = Some(ips);
+                action.ok_or_else(denied)?
+            }
+        },
+    };
+    match action {
+        Action::Blocked => { crate::traffic::blocked(); Err(denied()) }
+        Action::Allowed => carrier.open(address, port).await,
+        Action::Direct => client_state::dial_direct(address, port, pinned).await.map(ProxyTunnel::Direct),
+    }
+}
+
 impl ProxyClient {
     fn direct(carrier: Carrier) -> Self {
+        Self::direct_with_checkpoint(carrier, None)
+    }
+    fn direct_with_checkpoint(carrier: Carrier, checkpoint: Option<std::path::PathBuf>) -> Self {
+        let routing = Cache::new(carrier.own_routing_scope().unwrap_or("").to_owned(), checkpoint);
         Self::Direct(Arc::new(DirectClient {
             carrier,
+            routing,
             last_open: std::sync::atomic::AtomicU8::new(0),
         }))
     }
 
     async fn runtime_report(&self) -> String {
-        match self {
+        let report = match self {
             Self::Reality(r) => r.runtime_report().await,
             Self::Direct(d) => {
                 let policy = match &d.carrier {
@@ -943,6 +1038,21 @@ impl ProxyClient {
                 format!("Локальный прокси работает. Это не подтверждает связь с сервером.\nРежим передачи: {} · последнее подтверждённое соединение: {opened}; XHTTP: {}\nВременный переход с H3: {}", if policy == "auto" { "автоматически" } else { policy }, xhttp_observation(d.last_xhttp()), if d.fallback() { "активен: временная сетевая недоступность QUIC" } else { "не активен" })
             }
         }
+        ;
+        format!("{report}\n{}\n{}", self.routing_cache().report(), crate::traffic::routing_summary())
+    }
+
+    fn routing_cache(&self) -> &Cache {
+        match self { Self::Direct(c) => &c.routing, Self::Reality(c) => &c.routing }
+    }
+    async fn routing_policy(&self) -> Result<Arc<Snapshot>, ClientError> {
+        match self {
+            Self::Direct(c) => c.routing.get(|| c.carrier.fetch_routing()).await,
+            Self::Reality(c) => {
+                let generation = c.generation().await?;
+                c.routing.get(|| generation.carrier.fetch_routing()).await
+            }
+        }
     }
 
     fn profile_budget(&self) -> Arc<Semaphore> {
@@ -955,20 +1065,27 @@ impl ProxyClient {
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
             Self::Direct(client) => {
-                let tunnel = client.carrier.open(address, port).await?;
-                client
-                    .last_open
-                    .store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
+                let tunnel = routed_open(&client.carrier, &client.routing, address, port).await?;
+                if tunnel.open_code() != 0 {
+                    client.last_open.store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
+                }
                 Ok(tunnel)
             }
             Self::Reality(client) => client.open(address, port).await,
         }
     }
     async fn maintain(&self) -> Result<(), ClientError> {
-        match self {
+        let carrier = async { match self {
             Self::Direct(client) => client.carrier.maintain().await,
             Self::Reality(client) => client.maintain().await,
-        }
+        }};
+        let routing = async {
+            loop {
+                let _ = self.routing_policy().await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        };
+        tokio::select! { result = carrier => result, result = routing => result }
     }
 }
 
@@ -983,6 +1100,7 @@ pub(crate) fn xhttp_observation(code: u8) -> &'static str {
 impl ProxyTunnel {
     fn open_code(&self) -> u8 {
         let (transport, up) = match self {
+            Self::Direct(_) => return 0,
             Self::H2(t) => (2, t.opened_stream_up()),
             Self::H3(t) => (3, t.opened_stream_up()),
         };
@@ -991,6 +1109,7 @@ impl ProxyTunnel {
 
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
         match self {
+            Self::Direct(target) => client_state::relay_direct(socket, target).await,
             Self::H2(tunnel) => tunnel.relay(socket).await,
             Self::H3(tunnel) => tunnel.relay(socket).await,
         }
@@ -1125,9 +1244,9 @@ impl ClientRuntime {
             return Err(ClientError::Configuration);
         }
         let client = if old.id == next.id {
-            load_client_with_budget(next, previous.client.profile_budget()).await?
+            load_client_with_budget(next, previous.client.profile_budget(), Some(&self.path)).await?
         } else {
-            load_client(next).await?
+            load_client_with_budget(next, crate::connection_pool::profile_budget(), Some(&self.path)).await?
         };
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
@@ -1190,7 +1309,7 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     else {
         return Err(ClientError::Configuration);
     };
-    let (http, socks, client) = prepare_proxy(&document).await?;
+    let (http, socks, client) = prepare_proxy(&document, config_path).await?;
     #[cfg(windows)]
     let http_bound = http.local_addr().map_err(|_| ClientError::Io)?;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1255,6 +1374,7 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
 /// authenticated remote tunnel merely because the listeners bind.
 async fn prepare_proxy(
     document: &config::ClientDocument,
+    path: &Path,
 ) -> Result<(TcpListener, TcpListener, ProxyClient), ClientError> {
     let profile = document
         .client
@@ -1268,7 +1388,8 @@ async fn prepare_proxy(
         "config_valid",
         "profiles" = Value::Count(document.client.profiles.len() as u64)
     );
-    let client = load_client(profile).await?;
+    let client = load_client_with_budget(profile, crate::connection_pool::profile_budget(), Some(path)).await?;
+    client.routing_policy().await?;
     crate::diag!(Info, "client.proxy", "transport_preflight_passed");
     // All startup validation and both binds must succeed before accepting.
     let http = TcpListener::bind(&document.client.proxy.http_listen)
@@ -1307,7 +1428,7 @@ impl PreparedLocalProxy {
         else {
             return Err(ClientError::Configuration);
         };
-        let (http, socks, client) = prepare_proxy(&document).await?;
+        let (http, socks, client) = prepare_proxy(&document, path).await?;
         Ok(Self {
             http,
             socks,
@@ -1333,7 +1454,7 @@ impl PreparedLocalProxy {
         {
             return Err(ClientError::Configuration);
         }
-        let (http, socks, client) = prepare_proxy(&document).await?;
+        let (http, socks, client) = prepare_proxy(&document, path).await?;
         // Detect edits during DNS/bind preflight before accepting traffic.
         saved_client_bytes(path, expected)?;
         Ok(Self {
@@ -1718,10 +1839,10 @@ async fn handle(
             crate::diag!(
                 Debug,
                 "client.proxy",
-                "remote_open_ok",
+                if tunnel.open_code() == 0 { "direct_open_ok" } else { "remote_open_ok" },
                 "session" = Value::Count(session_id)
             );
-            // This is the only success path; open() already verified OPEN_OK.
+            // A direct socket is already connected; proxied routes verified OPEN_OK.
             if is_http {
                 timeout(REPLY_TIMEOUT, socket.write_all(HTTP_OK))
                     .await
