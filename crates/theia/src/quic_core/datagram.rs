@@ -52,6 +52,13 @@ pub fn split(datagram: &[u8]) -> Result<Vec<Packet<'_>>, Error> {
         if out.len() == MAX_PACKETS {
             return Err(Error::Limit);
         }
+        // Some peers pad an Initial-containing UDP datagram outside the
+        // protected packet. Never interpret a terminal zero suffix as a
+        // packet or as authenticated bytes.
+        if out.first().is_some_and(|p| p.kind == PacketKind::Initial)
+            && remaining.iter().all(|&b| b == 0) {
+            break;
+        }
         let first = remaining[0];
         let packet = if first & 0x80 == 0 {
             if first & 0x40 == 0 || remaining.len() < 1 + CID_LEN + 4 + 16 {
@@ -228,6 +235,19 @@ mod tests {
             assert_eq!(routes.retire(cid, 7), Err(Error::Owner));
             assert_eq!(routes.classify(&short(cid)), Ok(Route::Existing(8)));
         }
+    }
+
+    #[test]
+    fn terminal_zero_padding_after_initial_is_not_a_packet() {
+        let cid = [1; CID_LEN];
+        let mut writer = Writer::new(Version::V1, &cid, Side::Client).unwrap();
+        let initial = writer.seal(&cid, &[2; CID_LEN], &[], &[1]).unwrap();
+        let mut padded = initial.clone();
+        padded.extend([0; 32]);
+        assert_eq!(split(&padded).unwrap()[0].bytes, initial);
+        assert_eq!(split(&padded).unwrap().len(), 1);
+        *padded.last_mut().unwrap() = 1;
+        assert!(split(&padded).is_err());
     }
 
     #[test]

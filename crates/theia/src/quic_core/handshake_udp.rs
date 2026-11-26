@@ -34,6 +34,7 @@ use tokio::net::UdpSocket;
 
 const MTU: usize = 1200;
 const CHUNK: usize = 900;
+const MAX_RETRY_TOKEN: usize = 512;
 const DEADLINE: Duration = Duration::from_secs(8);
 const CID_LEN: usize = 8;
 const CREDIT: u64 = 64 * 1024;
@@ -553,7 +554,7 @@ impl Handshake {
             return Ok(());
         }
         // Bound the opaque token to leave room for the original CRYPTO chunks.
-        if cid == self.local.as_slice() || token.is_empty() || token.len() > 200 {
+        if cid == self.local.as_slice() || token.is_empty() || token.len() > MAX_RETRY_TOKEN {
             return Ok(());
         }
         let next = self.epochs[0]
@@ -570,8 +571,18 @@ impl Handshake {
             ack: History::default(),
             schedule: Scheduler::after_retry(next),
         };
+        // A larger opaque Retry token consumes Initial payload space.
+        // Re-fragment the original CRYPTO without changing TLS offsets.
+        let chunk = CHUNK.min(MTU - 80 - token.len());
         for frame in self.initial_frames.drain(..) {
-            epoch.schedule.enqueue(frame).map_err(Error::Schedule)?;
+            let parsed = frames::decode(&frame, Space::Initial).map_err(|_| Error::Protocol)?;
+            for item in parsed {
+                let Frame::Crypto { offset, data } = item else { return Err(Error::Protocol); };
+                for (i, part) in data.chunks(chunk).enumerate() {
+                    let frame = crypto_frame(offset + (i * chunk) as u64, part).map_err(|_| Error::Protocol)?;
+                    epoch.schedule.enqueue(frame).map_err(Error::Schedule)?;
+                }
+            }
         }
         self.epochs[0] = Some(epoch);
         self.remote = cid.to_vec();
