@@ -1672,6 +1672,7 @@ dependencies = [
  "quircs",
  "ratatui",
  "rcgen",
+ "regex",
  "ring",
  "rustls",
  "rustls-native-certs",

@@ -1,0 +1,512 @@
+//! Shared route matching primitives for server and client.
+//! No DNS, transport, file I/O or implicit bypass occurs in this module.
+use regex::{Regex, RegexBuilder};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
+
+pub const GEOSITE_URL: &str =
+    "https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite-expand.dat";
+pub const GEOIP_URL: &str =
+    "https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-full.dat";
+const MAX_DAT: usize = 256 * 1024 * 1024;
+const MAX_RULES: usize = 1024;
+const MAX_SELECTORS: usize = 8192;
+const MAX_ENTRIES: usize = 2_000_000;
+const MAX_REGEXES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    Direct,
+    Blocked,
+    Allowed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    pub name: String,
+    pub action: Action,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingError {
+    InvalidRule,
+    InvalidDomain,
+    InvalidIp,
+    InvalidCategory,
+    MissingCategory,
+    InvalidDat,
+    Limit,
+}
+
+impl std::fmt::Display for RoutingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "routing: {self:?}")
+    }
+}
+impl std::error::Error for RoutingError {}
+
+fn domain_name(value: &str) -> Result<String, RoutingError> {
+    let value = value.strip_suffix('.').unwrap_or(value);
+    if value.is_empty() || value.len() > 253 || value.parse::<IpAddr>().is_ok()
+        || !value.split('.').all(|label| {
+            !label.is_empty() && label.len() <= 63
+                && !label.starts_with('-') && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return Err(RoutingError::InvalidDomain);
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn category(value: &str) -> Result<String, RoutingError> {
+    if value.is_empty() || value.len() > 128
+        || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+    {
+        return Err(RoutingError::InvalidCategory);
+    }
+    Ok(value.to_ascii_uppercase())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Cidr {
+    address: IpAddr,
+    prefix: u32,
+}
+impl Cidr {
+    fn new(address: IpAddr, prefix: u32) -> Result<Self, RoutingError> {
+        let bits = if address.is_ipv4() { 32 } else { 128 };
+        if prefix > bits {
+            return Err(RoutingError::InvalidIp);
+        }
+        Ok(Self { address, prefix })
+    }
+
+    fn parse(value: &str) -> Result<Self, RoutingError> {
+        let (ip, prefix) = match value.split_once('/') {
+            Some((ip, prefix)) => (ip, Some(prefix.parse::<u32>().map_err(|_| RoutingError::InvalidIp)?)),
+            None => (value, None),
+        };
+        let address = ip.parse::<IpAddr>().map_err(|_| RoutingError::InvalidIp)?;
+        Self::new(address, prefix.unwrap_or(if address.is_ipv4() { 32 } else { 128 }))
+    }
+
+    fn matches(self, ip: IpAddr) -> bool {
+        match (self.address, ip) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => self.prefix == 0
+                || (u32::from(a) ^ u32::from(b)) >> (32 - self.prefix) == 0,
+            (IpAddr::V6(a), IpAddr::V6(b)) => self.prefix == 0
+                || (u128::from(a) ^ u128::from(b)) >> (128 - self.prefix) == 0,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DomainPattern {
+    Full(String),
+    Suffix(String),
+    Substring(String),
+    Regex(Regex),
+}
+impl DomainPattern {
+    fn matches(&self, host: &str) -> bool {
+        match self {
+            Self::Full(name) => name == host,
+            Self::Suffix(name) => host == name || host.strip_suffix(name.as_str()).is_some_and(|prefix| prefix.ends_with('.')),
+            Self::Substring(value) => host.contains(value.as_str()),
+            Self::Regex(regex) => regex.is_match(host),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IpCategory {
+    cidrs: Vec<Cidr>,
+    reverse: bool,
+}
+impl IpCategory {
+    fn matches(&self, ip: IpAddr) -> bool {
+        self.cidrs.iter().any(|cidr| cidr.matches(ip)) != self.reverse
+    }
+}
+
+// Only protobuf wire types used by the Xray geodata schema are accepted.
+// Every read is bounds checked, including length and varint overflow.
+enum Field<'a> {
+    Number(u64),
+    Bytes(&'a [u8]),
+    Other,
+}
+struct Wire<'a>(&'a [u8]);
+impl<'a> Wire<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], RoutingError> {
+        if n > self.0.len() {
+            return Err(RoutingError::InvalidDat);
+        }
+        let (value, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(value)
+    }
+    fn varint(&mut self) -> Result<u64, RoutingError> {
+        let mut result = 0u64;
+        for shift in (0..=63).step_by(7) {
+            let byte = self.take(1)?[0];
+            if shift == 63 && byte > 1 {
+                return Err(RoutingError::InvalidDat);
+            }
+            result |= u64::from(byte & 127) << shift;
+            if byte & 128 == 0 {
+                return Ok(result);
+            }
+        }
+        Err(RoutingError::InvalidDat)
+    }
+    fn next(&mut self) -> Result<Option<(u32, Field<'a>)>, RoutingError> {
+        if self.0.is_empty() {
+            return Ok(None);
+        }
+        let tag = self.varint()?;
+        let number = u32::try_from(tag >> 3).map_err(|_| RoutingError::InvalidDat)?;
+        if number == 0 || number >= (1 << 29) {
+            return Err(RoutingError::InvalidDat);
+        }
+        let value = match tag & 7 {
+            0 => Field::Number(self.varint()?),
+            1 => { self.take(8)?; Field::Other }
+            2 => {
+                let n = usize::try_from(self.varint()?).map_err(|_| RoutingError::InvalidDat)?;
+                Field::Bytes(self.take(n)?)
+            }
+            5 => { self.take(4)?; Field::Other }
+            _ => return Err(RoutingError::InvalidDat),
+        };
+        Ok(Some((number, value)))
+    }
+}
+
+fn utf8(bytes: &[u8]) -> Result<&str, RoutingError> {
+    std::str::from_utf8(bytes).map_err(|_| RoutingError::InvalidDat)
+}
+
+fn entry_code(bytes: &[u8]) -> Result<String, RoutingError> {
+    let mut wire = Wire(bytes);
+    let mut code = None;
+    while let Some((field, value)) = wire.next()? {
+        if field == 1 {
+            match value {
+                Field::Bytes(value) if code.is_none() => code = Some(category(utf8(value)?)?),
+                _ => return Err(RoutingError::InvalidDat),
+            }
+        }
+    }
+    code.ok_or(RoutingError::InvalidDat)
+}
+
+fn dat_domain(bytes: &[u8], regex_count: &mut usize) -> Result<DomainPattern, RoutingError> {
+    let mut wire = Wire(bytes);
+    let mut kind = None;
+    let mut value = None;
+    while let Some((field, item)) = wire.next()? {
+        match (field, item) {
+            (1, Field::Number(n)) if kind.is_none() => kind = Some(n),
+            (2, Field::Bytes(bytes)) if value.is_none() => value = Some(utf8(bytes)?),
+            // Attributes are not used by unqualified geosite:CODE selectors.
+            (3, Field::Bytes(_)) => {}
+            (1..=3, _) => return Err(RoutingError::InvalidDat),
+            _ => {}
+        }
+    }
+    let value = value.ok_or(RoutingError::InvalidDat)?;
+    if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+        return Err(RoutingError::InvalidDat);
+    }
+    match kind.unwrap_or(0) {
+        0 => Ok(DomainPattern::Substring(value.to_ascii_lowercase())),
+        1 => {
+            *regex_count += 1;
+            if *regex_count > MAX_REGEXES {
+                return Err(RoutingError::Limit);
+            }
+            let regex = RegexBuilder::new(value).size_limit(256 * 1024)
+                .dfa_size_limit(256 * 1024).build().map_err(|_| RoutingError::InvalidDat)?;
+            Ok(DomainPattern::Regex(regex))
+        }
+        2 => Ok(DomainPattern::Suffix(domain_name(value)?)),
+        3 => Ok(DomainPattern::Full(domain_name(value)?)),
+        _ => Err(RoutingError::InvalidDat),
+    }
+}
+
+fn dat_cidr(bytes: &[u8]) -> Result<Cidr, RoutingError> {
+    let mut wire = Wire(bytes);
+    let mut ip = None;
+    let mut prefix = None;
+    while let Some((field, value)) = wire.next()? {
+        match (field, value) {
+            (1, Field::Bytes(bytes)) if ip.is_none() => {
+                ip = Some(match bytes.len() {
+                    4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(bytes).map_err(|_| RoutingError::InvalidDat)?)),
+                    16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(bytes).map_err(|_| RoutingError::InvalidDat)?)),
+                    _ => return Err(RoutingError::InvalidDat),
+                });
+            }
+            (2, Field::Number(n)) if prefix.is_none() => {
+                prefix = Some(u32::try_from(n).map_err(|_| RoutingError::InvalidDat)?);
+            }
+            (1 | 2, _) => return Err(RoutingError::InvalidDat),
+            _ => {}
+        }
+    }
+    Cidr::new(ip.ok_or(RoutingError::InvalidDat)?, prefix.unwrap_or(0))
+}
+
+#[derive(Debug)]
+enum DomainSelector {
+    Literal(DomainPattern),
+    Category(String),
+}
+#[derive(Debug)]
+enum IpSelector {
+    Literal(Cidr),
+    Category(String),
+}
+#[derive(Debug)]
+struct CompiledRule {
+    action: Action,
+    domains: Vec<DomainSelector>,
+    ips: Vec<IpSelector>,
+}
+
+/// Validated immutable rules and only the referenced geodata categories.
+/// Callers must authenticate and verify exact DAT digests before compiling.
+#[derive(Debug)]
+pub struct Policy {
+    rules: Vec<CompiledRule>,
+    sites: HashMap<String, Vec<DomainPattern>>,
+    ips: HashMap<String, IpCategory>,
+}
+
+impl Policy {
+    pub fn compile(rules: &[Rule], geosite: &[u8], geoip: &[u8]) -> Result<Self, RoutingError> {
+        if rules.len() > MAX_RULES || geosite.len() > MAX_DAT || geoip.len() > MAX_DAT {
+            return Err(RoutingError::Limit);
+        }
+        let mut site_codes = HashSet::new();
+        let mut ip_codes = HashSet::new();
+        let mut compiled = Vec::new();
+        let mut selectors = 0usize;
+        for rule in rules {
+            if rule.name.trim().is_empty() || rule.name.len() > 128
+                || rule.name.chars().any(char::is_control)
+                || (rule.domains.is_empty() && rule.ips.is_empty())
+            {
+                return Err(RoutingError::InvalidRule);
+            }
+            selectors = selectors.saturating_add(rule.domains.len()).saturating_add(rule.ips.len());
+            if selectors > MAX_SELECTORS {
+                return Err(RoutingError::Limit);
+            }
+            let mut domains = Vec::new();
+            let mut ips = Vec::new();
+            for selector in &rule.domains {
+                domains.push(if let Some(value) = selector.strip_prefix("geosite:") {
+                    let code = category(value)?;
+                    site_codes.insert(code.clone());
+                    DomainSelector::Category(code)
+                } else if let Some(value) = selector.strip_prefix("full:") {
+                    DomainSelector::Literal(DomainPattern::Full(domain_name(value)?))
+                } else {
+                    let value = selector.strip_prefix("domain:").unwrap_or(selector);
+                    DomainSelector::Literal(DomainPattern::Suffix(domain_name(value)?))
+                });
+            }
+            for selector in &rule.ips {
+                ips.push(if let Some(value) = selector.strip_prefix("geoip:") {
+                    let code = category(value)?;
+                    ip_codes.insert(code.clone());
+                    IpSelector::Category(code)
+                } else {
+                    IpSelector::Literal(Cidr::parse(selector)?)
+                });
+            }
+            compiled.push(CompiledRule { action: rule.action, domains, ips });
+        }
+        let mut count = 0usize;
+        let mut regex_count = 0usize;
+        let mut sites = HashMap::new();
+        let mut wire = Wire(geosite);
+        while let Some((field, value)) = wire.next()? {
+            if field != 1 { continue; }
+            let Field::Bytes(bytes) = value else { return Err(RoutingError::InvalidDat); };
+            let code = entry_code(bytes)?;
+            if !site_codes.contains(&code) { continue; }
+            let mut entries = Vec::new();
+            let mut entry = Wire(bytes);
+            while let Some((field, value)) = entry.next()? {
+                if field != 2 { continue; }
+                let Field::Bytes(bytes) = value else { return Err(RoutingError::InvalidDat); };
+                count += 1;
+                if count > MAX_ENTRIES { return Err(RoutingError::Limit); }
+                entries.push(dat_domain(bytes, &mut regex_count)?);
+            }
+            if entries.is_empty() || sites.insert(code, entries).is_some() {
+                return Err(RoutingError::InvalidDat);
+            }
+        }
+        let mut ips = HashMap::new();
+        let mut wire = Wire(geoip);
+        while let Some((field, value)) = wire.next()? {
+            if field != 1 { continue; }
+            let Field::Bytes(bytes) = value else { return Err(RoutingError::InvalidDat); };
+            let code = entry_code(bytes)?;
+            if !ip_codes.contains(&code) { continue; }
+            let mut cidrs = Vec::new();
+            let mut reverse = None;
+            let mut entry = Wire(bytes);
+            while let Some((field, value)) = entry.next()? {
+                match (field, value) {
+                    (2, Field::Bytes(bytes)) => {
+                        count += 1;
+                        if count > MAX_ENTRIES { return Err(RoutingError::Limit); }
+                        cidrs.push(dat_cidr(bytes)?);
+                    }
+                    (3, Field::Number(n)) if n <= 1 && reverse.is_none() => reverse = Some(n == 1),
+                    (2 | 3, _) => return Err(RoutingError::InvalidDat),
+                    _ => {}
+                }
+            }
+            if cidrs.is_empty() || ips.insert(code, IpCategory { cidrs, reverse: reverse.unwrap_or(false) }).is_some() {
+                return Err(RoutingError::InvalidDat);
+            }
+        }
+        if sites.len() != site_codes.len() || ips.len() != ip_codes.len() {
+            return Err(RoutingError::MissingCategory);
+        }
+        Ok(Self { rules: compiled, sites, ips })
+    }
+
+    /// First matching rule, with OR between all selectors in a rule.
+    /// An absent result is not an authorization: the transport still needs ACL.
+    /// A DNS name may be evaluated without resolving it; a caller can supply
+    /// an independently pinned IP in a second evaluation.
+    pub fn matching_action(&self, domain: Option<&str>, ip: Option<IpAddr>) -> Result<Option<Action>, RoutingError> {
+        let domain = domain.map(domain_name).transpose()?;
+        let ip = ip.map(|ip| match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            _ => ip,
+        });
+        for rule in &self.rules {
+            let domain_match = domain.as_ref().is_some_and(|host| {
+                rule.domains.iter().any(|selector| match selector {
+                    DomainSelector::Literal(pattern) => pattern.matches(host),
+                    DomainSelector::Category(code) => self.sites[code].iter().any(|p| p.matches(host)),
+                })
+            });
+            let ip_match = ip.is_some_and(|ip| rule.ips.iter().any(|selector| match selector {
+                IpSelector::Literal(cidr) => cidr.matches(ip),
+                IpSelector::Category(code) => self.ips[code].matches(ip),
+            }));
+            if domain_match || ip_match { return Ok(Some(rule.action)); }
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(action: Action, domains: &[&str], ips: &[&str]) -> Rule {
+        Rule { name: "test".into(), action, domains: domains.iter().map(|s| (*s).into()).collect(),
+            ips: ips.iter().map(|s| (*s).into()).collect() }
+    }
+    fn field(tag: u8, value: &[u8]) -> Vec<u8> {
+        assert!(value.len() < 128);
+        let mut result = vec![tag * 8 + 2, value.len() as u8];
+        result.extend_from_slice(value);
+        result
+    }
+    fn site(code: &str, kind: u8, name: &str) -> Vec<u8> {
+        let mut domain = vec![8, kind];
+        domain.extend(field(2, name.as_bytes()));
+        let mut entry = field(1, code.as_bytes());
+        entry.extend(field(2, &domain));
+        field(1, &entry)
+    }
+    fn ip_data(code: &str, ip: &[u8], prefix: u8, reverse: bool) -> Vec<u8> {
+        let mut cidr = field(1, ip);
+        cidr.extend([16, prefix]);
+        let mut entry = field(1, code.as_bytes());
+        entry.extend(field(2, &cidr));
+        if reverse { entry.extend([24, 1]); }
+        field(1, &entry)
+    }
+
+    #[test]
+    fn first_match_or_and_domain_boundaries() {
+        let p = Policy::compile(&[
+            rule(Action::Blocked, &["full:ads.example.com"], &[]),
+            rule(Action::Direct, &["example.com"], &["192.0.2.0/24"]),
+            rule(Action::Allowed, &["geosite:google"], &[]),
+        ], &site("GOOGLE", 2, "google.com"), &[]).unwrap();
+        assert_eq!(p.matching_action(Some("ads.example.com"), None).unwrap(), Some(Action::Blocked));
+        assert_eq!(p.matching_action(Some("WWW.EXAMPLE.COM."), None).unwrap(), Some(Action::Direct));
+        assert_eq!(p.matching_action(Some("badexample.com"), None).unwrap(), None);
+        assert_eq!(p.matching_action(Some("unrelated.com"), Some("192.0.2.12".parse().unwrap())).unwrap(), Some(Action::Direct));
+        assert_eq!(p.matching_action(Some("mail.google.com"), None).unwrap(), Some(Action::Allowed));
+    }
+
+    #[test]
+    fn dat_domain_types() {
+        let mut data = site("SUB", 0, "keyword");
+        data.extend(site("REG", 1, r"^foo[0-9]+\.example$"));
+        data.extend(site("FULL", 3, "exact.example"));
+        let p = Policy::compile(&[
+            rule(Action::Blocked, &["geosite:sub"], &[]),
+            rule(Action::Direct, &["geosite:reg"], &[]),
+            rule(Action::Allowed, &["geosite:full"], &[]),
+        ], &data, &[]).unwrap();
+        assert_eq!(p.matching_action(Some("keyword.example"), None).unwrap(), Some(Action::Blocked));
+        assert_eq!(p.matching_action(Some("foo12.example"), None).unwrap(), Some(Action::Direct));
+        assert_eq!(p.matching_action(Some("exact.example"), None).unwrap(), Some(Action::Allowed));
+        assert_eq!(p.matching_action(Some("sub.exact.example"), None).unwrap(), None);
+    }
+
+    #[test]
+    fn cidrs_and_reverse() {
+        let mut data = ip_data("RU", &[192, 0, 2, 0], 24, false);
+        data.extend(ip_data("V6", &[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 32, false));
+        data.extend(ip_data("NOT", &[203, 0, 113, 0], 24, true));
+        let p = Policy::compile(&[
+            rule(Action::Direct, &[], &["geoip:ru", "geoip:v6"]),
+            rule(Action::Blocked, &[], &["geoip:not"]),
+        ], &[], &data).unwrap();
+        for ip in ["192.0.2.1", "2001:db8::1", "::ffff:192.0.2.1"] {
+            assert_eq!(p.matching_action(None, Some(ip.parse().unwrap())).unwrap(), Some(Action::Direct));
+        }
+        assert_eq!(p.matching_action(None, Some("198.51.100.1".parse().unwrap())).unwrap(), Some(Action::Blocked));
+        assert_eq!(p.matching_action(None, Some("203.0.113.1".parse().unwrap())).unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_policy_and_dat_fail_closed() {
+        assert!(matches!(Policy::compile(&[rule(Action::Direct, &[], &[])], &[], &[]), Err(RoutingError::InvalidRule)));
+        assert!(matches!(Policy::compile(&[rule(Action::Direct, &["geosite:missing"], &[])], &[], &[]), Err(RoutingError::MissingCategory)));
+        assert!(matches!(Policy::compile(&[rule(Action::Direct, &[], &["192.0.2.1/33"])], &[], &[]), Err(RoutingError::InvalidIp)));
+        assert!(matches!(Policy::compile(&[], &[10, 127], &[]), Err(RoutingError::InvalidDat)));
+        assert!(matches!(Policy::compile(&[rule(Action::Direct, &["geosite:bad"], &[])], &site("BAD", 4, "example.com"), &[]), Err(RoutingError::InvalidDat)));
+        let mut dup = site("GOOGLE", 2, "google.com");
+        dup.extend(site("GOOGLE", 2, "other.com"));
+        assert!(matches!(Policy::compile(&[rule(Action::Direct, &["geosite:google"], &[])], &dup, &[]), Err(RoutingError::InvalidDat)));
+    }
+}

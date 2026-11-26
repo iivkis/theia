@@ -37,6 +37,7 @@ pub mod protocol;
 mod qr_import;
 pub mod quic_transport;
 pub(crate) mod quota;
+pub mod routing;
 pub mod reality_admission;
 pub mod reality_bootstrap;
 mod reality_checkpoint;
