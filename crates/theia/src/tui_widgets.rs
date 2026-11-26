@@ -802,13 +802,7 @@ impl Actions<'_> {
                 .style(style)
             })
             .collect::<Vec<_>>();
-        frame.render_widget(
-            List::new(items).block(section(
-                " Действия ",
-                focused,
-            )),
-            area,
-        );
+        frame.render_widget(List::new(items).block(section(" Действия ", focused)), area);
     }
 }
 

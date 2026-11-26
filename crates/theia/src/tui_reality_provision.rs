@@ -871,10 +871,7 @@ enum WizardStage {
         tokio::sync::oneshot::Sender<()>,
     ),
     ProbeConfirm(Box<(WizardInput, ResolvedSearch)>),
-    Checking(
-        Receiver<CheckResult>,
-        tokio::sync::oneshot::Sender<()>,
-    ),
+    Checking(Receiver<CheckResult>, tokio::sync::oneshot::Sender<()>),
     CreateConfirm(Box<(WizardInput, reference_health::State, RankedReview)>),
     NoEligible(RankedReview),
     Saving(Receiver<Result<RegistrationPanel, Error>>, PathBuf),

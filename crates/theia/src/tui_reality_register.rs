@@ -693,8 +693,16 @@ mod tests {
         }
         assert!(p.body().contains("ОТКАЗ"));
         for (error, expected, done) in [
-            (SaveError::Refused(Error::Indeterminate), "Повтор запрещён до проверки", true),
-            (SaveError::SavedReloadFailed, "TOML сохранён, перечитать редактор не удалось", true),
+            (
+                SaveError::Refused(Error::Indeterminate),
+                "Повтор запрещён до проверки",
+                true,
+            ),
+            (
+                SaveError::SavedReloadFailed,
+                "TOML сохранён, перечитать редактор не удалось",
+                true,
+            ),
             (SaveError::Refused(Error::Approval), "ОТКАЗ", false),
         ] {
             let (tx, rx) = mpsc::channel();

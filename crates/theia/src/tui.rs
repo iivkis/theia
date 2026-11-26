@@ -6510,10 +6510,8 @@ fn draw_workspace(
         ListItem::new(format!("{marker} {label}")).style(style)
     });
     frame.render_widget(
-        List::new(categories.collect::<Vec<_>>()).block(tui_widgets::section(
-            " Разделы ",
-            nav_focused,
-        )),
+        List::new(categories.collect::<Vec<_>>())
+            .block(tui_widgets::section(" Разделы ", nav_focused)),
         nav,
     );
     if let Some(editor) = editor {
