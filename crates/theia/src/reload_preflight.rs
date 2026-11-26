@@ -93,8 +93,11 @@ pub(crate) fn assess_managed_reload(
     Config::Server(candidate.clone())
         .validate()
         .map_err(|_| ReloadCheckError::InvalidConfig)?;
-    crate::routing::Settings::transition(running.server.policy.routing.as_ref(), candidate.server.policy.routing.as_ref())
-        .map_err(|_| ReloadCheckError::InvalidConfig)?;
+    crate::routing::Settings::transition(
+        running.server.policy.routing.as_ref(),
+        candidate.server.policy.routing.as_ref(),
+    )
+    .map_err(|_| ReloadCheckError::InvalidConfig)?;
     let mut normalized = candidate.clone();
     normalized.server.policy.routing = running.server.policy.routing.clone();
     normalized.server.users = running.server.users.clone();

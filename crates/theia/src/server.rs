@@ -283,7 +283,12 @@ impl ServerContext {
         }
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
-        let users = self.authorization.load().map_err(|_| ServerError::Config)?.users.clone();
+        let users = self
+            .authorization
+            .load()
+            .map_err(|_| ServerError::Config)?
+            .users
+            .clone();
         self.authorization = AuthCell::isolated(inbound, &users, &self.policy, Some(&inbound.id));
         self.routing_publication()?;
         self.padding = d.padding.clone();
@@ -432,10 +437,17 @@ impl ServerContext {
 
     /// Routing data is private to authenticated grants, including own-TLS.
     pub(crate) fn is_routing_request<T>(&self, request: &Request<T>) -> bool {
-        if request.method() != Method::GET { return false; }
+        if request.method() != Method::GET {
+            return false;
+        }
         match &self.identity_routes {
-            Some(routes) => routes.read().is_ok_and(|r| r.current() && request.uri().path() == r.paths.routing),
-            None => self.own_routes.as_ref().is_some_and(|r| request.uri().path() == r.routing),
+            Some(routes) => routes
+                .read()
+                .is_ok_and(|r| r.current() && request.uri().path() == r.paths.routing),
+            None => self
+                .own_routes
+                .as_ref()
+                .is_some_and(|r| request.uri().path() == r.routing),
         }
     }
 
@@ -444,23 +456,46 @@ impl ServerContext {
         request: &Request<T>,
         peer: IpAddr,
     ) -> Result<(SessionPermit, Arc<crate::routing::exchange::Published>), StatusCode> {
-        if !self.is_routing_request(request) || request.uri().query().is_some()
-            || request.headers().contains_key(crate::split_http::PAIR_HEADER)
+        if !self.is_routing_request(request)
+            || request.uri().query().is_some()
+            || request
+                .headers()
+                .contains_key(crate::split_http::PAIR_HEADER)
         {
             return Err(StatusCode::NOT_FOUND);
         }
-        if !self.peer_budget.admit(peer, Instant::now()) { return Err(StatusCode::TOO_MANY_REQUESTS); }
-        if request.headers().get_all(header::AUTHORIZATION).iter().count() != 1 {
+        if !self.peer_budget.admit(peer, Instant::now()) {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        if request
+            .headers()
+            .get_all(header::AUTHORIZATION)
+            .iter()
+            .count()
+            != 1
+        {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        let permit = self.authorize(request.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()))
+        let permit = self
+            .authorize(
+                request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok()),
+            )
             .map_err(AuthFailure::status)?;
         let publication = permit.routing.clone();
         Ok((permit, publication))
     }
 
     fn routing_publication(&self) -> Result<Arc<crate::routing::exchange::Published>, ServerError> {
-        self.authorization.load().map_err(|_| ServerError::Config)?.routing.get(&self.inbound_id).cloned().ok_or(ServerError::Config)
+        self.authorization
+            .load()
+            .map_err(|_| ServerError::Config)?
+            .routing
+            .get(&self.inbound_id)
+            .cloned()
+            .ok_or(ServerError::Config)
     }
 
     pub(crate) async fn routing_response(
@@ -469,9 +504,12 @@ impl ServerContext {
         headers: &http::HeaderMap,
     ) -> Result<Arc<[u8]>, StatusCode> {
         crate::routing::exchange::response_data(
-            publication, headers, self.policy.allow_private_ips,
+            publication,
+            headers,
+            self.policy.allow_private_ips,
             Duration::from_millis(u64::from(self.policy.connect_timeout_ms)),
-        ).await
+        )
+        .await
     }
 
     pub(crate) fn is_descriptor_request<T>(&self, request: &Request<T>) -> bool {
@@ -554,7 +592,9 @@ impl ServerContext {
         address: &Address,
         port: u16,
     ) -> Result<TcpStream, ErrorCode> {
-        let routing = self.routing_publication().map_err(|_| ErrorCode::PolicyDenied)?;
+        let routing = self
+            .routing_publication()
+            .map_err(|_| ErrorCode::PolicyDenied)?;
         connect_target(address, port, &self.policy, routing.snapshot.policy()).await
     }
 
@@ -728,7 +768,11 @@ impl ServerContext {
         {
             return Err(AuthFailure::Forbidden);
         }
-        let routing = snapshot.routing.get(&self.inbound_id).cloned().ok_or(AuthFailure::Forbidden)?;
+        let routing = snapshot
+            .routing
+            .get(&self.inbound_id)
+            .cloned()
+            .ok_or(AuthFailure::Forbidden)?;
         // Admission and quota resize serialize through a single short
         // occupancy lock across old/new H2 and QUIC listener generations.
         if let Some(ledger) = &self.live_quota {
@@ -838,9 +882,17 @@ async fn connect_target(
     policy: &ServerPolicy,
     routing: &crate::routing::Policy,
 ) -> Result<TcpStream, ErrorCode> {
-    let domain = match address { Address::Dns(name) => Some(name.as_str()), _ => None };
+    let domain = match address {
+        Address::Dns(name) => Some(name.as_str()),
+        _ => None,
+    };
     if let Some(name) = domain {
-        if matches!(routing.domain_decision(name).map_err(|_| ErrorCode::PolicyDenied)?, Some(crate::routing::Action::Direct | crate::routing::Action::Blocked)) {
+        if matches!(
+            routing
+                .domain_decision(name)
+                .map_err(|_| ErrorCode::PolicyDenied)?,
+            Some(crate::routing::Action::Direct | crate::routing::Action::Blocked)
+        ) {
             return Err(ErrorCode::PolicyDenied);
         }
     }
@@ -859,11 +911,18 @@ async fn connect_target(
         let permitted = permitted_candidates(candidates, policy.allow_private_ips)?;
         let mut routed = Vec::new();
         for candidate in permitted {
-            if routing.matching_action(domain, Some(candidate.ip())).map_err(|_| ErrorCode::PolicyDenied)?.unwrap_or(crate::routing::Action::Allowed) == crate::routing::Action::Allowed {
+            if routing
+                .matching_action(domain, Some(candidate.ip()))
+                .map_err(|_| ErrorCode::PolicyDenied)?
+                .unwrap_or(crate::routing::Action::Allowed)
+                == crate::routing::Action::Allowed
+            {
                 routed.push(candidate);
             }
         }
-        if routed.is_empty() { return Err(ErrorCode::PolicyDenied); }
+        if routed.is_empty() {
+            return Err(ErrorCode::PolicyDenied);
+        }
         // Pin each ACL-checked SocketAddr. Share the remaining deadline
         // between candidates so an unresponsive IPv6 route cannot starve IPv4.
         dial_candidates(&routed, deadline, TcpStream::connect).await
@@ -1273,7 +1332,9 @@ async fn handle_routing(
         Ok(value) => value,
         Err(status) => return reject(&mut respond, status).await,
     };
-    if !crate::channel_binding::admit(binding, &[&request]) { return reject(&mut respond, StatusCode::UNAUTHORIZED).await; }
+    if !crate::channel_binding::admit(binding, &[&request]) {
+        return reject(&mut respond, StatusCode::UNAUTHORIZED).await;
+    }
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         request.body_mut().data().await.is_none()
             && request
@@ -1287,7 +1348,10 @@ async fn handle_routing(
     if !empty {
         return reject(&mut respond, StatusCode::BAD_REQUEST).await;
     }
-    let signed = match context.routing_response(&publication, request.headers()).await {
+    let signed = match context
+        .routing_response(&publication, request.headers())
+        .await
+    {
         Ok(bytes) => bytes,
         Err(status) => return reject(&mut respond, status).await,
     };
@@ -1328,7 +1392,6 @@ async fn handle_routing(
     .await
     .map_err(|_| ServerError::Io)?
 }
-
 
 async fn handle_request(
     request: Request<h2::RecvStream>,
@@ -3203,30 +3266,49 @@ async fn run_supervised_file(
                 if let Ok(view) = runtime.snapshot() {
                     if let Some(settings) = view.document.server.policy.routing.clone() {
                         if let Some(directory) = settings.geodata_directory {
-                            if last_directory.as_ref() != Some(&directory) || tokio::time::Instant::now() >= next_refresh {
+                            if last_directory.as_ref() != Some(&directory)
+                                || tokio::time::Instant::now() >= next_refresh
+                            {
                                 last_directory = Some(directory.clone());
-                                next_refresh = tokio::time::Instant::now() + crate::routing::geodata::REFRESH_INTERVAL;
+                                next_refresh = tokio::time::Instant::now()
+                                    + crate::routing::geodata::REFRESH_INTERVAL;
                                 let result = async {
-                                    let store = crate::routing::geodata::Store::new(directory.into()).map_err(|_| ())?;
-                                    let pair = store.refresh(&settings.rules).await.map_err(|_| ())?;
+                                    let store =
+                                        crate::routing::geodata::Store::new(directory.into())
+                                            .map_err(|_| ())?;
+                                    let pair =
+                                        store.refresh(&settings.rules).await.map_err(|_| ())?;
                                     let manifest = pair.manifest().clone();
                                     drop(pair);
                                     let prepare = runtime.clone();
                                     let path = path.clone();
-                                    let stage = tokio::task::spawn_blocking(move || prepare.prepare_geodata(&view, &path, manifest))
-                                        .await.map_err(|_| ())?.map_err(|_| ())?;
+                                    let stage = tokio::task::spawn_blocking(move || {
+                                        prepare.prepare_geodata(&view, &path, manifest)
+                                    })
+                                    .await
+                                    .map_err(|_| ())?
+                                    .map_err(|_| ())?;
                                     match stage {
-                                        Some(stage) => { runtime.activate_geodata(stage).map_err(|_| ())?; Ok(true) }
+                                        Some(stage) => {
+                                            runtime.activate_geodata(stage).map_err(|_| ())?;
+                                            Ok(true)
+                                        }
                                         None => Ok(false),
                                     }
-                                }.await;
+                                }
+                                .await;
                                 match result {
                                     Ok(true) => crate::diag!(Info, "server", "geodata_activated"),
-                                    Ok(false) => {},
+                                    Ok(false) => {}
                                     Err(()) => {
                                         // Retry conflicts and temporary failures without replacing pending edits.
-                                        next_refresh = tokio::time::Instant::now() + Duration::from_secs(300);
-                                        crate::diag!(Warn, "server", "geodata_refresh_or_apply_failed");
+                                        next_refresh =
+                                            tokio::time::Instant::now() + Duration::from_secs(300);
+                                        crate::diag!(
+                                            Warn,
+                                            "server",
+                                            "geodata_refresh_or_apply_failed"
+                                        );
                                     }
                                 }
                             }

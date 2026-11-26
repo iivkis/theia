@@ -367,7 +367,9 @@ async fn run_client(
                 }
                 sleep(Duration::from_millis(50)).await;
             }
-        }).await.expect("invalid client must fail closed before binding");
+        })
+        .await
+        .expect("invalid client must fail closed before binding");
         return;
     }
     await_client(http, &mut process).await;
@@ -384,15 +386,34 @@ async fn run_client(
         stream.shutdown().await.unwrap();
     });
     let mut direct = TcpStream::connect(http).await.unwrap();
-    direct.write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes()).await.unwrap();
-    assert_eq!(response_head(&mut direct).await, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+    direct
+        .write_all(
+            format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response_head(&mut direct).await,
+        b"HTTP/1.1 200 Connection Established\r\n\r\n"
+    );
     let mut result = Vec::new();
     direct.read_to_end(&mut result).await.unwrap();
     assert_eq!(result, b"native-client-origin");
     listener.await.unwrap();
     let mut blocked = TcpStream::connect(http).await.unwrap();
-    blocked.write_all(format!("CONNECT blocked.invalid:{port} HTTP/1.1\r\nHost: blocked.invalid:{port}\r\n\r\n").as_bytes()).await.unwrap();
-    assert!(!response_head(&mut blocked).await.starts_with(b"HTTP/1.1 200"));
+    blocked
+        .write_all(
+            format!(
+                "CONNECT blocked.invalid:{port} HTTP/1.1\r\nHost: blocked.invalid:{port}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(!response_head(&mut blocked)
+        .await
+        .starts_with(b"HTTP/1.1 200"));
     assert!(process.0.try_wait().unwrap().is_none());
 }
 

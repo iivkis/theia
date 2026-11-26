@@ -1,7 +1,7 @@
 //! Verified, content-addressed XTLS datasets. The active pointer is a
 //! cooperating CAS publication; a failed refresh never replaces the old pair.
 //! Call from a supervised runtime or an explicitly confirmed operator action.
-use super::{Policy, Rule, RoutingError, MAX_DAT};
+use super::{Policy, RoutingError, Rule, MAX_DAT};
 use flate2::read::MultiGzDecoder;
 use http::{header, StatusCode, Uri};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -38,7 +38,9 @@ pub enum Error {
     Routing(RoutingError),
 }
 impl From<RoutingError> for Error {
-    fn from(value: RoutingError) -> Self { Self::Routing(value) }
+    fn from(value: RoutingError) -> Self {
+        Self::Routing(value)
+    }
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -78,21 +80,35 @@ impl Pair {
         }
         // Structural and selected category validation before publication.
         Policy::compile(rules, &geosite, &geoip)?;
-        Ok(Self { manifest, geosite, geoip })
+        Ok(Self {
+            manifest,
+            geosite,
+            geoip,
+        })
     }
-    pub fn manifest(&self) -> &Manifest { &self.manifest }
-    pub fn geosite(&self) -> &[u8] { &self.geosite }
-    pub fn geoip(&self) -> &[u8] { &self.geoip }
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+    pub fn geosite(&self) -> &[u8] {
+        &self.geosite
+    }
+    pub fn geoip(&self) -> &[u8] {
+        &self.geoip
+    }
     pub fn compile(&self, rules: &[Rule]) -> Result<Policy, Error> {
         Ok(Policy::compile(rules, &self.geosite, &self.geoip)?)
     }
 }
 
-fn hash(bytes: &[u8]) -> [u8; 32] { Sha256::digest(bytes).into() }
+fn hash(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut result = String::with_capacity(bytes.len() * 2);
-    for b in bytes { let _ = write!(result, "{b:02x}"); }
+    for b in bytes {
+        let _ = write!(result, "{b:02x}");
+    }
     result
 }
 fn decode_hash(value: &str) -> Result<[u8; 32], Error> {
@@ -124,14 +140,18 @@ fn valid_tag(tag: &str) -> bool {
 fn location(base: &Uri, raw: &str) -> Result<Uri, Error> {
     let uri: Uri = if raw.starts_with('/') && !raw.starts_with("//") {
         format!("https://{}{}", base.authority().ok_or(Error::Format)?, raw)
-            .parse().map_err(|_| Error::Format)?
+            .parse()
+            .map_err(|_| Error::Format)?
     } else {
         raw.parse().map_err(|_| Error::Format)?
     };
     let host = uri.host().ok_or(Error::Format)?;
     if uri.scheme_str() != Some("https")
         || uri.authority().is_none_or(|a| a.as_str() != host)
-        || !matches!(host, "github.com" | "release-assets.githubusercontent.com" | "objects.githubusercontent.com")
+        || !matches!(
+            host,
+            "github.com" | "release-assets.githubusercontent.com" | "objects.githubusercontent.com"
+        )
         || raw.contains('#')
     {
         return Err(Error::Format);
@@ -143,13 +163,21 @@ fn release_tag(base: &Uri, raw: &str) -> Result<String, Error> {
     if uri.host() != Some("github.com") || uri.query().is_some() {
         return Err(Error::Format);
     }
-    let tag = uri.path().strip_prefix(REPO).and_then(|s| s.strip_prefix("/tag/"))
-        .filter(|t| valid_tag(t)).ok_or(Error::Format)?;
+    let tag = uri
+        .path()
+        .strip_prefix(REPO)
+        .and_then(|s| s.strip_prefix("/tag/"))
+        .filter(|t| valid_tag(t))
+        .ok_or(Error::Format)?;
     Ok(tag.to_owned())
 }
 
 struct Abort(tokio::task::JoinHandle<()>);
-impl Drop for Abort { fn drop(&mut self) { self.0.abort(); } }
+impl Drop for Abort {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 struct Reply {
     status: StatusCode,
@@ -160,84 +188,152 @@ struct Reply {
 fn roots() -> Result<rustls::RootCertStore, Error> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-    if roots.is_empty() { return Err(Error::Tls); }
+    if roots.is_empty() {
+        return Err(Error::Tls);
+    }
     Ok(roots)
 }
 async fn get_once(uri: Uri, limit: usize, roots: &rustls::RootCertStore) -> Result<Reply, Error> {
     let host = uri.host().ok_or(Error::Format)?.to_owned();
-    let tls = crate::transport_policy::Carrier::H2.client_tls(roots.clone()).map_err(|_| Error::Tls)?;
+    let tls = crate::transport_policy::Carrier::H2
+        .client_tls(roots.clone())
+        .map_err(|_| Error::Tls)?;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
     let (mut sender, _driver) = tokio::time::timeout(CONNECT_TIMEOUT, async {
-        let tcp = tokio::net::TcpStream::connect((host.as_str(), 443)).await.map_err(|_| Error::Network)?;
+        let tcp = tokio::net::TcpStream::connect((host.as_str(), 443))
+            .await
+            .map_err(|_| Error::Network)?;
         let name = rustls::pki_types::ServerName::try_from(host).map_err(|_| Error::Tls)?;
         let tls = connector.connect(name, tcp).await.map_err(|_| Error::Tls)?;
         if !crate::transport_policy::Carrier::H2.accepts_tls(
-            tls.get_ref().1.protocol_version(), tls.get_ref().1.alpn_protocol(),
+            tls.get_ref().1.protocol_version(),
+            tls.get_ref().1.alpn_protocol(),
         ) {
             return Err(Error::Tls);
         }
         let (sender, conn) = h2::client::Builder::new()
             .max_header_list_size(16 * 1024)
-            .handshake::<_, bytes::Bytes>(tls).await.map_err(|_| Error::Network)?;
-        Ok((sender, Abort(tokio::spawn(async move { let _ = conn.await; }))))
-    }).await.map_err(|_| Error::Network)??;
+            .handshake::<_, bytes::Bytes>(tls)
+            .await
+            .map_err(|_| Error::Network)?;
+        Ok((
+            sender,
+            Abort(tokio::spawn(async move {
+                let _ = conn.await;
+            })),
+        ))
+    })
+    .await
+    .map_err(|_| Error::Network)??;
     sender = sender.ready().await.map_err(|_| Error::Network)?;
     let request = http::Request::get(uri)
         .header(header::USER_AGENT, "Theia-geodata/1")
         .header(header::ACCEPT_ENCODING, "identity")
-        .body(()).map_err(|_| Error::Format)?;
-    let (response, _) = sender.send_request(request, true).map_err(|_| Error::Network)?;
+        .body(())
+        .map_err(|_| Error::Format)?;
+    let (response, _) = sender
+        .send_request(request, true)
+        .map_err(|_| Error::Network)?;
     let response = response.await.map_err(|_| Error::Network)?;
     let status = response.status();
     if status.is_redirection() {
         if response.headers().get_all(header::LOCATION).iter().count() != 1 {
             return Err(Error::Format);
         }
-        let redirect = response.headers().get(header::LOCATION).and_then(|v| v.to_str().ok())
-            .filter(|s| s.len() <= 8192).ok_or(Error::Format)?.to_owned();
-        return Ok(Reply { status, redirect: Some(redirect), bytes: Vec::new() });
+        let redirect = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| s.len() <= 8192)
+            .ok_or(Error::Format)?
+            .to_owned();
+        return Ok(Reply {
+            status,
+            redirect: Some(redirect),
+            bytes: Vec::new(),
+        });
     }
-    if status != StatusCode::OK || response.headers().get_all(header::CONTENT_LENGTH).iter().count() > 1
-        || response.headers().get(header::CONTENT_ENCODING).is_some_and(|v| v.as_bytes() != b"identity")
+    if status != StatusCode::OK
+        || response
+            .headers()
+            .get_all(header::CONTENT_LENGTH)
+            .iter()
+            .count()
+            > 1
+        || response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .is_some_and(|v| v.as_bytes() != b"identity")
     {
         return Err(Error::Network);
     }
-    let expected = response.headers().get(header::CONTENT_LENGTH).map(|v| {
-        v.to_str().ok().and_then(|s| s.parse::<usize>().ok()).ok_or(Error::Format)
-    }).transpose()?;
-    if expected.is_some_and(|n| n > limit) { return Err(Error::Limit); }
+    let expected = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .map(|v| {
+            v.to_str()
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .ok_or(Error::Format)
+        })
+        .transpose()?;
+    if expected.is_some_and(|n| n > limit) {
+        return Err(Error::Limit);
+    }
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     while let Some(chunk) = body.data().await {
         let chunk = chunk.map_err(|_| Error::Network)?;
-        if bytes.len().checked_add(chunk.len()).is_none_or(|n| n > limit) {
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|n| n > limit)
+        {
             return Err(Error::Limit);
         }
         bytes.extend_from_slice(&chunk);
-        body.flow_control().release_capacity(chunk.len()).map_err(|_| Error::Network)?;
+        body.flow_control()
+            .release_capacity(chunk.len())
+            .map_err(|_| Error::Network)?;
     }
     if expected.is_some_and(|n| n != bytes.len())
         || body.trailers().await.map_err(|_| Error::Network)?.is_some()
     {
         return Err(Error::Format);
     }
-    Ok(Reply { status, redirect: None, bytes })
+    Ok(Reply {
+        status,
+        redirect: None,
+        bytes,
+    })
 }
 
 async fn latest(roots: &rustls::RootCertStore) -> Result<String, Error> {
     let uri: Uri = LATEST.parse().map_err(|_| Error::Format)?;
     let reply = tokio::time::timeout(CONNECT_TIMEOUT, get_once(uri.clone(), 0, roots))
-        .await.map_err(|_| Error::Network)??;
-    if !reply.status.is_redirection() { return Err(Error::Format); }
+        .await
+        .map_err(|_| Error::Network)??;
+    if !reply.status.is_redirection() {
+        return Err(Error::Format);
+    }
     release_tag(&uri, reply.redirect.as_deref().ok_or(Error::Format)?)
 }
 
 fn asset_uri(tag: &str, name: &str) -> Result<Uri, Error> {
-    if !valid_tag(tag) { return Err(Error::Format); }
-    format!("https://github.com{REPO}/download/{tag}/{name}").parse().map_err(|_| Error::Format)
+    if !valid_tag(tag) {
+        return Err(Error::Format);
+    }
+    format!("https://github.com{REPO}/download/{tag}/{name}")
+        .parse()
+        .map_err(|_| Error::Format)
 }
 
-async fn asset(tag: &str, name: &str, limit: usize, roots: &rustls::RootCertStore) -> Result<Vec<u8>, Error> {
+async fn asset(
+    tag: &str,
+    name: &str,
+    limit: usize,
+    roots: &rustls::RootCertStore,
+) -> Result<Vec<u8>, Error> {
     tokio::time::timeout(FETCH_TIMEOUT, async {
         let mut uri = asset_uri(tag, name)?;
         for _ in 0..=MAX_REDIRECTS {
@@ -258,28 +354,43 @@ async fn asset(tag: &str, name: &str, limit: usize, roots: &rustls::RootCertStor
             }
         }
         Err(Error::Format)
-    }).await.map_err(|_| Error::Network)?
+    })
+    .await
+    .map_err(|_| Error::Network)?
 }
 
 fn decompress(compressed: &[u8], expected: [u8; 32]) -> Result<Vec<u8>, Error> {
     let mut result = Vec::new();
-    MultiGzDecoder::new(compressed).take((MAX_DAT + 1) as u64)
-        .read_to_end(&mut result).map_err(|_| Error::Format)?;
-    if result.len() > MAX_DAT { return Err(Error::Limit); }
-    if result.is_empty() || hash(&result) != expected { return Err(Error::Integrity); }
+    MultiGzDecoder::new(compressed)
+        .take((MAX_DAT + 1) as u64)
+        .read_to_end(&mut result)
+        .map_err(|_| Error::Format)?;
+    if result.len() > MAX_DAT {
+        return Err(Error::Limit);
+    }
+    if result.is_empty() || hash(&result) != expected {
+        return Err(Error::Integrity);
+    }
     Ok(result)
 }
 
-async fn dataset(tag: &str, name: &str, roots: &rustls::RootCertStore) -> Result<(Vec<u8>, [u8; 32]), Error> {
+async fn dataset(
+    tag: &str,
+    name: &str,
+    roots: &rustls::RootCertStore,
+) -> Result<(Vec<u8>, [u8; 32]), Error> {
     let raw_sum = asset(tag, &format!("{name}.sha256sum"), MAX_CHECKSUM, roots).await?;
     let expected = checksum(&raw_sum, name)?;
     let gz_name = format!("{name}.gz");
     let gz_sum = asset(tag, &format!("{gz_name}.sha256sum"), MAX_CHECKSUM, roots).await?;
     let expected_gz = checksum(&gz_sum, &gz_name)?;
     let gz = asset(tag, &gz_name, MAX_COMPRESSED, roots).await?;
-    if hash(&gz) != expected_gz { return Err(Error::Integrity); }
+    if hash(&gz) != expected_gz {
+        return Err(Error::Integrity);
+    }
     let data = tokio::task::spawn_blocking(move || decompress(&gz, expected))
-        .await.map_err(|_| Error::Io)??;
+        .await
+        .map_err(|_| Error::Io)??;
     Ok((data, expected))
 }
 
@@ -291,34 +402,46 @@ pub struct Store {
 }
 impl Store {
     pub fn new(directory: PathBuf) -> Result<Self, Error> {
-        if !directory.is_absolute() || !fs::symlink_metadata(&directory)
-            .is_ok_and(|m| m.file_type().is_dir())
+        if !directory.is_absolute()
+            || !fs::symlink_metadata(&directory).is_ok_and(|m| m.file_type().is_dir())
         {
             return Err(Error::Io);
         }
         Ok(Self { directory })
     }
-    fn active(&self) -> PathBuf { self.directory.join("active.toml") }
+    fn active(&self) -> PathBuf {
+        self.directory.join("active.toml")
+    }
     fn data_path(&self, name: &str, digest: &[u8; 32]) -> PathBuf {
         self.directory.join(format!("{}-{name}", hex(digest)))
     }
     fn current_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
         match fs::symlink_metadata(self.active()) {
             Ok(_) => crate::bounded_input::read(&self.active(), 4096, true, true)
-                .map(|b| Some(b.to_vec())).map_err(|_| Error::Io),
+                .map(|b| Some(b.to_vec()))
+                .map_err(|_| Error::Io),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(_) => Err(Error::Io),
         }
     }
     fn load_bytes(&self, bytes: &[u8], rules: &[Rule]) -> Result<Pair, Error> {
-        let manifest: Manifest = toml::from_str(std::str::from_utf8(bytes).map_err(|_| Error::Format)?)
-            .map_err(|_| Error::Format)?;
+        let manifest: Manifest =
+            toml::from_str(std::str::from_utf8(bytes).map_err(|_| Error::Format)?)
+                .map_err(|_| Error::Format)?;
         let site = crate::bounded_input::read(
-            &self.data_path(SITE, &manifest.geosite_sha256), MAX_DAT as u64, true, true,
-        ).map_err(|_| Error::Io)?;
+            &self.data_path(SITE, &manifest.geosite_sha256),
+            MAX_DAT as u64,
+            true,
+            true,
+        )
+        .map_err(|_| Error::Io)?;
         let ip = crate::bounded_input::read(
-            &self.data_path(IP, &manifest.geoip_sha256), MAX_DAT as u64, true, true,
-        ).map_err(|_| Error::Io)?;
+            &self.data_path(IP, &manifest.geoip_sha256),
+            MAX_DAT as u64,
+            true,
+            true,
+        )
+        .map_err(|_| Error::Io)?;
         Pair::verified(manifest, site.to_vec(), ip.to_vec(), rules)
     }
     /// Prepare exact content-addressed files, not the mutable active pointer.
@@ -327,13 +450,18 @@ impl Store {
         self.load_bytes(text.as_bytes(), rules)
     }
     pub fn load(&self, rules: &[Rule]) -> Result<Option<Pair>, Error> {
-        self.current_bytes()?.map(|b| self.load_bytes(&b, rules)).transpose()
+        self.current_bytes()?
+            .map(|b| self.load_bytes(&b, rules))
+            .transpose()
     }
     fn write_blob(&self, name: &str, bytes: &[u8], digest: [u8; 32]) -> Result<(), Error> {
         let path = self.data_path(name, &digest);
         let check = || -> Result<(), Error> {
-            let existing = crate::bounded_input::read(&path, MAX_DAT as u64, true, true).map_err(|_| Error::Io)?;
-            if hash(&existing) != digest { return Err(Error::Integrity); }
+            let existing = crate::bounded_input::read(&path, MAX_DAT as u64, true, true)
+                .map_err(|_| Error::Io)?;
+            if hash(&existing) != digest {
+                return Err(Error::Integrity);
+            }
             Ok(())
         };
         match fs::symlink_metadata(&path) {
@@ -342,8 +470,12 @@ impl Store {
             Err(_) => return Err(Error::Io),
         }
         let mut random = [0u8; 16];
-        SystemRandom::new().fill(&mut random).map_err(|_| Error::Io)?;
-        let temp = self.directory.join(format!(".geodata-{}.tmp", hex(&random)));
+        SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| Error::Io)?;
+        let temp = self
+            .directory
+            .join(format!(".geodata-{}.tmp", hex(&random)));
         let mut file = new_file(&temp).map_err(|_| Error::Io)?;
         let result = (|| {
             file.write_all(bytes).map_err(|_| Error::Io)?;
@@ -359,14 +491,17 @@ impl Store {
         result?;
         removed?;
         #[cfg(unix)]
-        File::open(&self.directory).and_then(|f| f.sync_all()).map_err(|_| Error::Io)?;
+        File::open(&self.directory)
+            .and_then(|f| f.sync_all())
+            .map_err(|_| Error::Io)?;
         Ok(())
     }
     fn publish(&self, pair: &Pair, expected: Option<&[u8]>) -> Result<(), Error> {
         self.write_blob(SITE, &pair.geosite, pair.manifest.geosite_sha256)?;
         self.write_blob(IP, &pair.geoip, pair.manifest.geoip_sha256)?;
         let text = toml::to_string(&pair.manifest).map_err(|_| Error::Format)?;
-        crate::config::guarded_trust_write(&self.active(), &text, expected).map_err(|_| Error::Conflict)
+        crate::config::guarded_trust_write(&self.active(), &text, expected)
+            .map_err(|_| Error::Conflict)
     }
 
     /// Download one pinned release, validate both compressed and raw
@@ -374,12 +509,17 @@ impl Store {
     /// Concurrent writes are refused by exact old-manifest CAS.
     pub async fn refresh(&self, rules: &[Rule]) -> Result<Pair, Error> {
         let previous = self.current_bytes()?;
-        let roots = tokio::task::spawn_blocking(roots).await.map_err(|_| Error::Io)??;
+        let roots = tokio::task::spawn_blocking(roots)
+            .await
+            .map_err(|_| Error::Io)??;
         let tag = latest(&roots).await?;
         if let Some(bytes) = previous.as_deref() {
-            let manifest: Manifest = toml::from_str(std::str::from_utf8(bytes).map_err(|_| Error::Format)?)
-                .map_err(|_| Error::Format)?;
-            if !valid_tag(&manifest.release) || manifest.release > tag { return Err(Error::Conflict); }
+            let manifest: Manifest =
+                toml::from_str(std::str::from_utf8(bytes).map_err(|_| Error::Format)?)
+                    .map_err(|_| Error::Format)?;
+            if !valid_tag(&manifest.release) || manifest.release > tag {
+                return Err(Error::Conflict);
+            }
             if manifest.release == tag {
                 return self.load_bytes(bytes, rules);
             }
@@ -392,18 +532,28 @@ impl Store {
         let rules = rules.to_vec();
         tokio::task::spawn_blocking(move || {
             let pair = Pair::verified(
-                Manifest { release: tag, geosite_sha256: site_hash, geoip_sha256: ip_hash },
-                site, ip, &rules,
+                Manifest {
+                    release: tag,
+                    geosite_sha256: site_hash,
+                    geoip_sha256: ip_hash,
+                },
+                site,
+                ip,
+                &rules,
             )?;
             Store::new(directory)?.publish(&pair, previous.as_deref())?;
             Ok(pair)
-        }).await.map_err(|_| Error::Io)?
+        })
+        .await
+        .map_err(|_| Error::Io)?
     }
 }
 
 fn new_file(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
-    { crate::client_import::new_private_file(path) }
+    {
+        crate::client_import::new_private_file(path)
+    }
     #[cfg(not(windows))]
     {
         let mut options = fs::OpenOptions::new();
@@ -432,7 +582,10 @@ mod tests {
     #[test]
     fn pinned_sources_and_checksums() {
         let latest: Uri = LATEST.parse().unwrap();
-        assert_eq!(release_tag(&latest, "/XTLS/Xray-rules-dat/releases/tag/20261126014317").unwrap(), "20261126014317");
+        assert_eq!(
+            release_tag(&latest, "/XTLS/Xray-rules-dat/releases/tag/20261126014317").unwrap(),
+            "20261126014317"
+        );
         for bad in [
             "http://github.com/XTLS/Xray-rules-dat/releases/tag/20261126014317",
             "https://evil.example/XTLS/Xray-rules-dat/releases/tag/20261126014317",
@@ -440,8 +593,14 @@ mod tests {
             "https://github.com/other/repo/releases/tag/20261126014317",
             "//github.com/XTLS/Xray-rules-dat/releases/tag/20261126014317",
             "https://github.com/XTLS/Xray-rules-dat/releases/tag/20261126014317?x=1",
-        ] { assert!(release_tag(&latest, bad).is_err()); }
-        assert!(location(&latest, "https://release-assets.githubusercontent.com/asset?token=example").is_ok());
+        ] {
+            assert!(release_tag(&latest, bad).is_err());
+        }
+        assert!(location(
+            &latest,
+            "https://release-assets.githubusercontent.com/asset?token=example"
+        )
+        .is_ok());
         assert!(asset_uri("../latest", SITE).is_err());
         let digest = hash(b"test");
         let sum = format!("{}  {SITE}\n", hex(&digest));
@@ -457,13 +616,18 @@ mod tests {
         let gz = writer.finish().unwrap();
         assert_eq!(decompress(&gz, hash(b"test data")).unwrap(), b"test data");
         assert_eq!(decompress(&gz, hash(b"wrong")), Err(Error::Integrity));
-        assert!(decompress(&gz[..gz.len()-2], hash(b"test data")).is_err());
+        assert!(decompress(&gz[..gz.len() - 2], hash(b"test data")).is_err());
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn geodata_automatic_activation_preserves_pending_edit_and_rejects_rollback() {
-        use crate::{config::{self, Config}, live_auth::LiveAuthorization, reload_preflight::ReloadPreflight, runtime_generation::{State, View}};
+        use crate::{
+            config::{self, Config},
+            live_auth::LiveAuthorization,
+            reload_preflight::ReloadPreflight,
+            runtime_generation::{State, View},
+        };
         let mut random = [0; 16];
         SystemRandom::new().fill(&mut random).unwrap();
         let dir = std::env::temp_dir().join(format!("theia-geodata-activation-{}", hex(&random)));
@@ -472,27 +636,55 @@ mod tests {
         let pair = |release: &str, code: u8| {
             let site = dat(code);
             let ip = ip();
-            Pair::verified(Manifest { release: release.into(), geosite_sha256: hash(&site), geoip_sha256: hash(&ip) }, site, ip, &[]).unwrap()
+            Pair::verified(
+                Manifest {
+                    release: release.into(),
+                    geosite_sha256: hash(&site),
+                    geoip_sha256: hash(&ip),
+                },
+                site,
+                ip,
+                &[],
+            )
+            .unwrap()
         };
         let old = pair("20261126014317", b'X');
         let next = pair("20261127014317", b'Y');
         store.publish(&old, None).unwrap();
-        store.publish(&next, store.current_bytes().unwrap().as_deref()).unwrap();
-        let Config::Server(mut doc) = config::parse(&include_str!("../../../../examples/server.toml").replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64))).unwrap() else { panic!() };
+        store
+            .publish(&next, store.current_bytes().unwrap().as_deref())
+            .unwrap();
+        let Config::Server(mut doc) = config::parse(
+            &include_str!("../../../../examples/server.toml")
+                .replace("REPLACE_WITH_64_LOWERCASE_HEX", &"a".repeat(64)),
+        )
+        .unwrap() else {
+            panic!()
+        };
         doc.server.policy.routing = Some(crate::routing::Settings {
-            revision: 2, geodata_directory: Some(dir.to_str().unwrap().into()),
-            rules: vec![], datasets: Some(old.manifest().clone()),
+            revision: 2,
+            geodata_directory: Some(dir.to_str().unwrap().into()),
+            rules: vec![],
+            datasets: Some(old.manifest().clone()),
         });
         let path = dir.join("server.toml");
         config::atomic_write(&path, &Config::Server(doc.clone())).unwrap();
         let live = Arc::new(LiveAuthorization::new(doc.clone()).unwrap());
         let state = State::new(View {
-            document: Arc::new(doc.clone()), inbounds: doc.server.inbounds.len(),
+            document: Arc::new(doc.clone()),
+            inbounds: doc.server.inbounds.len(),
             preflight: Arc::new(ReloadPreflight::new(path.clone(), doc.clone(), vec![])),
             live: live.clone(),
-        }).with_reality_ledger(crate::quota::Ledger::new(&doc.server.policy, &doc.server.users));
+        })
+        .with_reality_ledger(crate::quota::Ledger::new(
+            &doc.server.policy,
+            &doc.server.users,
+        ));
         let view = state.snapshot().unwrap();
-        let stage = state.prepare_geodata(&view, &path, next.manifest().clone()).unwrap().unwrap();
+        let stage = state
+            .prepare_geodata(&view, &path, next.manifest().clone())
+            .unwrap()
+            .unwrap();
         let mut edit = doc.clone();
         edit.server.users[0].disabled = true;
         config::atomic_write(&path, &Config::Server(edit.clone())).unwrap();
@@ -500,16 +692,27 @@ mod tests {
         assert_eq!(config::read_file(&path).unwrap(), Config::Server(edit));
         assert_eq!(live.revision(), Ok(1));
         config::atomic_write(&path, &Config::Server(doc.clone())).unwrap();
-        let stage = state.prepare_geodata(&view, &path, next.manifest().clone()).unwrap().unwrap();
+        let stage = state
+            .prepare_geodata(&view, &path, next.manifest().clone())
+            .unwrap()
+            .unwrap();
         state.activate_geodata(stage).unwrap();
         let current = state.snapshot().unwrap();
         assert_eq!(current.live.revision(), Ok(2));
         let routing = current.document.server.policy.routing.as_ref().unwrap();
         assert_eq!(routing.revision, 3);
         assert_eq!(routing.datasets.as_ref(), Some(next.manifest()));
-        assert_eq!(config::read_file(&path).unwrap(), Config::Server(current.document.as_ref().clone()));
-        assert!(state.prepare_geodata(&current, &path, old.manifest().clone()).is_err());
-        assert!(state.prepare_geodata(&current, &path, next.manifest().clone()).unwrap().is_none());
+        assert_eq!(
+            config::read_file(&path).unwrap(),
+            Config::Server(current.document.as_ref().clone())
+        );
+        assert!(state
+            .prepare_geodata(&current, &path, old.manifest().clone())
+            .is_err());
+        assert!(state
+            .prepare_geodata(&current, &path, next.manifest().clone())
+            .unwrap()
+            .is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -539,7 +742,10 @@ mod tests {
         assert!(store.publish(&next, None).is_err());
         assert_eq!(store.load(&[]).unwrap().unwrap().manifest(), &manifest);
         store.publish(&next, Some(&baseline)).unwrap();
-        assert_eq!(store.load(&[]).unwrap().unwrap().manifest(), next.manifest());
+        assert_eq!(
+            store.load(&[]).unwrap().unwrap().manifest(),
+            next.manifest()
+        );
         assert!(Pair::verified(manifest, site, b"wrong".to_vec(), &[]).is_err());
         fs::remove_dir_all(dir).unwrap();
     }

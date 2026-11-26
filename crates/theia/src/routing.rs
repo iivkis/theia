@@ -1,10 +1,10 @@
 //! Shared route matching primitives for server and client.
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
-pub mod snapshot;
-pub mod geodata;
-pub(crate) mod exchange;
 pub(crate) mod client_state;
+pub(crate) mod exchange;
+pub mod geodata;
 mod settings;
+pub mod snapshot;
 pub use settings::Settings;
 
 use regex::{Regex, RegexBuilder};
@@ -63,11 +63,17 @@ impl std::error::Error for RoutingError {}
 
 fn domain_name(value: &str) -> Result<String, RoutingError> {
     let value = value.strip_suffix('.').unwrap_or(value);
-    if value.is_empty() || value.len() > 253 || value.parse::<IpAddr>().is_ok()
+    if value.is_empty()
+        || value.len() > 253
+        || value.parse::<IpAddr>().is_ok()
         || !value.split('.').all(|label| {
-            !label.is_empty() && label.len() <= 63
-                && !label.starts_with('-') && !label.ends_with('-')
-                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
     {
         return Err(RoutingError::InvalidDomain);
@@ -76,8 +82,11 @@ fn domain_name(value: &str) -> Result<String, RoutingError> {
 }
 
 fn category(value: &str) -> Result<String, RoutingError> {
-    if value.is_empty() || value.len() > 128
-        || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
     {
         return Err(RoutingError::InvalidCategory);
     }
@@ -100,19 +109,27 @@ impl Cidr {
 
     fn parse(value: &str) -> Result<Self, RoutingError> {
         let (ip, prefix) = match value.split_once('/') {
-            Some((ip, prefix)) => (ip, Some(prefix.parse::<u32>().map_err(|_| RoutingError::InvalidIp)?)),
+            Some((ip, prefix)) => (
+                ip,
+                Some(prefix.parse::<u32>().map_err(|_| RoutingError::InvalidIp)?),
+            ),
             None => (value, None),
         };
         let address = ip.parse::<IpAddr>().map_err(|_| RoutingError::InvalidIp)?;
-        Self::new(address, prefix.unwrap_or(if address.is_ipv4() { 32 } else { 128 }))
+        Self::new(
+            address,
+            prefix.unwrap_or(if address.is_ipv4() { 32 } else { 128 }),
+        )
     }
 
     fn matches(self, ip: IpAddr) -> bool {
         match (self.address, ip) {
-            (IpAddr::V4(a), IpAddr::V4(b)) => self.prefix == 0
-                || (u32::from(a) ^ u32::from(b)) >> (32 - self.prefix) == 0,
-            (IpAddr::V6(a), IpAddr::V6(b)) => self.prefix == 0
-                || (u128::from(a) ^ u128::from(b)) >> (128 - self.prefix) == 0,
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                self.prefix == 0 || (u32::from(a) ^ u32::from(b)) >> (32 - self.prefix) == 0
+            }
+            (IpAddr::V6(a), IpAddr::V6(b)) => {
+                self.prefix == 0 || (u128::from(a) ^ u128::from(b)) >> (128 - self.prefix) == 0
+            }
             _ => false,
         }
     }
@@ -129,7 +146,12 @@ impl DomainPattern {
     fn matches(&self, host: &str) -> bool {
         match self {
             Self::Full(name) => name == host,
-            Self::Suffix(name) => host == name || host.strip_suffix(name.as_str()).is_some_and(|prefix| prefix.ends_with('.')),
+            Self::Suffix(name) => {
+                host == name
+                    || host
+                        .strip_suffix(name.as_str())
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+            }
             Self::Substring(value) => host.contains(value.as_str()),
             Self::Regex(regex) => regex.is_match(host),
         }
@@ -145,8 +167,12 @@ struct DomainCategory {
 impl DomainCategory {
     fn insert(&mut self, pattern: DomainPattern) {
         match pattern {
-            DomainPattern::Full(name) => { self.full.insert(name); }
-            DomainPattern::Suffix(name) => { self.suffix.insert(name); }
+            DomainPattern::Full(name) => {
+                self.full.insert(name);
+            }
+            DomainPattern::Suffix(name) => {
+                self.suffix.insert(name);
+            }
             other => self.other.push(other),
         }
     }
@@ -156,7 +182,9 @@ impl DomainCategory {
     fn matches(&self, host: &str) -> bool {
         self.full.contains(host)
             || self.suffix.contains(host)
-            || host.match_indices('.').any(|(index, _)| self.suffix.contains(&host[index + 1..]))
+            || host
+                .match_indices('.')
+                .any(|(index, _)| self.suffix.contains(&host[index + 1..]))
             || self.other.iter().any(|p| p.matches(host))
     }
 }
@@ -193,18 +221,30 @@ impl IpCategory {
         for cidr in cidrs {
             match cidr.address {
                 IpAddr::V4(ip) => {
-                    let mask = if cidr.prefix == 0 { 0 } else { u32::MAX << (32 - cidr.prefix) };
+                    let mask = if cidr.prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - cidr.prefix)
+                    };
                     let start = u32::from(ip) & mask;
                     v4.push((u128::from(start), u128::from(start | !mask)));
                 }
                 IpAddr::V6(ip) => {
-                    let mask = if cidr.prefix == 0 { 0 } else { u128::MAX << (128 - cidr.prefix) };
+                    let mask = if cidr.prefix == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - cidr.prefix)
+                    };
                     let start = u128::from(ip) & mask;
                     v6.push((start, start | !mask));
                 }
             }
         }
-        Self { v4: merge_ranges(v4), v6: merge_ranges(v6), reverse }
+        Self {
+            v4: merge_ranges(v4),
+            v6: merge_ranges(v6),
+            reverse,
+        }
     }
     fn matches(&self, ip: IpAddr) -> bool {
         let contained = match ip {
@@ -257,12 +297,18 @@ impl<'a> Wire<'a> {
         }
         let value = match tag & 7 {
             0 => Field::Number(self.varint()?),
-            1 => { self.take(8)?; Field::Other }
+            1 => {
+                self.take(8)?;
+                Field::Other
+            }
             2 => {
                 let n = usize::try_from(self.varint()?).map_err(|_| RoutingError::InvalidDat)?;
                 Field::Bytes(self.take(n)?)
             }
-            5 => { self.take(4)?; Field::Other }
+            5 => {
+                self.take(4)?;
+                Field::Other
+            }
             _ => return Err(RoutingError::InvalidDat),
         };
         Ok(Some((number, value)))
@@ -312,8 +358,11 @@ fn dat_domain(bytes: &[u8], regex_count: &mut usize) -> Result<DomainPattern, Ro
             if *regex_count > MAX_REGEXES {
                 return Err(RoutingError::Limit);
             }
-            let regex = RegexBuilder::new(value).size_limit(256 * 1024)
-                .dfa_size_limit(256 * 1024).build().map_err(|_| RoutingError::InvalidDat)?;
+            let regex = RegexBuilder::new(value)
+                .size_limit(256 * 1024)
+                .dfa_size_limit(256 * 1024)
+                .build()
+                .map_err(|_| RoutingError::InvalidDat)?;
             Ok(DomainPattern::Regex(regex))
         }
         2 => Ok(DomainPattern::Suffix(domain_name(value)?)),
@@ -330,8 +379,12 @@ fn dat_cidr(bytes: &[u8]) -> Result<Cidr, RoutingError> {
         match (field, value) {
             (1, Field::Bytes(bytes)) if ip.is_none() => {
                 ip = Some(match bytes.len() {
-                    4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(bytes).map_err(|_| RoutingError::InvalidDat)?)),
-                    16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(bytes).map_err(|_| RoutingError::InvalidDat)?)),
+                    4 => IpAddr::V4(Ipv4Addr::from(
+                        <[u8; 4]>::try_from(bytes).map_err(|_| RoutingError::InvalidDat)?,
+                    )),
+                    16 => IpAddr::V6(Ipv6Addr::from(
+                        <[u8; 16]>::try_from(bytes).map_err(|_| RoutingError::InvalidDat)?,
+                    )),
                     _ => return Err(RoutingError::InvalidDat),
                 });
             }
@@ -374,19 +427,24 @@ pub struct Policy {
 type Selectors = (Vec<CompiledRule>, HashSet<String>, HashSet<String>);
 
 fn compile_selectors(rules: &[Rule]) -> Result<Selectors, RoutingError> {
-    if rules.len() > MAX_RULES { return Err(RoutingError::Limit); }
+    if rules.len() > MAX_RULES {
+        return Err(RoutingError::Limit);
+    }
     let mut site_codes = HashSet::new();
     let mut ip_codes = HashSet::new();
     let mut compiled = Vec::new();
     let mut selectors = 0usize;
     for rule in rules {
-        if rule.name.trim().is_empty() || rule.name.len() > 128
+        if rule.name.trim().is_empty()
+            || rule.name.len() > 128
             || rule.name.chars().any(char::is_control)
             || (rule.domains.is_empty() && rule.ips.is_empty())
         {
             return Err(RoutingError::InvalidRule);
         }
-        selectors = selectors.saturating_add(rule.domains.len()).saturating_add(rule.ips.len());
+        selectors = selectors
+            .saturating_add(rule.domains.len())
+            .saturating_add(rule.ips.len());
         if selectors > MAX_SELECTORS {
             return Err(RoutingError::Limit);
         }
@@ -413,7 +471,11 @@ fn compile_selectors(rules: &[Rule]) -> Result<Selectors, RoutingError> {
                 IpSelector::Literal(Cidr::parse(selector)?)
             });
         }
-        compiled.push(CompiledRule { action: rule.action, domains, ips });
+        compiled.push(CompiledRule {
+            action: rule.action,
+            domains,
+            ips,
+        });
     }
 
     Ok((compiled, site_codes, ip_codes))
@@ -435,17 +497,29 @@ impl Policy {
         let mut sites = HashMap::new();
         let mut wire = Wire(geosite);
         while let Some((field, value)) = wire.next()? {
-            if field != 1 { continue; }
-            let Field::Bytes(bytes) = value else { return Err(RoutingError::InvalidDat); };
+            if field != 1 {
+                continue;
+            }
+            let Field::Bytes(bytes) = value else {
+                return Err(RoutingError::InvalidDat);
+            };
             let code = entry_code(bytes)?;
-            if !site_codes.contains(&code) { continue; }
+            if !site_codes.contains(&code) {
+                continue;
+            }
             let mut entries = DomainCategory::default();
             let mut entry = Wire(bytes);
             while let Some((field, value)) = entry.next()? {
-                if field != 2 { continue; }
-                let Field::Bytes(bytes) = value else { return Err(RoutingError::InvalidDat); };
+                if field != 2 {
+                    continue;
+                }
+                let Field::Bytes(bytes) = value else {
+                    return Err(RoutingError::InvalidDat);
+                };
                 count += 1;
-                if count > MAX_ENTRIES { return Err(RoutingError::Limit); }
+                if count > MAX_ENTRIES {
+                    return Err(RoutingError::Limit);
+                }
                 entries.insert(dat_domain(bytes, &mut regex_count)?);
             }
             if entries.is_empty() || sites.insert(code, entries).is_some() {
@@ -455,10 +529,16 @@ impl Policy {
         let mut ips = HashMap::new();
         let mut wire = Wire(geoip);
         while let Some((field, value)) = wire.next()? {
-            if field != 1 { continue; }
-            let Field::Bytes(bytes) = value else { return Err(RoutingError::InvalidDat); };
+            if field != 1 {
+                continue;
+            }
+            let Field::Bytes(bytes) = value else {
+                return Err(RoutingError::InvalidDat);
+            };
             let code = entry_code(bytes)?;
-            if !ip_codes.contains(&code) { continue; }
+            if !ip_codes.contains(&code) {
+                continue;
+            }
             let mut cidrs = Vec::new();
             let mut reverse = None;
             let mut entry = Wire(bytes);
@@ -466,7 +546,9 @@ impl Policy {
                 match (field, value) {
                     (2, Field::Bytes(bytes)) => {
                         count += 1;
-                        if count > MAX_ENTRIES { return Err(RoutingError::Limit); }
+                        if count > MAX_ENTRIES {
+                            return Err(RoutingError::Limit);
+                        }
                         cidrs.push(dat_cidr(bytes)?);
                     }
                     (3, Field::Number(n)) if n <= 1 && reverse.is_none() => reverse = Some(n == 1),
@@ -474,14 +556,22 @@ impl Policy {
                     _ => {}
                 }
             }
-            if cidrs.is_empty() || ips.insert(code, IpCategory::new(cidrs, reverse.unwrap_or(false))).is_some() {
+            if cidrs.is_empty()
+                || ips
+                    .insert(code, IpCategory::new(cidrs, reverse.unwrap_or(false)))
+                    .is_some()
+            {
                 return Err(RoutingError::InvalidDat);
             }
         }
         if sites.len() != site_codes.len() || ips.len() != ip_codes.len() {
             return Err(RoutingError::MissingCategory);
         }
-        Ok(Self { rules: compiled, sites, ips })
+        Ok(Self {
+            rules: compiled,
+            sites,
+            ips,
+        })
     }
 
     /// First matching rule, with OR between all selectors in a rule.
@@ -497,13 +587,21 @@ impl Policy {
                 DomainSelector::Literal(pattern) => pattern.matches(&host),
                 DomainSelector::Category(code) => self.sites[code].matches(&host),
             });
-            if matched { return Ok(Some(rule.action)); }
-            if !rule.ips.is_empty() { return Ok(None); }
+            if matched {
+                return Ok(Some(rule.action));
+            }
+            if !rule.ips.is_empty() {
+                return Ok(None);
+            }
         }
         Ok(Some(Action::Allowed))
     }
 
-    pub fn matching_action(&self, domain: Option<&str>, ip: Option<IpAddr>) -> Result<Option<Action>, RoutingError> {
+    pub fn matching_action(
+        &self,
+        domain: Option<&str>,
+        ip: Option<IpAddr>,
+    ) -> Result<Option<Action>, RoutingError> {
         let domain = domain.map(domain_name).transpose()?;
         let ip = ip.map(|ip| match ip {
             IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
@@ -516,11 +614,15 @@ impl Policy {
                     DomainSelector::Category(code) => self.sites[code].matches(host),
                 })
             });
-            let ip_match = ip.is_some_and(|ip| rule.ips.iter().any(|selector| match selector {
-                IpSelector::Literal(cidr) => cidr.matches(ip),
-                IpSelector::Category(code) => self.ips[code].matches(ip),
-            }));
-            if domain_match || ip_match { return Ok(Some(rule.action)); }
+            let ip_match = ip.is_some_and(|ip| {
+                rule.ips.iter().any(|selector| match selector {
+                    IpSelector::Literal(cidr) => cidr.matches(ip),
+                    IpSelector::Category(code) => self.ips[code].matches(ip),
+                })
+            });
+            if domain_match || ip_match {
+                return Ok(Some(rule.action));
+            }
         }
         Ok(None)
     }
@@ -531,8 +633,12 @@ mod tests {
     use super::*;
 
     fn rule(action: Action, domains: &[&str], ips: &[&str]) -> Rule {
-        Rule { name: "test".into(), action, domains: domains.iter().map(|s| (*s).into()).collect(),
-            ips: ips.iter().map(|s| (*s).into()).collect() }
+        Rule {
+            name: "test".into(),
+            action,
+            domains: domains.iter().map(|s| (*s).into()).collect(),
+            ips: ips.iter().map(|s| (*s).into()).collect(),
+        }
     }
     fn field(tag: u8, value: &[u8]) -> Vec<u8> {
         assert!(value.len() < 128);
@@ -552,22 +658,45 @@ mod tests {
         cidr.extend([16, prefix]);
         let mut entry = field(1, code.as_bytes());
         entry.extend(field(2, &cidr));
-        if reverse { entry.extend([24, 1]); }
+        if reverse {
+            entry.extend([24, 1]);
+        }
         field(1, &entry)
     }
 
     #[test]
     fn first_match_or_and_domain_boundaries() {
-        let p = Policy::compile(&[
-            rule(Action::Blocked, &["full:ads.example.com"], &[]),
-            rule(Action::Direct, &["example.com"], &["192.0.2.0/24"]),
-            rule(Action::Allowed, &["geosite:google"], &[]),
-        ], &site("GOOGLE", 2, "google.com"), &[]).unwrap();
-        assert_eq!(p.matching_action(Some("ads.example.com"), None).unwrap(), Some(Action::Blocked));
-        assert_eq!(p.matching_action(Some("WWW.EXAMPLE.COM."), None).unwrap(), Some(Action::Direct));
-        assert_eq!(p.matching_action(Some("badexample.com"), None).unwrap(), None);
-        assert_eq!(p.matching_action(Some("unrelated.com"), Some("192.0.2.12".parse().unwrap())).unwrap(), Some(Action::Direct));
-        assert_eq!(p.matching_action(Some("mail.google.com"), None).unwrap(), Some(Action::Allowed));
+        let p = Policy::compile(
+            &[
+                rule(Action::Blocked, &["full:ads.example.com"], &[]),
+                rule(Action::Direct, &["example.com"], &["192.0.2.0/24"]),
+                rule(Action::Allowed, &["geosite:google"], &[]),
+            ],
+            &site("GOOGLE", 2, "google.com"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            p.matching_action(Some("ads.example.com"), None).unwrap(),
+            Some(Action::Blocked)
+        );
+        assert_eq!(
+            p.matching_action(Some("WWW.EXAMPLE.COM."), None).unwrap(),
+            Some(Action::Direct)
+        );
+        assert_eq!(
+            p.matching_action(Some("badexample.com"), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            p.matching_action(Some("unrelated.com"), Some("192.0.2.12".parse().unwrap()))
+                .unwrap(),
+            Some(Action::Direct)
+        );
+        assert_eq!(
+            p.matching_action(Some("mail.google.com"), None).unwrap(),
+            Some(Action::Allowed)
+        );
     }
 
     #[test]
@@ -575,42 +704,102 @@ mod tests {
         let mut data = site("SUB", 0, "keyword");
         data.extend(site("REG", 1, r"^foo[0-9]+\.example$"));
         data.extend(site("FULL", 3, "exact.example"));
-        let p = Policy::compile(&[
-            rule(Action::Blocked, &["geosite:sub"], &[]),
-            rule(Action::Direct, &["geosite:reg"], &[]),
-            rule(Action::Allowed, &["geosite:full"], &[]),
-        ], &data, &[]).unwrap();
-        assert_eq!(p.matching_action(Some("keyword.example"), None).unwrap(), Some(Action::Blocked));
-        assert_eq!(p.matching_action(Some("foo12.example"), None).unwrap(), Some(Action::Direct));
-        assert_eq!(p.matching_action(Some("exact.example"), None).unwrap(), Some(Action::Allowed));
-        assert_eq!(p.matching_action(Some("sub.exact.example"), None).unwrap(), None);
+        let p = Policy::compile(
+            &[
+                rule(Action::Blocked, &["geosite:sub"], &[]),
+                rule(Action::Direct, &["geosite:reg"], &[]),
+                rule(Action::Allowed, &["geosite:full"], &[]),
+            ],
+            &data,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            p.matching_action(Some("keyword.example"), None).unwrap(),
+            Some(Action::Blocked)
+        );
+        assert_eq!(
+            p.matching_action(Some("foo12.example"), None).unwrap(),
+            Some(Action::Direct)
+        );
+        assert_eq!(
+            p.matching_action(Some("exact.example"), None).unwrap(),
+            Some(Action::Allowed)
+        );
+        assert_eq!(
+            p.matching_action(Some("sub.exact.example"), None).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn cidrs_and_reverse() {
         let mut data = ip_data("RU", &[192, 0, 2, 0], 24, false);
-        data.extend(ip_data("V6", &[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 32, false));
+        data.extend(ip_data(
+            "V6",
+            &[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            32,
+            false,
+        ));
         data.extend(ip_data("NOT", &[203, 0, 113, 0], 24, true));
-        let p = Policy::compile(&[
-            rule(Action::Direct, &[], &["geoip:ru", "geoip:v6"]),
-            rule(Action::Blocked, &[], &["geoip:not"]),
-        ], &[], &data).unwrap();
+        let p = Policy::compile(
+            &[
+                rule(Action::Direct, &[], &["geoip:ru", "geoip:v6"]),
+                rule(Action::Blocked, &[], &["geoip:not"]),
+            ],
+            &[],
+            &data,
+        )
+        .unwrap();
         for ip in ["192.0.2.1", "2001:db8::1", "::ffff:192.0.2.1"] {
-            assert_eq!(p.matching_action(None, Some(ip.parse().unwrap())).unwrap(), Some(Action::Direct));
+            assert_eq!(
+                p.matching_action(None, Some(ip.parse().unwrap())).unwrap(),
+                Some(Action::Direct)
+            );
         }
-        assert_eq!(p.matching_action(None, Some("198.51.100.1".parse().unwrap())).unwrap(), Some(Action::Blocked));
-        assert_eq!(p.matching_action(None, Some("203.0.113.1".parse().unwrap())).unwrap(), None);
+        assert_eq!(
+            p.matching_action(None, Some("198.51.100.1".parse().unwrap()))
+                .unwrap(),
+            Some(Action::Blocked)
+        );
+        assert_eq!(
+            p.matching_action(None, Some("203.0.113.1".parse().unwrap()))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
     fn invalid_policy_and_dat_fail_closed() {
-        assert!(matches!(Policy::compile(&[rule(Action::Direct, &[], &[])], &[], &[]), Err(RoutingError::InvalidRule)));
-        assert!(matches!(Policy::compile(&[rule(Action::Direct, &["geosite:missing"], &[])], &[], &[]), Err(RoutingError::MissingCategory)));
-        assert!(matches!(Policy::compile(&[rule(Action::Direct, &[], &["192.0.2.1/33"])], &[], &[]), Err(RoutingError::InvalidIp)));
-        assert!(matches!(Policy::compile(&[], &[10, 127], &[]), Err(RoutingError::InvalidDat)));
-        assert!(matches!(Policy::compile(&[rule(Action::Direct, &["geosite:bad"], &[])], &site("BAD", 4, "example.com"), &[]), Err(RoutingError::InvalidDat)));
+        assert!(matches!(
+            Policy::compile(&[rule(Action::Direct, &[], &[])], &[], &[]),
+            Err(RoutingError::InvalidRule)
+        ));
+        assert!(matches!(
+            Policy::compile(&[rule(Action::Direct, &["geosite:missing"], &[])], &[], &[]),
+            Err(RoutingError::MissingCategory)
+        ));
+        assert!(matches!(
+            Policy::compile(&[rule(Action::Direct, &[], &["192.0.2.1/33"])], &[], &[]),
+            Err(RoutingError::InvalidIp)
+        ));
+        assert!(matches!(
+            Policy::compile(&[], &[10, 127], &[]),
+            Err(RoutingError::InvalidDat)
+        ));
+        assert!(matches!(
+            Policy::compile(
+                &[rule(Action::Direct, &["geosite:bad"], &[])],
+                &site("BAD", 4, "example.com"),
+                &[]
+            ),
+            Err(RoutingError::InvalidDat)
+        ));
         let mut dup = site("GOOGLE", 2, "google.com");
         dup.extend(site("GOOGLE", 2, "other.com"));
-        assert!(matches!(Policy::compile(&[rule(Action::Direct, &["geosite:google"], &[])], &dup, &[]), Err(RoutingError::InvalidDat)));
+        assert!(matches!(
+            Policy::compile(&[rule(Action::Direct, &["geosite:google"], &[])], &dup, &[]),
+            Err(RoutingError::InvalidDat)
+        ));
     }
 }

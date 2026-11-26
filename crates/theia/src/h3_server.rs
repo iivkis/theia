@@ -287,7 +287,10 @@ async fn handle_routing(
             return;
         }
     };
-    if !crate::channel_binding::admit(binding, &[&request]) { reject_split(&mut stream, StatusCode::UNAUTHORIZED).await; return; }
+    if !crate::channel_binding::admit(binding, &[&request]) {
+        reject_split(&mut stream, StatusCode::UNAUTHORIZED).await;
+        return;
+    }
     let empty = timeout(HANDSHAKE_TIMEOUT, async {
         stream.recv_data().await.is_ok_and(|data| data.is_none())
             && stream
@@ -301,9 +304,15 @@ async fn handle_routing(
         reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
         return;
     }
-    let signed = match context.routing_response(&publication, request.headers()).await {
+    let signed = match context
+        .routing_response(&publication, request.headers())
+        .await
+    {
         Ok(bytes) => bytes,
-        Err(status) => { reject_split(&mut stream, status).await; return; }
+        Err(status) => {
+            reject_split(&mut stream, status).await;
+            return;
+        }
     };
     let Ok(response) = Response::builder()
         .status(StatusCode::OK)
@@ -320,7 +329,10 @@ async fn handle_routing(
                 .await
                 .map_err(|_| ServerError::Io)?;
             for chunk in signed.chunks(64 * 1024) {
-                stream.send_data(Bytes::copy_from_slice(chunk)).await.map_err(|_| ServerError::Io)?;
+                stream
+                    .send_data(Bytes::copy_from_slice(chunk))
+                    .await
+                    .map_err(|_| ServerError::Io)?;
             }
             stream.finish().await.map_err(|_| ServerError::Io)
         })
@@ -331,7 +343,6 @@ async fn handle_routing(
         stream.stop_sending(Code::H3_REQUEST_CANCELLED);
     }
 }
-
 
 async fn handle_request(
     request: Request<()>,

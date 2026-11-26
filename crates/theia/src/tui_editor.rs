@@ -206,19 +206,36 @@ pub struct Editor {
 
 impl Editor {
     pub(crate) fn routing_settings(&self) -> Option<&crate::routing::Settings> {
-        match &self.draft { Config::Server(doc) => doc.server.policy.routing.as_ref(), _ => None }
+        match &self.draft {
+            Config::Server(doc) => doc.server.policy.routing.as_ref(),
+            _ => None,
+        }
     }
 
-    pub(crate) fn stage_routing(&mut self, mut settings: crate::routing::Settings) -> Result<(), &'static str> {
+    pub(crate) fn stage_routing(
+        &mut self,
+        mut settings: crate::routing::Settings,
+    ) -> Result<(), &'static str> {
         self.require_clean_records()?;
-        let Config::Server(doc) = &self.original else { return Err("Требуется серверная конфигурация."); };
+        let Config::Server(doc) = &self.original else {
+            return Err("Требуется серверная конфигурация.");
+        };
         let old = doc.server.policy.routing.as_ref();
-        settings.revision = old.map_or(1, |s| s.revision).checked_add(1).ok_or("Исчерпана ревизия правил.")?;
-        settings.validate().map_err(|_| "Некорректные правила или отсутствуют проверенные базы.")?;
+        settings.revision = old
+            .map_or(1, |s| s.revision)
+            .checked_add(1)
+            .ok_or("Исчерпана ревизия правил.")?;
+        settings
+            .validate()
+            .map_err(|_| "Некорректные правила или отсутствуют проверенные базы.")?;
         let mut candidate = self.original.clone();
-        let Config::Server(doc) = &mut candidate else { unreachable!() };
+        let Config::Server(doc) = &mut candidate else {
+            unreachable!()
+        };
         doc.server.policy.routing = Some(settings);
-        candidate.validate().map_err(|_| "Конфигурация не прошла проверку.")?;
+        candidate
+            .validate()
+            .map_err(|_| "Конфигурация не прошла проверку.")?;
         self.draft = candidate;
         self.error = None;
         self.notice = "Правила подготовлены. Сохраните TOML, затем примените через Управление.";
@@ -895,9 +912,15 @@ impl Editor {
     }
 
     pub(crate) fn user_deletable(&self, id: &str) -> bool {
-        let Config::Server(doc) = &self.draft else { return false; };
+        let Config::Server(doc) = &self.draft else {
+            return false;
+        };
         doc.server.users.iter().any(|u| u.id == id)
-            && !doc.server.inbounds.iter().any(|i| i.allowed_user_ids.iter().any(|u| u == id))
+            && !doc
+                .server
+                .inbounds
+                .iter()
+                .any(|i| i.allowed_user_ids.iter().any(|u| u == id))
     }
 
     pub(crate) fn workspace_selected(&self) -> usize {
@@ -1143,7 +1166,9 @@ impl Editor {
                 }
                 doc.client.profiles.remove(self.selected_record);
                 next_selection = next_selection.min(doc.client.profiles.len() - 1);
-                format!("Удалить профиль {selected}. Файлы сертификата и ключа доступа сохраняются.")
+                format!(
+                    "Удалить профиль {selected}. Файлы сертификата и ключа доступа сохраняются."
+                )
             }
             (Config::Client(doc), RecordAction::ActivateProfile) => {
                 if doc.client.active_profile == selected {
@@ -1324,8 +1349,13 @@ impl Editor {
             ),
             Config::Client(doc) => format!(
                 "HTTP: {}\nSOCKS5: {}\nРазрешение управления системным прокси: {}",
-                doc.client.proxy.http_listen, doc.client.proxy.socks5_listen,
-                if self.system_proxy_allowed() { "разрешено" } else { "нет" }
+                doc.client.proxy.http_listen,
+                doc.client.proxy.socks5_listen,
+                if self.system_proxy_allowed() {
+                    "разрешено"
+                } else {
+                    "нет"
+                }
             ),
         }
     }

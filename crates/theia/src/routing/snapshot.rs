@@ -1,6 +1,6 @@
 //! Bounded, versioned routing snapshots for an already authenticated channel.
 //! Transport, durable trust state and publication are separate runtime steps.
-use super::{Field, Policy, RoutingError, Rule, Wire, entry_code};
+use super::{entry_code, Field, Policy, RoutingError, Rule, Wire};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -41,7 +41,9 @@ pub enum SnapshotError {
     Routing(RoutingError),
 }
 impl From<RoutingError> for SnapshotError {
-    fn from(error: RoutingError) -> Self { Self::Routing(error) }
+    fn from(error: RoutingError) -> Self {
+        Self::Routing(error)
+    }
 }
 impl std::fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,11 +52,16 @@ impl std::fmt::Display for SnapshotError {
 }
 impl std::error::Error for SnapshotError {}
 
-fn hash(bytes: &[u8]) -> [u8; 32] { Sha256::digest(bytes).into() }
+fn hash(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
 
 fn scope_valid(scope: &str) -> bool {
-    !scope.is_empty() && scope.len() <= 64
-        && scope.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !scope.is_empty()
+        && scope.len() <= 64
+        && scope
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn select_dat(data: &[u8], wanted: &HashSet<&str>) -> Result<Vec<u8>, SnapshotError> {
@@ -62,9 +69,15 @@ fn select_dat(data: &[u8], wanted: &HashSet<&str>) -> Result<Vec<u8>, SnapshotEr
     let mut output = Vec::new();
     while !wire.0.is_empty() {
         let original = wire.0;
-        let Some((tag, value)) = wire.next()? else { break; };
-        if tag != 1 { continue; }
-        let Field::Bytes(entry) = value else { return Err(SnapshotError::Invalid); };
+        let Some((tag, value)) = wire.next()? else {
+            break;
+        };
+        if tag != 1 {
+            continue;
+        }
+        let Field::Bytes(entry) = value else {
+            return Err(SnapshotError::Invalid);
+        };
         let code = entry_code(entry)?;
         if wanted.contains(code.as_str()) {
             let consumed = original.len() - wire.0.len();
@@ -78,7 +91,9 @@ fn select_dat(data: &[u8], wanted: &HashSet<&str>) -> Result<Vec<u8>, SnapshotEr
 }
 
 fn length_word(value: usize) -> Result<[u8; 4], SnapshotError> {
-    Ok(u32::try_from(value).map_err(|_| SnapshotError::Limit)?.to_be_bytes())
+    Ok(u32::try_from(value)
+        .map_err(|_| SnapshotError::Limit)?
+        .to_be_bytes())
 }
 
 impl Snapshot {
@@ -110,7 +125,10 @@ impl Snapshot {
             rules: rules.to_vec(),
         };
         let text = toml::to_string(&manifest).map_err(|_| SnapshotError::Invalid)?;
-        let len = HEADER.saturating_add(text.len()).saturating_add(site.len()).saturating_add(ip.len());
+        let len = HEADER
+            .saturating_add(text.len())
+            .saturating_add(site.len())
+            .saturating_add(ip.len());
         if text.len() > MAX_MANIFEST || len > MAX_SNAPSHOT {
             return Err(SnapshotError::Limit);
         }
@@ -123,29 +141,46 @@ impl Snapshot {
         wire.extend_from_slice(&site);
         wire.extend_from_slice(&ip);
         let digest = hash(&wire);
-        Ok((Self { manifest, policy, digest }, wire))
+        Ok((
+            Self {
+                manifest,
+                policy,
+                digest,
+            },
+            wire,
+        ))
     }
 
     /// Call only after authenticating the server and checking the profile
     /// trust anchor. A checksum alone does not establish authority.
     pub fn decode(wire: &[u8], expected_inbound: &str) -> Result<Self, SnapshotError> {
-        if wire.len() > MAX_SNAPSHOT { return Err(SnapshotError::Limit); }
+        if wire.len() > MAX_SNAPSHOT {
+            return Err(SnapshotError::Limit);
+        }
         if wire.len() < HEADER || &wire[..8] != MAGIC {
             return Err(SnapshotError::Invalid);
         }
         let read_len = |offset: usize| -> Result<usize, SnapshotError> {
-            let bytes = <[u8; 4]>::try_from(&wire[offset..offset + 4]).map_err(|_| SnapshotError::Invalid)?;
+            let bytes = <[u8; 4]>::try_from(&wire[offset..offset + 4])
+                .map_err(|_| SnapshotError::Invalid)?;
             usize::try_from(u32::from_be_bytes(bytes)).map_err(|_| SnapshotError::Limit)
         };
         let text_len = read_len(8)?;
         let site_len = read_len(12)?;
         let ip_len = read_len(16)?;
-        if text_len == 0 || text_len > MAX_MANIFEST { return Err(SnapshotError::Limit); }
+        if text_len == 0 || text_len > MAX_MANIFEST {
+            return Err(SnapshotError::Limit);
+        }
         let site_start = HEADER.checked_add(text_len).ok_or(SnapshotError::Limit)?;
-        let ip_start = site_start.checked_add(site_len).ok_or(SnapshotError::Limit)?;
+        let ip_start = site_start
+            .checked_add(site_len)
+            .ok_or(SnapshotError::Limit)?;
         let end = ip_start.checked_add(ip_len).ok_or(SnapshotError::Limit)?;
-        if end != wire.len() { return Err(SnapshotError::Invalid); }
-        let text = std::str::from_utf8(&wire[HEADER..site_start]).map_err(|_| SnapshotError::Invalid)?;
+        if end != wire.len() {
+            return Err(SnapshotError::Invalid);
+        }
+        let text =
+            std::str::from_utf8(&wire[HEADER..site_start]).map_err(|_| SnapshotError::Invalid)?;
         let manifest: Manifest = toml::from_str(text).map_err(|_| SnapshotError::Invalid)?;
         if manifest.revision == 0 || !scope_valid(&manifest.inbound_id) {
             return Err(SnapshotError::Invalid);
@@ -155,7 +190,9 @@ impl Snapshot {
         }
         let site = &wire[site_start..ip_start];
         let ip = &wire[ip_start..end];
-        if hash(site) != manifest.geosite_payload_sha256 || hash(ip) != manifest.geoip_payload_sha256 {
+        if hash(site) != manifest.geosite_payload_sha256
+            || hash(ip) != manifest.geoip_payload_sha256
+        {
             return Err(SnapshotError::Integrity);
         }
         let policy = Policy::compile(&manifest.rules, site, ip)?;
@@ -164,17 +201,30 @@ impl Snapshot {
         if select_dat(site, &site_codes)? != site || select_dat(ip, &ip_codes)? != ip {
             return Err(SnapshotError::Invalid);
         }
-        Ok(Self { manifest, policy, digest: hash(wire) })
+        Ok(Self {
+            manifest,
+            policy,
+            digest: hash(wire),
+        })
     }
 
-    pub fn manifest(&self) -> &Manifest { &self.manifest }
-    pub fn policy(&self) -> &Policy { &self.policy }
-    pub fn digest(&self) -> [u8; 32] { self.digest }
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
 
     /// Per-profile durable state must bind this checkpoint to the pinned
     /// server identity and inbound before reuse; caller owns atomic storage.
     pub fn checkpoint(&self) -> Checkpoint {
-        Checkpoint { revision: self.manifest.revision, digest: self.digest }
+        Checkpoint {
+            revision: self.manifest.revision,
+            digest: self.digest,
+        }
     }
 }
 
@@ -186,8 +236,12 @@ pub struct Checkpoint {
 }
 impl Checkpoint {
     pub fn accepts(&self, next: &Snapshot) -> Result<(), SnapshotError> {
-        if self.revision == 0 { return Err(SnapshotError::Invalid); }
-        if next.manifest.revision < self.revision { return Err(SnapshotError::Rollback); }
+        if self.revision == 0 {
+            return Err(SnapshotError::Invalid);
+        }
+        if next.manifest.revision < self.revision {
+            return Err(SnapshotError::Rollback);
+        }
         if next.manifest.revision == self.revision && next.digest != self.digest {
             return Err(SnapshotError::Equivocation);
         }
@@ -214,7 +268,12 @@ mod tests {
         field(1, &entry)
     }
     fn rule() -> Rule {
-        Rule { name: "Example".into(), action: Action::Direct, domains: vec!["geosite:TEST".into()], ips: vec![] }
+        Rule {
+            name: "Example".into(),
+            action: Action::Direct,
+            domains: vec!["geosite:TEST".into()],
+            ips: vec![],
+        }
     }
 
     #[test]
@@ -225,10 +284,28 @@ mod tests {
         let client = Snapshot::decode(&wire, "inbound").unwrap();
         assert_eq!(server.digest(), client.digest());
         assert_eq!(client.manifest().geosite_source_sha256, hash(&data));
-        assert_eq!(client.manifest().geosite_payload_sha256, hash(&site("TEST", "example.com")));
-        assert_eq!(client.policy().matching_action(Some("www.example.com"), None).unwrap(), Some(Action::Direct));
-        assert_eq!(client.policy().matching_action(Some("unused.example"), None).unwrap(), None);
-        assert!(matches!(Snapshot::decode(&wire, "another"), Err(SnapshotError::Scope)));
+        assert_eq!(
+            client.manifest().geosite_payload_sha256,
+            hash(&site("TEST", "example.com"))
+        );
+        assert_eq!(
+            client
+                .policy()
+                .matching_action(Some("www.example.com"), None)
+                .unwrap(),
+            Some(Action::Direct)
+        );
+        assert_eq!(
+            client
+                .policy()
+                .matching_action(Some("unused.example"), None)
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            Snapshot::decode(&wire, "another"),
+            Err(SnapshotError::Scope)
+        ));
     }
 
     #[test]
@@ -236,20 +313,35 @@ mod tests {
         let data = site("TEST", "example.com");
         let (old, wire) = Snapshot::build("inbound", 2, &[rule()], &data, &[]).unwrap();
         let checkpoint = old.checkpoint();
-        assert_eq!(checkpoint.accepts(&Snapshot::decode(&wire, "inbound").unwrap()), Ok(()));
+        assert_eq!(
+            checkpoint.accepts(&Snapshot::decode(&wire, "inbound").unwrap()),
+            Ok(())
+        );
         let (lower, _) = Snapshot::build("inbound", 1, &[rule()], &data, &[]).unwrap();
         assert_eq!(checkpoint.accepts(&lower), Err(SnapshotError::Rollback));
         let (different, _) = Snapshot::build("inbound", 2, &[], &data, &[]).unwrap();
-        assert_eq!(checkpoint.accepts(&different), Err(SnapshotError::Equivocation));
+        assert_eq!(
+            checkpoint.accepts(&different),
+            Err(SnapshotError::Equivocation)
+        );
         let (higher, _) = Snapshot::build("inbound", 3, &[], &data, &[]).unwrap();
         assert_eq!(checkpoint.accepts(&higher), Ok(()));
         let mut corrupted = wire.clone();
         *corrupted.last_mut().unwrap() ^= 1;
-        assert!(matches!(Snapshot::decode(&corrupted, "inbound"), Err(SnapshotError::Integrity)));
+        assert!(matches!(
+            Snapshot::decode(&corrupted, "inbound"),
+            Err(SnapshotError::Integrity)
+        ));
         let mut trailing = wire.clone();
         trailing.push(0);
-        assert!(matches!(Snapshot::decode(&trailing, "inbound"), Err(SnapshotError::Invalid)));
-        assert!(matches!(Snapshot::decode(&wire[..wire.len()-1], "inbound"), Err(SnapshotError::Invalid)));
+        assert!(matches!(
+            Snapshot::decode(&trailing, "inbound"),
+            Err(SnapshotError::Invalid)
+        ));
+        assert!(matches!(
+            Snapshot::decode(&wire[..wire.len() - 1], "inbound"),
+            Err(SnapshotError::Invalid)
+        ));
         assert!(Snapshot::build("inbound", 0, &[], &[], &[]).is_err());
     }
 }

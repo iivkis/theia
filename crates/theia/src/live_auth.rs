@@ -6,8 +6,8 @@
 //! network listeners, peer budgets, or user/global quota semaphores.
 use crate::{
     config::{Config, Inbound, ServerDocument, ServerPolicy, User},
-    routing::{exchange::Published, Settings},
     reload_preflight::{assess_reload, ReloadCheckError},
+    routing::{exchange::Published, Settings},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -50,19 +50,28 @@ pub(crate) struct AuthSnapshot {
 }
 
 impl AuthSnapshot {
-    fn for_document(doc: &ServerDocument, revision: u64, previous: Option<&Self>) -> Result<Self, LiveAuthError> {
+    fn for_document(
+        doc: &ServerDocument,
+        revision: u64,
+        previous: Option<&Self>,
+    ) -> Result<Self, LiveAuthError> {
         let settings = &doc.server.policy.routing;
         if let Some(old) = previous {
-            Settings::transition(old.routing_settings.as_ref(), settings.as_ref()).map_err(|_| LiveAuthError::InvalidCandidate)?;
+            Settings::transition(old.routing_settings.as_ref(), settings.as_ref())
+                .map_err(|_| LiveAuthError::InvalidCandidate)?;
         }
         let mut routing = HashMap::new();
         for inbound in &doc.server.inbounds {
-            let reused = previous.filter(|old| &old.routing_settings == settings)
+            let reused = previous
+                .filter(|old| &old.routing_settings == settings)
                 .and_then(|old| old.routing.get(&inbound.id))
                 .filter(|p| p.snapshot.manifest().inbound_id == Published::scope(inbound));
             let publication = match reused {
                 Some(p) => p.clone(),
-                None => Arc::new(Published::prepare(inbound, &doc.server.policy).map_err(|_| LiveAuthError::InvalidCandidate)?),
+                None => Arc::new(
+                    Published::prepare(inbound, &doc.server.policy)
+                        .map_err(|_| LiveAuthError::InvalidCandidate)?,
+                ),
             };
             routing.insert(inbound.id.clone(), publication);
         }
@@ -85,11 +94,20 @@ impl AuthSnapshot {
         })
     }
 
-    fn for_inbound(inbound: &Inbound, users: &[User], policy: &ServerPolicy, scope: Option<&str>) -> Self {
-        let publication = Published::for_scope(scope.unwrap_or_else(|| Published::scope(inbound)), policy);
+    fn for_inbound(
+        inbound: &Inbound,
+        users: &[User],
+        policy: &ServerPolicy,
+        scope: Option<&str>,
+    ) -> Self {
+        let publication =
+            Published::for_scope(scope.unwrap_or_else(|| Published::scope(inbound)), policy);
         Self {
             routing_settings: policy.routing.clone(),
-            routing: publication.ok().map(|p| HashMap::from([(inbound.id.clone(), Arc::new(p))])).unwrap_or_default(),
+            routing: publication
+                .ok()
+                .map(|p| HashMap::from([(inbound.id.clone(), Arc::new(p))]))
+                .unwrap_or_default(),
             revision: 1,
             users: users.to_vec(),
             grants: HashMap::from([(
@@ -107,9 +125,16 @@ pub(crate) struct AuthCell {
 }
 
 impl AuthCell {
-    pub(crate) fn isolated(inbound: &Inbound, users: &[User], policy: &ServerPolicy, scope: Option<&str>) -> Arc<Self> {
+    pub(crate) fn isolated(
+        inbound: &Inbound,
+        users: &[User],
+        policy: &ServerPolicy,
+        scope: Option<&str>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            current: RwLock::new(Arc::new(AuthSnapshot::for_inbound(inbound, users, policy, scope))),
+            current: RwLock::new(Arc::new(AuthSnapshot::for_inbound(
+                inbound, users, policy, scope,
+            ))),
         })
     }
 
@@ -202,7 +227,11 @@ impl LiveAuthorization {
         let stage = StagedAuthorization {
             owner: Arc::clone(&self.shared),
             expected_revision,
-            snapshot: Arc::new(AuthSnapshot::for_document(candidate, next, Some(self.shared.load()?.as_ref()))?),
+            snapshot: Arc::new(AuthSnapshot::for_document(
+                candidate,
+                next,
+                Some(self.shared.load()?.as_ref()),
+            )?),
         };
         Ok((rebased, stage))
     }
@@ -263,7 +292,11 @@ impl LiveAuthorization {
                 LiveAuthError::RequiresRestart
             }
         })?;
-        let snapshot = Arc::new(AuthSnapshot::for_document(candidate, next_revision, Some(self.shared.load()?.as_ref()))?);
+        let snapshot = Arc::new(AuthSnapshot::for_document(
+            candidate,
+            next_revision,
+            Some(self.shared.load()?.as_ref()),
+        )?);
         Ok(StagedAuthorization {
             owner: Arc::clone(&self.shared),
             expected_revision,
@@ -349,18 +382,44 @@ mod tests {
         let live = LiveAuthorization::new(doc.clone()).unwrap();
         assert_eq!(live.revision(), Ok(1));
         let mut routed = doc.clone();
-        routed.server.policy.routing = Some(crate::routing::Settings { revision: 2, geodata_directory: None, rules: vec![], datasets: None });
+        routed.server.policy.routing = Some(crate::routing::Settings {
+            revision: 2,
+            geodata_directory: None,
+            rules: vec![],
+            datasets: None,
+        });
         let (_, staged_routing) = live.prepare_tls_rebase(&routed, 1).unwrap();
-        assert_eq!(live.shared().load().unwrap().routing["alpha"].snapshot.manifest().revision, 1);
+        assert_eq!(
+            live.shared().load().unwrap().routing["alpha"]
+                .snapshot
+                .manifest()
+                .revision,
+            1
+        );
         drop(staged_routing);
         let (_, failed) = live.prepare_tls_rebase(&routed, 1).unwrap();
-        assert_eq!(live.publish_with(failed, || Err(LiveAuthError::Unavailable)), Err(LiveAuthError::Unavailable));
+        assert_eq!(
+            live.publish_with(failed, || Err(LiveAuthError::Unavailable)),
+            Err(LiveAuthError::Unavailable)
+        );
         assert_eq!(live.revision(), Ok(1));
-        assert_eq!(live.shared().load().unwrap().routing["alpha"].snapshot.manifest().revision, 1);
+        assert_eq!(
+            live.shared().load().unwrap().routing["alpha"]
+                .snapshot
+                .manifest()
+                .revision,
+            1
+        );
         let isolated = LiveAuthorization::new(doc.clone()).unwrap();
         let (_, publication) = isolated.prepare_tls_rebase(&routed, 1).unwrap();
         assert_eq!(isolated.publish(publication), Ok(2));
-        assert_eq!(isolated.shared().load().unwrap().routing["alpha"].snapshot.manifest().revision, 2);
+        assert_eq!(
+            isolated.shared().load().unwrap().routing["alpha"]
+                .snapshot
+                .manifest()
+                .revision,
+            2
+        );
         assert!(isolated.prepare_tls_rebase(&doc, 2).is_err());
         let mut changed = doc;
         changed.server.users[0].disabled = true;

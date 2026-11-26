@@ -162,7 +162,10 @@ const STARTUP_SERVER: &[Group] = &[
     Group {
         title: "Состояние сервера",
         entries: &[
-            always("Запуск / остановка локального сервера", Action::ServerProcess),
+            always(
+                "Запуск / остановка локального сервера",
+                Action::ServerProcess,
+            ),
             always("Проверить сервер", key('v')),
             always("Монитор трафика", Action::Traffic),
             always("Проверить готовность к перезапуску", key('R')),
@@ -177,15 +180,13 @@ const STARTUP_SERVER: &[Group] = &[
         ],
     },
 ];
-const STARTUP_CLIENT: &[Group] = &[
-    Group {
-        title: "Дополнительно",
-        entries: &[
-            always("Монитор трафика", Action::Traffic),
-            always("Открыть сохранённые настройки", Action::Config),
-        ],
-    },
-];
+const STARTUP_CLIENT: &[Group] = &[Group {
+    title: "Дополнительно",
+    entries: &[
+        always("Монитор трафика", Action::Traffic),
+        always("Открыть сохранённые настройки", Action::Config),
+    ],
+}];
 
 pub(crate) struct Menu {
     role: Role,
@@ -2146,7 +2147,11 @@ mod tests {
                 if configured {
                     assert_eq!(Menu::categories(role).len(), menu.groups().len());
                 } else {
-                    assert!(menu.groups().iter().flat_map(|group| group.entries).all(|entry| !entry.requires_config));
+                    assert!(menu
+                        .groups()
+                        .iter()
+                        .flat_map(|group| group.entries)
+                        .all(|entry| !entry.requires_config));
                 }
                 let group_count = menu.groups().len();
                 for group in 0..group_count {

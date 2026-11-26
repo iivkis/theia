@@ -1018,8 +1018,21 @@ where
     let response = if !newline {
         "ERR unsupported\n".into()
     } else if command == b"client-status" {
-        let (revision, digest, descriptor, transport, xhttp, fallback, (routing_revision, routing_state), totals) = client.status().await;
-        let totals = totals.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        let (
+            revision,
+            digest,
+            descriptor,
+            transport,
+            xhttp,
+            fallback,
+            (routing_revision, routing_state),
+            totals,
+        ) = client.status().await;
+        let totals = totals
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let hex = digest
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -1244,18 +1257,33 @@ where
                     "1" => true,
                     _ => return None,
                 };
-                let unsigned = |raw: &str| if raw == "0" { Some(0) } else { positive_decimal(raw) };
+                let unsigned = |raw: &str| {
+                    if raw == "0" {
+                        Some(0)
+                    } else {
+                        positive_decimal(raw)
+                    }
+                };
                 let routing_revision = unsigned(fields.next()?.strip_prefix("rr=")?)?;
                 let routing_state = match fields.next()?.strip_prefix("rs=")? {
-                    "0" => 0, "1" => 1, "2" => 2, "3" => 3, _ => return None,
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    "3" => 3,
+                    _ => return None,
                 };
                 if ((routing_state == 1 || routing_state == 2) != (routing_revision != 0)) {
                     return None;
                 }
                 let mut counters = fields.next()?.strip_prefix("rt=")?.split(',');
                 let mut routing_totals = [0; 7];
-                for counter in &mut routing_totals { *counter = unsigned(counters.next()?)?; }
-                if counters.next().is_some() || fields.next().is_some() || ((transport == 0) != (xhttp == 0)) {
+                for counter in &mut routing_totals {
+                    *counter = unsigned(counters.next()?)?;
+                }
+                if counters.next().is_some()
+                    || fields.next().is_some()
+                    || ((transport == 0) != (xhttp == 0))
+                {
                     return None;
                 }
                 Some(StatusReply::ClientRunning {
@@ -1914,14 +1942,18 @@ mod strict_wire_matrix_tests {
                     fallback: f,
                     routing_revision: 2,
                     routing_state: 1,
-                    routing_totals: [10,20,30,40,5,1,2],
+                    routing_totals: [10, 20, 30, 40, 5, 1, 2],
                 })
             );
         }
         for response in [
-            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt=0,0,0,0,0,0,0\n"),
+            format!(
+                "theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt=0,0,0,0,0,0,0\n"
+            ),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0\n"),
-            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,01\n"),
+            format!(
+                "theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,01\n"
+            ),
             format!("theia-client-v1 r=07 sha256={hex} d=0 t=0 x=0 f=0\n"),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=3 x=0 f=0\n"),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=1 f=1\n"),

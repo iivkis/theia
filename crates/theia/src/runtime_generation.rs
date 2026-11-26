@@ -199,12 +199,13 @@ impl State {
             .write()
             .map_err(|_| LiveAuthError::Unavailable)?;
         let revision = self.publish_managed_auth(view, candidate, stage)?;
-        *rollback = if view.document.server.policy.routing == candidate.server.policy.routing && view
-            .document
-            .server
-            .inbounds
-            .iter()
-            .any(|i| i.reality.is_some())
+        *rollback = if view.document.server.policy.routing == candidate.server.policy.routing
+            && view
+                .document
+                .server
+                .inbounds
+                .iter()
+                .any(|i| i.reality.is_some())
         {
             Some(AuthRollback {
                 document: view.document.clone(),
@@ -237,18 +238,41 @@ impl State {
         manifest: crate::routing::geodata::Manifest,
     ) -> Result<Option<GeodataStage>, LiveAuthError> {
         use crate::config::{self, Config};
-        let old = view.document.server.policy.routing.as_ref().ok_or(LiveAuthError::InvalidCandidate)?;
-        let pinned = old.datasets.as_ref().ok_or(LiveAuthError::InvalidCandidate)?;
-        if manifest == *pinned { return Ok(None); }
-        if manifest.release <= pinned.release { return Err(LiveAuthError::InvalidCandidate); }
+        let old = view
+            .document
+            .server
+            .policy
+            .routing
+            .as_ref()
+            .ok_or(LiveAuthError::InvalidCandidate)?;
+        let pinned = old
+            .datasets
+            .as_ref()
+            .ok_or(LiveAuthError::InvalidCandidate)?;
+        if manifest == *pinned {
+            return Ok(None);
+        }
+        if manifest.release <= pinned.release {
+            return Err(LiveAuthError::InvalidCandidate);
+        }
         let mut candidate = view.document.as_ref().clone();
-        let next = candidate.server.policy.routing.as_mut().ok_or(LiveAuthError::InvalidCandidate)?;
-        next.revision = next.revision.checked_add(1).ok_or(LiveAuthError::RevisionExhausted)?;
+        let next = candidate
+            .server
+            .policy
+            .routing
+            .as_mut()
+            .ok_or(LiveAuthError::InvalidCandidate)?;
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or(LiveAuthError::RevisionExhausted)?;
         next.datasets = Some(manifest);
         let expected = view.live.revision()?;
         let source = config::editor_bytes(path).map_err(|_| LiveAuthError::Unavailable)?;
-        let parsed = config::parse(std::str::from_utf8(&source).map_err(|_| LiveAuthError::InvalidCandidate)?)
-            .map_err(|_| LiveAuthError::InvalidCandidate)?;
+        let parsed = config::parse(
+            std::str::from_utf8(&source).map_err(|_| LiveAuthError::InvalidCandidate)?,
+        )
+        .map_err(|_| LiveAuthError::InvalidCandidate)?;
         if parsed != Config::Server(view.document.as_ref().clone()) {
             return Err(LiveAuthError::StaleRevision);
         }
@@ -259,24 +283,49 @@ impl State {
             preflight: Arc::new(view.preflight.rebased(candidate.clone())),
             live: Arc::new(view.live.with_new_baseline(candidate.clone())),
         });
-        Ok(Some(GeodataStage { previous: view.clone(), next: next_view, expected, source, auth: stage, path: path.to_owned() }))
+        Ok(Some(GeodataStage {
+            previous: view.clone(),
+            next: next_view,
+            expected,
+            source,
+            auth: stage,
+            path: path.to_owned(),
+        }))
     }
 
     // Only the supervised async task calls this method. The cancellable
     // blocking preparation never writes the server configuration.
     pub(crate) fn activate_geodata(&self, stage: GeodataStage) -> Result<(), LiveAuthError> {
         use crate::config::{self, Config};
-        let GeodataStage { previous: view, next: next_view, expected, source, auth, path } = stage;
-        let mut current = self.current.write().map_err(|_| LiveAuthError::Unavailable)?;
+        let GeodataStage {
+            previous: view,
+            next: next_view,
+            expected,
+            source,
+            auth,
+            path,
+        } = stage;
+        let mut current = self
+            .current
+            .write()
+            .map_err(|_| LiveAuthError::Unavailable)?;
         if !Arc::ptr_eq(&current, &view) || view.live.revision()? != expected {
             return Err(LiveAuthError::StaleRevision);
         }
-        let mut rollback = self.auth_rollback.write().map_err(|_| LiveAuthError::Unavailable)?;
+        let mut rollback = self
+            .auth_rollback
+            .write()
+            .map_err(|_| LiveAuthError::Unavailable)?;
         // No roster/quota/identity changes. Publish only after the exact-byte
         // disk CAS succeeds. The AuthCell lock rejects a stale prepared stage.
         view.live.publish_with(auth, || {
-            config::guarded_write(&path, &Config::Server(next_view.document.as_ref().clone()), &source)
-                .map(|_| ()).map_err(|_| LiveAuthError::Unavailable)
+            config::guarded_write(
+                &path,
+                &Config::Server(next_view.document.as_ref().clone()),
+                &source,
+            )
+            .map(|_| ())
+            .map_err(|_| LiveAuthError::Unavailable)
         })?;
         *rollback = None;
         *current = next_view;
@@ -292,7 +341,9 @@ impl State {
         if self.reality_ledger.is_some() {
             crate::reload_preflight::assess_managed_reload(&view.document, candidate)
                 .map_err(|_| LiveAuthError::RequiresRestart)?;
-            view.live.prepare_tls_rebase(candidate, expected).map(|(_, stage)| stage)
+            view.live
+                .prepare_tls_rebase(candidate, expected)
+                .map(|(_, stage)| stage)
         } else {
             view.live.stage(candidate, expected)
         }

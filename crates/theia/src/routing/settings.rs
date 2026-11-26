@@ -24,13 +24,19 @@ pub enum Error {
     Snapshot(snapshot::SnapshotError),
 }
 impl From<RoutingError> for Error {
-    fn from(error: RoutingError) -> Self { Self::Routing(error) }
+    fn from(error: RoutingError) -> Self {
+        Self::Routing(error)
+    }
 }
 impl From<geodata::Error> for Error {
-    fn from(error: geodata::Error) -> Self { Self::Data(error) }
+    fn from(error: geodata::Error) -> Self {
+        Self::Data(error)
+    }
 }
 impl From<snapshot::SnapshotError> for Error {
-    fn from(error: snapshot::SnapshotError) -> Self { Self::Snapshot(error) }
+    fn from(error: snapshot::SnapshotError) -> Self {
+        Self::Snapshot(error)
+    }
 }
 
 impl Settings {
@@ -52,12 +58,16 @@ impl Settings {
         let (_, site_codes, ip_codes) = super::compile_selectors(&self.rules)?;
         let requires_data = !site_codes.is_empty() || !ip_codes.is_empty();
         match (&self.geodata_directory, &self.datasets) {
-            (Some(directory), Some(manifest)) if crate::bounded_input::explicit_file_path(Path::new(directory))
-                && !directory.chars().any(char::is_control)
-                && manifest.release.len() == 14
-                && manifest.release.bytes().all(|b| b.is_ascii_digit())
-                && manifest.geosite_sha256 != [0; 32]
-                && manifest.geoip_sha256 != [0; 32] => Ok(()),
+            (Some(directory), Some(manifest))
+                if crate::bounded_input::explicit_file_path(Path::new(directory))
+                    && !directory.chars().any(char::is_control)
+                    && manifest.release.len() == 14
+                    && manifest.release.bytes().all(|b| b.is_ascii_digit())
+                    && manifest.geosite_sha256 != [0; 32]
+                    && manifest.geoip_sha256 != [0; 32] =>
+            {
+                Ok(())
+            }
             (None, None) if !requires_data => Ok(()),
             _ => Err(Error::Invalid),
         }
@@ -67,10 +77,23 @@ impl Settings {
         self.validate()?;
         match (&self.geodata_directory, &self.datasets) {
             (Some(directory), Some(manifest)) => {
-                let pair = geodata::Store::new(PathBuf::from(directory))?.load_pinned(manifest, &self.rules)?;
-                Ok(snapshot::Snapshot::build(inbound_scope, self.revision, &self.rules, pair.geosite(), pair.geoip())?)
+                let pair = geodata::Store::new(PathBuf::from(directory))?
+                    .load_pinned(manifest, &self.rules)?;
+                Ok(snapshot::Snapshot::build(
+                    inbound_scope,
+                    self.revision,
+                    &self.rules,
+                    pair.geosite(),
+                    pair.geoip(),
+                )?)
             }
-            (None, None) => Ok(snapshot::Snapshot::build(inbound_scope, self.revision, &self.rules, &[], &[])?),
+            (None, None) => Ok(snapshot::Snapshot::build(
+                inbound_scope,
+                self.revision,
+                &self.rules,
+                &[],
+                &[],
+            )?),
             _ => Err(Error::Invalid),
         }
     }
@@ -79,7 +102,11 @@ impl Settings {
     /// lower revision or same-revision different settings can be activated.
     pub fn accepts_replacement(&self, next: &Self) -> Result<(), Error> {
         next.validate()?;
-        if self == next || next.revision > self.revision { Ok(()) } else { Err(Error::Invalid) }
+        if self == next || next.revision > self.revision {
+            Ok(())
+        } else {
+            Err(Error::Invalid)
+        }
     }
 }
 

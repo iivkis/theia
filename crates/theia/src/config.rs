@@ -549,7 +549,9 @@ impl ServerDocument {
         }
         let p = &self.server.policy;
         if let Some(routing) = &p.routing {
-            routing.validate().map_err(|_| ConfigError::new("server.policy.routing", "invalid routing settings"))?;
+            routing.validate().map_err(|_| {
+                ConfigError::new("server.policy.routing", "invalid routing settings")
+            })?;
         }
         ensure(
             p.max_connections_per_user > 0,

@@ -37,7 +37,6 @@ pub mod protocol;
 mod qr_import;
 pub mod quic_transport;
 pub(crate) mod quota;
-pub mod routing;
 pub mod reality_admission;
 pub mod reality_bootstrap;
 mod reality_checkpoint;
@@ -58,6 +57,7 @@ mod relay_batch;
 mod relay_liveness;
 pub mod reload_preflight;
 pub mod restart_guard;
+pub mod routing;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
 pub mod security_profile;

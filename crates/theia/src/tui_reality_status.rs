@@ -872,7 +872,9 @@ impl StatusPanel {
         }
     }
     pub(crate) fn routing_observation(&self, digest: [u8; 32]) -> Option<String> {
-        if self.digest != digest || !self.client_active { return None; }
+        if self.digest != digest || !self.client_active {
+            return None;
+        }
         let run = self.client_run.as_ref()?;
         run.stop.as_ref()?;
         let report = run.report.lock().ok()?;
