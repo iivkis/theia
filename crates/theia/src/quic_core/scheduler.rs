@@ -289,8 +289,12 @@ impl Scheduler {
         }
     }
 
+    pub(crate) fn burn_unsent(&mut self, number: u64, now: Instant) -> Result<(), Error> {
+        self.ledger.burn(number, now).map_err(|_| Error::Ledger)
+    }
+
     pub(crate) fn reject_mtu(&mut self, number: u64, size: usize, now: Instant) -> Result<(), Error> {
-        self.ledger.burn(number, now).map_err(|_| Error::Ledger)?;
+        self.burn_unsent(number, now)?;
         let before = self.mtu.current();
         self.mtu.local_reject(size, now);
         self.apply_mtu(before);
@@ -488,7 +492,7 @@ impl Scheduler {
         if self.frames.is_empty() && self.ledger.bytes_in_flight() == 0 {
             self.last_eliciting = None;
         }
-        if outcome.acknowledged.iter().any(|p| p.ack_eliciting) {
+        if outcome.newly_acked_eliciting {
             self.pto_count = 0;
         }
         self.apply_loss(outcome, now)?;
@@ -512,19 +516,23 @@ impl Scheduler {
         self.apply_mtu(before);
         // BBR uses the same authoritative in-flight ledger, but does not
         // apply CUBIC's multiplicative decrease/growth to its model.
+        let persistent = self.first_rtt_at.filter(|_| !outcome.lost.is_empty()).and_then(|first| {
+            self.ledger.persistent_end(first, self.base_pto().saturating_mul(3))
+        }).filter(|end| self.persistent_reported.is_none_or(|old| *end > old));
         if let Some(bbr) = self.bbr.as_mut() {
             bbr.feedback(&outcome, now, self.window.in_flight())
                 .map_err(|_| Error::Window)?;
+            if persistent.is_some() {
+                bbr.persistent_congestion(now);
+            }
             self.window
                 .set_target(bbr.cwnd())
                 .map_err(|_| Error::Window)?;
-        } else if let Some(end) = self.first_rtt_at.filter(|_| !outcome.lost.is_empty()).and_then(|first| {
-            self.ledger.persistent_end(first, self.base_pto().saturating_mul(3))
-        }) {
-            if self.persistent_reported.is_none_or(|old| end > old) {
-                self.window.persistent_congestion(now);
-                self.persistent_reported = Some(end);
-            }
+        } else if persistent.is_some() {
+            self.window.persistent_congestion(now);
+        }
+        if persistent.is_some() {
+            self.persistent_reported = persistent;
         }
         // Apply loss before growth, so an ACK for a packet sent before
         // the new recovery boundary cannot undo the congestion event.

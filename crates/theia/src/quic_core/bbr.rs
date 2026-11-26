@@ -134,6 +134,17 @@ impl Bbr {
 
     /// Conservative CE response, at most once per packet-timed round.
     /// This does not claim BBRv3 ECN/L4S conformance.
+    pub(crate) fn persistent_congestion(&mut self, now: Instant) {
+        let floor = 4 * self.mtu;
+        self.cwnd = floor;
+        self.loss_ceiling = Some(floor);
+        self.bound_bandwidth();
+        self.full_pipe = true;
+        self.recovery_until = self.last_sent;
+        self.mode = Mode::ProbeBw;
+        self.set_phase(ProbePhase::Down, now);
+    }
+
     pub(crate) fn ecn_congestion(&mut self, now: Instant) {
         if self.last_ecn_round == Some(self.round) { return; }
         self.last_ecn_round = Some(self.round);
@@ -567,6 +578,9 @@ mod tests {
         let cwnd = b.cwnd();
         b.ecn_congestion(refill + Duration::from_millis(201));
         assert_eq!(b.cwnd(), cwnd);
+        b.persistent_congestion(refill + Duration::from_secs(1));
+        assert_eq!(b.cwnd(), 4800);
+        assert_eq!(b.loss_ceiling, Some(4800));
     }
 
     #[test]

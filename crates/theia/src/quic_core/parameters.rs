@@ -227,7 +227,7 @@ impl Parameters<'_> {
         let initial_bidi_local = get(0x05, 0)?;
         let initial_bidi_remote = get(0x06, 0)?;
         let initial_uni = get(0x07, 0)?;
-        if max_udp_payload < 1200
+        if !(1200..=65527).contains(&max_udp_payload)
             || max_streams_bidi > (1u64 << 60)
             || max_streams_uni > (1u64 << 60)
             || ack_delay_exponent > 20

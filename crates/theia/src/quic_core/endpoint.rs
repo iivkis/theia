@@ -409,20 +409,23 @@ impl LabSession {
         if capacity < frame.len() { return Err(Error::Protocol); }
         payload.resize(capacity, 0);
         let (number, packet) = self.seal(&payload)?;
-        self.scheduler
-            .record_path(number, packet.len(), now)
-            .map_err(Error::Schedule)?;
-        if self
-            .socket
-            .send_to(&packet, peer)
-            .await
-            .map_err(Error::Io)?
-            != packet.len()
-        {
-            return Err(Error::Protocol);
+        match self.socket.send_to(&packet, peer).await {
+            Ok(n) if n == packet.len() => {
+                self.scheduler.record_path(number, n, now).map_err(Error::Schedule)?;
+                if peer == self.paths.active() { self.idle.sent(now); }
+                Ok(())
+            }
+            // A failed candidate must not kill the old validated route.
+            // These synchronous failures did not transmit this packet;
+            // its PN remains burned and its amplification reservation stays charged.
+            Err(e) if peer != self.paths.active() && (matches!(e.kind(),
+                io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable |
+                io::ErrorKind::AddrNotAvailable) || super::mtu::message_too_large(&e)) => {
+                self.scheduler.burn_unsent(number, now).map_err(Error::Schedule)
+            }
+            Ok(_) => Err(Error::Protocol),
+            Err(e) => Err(Error::Io(e)),
         }
-        self.idle.sent(now);
-        Ok(())
     }
 
     pub fn update_keys(&mut self) -> Result<(), Error> {

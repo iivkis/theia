@@ -45,6 +45,7 @@ pub struct Outcome {
     pub acknowledged_bytes: u64,
     pub lost_bytes: u64,
     pub rtt_sample: Option<Duration>,
+    pub newly_acked_eliciting: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +67,7 @@ pub struct Ledger {
     largest_ack: Option<u64>,
     bytes_in_flight: u64,
     congestion_history: BTreeMap<u64, (Instant, Status)>,
+    ack_only: BTreeMap<u64, Instant>,
     burned: BTreeSet<u64>,
 }
 
@@ -107,6 +109,11 @@ impl Ledger {
             if self.congestion_history.len() > MAX_OUTSTANDING * 2 {
                 self.congestion_history.pop_first();
             }
+        } else {
+            self.ack_only.insert(packet.number, packet.at);
+            if self.ack_only.len() > MAX_OUTSTANDING {
+                self.ack_only.pop_first();
+            }
         }
         self.next += 1;
         self.last_send = Some(packet.at);
@@ -125,6 +132,7 @@ impl Ledger {
         self.bytes_in_flight = 0;
         self.largest_ack = None;
         self.congestion_history.clear();
+        self.ack_only.clear();
     }
 
     /// A definitive local EMSGSIZE means this number was never transmitted.
@@ -183,20 +191,26 @@ impl Ledger {
             self.largest_ack
                 .map_or(first.last, |old| old.max(first.last)),
         );
-        // Late ACK of a previously declared lost packet also breaks a
-        // future persistent-congestion interval. ACK-only PN gaps are absent.
+        // RFC 9002 section 5.1: sample the largest newly acknowledged
+        // packet, provided at least one newly ACKed packet is eliciting.
+        // The largest itself can be ACK-only. Old-path timestamps were
+        // cleared on migration, and an ACK can never sample twice.
+        let largest_at = self.congestion_history.get(&first.last)
+            .filter(|(_, status)| *status != Status::Acked)
+            .map(|(at, _)| *at)
+            .or_else(|| self.ack_only.get(&first.last).copied());
+        let mut result = Outcome::default();
         for range in &ack.ranges {
             for (_, (_, status)) in self.congestion_history.range_mut(range.first..=range.last) {
+                result.newly_acked_eliciting |= *status != Status::Acked;
                 *status = Status::Acked;
             }
         }
-        let mut result = Outcome::default();
+        self.ack_only.retain(|number, _| !ack.acknowledges(*number));
         let mut pending = VecDeque::with_capacity(self.sent.len());
         while let Some(p) = self.sent.pop_front() {
             if ack.acknowledges(p.number) {
-                if p.number == first.last && p.ack_eliciting {
-                    result.rtt_sample = Some(now.duration_since(p.at));
-                }
+                result.newly_acked_eliciting |= p.ack_eliciting;
                 if p.in_flight {
                     let bytes = u64::from(p.bytes);
                     self.bytes_in_flight -= bytes;
@@ -208,6 +222,9 @@ impl Ledger {
             }
         }
         self.sent = pending;
+        if result.newly_acked_eliciting {
+            result.rtt_sample = largest_at.map(|at| now.duration_since(at));
+        }
         let loss_delay = delay(result.rtt_sample);
         self.detect(now, loss_delay, &mut result);
         Ok(result)
@@ -393,6 +410,31 @@ mod tests {
         l.restart_path();
         assert_eq!(l.acknowledge(&ack(1), now, Duration::ZERO).unwrap_err(), Error::Ack);
         l.record(packet(3, now)).unwrap();
+    }
+
+    #[test]
+    fn sample_largest_ack_only_when_new_eliciting_packet_is_acknowledged() {
+        let start = Instant::now();
+        let delta = Duration::from_millis(10);
+        let mut l = Ledger::default();
+        l.record(packet(0, start)).unwrap();
+        let mut pure = packet(1, start + delta);
+        pure.ack_eliciting = false;
+        pure.in_flight = false;
+        l.record(pure).unwrap();
+        let both = Ack { delay: 0, ranges: vec![Range { first: 0, last: 1 }], ecn: None };
+        let outcome = l.acknowledge(&both, start + delta * 3, delta * 4).unwrap();
+        assert_eq!(outcome.rtt_sample, Some(delta * 2));
+        assert!(outcome.newly_acked_eliciting);
+        assert_eq!(outcome.acknowledged_bytes, 1200);
+        let duplicate = l.acknowledge(&both, start + delta * 4, delta).unwrap();
+        assert!(!duplicate.newly_acked_eliciting);
+        assert_eq!(duplicate.rtt_sample, None);
+        let mut pure = packet(2, start + delta * 4);
+        pure.ack_eliciting = false;
+        pure.in_flight = false;
+        l.record(pure).unwrap();
+        assert_eq!(l.acknowledge(&ack(2), start + delta * 5, delta).unwrap().rtt_sample, None);
     }
 
     #[test]
