@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-const MAX_FLOWS: usize = 4096;
+pub(crate) const MAX_FLOWS: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Protocol {
@@ -53,6 +53,24 @@ impl FlowTable {
         TABLE.get_or_init(|| Arc::new(Self::new(MAX_FLOWS))).clone()
     }
 
+    /// Active relay counts in pending/Pass/Modify/Redirect order. No
+    /// endpoint, process identity or payload leaves the table.
+    pub(crate) fn counts(&self) -> Option<[u16; 4]> {
+        let state = self.state.lock().ok()?;
+        let mut counts = [0u16; 4];
+        for entry in state.entries.values() {
+            let index = match entry.committed {
+                None => 0,
+                Some(PacketAction::Pass) => 1,
+                Some(PacketAction::Modify) => 2,
+                Some(PacketAction::Redirect) => 3,
+                Some(PacketAction::Drop) => return None,
+            };
+            counts[index] = counts[index].checked_add(1)?;
+        }
+        Some(counts)
+    }
+
     pub(crate) fn begin(
         self: &Arc<Self>,
         engine: Arc<Engine>,
@@ -75,6 +93,13 @@ impl FlowTable {
         state.next = id;
         state.entries.insert(id, Entry { identity: identity.clone(), committed: None });
         Ok(FlowLease { table: self.clone(), id, identity, engine })
+    }
+}
+
+pub(crate) fn summary(counts: Option<[u16; 4]>) -> String {
+    match counts {
+        Some([pending, pass, modify, redirect]) => format!("Потоки: ожидают {pending} · Pass {pass} · Modify {modify} · Redirect {redirect}"),
+        None => "Состояние потоков не подтверждено".into(),
     }
 }
 
@@ -168,12 +193,15 @@ mod tests {
         let (table, engine) = setup();
         let flow = begin(&table, &engine, PacketAction::Modify).unwrap();
         assert!(matches!(begin(&table, &engine, PacketAction::Pass), Err(ClientError::Open(ErrorCode::ResourceLimit))));
+        assert_eq!(table.counts(), Some([1, 0, 0, 0]));
         assert!(flow.commit(PacketAction::Pass).is_err());
         flow.commit(PacketAction::Modify).unwrap();
+        assert_eq!(table.counts(), Some([0, 0, 1, 0]));
         assert!(flow.commit(PacketAction::Redirect).is_err());
         engine.authorize_policy(None);
         assert!(flow.commit(PacketAction::Modify).is_ok());
         drop(flow);
+        assert_eq!(table.counts(), Some([0, 0, 0, 0]));
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
         engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
         let flow = begin(&table, &engine, PacketAction::Modify).unwrap();

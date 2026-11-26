@@ -1396,7 +1396,8 @@ impl ProxyClient {
             }
         };
         format!(
-            "{report}\n{}\nЛокальный Anti-DPI: {}\n{}",
+            "{report}\nСистемный перехват: не активирован (backend не готов)\n{}\n{}\nЛокальный Anti-DPI: {}\n{}",
+            crate::routing::flow::summary(self.routing_cache().flows.counts()),
             self.routing_cache().report(),
             if self.routing_cache().dpi.enabled() {
                 "разрешён (экспериментальный TCP/TLS)"
@@ -1615,7 +1616,7 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 38]) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 38], Option<[u16; 4]>) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -1649,6 +1650,7 @@ impl ClientRuntime {
             fallback,
             view.client.routing_cache().observation(),
             crate::traffic::routing_totals(),
+            view.client.routing_cache().flows.counts(),
         )
     }
     async fn candidate(

@@ -157,6 +157,7 @@ pub enum StatusReply {
         routing_revision: u64,
         routing_state: u8,
         routing_totals: Box<[u64; 38]>,
+        flow_counts: Option<[u16; 4]>,
     },
     ClientReady {
         revision: u64,
@@ -1027,7 +1028,9 @@ where
             fallback,
             (routing_revision, routing_state),
             totals,
+            flow_counts,
         ) = client.status().await;
+        let flows = flow_counts.map_or_else(|| "unknown".to_owned(), |counts| counts.map(|n| n.to_string()).join(","));
         let totals = totals
             .iter()
             .map(u64::to_string)
@@ -1038,7 +1041,7 @@ where
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         format!(
-            "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} x={xhttp} f={} rr={routing_revision} rs={routing_state} rt={totals}\n",
+            "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} x={xhttp} f={} rr={routing_revision} rs={routing_state} rt={totals} fs={flows}\n",
             u8::from(fallback)
         )
     } else {
@@ -1280,6 +1283,20 @@ where
                 for counter in &mut routing_totals {
                     *counter = unsigned(counters.next()?)?;
                 }
+                let raw_flows = fields.next()?.strip_prefix("fs=")?;
+                let flow_counts = if raw_flows == "unknown" {
+                    None
+                } else {
+                    let mut parts = raw_flows.split(',');
+                    let mut counts = [0u16; 4];
+                    for count in &mut counts {
+                        *count = u16::try_from(unsigned(parts.next()?)?).ok()?;
+                    }
+                    if parts.next().is_some() || counts.iter().map(|n| usize::from(*n)).sum::<usize>() > crate::routing::flow::MAX_FLOWS {
+                        return None;
+                    }
+                    Some(counts)
+                };
                 if counters.next().is_some()
                     || fields.next().is_some()
                     || ((transport == 0) != (xhttp == 0))
@@ -1296,6 +1313,7 @@ where
                     routing_revision,
                     routing_state,
                     routing_totals: Box::new(routing_totals),
+                    flow_counts,
                 })
             }
             StatusCommand::ClientPreview {
@@ -1928,7 +1946,7 @@ mod strict_wire_matrix_tests {
             (4, 3, 1, false),
         ] {
             let response = format!(
-                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={} rr=2 rs=1 rt=10,20,30,40,5,1,2,6,7,8,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38\n",
+                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={} rr=2 rs=1 rt=10,20,30,40,5,1,2,6,7,8,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38 fs=1,2,3,4\n",
                 u8::from(f)
             );
             assert_eq!(
@@ -1946,6 +1964,7 @@ mod strict_wire_matrix_tests {
                         10, 20, 30, 40, 5, 1, 2, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
                         21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38
                     ]),
+                    flow_counts: Some([1, 2, 3, 4]),
                 })
             );
         }
@@ -1956,7 +1975,7 @@ mod strict_wire_matrix_tests {
             .collect::<Vec<_>>()
             .join(",");
         let max_response = format!(
-            "theia-client-v1 r={} sha256={hex} d={} t=3 x=2 f=0 rr={} rs=1 rt={max_counters}\n",
+            "theia-client-v1 r={} sha256={hex} d={} t=3 x=2 f=0 rr={} rs=1 rt={max_counters} fs=1024,1024,1024,1024\n",
             u64::MAX,
             u64::MAX,
             u64::MAX
@@ -1969,6 +1988,9 @@ mod strict_wire_matrix_tests {
         let zeros = ["0"; 38].join(",");
         let noncanonical = format!("{},01", ["0"; 37].join(","));
         for response in [
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={zeros}\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={zeros} fs=4096,1,0,0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={zeros} fs=0,0,01,0\n"),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt={zeros}\n"),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={noncanonical}\n"),
             format!(

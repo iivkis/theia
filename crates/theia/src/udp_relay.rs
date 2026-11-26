@@ -173,7 +173,6 @@ impl Tunnel {
         download: mpsc::Sender<Vec<u8>>,
         flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
-        use crate::routing::PacketAction;
         match self {
             Self::VerifiedLocal(verified, fallback) => {
                 let Some(first) = upload.recv().await else {
@@ -201,19 +200,13 @@ impl Tunnel {
                     if !matches!(tunnel, Self::H2(_) | Self::H3(_)) {
                         return Err(ClientError::Protocol);
                     }
-                    if let Some(flow) = flow {
-                        flow.commit(PacketAction::Redirect)?;
-                    }
-                    return tunnel.relay_selected(Some(first), upload, download).await;
+                    return tunnel.relay_selected(Some(first), upload, download, flow).await;
                 }
                 // Once a send is attempted no fallback or replay is legal.
                 drop(fallback);
                 verified.check_policy()?;
-                if let Some(flow) = flow {
-                    flow.commit(PacketAction::Modify)?;
-                }
                 let result = if let Some(strategy) = stun {
-                    relay_stun(&verified.socket, strategy, first, upload, download).await
+                    relay_stun(&verified.socket, strategy, first, upload, download, flow).await
                 } else {
                     relay_local(
                         &verified.socket,
@@ -221,6 +214,7 @@ impl Tunnel {
                         Some(first),
                         upload,
                         download,
+                        flow,
                     )
                     .await
                 };
@@ -230,16 +224,7 @@ impl Tunnel {
                 }
                 result.map_err(LocalRelayError::into_client)
             }
-            other => {
-                if let Some(flow) = flow {
-                    let Some(first) = upload.recv().await else { return Ok(()); };
-                    let action = if matches!(&other, Self::Direct(_)) { PacketAction::Pass } else { PacketAction::Redirect };
-                    flow.commit(action)?;
-                    other.relay_selected(Some(first), upload, download).await
-                } else {
-                    other.relay_selected(None, upload, download).await
-                }
-            }
+            other => other.relay_selected(None, upload, download, flow).await,
         }
     }
 
@@ -248,11 +233,12 @@ impl Tunnel {
         first: Option<Vec<u8>>,
         upload: mpsc::Receiver<Vec<u8>>,
         download: mpsc::Sender<Vec<u8>>,
+        flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
         match self {
-            Self::H2(t) => t.relay_udp(first, upload, download).await,
-            Self::H3(t) => t.relay_udp(first, upload, download).await,
-            Self::Direct(socket) => relay_local(&socket, None, first, upload, download)
+            Self::H2(t) => t.relay_udp(first, upload, download, flow).await,
+            Self::H3(t) => t.relay_udp(first, upload, download, flow).await,
+            Self::Direct(socket) => relay_local(&socket, None, first, upload, download, flow)
                 .await
                 .map_err(LocalRelayError::into_client),
             Self::VerifiedLocal(..) => Err(ClientError::Protocol),
@@ -277,7 +263,10 @@ async fn relay_local(
     mut first: Option<Vec<u8>>,
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
+    flow: Option<&crate::routing::flow::FlowLease>,
 ) -> Result<(), LocalRelayError> {
+    use crate::routing::{flow::FirstSend, PacketAction};
+    let mut first_send = FirstSend::new(flow, if verification_deadline.is_some() { PacketAction::Modify } else { PacketAction::Pass });
     let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
     let activity = Activity::new();
     // For verified QUIC, start the receive deadline only after a successful
@@ -286,6 +275,7 @@ async fn relay_local(
         let data = first
             .take()
             .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+        first_send.attempt().map_err(LocalRelayError::Application)?;
         timeout(deadline, send_datagram(socket, &data))
             .await
             .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
@@ -296,6 +286,7 @@ async fn relay_local(
     }
     let send = async {
         while let Some(data) = next_datagram(&mut first, &mut upload).await {
+            first_send.attempt().map_err(LocalRelayError::Application)?;
             send_datagram(socket, &data)
                 .await
                 .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
@@ -341,6 +332,7 @@ async fn relay_stun(
     first: Vec<u8>,
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
+    flow: Option<&crate::routing::flow::FlowLease>,
 ) -> Result<(), LocalRelayError> {
     use crate::routing::dpi::udp::{prepare_binding, BindingTransactions};
     let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
@@ -355,6 +347,9 @@ async fn relay_stun(
     }
     let packet = prepare_binding(&first, strategy)
         .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+    if let Some(flow) = flow {
+        flow.commit(crate::routing::PacketAction::Modify).map_err(LocalRelayError::Application)?;
+    }
     timeout(FIRST_RESPONSE, send_datagram(socket, &packet))
         .await
         .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
@@ -607,6 +602,7 @@ mod tests {
                 Some(b"first".to_vec()),
                 rx,
                 down,
+                None,
             )
             .await
         });
@@ -647,6 +643,7 @@ mod tests {
                 Some(b"first".to_vec()),
                 rx,
                 down,
+                None,
             )
             .await
         });
@@ -680,7 +677,7 @@ mod tests {
             .unwrap()
             .into_owned();
         let task = tokio::spawn(async move {
-            relay_stun(&socket, BindingStrategy::Fingerprint, first, rx, down).await
+            relay_stun(&socket, BindingStrategy::Fingerprint, first, rx, down, None).await
         });
         let mut buf = [0; 512];
         let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf))

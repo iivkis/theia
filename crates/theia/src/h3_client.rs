@@ -969,6 +969,7 @@ impl H3Tunnel {
         mut first: Option<Vec<u8>>,
         mut upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
         download: tokio::sync::mpsc::Sender<Vec<u8>>,
+        flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
         if !self.state.udp() {
             return Err(ClientError::Protocol);
@@ -982,12 +983,14 @@ impl H3Tunnel {
         let activity = crate::udp_relay::Activity::new();
         let writing = std::sync::atomic::AtomicBool::new(false);
         let send_loop = async {
+            let mut first_send = crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
             while let Some(data) = crate::udp_relay::next_datagram(&mut first, &mut upload).await {
                 let size = data.len();
                 let frame = Frame::Datagram(data);
                 tx_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
+                first_send.attempt()?;
                 writing.store(true, std::sync::atomic::Ordering::Relaxed);
                 send(tx, &frame).await?;
                 writing.store(false, std::sync::atomic::Ordering::Relaxed);
